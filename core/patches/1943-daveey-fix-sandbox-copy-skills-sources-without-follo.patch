@@ -1,0 +1,567 @@
+From 035b7bbe6aa65b74319f51134656326d0d8f4429 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 11:06:41 +0000
+Subject: [PATCH] [daveey] fix(sandbox): copy skills sources without following
+ symlinks at any level
+
+A container that can write a skills source (a trusted project's .hermes/skills
+under a cwd mounted rw via docker_mount_cwd_to_workspace, or an rw
+docker_volumes entry) could swap a vetted file, or any directory above it, for
+a symlink to a host file between the walk's check and the copy's open. The
+path-based copy (src.stat + shutil.copy2) followed the link and wrote e.g.
+HERMES_HOME/.env into the container's own read-only skills mount. The live
+refresh re-runs the copy every 5 s on the container's commands, so the race
+could be retried forever (review repro: leak after 10-31 refreshes, 3/3 runs).
+
+Problem: race.py leaks TOP-SECRET-HOST-TOKEN into cache/sandbox-skills/<key>/s/zz_payload.md.
+Why 1: _copy_if_stale opened the source by path and followed symlinks (copy2).
+Why 2: the walk vetted names/paths (is_symlink, deny guard) and the copy re-resolved
+       the path later, so check and use referred to different objects (TOCTOU).
+Why 3: the copy was written for a host-only, once-per-container source; the
+       live-refresh commit made it run repeatedly on a source the sandbox can write.
+Root (happened): the copy had no invariant tying "the entry that was vetted" to
+       "the bytes that are read"; every source component was re-resolved by path.
+Root (not caught): tests only covered static trees (symlinks present before the
+       walk); no test changed the tree between enumeration and open.
+Recurrence: first time for this copy (parent commit ran it once at creation).
+
+Fix:
+- The root is resolved once; the copy key and the walk use that realpath, and it
+  is opened component by component from "/" with O_NOFOLLOW|O_DIRECTORY, so an
+  ancestor swapped after resolution fails the open and the tree is withheld.
+- _walk_skill_tree_anchored walks via directory fds: each subdir is opened
+  O_NOFOLLOW relative to its open parent and must be the inode that was listed;
+  files are opened O_NOFOLLOW|O_NONBLOCK relative to their dir fd, fstat must
+  show S_ISREG, and bytes are copied from that fd (mode & 0o777, ns mtime kept).
+  A swapped parent dir therefore can't redirect a file open either.
+- Platforms without O_NOFOLLOW/dir_fd opens (Windows) withhold the copy (left
+  empty, warned once per root) instead of falling back to a path-following copy.
+- iter_skills_files (remote upload backends, whose sandbox can't write the host
+  source) still uses the path walk; unchanged.
+- Warm no-op refresh of a 5,000-file tree: 121 ms -> 65 ms (cold 648 -> 566 ms).
+
+Proof: tests/tools/test_skills_copy_race.py swaps deterministically from inside
+the walk's deny predicate (after vetting, before open): file -> symlink, parent
+dir -> symlink after its file was vetted, root ancestor -> symlink, dir ->
+symlink before descent, file -> FIFO, plus capability-missing withholding,
+symlinked-root portability, and posix/windows platform-lane checks. 4 of these
+fail on e38682765006 (file, parent dir, root ancestor, capability) and pass here.
+The review's race.py / race_env.py repros: no leak in 200 refreshes (4 runs).
+Neighbouring suites (credential_files, docker_environment, docker_skills_mount_live,
+file_sync*, ssh_*, capsule, daytona, modal, vercel, skill_usage, ...): 382 passed,
+14 skipped. scripts/check: ok.
+---
+ tests/tools/test_skills_copy_race.py     | 245 +++++++++++++++++++++++
+ tools/credential_files.py                | 188 ++++++++++++++---
+ website/docs/user-guide/configuration.md |   2 +-
+ 3 files changed, 407 insertions(+), 28 deletions(-)
+ create mode 100644 tests/tools/test_skills_copy_race.py
+
+diff --git a/tests/tools/test_skills_copy_race.py b/tests/tools/test_skills_copy_race.py
+new file mode 100644
+index 00000000000..9efead2b64e
+--- /dev/null
++++ b/tests/tools/test_skills_copy_race.py
+@@ -0,0 +1,245 @@
++"""The sanitized skills copy never follows a swap made between enumeration and open.
++
++A sandbox that can write a skills source (a trusted project's ``.hermes/skills`` under a
++cwd mounted read-write at ``/workspace``, or an rw ``docker_volumes`` entry) could swap a
++vetted file, or a vetted file's parent directory, for a symlink to any host path after the
++walk checked it and before the copy opened it. The path-based copy then followed the link
++and wrote the host file (``HERMES_HOME/.env``, say) into the container's own mount. Every
++docker refresh tick re-runs the copy, so the race could be retried without limit.
++
++Each test swaps deterministically from inside the walk's deny predicate, i.e. after the
++entry was enumerated and vetted and before it is opened, and asserts no secret byte ever
++reaches the copy.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import threading
++from pathlib import Path
++
++import pytest
++
++import tools.credential_files as cf
++
++SECRET = "TOP-SECRET-HOST-TOKEN"
++
++def posix_only(test):
++    """Runs on the Linux suite and the macOS ``-m platforms`` lane (real O_NOFOLLOW semantics)."""
++    return pytest.mark.platforms("posix")(
++        pytest.mark.skipif(not cf._ANCHORED_COPY_SUPPORTED, reason="needs O_NOFOLLOW + dir_fd opens")(test))
++
++
++@pytest.mark.platforms("posix")
++def test_posix_hosts_have_anchored_copy():
++    """Linux and macOS must take the race-free path; losing it would silently empty every mount."""
++    assert cf._ANCHORED_COPY_SUPPORTED
++
++
++@pytest.mark.platforms("windows")
++def test_windows_withholds_skills_copy_for_real(tmp_path, monkeypatch):
++    home = tmp_path / "hh"
++    (home / "skills" / "s").mkdir(parents=True)
++    (home / "skills" / "s" / "SKILL.md").write_text("# s")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert not cf._ANCHORED_COPY_SUPPORTED
++    assert not any(p.is_file() for p in copy.rglob("*"))
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / "hh"
++    (home / "skills" / "s").mkdir(parents=True)
++    (home / "skills" / "s" / "SKILL.md").write_text("---\nname: s\n---\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return home
++
++
++@pytest.fixture
++def secret(tmp_path) -> Path:
++    path = tmp_path / "host_secret.txt"
++    path.write_text(SECRET + "\n")
++    return path
++
++
++def _swap_when_vetted(monkeypatch, name: str, swap) -> list[Path]:
++    """Run *swap(path)* once, the first time the walk vets an entry called *name*."""
++    fired: list[Path] = []
++    real_denier = cf._skill_entry_denier
++
++    def denier(root):
++        denied = real_denier(root)
++        if denied is None:
++            return None
++
++        def check(path):
++            result = denied(path)
++            if path.name == name and not fired:
++                fired.append(path)
++                swap(path)
++            return result
++
++        return check
++
++    monkeypatch.setattr(cf, "_skill_entry_denier", denier)
++    return fired
++
++
++def _copied_text(copy: Path) -> str:
++    return "".join(p.read_text(errors="replace") for p in copy.rglob("*") if p.is_file() and not p.is_symlink())
++
++
++@posix_only
++def test_file_swapped_for_symlink_after_vetting_is_not_followed(home, secret, monkeypatch):
++    victim = home / "skills" / "s" / "zz_payload.md"
++    victim.write_text("benign")
++
++    def swap(path):
++        path.unlink()
++        path.symlink_to(secret)
++
++    fired = _swap_when_vetted(monkeypatch, "zz_payload.md", swap)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert fired, "the swap hook never ran: the test did not exercise the race"
++    assert SECRET not in _copied_text(copy)
++    assert (copy / "s" / "SKILL.md").is_file(), "the rest of the tree must still be copied"
++
++
++@posix_only
++def test_parent_dir_swapped_for_symlink_after_file_vetting_is_not_followed(home, tmp_path, monkeypatch):
++    """The file is fine; its *parent directory* is swapped for a link to a host dir holding a
++    same-named secret between vetting the file and opening it."""
++    sub = home / "skills" / "s" / "sub"
++    sub.mkdir()
++    (sub / "zz.md").write_text("benign")
++    host_dir = tmp_path / "host_dir"
++    host_dir.mkdir()
++    (host_dir / "zz.md").write_text(SECRET)
++
++    def swap(path):
++        parent = path.parent
++        parent.rename(tmp_path / "moved_away")
++        parent.symlink_to(host_dir, target_is_directory=True)
++
++    fired = _swap_when_vetted(monkeypatch, "zz.md", swap)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert fired
++    assert SECRET not in _copied_text(copy)
++
++
++@posix_only
++def test_dir_swapped_for_symlink_before_descent_is_not_walked(home, tmp_path, monkeypatch):
++    sub = home / "skills" / "s" / "sub"
++    sub.mkdir()
++    (sub / "a.md").write_text("benign")
++    host_dir = tmp_path / "host_dir"
++    host_dir.mkdir()
++    (host_dir / "a.md").write_text(SECRET)
++
++    def swap(path):
++        path.rename(tmp_path / "moved_away")
++        path.symlink_to(host_dir, target_is_directory=True)
++
++    fired = _swap_when_vetted(monkeypatch, "sub", swap)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert fired
++    assert SECRET not in _copied_text(copy)
++
++
++@posix_only
++def test_root_ancestor_swapped_after_vetting_withholds_the_tree(tmp_path, monkeypatch):
++    """A project skills root's own ancestor (``<cwd>/.hermes``) is container-writable too."""
++    home = tmp_path / "hh"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    project = tmp_path / "proj"
++    (project / ".hermes" / "skills" / "s").mkdir(parents=True)
++    (project / ".hermes" / "skills" / "s" / "SKILL.md").write_text("# s")
++    decoy = tmp_path / "decoy"
++    (decoy / "skills" / "s").mkdir(parents=True)
++    (decoy / "skills" / "s" / "secret.md").write_text(SECRET)
++
++    root = project / ".hermes" / "skills"
++    real_denier = cf._skill_entry_denier
++    fired: list[bool] = []
++
++    def denier(r):
++        result = real_denier(r)
++        if not fired:
++            fired.append(True)
++            (project / ".hermes").rename(tmp_path / "moved_away")
++            (project / ".hermes").symlink_to(decoy, target_is_directory=True)
++        return result
++
++    monkeypatch.setattr(cf, "_skill_entry_denier", denier)
++    copy = Path(cf._safe_skills_path(root))
++
++    assert fired
++    assert SECRET not in _copied_text(copy)
++
++
++@posix_only
++@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
++def test_file_swapped_for_fifo_after_vetting_neither_hangs_nor_copies(home, monkeypatch):
++    victim = home / "skills" / "s" / "zz_pipe.md"
++    victim.write_text("benign")
++
++    def swap(path):
++        path.unlink()
++        os.mkfifo(path)
++
++    fired = _swap_when_vetted(monkeypatch, "zz_pipe.md", swap)
++    result: list[Path] = []
++    worker = threading.Thread(target=lambda: result.append(Path(cf._safe_skills_path(home / "skills"))),
++                              daemon=True)
++    worker.start()
++    worker.join(10)
++
++    assert not worker.is_alive(), "opening the swapped-in FIFO blocked the refresh"
++    assert fired
++    copy = result[0]
++    assert not (copy / "s" / "zz_pipe.md").exists()
++    assert (copy / "s" / "SKILL.md").is_file()
++
++
++@posix_only
++def test_symlinked_skills_root_is_still_copied(tmp_path, monkeypatch):
++    """Portability: a user's ``skills`` that is itself a symlink to their real skills dir
++    (dotfiles setups) keeps working; only links *inside* the tree are refused."""
++    home = tmp_path / "hh"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    real = tmp_path / "dotfiles" / "skills"
++    (real / "s").mkdir(parents=True)
++    (real / "s" / "SKILL.md").write_text("# s")
++    (real / "s" / "run.sh").write_text("#!/bin/sh\n")
++    os.chmod(real / "s" / "run.sh", 0o755)
++    (home / "skills").symlink_to(real, target_is_directory=True)
++
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert (copy / "s" / "SKILL.md").read_text() == "# s"
++    assert os.stat(copy / "s" / "run.sh").st_mode & 0o111, "executable bit must survive the copy"
++    assert os.stat(copy / "s" / "SKILL.md").st_mtime_ns == os.stat(real / "s" / "SKILL.md").st_mtime_ns
++
++
++def test_platform_without_anchored_opens_withholds_the_copy(home, monkeypatch, caplog):
++    """Fail closed: without O_NOFOLLOW/dir_fd there is no race-free copy, so nothing is copied
++    (and a previous copy is emptied) rather than falling back to a path-following copy."""
++    (home / "skills" / "s" / "notes.md").write_text("# notes")
++    copy = Path(cf._safe_skills_path(home / "skills"))
++    assert (copy / "s" / "notes.md").exists() or not cf._ANCHORED_COPY_SUPPORTED
++
++    monkeypatch.setattr(cf, "_ANCHORED_COPY_SUPPORTED", False)
++    with caplog.at_level(logging.WARNING, logger=cf.logger.name):
++        copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert not any(p.is_file() for p in copy.rglob("*")), "a path-following copy must not run"
++    assert "withholding" in caplog.text
+diff --git a/tools/credential_files.py b/tools/credential_files.py
+index 6bf02c8fb2f..027877a941d 100644
+--- a/tools/credential_files.py
++++ b/tools/credential_files.py
+@@ -284,12 +284,16 @@ def _safe_skills_path(skills_dir: Path) -> str:
+     process and reused here, keeps its bind mount and sees each refresh. (A per-process
+     ``mkdtemp`` copy was deleted at that process's exit, emptying the mount of any container
+     a later process reused.) Refreshes of one copy are serialized across threads and processes.
++
++    The source is resolved once: the copy's key and the walk use the same realpath, so a
++    root (or root ancestor) swapped between the two can never fill this copy from elsewhere.
+     """
+     from tools.skill_usage import skill_file_lock
+ 
+-    safe_dir = _sanitized_copy_dir(skills_dir)
++    real = os.path.realpath(skills_dir)
++    safe_dir = _sanitized_copy_dir(real)
+     with _safe_skills_lock, skill_file_lock(safe_dir.with_name(f"{safe_dir.name}.lock")):
+-        return str(_refresh_sanitized_copy(skills_dir, safe_dir))
++        return str(_refresh_sanitized_copy(Path(real), safe_dir))
+ 
+ 
+ def _sanitized_copy_store() -> Path:
+@@ -297,7 +301,7 @@ def _sanitized_copy_store() -> Path:
+     return get_hermes_home() / "cache" / "sandbox-skills"
+ 
+ 
+-def _sanitized_copy_dir(skills_dir: Path) -> Path:
++def _sanitized_copy_dir(skills_dir: Path | str) -> Path:
+     import hashlib
+ 
+     key = hashlib.sha256(os.path.realpath(skills_dir).encode("utf-8")).hexdigest()[:16]
+@@ -317,54 +321,184 @@ def _remove_entry(path: Path) -> None:
+         path.unlink(missing_ok=True)
+ 
+ 
+-def _copy_if_stale(src: Path, dst: Path) -> None:
+-    """Copy *src* over *dst* unless it already matches (size + ns mtime, which ``copy2`` keeps).
++# --- Race-free source reads for the sanitized copy ---
++#
++# The copy's source may be writable by the very sandbox that mounts the copy (a trusted
++# project's skills under a cwd mounted rw at /workspace, an rw docker volume), and the copy is
++# refreshed on that sandbox's commands. Any path-based open between "vetted" and "read" can then
++# be redirected by swapping a file, or any directory above it, for a symlink to a host file. So
++# every source component is opened relative to its already-open parent with O_NOFOLLOW, and a
++# file is copied from its own fd only after fstat proves it a regular file.
++_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
++_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
++_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
++# O_NONBLOCK: a FIFO swapped in after vetting must not block the open (fstat then rejects it).
++_SOURCE_FILE_FLAGS = os.O_RDONLY | _O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | _O_CLOEXEC
++_SOURCE_DIR_FLAGS = _SOURCE_FILE_FLAGS | _O_DIRECTORY
++# Without these (Windows) there is no race-free way to read a sandbox-writable tree, so the
++# sanitized copy is withheld (fails closed) instead of falling back to a path-following copy.
++_ANCHORED_COPY_SUPPORTED = bool(
++    _O_NOFOLLOW and _O_DIRECTORY
++    and os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
++    and os.stat in os.supports_follow_symlinks and os.scandir in os.supports_fd
++)
++_withheld_roots_warned: set[str] = set()
++
++
++def _open_dir_anchored(real_path: str) -> int:
++    """Open the absolute, already-resolved *real_path* one component at a time from ``/``,
++    never following a symlink: a component swapped for a link after resolution raises."""
++    fd = os.open("/", _SOURCE_DIR_FLAGS)
++    try:
++        for part in real_path.split(os.sep):
++            if part:
++                child = os.open(part, _SOURCE_DIR_FLAGS, dir_fd=fd)
++                os.close(fd)
++                fd = child
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++def _walk_skill_tree_anchored(root: Path, *, skip_dir: Optional[Path] = None
++                              ) -> Iterator[tuple[str, int, list[tuple[str, os.stat_result]]]]:
++    """:func:`_walk_skill_tree`'s view of the resolved *root*, read through directory fds.
++
++    Yields ``(rel, dir_fd, [(name, lstat), ...])``: *rel* is ``""`` or ``"/a/b"``, *dir_fd* the
++    open directory to open the files from (valid only until the next item). Same pruning and
++    deny rules as the path walk. Each entry is vetted before it is opened, and a directory that
++    is no longer the one that was listed (now a symlink, a file, another inode) is skipped.
++    Fails closed: a root that can't be opened without following a symlink yields nothing.
++    """
++    denied = _skill_entry_denier(root)  # vetted before the open: a swap after this fails the open
++    if denied is None:
++        logger.warning("credential_files: withholding read-denied skills root from sandbox: %s", root)
++        return
++    try:
++        root_fd = _open_dir_anchored(str(root))
++    except OSError as exc:
++        logger.warning("credential_files: withholding skills root %s: not reachable without symlinks (%s)",
++                       root, exc)
++        return
++    skip_id = None
++    if skip_dir is not None:
++        with contextlib.suppress(OSError):
++            skip_st = os.stat(skip_dir)
++            skip_id = (skip_st.st_dev, skip_st.st_ino)
++
++    def walk(dir_fd: int, rel: str) -> Iterator[tuple[str, int, list[tuple[str, os.stat_result]]]]:
++        base = Path(str(root) + rel)
++        files: list[tuple[str, os.stat_result]] = []
++        subdirs: list[tuple[str, os.stat_result]] = []
++        with os.scandir(dir_fd) as entries:
++            for entry in entries:
++                try:
++                    st = entry.stat(follow_symlinks=False)  # taken before vetting: what is vetted gets opened
++                except OSError:
++                    continue
++                if stat.S_ISDIR(st.st_mode):
++                    if (entry.name not in EXCLUDED_SKILL_DIRS and (st.st_dev, st.st_ino) != skip_id
++                            and not denied(base / entry.name)):
++                        subdirs.append((entry.name, st))
++                elif stat.S_ISREG(st.st_mode) and not denied(base / entry.name):
++                    files.append((entry.name, st))
++        yield rel, dir_fd, sorted(files, key=lambda item: item[0])
++        for name, listed in sorted(subdirs, key=lambda item: item[0]):
++            try:
++                child = os.open(name, _SOURCE_DIR_FLAGS, dir_fd=dir_fd)
++            except OSError as exc:  # swapped for a symlink/file, or gone, since it was listed
++                logger.warning("credential_files: skipping skills dir %s: %s", base / name, exc)
++                continue
++            try:
++                opened = os.fstat(child)
++                if (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino):
++                    logger.warning("credential_files: skipping skills dir %s: replaced while walking", base / name)
++                    continue
++                yield from walk(child, f"{rel}/{name}")
++            finally:
++                os.close(child)
++
++    try:
++        yield from walk(root_fd, "")
++    finally:
++        os.close(root_fd)
++
++
++def _copy_if_stale(dir_fd: int, name: str, listed: os.stat_result, dst: str) -> None:
++    """Copy the regular file *name* under *dir_fd* over *dst* unless it already matches
++    (size + ns mtime, which the copy keeps).
+ 
+-    Written to a sibling temp file and ``os.replace``d in: a live container never reads a
+-    half-written file, and a read-only (0444) previous copy can still be replaced.
++    The source is opened ``O_NOFOLLOW`` relative to its directory fd and read from that fd only
++    after ``fstat`` shows a regular file, so a symlink, FIFO or device swapped in after the walk
++    vetted it raises instead of being followed. Written to a sibling temp file and
++    ``os.replace``d in: a live container never reads a half-written file, and a read-only
++    (0444) previous copy can still be replaced.
+     """
+     import shutil
+ 
+     try:
+-        src_st, dst_st = src.stat(), dst.lstat()
+-        if (stat.S_ISREG(dst_st.st_mode) and src_st.st_size == dst_st.st_size
+-                and src_st.st_mtime_ns == dst_st.st_mtime_ns):
++        dst_st = os.lstat(dst)
++        if (stat.S_ISREG(dst_st.st_mode) and listed.st_size == dst_st.st_size
++                and listed.st_mtime_ns == dst_st.st_mtime_ns):
+             return
+     except FileNotFoundError:
+         pass
+-    if dst.is_dir() and not dst.is_symlink():
++    if os.path.isdir(dst) and not os.path.islink(dst):
+         shutil.rmtree(dst, ignore_errors=True)
+-    tmp = dst.with_name(f".{dst.name}.hermes-tmp")
+-    _remove_entry(tmp)
++    src_fd = os.open(name, _SOURCE_FILE_FLAGS, dir_fd=dir_fd)
+     try:
+-        shutil.copy2(str(src), str(tmp))
+-        os.replace(tmp, dst)
+-    except OSError:
+-        _remove_entry(tmp)
+-        raise
++        src_st = os.fstat(src_fd)
++        if not stat.S_ISREG(src_st.st_mode):
++            raise OSError(f"not a regular file: {name}")
++        tmp = os.path.join(os.path.dirname(dst), f".{os.path.basename(dst)}.hermes-tmp")
++        _remove_entry(Path(tmp))
++        try:
++            out_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC, 0o600)
++            with open(out_fd, "wb") as fdst, open(src_fd, "rb", closefd=False) as fsrc:
++                shutil.copyfileobj(fsrc, fdst, 1 << 20)
++            os.chmod(tmp, stat.S_IMODE(src_st.st_mode) & 0o777)  # never carry setuid/setgid into a mount
++            os.utime(tmp, ns=(src_st.st_atime_ns, src_st.st_mtime_ns))
++            os.replace(tmp, dst)
++        except OSError:
++            _remove_entry(Path(tmp))
++            raise
++    finally:
++        os.close(src_fd)
+ 
+ 
+ def _refresh_sanitized_copy(skills_dir: Path, safe_dir: Path) -> Path:
+-    """Make *safe_dir* hold exactly the sync view of *skills_dir*, updating in place.
++    """Make *safe_dir* hold exactly the sync view of the resolved *skills_dir*, in place.
+ 
+     Runs on every docker refresh tick, so it keys on plain path strings: the ``Path``
+     arithmetic (``relative_to``, hashing) cost more than the syscalls on a 5k-file tree.
++    Reads go through :func:`_walk_skill_tree_anchored` (see there for why); where that is
++    unavailable the copy is emptied and stays empty rather than copied by path.
+     """
+-    src_root, dst_root = str(skills_dir), str(safe_dir)
++    dst_root = str(safe_dir)
+     wanted_dirs: set[str] = set()
+     wanted_files: set[str] = set()
+-    for base, files in _walk_skill_tree(skills_dir, skip_dir=safe_dir.parent):
+-        dst_dir = dst_root + str(base)[len(src_root):]
++    if _ANCHORED_COPY_SUPPORTED:
++        tree = _walk_skill_tree_anchored(skills_dir, skip_dir=safe_dir.parent)
++    else:
++        if str(skills_dir) not in _withheld_roots_warned:
++            _withheld_roots_warned.add(str(skills_dir))
++            logger.warning("credential_files: withholding skills %s from the sandbox mount: this platform has"
++                           " no O_NOFOLLOW/dir_fd opens, so a race-free copy is impossible", skills_dir)
++        tree = iter(())
++    for rel, dir_fd, files in tree:
++        dst_dir = dst_root + rel
+         wanted_dirs.add(dst_dir)
+         if os.path.islink(dst_dir) or (os.path.lexists(dst_dir) and not os.path.isdir(dst_dir)):
+             _remove_entry(Path(dst_dir))  # was a file, is now a dir (parents were fixed on the way down)
+         os.makedirs(dst_dir, exist_ok=True)
+-        for item in files:
+-            dst = os.path.join(dst_dir, item.name)
++        for name, listed in files:
++            dst = os.path.join(dst_dir, name)
+             try:
+-                _copy_if_stale(item, Path(dst))
+-            except OSError as exc:  # unreadable or vanished mid-walk: skip it, don't drop every mount
+-                logger.warning("credential_files: skipping unreadable skills file %s: %s", item, exc)
++                _copy_if_stale(dir_fd, name, listed, dst)
++            except OSError as exc:  # unreadable, vanished or swapped mid-walk: skip it, don't drop every mount
++                logger.warning("credential_files: skipping unreadable skills file %s%s/%s: %s",
++                               skills_dir, rel, name, exc)
+                 continue
+             wanted_files.add(dst)
+     # Drop what the source no longer has (or now withholds), deepest first; never the root.
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 72645119062..13b64bf891c 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -455,7 +455,7 @@ Hermes-managed containers carry labels so subsequent processes (and the orphan r
+ - `hermes-profile=<sanitized profile name>` — scopes reuse and reaping to the active Hermes profile by default; when `docker_shared_container_key` is set, its sanitized value is used instead
+ - `hermes-environment=<digest>` — for containers without an explicit shared key, scopes reuse to the requested image, mount arguments, and active `HERMES_HOME`; host paths and volume sources are hashed rather than exposed in this label. Per-process tempdir-sourced mounts are hashed by their stable container path, not the random host tempdir, so they don't defeat reuse
+ 
+-Skills directories are never bind-mounted raw: each root mounts a sanitized copy under `<HERMES_HOME>/cache/sandbox-skills/` (no symlinks, no `skills/.hub` cache, nothing the read deny-list blocks such as a skill's `.env`). Hermes refreshes the copies in place before commands, at most every 5 seconds, so skill edits reach a running container while files created later that the agent may not read on the host never do.
++Skills directories are never bind-mounted raw: each root mounts a sanitized copy under `<HERMES_HOME>/cache/sandbox-skills/` (no symlinks, no `skills/.hub` cache, nothing the read deny-list blocks such as a skill's `.env`). Hermes refreshes the copies in place before commands, at most every 5 seconds, so skill edits reach a running container while files created later that the agent may not read on the host never do. The copy reads its source without following symlinks at any level (each file and directory is opened relative to its already-open parent), so a container that can write a skills source, e.g. a project's `.hermes/skills` under a cwd mounted read-write with `docker_mount_cwd_to_workspace`, cannot redirect the copy to other host files by swapping in a symlink. On a platform without those no-follow opens (Windows), the skills copy is left empty rather than copied unsafely.
+ 
+ On startup, Hermes runs `docker ps --filter label=hermes-task-id=<id> --filter label=hermes-profile=<identity>` and **attaches to the existing container** when it finds one. The identity is the active profile unless `docker_shared_container_key` explicitly opts trusted profiles into a common value. If the container is `exited` (e.g. after a Docker daemon restart), it's `docker start`'d and reused — filesystem state and any installed packages survive, but in-container background processes do not.
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,196 @@
+From 92e8c9d1c63ddb1b9a5ba42de0a5a44487a773f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 18:20:42 +0000
+Subject: [PATCH] [daveey] Keep repin notices under the queued reserve throttle
+
+The queued keepalive (d78f5fb5985) skipped same-sync_version reserves for 60 s,
+but the owner's repin notice only ran from record_reply after a Board reply, and
+its once-per-revision identity (required labels + run count) is not sync_version.
+
+Problem: affected-test gate failed 3 tests in test_kanban_repin_notice.py.
+Why 1: throttled passes `continue` before hub.reserve, so record_reply ->
+  maybe_notify never runs (kanban_queue_reason.py record_reply).
+Why 2: a card queued before its notice existed relied on "every reply" running
+  maybe_notify; with no reply inside the keepalive it never got one.
+Why 3: the throttle identity was sync_version alone, while the notice identity is
+  required labels + run count, so a requirement change at the same sync_version
+  was throttled and the Board's fresh answer never asked for.
+Root (happened): the throttle gated a local side effect (notice) that was coupled
+  to the network reply, and keyed on a narrower identity than that side effect.
+Root (not caught): the throttle commit's own tests used RecordingHub replies with
+  no observation; the repin-notice suite was only run by the ship gate.
+
+Fix:
+- throttle identity = (sync_version, notice revision); a requirement change
+  re-asks the Board inside the keepalive.
+- a throttled pass runs maybe_notify locally from the stored observation
+  (no network; maybe_notify re-fences ownership/lifecycle and dedups).
+- repin_notice._revision -> public notice_revision.
+
+Tests: the across-passes test now pins both semantics (throttled passes return
+0 with one Board call; expired passes return 1 each), still one comment and one
+delivery; the new-revision test asserts the Board is re-asked and the new notice
+names the fresh labels; the already-queued test asserts no Board call.
+Mutants (drop identity; drop throttled notice) each kill one test.
+Proof: run_tests.sh on 40 kanban worker/queue/repin/placement/dispatch files:
+750 passed, 1 skipped, 0 failed.
+---
+ hermes_cli/kanban_repin_notice.py             |  7 ++---
+ hermes_cli/kanban_worker_placement.py         | 27 ++++++++++++++++---
+ .../test_kanban_queued_reserve_throttle.py    |  2 +-
+ tests/hermes_cli/test_kanban_repin_notice.py  | 25 +++++++++++++----
+ 4 files changed, 49 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_repin_notice.py b/hermes_cli/kanban_repin_notice.py
+index bb3d14e37d5..d9608cf1f34 100644
+--- a/hermes_cli/kanban_repin_notice.py
++++ b/hermes_cli/kanban_repin_notice.py
+@@ -86,7 +86,8 @@ def notice_text(payload):
+             f"`{command(task_id, origin)}` on {origin}, or until a pool worker is given those labels.")
+ 
+ 
+-def _revision(conn, task_id, row):
++def notice_revision(conn, task_id, row):
++    """The card revision a notice is posted once for: its required labels and how many runs it has had."""
+     runs = conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
+     return {"required": required_labels(row), "run_count": runs}
+ 
+@@ -112,7 +113,7 @@ def maybe_notify(conn, task_id, gateway, value, pool=None):
+                 or sync.board_mode(conn) != "primary"
+                 or (sync.sync_state(conn) or {}).get("gateway_id") != gateway):
+             return False
+-        revision = _revision(conn, task_id, row)
++        revision = notice_revision(conn, task_id, row)
+         for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                                        (task_id, NOTICE_KIND)):
+             if kb._json_dict(payload).get("revision") == revision:
+@@ -137,7 +138,7 @@ def awaiting(conn, task_id):
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+     if row is None:
+         return False
+-    revision = _revision(conn, task_id, row)
++    revision = notice_revision(conn, task_id, row)
+     from hermes_cli import kanban_db as kb
+     return any(kb._json_dict(p).get("revision") == revision for (p,) in conn.execute(
+         "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (task_id, NOTICE_KIND)))
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 502119638aa..765f33c3e5d 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -20,7 +20,26 @@ _refused: dict[tuple[str, str], tuple[int, float]] = {}  # (board, task) -> (ref
+ # No assigned keepalive exists here. Sixty seconds bounds queue probes while still discovering
+ # registry-only capacity changes without waiting for a task revision. Assigned renewals are unchanged.
+ RESERVE_KEEPALIVE_S = 60.0
+-_queued: dict[tuple[str, str], tuple[int, float]] = {}
++# (board, task) -> (queued revision, local notice revision, retry after). The notice revision (required labels, run
++# count) is part of the identity: a requirement change the Board would answer differently is never throttled away.
++_queued: dict[tuple[str, str], tuple[int, str | None, float]] = {}
++
++
++def _local_identity(conn, task_id):
++    from hermes_cli import kanban_repin_notice as repin
++
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    return "" if row is None else json.dumps(repin.notice_revision(conn, task_id, row), sort_keys=True)
++
++
++def _notice_from_stored(conn, task_id, gateway, pool):
++    """A throttled pass makes no Board request, but the owner's repin notice still runs from the stored current
++    observation (local only, once per card revision), so a card queued before its notice existed still gets it."""
++    from hermes_cli import kanban_queue_reason as queue
++    from hermes_cli import kanban_repin_notice as repin
++
++    # Only reached while the identity is unchanged, and maybe_notify re-fences ownership and lifecycle itself.
++    repin.maybe_notify(conn, task_id, gateway, queue.latest(conn, task_id), pool)
+ 
+ 
+ def creation_decision(args, cfg, gateway, pin, origin_intent):
+@@ -149,7 +168,9 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+             labels = requested_move(conn, row["id"])
+             stage = "reserve" if labels is None else "repin"  # provenance for a failure below
+             held = _queued.get(key)
+-            if labels is None and held and held[0] == row["sync_version"] and now < held[1]:
++            identity = _local_identity(conn, row["id"]) if labels is None else None
++            if labels is None and held and held[:2] == (row["sync_version"], identity) and now < held[2]:
++                queue.try_record(_notice_from_stored, conn, row["id"], gateway, candidates)
+                 continue
+             _queued.pop(key, None)
+             try:
+@@ -168,7 +189,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                     if reply.get("state") == "queued":
+                         # Never adopt an arbitrary post-pull revision: it may be somebody else's edit.
+                         version = reply.get("task_version", row["sync_version"])
+-                        _queued[key] = (version, time.monotonic() + RESERVE_KEEPALIVE_S)
++                        _queued[key] = (version, identity, time.monotonic() + RESERVE_KEEPALIVE_S)
+                         if len(_queued) > 1024:
+                             del _queued[next(iter(_queued))]
+                     queue.try_record(queue.record_reply, conn, row["id"], gateway, reply, candidates)
+diff --git a/tests/hermes_cli/test_kanban_queued_reserve_throttle.py b/tests/hermes_cli/test_kanban_queued_reserve_throttle.py
+index 53ded85784f..79344c65e7a 100644
+--- a/tests/hermes_cli/test_kanban_queued_reserve_throttle.py
++++ b/tests/hermes_cli/test_kanban_queued_reserve_throttle.py
+@@ -76,7 +76,7 @@ def test_explicit_move_bypasses_queued_cache(conn, monkeypatch):
+ 
+ def test_cache_has_hard_bound(conn, monkeypatch):
+     fixtures.acknowledged(conn)
+-    monkeypatch.setattr(wp, "_queued", {("default", str(i)): (4, float("inf")) for i in range(1024)})
++    monkeypatch.setattr(wp, "_queued", {("default", str(i)): (4, "", float("inf")) for i in range(1024)})
+     monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
+     wp.reevaluate(conn, fixtures.RecordingHub(), "default", "hub", cfg=CFG)
+     assert len(wp._queued) == 1024
+diff --git a/tests/hermes_cli/test_kanban_repin_notice.py b/tests/hermes_cli/test_kanban_repin_notice.py
+index 227724c7238..67c2dcdf856 100644
+--- a/tests/hermes_cli/test_kanban_repin_notice.py
++++ b/tests/hermes_cli/test_kanban_repin_notice.py
+@@ -73,12 +73,21 @@ def _no_pull(monkeypatch):
+     monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
+ 
+ 
+-def test_one_comment_and_one_delivery_per_revision_across_passes(conn):
++@pytest.mark.parametrize("keepalive", ["throttled", "expired"])
++def test_one_comment_and_one_delivery_per_revision_across_passes(conn, monkeypatch, keepalive):
++    # Same-revision queued passes inside the keepalive make no Board request (they return 0 and only re-run the
++    # local notice check); once it expires every pass re-asks the Board. Either way: one comment, one delivery.
+     tid = _card(conn)
+     _subscribe(conn, tid)
+     hub = _hub()
+-    for _ in range(4):
+-        assert wp.reevaluate(conn, hub, "default", "hub", cfg=CFG) == 1
++    clock = [100.0]
++    monkeypatch.setattr(wp, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++    for i in range(4):
++        expected = 1 if keepalive == "expired" or i == 0 else 0
++        assert wp.reevaluate(conn, hub, "default", "hub", cfg=CFG) == expected
++        if keepalive == "expired":
++            clock[0] += wp.RESERVE_KEEPALIVE_S
++    assert hub.reserve.call_count == (4 if keepalive == "expired" else 1)
+     comments = _notice_comments(conn, tid)
+     assert len(comments) == 1
+     body = comments[0].body
+@@ -136,7 +145,12 @@ def test_new_card_revision_gets_a_new_notice(conn):
+     hub.reserve.return_value = _queued(missing=("skill:five-whys", "skill:plan"))
+     for _ in range(2):
+         wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
+-    assert len(_notice_comments(conn, tid)) == 2
++    comments = _notice_comments(conn, tid)
++    assert len(comments) == 2
++    # The requirement change is a new local identity: the Board is re-asked inside the queued keepalive, so the
++    # new notice names the Board's fresh answer rather than the stored one.
++    assert hub.reserve.call_count == 2
++    assert "(needs: skill:five-whys, skill:plan)" in comments[1].body
+ 
+ 
+ def test_no_repin_call_is_made_and_the_fence_stays(conn):
+@@ -161,7 +175,8 @@ def test_already_queued_card_gets_its_notice_on_the_next_pass(conn, monkeypatch)
+         wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
+     assert qr.latest(conn, tid)["code"] == "no_eligible_worker"
+     assert _notice_comments(conn, tid) == []
+-    wp.reevaluate(conn, hub, "default", "hub", cfg=CFG)
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg=CFG) == 0  # inside the queued keepalive: no Board call
++    assert hub.reserve.call_count == 1
+     assert len(_notice_comments(conn, tid)) == 1
+     assert len(_delivered(conn, tid)) == 1
+ 
+-- 
+2.55.0
+

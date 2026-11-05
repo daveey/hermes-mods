@@ -1,0 +1,241 @@
+From 4d0727734caed4798b1d1aafd9bc1c3691799469 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 18:29:59 +0000
+Subject: [PATCH] [daveey] state: release the failing pooled reader's page
+ cache before the corruption replay (fail closed if it cannot)
+
+A warm mode=ro reader keeps its cache while the WAL is unchanged, so the one-shot replay after a clean
+fresh-process check re-read the cached bad page, recurred and latched. The writer already runs PRAGMA
+shrink_memory; the reader now does too, on the connection that failed and without closing it.
+
+Proof: new real-file fixture (bad page on disk for the first read, restored before the check) latched
+'recurred on replay' before this change; after it the read lands and nothing latches.
+---
+ hermes_state.py                               |  28 +++-
+ hermes_state_corruption_confirm.py            |  15 +++
+ .../test_storage_corruption_scoped_confirm.py | 125 ++++++++++++++++++
+ 3 files changed, 161 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_state.py b/hermes_state.py
+index c8451925beb..46ba672de1c 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -1237,11 +1237,21 @@ class SessionDB(
+         first_corrupt: Optional[BaseException] = None
+         while True:
+             scope = _corrupt_confirm.TouchedTables()
++            cache_released: Optional[bool] = None  # None: no connection was in use when the read failed
+             try:
+                 with self._read_ctx() as conn:
+-                    # Composed with any caller authorizer (also on the non-WAL writer fallback).
+-                    with scope.recording(conn):
+-                        result = fn(conn)
++                    try:
++                        # Composed with any caller authorizer (also on the non-WAL writer fallback).
++                        with scope.recording(conn):
++                            result = fn(conn)
++                    except sqlite3.DatabaseError as exc:
++                        # A warm reader keeps its page cache across transactions while the WAL is
++                        # unchanged: a bad page read once would be re-read from the cache by the
++                        # replay and recur even when the file is clean. Release it while this
++                        # connection is still ours, never by closing it (POSIX locks, see above).
++                        if first_corrupt is None and is_structural_corruption_error(exc):
++                            cache_released = _corrupt_confirm.release_reader_cache(conn)
++                        raise
+             except sqlite3.OperationalError as exc:
+                 if ioerr_attempts >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
+                     note_storage_error(self.db_path, exc)
+@@ -1254,7 +1264,7 @@ class SessionDB(
+                 # touched does NOT confirm is replayed before it latches the process (a SELECT has
+                 # no effect to duplicate); a confirmed one, a check timeout/error or a recurrence
+                 # is published as before.
+-                outcome = self._read_corrupt_replay_blocker(exc, scope, first_corrupt)
++                outcome = self._read_corrupt_replay_blocker(exc, scope, first_corrupt, cache_released)
+                 if outcome is None:
+                     first_corrupt = exc
+                     continue
+@@ -1268,15 +1278,19 @@ class SessionDB(
+             return result
+ 
+     def _read_corrupt_replay_blocker(self, exc: BaseException, scope: "_corrupt_confirm.TouchedTables",
+-                                     first_corrupt: Optional[BaseException]) -> Optional[str]:
+-        """None when a read that raised *exc* may be replayed once (structural, first time, and a
+-        clean scoped read-only quick_check); otherwise the outcome for the latch reason."""
++                                     first_corrupt: Optional[BaseException],
++                                     cache_released: Optional[bool] = None) -> Optional[str]:
++        """None when a read that raised *exc* may be replayed once (structural, first time, the failing
++        reader's page cache released, and a clean scoped read-only quick_check); otherwise the outcome
++        for the latch reason."""
+         if first_corrupt is not None:
+             return "recurred on replay"
+         if not is_structural_corruption_error(exc):
+             return "no replay"
+         if storage_state(self.db_path) == STORAGE_CORRUPT:  # no replay once latched: never spawn per read
+             return "no replay: storage already latched"
++        if cache_released is False:  # fail closed: a replay could re-read the very page that failed
++            return "no replay: reader cache not released"
+         confirm = _corrupt_confirm.confirm_corruption(
+             self.db_path, scope.tables(), _corrupt_confirm.confirm_budget(None),
+             extensions=_corrupt_confirm.extensions_loaded_by(self))
+diff --git a/hermes_state_corruption_confirm.py b/hermes_state_corruption_confirm.py
+index ba7cd7e2fd9..251dc85296d 100644
+--- a/hermes_state_corruption_confirm.py
++++ b/hermes_state_corruption_confirm.py
+@@ -269,6 +269,21 @@ def writer_replay_blocker(db, stage: str, first_corrupt: Optional[BaseException]
+     return None
+ 
+ 
++def release_reader_cache(conn) -> bool:
++    """Release a pooled reader's unpinned page cache after a structural read error; False when that fails.
++
++    The read twin of the writer's release in ``writer_replay_blocker``: a ``mode=ro`` reader keeps its
++    cache across transactions while the WAL is unchanged, so a replay could re-read the cached page
++    that raised instead of the file. The connection stays open and in the pool (``close()`` would
++    cancel this process's POSIX locks for every sibling connection); a failure means the caller must
++    not replay."""
++    try:
++        conn.execute("PRAGMA shrink_memory")
++    except sqlite3.Error:
++        return False
++    return True
++
++
+ @dataclass(frozen=True)
+ class ConfirmResult:
+     """``outcome``: ``clean`` | ``damaged`` | ``timeout`` | ``no_budget`` | ``error``.
+diff --git a/tests/hermes_state/test_storage_corruption_scoped_confirm.py b/tests/hermes_state/test_storage_corruption_scoped_confirm.py
+index 3a31389d8a3..2c62cb2cbf3 100644
+--- a/tests/hermes_state/test_storage_corruption_scoped_confirm.py
++++ b/tests/hermes_state/test_storage_corruption_scoped_confirm.py
+@@ -847,3 +847,128 @@ def test_notice_guarantee_recurring_corrupt_after_clean_confirm_latches(tmp_path
+         assert "recurred on replay" in _reason(db.db_path)
+     finally:
+         db.close()
++
++
++# ── a warm pooled reader's page cache must not outlive the failing read ──
++#
++# A ``mode=ro`` pooled reader keeps its page cache across transactions while the WAL is unchanged. A
++# bad page read once (a torn read, a transient fault) stays cached, so a replay that reuses it recurs
++# and latches even though the fresh-process check found the file clean. The writer releases its cache
++# (``PRAGMA shrink_memory``) before a replay; the reader must too, WITHOUT closing the connection
++# (close() cancels this process's POSIX locks for every sibling connection).
++
++
++def _page_of(path, table):
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
++        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = ?", (table,)).fetchone()[0]
++    finally:
++        conn.close()
++    return page_size, root
++
++
++class _TransientBadPage:
++    """Garbage on disk for the first read of *table*'s root page; the bytes are restored before the
++    fresh-process check runs, so the check is clean while the reader's cache still holds the bad page."""
++
++    def __init__(self, path, table, monkeypatch):
++        self.path = path
++        self.page_size, root = _page_of(path, table)
++        self.offset = self.page_size * (root - 1)
++        with open(path, "rb") as fh:
++            fh.seek(self.offset)
++            self.good = fh.read(self.page_size)
++        self.restored = False
++        real = cc.confirm_corruption
++
++        def confirm(*a, **kw):
++            self.restore()
++            return real(*a, **kw)
++
++        monkeypatch.setattr(cc, "confirm_corruption", confirm)
++
++    def _write(self, data):
++        with open(self.path, "r+b") as fh:
++            fh.seek(self.offset)
++            fh.write(data)
++
++    def damage(self):
++        self._write(b"\xde\xad\xbe\xef" * (self.page_size // 4))
++
++    def restore(self):
++        self._write(self.good)
++        self.restored = True
++
++
++def _warm_reader_db(tmp_path):
++    path = tmp_path / "state.db"
++    db = SessionDB(db_path=path)
++    db.create_session("s1", source="cli")
++    db.append_message("s1", "user", "hello")
++    return db, path
++
++
++def test_reader_replay_releases_its_cached_bad_page(tmp_path, monkeypatch):
++    db, path = _warm_reader_db(tmp_path)
++    try:
++        bad = _TransientBadPage(path, "sessions", monkeypatch)
++        bad.damage()
++        row = db._read_one("SELECT id, source FROM sessions WHERE id = ?", ("s1",))
++        assert bad.restored  # a real structural error reached the (clean) fresh-process check
++        assert row is not None and row[0] == "s1"
++        assert storage_state(path) == "ok"
++        assert unconfirmed_corruption_count(path) == 1
++    finally:
++        db.close()
++
++
++def test_reader_replay_never_closes_the_pooled_connection(tmp_path, monkeypatch):
++    db, path = _warm_reader_db(tmp_path)
++    try:
++        closed = []
++        monkeypatch.setattr(db, "_close_read_conn", lambda conn: closed.append(conn))
++        bad = _TransientBadPage(path, "sessions", monkeypatch)
++        bad.damage()
++        assert db._read_one("SELECT id FROM sessions WHERE id = ?", ("s1",))[0] == "s1"
++        assert closed == []
++        assert db._read_one("SELECT count(*) FROM messages")[0] == 1  # the pool still serves reads
++    finally:
++        db.close()
++
++
++def test_reader_cache_release_failure_fails_closed(tmp_path, monkeypatch):
++    db, path = _warm_reader_db(tmp_path)
++    try:
++        bad = _TransientBadPage(path, "sessions", monkeypatch)
++        real_ctx = db._read_ctx
++
++        @contextmanager
++        def ctx(*a, **k):
++            with real_ctx(*a, **k) as conn:
++                yield _NoShrink(conn)
++
++        monkeypatch.setattr(db, "_read_ctx", ctx)
++        bad.damage()
++        with pytest.raises(sqlite3.DatabaseError):
++            db._read_one("SELECT id, source FROM sessions WHERE id = ?", ("s1",))
++        assert storage_state(path) == "corrupt"
++        assert "no replay: reader cache not released" in _reason(path)
++    finally:
++        db.close()
++
++
++class _NoShrink:
++    """Reader proxy whose cache release fails."""
++
++    def __init__(self, real):
++        self._real = real
++
++    def execute(self, sql, *args, **kwargs):
++        if "shrink_memory" in sql:
++            raise sqlite3.OperationalError("injected: cannot release cache")
++        return self._real.execute(sql, *args, **kwargs)
++
++    def __getattr__(self, name):
++        return getattr(self._real, name)
+-- 
+2.55.0
+

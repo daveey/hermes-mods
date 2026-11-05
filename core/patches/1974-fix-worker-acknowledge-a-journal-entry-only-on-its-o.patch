@@ -1,0 +1,461 @@
+From e64c4d9826a92e56721979691f88db84df0d49e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 00:40:05 +0000
+Subject: [PATCH] fix(worker): acknowledge a journal entry only on its own
+ committed receipt; re-send a gap or fail lost_receipt
+
+Run 158945 (t_01a1a7e35b67b8e1) died with a sticky invalid_params "expected 273, got 274": the
+worker outbox had dropped sequence 273 on a success reply while the owner never committed it
+(last_sequence 272, no receipt row 273); same signature at 01:11Z on 11-04 (194 vs 192, 171 vs 168).
+
+Why-chain:
+1. Worker sent 274 while the owner expected 273: the outbox had removed 273 from pending
+   (pending.json next_sequence=275, pending=[274]).
+2. It removed 273 because retry_pending treats ANY success the rpc returns as that entry's receipt.
+3. The rpc accepted a frame as the reply by request id alone, and the reader never cleared
+   `awaiting` after a reply, so a duplicate/late frame with that id was queued and consumed as the
+   NEXT call's reply; nothing in the reply said which (execution, sequence) it acknowledged.
+4. The owner's reply carried no receipt identity, so the worker could not tell its committed write
+   from another frame.  The owner side commits before replying (BEGIN IMMEDIATE + commit under the
+   write lock in _execute_write; no shared-connection rollback can undo it, DB generation/inode
+   unchanged), so the loss is on the ack side.
+5. Root gap (design): the journal's "durable" step trusted transport correlation instead of a
+   receipt identity, and a divergence had no recovery path, so one bad ack killed the worker for
+   good.  Which owner path produced the stray frame in production is not identified; this closes
+   the class regardless.
+
+Fix (owner's sequence fence unchanged):
+- Owner stamps `_receipt` = {execution_id, sequence} on every worker.persist reply after the
+  receipt transaction returned (gateway/session_worker.py; never stored).
+- WorkerRPC returns a worker.persist result only if `_receipt` names that exact write; a reply
+  naming another write is re-sent (idempotent at the owner by execution, sequence, digest), up to
+  3 times, then `receipt_mismatch`.  A reply with no stamp (pre-upgrade owner) is accepted as before.
+- The reader takes only response frames (result/error, no method) and clears `awaiting` on the
+  first, so a duplicate can never answer the next call.
+- A sequence refusal carries `expected_sequence`; the journal keeps its last 4 acknowledged entries
+  (<=256 KiB) and re-sends the gap from them, else fails with a clear `lost_receipt`.
+
+Tests: tests/agent/test_worker_receipt_binding.py (all 5 fail on the old code; the first reproduces
+the exact sticky invalid_params).
+
+Card: t_01a1a8fa8be4217f
+---
+ agent/runtime_session_store.py                |  86 +++++++-
+ gateway/session_controls.py                   |   2 +-
+ gateway/session_worker.py                     |  14 +-
+ hermes_state_runtime.py                       |  10 +-
+ tests/agent/test_worker_receipt_binding.py    | 184 ++++++++++++++++++
+ .../test_runtime_worker_children.py           |   4 +-
+ 6 files changed, 291 insertions(+), 9 deletions(-)
+ create mode 100644 tests/agent/test_worker_receipt_binding.py
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index 3fccbcb9697..e94cf914009 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -45,7 +45,17 @@ def apply_row_annotations(messages, annotations):
+                 message[key] = value
+ 
+ class WorkerPersistenceError(RuntimeError):
+-    pass
++    data = {}  # the owner's structured ``error.data`` (field, detail, expected_sequence) when it refused
++
++
++#: Receipted entries the journal keeps after their receipt, so a gap the owner reports (``expected N``
++#: while the journal is past N) can be re-sent instead of killing the worker. Bounded twice: a few
++#: entries, and a byte budget, since the journal is rewritten and fsynced on every receipt.
++_ACKED_KEEP = 4
++_ACKED_MAX_BYTES = 256 * 1024
++#: Operations whose result moved the worker's own identity (target, child, terminal status). A gap
++#: holding one is not re-sent: replaying it under the current scope would not be the same write.
++_UNREPLAYABLE = frozenset({'compression.publish', 'child.reserve', 'execution.finish'})
+ 
+ 
+ def is_retired_generation_error(exc) -> bool:
+@@ -115,7 +125,13 @@ class _OwnerLink:
+                     frame = json.loads(self.ws.recv())
+                 except ValueError:
+                     continue
+-                if isinstance(frame, dict) and self.awaiting is not None and frame.get('id') == self.awaiting:
++                # Only a response (result/error, no method) answers the call, and only once: clearing
++                # ``awaiting`` before the put means a duplicate or late frame with the same id is
++                # dropped instead of queued as the NEXT call's reply (it would hand that call another
++                # write's result and the journal would advance past a write never committed).
++                if (isinstance(frame, dict) and self.awaiting is not None and frame.get('id') == self.awaiting
++                        and 'method' not in frame and ('result' in frame or 'error' in frame)):
++                    self.awaiting = None
+                     self.replies.put(frame)
+         except Exception as exc:  # health: allow BLE001 -- handed to the caller, which raises it (ConnectionClosed included)
+             self.replies.put(exc)
+@@ -199,6 +215,26 @@ class WorkerRPC:
+             self._drop()
+ 
+     def __call__(self, method, **params):
++        if method != 'worker.persist':
++            return self._call(method, **params)
++        # A success reply is acknowledged only when it is THIS write's receipt: the owner stamps
++        # ``_receipt`` = (execution, sequence) after the commit returned. Anything else (another
++        # write's reply, a stale frame) is not durable proof (t_01a1a8fa8be4217f: the journal dropped
++        # 273 on a reply while the owner stayed at 272), so the exact entry is re-sent; the owner
++        # resolves that idempotently by (execution, sequence, digest).
++        expected = {'execution_id': params.get('execution_id'), 'sequence': params.get('sequence')}
++        for _attempt in range(3):
++            result = self._call(method, **params)
++            receipt = result.get('_receipt') if isinstance(result, dict) else None
++            if receipt is None or receipt == expected:
++                # No receipt at all is an owner from before the stamp (a rolling upgrade): accepted as
++                # before. A receipt naming another write is never this write's proof.
++                return {key: value for key, value in result.items() if key != '_receipt'} if receipt else result
++            logger.warning('worker.persist reply is not the receipt of sequence %s operation=%s (got %r); re-sending',
++                           expected['sequence'], params.get('operation'), receipt)
++        raise WorkerPersistenceError('receipt_mismatch')
++
++    def _call(self, method, **params):
+         try:
+             asyncio.get_running_loop()
+         except RuntimeError:
+@@ -239,7 +275,9 @@ class WorkerRPC:
+                     logger.warning('worker owner refused %s operation=%s sequence=%s: %s field=%s detail=%s',
+                                    method, params.get('operation'), params.get('sequence'),
+                                    error.get('message'), data.get('field'), data.get('detail'))
+-                raise WorkerPersistenceError(error.get('message', 'persistence_failed'))
++                failure = WorkerPersistenceError(error.get('message', 'persistence_failed'))
++                failure.data = data  # the str stays the bare wire code; recovery reads the structure
++                raise failure
+             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
+                 global _worker_process
+                 _worker_process = True
+@@ -369,15 +407,55 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+             self.journal = candidate
+             return self.retry_pending()[0]
+ 
++    def _persist(self, entry):
++        return self.rpc('worker.persist', **self.scope, **entry)
++
++    def _resend_gap(self, error, entry):
++        """The owner refused ``entry`` because it still expects an earlier sequence: a receipt this
++        journal acknowledged never committed. Re-send the gap from the retained acknowledged entries,
++        or fail ``lost_receipt`` when they are gone (never re-number, never loosen the owner's fence)."""
++        data = getattr(error, 'data', None) or {}
++        expected = data.get('expected_sequence')
++        if str(error) != 'invalid_params' or data.get('field') != 'sequence' or type(expected) is not int:
++            return False
++        if expected >= entry['sequence']:
++            return False
++        held = {item['sequence']: item for item in self.journal.get('acked', [])}
++        gap = [held.get(number) for number in range(expected, entry['sequence'])]
++        if any(item is None or item['operation'] in _UNREPLAYABLE for item in gap):
++            logger.error('worker journal acknowledged sequences %s..%s the owner never committed; '
++                         'not held for re-send: lost_receipt', expected, entry['sequence'] - 1)
++            raise WorkerPersistenceError('lost_receipt') from error
++        logger.warning('worker owner expects sequence %s, journal at %s: re-sending the gap',
++                       expected, entry['sequence'])
++        for item in gap:
++            self._persist(item)
++        return True
++
++    def _acked(self, journal, entry):
++        acked = [*journal.get('acked', []), entry][-_ACKED_KEEP:]
++        while acked and len(json.dumps(acked)) > _ACKED_MAX_BYTES:
++            acked.pop(0)
++        return dict(journal, acked=acked)
++
+     def retry_pending(self):
+         with self.lock:
+             results = []
+             try:
+                 while self.journal['pending']:
+                     entry = self.journal['pending'][0]
+-                    result = self.rpc('worker.persist', **self.scope, **entry)
++                    try:
++                        result = self._persist(entry)
++                    except WorkerPersistenceError as exc:
++                        if not self._resend_gap(exc, entry):
++                            raise
++                        continue  # the gap is committed now; send this entry again
+                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
+                     candidate = self._compression_receipt_journal(candidate, result)
++                    if candidate['scope'] == self.scope:
++                        candidate = self._acked(candidate, entry)
++                    else:
++                        candidate = {key: value for key, value in candidate.items() if key != 'acked'}
+                     self._save(candidate)
+                     self.scope = candidate['scope']
+                     self.journal = candidate
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 779114a9a99..afbef8c6157 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -27,7 +27,7 @@ def _refusal_data(exc: RuntimeStoreError) -> dict:
+         value = getattr(exc, key, None)
+         if value:
+             data[key] = value
+-    for key in ('revision', 'execution_generation'):
++    for key in ('revision', 'execution_generation', 'expected_sequence'):
+         if isinstance(getattr(exc, key, None), int):
+             data[key] = getattr(exc, key)
+     if getattr(exc, 'admitted', None) is False:
+diff --git a/gateway/session_worker.py b/gateway/session_worker.py
+index b576321389c..9df47bddd8e 100644
+--- a/gateway/session_worker.py
++++ b/gateway/session_worker.py
+@@ -96,10 +96,22 @@ def _verify(connection, ref, params, claim):
+ 
+ async def worker_request(connection, ref, params, *, operation):
+     if operation == 'persist':
+-        return await timed_persist(params, lambda: _worker_request(connection, ref, params, operation=operation))
++        result = await timed_persist(params, lambda: _worker_request(connection, ref, params, operation=operation))
++        return stamp_worker_receipt(result, params)
+     return await _worker_request(connection, ref, params, operation=operation)
+ 
+ 
++def stamp_worker_receipt(result, params):
++    """Name the committed write a ``worker.persist`` reply answers. Only reached once the receipt
++    transaction returned (a refusal or failed commit raises instead), and never stored: the worker
++    drops a journal entry only on a reply naming exactly that (execution, sequence). Correlating by
++    the RPC id alone once let a reply that was not this write's receipt advance the journal past a
++    write the owner never committed (t_01a1a8fa8be4217f: owner at 272, journal acked 273)."""
++    if not isinstance(result, dict):
++        return result
++    return {**result, '_receipt': {'execution_id': params.get('execution_id'), 'sequence': params.get('sequence')}}
++
++
+ async def _worker_request(connection, ref, params, *, operation):
+     from gateway.session_authorities import require_serving
+     require_serving(connection.authority)  # adopt/persist would write with the released epoch
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index debfcfa9705..fe1a71eb5e3 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -50,6 +50,9 @@ class RuntimeStoreError(ValueError):
+     string); ``field`` and ``detail`` name the check that fired and why, so a client and the gateway
+     log can tell the reasons' many checks apart instead of reporting the bare code."""
+ 
++    #: The sequence the owner's fence expects, set only on a sequence refusal (sent as error data).
++    expected_sequence: int | None = None
++
+     def __init__(self, reason: str, *, field: str | None = None, detail: str | None = None):
+         self.reason = reason
+         self.field = _one_line(field, 80)
+@@ -1038,8 +1041,11 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
+             # Named, so the gateway logs it at warning and the worker can say which write it lost:
+             # a bare code is a debug line, and a skipped sequence once killed two workers with no
+             # owner-side trace (t_01a1a264e0987946 run 36008: journal at 194, owner at 192).
+-            raise RuntimeStoreError('invalid_params', field='sequence',
+-                                    detail=f"expected {row['last_sequence'] + 1}, got {sequence}")
++            refusal = RuntimeStoreError('invalid_params', field='sequence',
++                                        detail=f"expected {row['last_sequence'] + 1}, got {sequence}")
++            # Structured, so a worker whose journal ran ahead can re-send the gap it still holds.
++            refusal.expected_sequence = row['last_sequence'] + 1
++            raise refusal
+         # Each SQLite retry gets fresh rows; rolled-back annotations must not escape.
+         changes = conn.total_changes
+         result = handlers[operation](db, conn, session_id, json.loads(encoded))
+diff --git a/tests/agent/test_worker_receipt_binding.py b/tests/agent/test_worker_receipt_binding.py
+new file mode 100644
+index 00000000000..7bcdac2eb6d
+--- /dev/null
++++ b/tests/agent/test_worker_receipt_binding.py
+@@ -0,0 +1,184 @@
++"""A worker journal entry is acknowledged only by its own committed receipt (t_01a1a8fa8be4217f).
++
++Run 158945 died with a sticky ``invalid_params`` (``expected 273, got 274``): the worker journal had
++dropped sequence 273 on a success reply although the owner never committed it (``last_sequence``
++272, no receipt row 273). The worker correlated replies by RPC id alone, so any success frame with
++that id (another write's reply, a duplicate or late frame) advanced the journal past a write the owner
++never made, and the next write hit the owner's sequence fence forever.
++
++Now the owner stamps ``_receipt`` = (execution, sequence) after the commit, the worker re-sends an
++entry whose reply is not its receipt, and a divergence that happens anyway re-sends the gap from the
++retained acknowledged entries or fails ``lost_receipt``. The owner's sequence fence is unchanged.
++"""
++import json
++import queue
++from types import SimpleNamespace
++
++import pytest
++from websockets.exceptions import ConnectionClosed
++
++import hermes_state_runtime as rt
++from tests.hermes_state.test_runtime_worker import append, setup_worker
++
++SCOPE = {'session_id': 's', 'execution_id': 'w', 'epoch': 1, 'generation': 1}
++
++
++class _Owner:
++    """An owner over a scripted socket: commits in sequence order behind the real fence, stamps
++    receipts like ``apply_worker_receipt``, and can answer a write with a frame that is not its receipt."""
++
++    def __init__(self, misdeliver=()):
++        self.last_sequence = 0
++        self.committed = {}
++        self.misdeliver = set(misdeliver)
++        self.sent = []
++
++    def handle(self, params):
++        sequence = params['sequence']
++        self.sent.append(sequence)
++        if sequence in self.misdeliver:
++            self.misdeliver.discard(sequence)
++            # Another write's success, delivered under this request's id; nothing is committed.
++            return {'result': {'count': 1, 'annotations': [{}], '_receipt': {'execution_id': 'other-worker', 'sequence': sequence}}}
++        if sequence in self.committed:
++            return {'result': {**self.committed[sequence], '_receipt': {'execution_id': 'w', 'sequence': sequence}}}
++        if sequence != self.last_sequence + 1:
++            return {'error': {'code': 4001, 'message': 'invalid_params', 'data': {
++                'reason': 'invalid_params', 'field': 'sequence',
++                'detail': f'expected {self.last_sequence + 1}, got {sequence}',
++                'expected_sequence': self.last_sequence + 1}}}
++        self.last_sequence = sequence
++        self.committed[sequence] = {'count': 1, 'annotations': [{}]}
++        return {'result': {'count': 1, 'annotations': [{}], '_receipt': {'execution_id': 'w', 'sequence': sequence}}}
++
++
++def _wire(monkeypatch, owner, extra_frames=None):
++    endpoint = SimpleNamespace(api_origin='http://127.0.0.1:1234')
++    monkeypatch.setattr('hermes_cli.gateway_runtime.discover_gateway_endpoint',
++                        lambda *a, **k: SimpleNamespace(state='ready', endpoint=endpoint))
++    monkeypatch.setattr('hermes_cli.gateway_runtime.control_home_for', lambda home, endpoint: home)
++    monkeypatch.setattr('hermes_cli.gateway_runtime_discovery.query_identify', lambda *a, **k: {'pid': -1})
++    monkeypatch.setattr('hermes_cli.gateway_client._session_ticket', lambda *a, **k: 'ticket')
++
++    def connect(url, **kwargs):
++        frames = queue.SimpleQueue()
++
++        def recv():
++            frame = frames.get()
++            if frame is None:
++                raise ConnectionClosed(None, None)
++            return frame
++
++        def send(value):
++            request = json.loads(value)
++            reply = owner.handle(request['params'])
++            frames.put(json.dumps({'jsonrpc': '2.0', 'id': request['id'], **reply}))
++            for frame in (extra_frames or (lambda request: []))(request):
++                frames.put(json.dumps(frame))
++        return SimpleNamespace(send=send, recv=recv, close=lambda: frames.put(None))
++    monkeypatch.setattr('websockets.sync.client.connect', connect)
++
++
++def test_a_reply_that_is_not_the_writes_receipt_does_not_skip_the_sequence(tmp_path, monkeypatch):
++    from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
++    owner = _Owner(misdeliver={2})
++    _wire(monkeypatch, owner)
++    rpc = WorkerRPC(tmp_path / 'home')
++    store = RuntimeSessionStore(rpc, SCOPE, tmp_path / 'outbox')
++    try:
++        for content in ('one', 'two', 'three'):
++            store.append_messages_batch('s', [{'role': 'user', 'content': content}])
++        assert owner.last_sequence == 3 and sorted(owner.committed) == [1, 2, 3]
++        assert owner.sent == [1, 2, 2, 3]  # the misdelivered write was re-sent, never skipped
++        assert store.failure is None
++        assert json.loads(store.path.read_text())['pending'] == []
++    finally:
++        store.close()
++        rpc.close()
++
++
++def test_a_duplicate_reply_frame_is_not_the_next_calls_reply(tmp_path, monkeypatch):
++    from agent.runtime_session_store import WorkerRPC
++    owner = _Owner()
++    # The owner's reply to the first call arrives twice; the copy must not answer the second call.
++    _wire(monkeypatch, owner, extra_frames=lambda request: (
++        [{'jsonrpc': '2.0', 'id': request['id'], 'result': {'count': 9, 'annotations': [{}], '_receipt': {
++            'execution_id': 'w', 'sequence': request['params']['sequence']}}}]
++        if request['params']['sequence'] == 1 else []))
++    rpc = WorkerRPC(tmp_path)
++    try:
++        assert rpc('worker.persist', **SCOPE, sequence=1, operation='transcript.append', payload={}) == {'count': 1, 'annotations': [{}]}
++        assert rpc('worker.persist', **SCOPE, sequence=2, operation='transcript.append', payload={}) == {'count': 1, 'annotations': [{}]}
++        assert owner.last_sequence == 2
++    finally:
++        rpc.close()
++
++
++def _store_over(tmp_path, owner, *, forge=()):
++    """A store whose rpc acknowledges ``forge`` sequences with a matching receipt but no commit: a
++    divergence the receipt check cannot see, which recovery must still survive."""
++    from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
++    forged = set(forge)
++
++    def rpc(method, **params):
++        if params['sequence'] in forged:
++            forged.discard(params['sequence'])
++            owner.sent.append(params['sequence'])
++            return {'count': 1, 'annotations': [{}]}
++        reply = owner.handle(params)
++        if 'error' in reply:
++            failure = WorkerPersistenceError(reply['error']['message'])
++            failure.data = reply['error']['data']
++            raise failure
++        return {key: value for key, value in reply['result'].items() if key != '_receipt'}
++    return RuntimeSessionStore(rpc, SCOPE, tmp_path / 'outbox')
++
++
++def test_a_gap_the_journal_still_holds_is_re_sent_instead_of_dying(tmp_path):
++    owner = _Owner()
++    store = _store_over(tmp_path, owner, forge={3})
++    try:
++        for index in range(5):
++            store.append_messages_batch('s', [{'role': 'user', 'content': f'm{index}'}])
++        assert owner.last_sequence == 5 and sorted(owner.committed) == [1, 2, 3, 4, 5]
++        assert owner.sent == [1, 2, 3, 4, 3, 4, 5]
++        assert store.failure is None
++    finally:
++        store.close()
++
++
++def test_a_gap_the_journal_no_longer_holds_fails_lost_receipt(tmp_path, monkeypatch):
++    import agent.runtime_session_store as store_module
++    from agent.runtime_session_store import WorkerPersistenceError
++    monkeypatch.setattr(store_module, '_ACKED_KEEP', 1)
++    owner = _Owner()
++    store = _store_over(tmp_path, owner, forge={2, 3})
++    try:
++        for index in range(3):
++            store.append_messages_batch('s', [{'role': 'user', 'content': f'm{index}'}])
++        with pytest.raises(WorkerPersistenceError, match='lost_receipt'):
++            store.append_messages_batch('s', [{'role': 'user', 'content': 'm3'}])
++        assert store.failure == 'lost_receipt'
++        assert owner.last_sequence == 1  # nothing re-numbered or forced past the fence
++        assert [entry['sequence'] for entry in json.loads(store.path.read_text())['pending']] == [4]
++    finally:
++        with pytest.raises(WorkerPersistenceError):
++            store.close()
++
++
++def test_owner_stamps_the_committed_receipt_and_names_the_expected_sequence(tmp_path):
++    from gateway.session_controls import _refusal_data
++    from gateway.session_worker import stamp_worker_receipt
++    db, epoch, assignment = setup_worker(tmp_path)
++    try:
++        first = append(db, epoch=epoch, **assignment, sequence=1, content='first')
++        params = {**assignment, 'sequence': 1}
++        assert stamp_worker_receipt(first, params)['_receipt'] == {
++            'execution_id': assignment['execution_id'], 'sequence': 1}
++        stored = db._conn.execute("SELECT result_json FROM worker_receipts WHERE sequence=1").fetchone()[0]
++        assert '_receipt' not in json.loads(stored)
++        with pytest.raises(rt.RuntimeStoreError) as caught:
++            append(db, epoch=epoch, **assignment, sequence=3, content='skipped')
++        assert _refusal_data(caught.value)['expected_sequence'] == 2
++    finally:
++        db.close()
+diff --git a/tests/hermes_state/test_runtime_worker_children.py b/tests/hermes_state/test_runtime_worker_children.py
+index 5dfcbeca031..b8126340a34 100644
+--- a/tests/hermes_state/test_runtime_worker_children.py
++++ b/tests/hermes_state/test_runtime_worker_children.py
+@@ -149,7 +149,9 @@ async def test_child_reserve_verifies_the_parent_claim_and_refuses_while_drainin
+         with pytest.raises(rt.RuntimeStoreError, match='permission_denied'):
+             await reserve(1, secret='f' * 32)
+         draining.append(True)
+-        assert await reserve(1) == {'refused': 'runtime_draining'}
++        # The wire reply names the committed receipt it answers (t_01a1a8fa8be4217f).
++        assert await reserve(1) == {'refused': 'runtime_draining',
++                                    '_receipt': {'execution_id': 'compute', 'sequence': 1}}
+         draining.clear()
+         assert 'child' in await reserve(2)
+         with db._read_ctx() as conn:
+-- 
+2.55.0
+

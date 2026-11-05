@@ -1,0 +1,128 @@
+From 22f981f96f5ad7cd1320f1313142f70481926d51 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 10:48:53 +0000
+Subject: [PATCH] [daveey] fix(safety): casefold write denials and approval
+ paths
+
+---
+ agent/file_safety.py                       | 15 +++---
+ tests/agent/test_file_safety_write_case.py | 57 ++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 6 deletions(-)
+ create mode 100644 tests/agent/test_file_safety_write_case.py
+
+diff --git a/agent/file_safety.py b/agent/file_safety.py
+index 06497d2b16b..7fc8511c953 100644
+--- a/agent/file_safety.py
++++ b/agent/file_safety.py
+@@ -59,7 +59,7 @@ def _folded_parts(path: Path) -> tuple[str, ...]:
+ 
+ 
+ def _is_under_folded(resolved: Path, base: Path) -> bool:
+-    """Case-insensitive :func:`_is_under` for the read deny-list: on a case-insensitive FS
++    """Case-insensitive :func:`_is_under` for deny-lists: on a case-insensitive FS
+     (macOS APFS/HFS+, Windows) ``resolve()`` keeps the caller's spelling, so ``AUTH.JSON`` or
+     ``.HUB/`` opens the denied file while an exact-case compare lets it through. Over-blocking a
+     differently cased lookalike on a case-sensitive FS is the accepted cost of failing closed."""
+@@ -306,12 +306,14 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
+     """Credential / protected-subpath / safe-root verdict for an already-resolved path."""
+     # Approval-gated paths are allowed at this layer so interactive tools can
+     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
+-    if any(resolved in build_write_approval_paths(home) for home in homes):
++    target = Path(resolved)
++    folded = _folded_parts(target)
++    if any(folded == _folded_parts(Path(p)) for home in homes for p in build_write_approval_paths(home)):
+         return None
+ 
+     if any(
+-        resolved in build_write_denied_paths(home)
+-        or any(resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home))
++        any(folded == _folded_parts(Path(p)) for p in build_write_denied_paths(home))
++        or any(_is_under_folded(target, Path(prefix)) for prefix in build_write_denied_prefixes(home))
+         for home in homes
+     ):
+         return "credential"
+@@ -319,7 +321,7 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
+     for base in _hermes_dirs():
+         for sub in _HERMES_PROTECTED_SUBPATHS:
+             with suppress(Exception):
+-                if _is_under(resolved, os.path.realpath(os.path.join(str(base), sub))):
++                if _is_under_folded(target, Path(os.path.realpath(base / sub))):
+                     return "credential"
+ 
+     safe_roots = get_safe_write_roots()
+@@ -353,7 +355,8 @@ def is_write_approval_required(path: str) -> bool:
+     """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
+     prompt, callers without a channel treat it as a block (fail closed)."""
+     homes, resolved = _homes_and_resolved(path)
+-    return any(resolved in build_write_approval_paths(home) for home in homes)
++    folded = _folded_parts(Path(resolved))
++    return any(folded == _folded_parts(Path(p)) for home in homes for p in build_write_approval_paths(home))
+ 
+ 
+ # Secret-bearing project-local env file basenames, blocked anywhere on disk.
+diff --git a/tests/agent/test_file_safety_write_case.py b/tests/agent/test_file_safety_write_case.py
+new file mode 100644
+index 00000000000..6e97aa5b254
+--- /dev/null
++++ b/tests/agent/test_file_safety_write_case.py
+@@ -0,0 +1,57 @@
++"""Write-denial case parity, independent of the host filesystem's casing."""
++
++import pytest
++
++from agent import file_safety as safety
++
++
++@pytest.fixture
++def homes(tmp_path, monkeypatch):
++    home = tmp_path / "user"
++    root = home / ".hermes"
++    profile = root / "profiles" / "work"
++    monkeypatch.setattr(safety, "_guard_homes", lambda path="": {str(home)})
++    monkeypatch.setattr(safety, "_hermes_home_path", lambda: profile)
++    monkeypatch.setattr(safety, "_hermes_root_path", lambda: root)
++    monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
++    return home, root, profile
++
++
++@pytest.mark.parametrize("relative", [
++    ".ENV", "MCP-TOKENS/x", "SESSIONS/history.json", "STATE.DB",
++    "VAULT/x", "AUTH/GOOGLE_OAUTH.JSON",
++])
++@pytest.mark.parametrize("index", [1, 2])
++@pytest.mark.parametrize("entry", [False, True])
++def test_hermes_case_denials(homes, relative, index, entry):
++    assert safety.get_write_denied_error(str(homes[index] / relative), entry=entry)
++
++
++@pytest.mark.parametrize("relative", [
++    ".SSH/AUTHORIZED_KEYS", ".AWS/credentials", ".CONFIG/GH/hosts.yml", ".NETRC",
++])
++def test_home_case_denials(homes, relative):
++    assert safety.get_write_denied_error(str(homes[0] / relative))
++
++
++@pytest.mark.parametrize("relative", [".SSH/CONFIG", ".Ssh/Config", ".ssh/config"])
++def test_case_approval_still_prompts(homes, relative):
++    path = str(homes[0] / relative)
++    assert safety.get_write_denied_error(path) is None
++    assert safety.is_write_approval_required(path)
++
++
++@pytest.mark.parametrize("relative", [
++    "AUTH.JSON", "auth.json", "MCP-TOKENS-extra/x", "SESSIONS-extra/x", ".ENV.example",
++])
++def test_explicitly_allowed_control_files_and_siblings(homes, relative):
++    # Upstream #45947 intentionally removed auth.json from the write deny-list.
++    path = str(homes[1] / relative)
++    assert safety.get_write_denied_error(path) is None
++    assert not safety.is_write_approval_required(path)
++
++
++def test_prefix_sibling_and_approval_sibling_not_confused(homes):
++    assert safety.get_write_denied_error(str(homes[0] / ".SSH-extra/key")) is None
++    assert safety.get_write_denied_error(str(homes[0] / ".SSH/CONFIG-extra"))
++    assert not safety.is_write_approval_required(str(homes[0] / ".SSH/CONFIG-extra"))
+-- 
+2.55.0
+

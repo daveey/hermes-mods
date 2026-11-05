@@ -1,0 +1,198 @@
+From 26a4eeb82d0c6e9027c6a08ab66222aa0e732cd9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 10:36:58 -0800
+Subject: [PATCH] fix(cli): exclude own in-flight submission from queue dock
+ [daveey]
+
+---
+ hermes_cli/gateway_agent.py                   |  18 ++-
+ hermes_cli/gateway_queue.py                   |   8 +-
+ .../test_cli_queue_dock_own_submit.py         | 104 ++++++++++++++++++
+ 3 files changed, 127 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_cli_queue_dock_own_submit.py
+
+diff --git a/hermes_cli/gateway_agent.py b/hermes_cli/gateway_agent.py
+index 59155892292..5aa94268ffe 100644
+--- a/hermes_cli/gateway_agent.py
++++ b/hermes_cli/gateway_agent.py
+@@ -66,7 +66,7 @@ class _Turn:
+     settlement after a replay gap."""
+ 
+     def __init__(self, session_id):
+-        self.session_id, self.admission = session_id, None
++        self.session_id, self.admission, self.submission = session_id, None, None
+         # Parts, joined on read: ``+=`` on an attribute copies the whole segment per delta (quadratic).
+         self._shown, self._spoken = [], []
+         self.seen, self.answered, self.gapped = set(), set(), False
+@@ -175,6 +175,12 @@ class GatewayAgent:
+         self._generation = None
+         self._admission = None
+         self._turn = None  # a turn a later one replaced stops taking frames
++        # ``(session_id, submission_id)`` of each typed turn from its ``prompt.submit`` until its
++        # ``run_conversation`` returns: the owner publishes its pending list (listing the admission as
++        # ``queued`` by ``input_id``) before the receipt and the claim, and that row is this turn, not a
++        # queued prompt (``gateway_queue.published_queue``). A set: a later turn may submit while an
++        # earlier one's submit still blocks (``_take_turn_route``).
++        self._own_submissions = set()
+         self._epoch = None  # the connection epoch this turn was submitted on
+         self._interrupt_sent_at = None
+         self._rate_limit_state = None
+@@ -750,6 +756,14 @@ class GatewayAgent:
+     def run_conversation(self, user_message, conversation_history=None, stream_callback=None,
+                          task_id=None, persist_user_message=None, turn_author=None, **_kw):
+         turn = self._turn = _Turn(self.session_id)  # first: a turn main gave up on stops consuming
++        try:
++            return self._run_turn(turn, user_message, conversation_history, stream_callback,
++                                  persist_user_message, turn_author)
++        finally:
++            self._own_submissions.discard(turn.submission)
++
++    def _run_turn(self, turn, user_message, conversation_history, stream_callback, persist_user_message,
++                  turn_author):
+         history = list(conversation_history or [])
+         self._turn_ask_index = len(history)  # the staged ask's row in this turn's transcript
+         self._turn_api_calls = None
+@@ -775,6 +789,8 @@ class GatewayAgent:
+                 if notice:
+                     return self._unadmitted(history, user_message, notice)
+                 params = self._submit_params(user_message, persist_user_message, turn_author)
++                turn.submission = (turn.session_id, params["submission_id"])
++                self._own_submissions.add(turn.submission)
+                 if self._stop(turn)():
+                     raise CallStopped("prompt.submit")
+                 receipt = self.connection.call("prompt.submit", **{**params, "session_id": turn.session_id})
+diff --git a/hermes_cli/gateway_queue.py b/hermes_cli/gateway_queue.py
+index fbc26dffc57..59ba7dec0b1 100644
+--- a/hermes_cli/gateway_queue.py
++++ b/hermes_cli/gateway_queue.py
+@@ -101,11 +101,15 @@ def published_queue(cli, store) -> list[str]:
+ 
+     The owner's published list is authoritative: an admission it no longer lists (cancelled, replaced or
+     steered by another client, or started) is not shown as queued, even while ``queued_inputs`` still
+-    owes its turn a paint."""
++    owes its turn a paint. The typed turn this viewer is submitting or running (``GatewayAgent``'s
++    ``_own_submissions``, matched by the row's ``input_id``: its ``submission_id``) is not a queued
++    prompt, though the owner lists it ``queued`` from its admission until its claim."""
+     state = _state(cli, store)
+     for gone in [admission for admission in state.queued_at if admission not in state.queued_inputs]:
+         state.queued_at.pop(gone, None)
+-    rows = [row for row in state.pending or () if isinstance(row, dict)]
++    agent = getattr(cli, "agent", None)
++    own = {sub for sid, sub in set(getattr(agent, "_own_submissions", ())) if sid == cli.session_id}
++    rows = [row for row in state.pending or () if isinstance(row, dict) and row.get("input_id") not in own]
+     known = {row.get("admission_id") for row in rows}
+     fresh = [text for admission, text in state.queued_inputs.items()
+              if admission not in known and state.queued_at.get(admission, -1) >= state.pending_seq]
+diff --git a/tests/hermes_cli/test_cli_queue_dock_own_submit.py b/tests/hermes_cli/test_cli_queue_dock_own_submit.py
+new file mode 100644
+index 00000000000..35d0c1f65b3
+--- /dev/null
++++ b/tests/hermes_cli/test_cli_queue_dock_own_submit.py
+@@ -0,0 +1,104 @@
++"""The classic CLI's Queue dock never lists the typed turn it is submitting or running.
++
++The owner commits a plain (non-``/queue``) ``prompt.submit`` and publishes its pending list, which
++lists that admission ``queued`` by ``input_id`` (= the request's ``submission_id``), before the receipt
++returns and before the drain's claim publishes a list without it. The dock painted the user's own prompt
++as queued in that window, and the Linux PTY e2e caught the prompt twice on screen. Real
++``GatewayConnection`` / ``GatewaySessionStore`` / ``GatewayAgent`` / ``queued_prompts``; the owner is
++the shared ``FakeClient`` with its publishes scripted onto the event stream.
++"""
++from hermes_cli.cli_session_dock import queued_prompts
++from hermes_cli.gateway_agent import GatewayAgent
++from hermes_cli.gateway_client import GatewayRPCError
++from tests.hermes_cli.test_gateway_agent import SID, FakeClient, frame
++from tests.hermes_cli.test_gateway_tools_notify import _idle_cli
++from tests.waiting import async_wait_until
++
++OWN, OTHER = "typed while idle omega-q9", "another viewer's queued prompt"
++
++
++def _row(admission, input_id, text, sequence):
++    return {"admission_id": admission, "input_id": input_id, "status": "queued", "sequence": sequence,
++            "text": text}
++
++
++def _info(*rows):
++    return frame("session.info", {"pending": list(rows)}, admission="")
++
++
++class _Owner(FakeClient):
++    """At ``prompt.submit`` publishes the admission's pending list (own row ``queued``, plus another
++    viewer's queued row) before answering, as ``SessionAuthority._admitted`` does; records what the dock
++    painted then. ``refuse`` answers the submit with that refusal instead (nothing admitted)."""
++
++    def __init__(self, script, cli, refuse=None, **kw):
++        super().__init__(script, **kw)
++        self.cli, self.refuse, self.dock_at_submit = cli, refuse, None
++
++    async def rpc(self, method, *, _timeout=None, **params):
++        if method != "prompt.submit":
++            return await super().rpc(method, _timeout=_timeout, **params)
++        self.calls.append((method, params))
++        if self.refuse:
++            raise GatewayRPCError(self.refuse)
++        await self.events.put(_info(_row("adm-o", "other-viewer", OTHER, 1),
++                                    _row("adm-1", params["submission_id"], OWN, 2)))
++        state = self.cli._session_db.connection.state(SID)
++        await async_wait_until(lambda: len(state.pending) == 2, timeout=5)
++        self.dock_at_submit = queued_prompts(self.cli)
++        self.calls.pop()
++        return await super().rpc(method, _timeout=_timeout, **params)
++
++
++def _agent_cli(owner_script, refuse=None):
++    from hermes_cli.gateway_connection import GatewayConnection
++    from tests.hermes_cli.test_gateway_agent import connect_with
++    owner = _Owner(owner_script, object(), refuse=refuse, result={"final_response": "OMEGA settled reply",
++                                                               "completed": True})
++    conn = GatewayConnection(connect=connect_with(owner))
++    conn.start(5)
++    conn.state(SID)
++    cli = _idle_cli(conn)
++    owner.cli = cli
++    cli.agent = GatewayAgent(connection=conn, session_id=SID)
++    return conn, owner, cli, cli.agent
++
++
++def _republish_own(conn, owner, submission):
++    """A later list naming that request id ``queued`` again: shown only once no turn of this agent
++    still owns it (the identity does not outlive its ``run_conversation``)."""
++    import asyncio
++    from tests.waiting import wait_until
++    state = conn.state(SID)
++    seq = state.pending_seq
++    asyncio.run_coroutine_threadsafe(owner.events.put(_info(_row("adm-1", submission, OWN, 2))),
++                                     conn.loop).result(5)
++    wait_until(lambda: state.pending_seq > seq, timeout=5)
++    return queued_prompts(owner.cli)
++
++
++def test_own_typed_submit_is_never_painted_queued_and_other_queues_stay():
++    script = [_info(_row("adm-o", "other-viewer", OTHER, 1)),  # the claim's publish: own row gone
++              frame("message.start", {}), frame("message.delta", {"text": "OMEGA settled reply"}),
++              frame("message.complete", {"text": "OMEGA settled reply", "status": "complete"})]
++    conn, owner, cli, agent = _agent_cli(script)
++    try:
++        result = agent.run_conversation(OWN, conversation_history=[])
++        assert result["final_response"] == "OMEGA settled reply"
++        assert owner.dock_at_submit == [OTHER], "own submitting turn painted as a queued prompt"
++        assert queued_prompts(cli) == [OTHER]
++        submission = next(p["submission_id"] for m, p in owner.calls if m == "prompt.submit")
++        assert _republish_own(conn, owner, submission) == [OWN]  # cleared after a settled turn
++    finally:
++        conn.close()
++
++
++def test_a_refused_submit_leaves_no_own_identity_behind():
++    conn, owner, _cli, agent = _agent_cli([], refuse="session_busy")
++    try:
++        result = agent.run_conversation(OWN, conversation_history=[])
++        assert result["failure_reason"] == "session_busy"
++        submission = next(p["submission_id"] for m, p in owner.calls if m == "prompt.submit")
++        assert _republish_own(conn, owner, submission) == [OWN]
++    finally:
++        conn.close()
+-- 
+2.55.0
+

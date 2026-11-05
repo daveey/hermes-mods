@@ -1,0 +1,251 @@
+From 0b55913ea54c5d1247d1a97b092378c5cfc0cd4b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 18:05:23 +0000
+Subject: [PATCH] [daveey] kanban: record allowlisted stage + transport subtype
+ on Board errors; budget exhaustion is BoardBudgetExhausted
+
+Soak OSError events could not tell feed (pull) from reserve/repin failures, nor
+a local deadline exhaustion from a real timeout/disconnect/reset/refusal.
+record_error gains optional stage (pull|reserve|repin) and, for OSError, a
+transport kind computed from exception classes only (URLError.reason unwrapped
+only when it is an exception). Raw messages/urls/attributes are never stored.
+error_class is unchanged; stage/transport are excluded from the dedupe
+signature so event suppression is unchanged.
+---
+ hermes_cli/kanban_queue_reason.py             |  31 +++++-
+ hermes_cli/kanban_sync_client.py              |   6 +-
+ hermes_cli/kanban_worker_placement.py         |   5 +-
+ .../test_kanban_queue_error_provenance.py     | 102 ++++++++++++++++++
+ 4 files changed, 138 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_queue_error_provenance.py
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index e4e8d042068..17ed1835713 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -123,7 +123,9 @@ def _same_lifecycle(conn, task_id, row, value):
+ 
+ 
+ def _signature(value):
+-    signature = {k: v for k, v in value.items() if k not in ("observed_at_ms", "recorded_at_ms", "current")}
++    # stage/transport are provenance only: they never make an otherwise-identical observation a new event.
++    signature = {k: v for k, v in value.items()
++                 if k not in ("observed_at_ms", "recorded_at_ms", "current", "stage", "transport")}
+     if value.get("state") == "assigned" and value.get("machine") and "lifecycle" in value:
+         # Reading back the assignment promised by this reply is not a transition.
+         signature["lifecycle"] = {**value["lifecycle"], "runs_on": value["machine"]}
+@@ -243,6 +245,25 @@ def try_record(writer, *args, **kwargs):
+         return False
+ 
+ 
++STAGES = frozenset({"pull", "reserve", "repin"})
++
++
++def transport_kind(error):
++    """Allowlisted transport subtype from the exception CLASS only; never its message, url or attributes."""
++    import http.client
++    import urllib.error
++    from hermes_cli.kanban_sync_client import BoardBudgetExhausted
++
++    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
++        error = error.reason  # unwrap only an exception reason; a str reason stays "other"
++    for cls, kind in ((BoardBudgetExhausted, "budget_exhausted"), (TimeoutError, "timeout"),
++                      (http.client.RemoteDisconnected, "disconnected"), (ConnectionResetError, "reset"),
++                      (ConnectionRefusedError, "refused")):
++        if isinstance(error, cls):
++            return kind
++    return "other"
++
++
+ def record_pull_error(conn, gateway, *, status=None, error=None):
+     """A failed feed read affects all origin-owned ready policy observations.
+ 
+@@ -253,10 +274,10 @@ def record_pull_error(conn, gateway, *, status=None, error=None):
+         "SELECT id FROM tasks WHERE placement_policy='worker-first-v1' AND status='ready' "
+         "AND created_on=? AND claim_lock IS NULL AND lease_holder IS NULL", (gateway,)).fetchall()
+     for row in rows:
+-        try_record(record_error, conn, row["id"], gateway, status=status, error=error)
++        try_record(record_error, conn, row["id"], gateway, status=status, error=error, stage="pull")
+ 
+ 
+-def record_error(conn, task_id, gateway, *, status=None, error=None, fence=None):
++def record_error(conn, task_id, gateway, *, status=None, error=None, fence=None, stage=None):
+     value = {"version": 1, "code": "board_error", "candidates": []}
+     from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
+     if isinstance(error, Resync):
+@@ -268,6 +289,10 @@ def record_error(conn, task_id, gateway, *, status=None, error=None, fence=None)
+         value["error_class"] = ("HubError" if isinstance(error, HubError) else
+                                 "SyncUnavailable" if isinstance(error, SyncUnavailable) else
+                                 "OSError" if isinstance(error, OSError) else "unknown")
++        if isinstance(error, OSError):
++            value["transport"] = transport_kind(error)
++    if stage in STAGES:
++        value["stage"] = stage
+     if isinstance(error, HubError):
+         status = error.status
+         try:
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f0653c4c02d..290d4ada3ff 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -67,6 +67,10 @@ class HubError(RuntimeError):
+         self.status, self.detail = status, detail
+ 
+ 
++class BoardBudgetExhausted(TimeoutError):
++    """The shared Board deadline ran out before this attempt; an earlier attempt may have been sent."""
++
++
+ class Resync(Exception):
+     """The cursor is below the service's retention floor: rebuild from a snapshot."""
+ 
+@@ -258,7 +262,7 @@ class Hub:
+         if self.deadline is not None:
+             timeout = min(timeout, self.deadline - time.monotonic())
+             if timeout <= 0:
+-                raise TimeoutError("Board request budget exhausted")
++                raise BoardBudgetExhausted("Board request budget exhausted")
+         return timeout
+ 
+     def _call(self, method: str, path: str, body: Optional[dict] = None, *, replay_safe: bool = False) -> dict:
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 30767cb6937..e8718b3095e 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -143,6 +143,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                 for stale in [k for k, (_, until) in _refused.items() if until <= now]:
+                     del _refused[stale]
+             labels = requested_move(conn, row["id"])
++            stage = "reserve" if labels is None else "repin"  # provenance for a failure below
+             try:
+                 if labels is not None:
+                     # A run moved this card (kanban_move). Its runs_on is Board-owned, so only the origin's
+@@ -160,7 +161,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                 attempted += 1
+             except OSError as exc:
+                 # An unavailable transport applies to the entire batch, not just this card.
+-                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc)
++                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc, stage=stage)
+                 return attempted
+             except client.HubError as exc:
+                 fence = None
+@@ -170,7 +171,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                     fence, machine = before[row["id"]]
+                     if picked_up(conn, hub, board, gateway, row["id"], machine, pulled):
+                         continue  # the worker we reserved already claimed it: a pickup, not a refusal
+-                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc, fence=fence)
++                queue.try_record(queue.record_error, conn, row["id"], gateway, error=exc, fence=fence, stage=stage)
+                 # Refused revisions still advance the local cursor, but never the feed.
+                 continue
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_queue_error_provenance.py b/tests/hermes_cli/test_kanban_queue_error_provenance.py
+new file mode 100644
+index 00000000000..e1900e1f89e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_error_provenance.py
+@@ -0,0 +1,102 @@
++"""Board-error provenance: stage + allowlisted transport subtype, never raw messages/urls/attributes."""
++import http.client
++import json
++import urllib.error
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++CFG = {"worker_pools": {"hub": ["worker-1"]}}
++SECRET = "https://user:hunter2-SECRET@hub.invalid/api?token=SECRET"
++
++
++def _event_blobs(conn, tid):
++    return [r[0] for r in conn.execute("SELECT payload FROM task_events WHERE task_id=?", (tid,)).fetchall()]
++
++
++def test_hub_deadline_raises_board_budget_exhausted(monkeypatch):
++    monkeypatch.setattr(client, "time", SimpleNamespace(monotonic=lambda: 100.0))
++    hub = client.Hub(client.Identity("http://example.invalid", "synthetic", "hub"), deadline=99.0)
++    with pytest.raises(client.BoardBudgetExhausted) as info:
++        hub._remaining()
++    assert isinstance(info.value, TimeoutError)  # existing `except OSError`/TimeoutError callers unchanged
++    assert qr.transport_kind(info.value) == "budget_exhausted"
++    assert qr.transport_kind(urllib.error.URLError(info.value)) == "budget_exhausted"
++
++
++def test_provenance_does_not_change_deduplication(conn):
++    tid = fixtures.acknowledged(conn)
++    assert qr.record_error(conn, tid, "hub", error=TimeoutError(SECRET), stage="pull")
++    before = _event_blobs(conn, tid)
++    assert not qr.record_error(conn, tid, "hub", error=ConnectionResetError(SECRET), stage="reserve")
++    assert _event_blobs(conn, tid) == before
++
++
++@pytest.mark.parametrize("error, kind", [
++    (TimeoutError("timed out " + SECRET), "timeout"),
++    (urllib.error.URLError(TimeoutError(SECRET)), "timeout"),
++
++    (http.client.RemoteDisconnected(SECRET), "disconnected"),
++    (ConnectionResetError(104, SECRET), "reset"),
++    (ConnectionRefusedError(111, SECRET), "refused"),
++    (OSError(SECRET), "other"),
++    (urllib.error.URLError(SECRET), "other"),  # reason is a str, not an exception: never unwrapped
++])
++def test_transport_kind_is_allowlisted(error, kind):
++    assert qr.transport_kind(error) == kind
++
++
++@pytest.mark.parametrize("stage", ["pull", "reserve", "repin"])
++def test_record_error_persists_stage_and_transport_without_secrets(conn, stage):
++    tid = fixtures.acknowledged(conn)
++    assert qr.record_error(conn, tid, "hub", error=urllib.error.URLError(ConnectionResetError(SECRET)), stage=stage)
++    value = qr.latest(conn, tid)
++    assert value["error_class"] == "OSError"  # unchanged field
++    assert value["stage"] == stage and value["transport"] == "reset"
++    assert all("SECRET" not in blob and "hunter2" not in blob for blob in _event_blobs(conn, tid))
++
++
++def test_unknown_exception_and_stage_are_not_serialized(conn):
++    class Weird(Exception):
++        url = SECRET
++    tid = fixtures.acknowledged(conn)
++    assert qr.record_error(conn, tid, "hub", error=Weird(SECRET), stage="not-a-stage")
++    value = qr.latest(conn, tid)
++    assert value["error_class"] == "unknown" and "stage" not in value and "transport" not in value
++    assert all("SECRET" not in blob for blob in _event_blobs(conn, tid))
++
++
++def test_legacy_call_without_stage_is_unchanged(conn):
++    tid = fixtures.acknowledged(conn)
++    assert qr.record_error(conn, tid, "hub", status=500)
++    value = qr.latest(conn, tid)
++    assert "stage" not in value and "transport" not in value and value["http_status"] == 500
++
++
++def test_record_pull_error_propagates_pull_stage(conn):
++    tid = fixtures.acknowledged(conn)
++    qr.record_pull_error(conn, "hub", error=http.client.RemoteDisconnected(SECRET))
++    value = qr.latest(conn, tid)
++    assert value["stage"] == "pull" and value["transport"] == "disconnected"
++
++
++@pytest.mark.parametrize("action", ["reserve", "repin"])
++def test_reevaluate_passes_stage(conn, monkeypatch, action):
++    tid = fixtures.acknowledged(conn)
++    hub = fixtures.RecordingHub()
++    def fail(board, **body):
++        raise ConnectionRefusedError(111, SECRET)
++    setattr(hub, action, fail)
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    if action == "repin":
++        monkeypatch.setattr(wp, "requested_move", lambda conn, task_id: ["worker-1"])
++    assert wp.reevaluate(conn, hub, "default", "hub", cfg=CFG) == 0
++    value = qr.latest(conn, tid)
++    assert value["stage"] == action and value["transport"] == "refused"
++    assert all("SECRET" not in json.dumps(blob) for blob in _event_blobs(conn, tid))
+-- 
+2.55.0
+

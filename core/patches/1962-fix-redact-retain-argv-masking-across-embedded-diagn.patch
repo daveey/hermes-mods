@@ -1,0 +1,82 @@
+From 799dd2f93037c740f781e9855457ee374fcf0a6d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:08:46 +0000
+Subject: [PATCH] fix(redact): retain argv masking across embedded diagnostic
+ tails [daveey]
+
+Shell scripts can contain quote-mismatched subprocess tail phrases. Track a recognized Command across bounded disjoint tail windows and accept either head quote. Synthetic exact-shape regressions fail before the fix; both redaction suites pass after it, including hostile-input timing limits.
+---
+ agent/redact.py                           | 15 +++++++++++---
+ tests/agent/test_redact_outbox_secrets.py | 25 +++++++++++++++++++++++
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/agent/redact.py b/agent/redact.py
+index 082c1e36491..b8f4cf60e38 100644
+--- a/agent/redact.py
++++ b/agent/redact.py
+@@ -863,14 +863,23 @@ def _redact_subprocess_argv(text: str) -> str:
+     lazy regex from every ``Command '`` rescanned the line per head (quadratic on hostile output).
+     ``scanned`` keeps the backward windows disjoint, so the whole pass is linear."""
+     out, pos, scanned = [], 0, 0
++    in_command = False
+     for m in _SUBPROCESS_COMMAND_TAIL_RE.finditer(text):
+         end = m.start()
+         lo = max(scanned, end - _SUBPROCESS_COMMAND_SPAN)
+         scanned = m.end()
+-        head = text.rfind(f"Command {m.group(1)}", lo, end)
+-        if head < 0:
++        # A shell script can contain a tail with a different quote from the
++        # diagnostic's head. Treat either quote as a conservative boundary.
++        head = max(text.rfind("Command '", lo, end), text.rfind('Command "', lo, end))
++        if head >= 0:
++            body = head + len("Command ") + 1
++            in_command = True
++        elif in_command:
++            # The earlier tail may itself be script text. Continue masking in
++            # this disjoint, bounded window rather than losing the real tail.
++            body = lo
++        else:
+             continue
+-        body = head + len("Command ") + 1
+         out += [text[pos:body], _ARGV_RANDOM_TOKEN_RE.sub("***", text[body:end])]
+         pos = end
+     if not out:
+diff --git a/tests/agent/test_redact_outbox_secrets.py b/tests/agent/test_redact_outbox_secrets.py
+index 8412653ebba..fdbed517b63 100644
+--- a/tests/agent/test_redact_outbox_secrets.py
++++ b/tests/agent/test_redact_outbox_secrets.py
+@@ -105,6 +105,31 @@ class TestSubprocessArgvDiagnostics:
+         out = redact_sensitive_text(_timeout_text(f"grep -rlF {SECRET} ."), code_file=True)
+         assert SECRET not in out
+ 
++    @pytest.mark.parametrize("error", [subprocess.TimeoutExpired, subprocess.CalledProcessError])
++    @pytest.mark.parametrize("tails", [1, 3])
++    def test_shell_string_with_embedded_tail_is_masked(self, error, tails):
++        script = 'echo "worker" died with code; ' * tails + f"curl -H {SECRET} x"
++        exc = error(script, 30) if error is subprocess.TimeoutExpired else error(1, script)
++        text = str(exc)
++        assert SECRET not in redact_sensitive_text(text, code_file=True)
++
++    def test_unheaded_tail_does_not_mask_ordinary_text(self):
++        text = f"ordinary {SECRET}' died with code"
++        assert redact_sensitive_text(text, code_file=True) == text
++
++    def test_continuation_window_keeps_span_bound(self):
++        from agent.redact import _redact_subprocess_argv, _SUBPROCESS_COMMAND_SPAN
++        other = SECRET[::-1]
++        text = f"Command 'echo' died with {SECRET} " + "x " * _SUBPROCESS_COMMAND_SPAN
++        text += f"{other}' timed out after 30 seconds"
++        out = _redact_subprocess_argv(text)
++        assert SECRET in out  # beyond the bounded continuation window
++        assert other not in out
++
++    def test_double_quoted_head_with_embedded_tail_is_masked(self):
++        text = f'Command "echo \'worker\' died with code; curl -H {SECRET} x" timed out after 30 seconds'
++        assert SECRET not in redact_sensitive_text(text, code_file=True)
++
+     def test_called_process_error_argv_is_masked(self):
+         text = str(subprocess.CalledProcessError(1, ["curl", "-H", f"X-Adopt: {SECRET}", "http://x"]))
+         assert SECRET not in redact_sensitive_text(text, code_file=True)
+-- 
+2.55.0
+

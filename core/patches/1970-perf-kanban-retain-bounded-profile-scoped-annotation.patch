@@ -1,0 +1,284 @@
+From 788114babe6ba20e9c8e4b6ccbccce4039874bca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 22:02:09 +0000
+Subject: [PATCH] perf(kanban): retain bounded profile-scoped annotation counts
+ [daveey]
+
+---
+ hermes_cli/kanban_counts_scopes.py            | 62 ++++++++++++
+ hermes_cli/kanban_session_activity.py         | 19 ++--
+ .../kanban_session_activity_revalidate.py     |  1 +
+ ...test_kanban_annotation_unchanged_inputs.py | 94 +++++++++++++++++++
+ 4 files changed, 166 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_counts_scopes.py
+
+diff --git a/hermes_cli/kanban_counts_scopes.py b/hermes_cli/kanban_counts_scopes.py
+new file mode 100644
+index 00000000000..40c08c9861c
+--- /dev/null
++++ b/hermes_cli/kanban_counts_scopes.py
+@@ -0,0 +1,62 @@
++"""Bounded count snapshots for multi-profile tree annotation. [daveey]
++
++The legacy active slot is retained for its readers; switching profiles restores
++all of its fields together. Restoring is NOT validation: callers still check the
++board fingerprint, TTL and time-derived maximum age before returning counts.
++Every operation is under kanban_session_activity._cache_lock. Published count
++maps are read-only internally (callers construct their own annotation rows).
++"""
++from collections import OrderedDict
++
++MAX_SCOPES = 32
++_entries: OrderedDict[tuple[str, ...], tuple] = OrderedDict()
++_FIELDS = ("_cache", "_cache_fingerprint", "_cache_read_at", "_cache_revalidatable", "_cache_generation")
++_BOXES = ("_waiting_cache", "_parked_cache", "_stalled_cache", "_remote_keys_cache", "_local_keys_cache")
++
++
++def remember_locked() -> None:
++    from hermes_cli import kanban_session_activity as ksa
++
++    scope = ksa._cache_scope
++    assert scope is not None
++    _entries[scope] = (tuple(getattr(ksa, name) for name in _FIELDS),
++                       tuple(getattr(ksa, name)[0] for name in _BOXES))
++    _entries.move_to_end(scope)
++    while len(_entries) > MAX_SCOPES:
++        _entries.popitem(last=False)
++
++
++def restore_locked(scope: tuple[str, ...]) -> None:
++    from hermes_cli import kanban_session_activity as ksa
++
++    if ksa._cache is not None and ksa._cache_scope == scope:
++        if scope in _entries:
++            _entries.move_to_end(scope)
++        return
++    saved = _entries.get(scope)
++    if saved is None:
++        return
++    values, boxes = saved
++    for name, value in zip(_FIELDS, values):
++        setattr(ksa, name, value)
++    for name, value in zip(_BOXES, boxes):
++        getattr(ksa, name)[0] = value
++    ksa._cache_scope = scope
++    _entries.move_to_end(scope)
++
++
++def result_locked(include_waiting: bool, include_snapshot: bool) -> tuple:
++    """Annotation identities travel with their count generation; caller holds the cache lock."""
++    from hermes_cli import kanban_session_activity as ksa
++
++    assert ksa._cache is not None
++    counts = ksa._cache[1:5]
++    if include_snapshot:
++        parked, held = ksa._parked_cache[0]
++        return (*counts, dict(ksa._waiting_cache[0]), parked, held, ksa._stalled_cache[0],
++                ksa._identity.merge_keys(ksa._remote_keys_cache[0], ksa._local_keys_cache[0]))
++    return (*counts, dict(ksa._waiting_cache[0])) if include_waiting else counts
++
++
++def reset_locked() -> None:
++    _entries.clear()
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 3f47172bc44..298de5dddba 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -21,6 +21,7 @@ from hermes_cli import kanban_annotation_refresh as _bounded
+ from hermes_cli import kanban_activity_revision as _revision
+ from hermes_cli import kanban_session_activity_hub as _hub_signature
+ from hermes_cli import kanban_session_activity_revalidate as _revalidate
++from hermes_cli import kanban_counts_scopes as _count_scopes
+ from hermes_cli import kanban_session_activity_recent_done as _recent_done
+ from hermes_cli.kanban_session_activity_origin_snapshot import remote_snapshot as _remote_snapshot
+ from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+@@ -77,6 +78,7 @@ _pairs_lock = threading.Lock()
+ # _all_counts single flight: held for a whole recompute; the generation bumps when one publishes.
+ _counts_flight = threading.Lock()
+ _counts_generation = 0
++_cache_generation = 0  # publication generation of the active scoped snapshot
+ # Cross-thread annotation flight. ``one_annotation_snapshot`` only shares a read
+ # inside one thread. Session-list polls arrive on many AnyIO workers at once; each
+ # used to wait on ``_counts_flight`` and then run waiting sources and attention
+@@ -1193,15 +1195,7 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+     return cards
+ 
+ 
+-def _cached_count_result(include_waiting: bool, include_snapshot: bool) -> tuple:
+-    """Called under _cache_lock: annotation identities must travel with their count generation."""
+-    assert _cache is not None
+-    counts = _cache[1:5]
+-    if include_snapshot:
+-        parked, held = _parked_cache[0]
+-        return (*counts, dict(_waiting_cache[0]), parked, held, _stalled_cache[0],
+-                _identity.merge_keys(_remote_keys_cache[0], _local_keys_cache[0]))
+-    return (*counts, dict(_waiting_cache[0])) if include_waiting else counts
++_cached_count_result = _count_scopes.result_locked
+ 
+ 
+ def _all_counts(*, include_waiting: bool = False, include_snapshot: bool = False) -> tuple:
+@@ -1216,12 +1210,13 @@ def _all_counts(*, include_waiting: bool = False, include_snapshot: bool = False
+     wall = time.time()
+     fingerprint = _activity_fingerprint()
+     with _cache_lock:
++        _count_scopes.restore_locked(scope)
+         if _revalidate.counts_fresh(scope, fingerprint, now):
+             return _cached_count_result(include_waiting, include_snapshot)
+         seen = _counts_generation
+     with _counts_flight:
+         with _cache_lock:
+-            if _counts_generation != seen and _cache is not None and _cache_scope == scope:
++            if _cache_generation > seen and _cache is not None and _cache_scope == scope:
+                 return _cached_count_result(include_waiting, include_snapshot)
+         return _recompute_all_counts(scope, now, fingerprint, include_waiting=include_waiting,
+                                      include_snapshot=include_snapshot, wall=wall)
+@@ -1231,6 +1226,7 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+                           include_snapshot: bool = False, wall: float | None = None) -> tuple:
+     """Read every local board and the remote links into fresh counts and publish them to the cache."""
+     global _cache, _cache_scope, _cache_fingerprint, _counts_generation, _cache_read_at, _cache_revalidatable
++    global _cache_generation
+     active: dict[str, int] = {}
+     blocked: dict[str, int] = {}
+     unseen: dict[str, int] = {}
+@@ -1291,11 +1287,13 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         _cache_revalidatable = wall is not None and _revalidate.revalidatable(fingerprint, wall)
+         _cache_fingerprint = fingerprint
+         _counts_generation += 1
++        _cache_generation = _counts_generation
+         _waiting_cache[0] = waiting_ids
+         _parked_cache[0] = parked_held
+         _stalled_cache[0] = stalled
+         _remote_keys_cache[0] = remote_ids
+         _local_keys_cache[0] = local_ids
++        _count_scopes.remember_locked()
+         return _cached_count_result(include_waiting, include_snapshot)
+ 
+ 
+@@ -1979,6 +1977,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+         _links_cache = None
+     with _cache_lock:
+         _cache = None
++        _count_scopes.reset_locked()
+         _attention.clear()
+         if not keep_remote:
+             _remote_last = None
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index ee5d184133a..d0c2ee8050c 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -82,6 +82,7 @@ def unchanged_inputs(scope: tuple[str, ...]) -> tuple[float, tuple] | None:
+     registered) for the local boards'. None otherwise, or while nothing is cached."""
+     from hermes_cli import kanban_session_activity as _ksa
+     with _ksa._cache_lock:
++        _ksa._count_scopes.restore_locked(scope)
+         if _ksa._cache is None or _ksa._cache_scope != scope:
+             return None
+     read_at = time.time()
+diff --git a/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py b/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
+index 6f60bd0bbfb..c906d9a04c2 100644
+--- a/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
++++ b/tests/hermes_cli/test_kanban_annotation_unchanged_inputs.py
+@@ -153,6 +153,100 @@ def test_a_settled_stat_keyed_board_revalidates_until_it_is_written(clock, spies
+         conn.close()
+ 
+ 
++def test_alternating_profile_scopes_reuse_their_unchanged_counts(clock, spies, tmp_path, monkeypatch):
++    """The all-profiles projects tree visits each home on every refresh."""
++    scope = ["a"]
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: (scope[0],))
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")])
++    try:
++        for name in ("a", "b"):
++            scope[0] = name
++            assert _poll()["kanban_active"] == 1
++        cold = dict(spies)
++        for _ in range(3):
++            _advance(clock, ksa._CACHE_TTL_S + 0.5)
++            for name in ("a", "b"):
++                scope[0] = name
++                assert _poll()["kanban_active"] == 1
++        assert spies == cold
++        # The stored scope must still observe a committed revision immediately.
++        conn.execute("INSERT INTO tasks VALUES ('t2', 'ready', 's1')")
++        for name in ("a", "b"):
++            scope[0] = name
++            assert _poll()["kanban_active"] == 2
++        assert spies["recompute"] == cold["recompute"] + 2
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("counted", [True, False])
++def test_restored_scope_keeps_its_original_age_bound(clock, spies, tmp_path, monkeypatch, counted):
++    scope = ["a"]
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: (scope[0],))
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")], counted=counted)
++    try:
++        _poll()
++        scope[0] = "b"
++        _poll()
++        _advance(clock, (ksa._COUNTS_MAX_AGE_S if counted else ksa._CACHE_TTL_S) + 1)
++        scope[0] = "a"
++        assert _poll()["kanban_active"] == 1
++        assert spies["recompute"] == 3
++    finally:
++        conn.close()
++
++
++def test_scoped_counts_lru_is_bounded(clock, spies, tmp_path, monkeypatch):
++    scope = ["a"]
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: (scope[0],))
++    monkeypatch.setattr(ksa._count_scopes, "MAX_SCOPES", 2)
++    conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1")])
++    try:
++        for name in ("a", "b", "a", "c", "a"):
++            scope[0] = name
++            assert _poll()["kanban_active"] == 1
++        assert spies["recompute"] == 3
++        assert len(ksa._count_scopes._entries) == 2
++        scope[0] = "b"  # evicted, not silently served from another profile
++        assert _poll()["kanban_active"] == 1
++        assert spies["recompute"] == 4
++    finally:
++        conn.close()
++
++
++def test_concurrent_scopes_keep_counts_and_waiting_identities_together(tmp_path, monkeypatch):
++    from concurrent.futures import ThreadPoolExecutor
++    from contextvars import ContextVar
++    from threading import Barrier
++
++    scope = ContextVar("test_scope", default="a")
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: (scope.get(),))
++    paths = {name: tmp_path / name / "kanban.db" for name in ("a", "b")}
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [paths[scope.get()]])
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [])
++    monkeypatch.setattr(ksa, "_shadow_fingerprint", lambda: ())
++    for name, path in paths.items():
++        conn = _board(path, [(name, "running", name)])
++        conn.close()
++    ksa._reset_cache_for_tests()
++    barrier = Barrier(4)
++
++    def read(name):
++        scope.set(name)
++        barrier.wait(timeout=10)
++        for _ in range(10):
++            active, _, _, _, waiting, _, _, _, keys = ksa._all_counts(include_snapshot=True)
++            assert active == {name: 1}
++            assert waiting == {name: frozenset({name})}
++            assert set(keys) == {name}
++
++    try:
++        with ThreadPoolExecutor(max_workers=4) as pool:
++            list(pool.map(read, ("a", "b", "a", "b")))
++    finally:
++        ksa._reset_cache_for_tests()
++
++
+ def _done_board(path: Path) -> sqlite3.Connection:
+     conn = _board(path, [])
+     conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
+-- 
+2.55.0
+

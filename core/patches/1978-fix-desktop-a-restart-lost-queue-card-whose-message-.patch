@@ -1,0 +1,771 @@
+From 76c9a926ad01a51cd1d9e9b805fef68af7e7f55e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 01:03:50 +0000
+Subject: [PATCH] fix(desktop): a restart-lost queue card whose message already
+ ran stops painting the chat red on every route [daveey]
+
+An unknown card (a turn the owner lost in a restart) paints its chat red until the
+owner's next pending snapshot drops it or the user discards it. Only a provably local
+route gets that snapshot in the background, so on a hub route a card whose message ran
+again kept the chat red after everything finished, while the backend's own status said
+nothing was wrong (self-heal desktop-d94ca254ae).
+
+On each session-list refresh, a red chat whose row shows no live turn now reads its
+stored transcript passively (REST, never session.resume): a user row newer than the card
+carrying its submission id or its words (merged turns included), answered by an
+assistant reply before the next user turn starts (rows stored as _queued_prompt ride
+the running turn), settles the card. The reply is required, since the lost run itself
+stored its user row. The journal entry is dropped rather than retired, so a later
+snapshot that still lists the card unknown repaints it with its Discard.
+
+The red stripe's tooltip now names this cause: A message queued before a restart may
+not have run: Send again or Discard.
+---
+ .../chat/sidebar/session-row-stripe.test.tsx  |  46 +++++
+ .../app/chat/sidebar/session-row-stripe.tsx   |  15 +-
+ apps/desktop/src/i18n/ar_chrome.ts            |   1 +
+ apps/desktop/src/i18n/de.ts                   |   1 +
+ .../desktop/src/i18n/en_session_row_status.ts |   1 +
+ apps/desktop/src/i18n/es.ts                   |   1 +
+ apps/desktop/src/i18n/fr.ts                   |   1 +
+ apps/desktop/src/i18n/ja.ts                   |   1 +
+ apps/desktop/src/i18n/ru.ts                   |   1 +
+ .../src/i18n/types_session_row_status.ts      |   2 +
+ apps/desktop/src/i18n/zh-hant_chrome.ts       |   1 +
+ apps/desktop/src/i18n/zh.ts                   |   1 +
+ .../src/store/owner-queue-landed.test.ts      |  78 ++++++++
+ apps/desktop/src/store/owner-queue-landed.ts  | 188 ++++++++++++++++++
+ .../src/store/owner-queue-reconcile.test.ts   | 133 ++++++++++++-
+ .../src/store/owner-queue-reconcile.ts        |  11 +-
+ apps/desktop/src/store/pending-submissions.ts |  13 ++
+ locales/_keys.desktop.json                    |   1 +
+ 18 files changed, 492 insertions(+), 4 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
+ create mode 100644 apps/desktop/src/store/owner-queue-landed.test.ts
+ create mode 100644 apps/desktop/src/store/owner-queue-landed.ts
+
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
+new file mode 100644
+index 00000000000..6a53963f280
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
+@@ -0,0 +1,46 @@
++import { cleanup, render } from '@testing-library/react'
++import { afterEach, expect, it } from 'vitest'
++
++import { $queuedPromptsBySession } from '@/store/composer-queue'
++import { reconcilePendingSubmissions } from '@/store/pending-submissions'
++import { $sessions, setSessions } from '@/store/session'
++import type { SessionInfo } from '@/types/hermes'
++
++import { SessionRowStatusStripe } from './session-row-stripe'
++
++const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
++  ({ id, message_count: 4, source: 'desktop', started_at: 0, title: id, ...extra }) as SessionInfo
++
++const stripe = (container: HTMLElement) => container.querySelector('[data-slot="session-status-stripe"]')
++
++afterEach(() => {
++  cleanup()
++  window.localStorage.clear()
++  $queuedPromptsBySession.set({})
++  $sessions.set([])
++})
++
++// [daveey] The red of a queue card a restart may have lost is this app's own: the backend's status shows nothing,
++// so the stripe says what it is and what the user can do about it.
++it('a red painted by a queue card a restart may have lost names its cause', () => {
++  setSessions([row('hub-chat')])
++  reconcilePendingSubmissions('hub-chat', [{ admission_id: 'lost-turn', status: 'unknown', user: 'resume' }])
++
++  const { container } = render(
++    <SessionRowStatusStripe outcomePainted={false} session={row('hub-chat')} statusStripe="stuck" />
++  )
++
++  expect(stripe(container)?.getAttribute('aria-label')).toBe(
++    'A message queued before a restart may not have run: Send again or Discard'
++  )
++})
++
++it('a red with no paused queue card keeps its own explanation', () => {
++  setSessions([row('other')])
++
++  const { container } = render(
++    <SessionRowStatusStripe outcomePainted={false} session={row('other')} statusStripe="stuck" />
++  )
++
++  expect(stripe(container)?.getAttribute('aria-label')).toBeNull()
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+index b9b7ad23f66..d4ab8c57d74 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+@@ -1,3 +1,4 @@
++import { useStore } from '@nanostores/react'
+ import { useEffect } from 'react'
+ 
+ import { Codicon } from '@/components/ui/codicon'
+@@ -8,6 +9,9 @@ import { outcomeHasCrons, outcomeStripe, outcomeTooltip } from '@/lib/session-ou
+ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+ import { useSessionParked } from '@/lib/use-session-parked'
+ import { cn } from '@/lib/utils'
++import { stuckOnPausedQueue } from '@/store/owner-queue-landed'
++import { $pausedQueueSessionIds } from '@/store/owner-queue-reconcile'
++import { $sessions } from '@/store/session'
+ import {
+   kanbanStripeCounts,
+   recordStripeTransition,
+@@ -69,13 +73,22 @@ interface SessionRowStatusStripeProps {
+  *  it waits on, or why it is unresolved. */
+ export function SessionRowStatusStripe({ session, statusStripe, outcomePainted }: SessionRowStatusStripeProps) {
+   const { t } = useI18n()
++  const pausedIds = useStore($pausedQueueSessionIds)
+ 
+   if (!statusStripe) {
+     return null
+   }
+ 
+   const outcomeKind = outcomePainted && outcomeStripe(session.outcome) ? session.outcome?.kind : undefined
+-  const tipText = outcomeKind ? outcomeTooltip(session.outcome, t.sidebar.row) : null
++  const pausedQueue = statusStripe === 'stuck' && stuckOnPausedQueue(session.id, pausedIds, $sessions.get())
++
++  // [daveey] A red painted by this app's own queue names its cause: the backend's status says nothing about it.
++  const tipText = pausedQueue
++    ? t.sidebar.row.pausedQueue
++    : outcomeKind
++      ? outcomeTooltip(session.outcome, t.sidebar.row)
++      : null
++
+   const doneCron = Boolean(outcomeKind) && outcomeHasCrons(session.outcome)
+   const glyph = GLYPH_STRIPES.has(statusStripe) || doneCron
+ 
+diff --git a/apps/desktop/src/i18n/ar_chrome.ts b/apps/desktop/src/i18n/ar_chrome.ts
+index 60750d50b3c..1a78fd7c36f 100644
+--- a/apps/desktop/src/i18n/ar_chrome.ts
++++ b/apps/desktop/src/i18n/ar_chrome.ts
+@@ -314,6 +314,7 @@ export const arChrome = {
+     loadMore: 'تحميل المزيد',
+     loadCount: step => `تحميل ${step} أخرى`,
+     row: {
++      pausedQueue: 'قد لا تكون رسالة وُضعت في قائمة الانتظار قبل إعادة التشغيل قد أُرسلت: أرسلها مجددًا أو تجاهلها',
+       pin: 'تثبيت',
+       unpin: 'إلغاء التثبيت',
+       markUnread: 'وضع علامة كغير مقروء',
+diff --git a/apps/desktop/src/i18n/de.ts b/apps/desktop/src/i18n/de.ts
+index 402c937c503..b123cad8ad2 100644
+--- a/apps/desktop/src/i18n/de.ts
++++ b/apps/desktop/src/i18n/de.ts
+@@ -3704,6 +3704,7 @@ export const deOverrides = {
+     messageCount: count => `${count} ${count === 1 ? 'Nachricht' : 'Nachrichten'}`,
+     toolCallCount: count => `${count} ${count === 1 ? 'Tool-Aufruf' : 'Tool-Aufrufe'}`,
+     row: {
++      pausedQueue: 'Eine vor einem Neustart eingereihte Nachricht wurde womöglich nicht ausgeführt: erneut senden oder verwerfen',
+       pin: 'Anpinnen',
+       unpin: 'Lösen',
+       markUnread: 'Als ungelesen markieren',
+diff --git a/apps/desktop/src/i18n/en_session_row_status.ts b/apps/desktop/src/i18n/en_session_row_status.ts
+index cb7e180a7ce..4626112c171 100644
+--- a/apps/desktop/src/i18n/en_session_row_status.ts
++++ b/apps/desktop/src/i18n/en_session_row_status.ts
+@@ -26,6 +26,7 @@ export const enSessionRowStatus = {
+   outcomeMuted: 'Muted',
+   outcomeRunning: 'Running',
+   outcomeWaiting: 'Waiting',
++  pausedQueue: 'A message queued before a restart may not have run: Send again or Discard',
+   outcomeUnresolved: reason =>
+     reason && Object.hasOwn(UNRESOLVED_REASONS, reason) ? UNRESOLVED_REASONS[reason] : 'Unresolved',
+   muteFailed: 'Could not update the parked state',
+diff --git a/apps/desktop/src/i18n/es.ts b/apps/desktop/src/i18n/es.ts
+index 1720b24bf22..8c205de8785 100644
+--- a/apps/desktop/src/i18n/es.ts
++++ b/apps/desktop/src/i18n/es.ts
+@@ -3692,6 +3692,7 @@ export const esOverrides = {
+     messageCount: (count: number) => `${count} ${count === 1 ? 'mensaje' : 'mensajes'}`,
+     toolCallCount: (count: number) => `${count} ${count === 1 ? 'llamada a herramienta' : 'llamadas a herramientas'}`,
+     row: {
++      pausedQueue: 'Puede que un mensaje en cola antes de un reinicio no se haya ejecutado: envíalo de nuevo o descártalo',
+       pin: 'Fijar',
+       unpin: 'Desfijar',
+       markUnread: 'Marcar como no leído',
+diff --git a/apps/desktop/src/i18n/fr.ts b/apps/desktop/src/i18n/fr.ts
+index 0ab2a5bc668..c2327210c5a 100644
+--- a/apps/desktop/src/i18n/fr.ts
++++ b/apps/desktop/src/i18n/fr.ts
+@@ -3711,6 +3711,7 @@ export const frOverrides = {
+     messageCount: count => `${count} ${count === 1 ? 'message' : 'messages'}`,
+     toolCallCount: count => `${count} ${count === 1 ? "appel d'outil" : "appels d'outil"}`,
+     row: {
++      pausedQueue: 'Un message mis en file avant un redémarrage n’a peut-être pas été exécuté : renvoyez-le ou supprimez-le',
+       pin: 'Épingler',
+       unpin: 'Désépingler',
+       markUnread: 'Marquer comme non lue',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 6580e73622e..ec35193072b 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -2235,6 +2235,7 @@ export const jaOverrides = {
+     messageCount: count => `${count} 件のメッセージ`,
+     toolCallCount: count => `${count} 件のツール呼び出し`,
+     row: {
++      pausedQueue: '再起動前にキューに入れたメッセージが実行されていない可能性があります：再送信するか破棄してください',
+       pin: 'ピン留め',
+       unpin: 'ピン留めを解除',
+       markUnread: '未読にする',
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index 7df9d58db47..3376df814d0 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -2496,6 +2496,7 @@ export const ruOverrides = {
+     toolCallCount: count =>
+       `${count} ${RU_PLURAL(count, 'вызов инструмента', 'вызова инструмента', 'вызовов инструмента')}`,
+     row: {
++      pausedQueue: 'Сообщение, поставленное в очередь до перезапуска, возможно, не выполнено: отправьте снова или отмените',
+       pin: 'Закрепить',
+       unpin: 'Открепить',
+       markUnread: 'Отметить как непрочитанное',
+diff --git a/apps/desktop/src/i18n/types_session_row_status.ts b/apps/desktop/src/i18n/types_session_row_status.ts
+index 0d8dc3725ea..361152112dc 100644
+--- a/apps/desktop/src/i18n/types_session_row_status.ts
++++ b/apps/desktop/src/i18n/types_session_row_status.ts
+@@ -10,6 +10,8 @@ export interface SessionRowStatusCopy {
+   outcomeMuted: string
+   outcomeRunning: string
+   outcomeWaiting: string
++  /** [daveey] The red is a queue card a restart may have lost (this app's queue, not the backend's status). */
++  pausedQueue: string
+   outcomeUnresolved: (reason: null | string) => string
+   muteFailed: string
+   backgroundProcesses: (count: number) => string
+diff --git a/apps/desktop/src/i18n/zh-hant_chrome.ts b/apps/desktop/src/i18n/zh-hant_chrome.ts
+index b149df39269..4bbc6115536 100644
+--- a/apps/desktop/src/i18n/zh-hant_chrome.ts
++++ b/apps/desktop/src/i18n/zh-hant_chrome.ts
+@@ -196,6 +196,7 @@ export const zhHantChrome = {
+     messageCount: count => `${count} 條訊息`,
+     toolCallCount: count => `${count} 次工具調用`,
+     row: {
++      pausedQueue: '重新啟動前排入佇列的訊息可能未執行：請重新傳送或捨棄',
+       pin: '釘選',
+       unpin: '取消釘選',
+       markUnread: '標記為未讀',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 9f0cb8f35eb..7118ed46443 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -3102,6 +3102,7 @@ export const zhOverrides = {
+     messageCount: count => `${count} 条消息`,
+     toolCallCount: count => `${count} 次工具调用`,
+     row: {
++      pausedQueue: '重启前排队的消息可能未运行：请重新发送或丢弃',
+       pin: '置顶',
+       unpin: '取消置顶',
+       markUnread: '标记为未读',
+diff --git a/apps/desktop/src/store/owner-queue-landed.test.ts b/apps/desktop/src/store/owner-queue-landed.test.ts
+new file mode 100644
+index 00000000000..ab21d6f79e0
+--- /dev/null
++++ b/apps/desktop/src/store/owner-queue-landed.test.ts
+@@ -0,0 +1,78 @@
++import { expect, it } from 'vitest'
++
++import type { SessionMessage } from '@/types/hermes'
++
++import type { QueuedPromptEntry } from './composer-queue'
++import { cardRanToReply } from './owner-queue-landed'
++
++// [daveey] The stored rows of the incident chat (hub state.db, 2026-11-03 UTC, text shortened): two sends queued
++// behind a running turn at 02:50-02:51, the backend restarted at 02:54, "resume  resume" ran again at 02:56:09 and
++// was answered at 02:57:45; "what are you waiting on?" was re-asked by hand at 03:01:37. The 03:02:00 user turn is
++// synthetic: it cuts the re-ask's turn before a reply, to test that boundary on the real shape.
++const at = (hms: string) => Date.parse(`2026-11-03T${hms}Z`) / 1000
++const queued = JSON.stringify({ _queued_prompt: true })
++
++const incident: SessionMessage[] = [
++  { role: 'user', content: 'what are you waiting on?', timestamp: at('02:50:17'), display_metadata: queued },
++  { role: 'user', content: 'resume  resume', timestamp: at('02:51:05'), display_metadata: queued },
++  { role: 'user', content: 'resume  resume', timestamp: at('02:56:09') },
++  { role: 'assistant', content: '', timestamp: at('02:56:29') },
++  { role: 'tool', content: '{"ok": true}', timestamp: at('02:56:30') },
++  { role: 'assistant', content: 'Resumed. The placement repair has published PR #734', timestamp: at('02:57:45') },
++  { role: 'user', content: 'what are you waiting on??', timestamp: at('03:01:37') },
++  {
++    role: 'user',
++    content: '[Message from another Hermes session]',
++    timestamp: at('03:01:46'),
++    display_metadata: queued
++  },
++  { role: 'assistant', content: '', timestamp: at('03:01:57') },
++  { role: 'user', content: 'unrelated next turn', timestamp: at('03:02:00') },
++  { role: 'assistant', content: 'The immediate blocker is an older gateway', timestamp: at('03:03:16') }
++]
++
++const card = (text: string, queuedAtS: number, extra: Partial<QueuedPromptEntry> = {}): QueuedPromptEntry => ({
++  attachments: [],
++  id: 'lost-turn',
++  queuedAt: queuedAtS * 1000,
++  serverStatus: 'unknown',
++  text,
++  ...extra
++})
++
++it('a card whose words ran again after the restart and were answered in that turn settles', () => {
++  expect(cardRanToReply(card('resume  resume', at('02:52:00')), incident)).toBe(true)
++  // Newest-first pages (the REST read's `order=latest`) read the same.
++  expect(cardRanToReply(card('resume resume', at('02:52:00')), [...incident].reverse())).toBe(true)
++})
++
++it('a send stored at queue time whose turn the next user turn replaced stays unsettled', () => {
++  // 02:50:17's own turn never answered it: the next turn started at 02:56:09. The 03:01:37 re-ask is not the same
++  // words' turn either: it was cut by another user turn before any reply.
++  expect(cardRanToReply(card('what are you waiting on?', at('02:50:00')), incident)).toBe(false)
++})
++
++it('a user row stored while the turn ran (queued prompt) rides that turn instead of ending it', () => {
++  const rows: SessionMessage[] = [
++    { role: 'user', content: 'check the hub', timestamp: 100 },
++    { role: 'user', content: 'also the mini', timestamp: 101, display_metadata: { _queued_prompt: true } as never },
++    { role: 'assistant', content: 'Both checked.', timestamp: 102 }
++  ]
++
++  expect(cardRanToReply(card('check the hub', 90), rows)).toBe(true)
++})
++
++it('the owner-stamped submission id matches even when the words were rewritten', () => {
++  const rows: SessionMessage[] = [
++    {
++      role: 'user',
++      content: 'expanded skill body',
++      timestamp: 100,
++      display_metadata: JSON.stringify({ submission_id: 'sub-1' })
++    },
++    { role: 'assistant', content: 'Done.', timestamp: 101 }
++  ]
++
++  expect(cardRanToReply(card('/skill run', 90, { submissionId: 'sub-1' }), rows)).toBe(true)
++  expect(cardRanToReply(card('/skill run', 90, { submissionId: 'sub-2' }), rows)).toBe(false)
++})
+diff --git a/apps/desktop/src/store/owner-queue-landed.ts b/apps/desktop/src/store/owner-queue-landed.ts
+new file mode 100644
+index 00000000000..037505398d1
+--- /dev/null
++++ b/apps/desktop/src/store/owner-queue-landed.ts
+@@ -0,0 +1,188 @@
++import { getSessionMessages } from '@/api/sessions'
++import type { SessionInfo, SessionMessage } from '@/types/hermes'
++
++import { getQueuedPrompts, type QueuedPromptEntry, queuedSubmissionId, writeSessionQueue } from './composer-queue'
++import { forgetPendingSubmission } from './pending-submissions'
++import { $sessions, resolveComposerSessionKey } from './session'
++import { $workingSessionIds } from './session-states'
++
++// [daveey] An `unknown` queue card is a turn the owner lost in a restart: its FIFO pauses and the chat paints red
++// until the owner's next pending snapshot drops it, or the user's Discard. Only a provably local route gets that
++// snapshot in the background (owner-queue-reconcile), so on a hub route a card whose message DID run again (the
++// owner replayed it, or the user re-sent it) kept the chat red after everything had finished, and the backend's own
++// view (`sessions outcome`) said nothing was wrong. The stored transcript answers it passively: a REST read, never
++// a `session.resume` (which can start a billed turn on a legacy backend).
++//
++// A card ran when, newer than the card (less clock skew), a user row carries its submission id or its words (a
++// merged turn joins queued sends, so the words may be part of the row) AND an assistant reply answers that row's
++// turn before the next turn starts (a later user row not stored as `_queued_prompt`). The reply is required: the
++// lost run itself persisted its user row before the restart cut it, and that row alone says
++// nothing about whether it finished. Anything else (no match, no reply, a failed read) leaves the card as it was.
++// The card leaves the journal entirely rather than as `retired`: if the owner still lists it `unknown` in a later
++// snapshot, that listing repaints it with its Discard.
++
++const PAGE = 50
++const SKEW_S = 10 * 60
++
++const textOf = (value: unknown): string => {
++  if (typeof value === 'string') {
++    return value
++  }
++
++  if (Array.isArray(value)) {
++    return value
++      .map(part => (part && typeof part === 'object' && typeof part.text === 'string' ? part.text : ''))
++      .join('\n')
++  }
++
++  return ''
++}
++
++const normalized = (text: string) => text.replace(/\s+/g, ' ').trim()
++
++function metadataOf(message: SessionMessage): Record<string, unknown> {
++  let metadata: unknown = message.display_metadata
++
++  if (typeof metadata === 'string') {
++    try {
++      metadata = JSON.parse(metadata)
++    } catch {
++      return {}
++    }
++  }
++
++  return metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {}
++}
++
++const isReply = (message: SessionMessage) =>
++  message.role === 'assistant' && normalized(textOf(message.content)).length > 0
++
++// A user row stored while a turn ran (`_queued_prompt`) rides that turn; any other user row starts the next one.
++const startsTurn = (message: SessionMessage) => metadataOf(message)._queued_prompt !== true
++
++/** Whether a reply answers the turn `ordered[index]` belongs to, before the next turn starts. */
++const answeredInTurn = (ordered: readonly SessionMessage[], index: number): boolean => {
++  for (const message of ordered.slice(index + 1)) {
++    if (message.role === 'user' && startsTurn(message)) {
++      return false
++    }
++
++    if (isReply(message)) {
++      return true
++    }
++  }
++
++  return false
++}
++
++/** Whether `messages` (any order) show `card` sent after it was queued and answered. */
++export function cardRanToReply(card: QueuedPromptEntry, messages: readonly SessionMessage[]): boolean {
++  const words = normalized(card.text)
++  const since = card.queuedAt / 1000 - SKEW_S
++  const ordered = [...messages].sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0))
++
++  return ordered.some((message, index) => {
++    if (message.role !== 'user' || (message.timestamp ?? 0) < since) {
++      return false
++    }
++
++    const sent =
++      metadataOf(message).submission_id === queuedSubmissionId(card) ||
++      (words.length > 0 && normalized(textOf(message.content)).includes(words))
++
++    return sent && answeredInTurn(ordered, index)
++  })
++}
++
++const unknownCards = (key: string) => getQueuedPrompts(key).filter(entry => entry.serverStatus === 'unknown')
++
++/** Settle the `unknown` cards of `key` the stored transcript shows ran to a reply; true when any left. */
++export async function settleLandedUnknownCards(key: string): Promise<boolean> {
++  if (!unknownCards(key).length) {
++    return false
++  }
++
++  let messages: SessionMessage[]
++
++  try {
++    ;({ messages } = await getSessionMessages(
++      key,
++      undefined,
++      { includeCompacted: true, limit: PAGE, order: 'latest' },
++      { passive: true }
++    ))
++  } catch {
++    return false
++  }
++
++  // Re-read after the await: a snapshot or a Discard may have moved the queue meanwhile.
++  const landed = new Set(
++    unknownCards(key)
++      .filter(card => cardRanToReply(card, messages))
++      .map(card => card.id)
++  )
++
++  if (!landed.size) {
++    return false
++  }
++
++  landed.forEach(id => forgetPendingSubmission(key, id))
++  writeSessionQueue(
++    key,
++    getQueuedPrompts(key).filter(entry => !(entry.serverStatus === 'unknown' && landed.has(entry.id)))
++  )
++
++  return true
++}
++
++// The row stamp a check was last made at: re-read only once the row moved (a new message, a turn ending).
++const checkedAt = new Map<string, string>()
++const inFlight = new Set<string>()
++
++const rowStamp = (key: string, row: SessionInfo) =>
++  [row.message_count ?? 0, row.last_active ?? 0, ...unknownCards(key).map(card => card.id)].join(':')
++
++function rowFor(key: string, sessions: readonly SessionInfo[]): SessionInfo | undefined {
++  return sessions.find(row => row.id === key || resolveComposerSessionKey(row.id, sessions) === key)
++}
++
++/** On each session-list refresh, check every chat painted red by an `unknown` card whose row shows no live turn. */
++export function checkLandedUnknownCards(pausedKeys: readonly string[]): void {
++  const sessions = $sessions.get()
++  const working = new Set($workingSessionIds.get())
++
++  for (const key of pausedKeys) {
++    const row = rowFor(key, sessions)
++
++    if (!row || row.turn_live === true || working.has(key) || working.has(row.id) || inFlight.has(key)) {
++      continue
++    }
++
++    const stamp = rowStamp(key, row)
++
++    if (checkedAt.get(key) === stamp) {
++      continue
++    }
++
++    checkedAt.set(key, stamp)
++    inFlight.add(key)
++    void settleLandedUnknownCards(key).finally(() => inFlight.delete(key))
++  }
++}
++
++export const resetLandedUnknownChecksForTests = (): void => {
++  checkedAt.clear()
++  inFlight.clear()
++}
++
++/** [daveey] Whether the row's red comes from a queue card a restart may have lost (the stripe tooltip names it, so
++ *  the user and an agent reading the row both see that the cause is this app's queue, not the backend's status). */
++export function stuckOnPausedQueue(
++  sessionId: string,
++  pausedIds: readonly string[],
++  sessions: readonly SessionInfo[]
++): boolean {
++  const key = resolveComposerSessionKey(sessionId, sessions) ?? sessionId
++
++  return pausedIds.includes(key) || pausedIds.includes(sessionId)
++}
+diff --git a/apps/desktop/src/store/owner-queue-reconcile.test.ts b/apps/desktop/src/store/owner-queue-reconcile.test.ts
+index bf092f9356a..9d3040fede8 100644
+--- a/apps/desktop/src/store/owner-queue-reconcile.test.ts
++++ b/apps/desktop/src/store/owner-queue-reconcile.test.ts
+@@ -1,11 +1,13 @@
+-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
++import { getSessionMessages } from '@/api/sessions'
+ import type { HermesConnection } from '@/global'
+ import { createClientSessionState } from '@/lib/chat-runtime'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+ import { $queuedPromptsBySession } from './composer-queue'
+ import { requestGatewayForProfile } from './gateway'
++import { resetLandedUnknownChecksForTests } from './owner-queue-landed'
+ import { watchOwnerQueues } from './owner-queue-reconcile'
+ import { reconcilePendingSubmissions, trackPendingSubmission } from './pending-submissions'
+ import { $connection, $gatewayState, $selectedStoredSessionId, $sessions, setSessions } from './session'
+@@ -19,11 +21,29 @@ vi.mock('@/store/gateway', async importOriginal => {
+   return { ...actual, requestGatewayForProfile: vi.fn(actual.requestGatewayForProfile) }
+ })
+ 
++// The stored transcript (a passive REST read): empty unless a test says what ran.
++vi.mock('@/api/sessions', async importOriginal => ({
++  ...(await importOriginal<object>()),
++  getSessionMessages: vi.fn(async () => ({
++    messages: [],
++    pagination: { limit: 50, offset: 0, order: 'latest', returned: 0 },
++    session_id: ''
++  }))
++}))
++
+ const connectionAt = (wsUrl: string) => ({ mode: 'local', wsUrl }) as HermesConnection
+ 
+ const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
+   // Fork: a row without a fresh kanban read stays `background` (see kanban-observation.ts).
+-  ({ id, kanban_observed_at: Date.now() / 1000, message_count: 4, source: 'desktop', started_at: 0, title: id, ...extra }) as SessionInfo
++  ({
++    id,
++    kanban_observed_at: Date.now() / 1000,
++    message_count: 4,
++    source: 'desktop',
++    started_at: 0,
++    title: id,
++    ...extra
++  }) as SessionInfo
+ 
+ // The owner's list after a restart cut the running turn: the turn is `unknown` (only Discard
+ // resolves it) and the send queued behind it waits.
+@@ -152,3 +172,112 @@ it('a chat whose queue only holds a waiting send does not ask for the user', ()
+ 
+   expect($sessionDotStateById.get().gamma).not.toBe('needs-input')
+ })
++
++// A restart cut the chat's turn on a hub (non-local) route: the owner listed it `unknown`, and nothing
++// in the background re-reads that owner, so the card outlived the message running again.
++describe('an unknown card on a route the background reconcile never reads', () => {
++  const hub = () => ({ mode: 'remote', wsUrl: 'wss://hub.example/api/ws?token=t' }) as HermesConnection
++  const now = () => Date.now() / 1000
++
++  const transcript = (...messages: Array<Record<string, unknown>>) =>
++    vi.mocked(getSessionMessages).mockResolvedValue({
++      messages: messages as never,
++      pagination: { limit: 50, offset: 0, order: 'latest', returned: messages.length },
++      session_id: 'hub-chat'
++    })
++
++  const lostTurn = () => {
++    $connection.set(hub())
++    reconcilePendingSubmissions('hub-chat', [
++      { admission_id: 'lost-turn', status: 'unknown', user: 'resume the rollout' }
++    ])
++  }
++
++  afterEach(() => {
++    vi.mocked(getSessionMessages).mockClear()
++    resetLandedUnknownChecksForTests()
++  })
++
++  it('stops asking for the user once the stored transcript shows the message ran to a reply', async () => {
++    lostTurn()
++    transcript(
++      { role: 'assistant', content: 'Done.', timestamp: now() },
++      { role: 'user', content: 'resume the rollout', timestamp: now() - 1 }
++    )
++    const stop = watchOwnerQueues(vi.fn() as unknown as Parameters<typeof watchOwnerQueues>[0])
++    $gatewayState.set('open')
++    setSessions([row('hub-chat', { turn_live: false })])
++    expect($sessionDotStateById.get()['hub-chat']).toBe('needs-input')
++
++    await vi.waitFor(() => expect($sessionDotStateById.get()['hub-chat']).not.toBe('needs-input'))
++    stop()
++    expect($queuedPromptsBySession.get()['hub-chat'] ?? []).toEqual([])
++    // Read passively from the stored transcript, never a session.resume (no billed turn).
++    expect(vi.mocked(getSessionMessages).mock.calls[0]?.[3]).toEqual({ passive: true })
++  })
++
++  it('a merged turn that joined the queued text with another send also counts', async () => {
++    lostTurn()
++    transcript(
++      { role: 'assistant', content: [{ type: 'text', text: 'On it.' }], timestamp: now() },
++      { role: 'user', content: 'resume the rollout\n\nand report back', timestamp: now() - 1 }
++    )
++    const stop = watchOwnerQueues(vi.fn() as unknown as Parameters<typeof watchOwnerQueues>[0])
++    $gatewayState.set('open')
++    setSessions([row('hub-chat', { turn_live: false })])
++
++    await vi.waitFor(() => expect($sessionDotStateById.get()['hub-chat']).not.toBe('needs-input'))
++    stop()
++  })
++
++  it.each([
++    [
++      'the text is not in the transcript',
++      [
++        { role: 'assistant', content: 'Done.', timestamp: 1e10 },
++        { role: 'user', content: 'something else', timestamp: 1e10 - 1 }
++      ]
++    ],
++    [
++      'a later turn was answered, not the one that carried the text',
++      [
++        { role: 'assistant', content: 'Done.', timestamp: 1e10 + 2 },
++        { role: 'user', content: 'a new question', timestamp: 1e10 + 1 },
++        { role: 'user', content: 'resume the rollout', timestamp: 1e10 }
++      ]
++    ],
++    [
++      'the message is stored but nothing replied after it (the lost run itself)',
++      [{ role: 'user', content: 'resume the rollout', timestamp: 1e10 }]
++    ],
++    [
++      'only an older copy of the same words is stored',
++      [
++        { role: 'assistant', content: 'Done.', timestamp: 1000 },
++        { role: 'user', content: 'resume the rollout', timestamp: 999 }
++      ]
++    ]
++  ])('stays paused when %s', async (_why, messages) => {
++    lostTurn()
++    transcript(...messages)
++    const stop = watchOwnerQueues(vi.fn() as unknown as Parameters<typeof watchOwnerQueues>[0])
++    $gatewayState.set('open')
++    setSessions([row('hub-chat', { turn_live: false })])
++    await vi.waitFor(() => expect(getSessionMessages).toHaveBeenCalled())
++    await new Promise(resolve => setTimeout(resolve, 0))
++    stop()
++
++    expect($sessionDotStateById.get()['hub-chat']).toBe('needs-input')
++  })
++
++  it('never reads while a turn is live in the chat', async () => {
++    lostTurn()
++    const stop = watchOwnerQueues(vi.fn() as unknown as Parameters<typeof watchOwnerQueues>[0])
++    $gatewayState.set('open')
++    setSessions([row('hub-chat', { turn_live: true })])
++    await new Promise(resolve => setTimeout(resolve, 0))
++    stop()
++
++    expect(getSessionMessages).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/store/owner-queue-reconcile.ts b/apps/desktop/src/store/owner-queue-reconcile.ts
+index aac6187b103..fcba2dc906f 100644
+--- a/apps/desktop/src/store/owner-queue-reconcile.ts
++++ b/apps/desktop/src/store/owner-queue-reconcile.ts
+@@ -7,6 +7,7 @@ import { stableArray } from '@/lib/stable-array'
+ import type { SessionResumeResult } from '@/types/hermes'
+ 
+ import { $queuedPromptsBySession, serverOwnsComposerQueue } from './composer-queue'
++import { checkLandedUnknownCards } from './owner-queue-landed'
+ import { journaledPendingSessions, pendingSnapshotFence, reconcilePendingSubmissions } from './pending-submissions'
+ import { $connection, $gatewayState, $selectedStoredSessionId, $sessions, resolveComposerSessionKey } from './session'
+ import { knownOwnerForSession, ownerConnectionMode, requestForOwnedSession } from './session-states'
+@@ -114,7 +115,15 @@ export function watchOwnerQueues(request: GatewayRequest): () => void {
+     }
+   }
+ 
+-  const stops = [$gatewayState.subscribe(check), $sessions.listen(check)]
++  // [daveey] Every route, every list refresh: a red `unknown` card whose message the stored transcript shows ran.
++  const checkLanded = () => checkLandedUnknownCards($pausedQueueSessionIds.get())
++
++  const stops = [
++    $gatewayState.subscribe(check),
++    $sessions.listen(check),
++    $sessions.listen(checkLanded),
++    $pausedQueueSessionIds.subscribe(checkLanded)
++  ]
+ 
+   return () => stops.forEach(stop => stop())
+ }
+diff --git a/apps/desktop/src/store/pending-submissions.ts b/apps/desktop/src/store/pending-submissions.ts
+index 444411f6927..ab65f9532d0 100644
+--- a/apps/desktop/src/store/pending-submissions.ts
++++ b/apps/desktop/src/store/pending-submissions.ts
+@@ -355,6 +355,19 @@ export function reconcilePendingSubmissions(storedId: string, value: unknown, fe
+   }
+ }
+ 
++/** Drop one admission's record (not retire it): the stored transcript showed its turn ran, on a route whose owner
++ *  snapshot this page cannot read. A later snapshot that still lists it repaints its card. */
++export function forgetPendingSubmission(storedId: string, id: string): void {
++  const key = journalKey(storedId)
++  const before = readPendingSubmissions(key)
++
++  if (id in before) {
++    const after = { ...before }
++    delete after[id]
++    writeEntries(key, before, after)
++  }
++}
++
+ /** The fence of a canonical frame or snapshot, when it carries a usable one. */
+ export function pendingSnapshotFence(epoch: unknown, sequence: unknown): PendingSnapshotFence | undefined {
+   return typeof epoch === 'string' && epoch && typeof sequence === 'number' && Number.isFinite(sequence)
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 6151e8d425d..88b932c0542 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -4900,6 +4900,7 @@
+     "sidebar.row.outcomeUnresolved",
+     "sidebar.row.outcomeWaiting",
+     "sidebar.row.ownedByProfile",
++    "sidebar.row.pausedQueue",
+     "sidebar.row.pin",
+     "sidebar.row.rename",
+     "sidebar.row.renameDesc",
+-- 
+2.55.0
+

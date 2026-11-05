@@ -1,0 +1,659 @@
+From 3915a57f6eed2d16e253b86205877a1f5de8de8a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:45:45 +0000
+Subject: [PATCH] [daveey] desktop: only real use stamps the remote warm set
+ (reconnect sweep no longer prewarms/holds every listed profile)
+
+After the hub default backend reconnected, the renderer redialed every pooled
+hub-profile secondary socket in the same millisecond (reconnectSecondaryGateways
+-> reconnectSecondary -> openSecondary -> hermes:connection:for + ws-url-for).
+Each was a non-passive ensureRegistryBackend dial, and main counted every such
+dial as use: remoteWarmSet.recent.touch + holds.noteUse. So all listed profiles
+were stamped with one timestamp (cap-4 prewarm set decided by tie order; bb-tuner
+respawned/kept warm with no dispatch) and each got a 30-min keep-alive hold.
+
+Now a dial counts as use only when its caller says so (opts.use: terminal opens).
+Renderer user actions report use through a new hermes:remote:note-use IPC
+(store/remote-use, throttled 1/min per scope): foreground open/create/request
+(spawnPriority 'foreground'), a user-chosen profile activation, and a routed
+prompt.submit turn (including sends on a remote primary). Socket (re)dials,
+ws-url mints, session-list/roster reads, passive reads and the prewarm probe
+never count. Caps and thresholds unchanged.
+
+Tests: electron/remote-warm-use.test.ts (sweep of N profiles touches neither the
+recent set nor the hold; real use does both; main wiring), src/store/
+gateway-remote-use.test.ts (post-reconnect sweep of 4 pooled hub profiles redials
+each with no note-use; foreground open/create/retain and prompt.submit do).
+---
+ apps/desktop/electron/main.ts                 |  17 +-
+ apps/desktop/electron/preload.ts              |   2 +
+ .../electron/remote-warm-dispatch.test.ts     |   9 +-
+ apps/desktop/electron/remote-warm-set.ts      |  36 +++-
+ apps/desktop/electron/remote-warm-use.test.ts | 131 +++++++++++++
+ apps/desktop/src/global.d.ts                  |   3 +
+ .../src/store/gateway-remote-use.test.ts      | 172 ++++++++++++++++++
+ apps/desktop/src/store/gateway.ts             |  20 ++
+ apps/desktop/src/store/profile.ts             |   4 +
+ apps/desktop/src/store/remote-use.ts          |  43 +++++
+ 10 files changed, 425 insertions(+), 12 deletions(-)
+ create mode 100644 apps/desktop/electron/remote-warm-use.test.ts
+ create mode 100644 apps/desktop/src/store/gateway-remote-use.test.ts
+ create mode 100644 apps/desktop/src/store/remote-use.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 57fe05dc24c..6e99a624f82 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -547,7 +547,7 @@ import { createRemoteOwnerCache } from './remote-owner-cache'
+ import { RemotePrewarmer } from './remote-prewarm'
+ import { remoteSessionCookies } from './remote-session-cookies'
+ import { RemoteUpdatePause, remoteUpdatePauseKey } from './remote-update-pause'
+-import { createRemoteWarmSet } from './remote-warm-set'
++import { createRemoteWarmSet, type RegistryDialUseOpts } from './remote-warm-set'
+ import {
+   applyRemoteRequestHeaders,
+   attachRemoteRequestHeaderListener,
+@@ -9482,7 +9482,7 @@ async function ensureTerminalBackend(webContentsId: number) {
+   // here avoids bootstrapping a second SSH tunnel / remote dashboard.
+   if (windowRoute?.registryScoped && windowRoute.connectionId) {
+     return backendDialClaims.run(backendDialClaimKey(windowRoute.connectionId, windowRoute.profile), () =>
+-      ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)
++      ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile, '', { use: true })
+     )
+   }
+ 
+@@ -10644,7 +10644,7 @@ async function ensureRegistryBackend(
+   connectionId,
+   profile,
+   managedUpdateCorrelation = '',
+-  opts: { forceProbe?: boolean; passive?: boolean } = {}
++  opts: RegistryDialUseOpts = {}
+ ) {
+   const passive = Boolean(opts.passive)
+   const registry = readDesktopConnectionsRegistry()
+@@ -10670,9 +10670,9 @@ async function ensureRegistryBackend(
+     throw new Error(`Profile '${profileKey}' does not exist.`)
+   }
+ 
+-  if (source.kind === 'ssh' && !passive && !opts.forceProbe) {
+-    remoteWarmSet.recent.touch(id, profileKey)
+-    remoteWarmSet.holds.noteUse(backendScopeKey(id, profileKey))
++  // Only a dial made for a user action counts as use (prewarm recent set + 30-min hold); see registryDialCountsAsUse.
++  if (source.kind === 'ssh') {
++    remoteWarmSet.noteDial(id, profileKey, opts)
+   }
+ 
+   let resolvedRegistrySshConfig
+@@ -14144,6 +14144,9 @@ async function connectDesktopProfileRoute(route: DesktopProfileRoute, sender?: E
+ // ensureBackend when the v1 route is local, and attaches to this machine's
+ // canonical gateway when the v1 global mode is remote (the registry 'local'
+ // entry always means this machine) unless the profile is remote-only.
++// A renderer user action (open, new chat, send) on a registry route: the only renderer signal that counts as use.
++ipcMain.handle('hermes:remote:note-use', (_event, payload) => remoteWarmSet.noteUse(payload?.connectionId, payload?.profile))
++
+ ipcMain.handle('hermes:connection:for', async (event, payload) => {
+   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
+   const registry = readDesktopConnectionsRegistry()
+@@ -17247,7 +17250,7 @@ const terminalIpc = registerTerminalIpc({
+   gatewayTarget: owner => terminalGatewayTarget(owner, readDesktopConnectionsRegistry(), sshConnections),
+   ensureGatewayBackend: owner =>
+     backendDialClaims.run(backendScopeKey(owner.connectionId, owner.profile), () =>
+-      ensureRegistryBackend(owner.connectionId, owner.profile)
++      ensureRegistryBackend(owner.connectionId, owner.profile, '', { use: true })
+     )
+ })
+ 
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index a3e2d4de222..98a38aeaddd 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -55,6 +55,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+   getEmbedHostOrigin: () => ipcRenderer.invoke('hermes:embed-host:origin'),
+   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
+   getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),
++  // A user action (open, new chat, send) on a registry route: stamps the remote warm set (counts as use).
++  noteRemoteUse: payload => ipcRenderer.invoke('hermes:remote:note-use', payload),
+   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
+   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
+   // [daveey] Sidebar boot snapshot (cold start): read once, synchronously, before the backend is up.
+diff --git a/apps/desktop/electron/remote-warm-dispatch.test.ts b/apps/desktop/electron/remote-warm-dispatch.test.ts
+index 9237ab03375..5fec2213430 100644
+--- a/apps/desktop/electron/remote-warm-dispatch.test.ts
++++ b/apps/desktop/electron/remote-warm-dispatch.test.ts
+@@ -271,10 +271,11 @@ describe('main.ts wiring', () => {
+     expect(warmSet).toMatch(/HERMES_DESKTOP_REMOTE_PREWARM === '0' \? \[\] : prewarmTargets\(sshConnectionIds\(\), recent\)/)
+   })
+ 
+-  it('records a named profile on every user dispatch to an SSH connection, not on prewarm or passive calls', () => {
+-    expect(main).toMatch(
+-      /if \(source\.kind === 'ssh' && !passive && !opts\.forceProbe\) \{\n\s+remoteWarmSet\.recent\.touch\(id, profileKey\)\n\s+remoteWarmSet\.holds\.noteUse\(backendScopeKey\(id, profileKey\)\)/
+-    )
++  it('records a named profile only for a dial flagged as use (never a sweep, prewarm or passive call)', () => {
++    // A plain non-passive dial used to count, so a post-reconnect sweep stamped every listed profile
++    // (remote-warm-use.test.ts). The gate lives in remote-warm-set.ts noteDial/registryDialCountsAsUse.
++    expect(main).toMatch(/if \(source\.kind === 'ssh'\) \{\n\s+remoteWarmSet\.noteDial\(id, profileKey, opts\)/)
++    expect(warmSet).toMatch(/return opts\.use === true && !opts\.passive && !opts\.forceProbe/)
+   })
+ 
+   it('pooled dispatch skips the probe from the shared answer ledger unless forced', () => {
+diff --git a/apps/desktop/electron/remote-warm-set.ts b/apps/desktop/electron/remote-warm-set.ts
+index bbe06057e70..85a807a2f2b 100644
+--- a/apps/desktop/electron/remote-warm-set.ts
++++ b/apps/desktop/electron/remote-warm-set.ts
+@@ -4,6 +4,7 @@
+ // ACTIVE_USE_HOLD_MS).
+ import fs from 'node:fs'
+ 
++import { backendScopeKey } from './connection-registry'
+ import { prewarmTargetKey, prewarmTargets, RecentRemoteProfiles } from './remote-prewarm'
+ import { type SshKeepaliveHoldDeps, SshKeepaliveHolds } from './ssh-keepalive-hold'
+ 
+@@ -39,5 +40,38 @@ export function createRemoteWarmSet(deps: RemoteWarmSetDeps) {
+     log: deps.log
+   })
+ 
+-  return { holds, listTargets, recent }
++  // The one door that counts as use: it stamps the recent set (prewarm) and the 30-min keep-alive hold together.
++  // Only an SSH connection in the registry and a valid profile name count; anything else is a no-op.
++  const noteUse = (connectionId: unknown, profile: unknown): boolean => {
++    const id = String(connectionId ?? '').trim()
++    const name = String(profile ?? '').trim() || 'default'
++
++    if (!id || !USE_PROFILE_NAME_RE.test(name) || !sshConnectionIds().includes(id)) {
++      return false
++    }
++
++    recent.touch(id, name)
++    holds.noteUse(backendScopeKey(id, name))
++
++    return true
++  }
++
++  // ensureRegistryBackend's call for every SSH dial: stamps only when the dial was made for a user action.
++  const noteDial = (connectionId: unknown, profile: unknown, opts: RegistryDialUseOpts = {}): boolean =>
++    registryDialCountsAsUse(opts) && noteUse(connectionId, profile)
++
++  return { holds, listTargets, noteDial, noteUse, recent }
++}
++
++const USE_PROFILE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
++
++export type RegistryDialUseOpts = { forceProbe?: boolean; passive?: boolean; use?: boolean }
++
++// Whether an ensureRegistryBackend dial counts as the user using that profile. Only callers acting on a user's
++// action set `use` (opening a terminal on it). Every other dial is plumbing: a renderer socket (re)connect, a
++// sidebar/roster/session-list read, a media load, a post-resume redial, the prewarm probe. Those once counted, so
++// one reconnect sweep over a host's profiles stamped them all into the cap-4 prewarm set and pinned each for
++// 30 min. Renderer user actions (open, new chat, send) report use through `hermes:remote:note-use` instead.
++export function registryDialCountsAsUse(opts: RegistryDialUseOpts = {}): boolean {
++  return opts.use === true && !opts.passive && !opts.forceProbe
+ }
+diff --git a/apps/desktop/electron/remote-warm-use.test.ts b/apps/desktop/electron/remote-warm-use.test.ts
+new file mode 100644
+index 00000000000..c9c5e7c9375
+--- /dev/null
++++ b/apps/desktop/electron/remote-warm-use.test.ts
+@@ -0,0 +1,131 @@
++/**
++ * Only real use stamps the remote warm set. A post-reconnect sweep (every pooled hub-profile socket redialing in
++ * the same millisecond, roster and session-list reads) once ran ensureRegistryBackend non-passive for every listed
++ * profile, and each such dial touched the cap-4 prewarm recent set and took a 30-min keep-alive hold: four hub
++ * profiles ended up stamped with one timestamp, and a profile nobody dispatched to was respawned and kept warm.
++ */
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { createRemoteWarmSet, registryDialCountsAsUse } from './remote-warm-set'
++import { createSshIsolatedKeepaliveRegistry } from './ssh-isolated-keepalive'
++
++const HUB_PROFILES = ['bb-tuner', 'coach', 'research', 'alpha', 'designer', 'ops']
++const dirs: string[] = []
++
++afterEach(() => {
++  for (const dir of dirs.splice(0)) {
++    fs.rmSync(dir, { force: true, recursive: true })
++  }
++})
++
++function warmSet(recent: Record<string, Record<string, number>>) {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-warm-use-'))
++  dirs.push(dir)
++  const statePath = path.join(dir, 'remote-prewarm-profiles.json')
++  fs.writeFileSync(statePath, JSON.stringify(recent))
++  const keepalives = createSshIsolatedKeepaliveRegistry({ WebSocketImpl: class {} as any, reconnectDelayMs: 10 })
++  const setHeld = vi.spyOn(keepalives, 'setHeld')
++
++  const set = createRemoteWarmSet({
++    statePath: () => statePath,
++    readRegistry: () => ({
++      connections: [
++        { id: 'hermes-hub', kind: 'ssh' },
++        { id: 'local', kind: 'local' }
++      ]
++    }),
++    keepalives,
++    isPrimaryScope: () => false,
++    log: () => {}
++  })
++
++  return { set, setHeld, stateBytes: () => fs.readFileSync(statePath, 'utf8') }
++}
++
++describe('remote warm set: what counts as use', () => {
++  it('a reconnect sweep of N profiles touches neither the prewarm recent set nor the keep-alive hold', () => {
++    const stamped = Date.now() - 60 * 60_000
++    const { set, setHeld, stateBytes } = warmSet({ 'hermes-hub': { research: stamped } })
++    const before = stateBytes()
++
++    // What ensureRegistryBackend passes for a socket (re)connect, a ws-url mint, a roster/session-list read
++    // (no flag), a passive read and the prewarm probe (forceProbe).
++    for (const profile of HUB_PROFILES) {
++      expect(set.noteDial('hermes-hub', profile, {})).toBe(false)
++      expect(set.noteDial('hermes-hub', profile, { passive: true })).toBe(false)
++      expect(set.noteDial('hermes-hub', profile, { forceProbe: true })).toBe(false)
++    }
++
++    expect(stateBytes()).toBe(before)
++    expect(setHeld).not.toHaveBeenCalled()
++    expect(set.listTargets()).toEqual([
++      { connectionId: 'hermes-hub', profile: 'default' },
++      { connectionId: 'hermes-hub', profile: 'research' }
++    ])
++    expect(set.holds.shouldHold('conn:hermes-hub::bb-tuner')).toBe(false)
++  })
++
++  it('a real dispatch (renderer note-use, or a dial flagged use) stamps the recent set and holds the scope', () => {
++    const { set, setHeld, stateBytes } = warmSet({})
++
++    expect(set.noteUse('hermes-hub', 'bb-tuner')).toBe(true)
++    expect(JSON.parse(stateBytes())['hermes-hub']).toHaveProperty('bb-tuner')
++    expect(setHeld).toHaveBeenCalledWith('conn:hermes-hub::bb-tuner', true)
++    expect(set.holds.shouldHold('conn:hermes-hub::bb-tuner')).toBe(true)
++
++    expect(set.noteDial('hermes-hub', 'coach', { use: true })).toBe(true)
++    expect(JSON.parse(stateBytes())['hermes-hub']).toHaveProperty('coach')
++    expect(setHeld).toHaveBeenCalledWith('conn:hermes-hub::coach', true)
++  })
++
++  it('note-use is a no-op for a non-SSH or unknown connection and an invalid profile name', () => {
++    const { set, setHeld, stateBytes } = warmSet({})
++    const before = stateBytes()
++
++    expect(set.noteUse('local', 'research')).toBe(false)
++    expect(set.noteUse('nope', 'research')).toBe(false)
++    expect(set.noteUse('hermes-hub', 'default@hermes-hub')).toBe(false)
++    expect(set.noteUse('', 'research')).toBe(false)
++
++    expect(stateBytes()).toBe(before)
++    expect(setHeld).not.toHaveBeenCalled()
++  })
++
++  it('registryDialCountsAsUse: only an explicit use flag on a non-passive, non-probe dial', () => {
++    expect(registryDialCountsAsUse()).toBe(false)
++    expect(registryDialCountsAsUse({})).toBe(false)
++    expect(registryDialCountsAsUse({ use: true })).toBe(true)
++    expect(registryDialCountsAsUse({ use: true, passive: true })).toBe(false)
++    expect(registryDialCountsAsUse({ use: true, forceProbe: true })).toBe(false)
++  })
++})
++
++describe('main.ts wiring', () => {
++  const main = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
++
++  it('ensureRegistryBackend stamps only through noteDial (no unconditional touch / noteUse left)', () => {
++    expect(main).toContain('remoteWarmSet.noteDial(id, profileKey, opts)')
++    expect(main).not.toMatch(/remoteWarmSet\.recent\.touch\(/)
++    expect(main).not.toMatch(/remoteWarmSet\.holds\.noteUse\(/)
++  })
++
++  it('the renderer note-use door is wired to the warm set', () => {
++    expect(main).toMatch(
++      /ipcMain\.handle\('hermes:remote:note-use',[^\n]*remoteWarmSet\.noteUse\(payload\?\.connectionId, payload\?\.profile\)/
++    )
++  })
++
++  it('socket dials, ws-url mints and REST reads pass no use flag', () => {
++    expect(main).toMatch(
++      /const connection = await ensureRegistryBackend\(payload\?\.connectionId, payload\?\.profile\)\n/
++    )
++    expect(main).toContain('ensureRegistryBackend(registryConnectionId, routeProfile)\n')
++    expect(main).toContain(
++      'route.connectionId ? ensureRegistryBackend(route.connectionId, route.profile) : ensureBackend(route.profile)'
++    )
++  })
++})
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index c1e8affe758..0f2c3909644 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -44,6 +44,9 @@ declare global {
+         connectionId?: null | string
+         profile?: null | string
+       }) => Promise<HermesConnection>
++      // A user action (open, new chat, send) on a registry route: the one renderer signal Desktop main counts as
++      // use of that remote profile (prewarm recent set + 30-min keep-alive hold). Plain dials and reads never count.
++      noteRemoteUse?: (payload: { connectionId: string; profile: string }) => Promise<boolean>
+       // Registry-scoped fresh WS URL (same result contract as getGatewayWsUrl).
+       getGatewayWsUrlFor?: (payload: {
+         connectionId?: null | string
+diff --git a/apps/desktop/src/store/gateway-remote-use.test.ts b/apps/desktop/src/store/gateway-remote-use.test.ts
+new file mode 100644
+index 00000000000..eca137e28dd
+--- /dev/null
++++ b/apps/desktop/src/store/gateway-remote-use.test.ts
+@@ -0,0 +1,172 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] What the renderer reports as use of a remote profile (store/remote-use → hermes:remote:note-use).
++// After the hub's default backend reconnected, every pooled hub-profile socket redialed in the same millisecond
++// (reconnectSecondaryGateways / the per-entry reconnect ladder → hermes:connection:for + ws-url-for per profile),
++// and Desktop main counted each of those dials as use: every listed profile got stamped into the cap-4 prewarm
++// set and a 30-min keep-alive hold. Dials and background reads must never report use; user actions must.
++
++const gatewayMocks = vi.hoisted(() => ({
++  instances: [] as Array<{ connectionState: string }>,
++  connect: vi.fn(async (_wsUrl: string): Promise<void> => undefined),
++  setConnection: vi.fn(),
++  setGatewayState: vi.fn()
++}))
++
++vi.mock('@/hermes', () => ({
++  setApiRequestConnection: vi.fn(),
++  HermesGateway: class {
++    connectionState = 'closed'
++    constructor() {
++      gatewayMocks.instances.push(this)
++    }
++    connect = async (wsUrl: string): Promise<void> => {
++      await gatewayMocks.connect(wsUrl)
++      this.connectionState = 'open'
++    }
++    close = (): void => {
++      this.connectionState = 'closed'
++    }
++    request = async (): Promise<unknown> => ({})
++    onEvent = vi.fn(() => () => {})
++    onState = vi.fn(() => () => {})
++  }
++}))
++vi.mock('@/store/session', () => ({
++  setConnection: gatewayMocks.setConnection,
++  setGatewayState: gatewayMocks.setGatewayState
++}))
++vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() }))
++
++const {
++  closeSecondaryGateways,
++  configureGatewayRegistry,
++  openGatewayForAgent,
++  reconnectSecondaryGateways,
++  requestGatewayForAgent,
++  retainGatewayForAgent,
++  retainGatewayForSessionTurn,
++  setPrimaryGateway,
++  setPrimaryGatewayConnectionId
++} = await import('./gateway')
++
++const { _resetRemoteUseForTests } = await import('./remote-use')
++
++const HUB = 'hermes-hub'
++const HUB_PROFILES = ['bb-tuner', 'coach', 'research', 'alpha']
++
++const hubConn = {
++  authMode: 'token',
++  baseUrl: 'http://127.0.0.1:50001',
++  mode: 'remote',
++  profile: 'default',
++  token: 'fake-test-token',
++  wsUrl: 'ws://127.0.0.1:50001/api/ws?token=fake-test-token'
++}
++
++let desktop: {
++  getConnection: ReturnType<typeof vi.fn>
++  getConnectionFor: ReturnType<typeof vi.fn>
++  getGatewayWsUrlFor: ReturnType<typeof vi.fn>
++  noteRemoteUse: ReturnType<typeof vi.fn>
++}
++
++beforeEach(() => {
++  configureGatewayRegistry({ onEvent: vi.fn() })
++  setPrimaryGateway({ connectionState: 'open' } as never, 'default')
++  desktop = {
++    getConnection: vi.fn(async () => hubConn),
++    getConnectionFor: vi.fn(async () => hubConn),
++    getGatewayWsUrlFor: vi.fn(async () => hubConn.wsUrl),
++    noteRemoteUse: vi.fn(async () => true)
++  }
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = desktop
++  gatewayMocks.instances.length = 0
++  _resetRemoteUseForTests()
++})
++
++afterEach(() => {
++  closeSecondaryGateways()
++  vi.clearAllMocks()
++  delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
++})
++
++const flush = async () => {
++  for (let i = 0; i < 10; i += 1) {
++    await Promise.resolve()
++  }
++}
++
++describe('remote profile use reporting', () => {
++  it('a post-reconnect sweep of N pooled hub profiles redials each one but reports no use', async () => {
++    // Pooled hub-profile sockets held by background surfaces (roster, sidebar, relay).
++    const releases: Array<() => void> = []
++
++    for (const profile of HUB_PROFILES) {
++      releases.push(await retainGatewayForAgent(HUB, profile))
++    }
++
++    expect(desktop.getConnectionFor).toHaveBeenCalledTimes(HUB_PROFILES.length)
++
++    // The hub tunnel drops: every pooled socket is closed. The primary's reconnect then sweeps them all.
++    for (const gateway of gatewayMocks.instances) {
++      gateway.connectionState = 'closed'
++    }
++
++    const dialed = () =>
++      [...desktop.getConnectionFor.mock.calls, ...desktop.getGatewayWsUrlFor.mock.calls].map(
++        ([payload]) => (payload as { profile: string }).profile
++      )
++
++    desktop.getConnectionFor.mockClear()
++    desktop.getGatewayWsUrlFor.mockClear()
++    reconnectSecondaryGateways()
++    await flush()
++    await vi.waitFor(() => expect(new Set(dialed())).toEqual(new Set(HUB_PROFILES)), { timeout: 15_000 })
++
++    // Background reads on the reopened sockets (session lists, roster) do not count either.
++    for (const profile of HUB_PROFILES) {
++      await requestGatewayForAgent(HUB, profile, 'session.list', {})
++    }
++
++    releases.forEach(release => release())
++    expect(desktop.noteRemoteUse).not.toHaveBeenCalled()
++  })
++
++  it('a real dispatch reports use: foreground open / create, and a routed prompt.submit turn', async () => {
++    await openGatewayForAgent(HUB, 'bb-tuner', { spawnPriority: 'foreground' })
++    expect(desktop.noteRemoteUse).toHaveBeenLastCalledWith({ connectionId: HUB, profile: 'bb-tuner' })
++
++    await requestGatewayForAgent(HUB, 'coach', 'session.create', {}, undefined, undefined, {
++      spawnPriority: 'foreground'
++    })
++    expect(desktop.noteRemoteUse).toHaveBeenLastCalledWith({ connectionId: HUB, profile: 'coach' })
++
++    const release = await retainGatewayForAgent(HUB, 'alpha', { spawnPriority: 'foreground' })
++    release()
++    expect(desktop.noteRemoteUse).toHaveBeenLastCalledWith({ connectionId: HUB, profile: 'alpha' })
++
++    const releaseTurn = await retainGatewayForSessionTurn(HUB, 'research', 'session-1')
++    releaseTurn()
++    expect(desktop.noteRemoteUse).toHaveBeenLastCalledWith({ connectionId: HUB, profile: 'research' })
++
++    expect(desktop.noteRemoteUse).toHaveBeenCalledTimes(4)
++  })
++
++  it('repeat sends on one route report at most once a minute; a bare profile route never reports', async () => {
++    await retainGatewayForSessionTurn(HUB, 'research', 'session-1').then(release => release())
++    await retainGatewayForSessionTurn(HUB, 'research', 'session-2').then(release => release())
++    await openGatewayForAgent(null, 'research', { spawnPriority: 'foreground' })
++
++    expect(desktop.noteRemoteUse).toHaveBeenCalledTimes(1)
++  })
++
++  it("a send on the window's own (remote primary) gateway is a use of the primary's route", async () => {
++    setPrimaryGateway({ connectionState: 'open' } as never, 'research')
++    setPrimaryGatewayConnectionId(HUB, 'remote')
++
++    await retainGatewayForSessionTurn(null, 'research', 'session-1').then(release => release())
++
++    expect(desktop.noteRemoteUse).toHaveBeenCalledExactlyOnceWith({ connectionId: HUB, profile: 'research' })
++  })
++})
+diff --git a/apps/desktop/src/store/gateway.ts b/apps/desktop/src/store/gateway.ts
+index 6c485846320..602cfebe130 100644
+--- a/apps/desktop/src/store/gateway.ts
++++ b/apps/desktop/src/store/gateway.ts
+@@ -42,6 +42,7 @@ import type { Secondary } from '@/store/gateway-socket-entry'
+ import { notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
+ import { markNativeNotifyBaseline } from '@/store/notify-baseline'
+ import { requestAfterPrimaryRecovery } from '@/store/primary-gateway-recovery'
++import { noteRemoteUse } from '@/store/remote-use'
+ import { setConnection, setGatewayState } from '@/store/session'
+ import { stampSecondaryProfileOwner } from '@/store/session-event-provenance'
+ export { useGatewayActivationEpoch } from '@/store/gateway-activation-epoch'
+@@ -65,6 +66,15 @@ const normKey = (profile: string | null | undefined): string => (profile ?? '').
+ // distinguishable from ambient hydration at the call site.
+ export type SpawnPriority = 'foreground' | 'background'
+ 
++// [daveey] 'foreground' marks a user gesture (open, new chat, Bot Chat open): that, not the dial it may cause, is
++// what counts as use of a remote profile (store/remote-use). Background reads and reconnect sweeps never count.
++// A null connection id is a plain profile route on the window's own source: a use of the primary's connection.
++function noteForegroundUse(connectionId: null | string, profile: string, spawnPriority: SpawnPriority): void {
++  if (spawnPriority === 'foreground') {
++    noteRemoteUse(connectionId ?? primaryConnectionId(), normKey(profile))
++  }
++}
++
+ // Read connection state through a call so TS control-flow analysis doesn't
+ // narrow the getter to a constant across guards (it genuinely changes).
+ const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionState === 'open'
+@@ -1164,6 +1174,8 @@ export async function requestGatewayForAgent<T>(
+   const key = normKey(profile)
+   const scope = registryBackendScopeKey(connectionId, key)
+ 
++  noteForegroundUse(connectionId, key, spawnPriority)
++
+   if (scope === key) {
+     return requestGatewayForProfile<T>(key, method, params, timeoutMs, signal, { spawnPriority })
+   }
+@@ -1395,6 +1407,8 @@ export async function retainGatewayForAgent(
+   const key = normKey(profile)
+   const scope = registryBackendScopeKey(connectionId, key)
+ 
++  noteForegroundUse(connectionId, key, spawnPriority)
++
+   if (scope === key) {
+     // Plain-profile route: gatewayForProfile's request lease IS the retain —
+     // hold it until the caller releases.
+@@ -1515,6 +1529,10 @@ export async function retainGatewayForSessionTurn(
+   profile: string,
+   sessionId: string
+ ): Promise<() => void> {
++  // Only a prompt.submit reaches here (session-request-router): the user's send counts as use of the route. A
++  // send on the window's own gateway arrives with a null connection id; it is a use of the primary's route.
++  noteRemoteUse(connectionId ?? primaryConnectionId(), normKey(profile))
++
+   // Primary events do not flow through a Secondary's terminal-event listener.
+   // Registering a no-op lease here would leave a phantom key that can suppress
+   // the real hold if this route is later re-homed as a secondary.
+@@ -1666,6 +1684,8 @@ export async function openGatewayForAgent(
+ ): Promise<void> {
+   const scope = registryBackendScopeKey(connectionId, profile)
+ 
++  noteForegroundUse(connectionId, profile, spawnPriority)
++
+   if (scope === normKey(profile) || isPrimaryRegistryRoute(connectionId, profile)) {
+     return openGatewayForProfile(profile, { spawnPriority })
+   }
+diff --git a/apps/desktop/src/store/profile.ts b/apps/desktop/src/store/profile.ts
+index c3b3d82088b..bbe772e43ad 100644
+--- a/apps/desktop/src/store/profile.ts
++++ b/apps/desktop/src/store/profile.ts
+@@ -31,6 +31,7 @@ import {
+ import { notifyError } from '@/store/notifications'
+ import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
+ import { exitProjectScope } from '@/store/project-scope'
++import { noteRemoteUse } from '@/store/remote-use'
+ import { $connection, clearComposerSelectionOwner, setComposerSelectionOwner, setConnection } from '@/store/session'
+ import type { SessionOwnerRoute } from '@/store/session-request-router'
+ import { reloadOpenStarmapGraph, resetStarmapGraph } from '@/store/starmap'
+@@ -890,6 +891,9 @@ export async function ensureGatewayAgent(
+ 
+     // Descriptor resolves concurrently with the dial, same as the profile
+     // path, so no await sits between the activation and the publication.
++    // An activation the user chose counts as use of that remote profile (store/remote-use); a redial does not.
++    noteRemoteUse(connection, target)
++
+     const activation = signal
+       ? ensureGatewayForAgent(connection, target, { signal })
+       : ensureGatewayForAgent(connection, target)
+diff --git a/apps/desktop/src/store/remote-use.ts b/apps/desktop/src/store/remote-use.ts
+new file mode 100644
+index 00000000000..7c0bdcd64d2
+--- /dev/null
++++ b/apps/desktop/src/store/remote-use.ts
+@@ -0,0 +1,43 @@
++// [daveey] The renderer's one "the user used this remote profile" signal.
++//
++// Desktop main keeps a bounded remote warm set per SSH gateway: default plus the profiles used in the last 24 h
++// (prewarmed at startup, cap 4), each also held by a 30-min keep-alive. Main used to count every non-passive dial
++// as use, so a post-reconnect sweep (every pooled secondary socket redialing at once, roster and session-list
++// reads) stamped every listed profile and decided the cap-4 set by tie order. Now dials never count. Only user
++// actions on a registry route do: opening a session, a new chat, a send, an activation the user chose. Each of
++// those calls noteRemoteUse, which main validates (SSH connection, real profile name) before stamping.
++
++const NOTE_USE_THROTTLE_MS = 60_000
++
++const lastNoted = new Map<string, number>()
++
++/** Report a user action on (connectionId, profile). No-op for a bare/legacy route; at most once a minute per scope. */
++export function noteRemoteUse(connectionId: null | string | undefined, profile: null | string | undefined): void {
++  const id = String(connectionId ?? '').trim()
++  const name = String(profile ?? '').trim() || 'default'
++  const report = typeof window === 'undefined' ? undefined : window.hermesDesktop?.noteRemoteUse
++
++  if (!id || typeof report !== 'function') {
++    return
++  }
++
++  const key = `${id}\u0000${name}`
++  const now = Date.now()
++
++  if (now - (lastNoted.get(key) ?? -Infinity) < NOTE_USE_THROTTLE_MS) {
++    return
++  }
++
++  lastNoted.set(key, now)
++
++  // Best effort: an older main without the handler (or a failed IPC) must never fail the user's action.
++  try {
++    void Promise.resolve(report({ connectionId: id, profile: name })).catch(() => undefined)
++  } catch {
++    void 0
++  }
++}
++
++export function _resetRemoteUseForTests(): void {
++  lastNoted.clear()
++}
+-- 
+2.55.0
+

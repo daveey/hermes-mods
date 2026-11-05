@@ -1,0 +1,268 @@
+From 4315fe13b99ecb834885548b75b4d7a6858ede84 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 23:16:57 +0000
+Subject: [PATCH] [daveey] Defer the client-active latch a busy shared-metrics
+ store cannot take
+
+The once-per-interval latch (client_active, install_snapshot) wrote through a
+bare _write(), so another process holding the store past the 250 ms user-path
+busy timeout raised `database is locked` out of session start. Every counter
+write already defers through _write_or_defer instead. Route the latch through
+the same deferral: it returns False at once, and the queued compare-and-set
+re-reads the clock and state row inside its eventual transaction (next write,
+export drain or exit drain), so the install is still recorded at most once per
+24 h. The busy-timeout contract and the dedup semantics are unchanged.
+
+Fixes the recurring CI failure of
+test_cross_process_client_active_attempts_record_one_install (a loaded runner
+holding one child's write > 250 ms). Adds deterministic held-store tests,
+in-process and cross-process, that fail with the CI stack before this change.
+
+A latch failing for a reason other than contention (now possible inside the
+deferred batch) drops only itself: _write_or_defer re-queues the earlier
+deferred writes for any exception, not only OperationalError.
+---
+ hermes_cli/observability/shared_metrics.py    |  77 ++++++++-----
+ tests/hermes_cli/test_relay_shared_metrics.py | 107 ++++++++++++++++++
+ 2 files changed, 155 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_cli/observability/shared_metrics.py b/hermes_cli/observability/shared_metrics.py
+index 5e8988f3146..b150dfa9588 100644
+--- a/hermes_cli/observability/shared_metrics.py
++++ b/hermes_cli/observability/shared_metrics.py
+@@ -250,33 +250,50 @@ class SharedMetricsStore:
+         self, state_key: str, metric_name: str, dimensions: dict[str, str],
+         resource: dict[str, str],
+     ) -> bool:
+-        """Transactional compare-and-set latch shared by concurrent Hermes processes."""
++        """Transactional compare-and-set latch shared by concurrent Hermes processes. True only when
++        this call recorded the metric; a store another writer holds past the short busy timeout
++        defers the compare-and-set (False) to the next write or the exit drain."""
+         self._validate_counter(metric_name, dimensions, resource)
+-        now = _utc_now()
+-        with self._write() as connection:
+-            row = connection.execute(
+-                "SELECT value FROM telemetry_state WHERE key = ?", (state_key,)
+-            ).fetchone()
+-            last_recorded = self._parse_state_timestamp(row["value"]) if row is not None else None
+-            if last_recorded is not None and last_recorded > now:
+-                # A wall-clock correction must not suppress activity until the stale future
+-                # timestamp plus another full interval.
+-                connection.execute(
+-                    "UPDATE telemetry_state SET value = ? WHERE key = ?",
+-                    (_isoformat(now), state_key),
+-                )
+-                return False
+-            if last_recorded is not None and now < last_recorded + _ACTIVE_INSTALL_INTERVAL:
+-                return False
+-            self._install_id(connection)
+-            self._record_counter_in_transaction(
+-                connection, metric_name, dimensions, resource, now.date().isoformat()
++        recorded = False
++
++        def latch(connection: sqlite3.Connection) -> None:
++            nonlocal recorded
++            recorded = self._latch_once_per_interval(
++                connection, state_key, metric_name, dimensions, resource
+             )
++
++        return self._write_or_defer(latch) and recorded
++
++    def _latch_once_per_interval(
++        self, connection: sqlite3.Connection, state_key: str, metric_name: str,
++        dimensions: dict[str, str], resource: dict[str, str],
++    ) -> bool:
++        # The clock is read inside the transaction: a deferred latch compares against what other
++        # processes committed meanwhile, never against its own stale attempt time.
++        now = _utc_now()
++        row = connection.execute(
++            "SELECT value FROM telemetry_state WHERE key = ?", (state_key,)
++        ).fetchone()
++        last_recorded = self._parse_state_timestamp(row["value"]) if row is not None else None
++        if last_recorded is not None and last_recorded > now:
++            # A wall-clock correction must not suppress activity until the stale future
++            # timestamp plus another full interval.
+             connection.execute(
+-                "INSERT INTO telemetry_state(key, value) VALUES (?, ?)"
+-                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+-                (state_key, _isoformat(now)),
++                "UPDATE telemetry_state SET value = ? WHERE key = ?",
++                (_isoformat(now), state_key),
+             )
++            return False
++        if last_recorded is not None and now < last_recorded + _ACTIVE_INSTALL_INTERVAL:
++            return False
++        self._install_id(connection)
++        self._record_counter_in_transaction(
++            connection, metric_name, dimensions, resource, now.date().isoformat()
++        )
++        connection.execute(
++            "INSERT INTO telemetry_state(key, value) VALUES (?, ?)"
++            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
++            (state_key, _isoformat(now)),
++        )
+         return True
+ 
+     def record_counter(
+@@ -431,18 +448,19 @@ class SharedMetricsStore:
+                 break
+         return self._export_and_prune()
+ 
+-    def _write_or_defer(self, write: Callable[[sqlite3.Connection], None]) -> None:
+-        """Run ``write`` (after any deferred ones) in one write transaction. A store another writer
+-        holds past the short busy timeout keeps them in memory for the next write or process exit
+-        instead of losing them or stalling the caller."""
++    def _write_or_defer(self, write: Callable[[sqlite3.Connection], None]) -> bool:
++        """Run ``write`` (after any deferred ones) in one write transaction; True once committed. A
++        store another writer holds past the short busy timeout keeps them in memory for the next
++        write or process exit instead of losing them or stalling the caller (False)."""
+         with self._deferred_lock:
+             pending, self._deferred = [*self._deferred, write], []
+         try:
+             with self._write() as connection:
+                 for item in pending:
+                     item(connection)
+-        except sqlite3.OperationalError as exc:
+-            busy = "locked" in str(exc) or "busy" in str(exc)
++            return True
++        except Exception as exc:
++            busy = isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc) or "busy" in str(exc))
+             with self._deferred_lock:
+                 # A failure that is not contention drops only this write: the earlier ones stay queued.
+                 self._deferred = [*(pending if busy else pending[:-1]), *self._deferred][-_DEFERRED_WRITES_MAX:]
+@@ -453,6 +471,7 @@ class SharedMetricsStore:
+                     _DEFERRING_STORES.append(self)
+             if not busy:
+                 raise
++            return False
+ 
+     def drain_deferred(self, busy_timeout_ms: int = _SCHEMA_BUSY_TIMEOUT_MS) -> None:
+         """Write the deferred writes (process exit / export waits longer than the user's path does)."""
+diff --git a/tests/hermes_cli/test_relay_shared_metrics.py b/tests/hermes_cli/test_relay_shared_metrics.py
+index 82adcfda7aa..a351a984ef1 100644
+--- a/tests/hermes_cli/test_relay_shared_metrics.py
++++ b/tests/hermes_cli/test_relay_shared_metrics.py
+@@ -163,6 +163,22 @@ def _record_client_active_in_process(
+     store.record_client_active(_resource())
+ 
+ 
++def _record_client_active_against_held_store(
++    database_path: str,
++    outbox_directory: str,
++    ready: Any,
++    held: Any,
++    attempted: Any,
++) -> None:
++    store = SharedMetricsStore(Path(database_path), Path(outbox_directory))
++    ready.set()
++    try:
++        assert held.wait(timeout=60)
++        store.record_client_active(_resource())
++    finally:
++        attempted.set()
++
++
+ def test_model_call_counter_survives_restart_and_exports_only_new_deltas(tmp_path):
+     database_path = tmp_path / "metrics.sqlite3"
+     outbox_directory = tmp_path / "outbox"
+@@ -1692,6 +1708,97 @@ def test_cross_process_client_active_attempts_record_one_install(tmp_path):
+     assert active["value"] == 1
+ 
+ 
++def test_client_active_the_busy_store_cannot_take_is_deferred_then_latched_once(tmp_path):
++    """A writer holding the store past the 250 ms busy timeout: the session-start latch returns at
++    once without raising, and the deferred compare-and-set lands later at most once."""
++    database_path = tmp_path / "metrics.sqlite3"
++    store = SharedMetricsStore(database_path, tmp_path / "outbox")
++    other = SharedMetricsStore(database_path, tmp_path / "outbox")
++    blocker = sqlite3.connect(database_path)
++    blocker.execute("BEGIN IMMEDIATE")
++    try:
++        assert store.record_client_active(_resource()) is False
++        assert other.record_client_active(_resource()) is False
++    finally:
++        blocker.rollback()
++        blocker.close()
++    assert store.counter_snapshot() == []
++    store.drain_deferred()
++    other.drain_deferred()
++    [active] = store.counter_snapshot()
++    assert active["metric_name"] == CLIENT_ACTIVE_METRIC
++    assert active["value"] == 1
++    assert store.record_client_active(_resource()) is False
++    assert store.counter_snapshot()[0]["value"] == 1
++
++
++def test_a_failing_latch_drops_only_itself_not_the_deferred_writes(tmp_path, monkeypatch):
++    """A latch that fails for a reason other than contention raises and is dropped; the writes
++    deferred before it stay queued for the next write."""
++    database_path = tmp_path / "metrics.sqlite3"
++    store = SharedMetricsStore(database_path, tmp_path / "outbox")
++    blocker = sqlite3.connect(database_path)
++    blocker.execute("BEGIN IMMEDIATE")
++    try:
++        store.record_model_call(_dimensions(), _resource())
++    finally:
++        blocker.rollback()
++        blocker.close()
++
++    def broken_install_id(connection):
++        raise RuntimeError("install id unavailable")
++
++    monkeypatch.setattr(store, "_install_id", broken_install_id)
++    with pytest.raises(RuntimeError):
++        store.record_client_active(_resource())
++    monkeypatch.undo()
++    store.drain_deferred()
++    [model_calls] = store.counter_snapshot()
++    assert model_calls["metric_name"] == MODEL_ROUTE_METRIC
++    assert model_calls["value"] == 1
++
++
++def test_cross_process_client_active_held_past_busy_timeout_records_one_install(tmp_path):
++    """Deterministic form of the cross-process race: the store is held past the busy timeout while
++    both processes attempt, so neither may fail, and the exit drains latch the install once."""
++    database_path = tmp_path / "metrics.sqlite3"
++    outbox_directory = tmp_path / "outbox"
++    SharedMetricsStore(database_path, outbox_directory)
++    context = mp.get_context("spawn")
++    held = context.Event()
++    readies = [context.Event() for _ in range(2)]
++    attempts = [context.Event() for _ in range(2)]
++    processes = [
++        context.Process(
++            target=_record_client_active_against_held_store,
++            args=(str(database_path), str(outbox_directory), ready, held, attempted),
++        )
++        for ready, attempted in zip(readies, attempts)
++    ]
++    for process in processes:
++        process.start()
++    # Each process opens its store (a schema write) before the store is held.
++    for ready in readies:
++        assert ready.wait(timeout=60)
++    blocker = sqlite3.connect(database_path)
++    blocker.execute("BEGIN IMMEDIATE")
++    try:
++        held.set()
++        for attempted in attempts:
++            assert attempted.wait(timeout=60)
++    finally:
++        blocker.rollback()
++        blocker.close()
++    for process in processes:
++        process.join(timeout=60)
++        assert not process.is_alive()
++        assert process.exitcode == 0
++
++    [active] = SharedMetricsStore(database_path, outbox_directory).counter_snapshot()
++    assert active["metric_name"] == CLIENT_ACTIVE_METRIC
++    assert active["value"] == 1
++
++
+ def test_schema_initialization_waits_for_an_existing_writer(tmp_path, monkeypatch):
+     database_path = tmp_path / "metrics.sqlite3"
+     outbox_directory = tmp_path / "outbox"
+-- 
+2.55.0
+

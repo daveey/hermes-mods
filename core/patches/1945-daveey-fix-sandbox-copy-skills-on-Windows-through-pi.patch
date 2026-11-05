@@ -1,0 +1,966 @@
+From 36faa0d1735450a38873f025eae69be50e95e9cd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 17:39:48 +0000
+Subject: [PATCH] [daveey] fix(sandbox): copy skills on Windows through pinned,
+ reparse-refusing handles
+
+Windows has no O_NOFOLLOW/dir_fd opens, so the anchored copy was withheld there and
+every Docker skills mount came up empty (regression vs. the path-based copy).
+
+tools/credential_files_windows.py walks the tree through CreateFileW handles opened
+with FILE_FLAG_OPEN_REPARSE_POINT and without FILE_SHARE_DELETE: every directory from
+the drive root down, and each file while it is read, stays open so it cannot be renamed
+or replaced mid-read. Each handle must be non-reparse, of the expected type, match the
+listed (st_dev, st_ino), and have GetFinalPathNameByHandleW equal to the expected path.
+A root that cannot be pinned yields nothing; a platform with neither mechanism still
+gets an empty copy (fail closed), never a path-following one.
+
+Tests: race tests run through both the POSIX walk and a Linux emulation of the handle
+API (reparse/identity/final-path checks; emulation cannot model share modes). Real
+Win32 tests (junction swaps, renames refused while pinned, clean-tree copy, read-only
+refresh) are platforms("windows") and have not run natively: the fork's tests-os lane
+is disabled.
+---
+ tests/tools/pinned_handles_emulation.py  |  55 ++++
+ tests/tools/test_skills_copy_race.py     |  51 ++--
+ tests/tools/test_skills_copy_windows.py  | 305 +++++++++++++++++++++++
+ tools/credential_files.py                |  86 +++++--
+ tools/credential_files_windows.py        | 231 +++++++++++++++++
+ website/docs/user-guide/configuration.md |   2 +-
+ 6 files changed, 686 insertions(+), 44 deletions(-)
+ create mode 100644 tests/tools/pinned_handles_emulation.py
+ create mode 100644 tests/tools/test_skills_copy_windows.py
+ create mode 100644 tools/credential_files_windows.py
+
+diff --git a/tests/tools/pinned_handles_emulation.py b/tests/tools/pinned_handles_emulation.py
+new file mode 100644
+index 00000000000..35f3e535480
+--- /dev/null
++++ b/tests/tools/pinned_handles_emulation.py
+@@ -0,0 +1,55 @@
++"""A Linux stand-in for ``tools.credential_files_windows.Win32Handles``.
++
++It mirrors the Win32 semantics the pinned walk relies on, with one exception:
++
++* Ancestors are followed (``CreateFileW`` follows reparse points above the last component).
++* The last component is opened as itself (``FILE_FLAG_OPEN_REPARSE_POINT``). A symlink comes
++  back as an ``O_PATH`` fd whose ``fstat`` reports ``S_IFLNK``.
++* ``final_path`` reads ``/proc/self/fd`` (``GetFinalPathNameByHandleW``).
++
++The exception: Linux has no share modes, so a held fd does **not** stop a rename. Tests that
++use this emulation therefore exercise the walk's reparse, identity and final-path checks
++without the pinning. Real pinning is covered only by the Windows-only tests.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++
++AVAILABLE = sys.platform.startswith("linux") and os.path.isdir("/proc/self/fd") and hasattr(os, "O_PATH")
++
++
++class LinuxPinnedHandles:
++    def __init__(self) -> None:
++        self._opened: dict[int, tuple[str, tuple[int, int]]] = {}  # fd -> (path, identity)
++        self.file_opens: list[tuple[str, set[str]]] = []  # (file path, paths still held then)
++
++    def open_pinned(self, path: str, directory: bool) -> int:
++        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | (os.O_DIRECTORY if directory else 0)
++        if not directory:
++            self.file_opens.append((path, set(self.held())))
++        try:
++            fd = os.open(path, flags)
++        except OSError:
++            if not os.path.islink(path):
++                raise
++            fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)  # the reparse point itself
++        st = os.fstat(fd)
++        self._opened[fd] = (path, (st.st_dev, st.st_ino))
++        return fd
++
++    def final_path(self, fd: int) -> str:
++        return os.readlink(f"/proc/self/fd/{fd}")
++
++    def held(self) -> list[str]:
++        """Paths opened through this API whose fd is still open (on the same object)."""
++        out = []
++        for fd, (path, ident) in self._opened.items():
++            try:
++                st = os.fstat(fd)
++            except OSError:
++                continue
++            if (st.st_dev, st.st_ino) == ident:
++                out.append(path)
++        return out
+diff --git a/tests/tools/test_skills_copy_race.py b/tests/tools/test_skills_copy_race.py
+index 5ce1668b9d6..cf09ad49452 100644
+--- a/tests/tools/test_skills_copy_race.py
++++ b/tests/tools/test_skills_copy_race.py
+@@ -10,6 +10,11 @@ docker refresh tick re-runs the copy, so the race could be retried without limit
+ Each test swaps deterministically from inside the walk's deny predicate, i.e. after the
+ entry was enumerated and vetted and before it is opened, and asserts no secret byte ever
+ reaches the copy.
++
++The race tests run twice: through the POSIX anchored walk, and through the Windows pinned
++walk driven by a Linux emulation of its handle API (``pinned_handles_emulation``). The
++emulation cannot hold a rename off (no share modes on Linux), so there the swap really
++happens and the walk's reparse, identity and final-path checks must catch it.
+ """
+ 
+ from __future__ import annotations
+@@ -22,6 +27,7 @@ from pathlib import Path
+ import pytest
+ 
+ import tools.credential_files as cf
++from tests.tools import pinned_handles_emulation as emulation
+ 
+ SECRET = "TOP-SECRET-HOST-TOKEN"
+ 
+@@ -31,6 +37,18 @@ def posix_only(test):
+         pytest.mark.skipif(not cf._ANCHORED_COPY_SUPPORTED, reason="needs O_NOFOLLOW + dir_fd opens")(test))
+ 
+ 
++@pytest.fixture(params=["anchored", "pinned"])
++def walker(request, monkeypatch):
++    """Which race-free walk the copy uses: POSIX dir_fd anchoring, or Windows handle pinning
++    (emulated on Linux; real pinning is in test_skills_copy_windows.py, Windows-only)."""
++    if request.param == "pinned":
++        if not emulation.AVAILABLE:
++            pytest.skip("the pinned-handle emulation needs Linux /proc and O_PATH")
++        monkeypatch.setattr(cf, "_ANCHORED_COPY_SUPPORTED", False)
++        monkeypatch.setattr(cf, "_WINDOWS_HANDLE_API", emulation.LinuxPinnedHandles())
++    return request.param
++
++
+ @pytest.mark.platforms("posix")
+ def test_posix_hosts_have_anchored_copy():
+     """Linux and macOS must take the race-free path; losing it would silently empty every mount."""
+@@ -85,19 +103,6 @@ def test_copy_key_uses_the_callers_single_resolution(home, monkeypatch):
+     assert (copy / "s" / "SKILL.md").is_file()
+ 
+ 
+-@pytest.mark.platforms("windows")
+-def test_windows_withholds_skills_copy_for_real(tmp_path, monkeypatch):
+-    home = tmp_path / "hh"
+-    (home / "skills" / "s").mkdir(parents=True)
+-    (home / "skills" / "s" / "SKILL.md").write_text("# s")
+-    monkeypatch.setenv("HERMES_HOME", str(home))
+-
+-    copy = Path(cf._safe_skills_path(home / "skills"))
+-
+-    assert not cf._ANCHORED_COPY_SUPPORTED
+-    assert not any(p.is_file() for p in copy.rglob("*"))
+-
+-
+ @pytest.fixture
+ def home(tmp_path, monkeypatch):
+     home = tmp_path / "hh"
+@@ -142,7 +147,7 @@ def _copied_text(copy: Path) -> str:
+ 
+ 
+ @posix_only
+-def test_file_swapped_for_symlink_after_vetting_is_not_followed(home, secret, monkeypatch):
++def test_file_swapped_for_symlink_after_vetting_is_not_followed(home, secret, monkeypatch, walker):
+     victim = home / "skills" / "s" / "zz_payload.md"
+     victim.write_text("benign")
+ 
+@@ -159,7 +164,7 @@ def test_file_swapped_for_symlink_after_vetting_is_not_followed(home, secret, mo
+ 
+ 
+ @posix_only
+-def test_parent_dir_swapped_for_symlink_after_file_vetting_is_not_followed(home, tmp_path, monkeypatch):
++def test_parent_dir_swapped_for_symlink_after_file_vetting_is_not_followed(home, tmp_path, monkeypatch, walker):
+     """The file is fine; its *parent directory* is swapped for a link to a host dir holding a
+     same-named secret between vetting the file and opening it."""
+     sub = home / "skills" / "s" / "sub"
+@@ -182,7 +187,7 @@ def test_parent_dir_swapped_for_symlink_after_file_vetting_is_not_followed(home,
+ 
+ 
+ @posix_only
+-def test_dir_swapped_for_symlink_before_descent_is_not_walked(home, tmp_path, monkeypatch):
++def test_dir_swapped_for_symlink_before_descent_is_not_walked(home, tmp_path, monkeypatch, walker):
+     sub = home / "skills" / "s" / "sub"
+     sub.mkdir()
+     (sub / "a.md").write_text("benign")
+@@ -202,7 +207,7 @@ def test_dir_swapped_for_symlink_before_descent_is_not_walked(home, tmp_path, mo
+ 
+ 
+ @posix_only
+-def test_root_ancestor_swapped_after_vetting_withholds_the_tree(tmp_path, monkeypatch):
++def test_root_ancestor_swapped_after_vetting_withholds_the_tree(tmp_path, monkeypatch, walker):
+     """A project skills root's own ancestor (``<cwd>/.hermes``) is container-writable too."""
+     home = tmp_path / "hh"
+     home.mkdir()
+@@ -235,7 +240,7 @@ def test_root_ancestor_swapped_after_vetting_withholds_the_tree(tmp_path, monkey
+ 
+ @posix_only
+ @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+-def test_file_swapped_for_fifo_after_vetting_neither_hangs_nor_copies(home, monkeypatch):
++def test_file_swapped_for_fifo_after_vetting_neither_hangs_nor_copies(home, monkeypatch, walker):
+     victim = home / "skills" / "s" / "zz_pipe.md"
+     victim.write_text("benign")
+ 
+@@ -258,7 +263,7 @@ def test_file_swapped_for_fifo_after_vetting_neither_hangs_nor_copies(home, monk
+ 
+ 
+ @posix_only
+-def test_symlinked_skills_root_is_still_copied(tmp_path, monkeypatch):
++def test_symlinked_skills_root_is_still_copied(tmp_path, monkeypatch, walker):
+     """Portability: a user's ``skills`` that is itself a symlink to their real skills dir
+     (dotfiles setups) keeps working; only links *inside* the tree are refused."""
+     home = tmp_path / "hh"
+@@ -279,13 +284,15 @@ def test_symlinked_skills_root_is_still_copied(tmp_path, monkeypatch):
+ 
+ 
+ def test_platform_without_anchored_opens_withholds_the_copy(home, monkeypatch, caplog):
+-    """Fail closed: without O_NOFOLLOW/dir_fd there is no race-free copy, so nothing is copied
+-    (and a previous copy is emptied) rather than falling back to a path-following copy."""
++    """Fail closed: with neither O_NOFOLLOW/dir_fd nor Win32 handles there is no race-free
++    copy, so nothing is copied (and a previous copy is emptied) rather than falling back to a
++    path-following copy."""
+     (home / "skills" / "s" / "notes.md").write_text("# notes")
+     copy = Path(cf._safe_skills_path(home / "skills"))
+-    assert (copy / "s" / "notes.md").exists() or not cf._ANCHORED_COPY_SUPPORTED
++    assert (copy / "s" / "notes.md").exists()
+ 
+     monkeypatch.setattr(cf, "_ANCHORED_COPY_SUPPORTED", False)
++    monkeypatch.setattr(cf, "_WINDOWS_HANDLE_API", None)
+     with caplog.at_level(logging.WARNING, logger=cf.logger.name):
+         copy = Path(cf._safe_skills_path(home / "skills"))
+ 
+diff --git a/tests/tools/test_skills_copy_windows.py b/tests/tools/test_skills_copy_windows.py
+new file mode 100644
+index 00000000000..7cc1fbd1bdd
+--- /dev/null
++++ b/tests/tools/test_skills_copy_windows.py
+@@ -0,0 +1,305 @@
++"""The Windows sanitized skills copy: pinned-handle reads instead of an empty mount.
++
++Windows has no ``O_NOFOLLOW``/``dir_fd`` opens. The copy used to be withheld there, which
++emptied every skills mount. It now reads through ``tools.credential_files_windows``: each
++ancestor and each file is held open without ``FILE_SHARE_DELETE`` through the read, every
++component is opened with ``FILE_FLAG_OPEN_REPARSE_POINT``, and identity plus final path are
++checked on the handle before anything is read.
++
++Two lanes:
++
++* Linux, via ``pinned_handles_emulation``. This exercises the walk's logic (parity with
++  the POSIX copy, reparse/identity/final-path refusals, ancestors held while reading). It
++  can't show that a held handle blocks a rename, because Linux has no share modes.
++* Windows-only (``platforms("windows")``): the real Win32 binding, junction swaps, and
++  renames refused while pinned. These tests run only on the Windows CI lane.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import stat
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++import tools.credential_files as cf
++import tools.credential_files_windows as winwalk
++from tests.tools import pinned_handles_emulation as emulation
++from tests.tools.test_skills_copy_race import SECRET, _copied_text, _swap_when_vetted
++
++emulated = pytest.mark.skipif(not emulation.AVAILABLE, reason="pinned-handle emulation needs Linux /proc + O_PATH")
++windows_only = pytest.mark.platforms("windows")
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / "hh"
++    (home / "skills" / "s").mkdir(parents=True)
++    (home / "skills" / "s" / "SKILL.md").write_text("---\nname: s\n---\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return home
++
++
++@pytest.fixture
++def pinned(monkeypatch) -> emulation.LinuxPinnedHandles:
++    api = emulation.LinuxPinnedHandles()
++    monkeypatch.setattr(cf, "_ANCHORED_COPY_SUPPORTED", False)
++    monkeypatch.setattr(cf, "_WINDOWS_HANDLE_API", api)
++    return api
++
++
++def _tree(copy: Path) -> dict[str, bytes]:
++    return {p.relative_to(copy).as_posix(): p.read_bytes() for p in sorted(copy.rglob("*")) if p.is_file()}
++
++
++def _populate(skills: Path, tmp_path: Path) -> None:
++    (skills / "s" / "references").mkdir()
++    (skills / "s" / "references" / "ref.md").write_bytes(b"a\r\nb\n\x1a tail")
++    (skills / "s" / ".env").write_text(SECRET)
++    (skills / ".hub").mkdir()
++    (skills / ".hub" / "cache.json").write_text("{}")
++    (skills / "s" / "node_modules").mkdir()
++    (skills / "s" / "node_modules" / "x.js").write_text("x")
++
++
++# --- Linux emulation of the pinned walk ---
++
++@emulated
++def test_pinned_copy_matches_the_anchored_copy(home, tmp_path, monkeypatch):
++    """Parity: the Windows walk ships exactly what the POSIX walk ships, byte for byte."""
++    skills = home / "skills"
++    _populate(skills, tmp_path)
++    (skills / "s" / "link.md").symlink_to(skills / "s" / "SKILL.md")
++    anchored = _tree(Path(cf._safe_skills_path(skills)))
++
++    monkeypatch.setattr(cf, "_ANCHORED_COPY_SUPPORTED", False)
++    monkeypatch.setattr(cf, "_WINDOWS_HANDLE_API", emulation.LinuxPinnedHandles())
++    for p in Path(cf._safe_skills_path(skills)).rglob("*"):  # start from an empty copy
++        if p.is_file():
++            p.unlink()
++    pinned = _tree(Path(cf._safe_skills_path(skills)))
++
++    assert pinned == anchored
++    assert set(pinned) == {"s/SKILL.md", "s/references/ref.md"}
++    assert pinned["s/references/ref.md"] == b"a\r\nb\n\x1a tail"
++
++
++@emulated
++def test_pinned_walk_holds_every_ancestor_while_reading_and_releases_them(home, pinned):
++    (home / "skills" / "s" / "deep").mkdir()
++    (home / "skills" / "s" / "deep" / "d.md").write_text("d")
++
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert (copy / "s" / "deep" / "d.md").read_text() == "d"
++    assert pinned.file_opens, "no file was opened through the handle API"
++    for path, held in pinned.file_opens:
++        chain = [str(p) for p in Path(path).parents]
++        assert set(chain) <= held, f"{path} was read with ancestors unpinned: {sorted(set(chain) - held)}"
++    assert pinned.held() == [], "the walk leaked pinned handles"
++
++
++@emulated
++def test_final_path_mismatch_alone_refuses_the_file(home, pinned, monkeypatch, caplog):
++    """Everything else about the handle checks out; only its final path is elsewhere."""
++    (home / "skills" / "s" / "zz.md").write_text("benign")
++    real_final = pinned.final_path
++
++    def final_path(fd):
++        path = real_final(fd)
++        return path.replace("zz.md", "elsewhere.md") if path.endswith("zz.md") else path
++
++    monkeypatch.setattr(pinned, "final_path", final_path)
++    with caplog.at_level(logging.WARNING, logger=cf.logger.name):
++        copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert not (copy / "s" / "zz.md").exists()
++    assert (copy / "s" / "SKILL.md").is_file()
++    assert "opens" in caplog.text and "elsewhere.md" in caplog.text
++
++
++@emulated
++def test_file_replaced_by_another_regular_file_after_vetting_is_refused(home, tmp_path, pinned, monkeypatch):
++    """Identity check: a different file under the vetted name is not read."""
++    (home / "skills" / "s" / "zz.md").write_text("benign")
++
++    def swap(path):
++        path.rename(tmp_path / "kept_alive.md")  # keep the vetted inode alive so it can't be reused
++        path.write_text("REPLACEMENT")
++
++    fired = _swap_when_vetted(monkeypatch, "zz.md", swap)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert fired
++    assert "REPLACEMENT" not in _copied_text(copy)
++    assert (copy / "s" / "SKILL.md").is_file()
++
++
++def test_reparse_attribute_is_refused_even_without_a_link_mode():
++    """A junction lstat()s as a directory on Windows; the attribute alone must refuse it."""
++    junction = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=winwalk.FILE_ATTRIBUTE_REPARSE_POINT)
++    plain = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10)
++    assert winwalk._is_reparse(junction)
++    assert not winwalk._is_reparse(plain)
++    assert winwalk._is_reparse(SimpleNamespace(st_mode=stat.S_IFLNK | 0o777))
++
++
++def test_final_path_prefixes_are_normalized():
++    assert winwalk._plain("\\\\?\\UNC\\srv\\share\\x") == os.path.normcase("\\\\srv\\share\\x")
++    assert winwalk._plain("\\\\?\\C:\\Users\\u") == os.path.normcase("C:\\Users\\u")
++
++
++@pytest.mark.platforms("posix")
++def test_no_win32_binding_off_windows():
++    assert winwalk.load_api() is None
++    assert cf._WINDOWS_HANDLE_API is None  # POSIX keeps the anchored walk
++
++
++# --- Real Windows (CI lane only) ---
++
++def _junction(target: Path, link: Path) -> None:
++    import _winapi
++
++    _winapi.CreateJunction(str(target), str(link))
++
++
++@windows_only
++def test_windows_copies_a_clean_tree_for_real(home, tmp_path):
++    skills = home / "skills"
++    _populate(skills, tmp_path)
++
++    copy = Path(cf._safe_skills_path(skills))
++
++    assert not cf._ANCHORED_COPY_SUPPORTED and cf._WINDOWS_HANDLE_API is not None
++    tree = _tree(copy)
++    assert set(tree) == {"s/SKILL.md", "s/references/ref.md"}, "clean files ship; .env/.hub/node_modules don't"
++    assert tree["s/references/ref.md"] == b"a\r\nb\n\x1a tail", "bytes must not be rewritten (text mode)"
++    assert os.stat(copy / "s" / "SKILL.md").st_mtime_ns == os.stat(skills / "s" / "SKILL.md").st_mtime_ns
++
++
++@windows_only
++def test_windows_refresh_replaces_and_removes_read_only_files(home):
++    src = home / "skills" / "s" / "ro.md"
++    src.write_text("v1")
++    os.chmod(src, stat.S_IREAD)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++    assert (copy / "s" / "ro.md").read_text() == "v1"
++
++    os.chmod(src, stat.S_IREAD | stat.S_IWRITE)
++    src.write_text("version 2")
++    os.chmod(src, stat.S_IREAD)
++    cf._safe_skills_path(home / "skills")
++    assert (copy / "s" / "ro.md").read_text() == "version 2"
++
++    os.chmod(src, stat.S_IREAD | stat.S_IWRITE)
++    src.unlink()
++    cf._safe_skills_path(home / "skills")
++    assert not (copy / "s" / "ro.md").exists()
++    assert (copy / "s" / "SKILL.md").is_file()
++
++
++@windows_only
++def test_windows_dir_swapped_for_junction_before_descent_is_not_walked(home, tmp_path, monkeypatch):
++    sub = home / "skills" / "s" / "sub"
++    sub.mkdir()
++    (sub / "a.md").write_text("benign")
++    host_dir = tmp_path / "host_dir"
++    host_dir.mkdir()
++    (host_dir / "a.md").write_text(SECRET)
++
++    def swap(path):
++        path.rename(tmp_path / "moved_away")  # not yet opened: nothing pins it
++        _junction(host_dir, path)
++
++    fired = _swap_when_vetted(monkeypatch, "sub", swap)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert fired
++    assert SECRET not in _copied_text(copy)
++    assert (copy / "s" / "SKILL.md").is_file()
++
++
++@windows_only
++def test_windows_root_ancestor_swapped_for_junction_withholds_the_tree(tmp_path, monkeypatch):
++    home = tmp_path / "hh"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    project = tmp_path / "proj"
++    (project / ".hermes" / "skills" / "s").mkdir(parents=True)
++    (project / ".hermes" / "skills" / "s" / "SKILL.md").write_text("# s")
++    decoy = tmp_path / "decoy"
++    (decoy / "skills" / "s").mkdir(parents=True)
++    (decoy / "skills" / "s" / "secret.md").write_text(SECRET)
++    real_denier = cf._skill_entry_denier
++    fired: list[bool] = []
++
++    def denier(r):
++        result = real_denier(r)
++        if not fired:
++            fired.append(True)
++            (project / ".hermes").rename(tmp_path / "moved_away")
++            _junction(decoy, project / ".hermes")
++        return result
++
++    monkeypatch.setattr(cf, "_skill_entry_denier", denier)
++    copy = Path(cf._safe_skills_path(project / ".hermes" / "skills"))
++
++    assert fired
++    assert SECRET not in _copied_text(copy)
++
++
++@windows_only
++def test_windows_pinned_ancestors_cannot_be_renamed_while_a_file_is_read(home, tmp_path, monkeypatch):
++    """The guarantee the final-path check alone can't give: while a file in ``sub`` is vetted
++    and read, ``sub`` and the skills root are held without delete sharing, so a swap fails."""
++    sub = home / "skills" / "s" / "sub"
++    sub.mkdir()
++    (sub / "zz.md").write_text("benign")
++    host_dir = tmp_path / "host_dir"
++    host_dir.mkdir()
++    (host_dir / "zz.md").write_text(SECRET)
++    refused: list[str] = []
++
++    def swap(path):
++        for victim in (path.parent, home / "skills"):
++            try:
++                victim.rename(tmp_path / f"moved_{victim.name}")
++            except OSError:
++                refused.append(victim.name)
++            else:
++                _junction(host_dir, victim)
++
++    fired = _swap_when_vetted(monkeypatch, "zz.md", swap)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert fired
++    assert refused == ["sub", "skills"], "a pinned ancestor was renamed mid-walk"
++    assert SECRET not in _copied_text(copy)
++    assert (copy / "s" / "sub" / "zz.md").read_text() == "benign"
++
++
++@windows_only
++def test_windows_file_swapped_for_symlink_after_vetting_is_not_followed(home, tmp_path, monkeypatch):
++    secret = tmp_path / "host_secret.txt"
++    secret.write_text(SECRET)
++    probe = tmp_path / "probe_link"
++    try:
++        probe.symlink_to(secret)
++    except OSError:
++        pytest.skip("creating symlinks needs Developer Mode or SeCreateSymbolicLinkPrivilege")
++    victim = home / "skills" / "s" / "zz_payload.md"
++    victim.write_text("benign")
++
++    def swap(path):
++        path.unlink()  # not yet opened (only listed), so delete is allowed
++        path.symlink_to(secret)
++
++    fired = _swap_when_vetted(monkeypatch, "zz_payload.md", swap)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++
++    assert fired
++    assert SECRET not in _copied_text(copy)
++    assert (copy / "s" / "SKILL.md").is_file()
+diff --git a/tools/credential_files.py b/tools/credential_files.py
+index 1ea53e4e0e1..6151f3e7555 100644
+--- a/tools/credential_files.py
++++ b/tools/credential_files.py
+@@ -8,6 +8,7 @@ dirs, and host cache dirs to mount or sync in, at creation and before each comma
+ from __future__ import annotations
+ 
+ import contextlib
++import functools
+ import logging
+ import os
+ import posixpath
+@@ -23,6 +24,7 @@ from hermes_constants import get_hermes_dir, get_hermes_home
+ 
+ from agent.provider_media import GENERATED_SUBDIR, MEDIA_CACHE_MAX_AGE_HOURS
+ from agent.skill_utils import EXCLUDED_SKILL_DIRS
++from tools import credential_files_windows as _winwalk
+ 
+ try:  # pragma: no cover - exercised via the fail-closed test below
+     from agent.file_safety import get_read_block_error, read_deny_candidate_names
+@@ -323,6 +325,7 @@ def _remove_entry(path: Path) -> None:
+     if path.is_dir() and not path.is_symlink():
+         shutil.rmtree(path, ignore_errors=True)
+     else:
++        _clear_readonly(str(path))
+         path.unlink(missing_ok=True)
+ 
+ 
+@@ -362,9 +365,11 @@ def _anchored_copy_supported() -> bool:
+     )
+ 
+ 
+-# Without these (Windows) there is no race-free way to read a sandbox-writable tree, so the
+-# sanitized copy is withheld (fails closed) instead of falling back to a path-following copy.
+ _ANCHORED_COPY_SUPPORTED = _anchored_copy_supported()
++# Windows has none of those; it reads through handles pinned without delete sharing instead
++# (tools/credential_files_windows.py). A platform with neither gets no copy (fails closed),
++# never a path-following one.
++_WINDOWS_HANDLE_API = None if _ANCHORED_COPY_SUPPORTED else _winwalk.load_api()
+ _withheld_roots_warned: set[str] = set()
+ 
+ 
+@@ -448,13 +453,57 @@ def _walk_skill_tree_anchored(root: Path, *, skip_dir: Optional[Path] = None
+         os.close(root_fd)
+ 
+ 
+-def _copy_if_stale(dir_fd: int, name: str, listed: os.stat_result, dst: str) -> None:
+-    """Copy the regular file *name* under *dir_fd* over *dst* unless it already matches
++def _walk_skill_tree_pinned(root: Path, api: _winwalk.HandleApi, *,
++                            skip_dir: Optional[Path] = None) -> Iterator[_winwalk.TreeItem]:
++    """The Windows counterpart of :func:`_walk_skill_tree_anchored`: same pruning and deny
++    rules, read through pinned handles (see :mod:`tools.credential_files_windows`)."""
++    denied = _skill_entry_denier(root)  # vetted before pinning: a swap after this fails the pin
++    if denied is None:
++        logger.warning("credential_files: withholding read-denied skills root from sandbox: %s", root)
++        return
++    skip_id = None
++    if skip_dir is not None:
++        with contextlib.suppress(OSError):
++            skip_st = os.stat(skip_dir)
++            skip_id = (skip_st.st_dev, skip_st.st_ino)
++    yield from _winwalk.walk_tree(api, root, denied, EXCLUDED_SKILL_DIRS, skip_id)
++
++
++def _open_anchored_file(dir_fd: int, name: str, _listed: os.stat_result) -> int:
++    return os.open(name, _SOURCE_FILE_FLAGS, dir_fd=dir_fd)
++
++
++def _source_tree(skills_dir: Path, skip_dir: Path) -> Iterator[_winwalk.TreeItem]:
++    """``(rel, open_file(name, listed) -> fd, files)`` from this platform's race-free walk."""
++    if _ANCHORED_COPY_SUPPORTED:
++        return ((rel, functools.partial(_open_anchored_file, dir_fd), files)
++                for rel, dir_fd, files in _walk_skill_tree_anchored(skills_dir, skip_dir=skip_dir))
++    if _WINDOWS_HANDLE_API is not None:
++        return _walk_skill_tree_pinned(skills_dir, _WINDOWS_HANDLE_API, skip_dir=skip_dir)
++    if str(skills_dir) not in _withheld_roots_warned:
++        _withheld_roots_warned.add(str(skills_dir))
++        logger.warning("credential_files: withholding skills %s from the sandbox mount: this platform has"
++                       " neither O_NOFOLLOW/dir_fd opens nor Win32 handles, so a race-free copy is"
++                       " impossible", skills_dir)
++    return iter(())
++
++
++def _clear_readonly(path: str) -> None:
++    """Windows refuses to replace or delete a read-only file; POSIX needs only the dir's write bit."""
++    if os.name == "nt":
++        with contextlib.suppress(OSError):
++            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
++
++
++def _copy_if_stale(open_src: Callable[[str, os.stat_result], int], name: str, listed: os.stat_result,
++                   dst: str) -> None:
++    """Copy the regular file *name*, opened by *open_src*, over *dst* unless it already matches
+     (size + ns mtime, which the copy keeps).
+ 
+-    The source is opened ``O_NOFOLLOW`` relative to its directory fd and read from that fd only
+-    after ``fstat`` shows a regular file, so a symlink, FIFO or device swapped in after the walk
+-    vetted it raises instead of being followed. Written to a sibling temp file and
++    *open_src* never follows a swapped-in link: ``O_NOFOLLOW`` relative to the directory fd on
++    POSIX, a pinned and verified handle on Windows. The fd is read only after ``fstat`` shows a
++    regular file, so a symlink, FIFO or device swapped in after the walk vetted it raises
++    instead of being followed. Written to a sibling temp file and
+     ``os.replace``d in: a live container never reads a half-written file, and a read-only
+     (0444) previous copy can still be replaced.
+     """
+@@ -469,7 +518,7 @@ def _copy_if_stale(dir_fd: int, name: str, listed: os.stat_result, dst: str) ->
+         pass
+     if os.path.isdir(dst) and not os.path.islink(dst):
+         shutil.rmtree(dst, ignore_errors=True)
+-    src_fd = os.open(name, _SOURCE_FILE_FLAGS, dir_fd=dir_fd)
++    src_fd = open_src(name, listed)
+     try:
+         src_st = os.fstat(src_fd)
+         if not stat.S_ISREG(src_st.st_mode):
+@@ -477,11 +526,13 @@ def _copy_if_stale(dir_fd: int, name: str, listed: os.stat_result, dst: str) ->
+         tmp = os.path.join(os.path.dirname(dst), f".{os.path.basename(dst)}.hermes-tmp")
+         _remove_entry(Path(tmp))
+         try:
+-            out_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC, 0o600)
++            out_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC
++                             | getattr(os, "O_BINARY", 0), 0o600)  # O_BINARY: no CRLF rewrite on Windows
+             with open(out_fd, "wb") as fdst, open(src_fd, "rb", closefd=False) as fsrc:
+                 shutil.copyfileobj(fsrc, fdst, 1 << 20)
+             os.chmod(tmp, stat.S_IMODE(src_st.st_mode) & 0o777)  # never carry setuid/setgid into a mount
+             os.utime(tmp, ns=(src_st.st_atime_ns, src_st.st_mtime_ns))
++            _clear_readonly(dst)
+             os.replace(tmp, dst)
+         except OSError:
+             _remove_entry(Path(tmp))
+@@ -495,21 +546,13 @@ def _refresh_sanitized_copy(skills_dir: Path, safe_dir: Path) -> Path:
+ 
+     Runs on every docker refresh tick, so it keys on plain path strings: the ``Path``
+     arithmetic (``relative_to``, hashing) cost more than the syscalls on a 5k-file tree.
+-    Reads go through :func:`_walk_skill_tree_anchored` (see there for why); where that is
+-    unavailable the copy is emptied and stays empty rather than copied by path.
++    Reads go through :func:`_source_tree` (see there for why); where no race-free walk exists
++    the copy is emptied and stays empty rather than copied by path.
+     """
+     dst_root = str(safe_dir)
+     wanted_dirs: set[str] = set()
+     wanted_files: set[str] = set()
+-    if _ANCHORED_COPY_SUPPORTED:
+-        tree = _walk_skill_tree_anchored(skills_dir, skip_dir=safe_dir.parent)
+-    else:
+-        if str(skills_dir) not in _withheld_roots_warned:
+-            _withheld_roots_warned.add(str(skills_dir))
+-            logger.warning("credential_files: withholding skills %s from the sandbox mount: this platform has"
+-                           " no O_NOFOLLOW/dir_fd opens, so a race-free copy is impossible", skills_dir)
+-        tree = iter(())
+-    for rel, dir_fd, files in tree:
++    for rel, open_src, files in _source_tree(skills_dir, safe_dir.parent):
+         dst_dir = dst_root + rel
+         wanted_dirs.add(dst_dir)
+         if os.path.islink(dst_dir) or (os.path.lexists(dst_dir) and not os.path.isdir(dst_dir)):
+@@ -518,7 +561,7 @@ def _refresh_sanitized_copy(skills_dir: Path, safe_dir: Path) -> Path:
+         for name, listed in files:
+             dst = os.path.join(dst_dir, name)
+             try:
+-                _copy_if_stale(dir_fd, name, listed, dst)
++                _copy_if_stale(open_src, name, listed, dst)
+             except OSError as exc:  # unreadable, vanished or swapped mid-walk: skip it, don't drop every mount
+                 logger.warning("credential_files: skipping unreadable skills file %s%s/%s: %s",
+                                skills_dir, rel, name, exc)
+@@ -529,6 +572,7 @@ def _refresh_sanitized_copy(skills_dir: Path, safe_dir: Path) -> Path:
+         for name in filenames:
+             path = os.path.join(dirpath, name)
+             if path not in wanted_files:
++                _clear_readonly(path)
+                 with contextlib.suppress(FileNotFoundError):
+                     os.unlink(path)
+         if dirpath != dst_root and dirpath not in wanted_dirs:
+diff --git a/tools/credential_files_windows.py b/tools/credential_files_windows.py
+new file mode 100644
+index 00000000000..ce494aee924
+--- /dev/null
++++ b/tools/credential_files_windows.py
+@@ -0,0 +1,231 @@
++"""Race-free reads of a skills tree on Windows, for the sanitized sandbox copy.
++
++Windows has no ``O_NOFOLLOW`` and no ``dir_fd`` opens, so the POSIX walk in
++:mod:`tools.credential_files` can't run there. A plain path copy is not safe either: the
++source may be writable by the sandbox that mounts the copy, and a file or any directory
++above it could be swapped for a junction or symlink to a host path between "vetted" and
++"read".
++
++This walk pins the path instead of anchoring it:
++
++* Every directory from the drive root down to the directory being listed, and each file
++  while it is read, is held open **without** ``FILE_SHARE_DELETE``. A rename or delete
++  needs ``DELETE`` access to the object, so nothing on that chain can be renamed away or
++  replaced until the handle closes. The handles request data access (list/read), because
++  NT records a share mode only for opens that ask for data or delete access. An
++  attributes-only open would not block anything.
++* Each component is opened with ``FILE_FLAG_OPEN_REPARSE_POINT``, so a junction or symlink
++  that replaced it is opened as itself and refused, never followed.
++* Before a handle is trusted, it must show no reparse attribute and the expected type, the
++  same identity (``st_dev``, ``st_ino``) as the entry that was listed and vetted, and a final
++  path (``GetFinalPathNameByHandleW``) equal to the expected one.
++
++The final-path check alone does not make this safe. A directory could still be swapped
++after its check and before a child is opened. The non-delete-sharing handles held through
++the read are what close that window. The final-path and identity checks make sure each
++pinned handle is the object that was vetted.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import stat
++from pathlib import Path
++from typing import Callable, Collection, Iterator, Optional, Protocol
++
++logger = logging.getLogger(__name__)
++
++FILE_ATTRIBUTE_REPARSE_POINT = 0x400
++
++# (rel, open_file(name, listed) -> fd, [(name, listed_stat), ...]); see walk_tree.
++TreeItem = tuple[str, Callable[[str, os.stat_result], int], list[tuple[str, os.stat_result]]]
++
++
++class HandleApi(Protocol):
++    def open_pinned(self, path: str, directory: bool) -> int:
++        """Open *path* itself, without following a final reparse point and without delete
++        sharing; return a CRT fd that owns the handle."""
++        ...
++
++    def final_path(self, fd: int) -> str:
++        """The final path of the object behind *fd*."""
++        ...
++
++
++class Win32Handles:
++    """ctypes binding for :class:`HandleApi` (Windows only)."""
++
++    _GENERIC_READ = 0x80000000
++    _FILE_LIST_DIRECTORY = 0x0001
++    _FILE_READ_ATTRIBUTES = 0x0080
++    _SYNCHRONIZE = 0x00100000
++    # Deliberately no FILE_SHARE_DELETE (0x4): renaming or deleting a held object fails.
++    _SHARE_READ_WRITE = 0x1 | 0x2
++    _OPEN_EXISTING = 3
++    _FLAG_OPEN_REPARSE_POINT = 0x00200000
++    _FLAG_BACKUP_SEMANTICS = 0x02000000  # required to open a directory handle
++
++    def __init__(self) -> None:
++        import ctypes
++        import msvcrt
++        from ctypes import wintypes
++
++        self._ctypes = ctypes
++        self._msvcrt = msvcrt
++        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++        self._create = kernel32.CreateFileW
++        self._create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
++                                 wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
++        self._create.restype = wintypes.HANDLE
++        self._final = kernel32.GetFinalPathNameByHandleW
++        self._final.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
++        self._final.restype = wintypes.DWORD
++        self._close = kernel32.CloseHandle
++        self._close.argtypes = [wintypes.HANDLE]
++        self._close.restype = wintypes.BOOL
++
++    def _error(self, path: str) -> OSError:
++        code = self._ctypes.get_last_error()
++        return OSError(None, self._ctypes.FormatError(code).strip(), path, code)
++
++    def open_pinned(self, path: str, directory: bool) -> int:
++        if directory:
++            access = self._FILE_LIST_DIRECTORY | self._FILE_READ_ATTRIBUTES | self._SYNCHRONIZE
++            flags = self._FLAG_OPEN_REPARSE_POINT | self._FLAG_BACKUP_SEMANTICS
++        else:
++            access, flags = self._GENERIC_READ, self._FLAG_OPEN_REPARSE_POINT
++        handle = self._create(path, access, self._SHARE_READ_WRITE, None, self._OPEN_EXISTING, flags, None)
++        if handle is None or handle == self._ctypes.c_void_p(-1).value:
++            raise self._error(path)
++        try:
++            return self._msvcrt.open_osfhandle(handle, os.O_RDONLY)
++        except OSError:
++            self._close(handle)
++            raise
++
++    def final_path(self, fd: int) -> str:
++        buf = self._ctypes.create_unicode_buffer(32768)
++        n = self._final(self._msvcrt.get_osfhandle(fd), buf, len(buf), 0)  # FILE_NAME_NORMALIZED|VOLUME_NAME_DOS
++        if not n or n >= len(buf):
++            raise self._error(f"<fd {fd}>")
++        return buf.value
++
++
++def load_api() -> Optional[HandleApi]:
++    """The Win32 binding on Windows; ``None`` elsewhere or when it can't be loaded."""
++    if os.name != "nt":
++        return None
++    try:
++        return Win32Handles()
++    except (ImportError, OSError, AttributeError):
++        logger.exception("credential_files: Win32 handle API unavailable; skills copies will be withheld")
++        return None
++
++
++def _is_reparse(st: os.stat_result) -> bool:
++    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
++
++
++def _plain(path: str) -> str:
++    """Drop the ``\\\\?\\`` / ``\\\\?\\UNC\\`` prefix ``GetFinalPathNameByHandleW`` adds, then normcase."""
++    if path.startswith("\\\\?\\UNC\\"):
++        path = "\\\\" + path[8:]
++    elif path.startswith("\\\\?\\"):
++        path = path[4:]
++    return os.path.normcase(path)
++
++
++def open_verified(api: HandleApi, path: str, *, directory: bool,
++                  listed: Optional[os.stat_result] = None) -> int:
++    """Open *path* pinned and return its fd only if the handle is the vetted, non-reparse
++    object at exactly *path*; otherwise close it and raise ``OSError``."""
++    fd = api.open_pinned(path, directory)
++    try:
++        st = os.fstat(fd)
++        if _is_reparse(st):
++            raise OSError(f"reparse point: {path}")
++        if not (stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)):
++            raise OSError(f"not a {'directory' if directory else 'regular file'}: {path}")
++        if listed is not None and (st.st_dev, st.st_ino) != (listed.st_dev, listed.st_ino):
++            raise OSError(f"replaced since it was listed: {path}")
++        final = api.final_path(fd)
++        if _plain(final) != _plain(path):
++            raise OSError(f"opens {final}, not {path}")
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++def pin_path(api: HandleApi, real_dir: str, held: list[int]) -> None:
++    """Open every component of the resolved *real_dir* from its drive root, appending each
++    verified fd to *held*. The caller closes them. A component that is now a reparse point
++    or another object raises ``OSError``."""
++    drive, tail = os.path.splitdrive(real_dir)
++    current = drive + os.sep
++    held.append(open_verified(api, current, directory=True))
++    for part in tail.split(os.sep):
++        if part:
++            current = os.path.join(current, part)
++            held.append(open_verified(api, current, directory=True))
++
++
++def walk_tree(api: HandleApi, root: Path, denied: Callable[[Path], bool], excluded: Collection[str],
++              skip_id: Optional[tuple[int, int]]) -> Iterator[TreeItem]:
++    """Yield ``(rel, open_file, files)`` for the resolved *root*, like the POSIX anchored walk.
++
++    *rel* is ``""`` or ``os.sep``-joined (``"\\\\a\\\\b"``), so ``dst_root + rel`` matches the
++    destination's ``os.walk`` spelling. ``open_file(name, listed)`` returns a verified fd for
++    a listed file. It is valid only until the next item, while this directory and all its
++    ancestors are still pinned. Fails closed: a root that can't be pinned yields nothing.
++    """
++    held: list[int] = []
++    try:
++        try:
++            pin_path(api, str(root), held)
++        except OSError as exc:
++            logger.warning("credential_files: withholding skills root %s: cannot pin it without reparse points (%s)",
++                           root, exc)
++            return
++        yield from _visit(api, root, str(root), "", denied, excluded, skip_id)
++    finally:
++        for fd in reversed(held):
++            os.close(fd)
++
++
++def _visit(api: HandleApi, root: Path, dir_path: str, rel: str, denied: Callable[[Path], bool],
++           excluded: Collection[str], skip_id: Optional[tuple[int, int]]) -> Iterator[TreeItem]:
++    base = Path(str(root) + rel)
++    files: list[tuple[str, os.stat_result]] = []
++    subdirs: list[tuple[str, os.stat_result]] = []
++    with os.scandir(dir_path) as entries:  # dir_path and every ancestor are pinned by the caller
++        for entry in entries:
++            try:
++                st = os.lstat(os.path.join(dir_path, entry.name))  # identity before vetting: what is vetted gets opened
++            except OSError:
++                continue
++            if _is_reparse(st):
++                continue
++            if stat.S_ISDIR(st.st_mode):
++                if (entry.name not in excluded and (st.st_dev, st.st_ino) != skip_id
++                        and not denied(base / entry.name)):
++                    subdirs.append((entry.name, st))
++            elif stat.S_ISREG(st.st_mode) and not denied(base / entry.name):
++                files.append((entry.name, st))
++
++    def open_file(name: str, listed: os.stat_result) -> int:
++        return open_verified(api, os.path.join(dir_path, name), directory=False, listed=listed)
++
++    yield rel, open_file, sorted(files, key=lambda item: item[0])
++    for name, listed in sorted(subdirs, key=lambda item: item[0]):
++        child = os.path.join(dir_path, name)
++        try:
++            fd = open_verified(api, child, directory=True, listed=listed)
++        except OSError as exc:  # now a junction/symlink/file, gone, or another directory
++            logger.warning("credential_files: skipping skills dir %s: %s", base / name, exc)
++            continue
++        try:
++            yield from _visit(api, root, child, f"{rel}{os.sep}{name}", denied, excluded, skip_id)
++        finally:
++            os.close(fd)
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 13b64bf891c..90cbfbc6382 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -455,7 +455,7 @@ Hermes-managed containers carry labels so subsequent processes (and the orphan r
+ - `hermes-profile=<sanitized profile name>` — scopes reuse and reaping to the active Hermes profile by default; when `docker_shared_container_key` is set, its sanitized value is used instead
+ - `hermes-environment=<digest>` — for containers without an explicit shared key, scopes reuse to the requested image, mount arguments, and active `HERMES_HOME`; host paths and volume sources are hashed rather than exposed in this label. Per-process tempdir-sourced mounts are hashed by their stable container path, not the random host tempdir, so they don't defeat reuse
+ 
+-Skills directories are never bind-mounted raw: each root mounts a sanitized copy under `<HERMES_HOME>/cache/sandbox-skills/` (no symlinks, no `skills/.hub` cache, nothing the read deny-list blocks such as a skill's `.env`). Hermes refreshes the copies in place before commands, at most every 5 seconds, so skill edits reach a running container while files created later that the agent may not read on the host never do. The copy reads its source without following symlinks at any level (each file and directory is opened relative to its already-open parent), so a container that can write a skills source, e.g. a project's `.hermes/skills` under a cwd mounted read-write with `docker_mount_cwd_to_workspace`, cannot redirect the copy to other host files by swapping in a symlink. On a platform without those no-follow opens (Windows), the skills copy is left empty rather than copied unsafely.
++Skills directories are never bind-mounted raw: each root mounts a sanitized copy under `<HERMES_HOME>/cache/sandbox-skills/` (no symlinks, no `skills/.hub` cache, nothing the read deny-list blocks such as a skill's `.env`). Hermes refreshes the copies in place before commands, at most every 5 seconds, so skill edits reach a running container while files created later that the agent may not read on the host never do. The copy reads its source without following symlinks at any level (each file and directory is opened relative to its already-open parent), so a container that can write a skills source, e.g. a project's `.hermes/skills` under a cwd mounted read-write with `docker_mount_cwd_to_workspace`, cannot redirect the copy to other host files by swapping in a symlink. Windows has no such opens, so there the copy holds every directory from the drive root down, and each file while it is read, open without delete sharing (so none can be renamed or replaced mid-read), refuses junctions and other reparse points, and checks each handle's identity and final path before reading it. A platform with neither mechanism gets an empty skills copy rather than an unsafe one.
+ 
+ On startup, Hermes runs `docker ps --filter label=hermes-task-id=<id> --filter label=hermes-profile=<identity>` and **attaches to the existing container** when it finds one. The identity is the active profile unless `docker_shared_container_key` explicitly opts trusted profiles into a common value. If the container is `exited` (e.g. after a Docker daemon restart), it's `docker start`'d and reused — filesystem state and any installed packages survive, but in-container background processes do not.
+ 
+-- 
+2.55.0
+

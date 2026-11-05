@@ -1,0 +1,176 @@
+From 447bde58e085df63d9b853a0325805a3c8542ab1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 11:16:30 +0000
+Subject: [PATCH] [daveey] fix(sandbox): detect anchored-copy support by name,
+ key the copy on one realpath
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: run individually via run_tests.sh, test_docker_skills_mount_live (2 visibility
+tests) and test_docker_environment::test_skills_mount_withholds_read_denied_files fail:
+the copy is empty and credential_files logs "this platform has no O_NOFOLLOW/dir_fd
+opens" on Linux. The same tests passed when 38fcaffc99f ran them in one big batch.
+Why 1: _ANCHORED_COPY_SUPPORTED was False on Linux — evidence: probe in the test process
+       printed `os.open in os.supports_dir_fd` == False with _O_NOFOLLOW/_O_DIRECTORY set.
+Why 2: os.open/os.stat/os.scandir were Python wrappers, not the builtins the supports_*
+       sets hold — evidence: their __code__ is tests/home_io_guard.py:226/282 (functools.wraps).
+Why 3: these files import tools.credential_files lazily inside a test, i.e. while the
+       per-test home I/O guard is installed, and the flag was computed at import by
+       identity (`os.stat in os.supports_dir_fd`); in the batch run another file imported
+       it at collection time, before any guard, so identity held.
+Root (happened): capability detection depended on the identity of mutable module
+       attributes at import time, so any wrapper (audit hook, profiler, test guard) present
+       then silently disabled the copy — failing closed into empty mounts.
+Root (not caught): test_posix_hosts_have_anchored_copy only checked the flag in an import
+       order where it held; no test computed detection with os functions wrapped, and the
+       verification ran files in one batch, never individually.
+Recurrence: first time.
+
+Also: _sanitized_copy_dir re-ran os.path.realpath on the root _safe_skills_path had
+already resolved, so a root swapped between the two calls keyed the copy on one tree
+while the walk filled it from the other. It now hashes the caller's resolution as-is.
+
+Countermeasures:
+- symptom/root: _os_supports() matches the supports_* sets by builtin __name__, robust to
+  any wrapper and to import order — proof: the three failing tests pass run individually.
+- detection: test_detection_survives_wrapped_os_functions[functools.wraps|plain] (asserts
+  the identity precondition is broken, then detection still True) and
+  test_copy_key_uses_the_callers_single_resolution (a later realpath of the root from
+  credential_files returns a swapped path; the key must be the first) — all 3 fail on
+  38fcaffc99f and pass here.
+Verified: hermes-core-wt test test_docker_skills_mount_live test_credential_files
+test_docker_environment test_file_sync test_skills_copy_race: 181 passed, 1 skipped
+(windows-only); each of the two previously failing files alone: 5/5, 84/84 passed.
+scripts/check: 15 checks, ok.
+---
+ tests/tools/test_skills_copy_race.py | 48 ++++++++++++++++++++++++++++
+ tools/credential_files.py            | 39 +++++++++++++++++-----
+ 2 files changed, 79 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tools/test_skills_copy_race.py b/tests/tools/test_skills_copy_race.py
+index 9efead2b64e..5ce1668b9d6 100644
+--- a/tests/tools/test_skills_copy_race.py
++++ b/tests/tools/test_skills_copy_race.py
+@@ -37,6 +37,54 @@ def test_posix_hosts_have_anchored_copy():
+     assert cf._ANCHORED_COPY_SUPPORTED
+ 
+ 
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("style", ["functools.wraps", "plain"])
++def test_detection_survives_wrapped_os_functions(monkeypatch, style):
++    """``os.stat in os.supports_dir_fd`` is identity: a module first imported while os.stat/
++    os.open/os.scandir are wrapped (the suite's home I/O guard, an audit hook) must still
++    detect the capability, or every skills mount is silently emptied."""
++    import functools
++
++    def wrapped(original):
++        def guarded(*args, **kwargs):
++            return original(*args, **kwargs)
++        return functools.wraps(original)(guarded) if style == "functools.wraps" else guarded
++
++    for name in ("open", "stat", "scandir"):
++        monkeypatch.setattr(os, name, wrapped(getattr(os, name)))
++    if style == "plain":
++        for name in ("open", "stat", "scandir"):
++            getattr(os, name).__name__ = name  # a wrapper only needs the builtin's name
++
++    assert os.stat not in os.supports_dir_fd  # precondition: identity membership is broken
++    assert cf._anchored_copy_supported()
++
++
++def test_copy_key_uses_the_callers_single_resolution(home, monkeypatch):
++    """The root is resolved once: a later realpath (seeing a root swapped since) must not
++    pick the copy dir, or the copy keyed on one tree is filled from another."""
++    import hashlib
++    import sys
++
++    real = os.path.realpath(home / "skills")
++    seen = []
++    original = os.path.realpath
++
++    def swapping_realpath(path, *args, **kwargs):
++        resolved = original(path, *args, **kwargs)
++        if resolved != real or sys._getframe(1).f_globals.get("__name__") != cf.__name__:
++            return resolved  # other paths, and the suite's own I/O guard, see the real answer
++        seen.append(path)  # the copy code's first resolution is honest, any later one "swapped"
++        return resolved if len(seen) == 1 else "/swapped/elsewhere"
++
++    monkeypatch.setattr(cf.os.path, "realpath", swapping_realpath)
++    copy = Path(cf._safe_skills_path(home / "skills"))
++    monkeypatch.setattr(cf.os.path, "realpath", original)
++
++    assert copy.name == hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
++    assert (copy / "s" / "SKILL.md").is_file()
++
++
+ @pytest.mark.platforms("windows")
+ def test_windows_withholds_skills_copy_for_real(tmp_path, monkeypatch):
+     home = tmp_path / "hh"
+diff --git a/tools/credential_files.py b/tools/credential_files.py
+index 027877a941d..1ea53e4e0e1 100644
+--- a/tools/credential_files.py
++++ b/tools/credential_files.py
+@@ -301,14 +301,19 @@ def _sanitized_copy_store() -> Path:
+     return get_hermes_home() / "cache" / "sandbox-skills"
+ 
+ 
+-def _sanitized_copy_dir(skills_dir: Path | str) -> Path:
++def _sanitized_copy_dir(real_skills_dir: str) -> Path:
++    """The copy dir keyed on *real_skills_dir*, which the caller has already resolved.
++
++    Not resolved again: a second ``realpath`` could see a root swapped since the caller's,
++    keying the copy on one tree while the walk fills it from another.
++    """
+     import hashlib
+ 
+-    key = hashlib.sha256(os.path.realpath(skills_dir).encode("utf-8")).hexdigest()[:16]
++    key = hashlib.sha256(real_skills_dir.encode("utf-8")).hexdigest()[:16]
+     safe_dir = _sanitized_copy_store() / key
+     if not safe_dir.is_dir():
+         safe_dir.mkdir(parents=True, exist_ok=True)
+-        logger.info("credential_files: created sanitized skills copy of %s at %s", skills_dir, safe_dir)
++        logger.info("credential_files: created sanitized skills copy of %s at %s", real_skills_dir, safe_dir)
+     return safe_dir
+ 
+ 
+@@ -335,13 +340,31 @@ _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+ # O_NONBLOCK: a FIFO swapped in after vetting must not block the open (fstat then rejects it).
+ _SOURCE_FILE_FLAGS = os.O_RDONLY | _O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | _O_CLOEXEC
+ _SOURCE_DIR_FLAGS = _SOURCE_FILE_FLAGS | _O_DIRECTORY
++
++
++def _os_supports(capability: set, name: str) -> bool:
++    """Whether ``os.<name>`` is in the ``os.supports_*`` set *capability*.
++
++    Matched by the builtin's name, not by identity: the sets hold the original builtins, so
++    ``os.stat in os.supports_dir_fd`` turns False as soon as anything has wrapped ``os.stat``
++    (an I/O audit hook, a profiler, the test suite's home guard) when this module is imported,
++    and the copy would then be withheld on a platform that supports it.
++    """
++    return any(getattr(func, "__name__", None) == name for func in capability)
++
++
++def _anchored_copy_supported() -> bool:
++    """Whether this platform can read a tree race-free (O_NOFOLLOW + dir_fd opens)."""
++    return bool(
++        _O_NOFOLLOW and _O_DIRECTORY
++        and _os_supports(os.supports_dir_fd, "open") and _os_supports(os.supports_dir_fd, "stat")
++        and _os_supports(os.supports_follow_symlinks, "stat") and _os_supports(os.supports_fd, "scandir")
++    )
++
++
+ # Without these (Windows) there is no race-free way to read a sandbox-writable tree, so the
+ # sanitized copy is withheld (fails closed) instead of falling back to a path-following copy.
+-_ANCHORED_COPY_SUPPORTED = bool(
+-    _O_NOFOLLOW and _O_DIRECTORY
+-    and os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+-    and os.stat in os.supports_follow_symlinks and os.scandir in os.supports_fd
+-)
++_ANCHORED_COPY_SUPPORTED = _anchored_copy_supported()
+ _withheld_roots_warned: set[str] = set()
+ 
+ 
+-- 
+2.55.0
+

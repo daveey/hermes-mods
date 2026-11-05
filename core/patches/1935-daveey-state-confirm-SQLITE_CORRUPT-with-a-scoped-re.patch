@@ -1,0 +1,1198 @@
+From 381b7e8e8d5ba3af2aea527e014e47a772cb6df3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 09:17:26 +0000
+Subject: [PATCH] [daveey] state: confirm SQLITE_CORRUPT with a scoped
+ read-only quick_check before the one replay
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Builds on 1a0329451e6 (rollback-guarded one-time replay). Before that replay, the writer
+(_execute_write) and the pooled reader now run a bounded PRAGMA quick_check of the tables the
+failing attempt touched (each table's indexes are checked with it; sqlite_schema always), on a
+FRESH read-only connection in a FRESH process (new sibling module
+hermes_state_corruption_confirm.py):
+
+- scope: a SQLite authorizer installed on the connection for each attempt (TouchedTables)
+  records the table NAMES every statement reads/writes at prepare time, incl. trigger bodies
+  and FTS5 shadow-table statements; never SQL text or bound parameters. Unknown scope (error
+  before any statement, e.g. BEGIN IMMEDIATE; an unmappable action; an attached db; a table
+  the fresh connection cannot resolve) widens to a whole-file quick_check under the same bound.
+- fresh process (`python -I -S`, minimal env, mode=ro + query_only): a second connection
+  closed in this process would cancel every sibling's POSIX locks (howtocorrupt §2.2).
+- bound: timeout = min(remaining write patience, 30s); reads 5s; <50ms left = no_budget.
+- fail closed: only an exact per-table "ok" is clean. damaged / timeout / no_budget / spawn or
+  child error / unparsable output latch with no replay, reason carries confirm=<outcome>
+  scope=<tables> <elapsed>.
+- a clean check allows exactly ONE replay; a recurrence latches without a second check.
+  Clean-then-replayed errors are counted (hermes_state_health.note_unconfirmed_corruption /
+  unconfirmed_corruption_count) and logged "NOT confirmed (confirm=clean scope=...)".
+- unchanged: FTS provenance first (FTS-scoped faults never reach the check), stage / rollback /
+  page-cache blockers, COMMIT never replayed (no check either), durable-commit-then-error
+  applies once.
+
+Known costs (deliberate, per card acceptance #4): a scoped check of a multi-GB table, or the
+whole-file check for a BEGIN-stage error, can exceed the patience bound and then latches
+(= pre-1a0329451e6 behaviour on that path). Installing the authorizer per attempt expires the
+connection's prepared statements, so statements re-prepare once per write/pooled read.
+
+Five whys (selfheal gateway-d7a592a91c), corrected from 1a0329451e6:
+Problem: 2026-11-03 16:26-17:01 PT every state.db write on hermes-hub refused with
+  StateDbCorruptError (gateway.log.3:6085-6134); 2 worker runs crashed.
+Why 1: _raise_if_db_corrupt(storage=True) refuses every write once the process-wide flag is
+  set — evidence: hermes_state.py _raise_if_db_corrupt.
+Why 2: the flag was set by one SQLITE_CORRUPT at 00:01:06Z and never re-checked — evidence:
+  hermes_state_health.mark_storage_corrupt keeps the first error.
+Why 3: any bare SQLITE_CORRUPT without FTS provenance counted as structural with no
+  confirmation step — evidence: is_structural_corruption_error -> _halt_db_corrupt on origin/main.
+Why 4 (corrected): the cause of the first error is UNDETERMINED. A later per-table
+  quick_check passing on all 36 tables + 8 FTS tables, and 20,900+ messages saved after the
+  restart, show the file read back consistent THEN; they do not prove it was never damaged
+  (a page could have been rewritten since), nor identify the fault (misread, transient I/O,
+  since-replaced page are hypotheses; 00:01 logs rotated). Evidence boundary: no capture of
+  the failing page / statement at the time.
+Root (happened): design assumed "corrupt once, corrupt forever" — no confirmation step, restart
+  the only exit, and nothing recorded which tables the failing statement touched.
+Root (not caught): test_storage_health_latch.py only injected persistent damage; no test
+  injected a one-shot error, and the latch reason kept only the message text.
+Recurrence: first false-positive latch since bd945ec3845 (#120274).
+Countermeasures:
+- symptom/root: scoped read-only confirm + one replay — proof:
+  tests/hermes_state/test_storage_corruption_scoped_confirm.py; RED with hermes_state.py at
+  1a0329451e6: 18 fail (clean-confirm replay x3 entry paths, recurrence x3, timeout x3,
+  error x3, no_budget, real damaged B-tree, begin-stage full scope, 3 pooled-read); GREEN 26/26.
+- safety: mutant "ignore confirm result + unscoped" fails 11 (timeout/error x3 paths, no_budget,
+  damaged B-tree, clean-confirm scope x3); FTS bypass / COMMIT fault / durable-commit guards and
+  all 15 tests of test_storage_corruption_confirmation.py stay green.
+- detection: reason/log carry confirm outcome, scope, elapsed; unconfirmed count per db.
+- deferred: proposal's coach rule on "unconfirmed corruption" (card t_01a1a5a82366d7e6).
+---
+ hermes_state.py                               | 109 ++--
+ hermes_state_corruption_confirm.py            | 295 ++++++++++
+ hermes_state_health.py                        |  37 +-
+ .../test_storage_corruption_scoped_confirm.py | 545 ++++++++++++++++++
+ 4 files changed, 946 insertions(+), 40 deletions(-)
+ create mode 100644 hermes_state_corruption_confirm.py
+ create mode 100644 tests/hermes_state/test_storage_corruption_scoped_confirm.py
+
+diff --git a/hermes_state.py b/hermes_state.py
+index 52de2a88979..a35650a209f 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -38,9 +38,10 @@ from hermes_state_holders import read_only_db_uri
+ from hermes_state_pidns import holder_pid_checkable
+ from hermes_state_health import (
+     STORAGE_CORRUPT, corruption_detail as _corruption_detail, is_structural_corruption_error,
+-    mark_storage_corrupt, note_storage_error, storage_corrupt_reason, storage_state,
++    mark_storage_corrupt, note_storage_error, note_unconfirmed_corruption, storage_corrupt_reason, storage_state,
+     write_op_name as _write_op_name,
+ )
++import hermes_state_corruption_confirm as _corrupt_confirm
+ from hermes_state_errors import (
+     _DELETED_WAL_GENERATION_MSG, _DISK_IO_ERROR_MARKER, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
+     _STATE_DB_REPLACED_MSG, DeletedWalGenerationError, SessionCompressionInProgressError, StateDbCorruptError,
+@@ -1076,6 +1077,8 @@ class SessionDB(
+         # healthy file for an hour). Nothing of the failed attempt is durable, so the replay is the
+         # same contract as the lock / FTS fail-open replays below. A second structural error latches.
+         # COMMIT itself is never replayed: its settlement is unknown (a durable receipt would apply twice).
++        # The replay also needs a clean scoped read-only quick_check first (_replay_or_halt_corrupt):
++        # `scope` records, per attempt, the tables the attempt's statements touched (names only).
+         first_corrupt: Optional[BaseException] = None
+         while True:
+             self._raise_if_db_corrupt(storage=True)
+@@ -1091,31 +1094,33 @@ class SessionDB(
+             # stable post-close state (identity cleared → adopt / reopen path).
+             fn_started = False
+             stage = "open"
++            scope = _corrupt_confirm.TouchedTables()
+             try:
+                 with self._lock:
+                     self._raise_if_db_replaced()
+                     if self._conn is None:  # close() raced this writer
+                         self._reopen_after_close_locked(context="write")
+                     stage = "begin"
+-                    self._conn.execute("BEGIN IMMEDIATE")
+-                    held_since = time.monotonic()
+-                    try:
+-                        fn_started = True
+-                        stage = "callback"
+-                        result = fn(self._conn)
+-                        stage = "commit"
+-                        self._conn.commit()
+-                        stage = "committed"
+-                        held_s = time.monotonic() - held_since
+-                        if held_s >= _WRITE_HOLD_WARN_S:  # the log names waiters; this names the holder's code
+-                            logger.warning("state.db write lock held %.1fs by %s (pid %d)", held_s,
+-                                           getattr(fn, "__qualname__", repr(fn)), os.getpid())
+-                    except BaseException:
++                    with scope.recording(self._conn):
++                        self._conn.execute("BEGIN IMMEDIATE")
++                        held_since = time.monotonic()
+                         try:
+-                            self._conn.rollback()
+-                        except Exception:
+-                            pass
+-                        raise
++                            fn_started = True
++                            stage = "callback"
++                            result = fn(self._conn)
++                            stage = "commit"
++                            self._conn.commit()
++                            stage = "committed"
++                            held_s = time.monotonic() - held_since
++                            if held_s >= _WRITE_HOLD_WARN_S:  # the log names waiters; this names the holder's code
++                                logger.warning("state.db write lock held %.1fs by %s (pid %d)", held_s,
++                                               getattr(fn, "__qualname__", repr(fn)), os.getpid())
++                        except BaseException:
++                            try:
++                                self._conn.rollback()
++                            except Exception:
++                                pass
++                            raise
+                 # Success — periodic best-effort checkpoint + FTS merge.
+                 self._note_unconfirmed_corruption(fn, first_corrupt)
+                 self._write_count += 1
+@@ -1185,7 +1190,8 @@ class SessionDB(
+                         continue
+                     # What survives both checks is structural damage: confirm once, then quarantine.
+                     if self._is_structural_corruption_error(exc):
+-                        first_corrupt = self._replay_or_halt_corrupt(exc, fn, stage, first_corrupt)
++                        first_corrupt = self._replay_or_halt_corrupt(
++                            exc, fn, stage, first_corrupt, scope=scope, deadline=deadline)
+                         continue  # the helper raised unless this one replay is safe
+                 raise
+ 
+@@ -1228,9 +1234,14 @@ class SessionDB(
+         ioerr_attempts = 0
+         first_corrupt: Optional[BaseException] = None
+         while True:
++            scope = _corrupt_confirm.TouchedTables()
+             try:
+                 with self._read_ctx() as conn:
+-                    result = fn(conn)
++                    if conn is self._conn:  # non-WAL fallback: the writer's authorizer slot is not ours
++                        result = fn(conn)
++                    else:
++                        with scope.recording(conn):
++                            result = fn(conn)
+             except sqlite3.OperationalError as exc:
+                 if ioerr_attempts >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
+                     note_storage_error(self.db_path, exc)
+@@ -1239,24 +1250,41 @@ class SessionDB(
+                 time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+                 continue
+             except sqlite3.DatabaseError as exc:
+-                # One unconfirmed structural error is replayed before it latches the process
+-                # (a SELECT has no effect to duplicate); a recurrence is published as before.
+-                if first_corrupt is None and is_structural_corruption_error(exc):
++                # One structural error that a bounded read-only quick_check of the tables the read
++                # touched does NOT confirm is replayed before it latches the process (a SELECT has
++                # no effect to duplicate); a confirmed one, a check timeout/error or a recurrence
++                # is published as before.
++                outcome = self._read_corrupt_replay_blocker(exc, scope, first_corrupt)
++                if outcome is None:
+                     first_corrupt = exc
+-                    logger.warning("state.db %s: a read raised structural corruption (%s); replaying it "
+-                                   "once before latching.", self.db_path, _corruption_detail(exc))
+                     continue
+                 # A reader is often the only observer (the sidebar poll on a store nobody is
+                 # writing to): publish structural damage so the list is not read as empty.
+-                note_storage_error(self.db_path, exc, context=(
+-                    f"{_corruption_detail(exc)}; op=read; "
+-                    + ("recurred on replay" if first_corrupt is not None else "no replay")))
++                note_storage_error(self.db_path, exc, context=f"{_corruption_detail(exc)}; op=read; {outcome}")
+                 raise
+             if first_corrupt is not None:
+                 logger.warning("state.db %s: read corruption (%s) did not recur on replay; storage is NOT "
+                                "latched (unconfirmed corruption).", self.db_path, _corruption_detail(first_corrupt))
+             return result
+ 
++    def _read_corrupt_replay_blocker(self, exc: BaseException, scope: "_corrupt_confirm.TouchedTables",
++                                     first_corrupt: Optional[BaseException]) -> Optional[str]:
++        """None when a read that raised *exc* may be replayed once (structural, first time, and a
++        clean scoped read-only quick_check); otherwise the outcome for the latch reason."""
++        if first_corrupt is not None:
++            return "recurred on replay"
++        if not is_structural_corruption_error(exc):
++            return "no replay"
++        confirm = _corrupt_confirm.confirm_corruption(
++            self.db_path, scope.tables(), _corrupt_confirm.confirm_budget(None))
++        if not confirm.clean:
++            return f"no replay: {confirm.describe()}"
++        logger.warning(
++            "state.db %s: a read raised structural corruption (%s), NOT confirmed (%s; unconfirmed "
++            "this process: %d); replaying it once before latching.", self.db_path,
++            _corruption_detail(exc), confirm.describe(), note_unconfirmed_corruption(self.db_path))
++        return None
++
+     def _ensure_db_file_generation(self) -> None:
+         """Mint a once-per-file generation stamp (state_meta + application_id). First opener wins (INSERT
+         OR IGNORE); application_id is written only while 0 so racers converge. PASSIVE checkpoint only.
+@@ -1447,16 +1475,31 @@ class SessionDB(
+         return None
+ 
+     def _replay_or_halt_corrupt(self, exc: BaseException, fn: Callable[..., Any], stage: str,
+-                                first_corrupt: Optional[BaseException]) -> BaseException:
+-        """Return *exc* (the caller replays the write once) or quarantine and raise."""
++                                first_corrupt: Optional[BaseException], *,
++                                scope: "_corrupt_confirm.TouchedTables",
++                                deadline: float) -> BaseException:
++        """Return *exc* (the caller replays the write once) or quarantine and raise.
++
++        The replay needs, after the rollback/stage blockers, a CLEAN bounded read-only
++        quick_check of the tables the attempt touched (fresh process, timeout = remaining
++        patience); damage, a timeout or any check error quarantines instead."""
+         replay_blocker = self._corrupt_replay_blocker(stage, first_corrupt)
++        confirm = None
++        if replay_blocker is None:
++            confirm = _corrupt_confirm.confirm_corruption(
++                self.db_path, scope.tables(), _corrupt_confirm.confirm_budget(deadline))
++            if not confirm.clean:
++                replay_blocker = f"no replay: {confirm.describe()}"
+         if replay_blocker is not None:
+             self._halt_db_corrupt(exc, context=(
+                 f"{_corruption_detail(exc)}; op={_write_op_name(fn)}; stage={stage}; {replay_blocker}"))
++        count = note_unconfirmed_corruption(self.db_path)
+         logger.warning(
+-            "state.db %s: %s raised structural corruption (%s) at stage=%s; the transaction rolled "
+-            "back, replaying it once on the same connection before quarantining.", self.db_path,
++            "state.db %s: %s raised structural corruption (%s) at stage=%s, NOT confirmed (%s; "
++            "unconfirmed this process: %d); the transaction rolled back, replaying it once on the "
++            "same connection before quarantining.", self.db_path,
+             _write_op_name(fn), _corruption_detail(exc), stage,
++            confirm.describe() if confirm is not None else "unchecked", count,
+         )
+         return exc
+ 
+diff --git a/hermes_state_corruption_confirm.py b/hermes_state_corruption_confirm.py
+new file mode 100644
+index 00000000000..5ec62c9aa2e
+--- /dev/null
++++ b/hermes_state_corruption_confirm.py
+@@ -0,0 +1,295 @@
++"""Confirm a structural ``SQLITE_CORRUPT`` before it latches state.db for the process.
++
++The storage latch (``hermes_state_health``) never clears, so one unconfirmed
++"database disk image is malformed" used to refuse every write until a restart
++(2026-11-03, hermes-hub: an hour of refused receipts and transcripts on a file that later
++passed ``quick_check`` on every table). Before the writer or the pooled reader replays a
++statement that raised structural corruption, this module runs a bounded
++``PRAGMA quick_check`` scoped to the tables the failing attempt touched (each table's
++indexes are checked with it), on a FRESH read-only connection in a FRESH process:
++
++* fresh process: a second connection opened and closed in this process would cancel the
++  POSIX locks every sibling connection holds on the file (close() drops all of the
++  process's fcntl locks; https://sqlite.org/howtocorrupt.html §2.2);
++* read-only (``mode=ro`` + ``query_only``): the check can never write to the file;
++* bounded: the child is killed at the caller's remaining write patience (capped);
++* fail closed: only an exact ``ok`` for every checked table is "clean". Damage, a timeout,
++  a missing budget, a spawn failure, unparsable output or any error is not, and the caller
++  latches as before.
++
++The scope comes from a SQLite authorizer installed on the connection for the attempt
++(``TouchedTables``): it sees every table each statement reads or writes at prepare time,
++including trigger bodies and FTS5's internal shadow-table statements. It records table
++NAMES only, never SQL text or bound parameters. When the scope is unknown (the error came
++before any statement was prepared, e.g. ``BEGIN IMMEDIATE``; an action the recorder cannot
++map; a table the fresh connection cannot resolve) the check widens to a whole-file
++``quick_check`` under the same bound, so an unknown scope is never treated as clean.
++
++A clean check does not prove the file was never damaged, nor explain the first error: it
++says the pages those tables live on read back consistent now. The caller therefore allows
++exactly one replay; a recurrence latches without a second check.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import sqlite3
++import subprocess
++import sys
++import time
++from contextlib import contextmanager
++from dataclasses import dataclass
++from typing import Iterator, Optional
++
++from hermes_state_holders import read_only_db_uri
++
++logger = logging.getLogger(__name__)
++
++# Upper bound on one confirmation, whatever patience the caller still has. The caller passes
++# its remaining patience; the effective timeout is the smaller of the two.
++CONFIRM_MAX_S = 30.0
++# Below this there is no time to start a child and read a page: fail closed without spawning.
++CONFIRM_MIN_S = 0.05
++# Readers have no write patience; a sidebar poll must not hang for long on a check.
++READ_CONFIRM_TIMEOUT_S = 5.0
++
++# Authorizer action codes (sqlite3.h). arg1 / arg2 carry the table for these:
++_TABLE_IN_ARG1 = frozenset({
++    2,   # SQLITE_CREATE_TABLE
++    9,   # SQLITE_DELETE
++    11,  # SQLITE_DROP_TABLE
++    18,  # SQLITE_INSERT
++    20,  # SQLITE_READ (table, column)
++    23,  # SQLITE_UPDATE (table, column)
++    28,  # SQLITE_ANALYZE
++    29,  # SQLITE_CREATE_VTABLE
++    30,  # SQLITE_DROP_VTABLE
++})
++_TABLE_IN_ARG2 = frozenset({
++    1,   # SQLITE_CREATE_INDEX (index, table)
++    7,   # SQLITE_CREATE_TRIGGER (trigger, table)
++    10,  # SQLITE_DROP_INDEX (index, table)
++    15,  # SQLITE_DROP_TRIGGER (trigger, table)
++    26,  # SQLITE_ALTER_TABLE (db, table)
++})
++# No table of the main schema involved (the schema table itself is always checked):
++_NO_TABLE = frozenset({
++    3, 4, 5, 6, 12, 13, 14, 16,  # temp index/table/trigger/view create/drop
++    8, 17,                       # CREATE/DROP VIEW (reads through a view arrive as SQLITE_READ)
++    19,                          # SQLITE_PRAGMA
++    21,                          # SQLITE_SELECT
++    22,                          # SQLITE_TRANSACTION
++    31,                          # SQLITE_FUNCTION
++    32,                          # SQLITE_SAVEPOINT
++    33,                          # SQLITE_RECURSIVE
++})
++_SQLITE_OK = 0
++_SCHEMA_TABLE = "sqlite_schema"
++
++
++class TouchedTables:
++    """Records which main-schema tables an attempt's statements touch (names only).
++
++    ``tables()`` is the scope for the confirmation: ``None`` means unknown (widen to the whole
++    file). It is unknown when the recorder never attached, saw an unmappable action or an
++    attached database, or recorded no table at all."""
++
++    __slots__ = ("_attached", "_names", "_unknown")
++
++    def __init__(self) -> None:
++        self._names: set[str] = set()
++        self._unknown = False
++        self._attached = False
++
++    def __call__(self, action, arg1, arg2, dbname, _source):  # sqlite3 authorizer signature
++        # Never raise and never deny: an exception here would be turned into SQLITE_DENY and
++        # fail the user's statement. Anything unexpected only widens the check.
++        try:
++            if dbname not in (None, "main"):
++                if dbname != "temp":
++                    self._unknown = True
++                return _SQLITE_OK
++            if action in _TABLE_IN_ARG1:
++                name = arg1
++            elif action in _TABLE_IN_ARG2:
++                name = arg2
++            elif action in _NO_TABLE:
++                return _SQLITE_OK
++            else:
++                self._unknown = True
++                return _SQLITE_OK
++            if isinstance(name, str) and name:
++                self._names.add(name)
++            else:
++                self._unknown = True
++        except Exception:  # health: allow BLE001 -- authorizer callback: an escaping exception becomes SQLITE_DENY and fails the user's statement; it only widens the check
++            self._unknown = True
++        return _SQLITE_OK
++
++    @contextmanager
++    def recording(self, conn) -> Iterator[TouchedTables]:
++        """Install this recorder as *conn*'s authorizer for the block. Installing an authorizer
++        expires the connection's prepared statements, so cached statements re-prepare and are
++        seen too. A connection that refuses the authorizer leaves the scope unknown."""
++        try:
++            conn.set_authorizer(self)
++            self._attached = True
++        except (sqlite3.Error, AttributeError, TypeError):  # closed / foreign connection: scope unknown
++            self._unknown = True
++        try:
++            yield self
++        finally:
++            if self._attached:
++                try:
++                    conn.set_authorizer(None)
++                except (sqlite3.Error, AttributeError, TypeError) as exc:  # closed under us: nothing to detach
++                    logger.debug("state.db scope recorder: authorizer detach failed: %s", exc)
++
++    def tables(self) -> Optional[frozenset]:
++        if not self._attached or self._unknown or not self._names:
++            return None
++        return frozenset(self._names)
++
++
++@dataclass(frozen=True)
++class ConfirmResult:
++    """``outcome``: ``clean`` | ``damaged`` | ``timeout`` | ``no_budget`` | ``error``.
++    Only ``clean`` allows the replay."""
++
++    outcome: str
++    scope: str  # "full" or comma-separated checked table names
++    elapsed_s: float
++    detail: str = ""
++
++    @property
++    def clean(self) -> bool:
++        return self.outcome == "clean"
++
++    def describe(self) -> str:
++        text = f"confirm={self.outcome} scope={self.scope} {self.elapsed_s:.2f}s"
++        return f"{text} ({self.detail})" if self.detail else text
++
++
++# Runs in the fresh process (``python -I -S``: no site-packages, no PYTHON* env, stdlib only).
++# argv: uri, JSON list of table names or null (whole file), busy timeout in ms.
++# Prints one JSON object; problem rows are page/row locations, never row contents.
++_CHILD = r"""
++import json, sqlite3, sys
++uri, scope_json, busy_ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
++scope = json.loads(scope_json)
++out = {}
++try:
++    conn = sqlite3.connect(uri, uri=True, timeout=busy_ms / 1000.0, isolation_level=None)
++    try:
++        conn.execute("PRAGMA query_only=1")
++        targets = None
++        if scope is not None:
++            known = {}
++            for name, sql in conn.execute("SELECT name, sql FROM sqlite_schema WHERE type='table'"):
++                known[name.lower()] = (name, (sql or "").lstrip().upper().startswith("CREATE VIRTUAL"))
++            known["sqlite_schema"] = known["sqlite_master"] = ("sqlite_schema", False)
++            targets = ["sqlite_schema"]
++            for name in scope:
++                hit = known.get(str(name).lower())
++                if hit is None:
++                    targets = None
++                    out["widened"] = "unresolved table"
++                    break
++                if not hit[1] and hit[0] not in targets:
++                    targets.append(hit[0])
++        problems = []
++        if targets is None:
++            problems += [r[0] for r in conn.execute("PRAGMA quick_check")]
++            problems = [] if problems == ["ok"] else problems
++        else:
++            for t in targets:
++                rows = [r[0] for r in conn.execute("PRAGMA quick_check('%s')" % t.replace("'", "''"))]
++                if rows != ["ok"]:
++                    problems += rows
++        out.update(ok=not problems, checked=targets, problems=len(problems),
++                   first=[str(p)[:160] for p in problems[:3]])
++    finally:
++        conn.close()
++except sqlite3.Error as exc:
++    out = {"ok": False, "error": type(exc).__name__,
++           "sqlite": getattr(exc, "sqlite_errorname", None), "message": str(exc)[:160]}
++sys.stdout.write(json.dumps(out))
++"""
++
++
++def _child_argv(uri: str, scope_json: str, busy_ms: int) -> list[str]:
++    """The fresh-process command (a seam for tests that need a hung or failing child)."""
++    return [sys.executable, "-I", "-S", "-c", _CHILD, uri, scope_json, str(busy_ms)]
++
++
++def confirm_budget(deadline: Optional[float], *, default_s: float = READ_CONFIRM_TIMEOUT_S) -> float:
++    """Seconds the confirmation may take: the caller's remaining patience (or *default_s*), capped."""
++    remaining = default_s if deadline is None else deadline - time.monotonic()
++    return max(0.0, min(remaining, CONFIRM_MAX_S))
++
++
++def _child_env() -> dict[str, str]:
++    """The stdlib-only child needs no profile home, credentials or PYTHON* settings (``-I``
++    ignores the latter anyway): pass only what an interpreter needs to start."""
++    env = {"PATH": os.environ.get("PATH", os.defpath)}
++    for name in ("SYSTEMROOT", "TMPDIR", "TEMP", "TMP"):  # SYSTEMROOT: Windows CPython startup
++        if name in os.environ:
++            env[name] = os.environ[name]
++    return env
++
++
++def _scope_label(checked) -> str:
++    if checked is None:
++        return "full"
++    return ",".join(sorted("".join(ch for ch in str(n) if ch.isalnum() or ch == "_")[:64] for n in checked))[:400]
++
++
++def confirm_corruption(db_path, tables: Optional[frozenset], timeout_s: float) -> ConfirmResult:
++    """Bounded read-only ``quick_check`` of *tables* (``None`` = whole file) in a fresh process.
++
++    Never raises; anything but an exact per-table ``ok`` is a non-clean result."""
++    started = time.monotonic()
++    requested = None if tables is None else sorted(tables)
++    label = _scope_label(requested)
++    if timeout_s < CONFIRM_MIN_S:
++        return ConfirmResult("no_budget", label, 0.0, f"{max(timeout_s, 0.0):.3f}s left of the write patience")
++    try:
++        argv = _child_argv(read_only_db_uri(db_path), json.dumps(requested), int(timeout_s * 1000))
++        proc = subprocess.run(
++            argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout_s, check=False,
++            close_fds=True, env=_child_env(),
++        )
++    except subprocess.TimeoutExpired:
++        return ConfirmResult("timeout", label, time.monotonic() - started, f"killed after {timeout_s:.2f}s")
++    except (OSError, ValueError, subprocess.SubprocessError) as exc:  # spawn failure (no executable, EMFILE, ...)
++        return ConfirmResult("error", label, time.monotonic() - started, f"spawn: {type(exc).__name__}")
++    elapsed = time.monotonic() - started
++    try:
++        out = json.loads(proc.stdout.decode("utf-8", "replace") or "null")
++    except ValueError:
++        out = None
++    if proc.returncode != 0 or not isinstance(out, dict):
++        return ConfirmResult("error", label, elapsed, f"child rc={proc.returncode}, unparsable output")
++    if "checked" in out:
++        label = _scope_label(out.get("checked"))
++    if "error" in out:
++        detail = f"{out.get('error')}/{out.get('sqlite')}: {out.get('message', '')}"[:200]
++        corrupt = out.get("sqlite") in ("SQLITE_CORRUPT", "SQLITE_NOTADB") or "malformed" in str(out.get("message"))
++        return ConfirmResult("damaged" if corrupt else "error", label, elapsed, detail)
++    if out.get("ok") is True and out.get("problems") == 0:
++        return ConfirmResult("clean", label, elapsed, str(out.get("widened") or ""))
++    first = "; ".join(str(p) for p in (out.get("first") or []))[:300]
++    return ConfirmResult("damaged", label, elapsed, f"{out.get('problems')} problem(s): {first}")
++
++
++__all__ = [
++    "CONFIRM_MAX_S",
++    "CONFIRM_MIN_S",
++    "READ_CONFIRM_TIMEOUT_S",
++    "ConfirmResult",
++    "TouchedTables",
++    "confirm_budget",
++    "confirm_corruption",
++]
+diff --git a/hermes_state_health.py b/hermes_state_health.py
+index 38ed82b1c5f..88edc9db226 100644
+--- a/hermes_state_health.py
++++ b/hermes_state_health.py
+@@ -18,11 +18,14 @@ the process restarts, which is the recovery boundary ``StateDbCorruptError`` alr
+ documents (stop Hermes, recover or restore, start again). No marker is written to disk:
+ the file it would describe is the one that is damaged.
+ 
+-Because it never clears, it must not be set on one unconfirmed error: the writer
+-(``SessionDB._execute_write``) and the pooled reader replay a rolled-back statement once on
+-the same connection and latch only when the corruption recurs (2026-11-03: one misread on a
+-healthy file refused every write for an hour). A COMMIT is never replayed (its settlement is
+-unknown), and the latched reason names the SQLite code, operation, stage and replay outcome.
++Because it never clears, it must not be set on one unconfirmed error (2026-11-03: one error on
++a file that later passed ``quick_check`` refused every write for an hour). The writer
++(``SessionDB._execute_write``) and the pooled reader first run a bounded ``quick_check`` of the
++tables the failing statement touched, read-only in a fresh process
++(``hermes_state_corruption_confirm``). Only a clean check allows ONE replay of the rolled-back
++statement on the same connection, counted by ``note_unconfirmed_corruption``; damage, a timeout
++or any check error latches, and so does a recurrence. A COMMIT is never replayed (its settlement
++is unknown). The latched reason names the SQLite code, operation, stage and check outcome.
+ """
+ 
+ from __future__ import annotations
+@@ -46,6 +49,7 @@ STORAGE_CORRUPT = "corrupt"
+ 
+ _lock = threading.Lock()
+ _corrupt: dict[str, str] = {}  # resolved db path -> first error text (log only, never served)
++_unconfirmed: dict[str, int] = {}  # resolved db path -> structural errors a clean check did not confirm
+ 
+ 
+ def _key(db_path) -> str:
+@@ -114,14 +118,31 @@ def storage_corrupt_reason(db_path) -> Optional[str]:
+         return _corrupt.get(_key(db_path))
+ 
+ 
++def note_unconfirmed_corruption(db_path) -> int:
++    """Count one structural error that a scoped read-only ``quick_check`` did NOT confirm (the
++    caller replays once instead of latching); returns this process's total for *db_path*."""
++    key = _key(db_path)
++    with _lock:
++        _unconfirmed[key] = _unconfirmed.get(key, 0) + 1
++        return _unconfirmed[key]
++
++
++def unconfirmed_corruption_count(db_path) -> int:
++    """How many structural errors on *db_path* this process saw but did not confirm."""
++    with _lock:
++        return _unconfirmed.get(_key(db_path), 0)
++
++
+ def reset_storage_state(db_path=None) -> None:
+-    """Forget the latch for *db_path* (all paths when None). For tests and a verified in-process
+-    recovery; nothing in the runtime clears it on its own."""
++    """Forget the latch (and the unconfirmed-error count) for *db_path* (all paths when None).
++    For tests and a verified in-process recovery; nothing in the runtime clears it on its own."""
+     with _lock:
+         if db_path is None:
+             _corrupt.clear()
++            _unconfirmed.clear()
+         else:
+             _corrupt.pop(_key(db_path), None)
++            _unconfirmed.pop(_key(db_path), None)
+ 
+ 
+ __all__ = [
+@@ -131,8 +152,10 @@ __all__ = [
+     "is_structural_corruption_error",
+     "mark_storage_corrupt",
+     "note_storage_error",
++    "note_unconfirmed_corruption",
+     "reset_storage_state",
+     "storage_corrupt_reason",
+     "storage_state",
++    "unconfirmed_corruption_count",
+     "write_op_name",
+ ]
+diff --git a/tests/hermes_state/test_storage_corruption_scoped_confirm.py b/tests/hermes_state/test_storage_corruption_scoped_confirm.py
+new file mode 100644
+index 00000000000..65574fe4f39
+--- /dev/null
++++ b/tests/hermes_state/test_storage_corruption_scoped_confirm.py
+@@ -0,0 +1,545 @@
++"""A structural SQLITE_CORRUPT is confirmed by a scoped, bounded, read-only quick_check before replay.
++
++Regression for selfheal gateway-d7a592a91c (2026-11-03, hermes-hub): one unconfirmed "database
++disk image is malformed" in a compression split latched a file that later passed quick_check on
++every table. Before the writer (or the pooled reader) replays such a statement, it now runs
++``PRAGMA quick_check`` on the tables the failing attempt touched, read-only, in a fresh process,
++bounded by the remaining write patience:
++
++* clean check -> one replay, the write lands once, nothing latches, the error is counted;
++* damage (a real damaged B-tree page), a check timeout, a check error, or no budget left ->
++  fail closed: latch with no replay;
++* FTS-scoped corruption, COMMIT faults and durable-commit-then-error never reach the check;
++* a recurrence after a clean check latches without a second check.
++
++Covered per entry path: worker receipt write (``mutate_worker_execution`` transcript.append),
++transcript append (``append_message``), compression split (``publish_compression_child``).
++Faults are injected into throwaway databases under ``tmp_path`` only.
++"""
++
++import logging
++import sqlite3
++import sys
++import time
++from contextlib import contextmanager
++
++import pytest
++
++import hermes_state_corruption_confirm as cc
++import hermes_state_runtime as rt
++from hermes_state import SessionDB, StateDbCorruptError
++from hermes_state_health import (
++    reset_storage_state, storage_corrupt_reason, storage_state, unconfirmed_corruption_count,
++)
++
++MALFORMED = "database disk image is malformed"
++PII = "PII-SENTINEL-alice@example.com"
++
++
++@pytest.fixture(autouse=True)
++def _fresh_latch():
++    reset_storage_state()
++    yield
++    reset_storage_state()
++
++
++def _malformed():
++    exc = sqlite3.DatabaseError(MALFORMED)
++    exc.sqlite_errorcode = 11
++    exc.sqlite_errorname = "SQLITE_CORRUPT"
++    return exc
++
++
++def _fts_error():
++    exc = sqlite3.DatabaseError(MALFORMED)
++    exc.sqlite_errorcode = 267
++    exc.sqlite_errorname = "SQLITE_CORRUPT_VTAB"
++    return exc
++
++
++class _Faulty:
++    """Proxy over the real writer connection raising an injected error on matching SQL."""
++
++    def __init__(self, real, *, match, times=1, exc=_malformed, on_commit=False, after_real_commit=False):
++        self._real, self._match, self._left, self._exc = real, match, times, exc
++        self._on_commit, self._after_real_commit = on_commit, after_real_commit
++        self.faults = 0
++        self.matched_calls = 0
++
++    def _fire(self):
++        if self._left is None or self._left > 0:
++            if self._left is not None:
++                self._left -= 1
++            self.faults += 1
++            raise self._exc()
++
++    def execute(self, sql, *args, **kwargs):
++        if self._match in sql:
++            self.matched_calls += 1
++            if not self._on_commit:
++                if not sql.lstrip().upper().startswith("BEGIN"):
++                    # Real corruption surfaces when the statement STEPS, after it was prepared (the
++                    # authorizer has seen its tables by then): prepare it via EXPLAIN, then fault.
++                    self._real.execute("EXPLAIN " + sql, *args, **kwargs)
++                self._fire()
++        return self._real.execute(sql, *args, **kwargs)
++
++    def commit(self):
++        if self._on_commit:
++            if self._after_real_commit:
++                self._real.commit()
++            self._fire()
++        return self._real.commit()
++
++    def __getattr__(self, name):
++        return getattr(self._real, name)
++
++
++@contextmanager
++def _inject(db, **kwargs):
++    real = db._conn
++    proxy = _Faulty(real, **kwargs)
++    db._conn = proxy
++    try:
++        yield proxy
++    finally:
++        if real.in_transaction:
++            real.rollback()
++        db._conn = real
++
++
++class _Calls(list):
++    """Recorded confirmations; ``spawned`` holds the fresh-process commands built for them."""
++
++    def __init__(self):
++        super().__init__()
++        self.spawned = []
++
++
++@pytest.fixture
++def confirms(monkeypatch):
++    """Spy on the REAL confirmation (and on the fresh-process command it builds)."""
++    calls = _Calls()
++    real_confirm, real_argv = cc.confirm_corruption, cc._child_argv
++
++    def spy(db_path, tables, timeout_s):
++        result = real_confirm(db_path, tables, timeout_s)
++        calls.append({"tables": tables, "timeout_s": timeout_s, "result": result})
++        return result
++
++    def argv_spy(*a):
++        argv = real_argv(*a)
++        calls.spawned.append(argv)
++        return argv
++
++    monkeypatch.setattr(cc, "confirm_corruption", spy)
++    monkeypatch.setattr(cc, "_child_argv", argv_spy)
++    return calls
++
++
++def _hung_child(monkeypatch, cap_s=1.0):
++    monkeypatch.setattr(cc, "CONFIRM_MAX_S", cap_s)
++    monkeypatch.setattr(cc, "_child_argv", lambda *a: [
++        sys.executable, "-I", "-S", "-c", "import threading; threading.Event().wait(120)"])
++
++
++def _failing_child(monkeypatch):
++    monkeypatch.setattr(cc, "_child_argv", lambda *a: [sys.executable, "-I", "-S", "-c", "raise SystemExit(3)"])
++
++
++def _contents(path):
++    raw = sqlite3.connect(str(path))
++    try:
++        return [r[0] for r in raw.execute("SELECT content FROM messages ORDER BY id")]
++    finally:
++        raw.close()
++
++
++def _reason(path):
++    return storage_corrupt_reason(path) or ""
++
++
++# ── entry paths ──
++
++
++class _TranscriptAppend:
++    match = "INSERT INTO messages"
++
++    def __init__(self, tmp_path):
++        self.db = SessionDB(db_path=tmp_path / "state.db")
++        self.db.create_session("s1", source="cli")
++
++    def write(self, content):
++        self.db.append_message(session_id="s1", role="user", content=content)
++
++    def landed(self, content):
++        return _contents(self.db.db_path).count(content)
++
++
++class _WorkerReceipt:
++    match = "INSERT INTO worker_receipts"
++
++    def __init__(self, tmp_path):
++        self.db = SessionDB(db_path=tmp_path / "state.db")
++        self.db.create_session("parent", source="kanban", profile_name="coder")
++        self.epoch = rt.begin_runtime_epoch(self.db, instance_id="boot")
++        rt.register_worker_execution(self.db, epoch=self.epoch, execution_id="worker", session_id="parent",
++                                     generation=0, kind="compute", adoption_secret="private-fixture")
++        self.seq = 0
++
++    def write(self, content):
++        self.seq += 1
++        return rt.mutate_worker_execution(
++            self.db, epoch=self.epoch, execution_id="worker", session_id="parent", generation=0,
++            sequence=self.seq, operation="transcript.append",
++            payload={"messages": [{"role": "assistant", "content": content}]})
++
++    def landed(self, content):
++        with self.db._read_ctx() as conn:
++            receipts = conn.execute("SELECT count(*) FROM worker_receipts WHERE execution_id='worker'").fetchone()[0]
++        n = _contents(self.db.db_path).count(content)
++        assert receipts == (1 if n else 0)  # one receipt per landed transcript append
++        return n
++
++
++class _CompressionSplit:
++    match = "INSERT INTO messages"
++
++    def __init__(self, tmp_path):
++        self.db = SessionDB(db_path=tmp_path / "state.db")
++        self.db.create_session("parent-1", source="cli")
++        self.db.append_message(session_id="parent-1", role="user", content="before split")
++
++    def write(self, content):
++        self.db.publish_compression_child(
++            parent_session_id="parent-1", child_session_id="child-1", source="test",
++            messages=[{"role": "user", "content": content}], require_compression_lease=False)
++
++    def landed(self, content):
++        n = _contents(self.db.db_path).count(content)
++        raw = sqlite3.connect(str(self.db.db_path))
++        try:
++            child = raw.execute("SELECT count(*) FROM sessions WHERE id='child-1'").fetchone()[0]
++            ended = raw.execute("SELECT end_reason FROM sessions WHERE id='parent-1'").fetchone()[0]
++        finally:
++            raw.close()
++        assert (child, ended is not None) == ((1, True) if n else (0, False))  # atomic split
++        return n
++
++
++ENTRY_PATHS = [_TranscriptAppend, _WorkerReceipt, _CompressionSplit]
++IDS = ["transcript_append", "worker_receipt", "compression_split"]
++
++
++@pytest.fixture(params=ENTRY_PATHS, ids=IDS)
++def entry(request, tmp_path):
++    path = request.param(tmp_path)
++    yield path
++    path.db.close()
++
++
++class TestCleanScopedConfirmAllowsOneReplay:
++    def test_one_shot_corrupt_with_clean_confirm_lands_once(self, entry, confirms, caplog):
++        caplog.set_level(logging.WARNING)
++        with _inject(entry.db, match=entry.match, times=1) as proxy:
++            entry.write(f"lands once {PII}")
++        assert proxy.faults == 1 and proxy.matched_calls == 2
++        assert entry.landed(f"lands once {PII}") == 1
++        assert storage_state(entry.db.db_path) == "ok" and entry.db._db_corrupt is False
++        # A real check ran, in a fresh process, scoped (not the whole file) to what the write touched.
++        assert len(confirms) == 1 and len(confirms.spawned) == 1
++        call = confirms[0]
++        assert call["result"].outcome == "clean"
++        assert call["tables"] is not None and "messages" in call["tables"]
++        assert call["result"].scope != "full" and "messages" in call["result"].scope
++        assert 0 < call["timeout_s"] <= cc.CONFIRM_MAX_S
++        assert unconfirmed_corruption_count(entry.db.db_path) == 1
++        assert "NOT confirmed (confirm=clean" in caplog.text
++        assert PII not in caplog.text  # names only: no SQL params in diagnostics
++        assert all(PII not in " ".join(argv) for argv in confirms.spawned)
++
++    def test_recurrence_after_clean_confirm_latches_without_second_check(self, entry, confirms):
++        with _inject(entry.db, match=entry.match, times=None) as proxy:
++            with pytest.raises(StateDbCorruptError):
++                entry.write("never lands")
++        assert proxy.matched_calls == 2
++        assert [c["result"].outcome for c in confirms] == ["clean"]
++        assert entry.landed("never lands") == 0
++        assert storage_state(entry.db.db_path) == "corrupt"
++        assert "recurred on replay" in _reason(entry.db.db_path)
++
++
++class TestConfirmFailsClosed:
++    def test_confirm_timeout_latches_without_replay(self, entry, confirms, monkeypatch):
++        _hung_child(monkeypatch, cap_s=1.0)
++        started = time.monotonic()
++        with _inject(entry.db, match=entry.match, times=1) as proxy:
++            with pytest.raises(StateDbCorruptError) as excinfo:
++                entry.write("timeout write")
++        assert time.monotonic() - started < 20  # bounded: the hung child is killed at the cap
++        assert proxy.matched_calls == 1  # no replay
++        assert [c["result"].outcome for c in confirms] == ["timeout"]
++        assert confirms[0]["timeout_s"] <= 1.0
++        assert entry.landed("timeout write") == 0
++        assert storage_state(entry.db.db_path) == "corrupt"
++        assert "confirm=timeout" in _reason(entry.db.db_path)
++        assert "confirm=timeout" in str(excinfo.value)
++        assert unconfirmed_corruption_count(entry.db.db_path) == 0
++        with pytest.raises(StateDbCorruptError):  # later writes refused exactly as before
++            entry.write("after latch")
++
++    def test_confirm_error_latches_without_replay(self, entry, confirms, monkeypatch):
++        _failing_child(monkeypatch)
++        with _inject(entry.db, match=entry.match, times=1) as proxy:
++            with pytest.raises(StateDbCorruptError):
++                entry.write("error write")
++        assert proxy.matched_calls == 1
++        assert [c["result"].outcome for c in confirms] == ["error"]
++        assert entry.landed("error write") == 0
++        assert storage_state(entry.db.db_path) == "corrupt"
++        assert "confirm=error" in _reason(entry.db.db_path)
++
++
++def test_no_patience_left_fails_closed_without_spawning(tmp_path, confirms):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("s1", source="cli")
++        with _inject(db, match="INSERT INTO messages", times=1) as proxy:
++            with pytest.raises(StateDbCorruptError):
++                db._execute_write(lambda conn: conn.execute(
++                    "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user','x',0)"),
++                    patience_s=0.0)
++        assert proxy.matched_calls == 1
++        assert [c["result"].outcome for c in confirms] == ["no_budget"]
++        assert confirms.spawned == []
++        assert storage_state(db.db_path) == "corrupt"
++    finally:
++        db.close()
++
++
++def test_spawn_failure_fails_closed(tmp_path, monkeypatch):
++    monkeypatch.setattr(cc, "_child_argv", lambda *a: [str(tmp_path / "no-such-python")])
++    result = cc.confirm_corruption(tmp_path / "state.db", None, 5.0)
++    assert result.outcome == "error" and not result.clean
++
++
++def test_unparsable_child_output_fails_closed(tmp_path, monkeypatch):
++    monkeypatch.setattr(cc, "_child_argv", lambda *a: [sys.executable, "-I", "-S", "-c", "print('ok')"])
++    assert cc.confirm_corruption(tmp_path / "state.db", None, 5.0).outcome == "error"
++
++
++# ── real damaged B-tree page ──
++
++
++def _seed_and_damage_sessions(path):
++    seed = SessionDB(db_path=path)
++    for i in range(40):
++        seed.create_session(f"s{i:03d}", source="cli")
++    seed.close()
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
++        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'sessions'").fetchone()[0]
++    finally:
++        conn.close()
++    with open(path, "r+b") as fh:
++        fh.seek(page_size * (root - 1))
++        fh.write(b"\xde\xad\xbe\xef" * (page_size // 4))
++
++
++def test_real_damaged_btree_is_confirmed_and_latches_without_replay(tmp_path, confirms):
++    path = tmp_path / "state.db"
++    _seed_and_damage_sessions(path)
++    db = SessionDB(db_path=path)
++    try:
++        with pytest.raises(StateDbCorruptError) as excinfo:
++            db.create_session("new-session", source="cli")
++        with pytest.raises(StateDbCorruptError):  # writes refused exactly as today
++            db.append_message(session_id="s001", role="user", content="refused")
++    finally:
++        db.close()
++    assert [c["result"].outcome for c in confirms] == ["damaged"]
++    assert "sessions" in confirms[0]["tables"]
++    assert storage_state(path) == "corrupt"
++    assert "confirm=damaged" in _reason(path)
++    assert "confirm=damaged" in str(excinfo.value)
++    assert unconfirmed_corruption_count(path) == 0
++
++
++def test_check_is_scoped_to_the_named_tables(tmp_path):
++    """The damaged ``sessions`` B-tree is found by a check that names it (or the whole file) and
++    not by one scoped to another table alone: the scope is what was touched, not a full scan."""
++    path = tmp_path / "state.db"
++    _seed_and_damage_sessions(path)
++    assert cc.confirm_corruption(path, frozenset({"sessions"}), 10.0).outcome == "damaged"
++    assert cc.confirm_corruption(path, None, 10.0).outcome == "damaged"
++    narrow = cc.confirm_corruption(path, frozenset({"state_meta"}), 10.0)
++    assert narrow.outcome == "clean", narrow
++    assert narrow.scope == "sqlite_schema,state_meta"
++
++
++# ── paths that must never reach the check ──
++
++
++class TestPathsThatNeverConfirm:
++    def test_fts_scoped_fault_bypasses_the_check(self, tmp_path, confirms):
++        db = SessionDB(db_path=tmp_path / "state.db")
++        try:
++            if not db._fts_enabled:
++                pytest.skip("FTS5 unavailable in this build")
++            db.create_session("s1", source="cli")
++            with _inject(db, match="INSERT INTO messages", times=1, exc=_fts_error):
++                db.append_message(session_id="s1", role="user", content="fts fault")
++            assert confirms == []
++            assert storage_state(db.db_path) == "ok"
++            assert _contents(db.db_path).count("fts fault") == 1
++        finally:
++            db.close()
++
++    def test_commit_fault_is_never_checked_or_replayed(self, tmp_path, confirms):
++        path = _WorkerReceipt(tmp_path)
++        try:
++            with _inject(path.db, match=path.match, times=1, on_commit=True) as proxy:
++                with pytest.raises(StateDbCorruptError):
++                    path.write("commit fault")
++            assert proxy.matched_calls == 1 and confirms == []
++            assert storage_state(path.db.db_path) == "corrupt"
++        finally:
++            path.db.close()
++
++    def test_durable_commit_then_error_applies_once_and_is_never_checked(self, tmp_path, confirms):
++        path = _WorkerReceipt(tmp_path)
++        try:
++            with _inject(path.db, match=path.match, times=1, on_commit=True, after_real_commit=True) as proxy:
++                with pytest.raises(StateDbCorruptError):
++                    path.write("durable once")
++            assert proxy.matched_calls == 1 and confirms == []
++            assert path.landed("durable once") == 1
++        finally:
++            path.db.close()
++
++
++def test_begin_stage_fault_has_unknown_scope_and_checks_the_whole_file(tmp_path, confirms):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("s1", source="cli")
++        with _inject(db, match="BEGIN IMMEDIATE", times=1):
++            db.append_message(session_id="s1", role="user", content="after begin fault")
++        assert [(c["tables"], c["result"].scope, c["result"].outcome) for c in confirms] == [(None, "full", "clean")]
++        assert _contents(db.db_path).count("after begin fault") == 1
++    finally:
++        db.close()
++
++
++# ── pooled reader ──
++
++
++class TestPooledRead:
++    def _flaky(self, db, monkeypatch, fail_times):
++        real_ctx = db._read_ctx
++        calls = {"n": 0}
++
++        @contextmanager
++        def ctx(*a, **k):
++            with real_ctx(*a, **k) as conn:
++                calls["n"] += 1
++                if fail_times is None or calls["n"] <= fail_times:
++                    raise _malformed()  # before the statement: unknown scope, whole-file check
++                yield conn
++
++        monkeypatch.setattr(db, "_read_ctx", ctx)
++        return calls
++
++    def test_one_shot_read_with_clean_confirm_replays(self, tmp_path, confirms, monkeypatch):
++        db = SessionDB(db_path=tmp_path / "state.db")
++        try:
++            db.create_session("s1", source="cli")
++            calls = self._flaky(db, monkeypatch, 1)
++            row = db._read_one("SELECT id FROM sessions WHERE id = ?", ("s1",))
++            assert row is not None and row[0] == "s1"
++            assert calls["n"] == 2
++            assert [(c["tables"], c["result"].outcome) for c in confirms] == [(None, "clean")]
++            assert storage_state(db.db_path) == "ok"
++            assert unconfirmed_corruption_count(db.db_path) == 1
++        finally:
++            db.close()
++
++    def test_read_scope_is_the_tables_the_statement_read(self, tmp_path, confirms):
++        db = SessionDB(db_path=tmp_path / "state.db")
++        try:
++            db.create_session("s1", source="cli")
++            attempts = {"n": 0}
++
++            def read(conn):
++                attempts["n"] += 1
++                row = conn.execute("SELECT count(*) FROM messages WHERE session_id = ?", (PII,)).fetchone()
++                if attempts["n"] == 1:
++                    raise _malformed()
++                return row[0]
++
++            assert db._read_retrying_ioerr(read) == 0
++            assert attempts["n"] == 2
++            [call] = confirms
++            assert call["tables"] is not None and "messages" in call["tables"]
++            assert call["result"].outcome == "clean"
++            assert PII not in repr(call)
++        finally:
++            db.close()
++
++    def test_read_confirm_timeout_latches_without_replay(self, tmp_path, confirms, monkeypatch):
++        db = SessionDB(db_path=tmp_path / "state.db")
++        try:
++            db.create_session("s1", source="cli")
++            calls = self._flaky(db, monkeypatch, 1)
++            _hung_child(monkeypatch, cap_s=1.0)
++            with pytest.raises(sqlite3.DatabaseError):
++                db._read_one("SELECT id FROM sessions WHERE id = ?", ("s1",))
++            assert calls["n"] == 1
++            assert [c["result"].outcome for c in confirms] == ["timeout"]
++            assert storage_state(db.db_path) == "corrupt"
++            assert "confirm=timeout" in _reason(db.db_path)
++        finally:
++            db.close()
++
++
++# ── the scope recorder ──
++
++
++class TestTouchedTables:
++    def test_records_tables_from_triggers_and_fts_shadow_statements_but_no_values(self, tmp_path):
++        conn = sqlite3.connect(tmp_path / "x.db")
++        try:
++            conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
++            conn.execute("CREATE TABLE audit(n)")
++            conn.execute("CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (1); END")
++            conn.commit()
++            rec = cc.TouchedTables()
++            with rec.recording(conn):
++                conn.execute("INSERT INTO t(b) VALUES (?)", (PII,))
++            assert rec.tables() == frozenset({"t", "audit"})
++            assert PII not in repr(rec._names)
++            # Detached afterwards: later statements are not recorded.
++            conn.execute("SELECT * FROM audit").fetchall()
++            assert rec.tables() == frozenset({"t", "audit"})
++        finally:
++            conn.close()
++
++    def test_unknown_scope_widens_to_full(self, tmp_path):
++        assert cc.TouchedTables().tables() is None  # never attached
++        rec = cc.TouchedTables()
++        conn = sqlite3.connect(tmp_path / "x.db")
++        try:
++            with rec.recording(conn):
++                conn.execute("BEGIN")
++                conn.execute("ROLLBACK")
++            assert rec.tables() is None  # nothing table-scoped seen
++        finally:
++            conn.close()
++        attached = cc.TouchedTables()
++        attached(18, "t", None, "other_db", None)  # an ATTACHed database
++        assert attached.tables() is None
++        odd = cc.TouchedTables()
++        odd(27, "idx", None, "main", None)  # SQLITE_REINDEX: not mapped
++        odd(18, "t", None, "main", None)
++        assert odd.tables() is None
+-- 
+2.55.0
+
