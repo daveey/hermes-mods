@@ -45,8 +45,14 @@ def board(monkeypatch):
         path = root / "kanban.db"
         assert db.kanban_db_path("default").resolve() == path.resolve()
         assert not kanban_path_is_fenced(path)
+        # Use the core's initialization contract, not only its base SQL: event
+        # writers also depend on migrations and auxiliary schemas (wake episodes).
+        from hermes_cli.kanban_db_connect import connect
+        connect(path).close()
         con = sqlite3.connect(path)
-        con.executescript(db.SCHEMA_SQL)
+        # Preserve the fixture's rollback-journal baseline. WAL-specific tests
+        # enable WAL explicitly before installing their observer/loss scenario.
+        assert con.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
         con.execute("INSERT INTO tasks (id,title,status,created_at,current_run_id,block_kind,human_request) "
                     "VALUES ('t_card','fixture','blocked',1,NULL,'human',?)", (json.dumps(REQUEST),))
         con.commit()
@@ -68,9 +74,13 @@ def at(hour, minute, winter=False):
 
 
 def add_block(path, when, run_id, payload):
+    db, _ = ut._kanban_api()
     with sqlite3.connect(path) as con:
-        con.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-                    "VALUES ('t_card', ?, 'blocked', ?, ?)", (run_id, json.dumps(payload), int(when)))
+        # Seed a real lifecycle event, including the core's wake-episode state;
+        # a raw event INSERT omits the exit/reset evidence of a blocked card.
+        last = con.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+        db._append_event(con, "t_card", "blocked", payload, run_id=run_id)
+        con.execute("UPDATE task_events SET created_at=? WHERE id>?", (int(when), last))
 
 
 def snapshot(path):
