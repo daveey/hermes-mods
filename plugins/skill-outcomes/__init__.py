@@ -37,6 +37,10 @@ def _load_core():
 
 
 core = _load_core()
+# A checklist line that doesn't apply to this change (e.g. "detached worktree" for a hub state edit made in the scratch
+# clone the skill prescribes) is not a failure: agent-bf18c74c00, coach nudged an honest `still failing` it can't close.
+NA_HINT = ("A line that doesn't apply to this change counts as passed: name it with `; n/a: <item> — <why>`, never "
+           "`still failing` for it; a skipped step that does apply is still failing.")
 _lock = threading.Lock()
 _loads: dict[str, dict[str, dict]] = {}  # session -> skill -> {skill, ts, has_done_means, turn_id}
 # session -> turn_id of its live turn (from pre_llm_call). A background-review or side-question fork shares the
@@ -142,7 +146,7 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
         return result + (
             f"\n\n{core.MARK} This skill has a `## Done means` list. Before your final reply, check each line, fix "
             f"failures at most 2 rounds, and end the reply with one line: `Done means ({name}): <passed on first "
-            f"check>/<total> first pass, <k> fix rounds` (add `; still failing: <what>` if any still fail).")
+            f"check>/<total> first pass, <k> fix rounds` (add `; still failing: <what>` if any still fail). " + NA_HINT)
     except Exception as exc:
         _warn("transform_tool_result", exc)
         return None
@@ -210,7 +214,7 @@ def pre_final_gate(session_id: str = "", final_response: Any = None, attempt: in
         return {"hold": True, "nudge": (
             f"{core.MARK} You loaded {', '.join(missing)} this turn; each has a `## Done means` list. Check each "
             f"line against your work, then send the reply again ending with one line per skill:\n{want}\n"
-            "(add `; still failing: <what>` when any line fails).")}
+            "(add `; still failing: <what>` when any line fails). " + NA_HINT)}
     except Exception as exc:
         _warn("pre_final_gate", exc)
         return None

@@ -438,3 +438,32 @@ def test_lines_before_rules_4_are_left_out_of_correction_rate():
     old = {"ts": t, "host": "h", "session": "s0", "skill": "x", "user_correction": True, "rules": 3,
            "checks_first_pass": None}
     assert core.rollup([old], t - 1, t + 1)[0]["correction_rate"] is None
+
+
+# ---------------------------------------------------------------- n/a: a line that doesn't apply (agent-bf18c74c00)
+# A hub worker that edited state through the scratch clone hermes-mods-repo's step 4 prescribes had no way to say the
+# "detached worktree" line didn't apply: the tick-off grammar offered only `still failing`, so coach nudged an honest
+# reply it couldn't close.
+def test_tickoff_hints_offer_na_for_lines_that_dont_apply():
+    out = plug.transform_tool_result(tool_name="skill_view", args={"name": "five-whys"},
+                                     result=view("five-whys", SKILL_DONE), session_id="s")
+    assert "n/a: <item>" in out and "never `still failing`" in out
+    plug.post_tool_call(tool_name="skill_view", args={"name": "five-whys"}, result=out, session_id="sna")
+    held = plug.pre_final_gate(session_id="sna", final_response="Root cause found.", attempt=0)
+    assert "n/a: <item>" in held["nudge"] and "never `still failing`" in held["nudge"]
+
+
+def test_parse_tickoffs_splits_na_from_still_failing():
+    na = core.parse_tickoffs("Done means (hermes-mods-repo): 5/5 first pass, 0 fix rounds; n/a: detached worktree "
+                             "— hub state edit made in a scratch clone of state (step 4)")["hermes-mods-repo"]
+    assert na["still_failing"] == [] and na["na"] == ["detached worktree — hub state edit made in a scratch clone "
+                                                      "of state (step 4)"]
+    sf = core.parse_tickoffs("Done means (hermes-mods-repo): 4/5 first pass, 0 fix rounds; still failing: the change "
+                             "was tested in a scratch clone of state, not a detached worktree")["hermes-mods-repo"]
+    assert sf["na"] == [] and sf["still_failing"] == ["the change was tested in a scratch clone of state, not a "
+                                                      "detached worktree"]
+    assert core.parse_tickoffs("Done means (five-whys): 4/5 first pass; still failing: none")["five-whys"][
+        "still_failing"] == []
+    # an n/a with no reason is not accepted as one: it stays a failure
+    bare = core.parse_tickoffs("Done means (x): 4/5 first pass; n/a: worktree")["x"]
+    assert bare["na"] == [] and bare["still_failing"] == ["worktree (n/a without a reason)"]

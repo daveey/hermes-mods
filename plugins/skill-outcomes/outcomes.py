@@ -34,10 +34,14 @@ COACH_EVENTS = {"selfheal_detect": {"complaint", "backstop"}, "lesson": None}
 # rules 4 drops background-review fork skill_views and closes an interrupted turn's uses at the next message.
 RULES = 4
 
-# `Done means (five-whys): 4/5 first pass, 1 fix round; still failing: ...`
+# `Done means (five-whys): 4/5 first pass, 1 fix round; still failing: ...` (a line that doesn't apply to the change
+# counts as passed and is named `; n/a: <item> — <why>`; agent-bf18c74c00)
 TICK_RE = re.compile(
     r"Done means\s*\(\s*`?([\w:.\-]+)`?\s*\)\s*[:\-–—]\s*(\d+)\s*/\s*(\d+)\b[^,;\n]{0,30}"
     r"(?:[,;]\s*(\d+)\s*fix(?:\s*|-)rounds?)?", re.I)
+# an n/a clause's reason: after a dash, "--", "(", ":" or "because"; a bare `n/a: <item>` is not accepted as one
+NA_REASON_RE = re.compile(r"\s(?:[—–]|-{1,2})\s*\S|[—–(:]\s*\S|\bbecause\s+\S", re.I)
+NONE_RE = re.compile(r"^\W*(?:none|nothing|n/?a|-)?\W*$", re.I)
 DONE_HEADING_RE = re.compile(r"^#{2,3}\s+Done means\b", re.I | re.M)
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe|System note|runtime|session-outcome|"
@@ -86,16 +90,37 @@ def count_done_means(text: str) -> Optional[int]:
     return len(re.findall(r"^\s*[-*]\s+\[[ xX]\]", body, re.M)) or None
 
 
+def tick_clauses(rest: str) -> tuple:
+    """(still_failing, na) items from the rest of a tick-off line: `; still failing: <what>` and
+    `; n/a: <item> — <why>`. An n/a with no reason counts as still failing."""
+    failing, na = [], []
+    for part in re.split(r";\s*", rest or ""):
+        m = re.match(r"\s*(still failing|n/a)\s*:\s*(.*?)\s*\.?\s*$", part, re.I)
+        if not m or NONE_RE.match(m.group(2)):
+            continue
+        item = m.group(2)
+        if m.group(1).lower() == "still failing":
+            failing.append(item)
+        elif NA_REASON_RE.search(item):
+            na.append(item)
+        else:
+            failing.append(f"{item} (n/a without a reason)")
+    return failing, na
+
+
 def parse_tickoffs(text: str) -> dict:
-    """{skill: {"passed", "total", "fix_rounds"}} from the reply's `Done means (<skill>): p/t first pass, k fix
-    rounds` lines (last one per skill wins)."""
+    """{skill: {"passed", "total", "fix_rounds", "still_failing", "na"}} from the reply's `Done means (<skill>): p/t
+    first pass, k fix rounds[; still failing: <what>][; n/a: <item> — <why>]` lines (last one per skill wins)."""
     out = {}
     for m in TICK_RE.finditer(text or ""):
         p, t = int(m.group(2)), int(m.group(3))
         if t <= 0 or p > t:
             continue
+        eol = text.find("\n", m.end())
+        failing, na = tick_clauses(text[m.end():eol if eol >= 0 else len(text)])
         out[m.group(1).lower()] = {"passed": p, "total": t,
-                                   "fix_rounds": int(m.group(4)) if m.group(4) is not None else None}
+                                   "fix_rounds": int(m.group(4)) if m.group(4) is not None else None,
+                                   "still_failing": failing, "na": na}
     return out
 
 
