@@ -1,0 +1,169 @@
+From b9a72fc3099180fa02aee2f9194a8f4243491e05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 04:39:03 +0000
+Subject: [PATCH] [daveey] Skip probe-less park evidence when no probe was ever
+ delivered
+
+Atomic triage parks (test_kanban_triage_park) must append only their
+scheduled event. A corridor probe-less park now emits wake_episode_evidence
+only when, after reconciling delivered snapshots, this home knows a probe or
+episode to clear. Outside-corridor exit resets and delivered foreign probes
+are still carried (test_kanban_wake_episode_probeless; 5 mutants killed).
+---
+ hermes_cli/kanban_wake_episode.py             | 19 +++-
+ .../test_kanban_wake_episode_probeless.py     | 98 +++++++++++++++++++
+ 2 files changed, 115 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wake_episode_probeless.py
+
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index a5503ff72b9..86f06ec4094 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -124,7 +124,9 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+     Lifecycle events carry the snapshot in their own payload. Unrelated events and
+     probe-less parks keep their payload untouched: their evidence (a corridor-exit
+     reset or a cleared probe, still needed by peers whose episode this home never
+-    observed) is returned separately for a ``wake_episode_evidence`` event.
++    observed) is returned separately for a ``wake_episode_evidence`` event. A
++    probe-less park inside the corridor on a task with no delivered probe or
++    episode adds nothing, so atomic parks still append only their own event.
+     """
+     status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     outside = status is not None and status[0] not in _CORRIDOR
+@@ -133,8 +135,15 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+     if outside and conn.execute("SELECT 1 FROM task_wake_episode_exit WHERE task_id = ?", (task_id,)).fetchone() \
+             and not conn.execute("SELECT 1 FROM task_wake_episodes WHERE task_id = ?", (task_id,)).fetchone():
+         return payload, None  # this exit's reset was already carried
++    probe_less = kind in {"scheduled", "continued"} and not (payload or {}).get("wake_check")
++    if probe_less and not outside:
++        reconcile(conn, task_id)  # judge against every delivered park, then idempotent in _snapshot
++        if not _probe_known(conn, task_id):
++            # Nothing to clear here and no probe was ever delivered: the park changes no
++            # episode state, so it adds no evidence (keeps atomic park event contracts).
++            return payload, None
+     snapshot = _snapshot(conn, task_id, kind, payload, outside)
+-    separate = (kind in {"scheduled", "continued"} and not (payload or {}).get("wake_check")) or (
++    separate = probe_less or (
+         outside and kind not in _CARRY_EVENTS and kind not in _EXIT_EVENTS and not kind.startswith("wake_"))
+     if separate:
+         return payload, snapshot
+@@ -159,6 +168,12 @@ def _snapshot(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict |
+     return {_SNAPSHOT: data, barriers.KEY: barriers.current(conn, task_id)}
+ 
+ 
++def _probe_known(conn: sqlite3.Connection, task_id: str) -> bool:
++    row = conn.execute("SELECT cmd FROM task_wake_episode_cmd WHERE task_id = ?", (task_id,)).fetchone()
++    return bool(row and row[0]) or conn.execute(
++        "SELECT 1 FROM task_wake_episodes WHERE task_id = ?", (task_id,)).fetchone() is not None
++
++
+ def reset(conn: sqlite3.Connection, task_id: str) -> None:
+     conn.execute("DELETE FROM task_wake_episodes WHERE task_id = ?", (task_id,))
+     barriers.advance(conn, task_id)
+diff --git a/tests/hermes_cli/test_kanban_wake_episode_probeless.py b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+new file mode 100644
+index 00000000000..7b68a9b8c31
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+@@ -0,0 +1,98 @@
++"""Probe-less parks add evidence only when some probe could still need clearing."""
++import json
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as wc
++from hermes_cli import kanban_wake_episode as episode
++from tests.hermes_cli import test_kanban_wake_check as helpers
++from tests.hermes_cli import test_kanban_wake_episode as base
++from tests.hermes_cli import test_kanban_wake_episode_carry as carry
++
++kanban_home = base.kanban_home
++parked = base.parked
++SOAK = "SCHEDULED_UNTIL=2026-09-13T00:00:00Z soak"
++
++
++def _kinds(conn, tid):
++    return [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
++
++
++def _park_without_probe(conn, tid):
++    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    before = len(_kinds(conn, tid))
++    assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
++    return [k for k in _kinds(conn, tid)[before:] if k not in {"claimed", "commented"}]
++
++
++def _episode(conn, tid):
++    return conn.execute("SELECT cmd FROM task_wake_episodes WHERE task_id = ?", (tid,)).fetchone()
++
++
++def test_never_probed_park_adds_no_evidence(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        before = len(_kinds(conn, tid))
++        assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
++        assert [k for k in _kinds(conn, tid)[before:] if k != "commented"] == ["scheduled"]
++
++
++def test_repeated_probe_less_park_evidence_is_emitted_once(parked):
++    conn, tid, _ = parked
++    assert _park_without_probe(conn, tid) == [episode.EVIDENCE_EVENT, "scheduled"]
++    assert _park_without_probe(conn, tid) == ["scheduled"]  # cleared probe already carried
++
++
++def test_local_episode_without_probe_record_still_carries_evidence(parked):
++    conn, tid, _ = parked
++    base.result(parked, 0)
++    conn.execute("DELETE FROM task_wake_episode_cmd WHERE task_id = ?", (tid,))
++    assert _episode(conn, tid)
++    assert _park_without_probe(conn, tid) == [episode.EVIDENCE_EVENT, "scheduled"]
++    assert _episode(conn, tid) is None
++
++
++def test_delivered_but_unreconciled_foreign_probe_is_cleared(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)  # this home never parks with a probe
++        peer = carry.replica(conn)
++        try:
++            assert kb.schedule_task(peer, tid, reason="waiting", wake_check="exit 1")
++            state = wc.get_state(peer, tid)
++            assert state is not None
++            wc.apply_result(peer, tid, state["cmd"], 1, "", generation=state["generation"],
++                            now=int(time.time()))
++            assert _episode(peer, tid)
++            carry.import_events(peer, conn, tid)  # delivered, not yet reconciled here
++            before = len(_kinds(conn, tid))
++            assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
++            added = [k for k in _kinds(conn, tid)[before:] if k != "commented"]
++            assert added == [episode.EVIDENCE_EVENT, "scheduled"]
++            carry.import_events(conn, peer, tid)
++            episode.reconcile(peer, tid)
++            assert _episode(peer, tid) is None
++        finally:
++            peer.close()
++
++
++def test_outside_probe_less_park_keeps_exit_reset_for_unobserved_episode(parked):
++    conn, tid, _ = parked
++    home = carry.replica(conn)
++    try:
++        home.execute("DELETE FROM task_wake_episode_cmd WHERE task_id = ?", (tid,))  # home knows no probe
++        base.result(parked, 0)
++        home.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
++        before = len(_kinds(home, tid))
++        kb._append_event(home, tid, "scheduled", {"reason": "late"})
++        rows = home.execute("SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
++                            (tid,)).fetchall()[before:]
++        assert [r[0] for r in rows] == [episode.EVIDENCE_EVENT, "scheduled"]
++        assert json.loads(rows[1][1]) == {"reason": "late"}
++        carry.import_events(home, conn, tid)
++        episode.reconcile(conn, tid)
++        state = wc.get_state(conn, tid)
++        assert state is not None and state["episode_first_at"] is None
++    finally:
++        home.close()
+-- 
+2.55.0
+

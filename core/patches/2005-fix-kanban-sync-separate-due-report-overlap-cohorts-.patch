@@ -1,0 +1,156 @@
+From 221510a25b32673c6f678f383ce15201b6f1c444 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:43:38 +0000
+Subject: [PATCH] fix(kanban-sync): separate due report overlap cohorts
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_timing_report.py       | 23 ++++++-
+ .../test_kanban_sync_timing_report.py         | 64 +++++++++++++++++++
+ 2 files changed, 84 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_timing_report.py
+
+diff --git a/hermes_cli/kanban_sync_timing_report.py b/hermes_cli/kanban_sync_timing_report.py
+index 8465f0a9d9f..604214106f1 100644
+--- a/hermes_cli/kanban_sync_timing_report.py
++++ b/hermes_cli/kanban_sync_timing_report.py
+@@ -11,6 +11,10 @@ reported as their own invalid capture, never dropped) and measured distributions
+   overlap, plus the overlap residual (latency minus the measured overlapping report time, the same interval's own
+   measurement, not another route's median); a capture with no overlapping change has coverage ``none``;
+ - failed/raised services, changes still unserviced at the stop marker (censored, never dropped);
++- due-report overlap and no-due-report-overlap cohorts separately from the compatibility total-report cohorts;
++  due means a recorded collect or send component, including failed/raised reports, never the result string or a
++  duration threshold. Overlap uses the full due report interval, not just its components; residuals subtract only
++  that interval's own measured overlap, not a counterfactual or a latency acceptance verdict;
+ - full report durations (due and not-due cohorts), their components and send outcomes;
+ - the diagnostic's own flush and hook overhead.
+ """
+@@ -102,7 +106,7 @@ def _overlap(a0: int, a1: int, spans: list[tuple[int, int]]) -> int:
+     return sum(max(0, min(a1, s1) - max(a0, s0)) for s0, s1 in spans)
+ 
+ 
+-def _served(cap: list[dict], report_spans, flush_spans) -> list[dict]:
++def _served(cap: list[dict], report_spans, flush_spans, due_report_spans=()) -> list[dict]:
+     changes = {r["seq"]: r for r in cap if r.get("ev") == "chg"}
+     done: set[int] = set()
+     served = []
+@@ -117,12 +121,17 @@ def _served(cap: list[dict], report_spans, flush_spans) -> list[dict]:
+             served.append({"seq": seq, "b": svc["b"], "latency_ns": svc["t1"] - chg["t"],
+                            "to_start_ns": svc["t0"] - chg["t"], "failed_attempts": svc.get("fails", 0),
+                            "report_overlap_ns": _overlap(chg["t"], svc["t1"], report_spans),
++                           "due_report_overlap_ns": _overlap(chg["t"], svc["t1"], due_report_spans),
+                            "flush_overlap_ns": _overlap(chg["t"], svc["t1"], flush_spans)})
+     return served
+ 
+ 
++def _is_due(rep: dict) -> bool:
++    return "collect_t0" in rep or "send_t0" in rep
++
++
+ def _reports(reps: list[dict]) -> dict:
+-    due = [r for r in reps if "collect_t0" in r or "send_t0" in r]
++    due = [r for r in reps if _is_due(r)]
+     parts = {name: _dist_ms([r[f"{name}_t1"] - r[f"{name}_t0"] for r in due if f"{name}_t0" in r])
+              for name in ("collect", "limit", "cpu", "adv", "send")}
+     return {"due": _dist_ms([r["t1"] - r["t0"] for r in due]),
+@@ -151,18 +160,26 @@ def _measure(cap: list[dict], stop: dict) -> dict[str, Any]:
+     start = cap[0]
+     by = {ev: [r for r in cap if r.get("ev") == ev] for ev in ("rep", "flush", "svc", "pend", "chg", "wait")}
+     report_spans = [(r["t0"], r["t1"]) for r in by["rep"]]
++    due_report_spans = [(r["t0"], r["t1"]) for r in by["rep"] if _is_due(r)]
+     flush_spans = [(r["t0"], r["t1"]) for r in by["flush"]]
+-    served = _served(cap, report_spans, flush_spans)
++    served = _served(cap, report_spans, flush_spans, due_report_spans)
+     overlap = [s for s in served if s["report_overlap_ns"] > 0]
+     plain = [s for s in served if s["report_overlap_ns"] == 0]
++    due_overlap = [s for s in served if s["due_report_overlap_ns"] > 0]
++    no_due_overlap = [s for s in served if s["due_report_overlap_ns"] == 0]
+     local = [r["t1"] - r["l_t"] for r in by["svc"] if r.get("out") == "ok" and r.get("loop") and "l_t" in r]
+     return {
+         "duration_ms": (stop["t"] - start["t"]) / _NS_PER_MS if "t" in stop else None,
+         "changes": len(by["chg"]), "served": served,
+         "coverage": "overlap" if overlap else "none",
++        "due_report_coverage": "overlap" if due_overlap else "none",
+         "cohorts": {"overlap": _dist_ms([s["latency_ns"] for s in overlap]),
+                     "non_overlap": _dist_ms([s["latency_ns"] for s in plain]),
+                     "overlap_residual_ms": _dist_ms([s["latency_ns"] - s["report_overlap_ns"] for s in overlap]),
++                    "due_report_overlap": _dist_ms([s["latency_ns"] for s in due_overlap]),
++                    "no_due_report_overlap": _dist_ms([s["latency_ns"] for s in no_due_overlap]),
++                    "due_report_overlap_residual_ms": _dist_ms(
++                        [s["latency_ns"] - s["due_report_overlap_ns"] for s in due_overlap]),
+                     "all": _dist_ms([s["latency_ns"] for s in served])},
+         "local_to_service": _dist_ms(local),
+         "service_failures": sum(r.get("out") != "ok" for r in by["svc"]),
+diff --git a/tests/hermes_cli/test_kanban_sync_timing_report.py b/tests/hermes_cli/test_kanban_sync_timing_report.py
+new file mode 100644
+index 00000000000..7252ce6fe18
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_timing_report.py
+@@ -0,0 +1,64 @@
++"""Due-report overlap is component-evidenced, never inferred from result or duration."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_timing_report as report
++from tests.hermes_cli.test_kanban_sync_timing import Harness, MS
++
++
++@pytest.mark.parametrize("kind", ["skipped", "none", "sent", "timeout", "raised", "send_only"])
++def test_due_overlap_uses_actual_components_and_keeps_total_cohorts(tmp_path, capsys, kind):
++    h = Harness(tmp_path)
++    h.arm()
++    h.diag.decoded_change("alpha", lambda _: None, "changes")
++
++    def report_fn():
++        if kind == "skipped":
++            h.clock.ns += 1500  # A positive 1.5us overlap is not evidence of a due report.
++            return False
++        with h.diag.span("send" if kind == "send_only" else "collect"):
++            h.clock.advance_ms(10)
++            if kind == "raised":
++                raise RuntimeError("collect failed")
++        try:
++            with h.diag.span("send"):
++                h.clock.advance_ms(20)
++                if kind == "timeout":
++                    raise TimeoutError("send budget")
++        except TimeoutError:
++            return False
++        return True
++
++    if kind == "raised":
++        with pytest.raises(RuntimeError):
++            h.diag.report(report_fn)
++    elif kind != "none":
++        h.diag.report(report_fn)
++    h.clock.advance_ms(5)
++    h.diag.select(lambda boards, *_: boards, [("alpha", tmp_path / "a.db")], 0, lambda _: False)
++    results = []
++    token = h.diag.board_start("alpha", results)
++    results.append("ok")
++    h.diag.board_end(token, results)
++    h.until[0] = None
++    h.diag.boundary()
++
++    assert report.main([str(h.log)]) == 0
++    summary, = json.loads(capsys.readouterr().out)
++    assert summary["valid"] and not summary["invalid"]
++    served, = summary["served"]
++    due = kind not in ("skipped", "none")
++    total_ns = 0 if kind == "none" else 1500 if kind == "skipped" else (10 if kind == "raised" else 30) * MS
++    assert served["report_overlap_ns"] == total_ns
++    assert summary["cohorts"]["overlap"]["n"] == int(kind != "none")
++    assert served["due_report_overlap_ns"] == (total_ns if due else 0)
++    assert summary["due_report_coverage"] == ("overlap" if due else "none")
++    assert summary["cohorts"]["due_report_overlap"]["n"] == int(due)
++    assert summary["cohorts"]["no_due_report_overlap"]["n"] == int(not due)
++    assert summary["reports"]["due"]["n"] == int(due)
++    assert summary["reports"]["not_due"]["n"] == int(kind == "skipped")
++    if due:
++        assert summary["cohorts"]["due_report_overlap_residual_ms"]["p50"] == 5
++    else:
++        assert summary["cohorts"]["due_report_overlap_residual_ms"] == {"n": 0}
+-- 
+2.55.0
+

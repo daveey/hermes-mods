@@ -1,0 +1,622 @@
+From 304c2ef7648ab4969fad234347c4cccdc8677f93 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 01:56:38 +0000
+Subject: [PATCH] [daveey] Track never-passing wake probe episodes across
+ re-parks
+
+Proof: 103 targeted tests pass (31 episode tests); original five acceptance tests on parent 2809ac61c7c yielded 1 pass and 4 failures including cases 1 and 3. Adds durable episode start/count, 48h configurable reconsideration and rate limit, reset boundaries and probe-state readback. Local-only state; cross-gateway carry review remains before publication.
+---
+ hermes_cli/config_defaults.py                |   4 +-
+ hermes_cli/kanban_db_connect.py              |   2 +
+ hermes_cli/kanban_diagnostics.py             |   1 +
+ hermes_cli/kanban_wake_check.py              |  60 ++++-
+ hermes_cli/kanban_wake_episode.py            |  78 ++++++
+ tests/hermes_cli/test_kanban_wake_episode.py | 256 +++++++++++++++++++
+ website/docs/user-guide/features/kanban.md   |  11 +
+ 7 files changed, 397 insertions(+), 15 deletions(-)
+ create mode 100644 hermes_cli/kanban_wake_episode.py
+ create mode 100644 tests/hermes_cli/test_kanban_wake_episode.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index c7a047cd3bd..ceb89f78adf 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1885,6 +1885,7 @@ DEFAULT_CONFIG = {
+     },
+     # Kanban coordination: one dispatcher per board reclaims, promotes, and spawns workers.
+     "kanban": {
++        "wake_check_stale_hours": 48,  # Reconsider a never-passing probe; same-probe re-parks retain age.
+         # Central sync (core patch 0193): true = boards opened afterwards get sync tables + outbox triggers. [daveey]
+         "sync": {"enabled": False},
+         "create_overlap_check": True,  # kanban_create refuses work open cards already own (kanban_overlap) [daveey]
+@@ -1896,8 +1897,7 @@ DEFAULT_CONFIG = {
+         "recovery_card_assignee": "default",  # assignee of the card an automatic recovery files [daveey]
+         # Opt-in per-profile broker argv before gh (empty = ordinary login); never include tokens.
+         "pr_acceptance": {"gh_command_prefix": []},
+-        # Calendar retention for terminal worktrees; archive commits to recovery
+-        # refs before reaping. 0 disables age-based archival/startup sweeping.
++        # Terminal worktrees: archive recovery refs before reaping; 0 disables age-based archival/sweeps.
+         "worktree_retention_days": 7,
+         # Auto-subscribe the originating gateway/TUI session to completion + block events when
+         # kanban_create is called from a session with a persistent delivery channel. Disable for
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 3893435aca7..e7933adcd43 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -967,6 +967,8 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+             if resolved not in _INITIALIZED_PATHS:
+                 conn.executescript(_kb.SCHEMA_SQL)
+                 _migrate_add_optional_columns(conn)
++                from hermes_cli.kanban_wake_episode import ensure_schema
++                ensure_schema(conn)
+                 _kb._sync.install_or_remove(conn, resolved)
+                 _ensure_activity_revision(conn, resolved)
+                 _INITIALIZED_PATHS.add(resolved)
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 85d183ca7f8..1db4166fe05 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -706,6 +706,7 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
+ _READY_WAIT_FLOOR_KINDS = frozenset({
+     "created", "promoted", "reclaimed", "unblocked",
+     "claimed", "spawned", "continuation_woken", "condition_met", "wake_probe_stale",
++    "wake_check_stale",
+ })
+ 
+ 
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index c7503039b14..7ed813c1088 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -44,6 +44,8 @@ from concurrent.futures import TimeoutError as FutureTimeout
+ from pathlib import Path
+ from typing import Any, Optional
+ 
++from hermes_cli import kanban_wake_episode as episode
++
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_CHECK_EVERY = 900
+@@ -429,6 +431,7 @@ def set_check(conn: sqlite3.Connection, task_id: str, cmd: Optional[str], every:
+               *, now: Optional[int] = None) -> None:
+     """Record (or clear, when ``cmd`` is None) the card's probe. Caller holds the write txn.
+     The first probe is due at once: the condition may have come true while the worker parked."""
++    episode.repark(conn, task_id, cmd)
+     conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
+     if not cmd:
+         return
+@@ -440,11 +443,16 @@ def set_check(conn: sqlite3.Connection, task_id: str, cmd: Optional[str], every:
+ 
+ 
+ def _row_dict(row) -> dict:
+-    keys = ("task_id", "cmd", "every", "next_at", "last_at", "last_rc", "last_out", "fails", "generation", "purpose")
+-    return {k: row[i] for i, k in enumerate(keys)}
++    keys = ("task_id", "cmd", "every", "next_at", "last_at", "last_rc", "last_out", "fails", "generation", "purpose",
++            "episode_first_at", "episode_checks", "episode_last_stale_at")
++    return dict(zip(keys, row))
+ 
+ 
+-_SELECT = ("SELECT task_id, cmd, every, next_at, last_at, last_rc, last_out, fails, generation, purpose "
++_LEGACY_SELECT = "SELECT task_id, cmd, every, next_at, last_at, last_rc, last_out, fails, generation, purpose"
++_SELECT = (_LEGACY_SELECT + ", "
++           "(SELECT first_at FROM task_wake_episodes e WHERE e.task_id = task_wake_checks.task_id), "
++           "(SELECT checks FROM task_wake_episodes e WHERE e.task_id = task_wake_checks.task_id), "
++           "(SELECT last_stale_at FROM task_wake_episodes e WHERE e.task_id = task_wake_checks.task_id) "
+            "FROM task_wake_checks")
+ # [daveey] Which status each probe purpose runs in: a park's wake_check while ``scheduled``, a human ask's
+ # resolved_check (``kanban_ask_resolved``) while ``blocked``. A row whose card left that status is stale.
+@@ -455,7 +463,7 @@ _LIVE_ROW = ("((w.purpose = 'ask_resolved' AND t.status = 'blocked') "
+ 
+ def get_state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+     try:
+-        row = conn.execute(_SELECT + " WHERE task_id = ?", (task_id,)).fetchone()
++        row = _state_rows(conn, " WHERE task_id = ?", (task_id,)).fetchone()
+     except sqlite3.OperationalError:  # board created by older code, read-only fenced conn
+         return None
+     return _row_dict(row) if row else None
+@@ -464,17 +472,27 @@ def get_state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+ def load_states(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, dict]:
+     try:
+         if task_ids is None:
+-            rows = conn.execute(_SELECT).fetchall()
++            rows = _state_rows(conn).fetchall()
+         elif not task_ids:
+             return {}
+         else:
+             marks = ",".join("?" for _ in task_ids)
+-            rows = conn.execute(_SELECT + f" WHERE task_id IN ({marks})", tuple(task_ids)).fetchall()
++            rows = _state_rows(conn, f" WHERE task_id IN ({marks})", tuple(task_ids)).fetchall()
+     except sqlite3.OperationalError:
+         return {}
+     return {r[0]: _row_dict(r) for r in rows}
+ 
+ 
++def _state_rows(conn: sqlite3.Connection, suffix: str = "", params: tuple = ()):
++    try:
++        return conn.execute(_SELECT + suffix, params)
++    except sqlite3.OperationalError as exc:
++        if "no such table: task_wake_episodes" not in str(exc):
++            raise
++        # A fenced read-only board may still be owned by a pre-upgrade process.
++        return conn.execute(_LEGACY_SELECT + ", NULL, NULL, NULL FROM task_wake_checks" + suffix, params)
++
++
+ def describe_state(state: dict, *, now: Optional[int] = None) -> str:
+     """One line for ``kanban show`` / worker context."""
+     now = int(time.time()) if now is None else int(now)
+@@ -487,7 +505,9 @@ def describe_state(state: dict, *, now: Optional[int] = None) -> str:
+     fails = f", {state['fails']} failing in a row" if state.get("fails") else ""
+     due = "due now" if state["next_at"] <= now else f"next {stamp(state['next_at'])}"
+     what = "ask resolved_check " if state.get("purpose") == "ask_resolved" else ""
+-    return f"{what}`{state['cmd']}` every {state['every']}s; {last}{fails}; {due}"
++    pending = (f"; not passed since {episode.stamp(state['episode_first_at'])} "
++               f"({state['episode_checks']} checks)" if state.get("episode_first_at") is not None else "")
++    return f"{what}`{state['cmd']}` every {state['every']}s; {last}{fails}; {due}{pending}"
+ 
+ 
+ # --- probe runner -------------------------------------------------------------------------
+@@ -725,7 +745,7 @@ def producer_note(hit: dict) -> str:
+ 
+ 
+ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str,
+-                     purpose: str = "wake") -> Any:
++                     purpose: str = "wake", stale_interval: Optional[float] = None) -> Any:
+     key = (db_path, task_id)
+     try:
+         rc, out = _run_probe(key, cmd, cwd, env)
+@@ -759,7 +779,8 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+                 from hermes_cli.kanban_dead_ancestry import detect
+                 dead_ancestry = detect(cmd, cwd)
+             apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
+-                         answered=answered, producer=producer, dead_ancestry=dead_ancestry)
++                         answered=answered, producer=producer, dead_ancestry=dead_ancestry,
++                         stale_interval=stale_interval)
+         finally:
+             conn.close()
+         return rc
+@@ -771,7 +792,8 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str,
+                  *, generation: str, now: Optional[int] = None,
+                  diagnostics: Optional[dict] = None, answered: Optional[dict] = None,
+-                 producer: Optional[dict] = None, dead_ancestry: Optional[list[dict]] = None) -> Optional[str]:
++                 producer: Optional[dict] = None, dead_ancestry: Optional[list[dict]] = None,
++                 stale_interval: Optional[float] = None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -779,6 +801,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+ 
+     now = int(time.time()) if now is None else int(now)
+     tail = _tail(out)
++    interval = episode.stale_seconds() if stale_interval is None else stale_interval
+     with kb.write_txn(conn):
+         state = get_state(conn, task_id)
+         status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+@@ -786,6 +809,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 or state.get("purpose") == "ask_resolved" or status is None or status[0] != "scheduled"):
+             return None
+         rc_col = rc if isinstance(rc, int) else -1
++        if rc == 0 or (diagnostics and diagnostics.get("first_rc") == 0):
++            episode.reset(conn, task_id)
+         if rc == 0:
+             return _wake(conn, task_id, CONDITION_MET_EVENT, {
+                 "wake_check": cmd, "output": tail, **({"diagnostics": diagnostics} if diagnostics else {})})
+@@ -815,6 +840,12 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 woke = wake_once(conn, task_id, cmd, dead_ancestry)
+                 if woke:
+                     return woke
++            stale = episode.not_yet(conn, task_id, cmd, now, interval)
++            if stale:
++                woke = _wake(conn, task_id, episode.STALE_EVENT, stale)
++                if woke:
++                    kb.add_comment(conn, task_id, "kanban-dispatcher", stale["note"])
++                return woke
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+                 "next_at = ? WHERE task_id = ?", (now, tail, now + int(state["every"]), task_id))
+@@ -885,6 +916,7 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+         if not db_path:
+             return {"submitted": [], "in_flight": 0}
+         ts = int(time.time()) if now is None else int(now)
++        stale_interval = episode.stale_seconds()  # resolve before crossing into unscoped pool threads
+         try:
+             stale = conn.execute(
+                 "SELECT w.task_id FROM task_wake_checks w LEFT JOIN tasks t ON t.id = w.task_id "
+@@ -929,7 +961,7 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                     continue
+             cwd = probe_cwd(task.workspace_path)
+             fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now, claim,
+-                                 purpose)
++                                 purpose, stale_interval)
+             with _LOCK:
+                 _IN_FLIGHT[key] = fut
+             submitted.append(task_id)
+@@ -968,13 +1000,15 @@ def _render_wake_context(conn: sqlite3.Connection, task_id: str) -> str:
+     lines: list[str] = []
+     from hermes_cli.kanban_comment_origin import WAKE_PROBE_STALE_EVENT
+ 
+-    kinds = (*SCHEDULED_ENTRY_EVENTS, CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT)
++    kinds = (*SCHEDULED_ENTRY_EVENTS, CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT, episode.STALE_EVENT)
+     marks = ",".join("?" for _ in kinds)
+     row = conn.execute(
+         f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+         "ORDER BY id DESC LIMIT 1", (task_id, *kinds)).fetchone()
+-    if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT):
++    if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT, episode.STALE_EVENT):
+         payload = kb._json_dict(row[1])
++        if row[0] == episode.STALE_EVENT:
++            return f"## Woken to reconsider a never-passing wake check\n{payload.get('note', '')}\n"
+         if row[0] == WAKE_PROBE_STALE_EVENT and payload.get("reason") == PRODUCER_FINISHED:
+             lines.append("## Woken because the awaited producer card finished but the wake check missed it")
+             lines.append(f"{payload.get('note')} Last output:")
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+new file mode 100644
+index 00000000000..b62c2d2b492
+--- /dev/null
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -0,0 +1,78 @@
++"""Durable age of a clean not-yet probe, independent of disposable probe leases.
++
++Ready/todo/running/review are the wake → worker → re-park corridor. An episode
++survives that corridor only for the identical probe; leaving it resets the wait.
++The status trigger covers direct SQL and synced status writers as well as tools.
++"""
++from __future__ import annotations
++
++import math
++import sqlite3
++from datetime import datetime
++from zoneinfo import ZoneInfo
++
++STALE_EVENT = "wake_check_stale"
++DEFAULT_STALE_HOURS = 48
++
++
++def ensure_schema(conn: sqlite3.Connection) -> None:
++    """Installed after legacy table rebuilds; local-only, like task_wake_checks."""
++    conn.execute("""CREATE TABLE IF NOT EXISTS task_wake_episodes (
++        task_id TEXT PRIMARY KEY, cmd TEXT NOT NULL, first_at INTEGER NOT NULL,
++        checks INTEGER NOT NULL, last_stale_at INTEGER)""")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_reset
++        AFTER UPDATE OF status ON tasks
++        WHEN NEW.status NOT IN ('scheduled', 'todo', 'ready', 'running', 'review')
++        BEGIN DELETE FROM task_wake_episodes WHERE task_id = NEW.id; END""")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_delete
++        AFTER DELETE ON tasks
++        BEGIN DELETE FROM task_wake_episodes WHERE task_id = OLD.id; END""")
++    conn.execute("DELETE FROM task_wake_episodes WHERE task_id NOT IN (SELECT id FROM tasks)")
++
++
++def reset(conn: sqlite3.Connection, task_id: str) -> None:
++    conn.execute("DELETE FROM task_wake_episodes WHERE task_id = ?", (task_id,))
++
++
++def repark(conn: sqlite3.Connection, task_id: str, cmd: str | None) -> None:
++    conn.execute("DELETE FROM task_wake_episodes WHERE task_id = ? AND cmd IS NOT ?", (task_id, cmd))
++
++
++def stale_seconds() -> float:
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++    from hermes_cli.config import load_config
++
++    try:
++        section = load_config().get("kanban")
++    except (ConfigBackendUnavailable, OSError, ValueError):
++        section = None
++    value = section.get("wake_check_stale_hours") if isinstance(section, dict) else None
++    try:
++        hours = float(value)
++    except (TypeError, ValueError):
++        hours = DEFAULT_STALE_HOURS
++    if not math.isfinite(hours) or hours <= 0:
++        hours = DEFAULT_STALE_HOURS
++    return hours * 3600
++
++
++def stamp(timestamp: int) -> str:
++    return datetime.fromtimestamp(timestamp, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M PT")
++
++
++def not_yet(conn: sqlite3.Connection, task_id: str, cmd: str, now: int, interval: float) -> dict | None:
++    """Count a validated clean exit 1 and return a due stale-wake payload."""
++    repark(conn, task_id, cmd)
++    conn.execute(
++        "INSERT INTO task_wake_episodes(task_id, cmd, first_at, checks) VALUES (?, ?, ?, 1) "
++        "ON CONFLICT(task_id) DO UPDATE SET checks = checks + 1", (task_id, cmd, now))
++    first, checks, last = conn.execute(
++        "SELECT first_at, checks, last_stale_at FROM task_wake_episodes WHERE task_id = ?", (task_id,)).fetchone()
++
++    if now - first < interval or (last is not None and now - last < interval):
++        return None
++    conn.execute("UPDATE task_wake_episodes SET last_stale_at = ? WHERE task_id = ?", (now, task_id))
++    note = (f"wake_check has not passed in {(now - first) / 3600:g} h "
++            f"({checks} checks since {stamp(first)}): check that its condition can occur, "
++            "then change the wait or the acceptance. Re-parking on the identical probe keeps this episode.")
++    return {"wake_check": cmd, "first_at": first, "checks": checks, "last_stale_at": now, "note": note}
+diff --git a/tests/hermes_cli/test_kanban_wake_episode.py b/tests/hermes_cli/test_kanban_wake_episode.py
+new file mode 100644
+index 00000000000..3aa2c021948
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_episode.py
+@@ -0,0 +1,256 @@
++"""Clean not-yet probes must eventually ask their worker to reconsider the wait."""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as wc
++from tests.hermes_cli import test_kanban_wake_check as helpers
++
++kanban_home = helpers.kanban_home
++HOUR = 3600
++STALE = "wake_check_stale"
++
++
++@pytest.fixture
++def parked(kanban_home, monkeypatch):
++    clock = [int(time.time())]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        assert kb.schedule_task(conn, tid, reason="waiting", wake_check="exit 1")
++        yield conn, tid, clock
++
++
++def result(parked, hours, rc=1):
++    conn, tid, clock = parked
++    state = wc.get_state(conn, tid)
++    now = clock[0] + int(hours * HOUR)
++    return wc.apply_result(conn, tid, state["cmd"], rc, "", generation=state["generation"], now=now)
++
++
++def repark(parked, cmd="exit 1"):
++    conn, tid, _ = parked
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    assert kb.schedule_task(conn, tid, reason="waiting", wake_check=cmd)
++
++
++def test_always_not_yet_wakes_once_at_48_hours(parked):
++    conn, tid, _ = parked
++    for hour in (0, 12, 24, 47):
++        assert result(parked, hour) is None
++    assert result(parked, 48) == STALE
++    assert kb.get_task(conn, tid).status == "ready"
++    assert len(helpers._events(conn, tid, STALE)) == 1
++    text = "\n".join(c.body for c in kb.list_comments(conn, tid))
++    assert "wake_check has not passed in 48 h (5 checks since " in text
++    assert " PT): check that its condition can occur" in text
++    assert "Re-parking on the identical probe keeps this episode." in text
++    assert "wake_check has not passed" in kb.build_worker_context(conn, tid)
++
++
++def test_pass_inside_window_resets_episode(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    assert result(parked, 24, 0) == "condition_met"
++    repark(parked)
++    result(parked, 25)
++    assert result(parked, 48) is None
++    assert not helpers._events(conn, tid, STALE)
++
++
++def test_same_probe_repark_waits_another_48_hours(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    assert result(parked, 48) == STALE
++    repark(parked)
++    for hour in (49, 72, 95):
++        assert result(parked, hour) is None
++    assert len(helpers._events(conn, tid, STALE)) == 1
++    assert result(parked, 96) == STALE
++    assert len(helpers._events(conn, tid, STALE)) == 2
++
++
++def test_changed_probe_starts_new_episode(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    with kb.write_txn(conn):
++        wc.set_check(conn, tid, "test -f new-flag", 120)
++    result(parked, 47)
++    assert result(parked, 48) is None
++    assert result(parked, 95) == STALE
++
++
++def test_exit_two_does_not_advance_episode(parked):
++    conn, tid, clock = parked
++    result(parked, 0)
++    assert result(parked, 49, 2) is None
++    assert not helpers._events(conn, tid, STALE)
++    state = wc.get_state(conn, tid)
++    assert state["episode_first_at"] == clock[0]
++    assert state["episode_checks"] == 1
++    assert state["fails"] == 1
++    assert result(parked, 50) == STALE
++    assert helpers._events(conn, tid, STALE)[0].payload["checks"] == 2
++
++
++@pytest.mark.parametrize("status", ["blocked", "triage", "done", "archived"])
++def test_leaving_wait_cycle_resets_even_without_a_dispatch_tick(parked, status):
++    conn, tid, clock = parked
++    result(parked, 0)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++        conn.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,))
++        wc.set_check(conn, tid, "exit 1", 120)
++    assert result(parked, 48) is None
++    assert wc.get_state(conn, tid)["episode_first_at"] == clock[0] + 48 * HOUR
++
++
++@pytest.mark.parametrize("rc", [2, 124, 255, "timeout", None])
++def test_errors_do_not_start_an_episode(parked, rc):
++    conn, tid, _ = parked
++    assert result(parked, 0, rc) is None
++    state = wc.get_state(conn, tid)
++    assert state["episode_first_at"] is None
++    assert state["fails"] == 1
++
++
++def test_clock_wake_repark_preserves_episode(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    from hermes_cli.kanban_continuation import wake_due_continuations
++    assert wake_due_continuations(conn, now=parked[2][0] + 25 * HOUR) == [tid]
++    repark(parked)
++    assert result(parked, 48) == STALE
++
++
++def test_cleared_probe_resets_episode(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    with kb.write_txn(conn):
++        wc.set_check(conn, tid, None, 120)
++        wc.set_check(conn, tid, "exit 1", 120)
++    assert result(parked, 48) is None
++
++
++def test_old_generation_cannot_count_or_reset(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    old = wc.get_state(conn, tid)
++    with kb.write_txn(conn):
++        wc.set_check(conn, tid, "exit 1", 120)
++    for rc in (0, 1):
++        assert wc.apply_result(conn, tid, "exit 1", rc, "", generation=old["generation"],
++                               now=parked[2][0] + 48 * HOUR) is None
++    assert wc.get_state(conn, tid)["episode_checks"] == 1
++    assert result(parked, 48) == STALE
++
++
++def test_configured_interval_and_live_state_rendering(parked, kanban_home):
++    from hermes_cli.config import atomic_config_write
++
++    atomic_config_write(kanban_home / "config.yaml", {"kanban": {"wake_check_stale_hours": 2}})
++    conn, tid, _ = parked
++    result(parked, 0)
++    assert result(parked, 1) is None
++    state = wc.load_states(conn, [tid])[tid]
++    assert state["episode_checks"] == 2
++    assert "not passed since" in wc.describe_state(state)
++    assert "(2 checks)" in wc.describe_state(state)
++    assert result(parked, 2) == STALE
++
++
++def test_initial_pass_then_failed_confirmation_resets(parked):
++    conn, tid, clock = parked
++    result(parked, 0)
++    state = wc.get_state(conn, tid)
++    assert wc.apply_result(conn, tid, "exit 1", 1, "", generation=state["generation"],
++                           now=clock[0] + 48 * HOUR, diagnostics={"first_rc": 0}) is None
++    assert wc.get_state(conn, tid)["episode_checks"] == 1
++    assert wc.get_state(conn, tid)["episode_first_at"] == clock[0] + 48 * HOUR
++
++
++def test_dispatcher_runs_and_persists_episode_across_connections(parked, monkeypatch):
++    conn, tid, clock = parked
++    monkeypatch.setattr(wc, "_run_probe", lambda *args: (1, "waiting"))
++    monkeypatch.setattr(wc, "finished_producer", lambda *args: None)
++    from hermes_cli import kanban_dead_ancestry
++    monkeypatch.setattr(kanban_dead_ancestry, "detect", lambda *args: None)
++    for hour in (0, 24, 48):
++        submitted = wc.run_due_wake_checks(conn, now=clock[0] + hour * HOUR, wait=True)
++        assert submitted["submitted"] == [tid]
++    assert kb.get_task(conn, tid).status == "ready"
++    assert len(helpers._events(conn, tid, STALE)) == 1
++    assert helpers._events(conn, tid, STALE)[0].payload["checks"] == 3
++
++
++def test_readonly_legacy_probe_state_remains_visible(parked):
++    conn, tid, _ = parked
++    conn.execute("DROP TABLE task_wake_episodes")
++    state = wc.get_state(conn, tid)
++    assert state["cmd"] == "exit 1"
++    assert state["episode_first_at"] is None
++    assert wc.load_states(conn)[tid] == state
++    assert wc.load_states(conn, [tid])[tid] == state
++    assert wc.load_states(conn, []) == {}
++    assert wc.get_state(conn, "absent") is None
++
++
++def test_eviction_deletes_episode(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    with kb.write_txn(conn):
++        conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++    assert conn.execute("SELECT * FROM task_wake_episodes").fetchall() == []
++
++
++@pytest.mark.parametrize("value", [0, -1, "invalid", float("nan"), float("inf"), None])
++def test_invalid_config_uses_default(monkeypatch, value):
++    from hermes_cli import config
++    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"wake_check_stale_hours": value}})
++    assert wc.episode.stale_seconds() == 48 * HOUR
++
++
++def test_config_backend_outage_keeps_default(monkeypatch):
++    from hermes_cli import config
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    def unavailable():
++        raise ConfigBackendUnavailable("unavailable")
++
++    monkeypatch.setattr(config, "load_config", unavailable)
++    assert wc.episode.stale_seconds() == 48 * HOUR
++    monkeypatch.setattr(config, "load_config", lambda: {"kanban": None})
++    assert wc.episode.stale_seconds() == 48 * HOUR
++
++
++def test_stale_wake_resets_ready_diagnostics_clock(parked):
++    from hermes_cli.kanban_diagnostics import _last_ready_entry_ts
++    conn, tid, clock = parked
++    result(parked, 0)
++    clock[0] += 48 * HOUR
++    assert result(parked, 0) == STALE
++    assert _last_ready_entry_ts(kb.list_events(conn, tid)) == clock[0]
++
++
++def test_pool_uses_dispatcher_interval_without_reading_config_in_transaction(parked, monkeypatch):
++    import threading
++    conn, tid, clock = parked
++    main_thread = threading.get_ident()
++
++    def interval():
++        assert threading.get_ident() == main_thread
++        assert not conn.in_transaction
++        return 2 * HOUR
++
++    monkeypatch.setattr(wc.episode, "stale_seconds", interval)
++    monkeypatch.setattr(wc, "_run_probe", lambda *args: (1, ""))
++    monkeypatch.setattr(wc, "finished_producer", lambda *args: None)
++    from hermes_cli import kanban_dead_ancestry
++    monkeypatch.setattr(kanban_dead_ancestry, "detect", lambda *args: None)
++    for hour in (0, 2):
++        assert wc.run_due_wake_checks(conn, now=clock[0] + hour * HOUR, wait=True)["submitted"] == [tid]
++    assert len(helpers._events(conn, tid, STALE)) == 1
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index fcb538a6e24..412d5cd2d2c 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -482,6 +482,17 @@ Probe state is in the `task_wake_checks` table and shown by `kanban show`,
+ the worker context and the board API; `kanban diagnostics` flags failing or
+ overdue probes, and parks more than 2 h out that have neither.
+ 
++A clean exit-1 probe that never passes wakes its card to reconsider the wait after
++`kanban.wake_check_stale_hours` (default 48; invalid/nonpositive values use 48).
++The `wake_check_stale` event and comment carry the elapsed hours, check count and
++episode start in Pacific time. Identical-probe re-parks retain the episode, with
++no further stale wake until another full interval has elapsed. A changed/removed
++probe, a passing probe (including the initial success before confirmation), or
++leaving the wake/worker/re-park cycle for blocked, triage or a terminal status resets
++it. Errors do not advance it and retain their existing handling. Machine-local
++`task_wake_episodes` stores the start, count and last stale wake independently of
++probe leases; `kanban show` and board probe state expose these episode fields.
++
+ Human asks that resolve outside Hermes: a blocked card's `human_request` may
+ carry `resolved_check` (a shell command) and `resolved_check_every` (seconds,
+ default 900, 120–21600). Use it when David's step leaves a readable trace, so
+-- 
+2.55.0
+

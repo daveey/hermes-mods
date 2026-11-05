@@ -1,0 +1,334 @@
+From 0cbbc98ed684c4c5c1a561bcd42f335a53e152d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 13:12:16 +0000
+Subject: [PATCH] [daveey] fix(kanban-sync): timing analyzer fails closed on
+ prefix, schema and provenance
+
+Review corrections for 4f388d7586a (REVIEW.md F1 blocking, F2-F6 non-blocking).
+
+- F1 analyzer: records before the first start (junk, orphans, a capture whose start is
+  missing) are kept as their own leading capture and fail as no_start_marker instead of
+  being dropped; validate adds schema_mismatch, unknown_event, field_not_allowed (the
+  writer's own _allowed), and identity_unverified (code_src != boot, no code, or
+  disk_moved). A record missing a needed field yields malformed_record, never a crash.
+- F2 writer: code identity is resolved before the fd is opened (any exception leaves the
+  capture unverified), and the fd is closed if start setup fails before the capture owns it.
+- F4/F3/F5 docs: stop happens at the first loop boundary after the bound (no hard timer,
+  overrun up to one round plus one wait); select holds the diag lock across
+  SyncWork.select while armed (feed callback wait shows in chg.lk); rotation keeps only
+  one .1, so archive a capture before arming the next.
+- F6: unserviced counts changes only; boards past PEND_MAX are unserviced_boards_truncated.
+
+The real-loop test now injects a boot identity: a test process has none, and the analyzer
+correctly reports that as identity_unverified.
+
+Proof: 16 new tests RED on the HEAD source, GREEN 187 passed / 0 failed across timing,
+timing_loop, machine_metrics, config_runtime_keys, kanban_sync_client; scripts/check ok.
+---
+ hermes_cli/kanban_sync_timing.py              |  36 ++++--
+ hermes_cli/kanban_sync_timing_report.py       |  45 +++++--
+ tests/hermes_cli/test_kanban_sync_timing.py   | 119 ++++++++++++++++++
+ .../test_kanban_sync_timing_loop.py           |   2 +
+ 4 files changed, 180 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_timing.py b/hermes_cli/kanban_sync_timing.py
+index 9f05efa8af3..49294e18b8b 100644
+--- a/hermes_cli/kanban_sync_timing.py
++++ b/hermes_cli/kanban_sync_timing.py
+@@ -3,10 +3,16 @@
+ Arm with the installation-root config key ``kanban.sync.diagnostics.timing_until``: a finite Unix timestamp at most
+ :data:`MAX_ACTIVATION_S` ahead when the loop first sees it. Missing, null, non-numeric, non-finite, past or overlong
+ values (an overlong value never arms later either) and an unreadable config are off. The loop checks the key at its
+-safe boundary (just before it waits for work); one capture ends at the earliest of the configured time, 600 s of
+-monotonic time, a changed/removed value, a config read failure, a write failure or the file cap, and the same
+-value never arms twice in a process. Off costs one signature-cached config read per loop and creates no file or
+-thread.
++safe boundary (just before it waits for work); one capture ends at the first such boundary after the earliest of
++the configured time, 600 s of monotonic time, a changed/removed value or a config read failure (there is no hard
++timer: the stop can overrun that time by up to one sync round plus one wait, at most about one poll period), or
++at once on a write failure or the file cap; the same value never arms twice in a process. Off costs one
++signature-cached config read per loop and creates no file or thread.
++
++Known limits while a capture is armed: ``select`` holds the diagnostic lock across ``SyncWork.select`` (including
++its per-board outbox reads), so a feed callback can wait that long before it returns to its socket; the wait shows
++in ``chg.lk``, and loop/product latency is unaffected. A new capture rotates a file at least half the cap to
++``.1``, replacing any older ``.1``: archive a capture you need before arming the next one.
+ 
+ What is recorded (monotonic ns; wall clock only for provenance/expiry), to ``<root>/logs/kanban-sync-timing.jsonl``:
+ - ``chg``: a decoded Board feed change frame, before ``SyncWork.changed`` (the connect-time catch-up is not one).
+@@ -269,17 +275,21 @@ class TimingDiag:
+                 os.replace(path, path.with_name(path.name + ".1"))
+         except FileNotFoundError:
+             pass
+-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+-        now = self.clock_ns()
+-        cap = _Capture(until, now + int(remaining * 1e9), fd, random.SystemRandom().getrandbits(62))
+-        cap.bytes = os.fstat(fd).st_size  # earlier captures count against the same file cap
+-        try:
++        try:  # resolved before the fd exists; any failure only leaves the capture unverified
+             code, src, moved = (self.code_identity or _code_identity)()
+-        except (ImportError, OSError, ValueError):
++        except Exception:  # health: allow BLE001 -- identity failure marks provenance unverified, never leaks an fd
+             code, src, moved = None, "none", None
+-        rec = {"ev": "start", "t": now, "wall_ms": int(self.wall() * 1000), "until_ms": int(until * 1000),
+-               "deadline_ns": cap.deadline_ns, "pid": os.getpid(), "run": cap.run, "schema": SCHEMA,
+-               "queue_max": self.queue_max, "file_max": self.file_max, "code_src": src}
++        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
++        try:  # until the capture owns the fd, any failure closes it
++            now = self.clock_ns()
++            cap = _Capture(until, now + int(remaining * 1e9), fd, random.SystemRandom().getrandbits(62))
++            cap.bytes = os.fstat(fd).st_size  # earlier captures count against the same file cap
++            rec = {"ev": "start", "t": now, "wall_ms": int(self.wall() * 1000), "until_ms": int(until * 1000),
++                   "deadline_ns": cap.deadline_ns, "pid": os.getpid(), "run": cap.run, "schema": SCHEMA,
++                   "queue_max": self.queue_max, "file_max": self.file_max, "code_src": src}
++        except BaseException:
++            os.close(fd)
++            raise
+         if code is not None:
+             rec["code"] = code
+         if moved is not None:
+diff --git a/hermes_cli/kanban_sync_timing_report.py b/hermes_cli/kanban_sync_timing_report.py
+index 1037d1a82ed..8465f0a9d9f 100644
+--- a/hermes_cli/kanban_sync_timing_report.py
++++ b/hermes_cli/kanban_sync_timing_report.py
+@@ -2,7 +2,9 @@
+ 
+ ``python -m hermes_cli.kanban_sync_timing_report <file>`` prints one JSON summary per capture. It applies no
+ threshold and no baseline: it reports validity (any lost record, sequence gap, diagnostic error, identity change,
+-missing stop marker or incomplete stop reason invalidates the capture) and measured distributions only:
++missing stop marker, incomplete stop reason, schema/event/allowlist violation, malformed record, or a start without a
++boot-recorded code identity or with a moved checkout invalidates the capture; records before the first ``start`` are
++reported as their own invalid capture, never dropped) and measured distributions only:
+ 
+ - per decoded change served by its own board's successful service: notification-to-service latency, and how much
+   of that interval overlapped measured report spans and diagnostic flush spans; cohorts with and without report
+@@ -22,6 +24,8 @@ from collections import Counter
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
++from hermes_cli.kanban_sync_timing import ENUMS, SCHEMA, _allowed
++
+ COMPLETE_REASONS = frozenset({"expired", "bound", "disabled"})
+ _NS_PER_MS = 1_000_000
+ 
+@@ -38,13 +42,13 @@ def load(path: Path) -> list[dict]:
+ 
+ 
+ def captures(records: Iterable[dict]) -> list[list[dict]]:
+-    """Split at each ``start`` record; records before the first start form no capture."""
++    """Split at each ``start`` record. Records before the first start (orphans, junk, a capture whose start is
++    missing) are kept as their own leading capture, which :func:`validate` rejects as ``no_start_marker``."""
+     caps: list[list[dict]] = []
+     for rec in records:
+-        if rec.get("ev") == "start":
++        if rec.get("ev") == "start" or not caps:
+             caps.append([])
+-        if caps:
+-            caps[-1].append(rec)
++        caps[-1].append(rec)
+     return caps
+ 
+ 
+@@ -61,6 +65,15 @@ def validate(cap: list[dict]) -> list[str]:
+         problems.append("unparseable_line")
+     if [r.get("seq") for r in cap] != list(range(len(cap))):
+         problems.append("sequence_gap")
++    if start.get("schema") != SCHEMA:
++        problems.append("schema_mismatch")
++    real = [r for r in cap if r.get("ev") != "_bad"]
++    if any(r.get("ev") not in ENUMS["ev"] for r in real):
++        problems.append("unknown_event")
++    if any(not _allowed(k, v) for r in real for k, v in r.items()):
++        problems.append("field_not_allowed")
++    if start.get("code_src") != "boot" or "code" not in start or start.get("disk_moved") is True:
++        problems.append("identity_unverified")
+     if stop is not None:
+         if stop.get("lost"):
+             problems.append("lost_records")
+@@ -122,6 +135,20 @@ def _reports(reps: list[dict]) -> dict:
+ def summarize(cap: list[dict]) -> dict[str, Any]:
+     problems = validate(cap)
+     start, stop = cap[0], (cap[-1] if cap[-1].get("ev") == "stop" else {})
++    try:
++        measured = _measure(cap, stop)
++    except (KeyError, TypeError, ValueError, ArithmeticError):  # a record missing or mistyping a needed field
++        problems, measured = problems + ["malformed_record"], {}
++    return {
++        "valid": not problems, "invalid": problems,
++        "identity": {k: start.get(k) for k in ("run", "pid", "code", "code_src", "disk_moved")},
++        "stop_reason": stop.get("reason"), "records": len(cap), "lost": stop.get("lost"),
++        **measured,
++    }
++
++
++def _measure(cap: list[dict], stop: dict) -> dict[str, Any]:
++    start = cap[0]
+     by = {ev: [r for r in cap if r.get("ev") == ev] for ev in ("rep", "flush", "svc", "pend", "chg", "wait")}
+     report_spans = [(r["t0"], r["t1"]) for r in by["rep"]]
+     flush_spans = [(r["t0"], r["t1"]) for r in by["flush"]]
+@@ -130,10 +157,7 @@ def summarize(cap: list[dict]) -> dict[str, Any]:
+     plain = [s for s in served if s["report_overlap_ns"] == 0]
+     local = [r["t1"] - r["l_t"] for r in by["svc"] if r.get("out") == "ok" and r.get("loop") and "l_t" in r]
+     return {
+-        "valid": not problems, "invalid": problems,
+-        "identity": {k: start.get(k) for k in ("run", "pid", "code", "code_src", "disk_moved")},
+         "duration_ms": (stop["t"] - start["t"]) / _NS_PER_MS if "t" in stop else None,
+-        "stop_reason": stop.get("reason"), "records": len(cap), "lost": stop.get("lost"),
+         "changes": len(by["chg"]), "served": served,
+         "coverage": "overlap" if overlap else "none",
+         "cohorts": {"overlap": _dist_ms([s["latency_ns"] for s in overlap]),
+@@ -142,7 +166,10 @@ def summarize(cap: list[dict]) -> dict[str, Any]:
+                     "all": _dist_ms([s["latency_ns"] for s in served])},
+         "local_to_service": _dist_ms(local),
+         "service_failures": sum(r.get("out") != "ok" for r in by["svc"]),
+-        "unserviced": sum(r.get("c_n", 0) for r in by["pend"]) + (stop.get("pend_more") or 0),
++        # Changes still pending at stop, and separately the boards beyond the stop's PEND_MAX records (their change
++        # count is unknown): different units, never summed.
++        "unserviced": sum(r.get("c_n", 0) for r in by["pend"]),
++        "unserviced_boards_truncated": stop.get("pend_more") or 0,
+         "reports": _reports(by["rep"]),
+         "waits": dict(Counter(r.get("why") for r in by["wait"])),
+         "overhead": {"flushes": len(by["flush"]), "flush": _dist_ms([e - s for s, e in flush_spans]),
+diff --git a/tests/hermes_cli/test_kanban_sync_timing.py b/tests/hermes_cli/test_kanban_sync_timing.py
+index cd49c0e1b82..0608151d439 100644
+--- a/tests/hermes_cli/test_kanban_sync_timing.py
++++ b/tests/hermes_cli/test_kanban_sync_timing.py
+@@ -704,3 +704,122 @@ def test_a_record_outside_the_allowlist_is_dropped_and_invalidates(tmp_path):
+     assert "secret" not in h.log.read_text(encoding="utf-8")
+     stop = h.records()[-1]
+     assert (stop["errors"], stop["lost"], stop["valid"]) == (2, 2, False)
++
++
++# --- review corrections: the analyzer fails closed on file-level problems and provenance --------------------------
++
++
++def _good_capture(tmp_path, **kw) -> list[dict]:
++    h = Harness(tmp_path, **kw)
++    h.arm()
++    with h.diag.lock:
++        h.diag._emit(h.diag.capture, {"ev": "chg", "b": 0, "t": h.clock.ns, "kind": "changes", "lk": 0})
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    assert report.validate(report.captures(recs)[0]) == []
++    return recs
++
++
++def _run_main(tmp_path, lines: list[str], capsys) -> tuple[int, list[dict]]:
++    path = tmp_path / "capture.jsonl"
++    path.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
++    code = report.main([str(path)])
++    return code, json.loads(capsys.readouterr().out)
++
++
++@pytest.mark.parametrize("prefix", [
++    ["not json"],  # junk before the first start
++    [json.dumps({"ev": "chg", "seq": 0, "b": 0, "t": 1, "kind": "changes", "lk": 0})],  # orphan record
++    ["{\"ev\": \"svc\"}", "[]"],  # a capture whose start marker is missing
++])
++def test_records_before_the_first_start_are_retained_and_fail_the_file(tmp_path, capsys, prefix):
++    good = [json.dumps(r) for r in _good_capture(tmp_path)]
++    code, summaries = _run_main(tmp_path, prefix + good, capsys)
++    assert code == 1
++    assert len(summaries) == 2, "the prefix is reported, never silently dropped"
++    assert summaries[0]["valid"] is False and "no_start_marker" in summaries[0]["invalid"]
++    assert summaries[1]["valid"] is True
++
++
++@pytest.mark.parametrize("lines", [[], ["not json"], ["{}", "{\"ev\": \"stop\"}"]])
++def test_a_file_with_no_complete_capture_never_passes_and_never_crashes(tmp_path, capsys, lines):
++    code, summaries = _run_main(tmp_path, lines, capsys)
++    assert code == 1
++    assert all(s["valid"] is False for s in summaries)
++
++
++@pytest.mark.parametrize("mutate, problem", [
++    (lambda recs: recs[0].update(schema=99), "schema_mismatch"),
++    (lambda recs: recs[1].update(ev="mystery"), "unknown_event"),
++    (lambda recs: recs[1].update(url="https://x"), "field_not_allowed"),
++    (lambda recs: recs[1].update(b="board-slug"), "field_not_allowed"),
++    (lambda recs: recs[0].update(code_src="none") or recs[0].pop("code"), "identity_unverified"),
++    (lambda recs: recs[0].update(disk_moved=True), "identity_unverified"),
++    (lambda recs: recs[0].pop("code"), "identity_unverified"),
++])
++def test_validate_rejects_schema_event_allowlist_and_unverified_identity(tmp_path, mutate, problem):
++    recs = _good_capture(tmp_path)
++    mutate(recs)
++    assert problem in report.validate(report.captures(recs)[0])
++
++
++def test_a_capture_without_boot_identity_is_unverified(tmp_path):
++
++    h = Harness(tmp_path, code_identity=lambda: (None, "none", None))
++    h.arm()
++    h.until[0] = None
++    h.diag.boundary()
++    assert report.validate(report.captures(h.records())[0]) == ["identity_unverified"]
++
++
++def test_malformed_but_allowlisted_records_are_invalid_not_a_crash(tmp_path, capsys):
++    recs = _good_capture(tmp_path)
++    i = next(i for i, r in enumerate(recs) if r["ev"] == "chg")
++    recs[i].pop("t")  # a chg record with no timestamp, then a service that claims it
++    recs.insert(i + 1, {"ev": "svc", "b": 0, "t0": 1, "t1": 2, "loop": True, "out": "ok",
++                        "c_first": recs[i]["seq"], "c_last": recs[i]["seq"]})
++    for i, r in enumerate(recs):
++        r["seq"] = i
++    code, summaries = _run_main(tmp_path, [json.dumps(r) for r in recs], capsys)
++    assert code == 1 and "malformed_record" in summaries[0]["invalid"]
++
++
++def test_unserviced_changes_and_truncated_boards_are_separate_counts(tmp_path):
++    recs = _good_capture(tmp_path)
++    recs.insert(-1, {"ev": "pend", "b": 0, "c_first": 1, "c_last": 3, "c_n": 3, "c_t": 1})
++    for i, r in enumerate(recs):
++        r["seq"] = i
++    recs[-1]["pend_more"] = 5
++    assert report.validate(report.captures(recs)[0]) == []
++    summary = report.summarize(report.captures(recs)[0])
++    assert summary["unserviced"] == 3
++    assert summary["unserviced_boards_truncated"] == 5
++
++
++@pytest.mark.parametrize("exc", [RuntimeError("boom"), KeyError("x")])
++def test_an_identity_failure_leaks_no_fd_and_still_captures_unverified(tmp_path, exc):
++    import os
++
++    def identity():
++        raise exc
++    before = len(os.listdir("/proc/self/fd"))
++    h = Harness(tmp_path, code_identity=identity)
++    h.arm()
++    h.until[0] = None
++    h.diag.boundary()
++    assert len(os.listdir("/proc/self/fd")) == before
++    recs = h.records()
++    assert recs[0]["code_src"] == "none" and recs[-1]["ev"] == "stop"
++    assert report.validate(report.captures(recs)[0]) == ["identity_unverified"]
++
++
++def test_a_start_failure_after_open_closes_the_fd(tmp_path, monkeypatch):
++    import os
++    h = Harness(tmp_path)
++    h.until[0] = h.clock.wall_s + 300.0
++    monkeypatch.setattr(timing.random, "SystemRandom", lambda: (_ for _ in ()).throw(RuntimeError("rng")))
++    before = len(os.listdir("/proc/self/fd"))
++    h.diag.boundary()
++    assert h.diag.capture is None
++    assert len(os.listdir("/proc/self/fd")) == before
+diff --git a/tests/hermes_cli/test_kanban_sync_timing_loop.py b/tests/hermes_cli/test_kanban_sync_timing_loop.py
+index 12ba620f9c6..7ae488843ef 100644
+--- a/tests/hermes_cli/test_kanban_sync_timing_loop.py
++++ b/tests/hermes_cli/test_kanban_sync_timing_loop.py
+@@ -49,6 +49,8 @@ def test_real_loop_records_full_report_cost_and_matches_a_change_to_its_boards_s
+     root = tmp_path / "root"
+     root.mkdir()
+     monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: root)
++    # A test process has no hermes_bootstrap boot fingerprint; stand one in so the capture's provenance is verified.
++    monkeypatch.setattr(timing, "_code_identity", lambda: ("0123456789abcdef0123456789abcdef01234567", "boot", False))
+     monkeypatch.setattr(timing, "_DIAG", timing.TimingDiag())
+     monkeypatch.setattr(mm, "REPORT_EVERY_S", 3.0)
+     _config(root, None)
+-- 
+2.55.0
+

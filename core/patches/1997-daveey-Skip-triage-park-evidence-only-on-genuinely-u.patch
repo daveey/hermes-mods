@@ -1,0 +1,264 @@
+From 591d4a026a024e5a93aa4a06fdba578ea876eee4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 06:10:41 +0000
+Subject: [PATCH] [daveey] Skip triage-park evidence only on genuinely unsynced
+ boards
+
+Review of e2a2ea reproduced (deleg_ed307335): on a synced board a peer can
+promote/claim/park, or directly park, a home-created triage card on probe P
+while this home still sees triage; the home's direct triage -> scheduled park
+then skipped the reset and, after delivery, the peer's same-P re-park yielded
+(t0, 2) instead of (t0+3600, 1).
+
+The no-evidence skip now requires durable local sync state to be absent
+(kanban_db_sync.sync_state, read inside the park's transaction; never config).
+On a synced board the direct triage park carries the reset barrier and snapshot
+inline in its own scheduled payload, so test_kanban_triage_park's six atomic
+cardinality cases (which run on a SYNCED board, not unsynced) still append one
+event. The transaction that creates kanban_sync_state (moved into the existing
+install_or_remove write_txn) clears every freshness marker; later enabled inits
+do not.
+
+Proof: test_kanban_wake_episode_triage_sync.py on e2a2ea prod code: 4 FAILED,
+1 passed (unsynced control); GREEN 5/5 here. Both real-API delayed foreign
+triage routes, created-unsynced then enable-sync, synced-at-create. Mutations
+9/9 killed (mut-triage-sync.log). Broad previous 65 files + new: 66 files,
+863 passed, 0 failed, retries 0.
+
+Boundary: an unsynced board copied to another host by a non-sync path (file
+copy/restore) can still have a foreign episode the skipped park never clears;
+a board whose sync row exists in any mode (including detached 'off') is
+treated as synced.
+---
+ hermes_cli/kanban_db_sync.py                  |  13 +-
+ hermes_cli/kanban_wake_episode.py             |  42 ++++--
+ .../test_kanban_wake_episode_triage_sync.py   | 124 ++++++++++++++++++
+ 3 files changed, 164 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wake_episode_triage_sync.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 2ca2a7bc896..60d987c6c06 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -384,13 +384,16 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+         _add_column_if_missing(conn, table, column, ddl)
+     for table in _UID_TABLES:
+         conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uid ON {table}(uid)")
+-    conn.execute(
+-        "INSERT OR IGNORE INTO kanban_sync_state (board_id, gateway_id, hlc_last, mode) "
+-        "SELECT ?, ?, '', 'shadow' WHERE NOT EXISTS (SELECT 1 FROM kanban_sync_state)",
+-        (f"local:{uuid7()}", f"gw_{uuid7()}"),
+-    )
+     from hermes_cli.kanban_db_connect import write_txn
+     with write_txn(conn):  # one transaction: no other writer can land between dropping and recreating a trigger
++        enabled_now = conn.execute(
++            "INSERT OR IGNORE INTO kanban_sync_state (board_id, gateway_id, hlc_last, mode) "
++            "SELECT ?, ?, '', 'shadow' WHERE NOT EXISTS (SELECT 1 FROM kanban_sync_state)",
++            (f"local:{uuid7()}", f"gw_{uuid7()}"),
++        ).rowcount > 0
++        if enabled_now:  # [daveey] peers may now receive this board's cards: no unsynced freshness marker survives
++            from hermes_cli.kanban_wake_episode import forget_fresh
++            forget_fresh(conn)
+         state = conn.execute("SELECT mode, board_id FROM kanban_sync_state").fetchone()
+         if state[0] == "off":
+             drop_triggers(conn)
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index d655ccaf807..b5d6e6f9e51 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -47,12 +47,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = NEW.id; END""")
+     conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_exit_delete AFTER DELETE ON tasks
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = OLD.id; END""")
+-    # Fresh local triage creation: a triage card is not runnable, so no peer can have
+-    # parked it on a probe before this home's direct triage -> scheduled park, which then
+-    # has nothing to clear. Set only by the local ``created`` event of a triage card
+-    # (sync-imported rows never append it; a runnable card may reach a peer and be parked
+-    # there first). Any other status transition, a probe park, or the first probe-less
+-    # park drops it.
++    # Fresh local triage creation: the card's direct triage -> scheduled park. On an
++    # UNSYNCED board no peer can have parked it on a probe first, so that park has nothing
++    # to clear and adds no evidence. On a synced board a peer may promote/claim/park (or
++    # directly park) the triage card while this home still sees triage, so the park
++    # carries the reset inline in its own event (atomic park: still one event); durable
++    # sync state is re-checked at the park and enabling sync clears every marker
++    # (``forget_fresh``). Set only by the local ``created`` event of a triage card
++    # (sync-imported rows never append it; a runnable card may reach a peer). Any other
++    # status transition, a probe park, or the first probe-less park drops it.
+     conn.execute("CREATE TABLE IF NOT EXISTS task_wake_episode_fresh (task_id TEXT PRIMARY KEY)")
+     conn.execute("DROP TRIGGER IF EXISTS task_wake_episode_fresh_insert")
+     conn.execute("DROP TRIGGER IF EXISTS task_wake_episode_fresh_entry")
+@@ -158,10 +161,14 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+         reconcile(conn, task_id)  # judge against every delivered park, then idempotent in _snapshot
+         fresh = conn.execute("DELETE FROM task_wake_episode_fresh WHERE task_id = ?", (task_id,)).rowcount > 0
+         if fresh and not _probe_known(conn, task_id):
+-            # Direct park of a locally created triage card, no probe delivered: nothing to clear, so
+-            # no evidence (keeps atomic park event contracts). Every later park may
+-            # follow an undelivered foreign episode, so it carries the reset below.
+-            return payload, None
++            # Direct park of a locally created triage card, no probe delivered. Unsynced:
++            # nothing to clear, no evidence. Synced: a peer may have parked it first, so
++            # carry the reset in the park's own payload (keeps atomic park cardinality).
++            # Every later park may follow an undelivered foreign episode: reset below.
++            if not _synced(conn):
++                return payload, None
++            reset(conn, task_id)
++            return {**(payload or {}), **_snapshot(conn, task_id, kind, payload, outside)}, None
+         reset(conn, task_id)  # home state may be unknown: make the clear an explicit reset barrier
+     snapshot = _snapshot(conn, task_id, kind, payload, outside)
+     separate = probe_less or (
+@@ -189,6 +196,21 @@ def _snapshot(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict |
+     return {_SNAPSHOT: data, barriers.KEY: barriers.current(conn, task_id)}
+ 
+ 
++def _synced(conn: sqlite3.Connection) -> bool:
++    """Durable local sync state exists: the board was enabled for sync at some point (any
++    mode, including a later detach), so peers may hold copies. Read from SQLite inside the
++    caller's transaction, never from config, so a concurrent enable is serialized."""
++    from hermes_cli import kanban_db_sync
++
++    return kanban_db_sync.sync_state(conn) is not None
++
++
++def forget_fresh(conn: sqlite3.Connection) -> None:
++    """Drop every freshness marker; called in the transaction that enables sync (after
++    ``ensure_schema``, which connect runs first)."""
++    conn.execute("DELETE FROM task_wake_episode_fresh")
++
++
+ def _probe_known(conn: sqlite3.Connection, task_id: str) -> bool:
+     row = conn.execute("SELECT cmd FROM task_wake_episode_cmd WHERE task_id = ?", (task_id,)).fetchone()
+     return bool(row and row[0]) or conn.execute(
+diff --git a/tests/hermes_cli/test_kanban_wake_episode_triage_sync.py b/tests/hermes_cli/test_kanban_wake_episode_triage_sync.py
+new file mode 100644
+index 00000000000..414d43294c8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_episode_triage_sync.py
+@@ -0,0 +1,124 @@
++"""Triage freshness may skip park evidence only on a genuinely unsynced board.
++
++On a synced board a peer can promote/claim/park (or directly park) a triage card on a
++probe while this home still sees it as triage; the home's direct triage -> scheduled
++park must then carry the reset, or the delayed foreign episode keeps its age/count.
++It carries it inline, so the atomic park still appends one event (test_kanban_triage_park).
++"""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_wake_check as wc
++from hermes_cli import kanban_wake_episode as episode
++from tests.hermes_cli import test_kanban_wake_episode as base
++from tests.hermes_cli import test_kanban_wake_episode_carry as carry
++
++kanban_home = base.kanban_home
++SOAK = "SCHEDULED_UNTIL=2026-09-13T00:00:00Z soak"
++
++
++def _enable_sync(monkeypatch):
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": True})
++    kb.init_db()  # re-runs install_or_remove: the board now has durable sync state
++
++
++def _triage(conn):
++    tid = kb.create_task(conn, title="t", assignee="worker", triage=True)
++    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "triage"
++    return tid
++
++
++def _fresh(conn, tid):
++    return conn.execute("SELECT 1 FROM task_wake_episode_fresh WHERE task_id = ?", (tid,)).fetchone() is not None
++
++
++def _home_park_kinds(conn, tid):
++    before = len(_kinds(conn, tid))
++    assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)  # home still sees triage
++    return [k for k in _kinds(conn, tid)[before:] if k != "commented"]
++
++
++def _kinds(conn, tid):
++    return [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
++
++
++def _inline_reset(conn, tid):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
++                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++    return episode._SNAPSHOT in json.loads(row[0] or "{}")
++
++
++def _exit1(peer, tid, now):
++    state = wc.get_state(peer, tid)
++    wc.apply_result(peer, tid, state["cmd"], 1, "", generation=state["generation"], now=now)
++    return tuple(peer.execute("SELECT first_at, checks FROM task_wake_episodes WHERE task_id = ?",
++                              (tid,)).fetchone())
++
++
++def _peer_promote_claim_park(peer, tid):
++    assert kb.promote_task(peer, tid, actor="peer")[0]
++    assert kb.claim_task(peer, tid, claimer="peer") is not None
++    assert kb.schedule_task(peer, tid, reason="waiting", wake_check="exit 1")
++
++
++def _peer_direct_park(peer, tid):
++    assert kb.schedule_task(peer, tid, reason="waiting", wake_check="exit 1")  # straight from triage
++
++
++@pytest.mark.parametrize("peer_park", [_peer_promote_claim_park, _peer_direct_park])
++def test_delayed_foreign_triage_park_is_reset_by_home_triage_park(kanban_home, monkeypatch, peer_park):
++    _enable_sync(monkeypatch)
++    with kbc.connect_closing() as conn:
++        tid = _triage(conn)
++        peer = carry.replica(conn)
++        try:
++            peer_park(peer, tid)
++            t0 = int(time.time())
++            assert _exit1(peer, tid, t0) == (t0, 1)  # foreign episode, not yet delivered home
++            assert _home_park_kinds(conn, tid) == ["scheduled"]  # atomic: the reset rides inline
++            assert _inline_reset(conn, tid)
++            carry.import_events(peer, conn, tid)  # the peer's pre-reset episode reaches home late
++            episode.reconcile(conn, tid)
++            assert conn.execute("SELECT 1 FROM task_wake_episodes WHERE task_id = ?", (tid,)).fetchone() is None
++            carry.import_events(conn, peer, tid)  # home's park reaches the peer
++            episode.reconcile(peer, tid)
++            assert peer.execute("SELECT 1 FROM task_wake_episodes WHERE task_id = ?", (tid,)).fetchone() is None
++            peer.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++            assert kb.claim_task(peer, tid, claimer="peer") is not None
++            assert kb.schedule_task(peer, tid, reason="waiting", wake_check="exit 1")  # same probe P
++            assert _exit1(peer, tid, t0 + 3600) == (t0 + 3600, 1)  # old age/count gone
++        finally:
++            peer.close()
++
++
++def test_synced_at_create_triage_park_is_one_event_carrying_the_reset(kanban_home, monkeypatch):
++    _enable_sync(monkeypatch)
++    with kbc.connect_closing() as conn:
++        tid = _triage(conn)
++        assert _home_park_kinds(conn, tid) == ["scheduled"]
++        assert _inline_reset(conn, tid)
++        assert not _fresh(conn, tid)  # consumed: the next park carries the separate reset
++
++
++def test_enabling_sync_invalidates_markers_of_cards_created_unsynced(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = _triage(conn)
++        assert _fresh(conn, tid)  # unsynced: the optimization applies
++    _enable_sync(monkeypatch)
++    with kbc.connect_closing() as conn:
++        assert not _fresh(conn, tid)  # cleared in the enabling transaction
++        assert _home_park_kinds(conn, tid) == [episode.EVIDENCE_EVENT, "scheduled"]
++
++
++def test_unsynced_triage_card_keeps_the_optimization(kanban_home):
++    with kbc.connect_closing() as conn:
++        assert sync.sync_state(conn) is None
++        tid = _triage(conn)
++        assert _fresh(conn, tid)
++        assert _home_park_kinds(conn, tid) == ["scheduled"]
++        assert not _inline_reset(conn, tid)  # nothing to clear: no evidence at all
+-- 
+2.55.0
+

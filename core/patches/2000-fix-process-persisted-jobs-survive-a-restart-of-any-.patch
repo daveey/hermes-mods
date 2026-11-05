@@ -1,0 +1,650 @@
+From 78a282ac5de6a8fb093f458b75d45a1451e33a4e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 08:37:28 +0000
+Subject: [PATCH] fix(process): persisted jobs survive a restart of any
+ spawning user unit [daveey]
+
+Background jobs started from hub chats died on every hub update, even with
+persist_on_release=true (a CI supervisor twice on 2026-11-04; ~every 80 min).
+Desktop's hub backend runs in hermes-always-on-dashboard.service
+(KillMode=control-group), which each update restarts; persisted jobs left
+their spawner's cgroup only when it was a Kanban run scope (#804).
+
+- process_registry_persist_scope: a persist job whose spawner runs in any
+  systemd user unit gets its own `systemd-run --user --scope`
+  (hermes-worker-<proc>.scope, session.systemd_unit set so kill works).
+  Kanban runs keep hermes-kanban.slice and the run cap; other spawners use
+  app.slice with the spawner unit's own cap (infinity when uncapped). No user
+  unit / no user bus: unchanged.
+- A persisted job also writes to the process-output log instead of a pipe
+  (POSIX): with only the scope, its first write after the spawner exited was
+  SIGPIPE (proven by the chatty integration case). The next backend re-adopts
+  the log. A persisted pty=true request runs on the log and says why
+  (pty_fallback / stdin error), instead of claiming an isolated worker.
+- Killed-job receipts (update pause and backend_shutdown) advise
+  "restart it with persist_on_release=true so it survives updates"; the
+  persist_on_release schema text says it survives restarts and updates.
+
+Tests: unit (fake app.slice/x.service cgroup -> scope argv; capped spawner;
+system/login/no unit unchanged), Linux integration (transient user service
+spawns a persist job, service stopped, job survives; chatty variant keeps
+printing), receipt hint. RED before, GREEN after.
+
+Self-heal: other-8101e835f4, gateway-67e85ef16a, other-ab3e1e2c74.
+---
+ tests/fixtures/prompt_surface/surfaces.json   |  18 +--
+ .../prompt_surface/tools/terminal.json        |   2 +-
+ tests/tools/test_persist_job_own_scope.py     | 152 +++++++++++++++++-
+ tests/tools/test_persist_on_release.py        |  32 ++++
+ .../tui_gateway/test_shutdown_job_receipts.py |  15 ++
+ tools/process_registry.py                     |  10 +-
+ tools/process_registry_output_log.py          |  22 ++-
+ tools/process_registry_persist_scope.py       |  78 ++++++---
+ tools/process_registry_stdin.py               |   3 +
+ tools/terminal_tool.py                        |   2 +-
+ tui_gateway/update_pause.py                   |   4 +-
+ 11 files changed, 297 insertions(+), 41 deletions(-)
+
+diff --git a/tests/fixtures/prompt_surface/surfaces.json b/tests/fixtures/prompt_surface/surfaces.json
+index 40e3d44ef1b..87fd1a87b3d 100644
+--- a/tests/fixtures/prompt_surface/surfaces.json
++++ b/tests/fixtures/prompt_surface/surfaces.json
+@@ -5,7 +5,7 @@
+       "stable": 1829,
+       "volatile": 1268
+     },
+-    "tool_tokens": 11760,
++    "tool_tokens": 11787,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -39,7 +39,7 @@
+       "stable": 1225,
+       "volatile": 1268
+     },
+-    "tool_tokens": 11760,
++    "tool_tokens": 11787,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -73,7 +73,7 @@
+       "stable": 1646,
+       "volatile": 1266
+     },
+-    "tool_tokens": 11760,
++    "tool_tokens": 11787,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -107,7 +107,7 @@
+       "stable": 2420,
+       "volatile": 1264
+     },
+-    "tool_tokens": 11916,
++    "tool_tokens": 11943,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -141,7 +141,7 @@
+       "stable": 1225,
+       "volatile": 1268
+     },
+-    "tool_tokens": 11760,
++    "tool_tokens": 11787,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -175,7 +175,7 @@
+       "stable": 1211,
+       "volatile": 1268
+     },
+-    "tool_tokens": 11760,
++    "tool_tokens": 11787,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -209,7 +209,7 @@
+       "stable": 1587,
+       "volatile": 1269
+     },
+-    "tool_tokens": 12416,
++    "tool_tokens": 12443,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -244,7 +244,7 @@
+       "stable": 1244,
+       "volatile": 1269
+     },
+-    "tool_tokens": 11760,
++    "tool_tokens": 11787,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+@@ -278,7 +278,7 @@
+       "stable": 1276,
+       "volatile": 1269
+     },
+-    "tool_tokens": 11760,
++    "tool_tokens": 11787,
+     "tools": [
+       "browser_cdp",
+       "browser_dialog",
+diff --git a/tests/fixtures/prompt_surface/tools/terminal.json b/tests/fixtures/prompt_surface/tools/terminal.json
+index dfd73f3ad72..1c9491379df 100644
+--- a/tests/fixtures/prompt_surface/tools/terminal.json
++++ b/tests/fixtures/prompt_surface/tools/terminal.json
+@@ -39,7 +39,7 @@
+       },
+       "persist_on_release": {
+         "default": false,
+-        "description": "With background=true: survive session end, /new, compression and other cleanup (not host exit). Only for jobs the user explicitly wants to outlive the conversation.",
++        "description": "With background=true: survive session end, /new, compression, backend restarts and Hermes updates (not host exit). Use it for jobs that must outlive the conversation or a restart, such as a long CI wait; a job without it is killed when the backend restarts for an update.",
+         "type": "boolean"
+       },
+       "pty": {
+diff --git a/tests/tools/test_persist_job_own_scope.py b/tests/tools/test_persist_job_own_scope.py
+index 9d563a646f6..919ad116d0d 100644
+--- a/tests/tools/test_persist_job_own_scope.py
++++ b/tests/tools/test_persist_job_own_scope.py
+@@ -4,6 +4,7 @@ The run scope is OOMPolicy=stop / KillMode=control-group and is stopped when the
+ it ends, which killed a persisted paid-rental watchdog (hub, 2026-11-03 03:42Z).
+ """
+ 
++import json
+ import os
+ import subprocess
+ import time
+@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
+ import pytest
+ 
+ import tools.process_registry as pr
++from tests.waiting import wait_until
+ from tools.process_registry import ProcessRegistry
+ from tools.process_registry_persist_scope import KANBAN_SLICE, kanban_run_scope_cgroup
+ 
+@@ -29,7 +31,7 @@ def test_run_scope_cgroup_parses_only_kanban_run_scopes(tmp_path):
+     assert kanban_run_scope_cgroup(str(tmp_path / "missing")) is None
+ 
+ 
+-def _spawn(monkeypatch, tmp_path, *, persist, in_run_scope=True):
++def _spawn(monkeypatch, tmp_path, *, persist, in_run_scope=True, in_user_unit=False):
+     scope_dir = tmp_path / "run-scope"
+     scope_dir.mkdir(exist_ok=True)
+     (scope_dir / "memory.max").write_text("8589934592\n")
+@@ -38,6 +40,8 @@ def _spawn(monkeypatch, tmp_path, *, persist, in_run_scope=True):
+     monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
+     monkeypatch.setattr("tools.process_registry_persist_scope.kanban_run_scope_cgroup",
+                         lambda: scope_dir if in_run_scope else None)
++    monkeypatch.setattr("tools.process_registry_persist_scope.user_unit_cgroup",
++                        lambda: scope_dir if in_user_unit else None, raising=False)
+     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+     captured = {}
+ 
+@@ -73,12 +77,156 @@ def test_volatile_job_stays_in_run_scope(monkeypatch, tmp_path):
+ 
+ 
+ @pytest.mark.platforms("linux")
+-def test_persisted_job_outside_kanban_run_scope_is_unchanged(monkeypatch, tmp_path):
++def test_persisted_job_outside_any_user_unit_is_unchanged(monkeypatch, tmp_path):
+     session, argv = _spawn(monkeypatch, tmp_path, persist=True, in_run_scope=False)
+     assert argv[0] != "/usr/bin/systemd-run"
+     assert session.systemd_unit == ""
+ 
+ 
++SERVICE_CGROUP = "user.slice/user-1000.slice/user@1000.service/app.slice/hermes-always-on-dashboard.service"
++
++
++def _spawn_from_cgroup(monkeypatch, tmp_path, relative, memory_max=None):
++    """Spawn a persisted job from a process whose /proc/self/cgroup says ``relative`` (real parser)."""
++    import tools.process_registry_persist_scope as ps
++    cg = tmp_path / "self-cgroup"
++    cg.write_text(f"0::/{relative}\n")
++    root = tmp_path / "cgroupfs"
++    if memory_max is not None:
++        (root / relative).mkdir(parents=True)
++        (root / relative / "memory.max").write_text(f"{memory_max}\n")
++    monkeypatch.setattr(ps, "PROC_SELF_CGROUP", str(cg), raising=False)
++    monkeypatch.setattr(ps, "CGROUP_ROOT", root, raising=False)
++    real_read = Path.read_text
++
++    def read_text(self, *a, **k):  # pre-fix code reads /proc/self/cgroup directly
++        return real_read(cg if str(self) == "/proc/self/cgroup" else self, *a, **k)
++
++    monkeypatch.setattr(Path, "read_text", read_text)
++    monkeypatch.setattr(pr, "_IS_LINUX", True)
++    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
++    monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
++    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
++    captured = {}
++
++    def fake_popen(argv, **kwargs):
++        captured["argv"] = list(argv)
++        proc = MagicMock(pid=4321, stdout=iter([]))
++        proc.poll.return_value = None
++        return proc
++
++    registry = ProcessRegistry()
++    with (patch("subprocess.Popen", side_effect=fake_popen), patch("threading.Thread", return_value=MagicMock()),
++          patch.object(registry, "_write_checkpoint")):
++        session = registry.spawn_local("sleep 60", cwd=str(tmp_path), persist_on_release=True)
++    return session, captured["argv"]
++
++
++@pytest.mark.platforms("linux")
++def test_persisted_job_from_any_user_service_gets_own_app_slice_scope(monkeypatch, tmp_path):
++    """Hub chats run in hermes-always-on-dashboard.service (KillMode=control-group), restarted by every update."""
++    session, argv = _spawn_from_cgroup(monkeypatch, tmp_path, SERVICE_CGROUP, memory_max="max")
++    assert argv[0] == "/usr/bin/systemd-run" and "--scope" in argv and "--user" in argv, argv
++    head = argv[:argv.index("--")]
++    assert argv[argv.index("--unit") + 1] == f"hermes-worker-{session.id}"
++    assert "--slice=app.slice" in head and f"--slice={KANBAN_SLICE}" not in head
++    assert "MemoryMax=infinity" in head, "an uncapped spawner's job is not given the 4 GiB worker cap"
++    assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
++
++
++@pytest.mark.platforms("linux")
++def test_persisted_job_inherits_a_capped_spawner_units_memory_max(monkeypatch, tmp_path):
++    _session, argv = _spawn_from_cgroup(monkeypatch, tmp_path, SERVICE_CGROUP, memory_max=str(16 << 30))
++    assert f"MemoryMax={16 << 30}" in argv[:argv.index("--")]
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("relative", ["system.slice/hermes.service", "", "user.slice/user-1000.slice/session-3.scope"])
++def test_persisted_job_outside_a_user_unit_is_unchanged(monkeypatch, tmp_path, relative):
++    session, argv = _spawn_from_cgroup(monkeypatch, tmp_path, relative)
++    assert argv[0] != "/usr/bin/systemd-run"
++    assert session.systemd_unit == ""
++
++
++def _user_systemd() -> bool:
++    import shutil
++    return bool(pr._IS_LINUX and shutil.which("systemd-run") and pr._systemd_run_user_scope_available())
++
++
++SPAWNER = """
++import json, sys, time
++sys.path.insert(0, {repo!r})
++from tools.process_registry import ProcessRegistry
++session = ProcessRegistry().spawn_local({command!r}, cwd={cwd!r}, persist_on_release=True)
++open({out!r} + ".tmp", "w").write(json.dumps({{"pid": session.pid, "unit": session.systemd_unit}}))
++import os; os.replace({out!r} + ".tmp", {out!r})
++time.sleep(600)
++"""
++
++
++def _alive(pid: int) -> bool:
++    try:
++        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
++    except OSError:
++        return False
++    return state != "Z"
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++@pytest.mark.parametrize("chatty", [False, True], ids=["sleep", "writes-output-after-spawner-exit"])
++def test_real_persisted_job_survives_stop_of_its_spawning_user_service(tmp_path, monkeypatch, chatty):
++    """A transient user service (KillMode=control-group) spawns a persist job; stopping it spares the job, and a
++    job that keeps printing outlives its spawner's stdout pipe (no SIGPIPE on the next write)."""
++    import uuid
++    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
++    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_PROBED_AT", 0.0)
++    import sys
++    repo = str(Path(pr.__file__).resolve().parents[1])
++    out = tmp_path / "spawned.json"
++    ticks = tmp_path / "ticks"
++    command = f"while :; do echo tick; echo t >> {ticks}; sleep 0.1; done" if chatty else "sleep 120"
++    script = tmp_path / "spawner.py"
++    script.write_text(SPAWNER.format(repo=repo, command=command, cwd=str(tmp_path), out=str(out)))
++    home = tmp_path / "home"
++    home.mkdir()
++    unit = f"hermes-test-persist-spawner-{uuid.uuid4().hex[:8]}.service"
++    env = pr.systemd_user_bus_env() or dict(os.environ)
++    subprocess.run(["systemd-run", "--user", "--quiet", "--collect", "--unit", unit,
++                    "--property", "KillMode=control-group", f"--setenv=HERMES_HOME={home}",
++                    f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
++                    sys.executable, str(script)], check=True, timeout=15, env=env)
++    spawned = {}
++    try:
++        wait_until(out.exists, timeout=30, what="the spawner's job report")
++        spawned = json.loads(out.read_text())
++        pid = spawned["pid"]
++        wait_until(lambda: _alive(pid), what="the persisted job")
++        # systemd-run execs the job only once its scope exists; stopping the spawner earlier tests nothing.
++        wait_until(lambda: spawned["unit"] and Path(f"/proc/{pid}/cgroup").read_text().rstrip().endswith(
++            "/" + spawned["unit"]), what="the job's own scope")
++        if chatty:
++            wait_until(ticks.exists, what="the job's first output")
++        # ``stop`` returns once systemd has killed the unit's whole cgroup (KillMode=control-group).
++        subprocess.run(["systemctl", "--user", "stop", unit], check=True, timeout=30, env=env)
++        assert subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit],
++                              env=env, check=False).returncode != 0
++        assert _alive(pid), "stopping the spawner's service killed its persist_on_release job"
++        if chatty:
++            seen = ticks.stat().st_size
++            wait_until(lambda: ticks.stat().st_size >= seen + 6, what="the job printing after its spawner exited")
++            assert _alive(pid), "the job died writing to its dead spawner's pipe"
++        cgroup = Path(f"/proc/{pid}/cgroup").read_text()
++        assert spawned["unit"] and cgroup.rstrip().endswith("/app.slice/" + spawned["unit"]), cgroup
++    finally:
++        subprocess.run(["systemctl", "--user", "stop", unit], check=False, timeout=30, env=env)
++        if spawned.get("unit"):
++            subprocess.run(["systemctl", "--user", "stop", spawned["unit"]], check=False, timeout=30, env=env)
++        if spawned.get("pid") and _alive(spawned["pid"]):
++            os.kill(spawned["pid"], 9)
++
++
+ def _in_real_run_scope() -> bool:
+     return kanban_run_scope_cgroup() is not None and pr._systemd_run_user_scope_available()
+ 
+diff --git a/tests/tools/test_persist_on_release.py b/tests/tools/test_persist_on_release.py
+index 4375097917c..e3fdb173f09 100644
+--- a/tests/tools/test_persist_on_release.py
++++ b/tests/tools/test_persist_on_release.py
+@@ -148,6 +148,38 @@ def test_spawn_local_stamps_persist_on_release(registry, monkeypatch, tmp_path):
+     assert session.persist_on_release is False
+ 
+ 
++def test_persisted_spawn_writes_a_log_and_says_why_it_has_no_pty(registry, monkeypatch, tmp_path):
++    """A persisted job outlives its spawner, so it never writes to the spawner's pipe (SIGPIPE once that
++    process exits); a pty=true request on it says why it runs without a PTY instead of failing silently."""
++    import subprocess
++
++    from tools import terminal_tool_sudo
++    from tools.environments import local as local_env
++    from tools.process_registry_output_log import PERSIST_NO_PTY, output_dir
++    from tools.process_registry_stdin import stdin_unavailable_error
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(local_env, "_resolve_hermes_bin_dir", lambda: None)
++    monkeypatch.setattr(registry, "_track_started", lambda *a, **k: None)
++    monkeypatch.setattr(terminal_tool_sudo, "_rewrite_compound_background", lambda c: c)
++    monkeypatch.setattr(ProcessRegistry, "_scope_argv", lambda self, session, command, *a: ["/bin/sh", "-c", command])
++    popen = MagicMock(return_value=MagicMock(pid=4242, stdin=None))
++    monkeypatch.setattr("subprocess.Popen", popen)
++    pty_spawn = MagicMock(side_effect=AssertionError("a persisted job must not get the backend's PTY"))
++    monkeypatch.setattr(ProcessRegistry, "_spawn_local_pty", pty_spawn)
++
++    session = registry.spawn_local("sleep 60", task_id="t1", persist_on_release=True, use_pty=True)
++
++    assert session.output_log == str(output_dir() / f"{session.id}.log")
++    assert popen.call_args.kwargs["stdout"] != subprocess.PIPE
++    assert session.pty_fallback == PERSIST_NO_PTY
++    assert PERSIST_NO_PTY in stdin_unavailable_error(session)
++    assert "isolated worker" not in stdin_unavailable_error(session)
++
++    volatile = registry.spawn_local("echo hi", task_id="t1")
++    assert not volatile.output_log and not volatile.pty_fallback
++
++
+ def test_checkpoint_carries_persist_on_release():
+     """A crash-recovery checkpoint must carry the flag, or a persisted job
+     resurrects as killable by the next session's release sweep (#41225)."""
+diff --git a/tests/tui_gateway/test_shutdown_job_receipts.py b/tests/tui_gateway/test_shutdown_job_receipts.py
+index 46a402a8c47..d5ea9805798 100644
+--- a/tests/tui_gateway/test_shutdown_job_receipts.py
++++ b/tests/tui_gateway/test_shutdown_job_receipts.py
+@@ -208,6 +208,21 @@ def test_idle_shutdown_without_update_names_the_backend_shutdown(home, registry,
+     assert "proc_notify" in text and "sleep 600" in text
+ 
+ 
++def test_shutdown_receipt_for_killed_notify_job_says_how_to_survive_updates(home, registry, backend, monkeypatch):
++    """A chat whose CI wait died with the backend must learn how to keep the next one alive."""
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    notify = _job("proc_notify", owner="turn-1", command="hermes-core-wt ship my-fix", notify=True)
++    registry._running[notify.id] = notify
++    backend.sessions["sid"] = _session(home)
++
++    server._shutdown_sessions()
++
++    assert notify.termination_source == "backend_shutdown" and notify.persist_on_release is False
++    text = _resume_text(monkeypatch, home)
++    assert "proc_notify" in text
++    assert "restart it with persist_on_release=true so it survives updates" in text
++
++
+ def test_idle_session_with_only_quiet_jobs_gets_no_wake_marker(home, registry, backend):
+     quiet = _job("proc_quiet", owner="turn-1", command="npm run dev")
+     registry._running[quiet.id] = quiet
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index fa2d37de3cc..9acd0fc421d 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -37,7 +37,7 @@ from tools.process_registry_notifications import (
+     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
+ from tools.process_registry_checkpoint import ProcessCheckpointMixin
+ from tools.process_registry_readopt import ProcessReadoptMixin
+-from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
++from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, spawn_output_log
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+@@ -179,8 +179,8 @@ def _worker_memory_max_bytes() -> int:
+     return min(override_bound, safe_bound) if override_bound else safe_bound
+ 
+ 
+-def _systemd_scope_argv(binary: str, unit_name: str, *argv: str, memory_max: int = 0, slice_name: str = "") -> list[str]:
+-    """``systemd-run --user --scope`` argv shared by the probe and real spawns.
++def _systemd_scope_argv(binary: str, unit_name: str, *argv: str, memory_max: int | str = 0, slice_name: str = "") -> list[str]:
++    """``systemd-run --user --scope`` argv shared by the probe and real spawns (``memory_max`` 0 = worker cap).
+     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
+     No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
+     ``--expand-environment=no`` keeps the command byte-identical (#132385)."""
+@@ -1197,8 +1197,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or process_cwd() or os.path.expanduser("~")),
+                                     persist_on_release=persist_on_release)
+         pty_scope_attempted = False
+-        # A worker's pipe or PTY dies with the worker (the child's next write is SIGPIPE): write to a log.
+-        log = worker_output_log(session.id)
++        # A worker's or persisted job's pipe/PTY dies with its spawner (next write is SIGPIPE): write to a log.
++        log = spawn_output_log(session, use_pty)
+         if use_pty and log is None:
+             try:
+                 return self._spawn_local_pty(session, safe_command, env_vars)
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index 8b88bdddc7b..b6bb12fae27 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -29,10 +29,14 @@ def output_dir() -> Path:
+     return get_hermes_home() / "logs" / "process-output"
+ 
+ 
+-def worker_output_log(session_id: str) -> Optional[Path]:
+-    """The log a worker-spawned process writes to; None outside a registered worker."""
++def worker_output_log(session_id: str, *, persist: bool = False) -> Optional[Path]:
++    """The log a worker-spawned or ``persist_on_release`` process writes to; None otherwise.
++
++    A persisted job outlives its spawner by contract (a Desktop backend restarted by every hub update,
++    2026-11-04): on a pipe its first write after the spawner exits is SIGPIPE, so it logs here too and the
++    next backend re-adopts the log (POSIX only: the Windows trap-wrapped log path is untested). [daveey]"""
+     from agent.runtime_session_store import is_worker_process
+-    if not is_worker_process():
++    if not ((persist and os.name != "nt") or is_worker_process()):
+         return None
+     directory = output_dir()
+     make_user_dir(directory, mode=0o700, parents=True, exist_ok=True)
+@@ -47,6 +51,18 @@ def worker_output_log(session_id: str) -> Optional[Path]:
+     return directory / f"{session_id}.log"
+ 
+ 
++PERSIST_NO_PTY = "persist_on_release jobs write to a log file so they outlive the backend"
++
++
++def spawn_output_log(session, use_pty: bool) -> Optional[Path]:
++    """``worker_output_log`` for a new local spawn. A persisted ``pty=true`` request runs on the log (the
++    backend holds a PTY master, so the job would get SIGHUP when it exits) and records why."""
++    log = worker_output_log(session.id, persist=session.persist_on_release)
++    if log is not None and use_pty and session.persist_on_release:
++        session.pty_fallback = PERSIST_NO_PTY
++    return log
++
++
+ def adoptable_log(path) -> str:
+     """A checkpointed log path, only when it names this profile's output directory."""
+     log = Path(str(path or ""))
+diff --git a/tools/process_registry_persist_scope.py b/tools/process_registry_persist_scope.py
+index 0c5108e8aae..96ea617f04b 100644
+--- a/tools/process_registry_persist_scope.py
++++ b/tools/process_registry_persist_scope.py
+@@ -1,10 +1,17 @@
+-"""A Kanban worker's persist_on_release job leaves the worker's run scope. [daveey]
++"""A persist_on_release job leaves its spawner's systemd user unit. [daveey]
+ 
+ A Kanban worker runs in ``hermes-worker-kanban-<task>-run-<n>.scope`` (OOMPolicy=stop,
+ KillMode=control-group), which systemd stops when the run OOMs and the dispatcher stops after the
+ run ends. A ``persist_on_release`` job spawned inside it died with the worker (a paid-rental
+ watchdog on the hub, 2026-11-03), so it gets its own transient scope in the same
+ aggregate-bounded ``hermes-kanban.slice``, with the run scope's own memory cap.
++
++Any other user unit kills it the same way: Desktop's hub backend runs in
++``hermes-always-on-dashboard.service`` (KillMode=control-group), which every hub update restarts, so
++a persist job started from a hub chat died with it although Hermes itself spares persist jobs on
++``backend_shutdown`` (a CI supervisor, twice on 2026-11-04). Such a job gets its own scope in
++``app.slice``, bounded like its spawner's unit (uncapped when that unit is). A process in no user unit
++(system service, container root, a login session scope) or with no user bus is unchanged.
+ """
+ from __future__ import annotations
+ 
+@@ -14,37 +21,70 @@ from typing import Optional
+ 
+ KANBAN_RUN_SCOPE_PREFIX = "hermes-worker-kanban-"
+ KANBAN_SLICE = "hermes-kanban.slice"
++APP_SLICE = "app.slice"
++PROC_SELF_CGROUP = "/proc/self/cgroup"
++CGROUP_ROOT = Path("/sys/fs/cgroup")
+ 
+ 
+-def kanban_run_scope_cgroup(proc_cgroup: str = "/proc/self/cgroup") -> Optional[Path]:
+-    """This process's Kanban run-scope cgroup directory, or None outside one."""
++def _own_cgroup(proc_cgroup: Optional[str]) -> Optional[str]:
++    """This process's cgroup-v2 path (the ``0::`` line), without the leading slash."""
+     try:
+-        for line in Path(proc_cgroup).read_text(encoding="utf-8-sig").splitlines():
++        for line in Path(proc_cgroup or PROC_SELF_CGROUP).read_text(encoding="utf-8-sig").splitlines():
+             if line.startswith("0::"):
+-                relative = line[3:].strip()
+-                name = relative.rsplit("/", 1)[-1]
+-                if name.startswith(KANBAN_RUN_SCOPE_PREFIX) and name.endswith(".scope"):
+-                    return Path("/sys/fs/cgroup") / relative.lstrip("/")
+-                return None
++                return line[3:].strip().lstrip("/")
+     except OSError:
+         pass
+     return None
+ 
+ 
++def kanban_run_scope_cgroup(proc_cgroup: Optional[str] = None) -> Optional[Path]:
++    """This process's Kanban run-scope cgroup directory, or None outside one."""
++    relative = _own_cgroup(proc_cgroup) or ""
++    name = relative.rsplit("/", 1)[-1]
++    if name.startswith(KANBAN_RUN_SCOPE_PREFIX) and name.endswith(".scope"):
++        return CGROUP_ROOT / relative
++    return None
++
++
++def user_unit_cgroup(proc_cgroup: Optional[str] = None) -> Optional[Path]:
++    """This process's systemd *user* unit cgroup directory (a ``.service``/``.scope`` below
++    ``user@<uid>.service``), or None when it runs in no user unit."""
++    relative = _own_cgroup(proc_cgroup) or ""
++    parts = relative.split("/")
++    manager = next((i for i, part in enumerate(parts) if part.startswith("user@") and part.endswith(".service")),
++                   None)
++    if manager is None or manager == len(parts) - 1 or not parts[-1].endswith((".service", ".scope")):
++        return None
++    return CGROUP_ROOT / relative
++
++
++def _unit_memory_max(unit: Path) -> str:
++    try:
++        return (unit / "memory.max").read_text(encoding="utf-8-sig").strip()
++    except OSError:
++        return ""
++
++
+ def persisted_job_scope_argv(session, shell_argv: list[str], unit_suffix: str) -> list[str]:
+-    """``systemd-run --user --scope`` argv moving a persisted job out of this process's Kanban run scope
++    """``systemd-run --user --scope`` argv moving a persisted job out of this process's systemd user unit
+     (and naming ``session.systemd_unit``); ``shell_argv`` itself (the same object) when that does not apply."""
+     from tools import process_registry as pr
+ 
+-    run_scope = kanban_run_scope_cgroup() if pr._IS_LINUX and session.persist_on_release else None
+-    binary = shutil.which("systemd-run") if run_scope is not None else None
+-    if binary is None or not pr._systemd_run_user_scope_available():
++    if not (pr._IS_LINUX and session.persist_on_release):
+         return shell_argv
+-    try:
+-        raw = (run_scope / "memory.max").read_text(encoding="utf-8-sig").strip()
+-    except OSError:
+-        raw = ""
+-    memory_max = int(raw) if raw.isdigit() and int(raw) >= pr._MIN_WORKER_MEMORY_MAX_BYTES else 0
++    run_scope = kanban_run_scope_cgroup()
++    unit = run_scope if run_scope is not None else user_unit_cgroup()
++    binary = shutil.which("systemd-run") if unit is not None else None
++    if unit is None or binary is None or not pr._systemd_run_user_scope_available():
++        return shell_argv
++    raw = _unit_memory_max(unit)
++    capped = raw.isdigit() and int(raw) >= pr._MIN_WORKER_MEMORY_MAX_BYTES
++    memory_max: int | str
++    if run_scope is not None:
++        memory_max, slice_name = (int(raw) if capped else 0), KANBAN_SLICE
++    else:
++        # The spawner's own bound; the 4 GiB worker default would OOM a build its uncapped spawner can run.
++        memory_max, slice_name = (int(raw) if capped else "infinity"), APP_SLICE
+     session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+     return pr._systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv,
+-                                  memory_max=memory_max, slice_name=KANBAN_SLICE)
++                                  memory_max=memory_max, slice_name=slice_name)
+diff --git a/tools/process_registry_stdin.py b/tools/process_registry_stdin.py
+index 18e93937917..82703c28212 100644
+--- a/tools/process_registry_stdin.py
++++ b/tools/process_registry_stdin.py
+@@ -17,6 +17,9 @@ def _no_pty_reason(session) -> str:
+     if session.pty_fallback:
+         return f"pty=true was requested but {session.pty_fallback}, so it runs without stdin"
+     if session.output_log:
++        if session.persist_on_release:
++            from tools.process_registry_output_log import PERSIST_NO_PTY
++            return f"{PERSIST_NO_PTY}, with no pseudo-terminal"
+         return "background processes here run in an isolated worker that cannot give them a pseudo-terminal"
+     if not _pty_available():
+         return "the PTY library (ptyprocess/pywinpty) is not installed"
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index ed910842790..cefc6853d64 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1704,7 +1704,7 @@ TERMINAL_SCHEMA = {
+             "persist_on_release": {
+                 "type": "boolean",
+                 "default": False,
+-                "description": "With background=true: survive session end, /new, compression and other cleanup (not host exit). Only for jobs the user explicitly wants to outlive the conversation."
++                "description": "With background=true: survive session end, /new, compression, backend restarts and Hermes updates (not host exit). Use it for jobs that must outlive the conversation or a restart, such as a long CI wait; a job without it is killed when the backend restarts for an update."
+             }
+             # Legacy aliases (unadvertised, still accepted): notify_on_complete
+             # (bool) and watch_patterns (list). notify=true|[...] maps onto
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 1a1264202f9..9d7681f7f3d 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
+ 
+ PAUSE_REASON = "core_update_pause"
+ UPDATE_KILL_REASON = "killed by the Hermes update"
++# Restart advice on every job an update or backend exit stopped: only persisted jobs survive both. [daveey]
++PERSIST_RESTART_HINT = "restart it with persist_on_release=true so it survives updates"
+ MAX_PAUSES = 3
+ PAUSE_STATUS_TEXT = "Paused for a Hermes update; continues automatically"
+ # The update itself takes a few minutes: a turn that would age out of the freshness window meanwhile is
+@@ -343,7 +345,7 @@ def killed_jobs_report(killed_jobs: list | None, heading: str) -> str:
+                          f"— interruption outcome {state}; inspect its result before restarting")
+             continue
+         lines.append(f"- {job['session_id']} started {_format_start(job.get('started_at'))}: {command} "
+-                     f"— restart it if you still need it")
++                     f"— restart it if you still need it; {PERSIST_RESTART_HINT}")
+         if job.get("notify_on_complete"):
+             notice = job.get("notice") or _killed_job_notice(job)
+             if notice:
+-- 
+2.55.0
+

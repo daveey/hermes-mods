@@ -1,0 +1,670 @@
+From 82c453a9c739d3da9cd74126e106227c1948e747 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 11:11:04 +0000
+Subject: [PATCH] fix(kanban): pull board_error records the failed HTTP
+ attempt's budget/elapsed [daveey]
+
+A dispatch-tick feed pull timeout fanned out as stage=pull, transport=timeout with no timing (only
+reserve/repin were instrumented), so a starved page-2 GET looked like a slow page-1 GET.
+
+Hub now stamps each FAILED HTTP attempt (kept-alive and urlopen paths) with raw (budget_s, elapsed_s):
+budget left on the shared deadline when THAT attempt started, and its own time to fail. A stale-socket
+GET retry restarts the clock; budget exhausted before an attempt stamps nothing. The stamp lives in a
+new sibling kanban_sync_client_attempt (client never imports the queue layer). record_pull_error reads
+it via queue.attempt_timing using the same _ms rounding/clamping as reserve/repin; absent, malformed or
+non-finite values are omitted and never mask the error.
+
+Diagnostics only: exception classes, OSError/URLError wrapping, attempts, deadlines, POST no-replay,
+event+comment fanout/dedupe and reserve/repin timing are unchanged. No timeout or suppression change.
+(Removed an unused `# noqa: A002` in the RED test file for ruff RUF100; no assertion touched.)
+
+Proof: tests/hermes_cli/test_kanban_pull_attempt_timing.py RED (2 failed: no budget_ms) -> GREEN;
+new test_kanban_pull_attempt_timing_edges.py (23) covers stale-GET retry timing, POST no-replay,
+exhausted-before-retry, no-deadline, urlopen path, absent/malformed/non-finite stamps, dedupe.
+Mutants on each added condition killed. Focused suite 200 passed; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_queue_reason.py             |  23 +-
+ hermes_cli/kanban_sync_client.py              | 104 ++++----
+ hermes_cli/kanban_sync_client_attempt.py      |  25 ++
+ .../test_kanban_pull_attempt_timing.py        | 181 ++++++++++++++
+ .../test_kanban_pull_attempt_timing_edges.py  | 233 ++++++++++++++++++
+ 5 files changed, 519 insertions(+), 47 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_client_attempt.py
+ create mode 100644 tests/hermes_cli/test_kanban_pull_attempt_timing.py
+ create mode 100644 tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index af6516087f0..7fd2eaa30ba 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -308,17 +308,38 @@ def transport_kind(error):
+     return "other"
+ 
+ 
++def attempt_timing(error):
++    """Allowlisted timing of the failed HTTP attempt the Board client stamped on ``error``; ``{}`` when absent.
++
++    The stamp is ``(budget_s, elapsed_s)`` seconds (``kanban_sync_client_attempt.note_attempt``). Each value goes
++    through the same bounded whole-millisecond rounding/clamping as reserve/repin timing; an unusable one is omitted."""
++    timing = {}
++    try:
++        from hermes_cli.kanban_sync_client_attempt import ATTEMPT_ATTR
++        stamp = getattr(error, ATTEMPT_ATTR, None)
++        if type(stamp) is not tuple or len(stamp) != 2:
++            return timing
++        for key, seconds in zip(TIMING_KEYS, stamp):
++            if (ms := _ms(seconds)) is not None:
++                timing[key] = ms
++    except Exception:  # health: allow BLE001 -- optional timing must never mask the original Board error
++        return {}
++    return timing
++
++
+ def record_pull_error(conn, gateway, *, status=None, error=None):
+     """A failed feed read affects all origin-owned ready policy observations.
+ 
+     Selection is diagnostic only; _record rechecks ownership and lifecycle under
+     the write transaction so a concurrent claim/repin cannot acquire a new wait.
++    Timing (budget_ms/elapsed_ms) is the failed HTTP attempt stamped on ``error``, never the whole pull.
+     """
++    timing = attempt_timing(error)
+     rows = conn.execute(
+         "SELECT id FROM tasks WHERE placement_policy='worker-first-v1' AND status='ready' "
+         "AND created_on=? AND claim_lock IS NULL AND lease_holder IS NULL", (gateway,)).fetchall()
+     for row in rows:
+-        try_record(record_error, conn, row["id"], gateway, status=status, error=error, stage="pull")
++        try_record(record_error, conn, row["id"], gateway, status=status, error=error, stage="pull", timing=timing)
+ 
+ 
+ def record_error(conn, task_id, gateway, *, status=None, error=None, fence=None, stage=None, timing=None):
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 290d4ada3ff..803c2c82d57 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
++from hermes_cli.kanban_sync_client_attempt import note_attempt
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -280,14 +281,19 @@ class Hub:
+         # urllib's internal redirect follows, not merely the initial fallback send.
+         open_request = (urllib.request.build_opener(_DeadlineRequests(self._remaining)).open
+                         if self.deadline is not None else urllib.request.urlopen)
++        started = time.monotonic()
+         try:
+-            with open_request(req, timeout=timeout) as resp:
+-                return json.loads(resp.read() or b"{}")
+-        except urllib.error.HTTPError as exc:
+-            text = exc.read().decode("utf-8", "replace")[:500]
+-            if exc.code == 410:
+-                raise Resync(text) from exc
+-            raise HubError(exc.code, text) from exc
++            try:
++                with open_request(req, timeout=timeout) as resp:
++                    return json.loads(resp.read() or b"{}")
++            except urllib.error.HTTPError as exc:
++                text = exc.read().decode("utf-8", "replace")[:500]
++                if exc.code == 410:
++                    raise Resync(text) from exc
++                raise HubError(exc.code, text) from exc
++        except Exception as exc:  # health: allow BLE001 -- stamps diagnostics, then re-raises the same error
++            note_attempt(exc, self.deadline, started, time.monotonic())
++            raise
+ 
+     @staticmethod
+     def _proxied(parts: urllib.parse.SplitResult) -> bool:
+@@ -348,46 +354,52 @@ class Hub:
+         target = (parts.path or "") + path
+         headers = self._headers()
+         for attempt in (0, 1):
+-            conn, reused = self._connection(parts, self._remaining(timeout))
+-            try:
+-                conn.request(method, target, body=data, headers=headers)
+-            except (OSError, http.client.HTTPException) as exc:
+-                self._drop()
+-                if reused and attempt == 0:  # a stale kept-alive socket: the request never reached the server
+-                    continue
+-                raise urllib.error.URLError(exc) from exc
+-            try:
+-                resp = conn.getresponse()
+-            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError) as exc:
+-                self._drop()
+-                # Only GET or an explicitly replay-safe operation may repeat after a lost answer.
+-                # Reserve is revision-fenced; other POSTs (ops, leases) must not opt in.
+-                if reused and attempt == 0 and (method == "GET" or replay_safe):
+-                    continue
+-                raise urllib.error.URLError(exc) from exc
+-            except (OSError, http.client.HTTPException) as exc:
+-                self._drop()
+-                raise urllib.error.URLError(exc) from exc
++            attempt_timeout = self._remaining(timeout)  # exhausted here: no attempt was made, so no timing
++            started = time.monotonic()  # this attempt only: a stale-socket retry restarts the clock
+             try:
+-                raw = resp.read()
+-            except (OSError, http.client.HTTPException) as exc:
+-                self._drop()
+-                raise urllib.error.URLError(exc) from exc
+-            if resp.will_close:
+-                self._drop()
+-            else:
+-                self._local.used = _hub_monotonic()
+-            status = resp.status
+-            if 300 <= status < 400 and method == "GET":  # the Board service sends none; urlopen follows them
+-                return self._call_urlopen(method, path, data, timeout)
+-            if 300 <= status < 400:  # never resend a POST the server may have applied
+-                raise HubError(status, raw.decode("utf-8", "replace")[:500])
+-            if not 200 <= status < 300:
+-                text = raw.decode("utf-8", "replace")[:500]
+-                if status == 410:
+-                    raise Resync(text)
+-                raise HubError(status, text)
+-            return json.loads(raw or b"{}")
++                conn, reused = self._connection(parts, attempt_timeout)
++                try:
++                    conn.request(method, target, body=data, headers=headers)
++                except (OSError, http.client.HTTPException) as exc:
++                    self._drop()
++                    if reused and attempt == 0:  # a stale kept-alive socket: the request never reached the server
++                        continue
++                    raise urllib.error.URLError(exc) from exc
++                try:
++                    resp = conn.getresponse()
++                except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError) as exc:
++                    self._drop()
++                    # Only GET or an explicitly replay-safe operation may repeat after a lost answer.
++                    # Reserve is revision-fenced; other POSTs (ops, leases) must not opt in.
++                    if reused and attempt == 0 and (method == "GET" or replay_safe):
++                        continue
++                    raise urllib.error.URLError(exc) from exc
++                except (OSError, http.client.HTTPException) as exc:
++                    self._drop()
++                    raise urllib.error.URLError(exc) from exc
++                try:
++                    raw = resp.read()
++                except (OSError, http.client.HTTPException) as exc:
++                    self._drop()
++                    raise urllib.error.URLError(exc) from exc
++                if resp.will_close:
++                    self._drop()
++                else:
++                    self._local.used = _hub_monotonic()
++                status = resp.status
++                if 300 <= status < 400 and method == "GET":  # the Board service sends none; urlopen follows them
++                    return self._call_urlopen(method, path, data, timeout)
++                if 300 <= status < 400:  # never resend a POST the server may have applied
++                    raise HubError(status, raw.decode("utf-8", "replace")[:500])
++                if not 200 <= status < 300:
++                    text = raw.decode("utf-8", "replace")[:500]
++                    if status == 410:
++                        raise Resync(text)
++                    raise HubError(status, text)
++                return json.loads(raw or b"{}")
++            except Exception as exc:  # health: allow BLE001 -- stamps diagnostics, then re-raises the same error
++                note_attempt(exc, self.deadline, started, time.monotonic())
++                raise
+         raise AssertionError("unreachable")  # pragma: no cover
+ 
+     def ops(self, board: str, ops: list[dict]) -> dict:
+diff --git a/hermes_cli/kanban_sync_client_attempt.py b/hermes_cli/kanban_sync_client_attempt.py
+new file mode 100644
+index 00000000000..2c0607f10b5
+--- /dev/null
++++ b/hermes_cli/kanban_sync_client_attempt.py
+@@ -0,0 +1,25 @@
++"""Per-HTTP-attempt timing provenance stamped on a failed Board request's exception. [daveey]
++
++Kept apart from ``kanban_sync_client`` (the HTTP client) and ``kanban_queue_reason`` (the reader that rounds and
++records it), so neither imports the other's layer for it.
++"""
++import logging
++from typing import Optional
++
++ATTEMPT_ATTR = "board_attempt"
++
++
++def note_attempt(exc: BaseException, deadline: Optional[float], started: float, ended: float) -> None:
++    """Stamp the FAILED HTTP attempt's raw ``(budget_s, elapsed_s)`` on ``exc`` as optional provenance.
++
++    ``budget_s`` is what the shared monotonic ``deadline`` had left when this attempt ``started`` (``None`` without
++    a deadline) and ``elapsed_s`` is how long that attempt took to fail (``ended - started``). Only those two
++    numbers: never the url, body or message. The innermost attempt wins (a redirect's own attempt is not
++    overwritten by its caller), and stamping never replaces or masks the error being raised. Rounding/clamping for
++    storage belongs to the reader (``kanban_queue_reason.attempt_timing``)."""
++    try:
++        if getattr(exc, ATTEMPT_ATTR, None) is None:
++            budget = None if deadline is None else deadline - started
++            setattr(exc, ATTEMPT_ATTR, (budget, ended - started))
++    except Exception as err:  # health: allow BLE001 -- optional diagnostics must never mask the Board error
++        logging.getLogger(__name__).debug("attempt timing not stamped (%s)", type(err).__name__)
+diff --git a/tests/hermes_cli/test_kanban_pull_attempt_timing.py b/tests/hermes_cli/test_kanban_pull_attempt_timing.py
+new file mode 100644
+index 00000000000..2f8862a4de3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pull_attempt_timing.py
+@@ -0,0 +1,181 @@
++"""Per-attempt timing provenance for the initial feed pull in ``dispatch_tick``.
++
++A live pull timeout fanned out to every origin card as ``stage=pull, transport=timeout`` with no timing, so a
++first page that had the whole shared tick budget and got no answer looked the same as a second page that started
++with only the remainder left after page 1's local apply. The pull's ``board_error`` events carry the same
++allowlisted fields as reserve/repin (``budget_ms`` / ``elapsed_ms``), and they describe the FAILED HTTP ATTEMPT:
++
++* ``budget_ms`` = budget left on the shared deadline when that GET started (not when the outer pull started);
++* ``elapsed_ms`` = how long that GET took to fail (not the outer pull's total time).
++
++Diagnostics only: every origin card still gets its own board_error and comment; no suppression, retry or timeout
++change. Everything runs through a real ``ThreadingHTTPServer``, real ``client.Hub`` HTTP and real
++``client.pull``; only identity, the tick budget (scaled down from 2 s) and a local apply delay are adapted.
++"""
++import json
++import threading
++import time as _time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++CFG = {"worker_pools": {"hub": ["worker-1"]}}
++BUDGET_S = 1.0  # the production 2 s shared tick deadline, scaled down for a quick test
++APPLY_DELAY_S = 0.6  # page 1's local apply spends most of it
++FEED = "/v2/boards/default/changes"
++
++
++def _is_int(value):
++    return type(value) is int
++
++
++def _pull_events(conn, tid):
++    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, qr.EVENT)).fetchall()
++    return [v for v in (json.loads(r[0]) for r in rows) if isinstance(v, dict) and v.get("stage") == "pull"]
++
++
++class _Board:
++    """A real HTTP Board feed. ``pages`` are answered in order; ``None`` = hold the GET past the budget."""
++
++    def __init__(self, pages):
++        self.pages, self.requests, self.release = list(pages), [], threading.Event()
++        board = self
++
++        class Handler(BaseHTTPRequestHandler):
++            protocol_version = "HTTP/1.1"  # keep-alive: page 2 may reuse page 1's socket
++
++            def do_GET(self):
++                board.requests.append(self.path)
++                page = board.pages.pop(0) if board.pages else None
++                if page is None:
++                    board.release.wait(10)  # never answers within the tick budget
++                    self.close_connection = True
++                    return
++                raw = json.dumps(page).encode()
++                self.send_response(200)
++                self.send_header("content-type", "application/json")
++                self.send_header("content-length", str(len(raw)))
++                self.end_headers()
++                self.wfile.write(raw)
++
++            def do_POST(self):  # reserve must not be reached after a failed pull
++                board.requests.append(self.path)
++                self.send_response(500)
++                self.send_header("content-length", "0")
++                self.end_headers()
++
++            def log_message(self, format, *args):  # the base signature
++                pass
++
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++
++    def __enter__(self):
++        self.thread.start()
++        return self
++
++    def __exit__(self, *exc):
++        self.release.set()
++        self.server.shutdown()
++        self.server.server_close()
++        self.thread.join()
++
++    @property
++    def url(self):
++        return f"http://127.0.0.1:{self.server.server_port}"
++
++
++def _arm(monkeypatch, board):
++    for var in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(client, "load_identity", lambda: client.Identity(board.url, "synthetic", "hub"))
++    monkeypatch.setattr(placement, "config", lambda: CFG)
++    monkeypatch.setattr(wp, "DISPATCH_NETWORK_BUDGET_S", BUDGET_S)
++
++
++def _two_origin_cards(conn):
++    cards = sorted([fixtures.acknowledged(conn), fixtures.acknowledged(conn)])
++    return cards, {tid: len(kb.list_comments(conn, tid)) for tid in cards}
++
++
++def _tick(conn):
++    start = _time.monotonic()
++    wp.dispatch_tick(conn)
++    return _time.monotonic() - start
++
++
++def _assert_fanout_unsuppressed(conn, cards, comments):
++    """Every origin card gets its own pull board_error and comment (provenance never suppresses the fanout)."""
++    values = {}
++    for tid in cards:
++        events = _pull_events(conn, tid)
++        assert len(events) == 1, f"{tid}: exactly one pull board_error expected, got {events}"
++        value = qr.latest(conn, tid)
++        assert value is not None, f"{tid}: no queue observation recorded"
++        assert value["code"] == "board_error" and value["current"] is True
++        assert value["stage"] == "pull" and value["transport"] == "timeout" and value["error_class"] == "OSError"
++        assert len(kb.list_comments(conn, tid)) == comments[tid] + 1, f"{tid}: board_error comment missing"
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == "ready"
++        values[tid] = value
++    return values
++
++
++def test_first_page_timeout_records_the_full_attempt_budget(conn, monkeypatch):
++    """Page 1 gets the whole shared budget and no answer: the failed GET's budget is ~the full tick budget and its
++    elapsed time ~that budget (a slow Board, not a starved call)."""
++    cards, comments = _two_origin_cards(conn)
++    with _Board([None]) as board:
++        _arm(monkeypatch, board)
++        took = _tick(conn)
++    assert [p.split("?")[0] for p in board.requests] == [FEED], "the first feed GET must actually reach the Board"
++    assert took < BUDGET_S + 1.0
++    values = _assert_fanout_unsuppressed(conn, cards, comments)
++    full_ms = round(BUDGET_S * 1000)
++    for tid, value in values.items():
++        assert "budget_ms" in value, f"{tid}: failed pull attempt carries no budget_ms: {value}"
++        assert "elapsed_ms" in value, f"{tid}: failed pull attempt carries no elapsed_ms: {value}"
++        assert _is_int(value["budget_ms"]) and full_ms - 150 <= value["budget_ms"] <= full_ms
++        assert _is_int(value["elapsed_ms"]) and value["budget_ms"] - 50 <= value["elapsed_ms"] <= value["budget_ms"] + 300
++
++
++def test_second_page_timeout_records_only_the_budget_left_after_page_one_apply(conn, monkeypatch):
++    """Page 1 answers ``more`` and its local apply spends most of the shared deadline; page 2's GET then gets no
++    answer. The record describes THAT attempt: its starting budget is only the remainder (never the full initial
++    budget the outer pull started with) and its elapsed time is bounded by that remainder (not the whole pull)."""
++    cards, comments = _two_origin_cards(conn)
++    cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++    apply_remote_changes, applied = sync.apply_remote_changes, []
++
++    def slow_apply(*args, **kwargs):
++        applied.append(kwargs.get("new_cursor"))
++        # health: allow HX013 -- local apply work consuming the shared deadline is the tested behavior
++        _time.sleep(APPLY_DELAY_S)
++        return apply_remote_changes(*args, **kwargs)
++
++    monkeypatch.setattr(sync, "apply_remote_changes", slow_apply)
++    with _Board([{"changes": [], "next": cursor + 1, "more": True}, None]) as board:
++        _arm(monkeypatch, board)
++        took = _tick(conn)
++    assert [p.split("?")[0] for p in board.requests] == [FEED, FEED], "page 2 must actually reach the Board"
++    assert f"since={cursor + 1}" in board.requests[1], "page 2 must follow page 1's cursor"
++    assert applied == [cursor + 1], "page 1 must have been applied locally before page 2"
++    assert took < BUDGET_S + 1.0
++    values = _assert_fanout_unsuppressed(conn, cards, comments)
++    remainder_cap_ms = round((BUDGET_S - APPLY_DELAY_S) * 1000)
++    for tid, value in values.items():
++        assert "budget_ms" in value, f"{tid}: failed page-2 attempt carries no budget_ms: {value}"
++        assert "elapsed_ms" in value, f"{tid}: failed page-2 attempt carries no elapsed_ms: {value}"
++        assert _is_int(value["budget_ms"]) and 0 < value["budget_ms"] <= remainder_cap_ms, (
++            f"{tid}: page 2 claimed {value['budget_ms']} ms; only <= {remainder_cap_ms} ms was left")
++        assert _is_int(value["elapsed_ms"]) and value["budget_ms"] - 50 <= value["elapsed_ms"] <= value["budget_ms"] + 300
++        assert value["elapsed_ms"] < round(APPLY_DELAY_S * 1000), "elapsed must be the attempt's, not the outer pull's"
+diff --git a/tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py b/tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py
+new file mode 100644
+index 00000000000..4ef31064f90
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pull_attempt_timing_edges.py
+@@ -0,0 +1,233 @@
++"""Edges of the per-HTTP-attempt timing stamp behind pull ``board_error`` provenance.
++
++``Hub`` stamps a failed attempt's raw ``(budget_s, elapsed_s)`` on the exception it raises (``kanban_sync_client_attempt.ATTEMPT_ATTR``);
++``record_pull_error`` reads it through ``attempt_timing`` with the same bounded rounding/clamping as reserve/repin.
++These tests pin: a stale-socket GET retry describes only the retry; a lost POST answer is still never replayed;
++no attempt (budget exhausted before the retry) means no timing; absent or malformed stamps are omitted and never
++mask the error; timing never makes a new event.
++"""
++import json
++import math
++import socket
++import urllib.error
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_queue_reason as qr
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_client_attempt as attempt
++from tests.hermes_cli import test_kanban_sync_hub_keepalive as keepalive
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++server = keepalive.server
++CAP_MS = 86_400_000
++T0 = 100.0
++
++
++def _deadline_hub(srv, budget_s=2.0):
++    hub = keepalive._hub(srv)
++    hub.deadline = T0 + budget_s
++    return hub
++
++
++def _latest(conn, tid) -> dict:
++    value = qr.latest(conn, tid)
++    assert isinstance(value, dict), f"{tid}: no queue observation recorded"
++    return value
++
++
++def _pull_values(conn, tid):
++    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, qr.EVENT)).fetchall()
++    return [v for v in (json.loads(r[0]) for r in rows) if isinstance(v, dict) and v.get("stage") == "pull"]
++
++
++def _handlers(monkeypatch, method, steps, now):
++    """Each request runs the next step ``(advance_s, action)``; action 'drop' loses the answer, 'status:N' replies."""
++    original, queue = getattr(keepalive._Handler, method), list(steps)
++
++    def serve(handler):
++        if not queue:
++            return original(handler)
++        advance, action = queue.pop(0)
++        n = int(handler.headers.get("content-length") or 0)
++        if n:
++            handler.rfile.read(n)
++        with handler.server.lock:
++            handler.server.requests.append((handler.command, handler.path))
++        now[0] += advance  # the attempt spends this much of the client's (fake) clock
++        if action == "drop":
++            handler.close_connection = True
++            handler.connection.shutdown(socket.SHUT_RDWR)
++            return
++        handler.send_response(int(action.split(":")[1]))
++        handler.send_header("content-length", "0")
++        handler.end_headers()
++
++    monkeypatch.setattr(keepalive._Handler, method, serve)
++
++
++@pytest.fixture
++def boxed_clock(monkeypatch):
++    now = [T0]
++    monkeypatch.setattr(ksc, "time", SimpleNamespace(monotonic=lambda: now[0]))
++    return now
++
++
++@pytest.mark.parametrize("retry", ["drop", "status:503"])
++def test_stale_get_retry_failure_is_timed_from_the_retry_only(conn, server, boxed_clock, monkeypatch, retry):
++    """The reused socket loses page 1's answer after 0.4 s; the GET retry on a fresh socket then fails after
++    0.25 s. The stamp is the retry's: budget = what was left when it started, elapsed = its own duration."""
++    tid = fixtures.acknowledged(conn)
++    hub = _deadline_hub(server)
++    hub.machines()  # warm: the next GET reuses this socket
++    _handlers(monkeypatch, "do_GET", [(0.4, "drop"), (0.25, retry)], boxed_clock)
++    try:
++        with pytest.raises(OSError if retry == "drop" else ksc.HubError) as caught:
++            hub.changes("default", since=0)
++    finally:
++        hub.close()
++    exc = caught.value
++    if retry == "drop":
++        assert isinstance(exc, urllib.error.URLError)  # the urlopen error contract is unchanged
++    assert [m for m, _ in server.requests].count("GET") == 3 and server.connections == 2
++    budget_s, elapsed_s = getattr(exc, attempt.ATTEMPT_ATTR)
++    assert budget_s == pytest.approx(1.6) and elapsed_s == pytest.approx(0.25)
++    qr.record_pull_error(conn, "hub", error=exc)
++    value = _latest(conn, tid)
++    assert value["code"] == "board_error" and value["stage"] == "pull"
++    assert (value["budget_ms"], value["elapsed_ms"]) == (1600, 250)
++
++
++def test_lost_post_answer_is_never_replayed_and_stamps_its_one_attempt(server, boxed_clock, monkeypatch):
++    hub = _deadline_hub(server)
++    hub.machines()
++    _handlers(monkeypatch, "do_POST", [(0.3, "drop")], boxed_clock)
++    try:
++        with pytest.raises(urllib.error.URLError) as caught:
++            hub.ops("default", [{"op": 1}])
++    finally:
++        hub.close()
++    assert [m for m, _ in server.requests].count("POST") == 1
++    budget_s, elapsed_s = getattr(caught.value, attempt.ATTEMPT_ATTR)
++    assert budget_s == pytest.approx(2.0) and elapsed_s == pytest.approx(0.3)
++
++
++def test_budget_exhausted_before_the_retry_records_no_timing(conn, server, boxed_clock, monkeypatch):
++    """No retry attempt was made, so there is no attempt timing to report (unknown is omitted, not guessed)."""
++    tid = fixtures.acknowledged(conn)
++    hub = _deadline_hub(server)
++    hub.machines()
++    _handlers(monkeypatch, "do_GET", [(2.1, "drop")], boxed_clock)
++    try:
++        with pytest.raises(ksc.BoardBudgetExhausted) as caught:
++            hub.changes("default", since=0)
++    finally:
++        hub.close()
++    assert getattr(caught.value, attempt.ATTEMPT_ATTR, None) is None
++    qr.record_pull_error(conn, "hub", error=caught.value)
++    value = _latest(conn, tid)
++    assert value["transport"] == "budget_exhausted"
++    assert not set(qr.TIMING_KEYS) & set(value)
++
++
++def test_no_deadline_stamps_elapsed_only(conn, server, boxed_clock, monkeypatch):
++    tid = fixtures.acknowledged(conn)
++    hub = keepalive._hub(server)  # no shared deadline: budget unknown
++    _handlers(monkeypatch, "do_GET", [(0.125, "status:503")], boxed_clock)
++    try:
++        with pytest.raises(ksc.HubError) as caught:
++            hub.changes("default", since=0)
++    finally:
++        hub.close()
++    assert getattr(caught.value, attempt.ATTEMPT_ATTR)[0] is None
++    qr.record_pull_error(conn, "hub", error=caught.value)
++    value = _latest(conn, tid)
++    assert "budget_ms" not in value and value["elapsed_ms"] == 125 and value["http_status"] == 503
++
++
++def test_urlopen_path_stamps_its_attempt(server, boxed_clock, monkeypatch):
++    monkeypatch.setattr(ksc.Hub, "_proxied", staticmethod(lambda parts: True))
++    hub = _deadline_hub(server)
++    _handlers(monkeypatch, "do_GET", [(0.5, "status:503")], boxed_clock)
++    with pytest.raises(ksc.HubError) as caught:
++        hub.changes("default", since=0)
++    budget_s, elapsed_s = getattr(caught.value, attempt.ATTEMPT_ATTR)
++    assert budget_s == pytest.approx(2.0) and elapsed_s == pytest.approx(0.5)
++
++
++def test_absent_stamp_keeps_existing_pull_records_unchanged(conn):
++    tid = fixtures.acknowledged(conn)
++    qr.record_pull_error(conn, "hub", error=TimeoutError("timed out"))
++    value = _latest(conn, tid)
++    assert value["transport"] == "timeout" and not set(qr.TIMING_KEYS) & set(value)
++    tid2 = fixtures.acknowledged(conn)
++    qr.record_pull_error(conn, "hub", status=503)
++    value = _latest(conn, tid2)
++    assert value["http_status"] == 503 and not set(qr.TIMING_KEYS) & set(value)
++
++
++class _TupleSub(tuple):
++    pass
++
++
++@pytest.mark.parametrize("stamp, expected", [
++    ((math.nan, math.inf), {}),
++    ((-math.inf, math.nan), {}),
++    (("1.0", None), {}),
++    ((True, False), {}),
++    ((10**400, 1j), {}),
++    ([1.0, 2.0], {}),
++    ((1.0,), {}),
++    ((1.0, 2.0, 3.0), {}),
++    ("1.0,2.0", {}),
++    (_TupleSub((1.0, 2.0)), {}),
++    ((math.nan, 0.25), {"elapsed_ms": 250}),
++    ((-5.0, 1e306), {"budget_ms": 0, "elapsed_ms": CAP_MS}),
++    ((0.0004, 0.0006), {"budget_ms": 0, "elapsed_ms": 1}),
++])
++def test_malformed_stamps_are_omitted_and_never_mask_the_error(conn, stamp, expected):
++    tid = fixtures.acknowledged(conn)
++    error = urllib.error.URLError(TimeoutError("timed out"))
++    setattr(error, attempt.ATTEMPT_ATTR, stamp)
++    assert qr.attempt_timing(error) == expected
++    qr.record_pull_error(conn, "hub", error=error)
++    value = _latest(conn, tid)
++    assert value["code"] == "board_error" and value["transport"] == "timeout" and value["error_class"] == "OSError"
++    assert {k: value[k] for k in qr.TIMING_KEYS if k in value} == expected
++
++
++def test_a_raising_stamp_attribute_still_records_the_error(conn):
++    class Hostile(OSError):
++        @property
++        def board_attempt(self):
++            raise RuntimeError("boom")
++
++    tid = fixtures.acknowledged(conn)
++    assert qr.attempt_timing(Hostile()) == {}
++    qr.record_pull_error(conn, "hub", error=Hostile())
++    value = _latest(conn, tid)
++    assert value["code"] == "board_error" and not set(qr.TIMING_KEYS) & set(value)
++
++
++def test_stamping_never_masks_and_the_innermost_attempt_wins():
++    class Frozen(OSError):
++        def __setattr__(self, name, value):
++            raise AttributeError(name)
++
++    frozen = Frozen()
++    assert attempt.note_attempt(frozen, T0 + 1, T0, T0) is None  # swallowed: the caller re-raises the original
++    inner = OSError()
++    attempt.note_attempt(inner, T0 + 2, T0, T0)
++    attempt.note_attempt(inner, T0 + 9, T0, T0 + 1)  # an outer attempt does not overwrite the redirect's own stamp
++    assert getattr(inner, attempt.ATTEMPT_ATTR) == (2.0, 0.0)
++
++
++def test_timing_never_makes_a_new_pull_event(conn):
++    tid = fixtures.acknowledged(conn)
++    for stamp in ((1.0, 1.0), (0.2, 0.2)):
++        error = urllib.error.URLError(TimeoutError("timed out"))
++        setattr(error, attempt.ATTEMPT_ATTR, stamp)
++        qr.record_pull_error(conn, "hub", error=error)
++    assert len(_pull_values(conn, tid)) == 1
+-- 
+2.55.0
+

@@ -1,0 +1,372 @@
+From b572d1bb6d46c47ce79947a27b8929d87c84c0fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 02:21:10 +0000
+Subject: [PATCH] [daveey] Carry wake episodes in synced lifecycle evidence
+
+---
+ hermes_cli/kanban_db.py                       |   5 +-
+ hermes_cli/kanban_db_events.py                |  20 ++++
+ hermes_cli/kanban_wake_check.py               |   3 +
+ hermes_cli/kanban_wake_episode.py             |  78 +++++++++++++
+ .../test_kanban_wake_episode_carry.py         | 110 ++++++++++++++++++
+ .../test_kanban_wake_episode_snapshot.py      |  62 ++++++++++
+ 6 files changed, 275 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_events.py
+ create mode 100644 tests/hermes_cli/test_kanban_wake_episode_carry.py
+ create mode 100644 tests/hermes_cli/test_kanban_wake_episode_snapshot.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 6b65293a92b..f4e0e11e8a5 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1860,9 +1860,8 @@ def _append_event(
+     run_id: Optional[int] = None,
+ ) -> None:
+     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
+-    from hermes_cli.kanban_recovery_history import stamp  # causal recovery evidence (synced boards)
+-    conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)", (
+-        task_id, run_id, kind, _json_or_null(stamp(conn, task_id, kind, payload, run_id)), int(time.time())))
++    from hermes_cli.kanban_db_events import append_event
++    append_event(conn, task_id, kind, payload, run_id=run_id)
+ 
+ 
+ def _end_run(
+diff --git a/hermes_cli/kanban_db_events.py b/hermes_cli/kanban_db_events.py
+new file mode 100644
+index 00000000000..4b1cdb4ea6a
+--- /dev/null
++++ b/hermes_cli/kanban_db_events.py
+@@ -0,0 +1,20 @@
++"""Event append seam: stamp portable recovery and wake-episode evidence atomically."""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++
++def append_event(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict | None = None,
++                 *, run_id: int | None = None) -> None:
++    from hermes_cli.kanban_recovery_history import stamp
++    from hermes_cli import kanban_wake_episode as episode
++
++    payload = episode.snapshot_event(conn, task_id, kind, payload)
++    stamped = stamp(conn, task_id, kind, payload, run_id)
++    cur = conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)", (
++        task_id, run_id, kind, json.dumps(stamped, ensure_ascii=False) if stamped else None, int(time.time())))
++    if payload is not None and "_wake_episode_v1" in payload:
++        assert cur.lastrowid is not None
++        episode.consumed(conn, task_id, cur.lastrowid)
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 7ed813c1088..90be501570a 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -809,8 +809,11 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 or state.get("purpose") == "ask_resolved" or status is None or status[0] != "scheduled"):
+             return None
+         rc_col = rc if isinstance(rc, int) else -1
++        episode.reconcile(conn, task_id)
+         if rc == 0 or (diagnostics and diagnostics.get("first_rc") == 0):
+             episode.reset(conn, task_id)
++            if rc != 0:
++                kb._append_event(conn, task_id, "wake_episode_reset")
+         if rc == 0:
+             return _wake(conn, task_id, CONDITION_MET_EVENT, {
+                 "wake_check": cmd, "output": tail, **({"diagnostics": diagnostics} if diagnostics else {})})
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index b62c2d2b492..95611e7ff37 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -6,6 +6,7 @@ The status trigger covers direct SQL and synced status writers as well as tools.
+ """
+ from __future__ import annotations
+ 
++import json
+ import math
+ import sqlite3
+ from datetime import datetime
+@@ -28,6 +29,79 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
+         AFTER DELETE ON tasks
+         BEGIN DELETE FROM task_wake_episodes WHERE task_id = OLD.id; END""")
+     conn.execute("DELETE FROM task_wake_episodes WHERE task_id NOT IN (SELECT id FROM tasks)")
++    conn.execute("""CREATE TABLE IF NOT EXISTS task_wake_episode_seen (
++        task_id TEXT PRIMARY KEY, event_id INTEGER NOT NULL)""")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_seen_delete AFTER DELETE ON tasks
++        BEGIN DELETE FROM task_wake_episode_seen WHERE task_id = OLD.id; END""")
++
++
++_SNAPSHOT = "_wake_episode_v1"
++_CARRY_EVENTS = frozenset({"scheduled", "continued", "continuation_woken", "wake_episode_started",
++                           "wake_episode_reset", "condition_met"})
++_CORRIDOR = frozenset({"scheduled", "todo", "ready", "running", "review"})
++
++
++def consumed(conn: sqlite3.Connection, task_id: str, event_id: int) -> None:
++    conn.execute("INSERT INTO task_wake_episode_seen VALUES (?, ?) ON CONFLICT(task_id) "
++                 "DO UPDATE SET event_id = excluded.event_id", (task_id, event_id))
++
++
++def reconcile(conn: sqlite3.Connection, task_id: str) -> None:
++    """Consume portable snapshots once, using only this DB's event ids as a cursor."""
++    seen = conn.execute("SELECT event_id FROM task_wake_episode_seen WHERE task_id = ?", (task_id,)).fetchone()
++    row = conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND id > ? "
++                       "AND payload LIKE ? ORDER BY id DESC LIMIT 1",
++                       (task_id, seen[0] if seen else 0, '%"_wake_episode_v1"%')).fetchone()
++    if row is None:
++        return
++    consumed(conn, task_id, row[0])
++    try:
++        payload = json.loads(row[1])
++    except (ValueError, TypeError):
++        return
++    if not isinstance(payload, dict) or _SNAPSHOT not in payload:
++        return
++    data = payload[_SNAPSHOT]
++    if data is not None and not _valid_snapshot(data):
++        return
++    if data is not None:
++        local = conn.execute("SELECT cmd, first_at, checks, last_stale_at FROM task_wake_episodes "
++                             "WHERE task_id = ?", (task_id,)).fetchone()
++        if local and local[0] == data["cmd"] and local[1] == data["first_at"]:
++            data["checks"] = max(local[2], data["checks"])
++            stamps = [stamp for stamp in (local[3], data["last_stale_at"]) if stamp is not None]
++            data["last_stale_at"] = max(stamps) if stamps else None
++    reset(conn, task_id)
++    if data is not None:
++        conn.execute("INSERT INTO task_wake_episodes VALUES (?, ?, ?, ?, ?)",
++                     (task_id, data["cmd"], data["first_at"], data["checks"], data["last_stale_at"]))
++
++
++def _valid_snapshot(data: object) -> bool:
++    return (isinstance(data, dict) and isinstance(data.get("cmd"), str) and bool(data["cmd"])
++            and type(data.get("first_at")) is int and data["first_at"] >= 0
++            and type(data.get("checks")) is int and data["checks"] > 0
++            and "last_stale_at" in data
++            and (data["last_stale_at"] is None or
++                 (type(data["last_stale_at"]) is int and data["last_stale_at"] >= data["first_at"])))
++
++
++def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict | None) -> dict | None:
++    """Carry at existing lifecycle/remote-alive events, never append a per-check journal."""
++    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    outside = status is not None and status[0] not in _CORRIDOR
++    if not outside and kind not in _CARRY_EVENTS and not kind.startswith("wake_"):
++        return payload
++    reconcile(conn, task_id)
++    if outside:
++        reset(conn, task_id)
++    elif kind in {"scheduled", "continued"}:
++        cmd = (payload or {}).get("wake_check")
++        conn.execute("DELETE FROM task_wake_episodes WHERE task_id = ? AND cmd IS NOT ?", (task_id, cmd))
++    row = conn.execute("SELECT cmd, first_at, checks, last_stale_at FROM task_wake_episodes "
++                       "WHERE task_id = ?", (task_id,)).fetchone()
++    data = dict(zip(("cmd", "first_at", "checks", "last_stale_at"), row)) if row else None
++    return {**(payload or {}), _SNAPSHOT: data}
+ 
+ 
+ def reset(conn: sqlite3.Connection, task_id: str) -> None:
+@@ -35,6 +109,7 @@ def reset(conn: sqlite3.Connection, task_id: str) -> None:
+ 
+ 
+ def repark(conn: sqlite3.Connection, task_id: str, cmd: str | None) -> None:
++    reconcile(conn, task_id)
+     conn.execute("DELETE FROM task_wake_episodes WHERE task_id = ? AND cmd IS NOT ?", (task_id, cmd))
+ 
+ 
+@@ -69,6 +144,9 @@ def not_yet(conn: sqlite3.Connection, task_id: str, cmd: str, now: int, interval
+     first, checks, last = conn.execute(
+         "SELECT first_at, checks, last_stale_at FROM task_wake_episodes WHERE task_id = ?", (task_id,)).fetchone()
+ 
++    if checks == 1:
++        from hermes_cli import kanban_db as kb
++        kb._append_event(conn, task_id, "wake_episode_started")
+     if now - first < interval or (last is not None and now - last < interval):
+         return None
+     conn.execute("UPDATE task_wake_episodes SET last_stale_at = ? WHERE task_id = ?", (now, task_id))
+diff --git a/tests/hermes_cli/test_kanban_wake_episode_carry.py b/tests/hermes_cli/test_kanban_wake_episode_carry.py
+new file mode 100644
+index 00000000000..3be4866d76d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_episode_carry.py
+@@ -0,0 +1,110 @@
++"""Episode payload transport, including remapped ids and coalesced status updates."""
++import sqlite3
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_wake_check as wc
++from tests.hermes_cli import test_kanban_wake_episode as base
++
++kanban_home = base.kanban_home
++parked = base.parked
++result = base.result
++repark = base.repark
++HOUR = base.HOUR
++
++
++def replica(conn):
++    other = sqlite3.connect(":memory:", isolation_level=None)
++    other.row_factory = sqlite3.Row
++    conn.backup(other)
++    return other
++
++
++def import_events(source, target, tid):
++    # Transport immutable payloads; intentionally remap local integer ids.
++    known = {tuple(row) for row in target.execute(
++        "SELECT kind, payload, created_at FROM task_events WHERE task_id = ?", (tid,))}
++    for row in source.execute("SELECT kind, payload, created_at FROM task_events WHERE task_id = ?", (tid,)):
++        if tuple(row) in known:
++            continue
++        target.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                       (tid, *row))
++
++
++def test_stale_wake_carries_age_count_and_cooldown(parked):
++    conn, tid, clock = parked
++    other = replica(conn)
++    try:
++        result(parked, 0)
++        assert result(parked, 48) == base.STALE
++        import_events(conn, other, tid)
++        other.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        moved = (other, tid, clock)
++        repark(moved)
++        assert result(moved, 49) is None
++        state = wc.get_state(other, tid)
++        assert state["episode_first_at"] == clock[0]
++        assert state["episode_checks"] == 3
++        assert state["episode_last_stale_at"] == clock[0] + 48 * HOUR
++        assert result(moved, 96) == base.STALE
++    finally:
++        other.close()
++
++
++def test_coalesced_blocked_transition_resets(parked):
++    conn, tid, clock = parked
++    result(parked, 0)
++    other = replica(conn)
++    try:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++            kb._append_event(conn, tid, "blocked", {"reason": "different work"})
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        repark(parked)
++        import_events(conn, other, tid)
++        assert kb.get_task(other, tid).status == "scheduled"
++        assert result((other, tid, clock), 48) is None
++        assert wc.get_state(other, tid)["episode_first_at"] == clock[0] + 48 * HOUR
++    finally:
++        other.close()
++
++
++def test_unconfirmed_success_reset_is_portable(parked):
++    conn, tid, clock = parked
++    result(parked, 0)
++    other = replica(conn)
++    try:
++        state = wc.get_state(conn, tid)
++        wc.apply_result(conn, tid, "exit 1", 2, "", generation=state["generation"],
++                        now=clock[0] + 24 * HOUR, diagnostics={"first_rc": 0})
++        import_events(conn, other, tid)
++        assert result((other, tid, clock), 48) is None
++        assert wc.get_state(other, tid)["episode_first_at"] == clock[0] + 48 * HOUR
++    finally:
++        other.close()
++
++
++def test_clock_wake_carries_exact_count(parked):
++    from hermes_cli.kanban_continuation import wake_due_continuations
++    conn, tid, clock = parked
++    other = replica(conn)
++    try:
++        result(parked, 0)
++        result(parked, 12)
++        assert wake_due_continuations(conn, now=clock[0] + 25 * HOUR) == [tid]
++        import_events(conn, other, tid)
++        other.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        repark((other, tid, clock))
++        assert result((other, tid, clock), 48) == base.STALE
++        assert base.helpers._events(other, tid, base.STALE)[0].payload["checks"] == 3
++    finally:
++        other.close()
++
++
++def test_clean_checks_do_not_append_one_event_each(parked):
++    conn, tid, _ = parked
++    result(parked, 0)
++    count = conn.execute("SELECT count(*) FROM task_events").fetchone()[0]
++    for hour in (1, 2, 3, 4):
++        result(parked, hour)
++    assert conn.execute("SELECT count(*) FROM task_events").fetchone()[0] == count
++    assert wc.get_state(conn, tid)["episode_checks"] == 5
+diff --git a/tests/hermes_cli/test_kanban_wake_episode_snapshot.py b/tests/hermes_cli/test_kanban_wake_episode_snapshot.py
+new file mode 100644
+index 00000000000..38f8b13595d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_episode_snapshot.py
+@@ -0,0 +1,62 @@
++"""Malformed peer evidence must not poison the dispatcher or lifecycle writer."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_wake_check as wc
++from tests.hermes_cli import test_kanban_wake_episode as base
++
++kanban_home = base.kanban_home
++parked = base.parked
++
++
++@pytest.mark.parametrize("raw", [
++    'broken "_wake_episode_v1"',
++    '{"_wake_episode_v1": {"cmd": "exit 1"}}',
++    '{"_wake_episode_v1": false}',
++    '{"meta": {"_wake_episode_v1": null}}',
++    '["_wake_episode_v1"]',
++])
++def test_bad_snapshot_does_not_poison_probe_or_blocked_event(parked, raw):
++    conn, tid, clock = parked
++    base.result(parked, 0)
++    with kb.write_txn(conn):
++        cur = conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                           (tid, "foreign", raw, clock[0]))
++        event_id = cur.lastrowid
++    assert base.result(parked, 1) is None
++    assert wc.get_state(conn, tid)["episode_checks"] == 2
++    assert conn.execute("SELECT event_id FROM task_wake_episode_seen WHERE task_id = ?", (tid,)).fetchone()[0] == event_id
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++        kb._append_event(conn, tid, "blocked")
++
++
++@pytest.mark.parametrize("key,value", [
++    ("cmd", None), ("cmd", ""), ("cmd", 123), ("first_at", -1), ("first_at", True),
++    ("checks", 0), ("checks", "5"), ("checks", False), ("last_stale_at", "later"),
++    ("last_stale_at", -1),
++])
++def test_snapshot_fields_are_validated(parked, key, value):
++    conn, tid, clock = parked
++    base.result(parked, 0)
++    data = {"cmd": "exit 1", "first_at": clock[0], "checks": 1, "last_stale_at": None}
++    data[key] = value
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                     (tid, "foreign", json.dumps({"_wake_episode_v1": data}), clock[0]))
++    assert base.result(parked, 48) == base.STALE
++
++
++def test_older_home_snapshot_cannot_reduce_executor_count(parked):
++    conn, tid, clock = parked
++    base.result(parked, 0)
++    for hour in (1, 2, 3):
++        base.result(parked, hour)
++    data = {"cmd": "exit 1", "first_at": clock[0], "checks": 1, "last_stale_at": None}
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                     (tid, "continuation_woken", json.dumps({"_wake_episode_v1": data}), clock[0]))
++    assert base.result(parked, 4) is None
++    assert wc.get_state(conn, tid)["episode_checks"] == 5
+-- 
+2.55.0
+

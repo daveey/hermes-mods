@@ -1,0 +1,1864 @@
+From 27720df1918ad0d7e48f7fa1ab360bc2cf6be93d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 12:41:22 +0000
+Subject: [PATCH] [daveey] feat(kanban-sync): bounded opt-in sync timing
+ diagnostics
+
+Off unless the installation-root key kanban.sync.diagnostics.timing_until holds a
+finite Unix time at most 600 s ahead. One capture per value, bounded by that time,
+600 s monotonic, config change/read failure, write failure or the 32 MiB file cap.
+
+- hermes_cli/kanban_sync_timing.py: allowlisted numeric/enum JSONL records to
+  <root>/logs/kanban-sync-timing.jsonl (board ordinals, run nonce, pid, seq, boot
+  code identity). Decoded feed change -> claimed at select under the same lock ->
+  matched to that board's own service; failures return to pending with a count.
+  Reporter outer span plus collect/limit/cpu/adv/send (whole private transport).
+  Flush only at the loop's pre-wait boundary, its cost recorded separately.
+  Lost/invalid/diagnostic-error/write-failure/file-cap captures are marked invalid.
+- hermes_cli/kanban_sync_timing_report.py: neutral analyzer (validity, latency,
+  overlap/non-overlap cohorts, overlap residual, failures, censored pending,
+  report components, overhead). No thresholds, no baseline subtraction.
+- Facade calls in kanban_sync_client (FeedWatcher, select, sync_all_once per board,
+  report_due, wait, loop exit) and machine_metrics Reporter spans.
+
+Proof: RED (import + 6 hook tests), GREEN unit + 2 real-loop tests, 86-file area
+suite 1039 passed, scripts/check ok, 44 exact-anchor mutants all killed.
+Tests validate instrumentation only; no live acceptance claimed.
+---
+ hermes_cli/config_runtime_keys.py             |   2 +
+ hermes_cli/kanban_sync_client.py              |  14 +-
+ hermes_cli/kanban_sync_timing.py              | 608 +++++++++++++++
+ hermes_cli/kanban_sync_timing_report.py       | 164 ++++
+ hermes_cli/machine_metrics.py                 |  19 +-
+ tests/hermes_cli/test_kanban_sync_timing.py   | 706 ++++++++++++++++++
+ .../test_kanban_sync_timing_loop.py           | 192 +++++
+ 7 files changed, 1696 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_timing.py
+ create mode 100644 hermes_cli/kanban_sync_timing_report.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_timing.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_timing_loop.py
+
+diff --git a/hermes_cli/config_runtime_keys.py b/hermes_cli/config_runtime_keys.py
+index 0a98c5dd494..ca9f682b493 100644
+--- a/hermes_cli/config_runtime_keys.py
++++ b/hermes_cli/config_runtime_keys.py
+@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
+ CORE_RUNTIME_KEYS: dict[str, str] = {
+     "computer_use.backend": "plugins/computer_use/__init__.py configured_backend_name() (unset = cua)",
+     "dashboard.kanban": "plugins/kanban/dashboard/plugin_api.py (bundled dashboard tab preferences)",
++    "kanban.sync.diagnostics.timing_until": "hermes_cli/kanban_sync_timing.py (installation root; finite Unix "
++                                            "time at most 600 s ahead arms one bounded sync timing capture)",
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 803c2c82d57..814d34fe9ee 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -41,6 +41,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_client_attempt import note_attempt
+ 
+@@ -1049,6 +1050,7 @@ def sync_all_once(hub: Optional[Hub] = None, *,
+     publish_pickup_if_changed(hub)
+     results = []
+     for slug, path in board_paths() if boards is None else boards:
++        mark = sync_timing.board_start(slug, results)
+         try:
+             results.append(sync_board(slug, path, hub, ident.gateway))
+         except SchemaAhead as exc:
+@@ -1057,6 +1059,8 @@ def sync_all_once(hub: Optional[Hub] = None, *,
+         except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable, SyncRoundBusy) as exc:
+             _log.warning("kanban sync: round for %s failed (%s: %s)", slug, type(exc).__name__, exc)
+             results.append(RoundResult(board=slug, mode="?", error=f"{type(exc).__name__}: {exc}"))
++        finally:
++            sync_timing.board_end(mark, results)
+     return results
+ 
+ 
+@@ -1110,7 +1114,7 @@ class FeedWatcher:
+                         if kind in ("changes", "changed", "resync"):
+                             self.frames += 1
+                             if self.on_change is not None:
+-                                self.on_change(self.board)
++                                sync_timing.decoded_change(self.board, self.on_change, kind)
+                             self.wake.set()
+             except Exception as exc:  # health: allow BLE001 -- any socket failure: back off and reconnect; polling covers the gap
+                 if self.on_state is not None:
+@@ -1438,6 +1442,8 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+     except BaseException as exc:
+         runstate.record_down(f"kanban sync loop crashed: {type(exc).__name__}: {exc}")
+         raise
++    finally:
++        sync_timing.stop()
+ 
+ 
+ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], runstate: Any) -> None:
+@@ -1470,7 +1476,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                                       on_state=work.feed_state)
+                 watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
+                 watchers[slug].start()
+-        selected = work.select(boards, time.monotonic(), outbox_pending)
++        selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
+         selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
+         results = sync_all_once(hub, boards=selected)
+         ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
+@@ -1487,12 +1493,12 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+         if time.monotonic() >= next_links:
+             reconcile_links(boards, ident.gateway, skip_unchanged=True)
+             next_links = time.monotonic() + LINKS_EVERY_S
+-        metrics.report_due()
++        sync_timing.report(metrics.report_due)
+         remaining = max(0.0, work.deadline - time.monotonic())
+         deferred_due = next_deferred_repair(boards)
+         if deferred_due is not None:
+             remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+-        wait_for_work(wake, [p for _s, p in boards], remaining, keep_running)
++        sync_timing.wait(wait_for_work, wake, [p for _s, p in boards], remaining, keep_running)
+     runstate.record_down("stopped (gateway stopping, or the host sync lease went to another gateway)")
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_timing.py b/hermes_cli/kanban_sync_timing.py
+new file mode 100644
+index 00000000000..9f05efa8af3
+--- /dev/null
++++ b/hermes_cli/kanban_sync_timing.py
+@@ -0,0 +1,608 @@
++"""Bounded, application-correlated timing diagnostics for the kanban sync loop. Off unless armed.
++
++Arm with the installation-root config key ``kanban.sync.diagnostics.timing_until``: a finite Unix timestamp at most
++:data:`MAX_ACTIVATION_S` ahead when the loop first sees it. Missing, null, non-numeric, non-finite, past or overlong
++values (an overlong value never arms later either) and an unreadable config are off. The loop checks the key at its
++safe boundary (just before it waits for work); one capture ends at the earliest of the configured time, 600 s of
++monotonic time, a changed/removed value, a config read failure, a write failure or the file cap, and the same
++value never arms twice in a process. Off costs one signature-cached config read per loop and creates no file or
++thread.
++
++What is recorded (monotonic ns; wall clock only for provenance/expiry), to ``<root>/logs/kanban-sync-timing.jsonl``:
++- ``chg``: a decoded Board feed change frame, before ``SyncWork.changed`` (the connect-time catch-up is not one).
++- ``sel``: the round's selection, taken under the same lock as the change hook, so every change is either claimed by
++  this round (it was dirty when ``select`` consumed it) or stays pending for a later service, never both.
++- ``loc``: the loop's first observation of a board's pending outbox (not the outbox write time).
++- ``svc``: each board's actual service with the claimed earliest change/local watermark, outcome and error class.
++  A failed or raised service is never a match: its claim returns to pending with a failure count.
++- ``rep``: the metrics report's outer span with collect/limit/cpu/adv/send component spans (send covers the whole
++  private bounded transport, join and timeout included), the result and the sampled window/end only.
++- ``wait`` and ``flush`` spans (flush cost is its own record, written by the next flush); ``pend`` and ``stop``.
++
++Records are allowlisted numbers, booleans and enums (no names, IDs, URLs, keys, messages or paths): boards are
++process-local ordinals. Every record has a sequence number; a full queue, a schema violation, a diagnostic
++exception, a write failure, the file cap or a missing stop marker marks the capture invalid rather than green.
++Nothing here can change sync: product callables run exactly once, outside the diagnostic ``try``.
++"""
++from __future__ import annotations
++
++import json
++import math
++import os
++import random
++import re
++import threading
++import time
++from collections import deque
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++CONFIG_KEY = ("kanban", "sync", "diagnostics", "timing_until")
++LOG_NAME = "kanban-sync-timing.jsonl"
++SCHEMA = 1
++MAX_ACTIVATION_S = 600.0
++QUEUE_MAX = 50_000
++FILE_MAX_BYTES = 32 * 1024 * 1024
++STOP_RESERVE_BYTES = 8192  # always left for the pend + stop records
++PEND_MAX = 32
++COMPLETE_REASONS = frozenset({"expired", "bound", "disabled"})
++SPANS = ("collect", "limit", "cpu", "adv", "send")
++_HEX40 = re.compile(r"[0-9a-f]{40}")
++_ERROR = object()
++
++OUTCOMES = frozenset({"ok", "timeout", "http", "os", "other"})
++ENUMS: dict[str, frozenset] = {
++    "ev": frozenset({"start", "chg", "sel", "loc", "svc", "rep", "wait", "flush", "pend", "stop"}),
++    "kind": frozenset({"changes", "changed", "resync", "other"}),
++    "out": frozenset({"ok", "error", "raised"}),
++    "err": frozenset({"SchemaAhead", "HubError", "Resync", "SyncUnavailable", "SyncRoundBusy", "OSError", "URLError",
++                      "TimeoutError", "BoardBudgetExhausted", "ConnectionError", "ConnectionResetError",
++                      "ConnectionRefusedError", "OperationalError", "DatabaseError", "IntegrityError", "Error",
++                      "other"}),
++    "mode": frozenset({"primary", "replica", "off", "?", "other"}),
++    "res": frozenset({"sent", "not_sent", "none"}),
++    "why": frozenset({"remote", "local", "period", "stopped", "other"}),
++    "reason": frozenset({"expired", "bound", "disabled", "config_error", "write_error", "file_cap", "loop_exit"}),
++    "code_src": frozenset({"boot", "none"}),
++    **{f"{s}_out": OUTCOMES for s in SPANS},
++}
++_INTS = ("seq run pid t t0 t1 wall_ms until_ms deadline_ns schema queue_max file_max b n nb claims local c_first "
++         "c_last c_n c_t l_t fails lk cpu_win_ms cpu_end_ms ovh_ns bytes lost errors flushes flush_ns pend_more")
++FIELDS: dict[str, Any] = {
++    **{k: int for k in _INTS.split()},
++    **{f"{s}_{p}": int for s in SPANS for p in ("t0", "t1", "st")},
++    "loop": bool, "valid": bool, "disk_moved": bool, "code": "hex40",
++    **ENUMS,
++}
++
++
++def log_path(root: Optional[Path] = None) -> Path:
++    if root is None:
++        from hermes_constants import get_default_hermes_root
++        root = Path(get_default_hermes_root())
++    return Path(root) / "logs" / LOG_NAME
++
++
++def _valid_until(value: Any) -> Optional[float]:
++    return float(value) if type(value) in (int, float) and math.isfinite(value) else None
++
++
++def _enum(value: Any, field: str) -> str:
++    return value if value in ENUMS[field] else "other"
++
++
++def _err_class(error: Any) -> str:
++    """``RoundResult.error`` is ``"<Type>: <message>"``: keep only an allowlisted type name."""
++    return _enum(error.split(":", 1)[0].strip(), "err") if isinstance(error, str) else "other"
++
++
++def _outcome(exc: Optional[BaseException]) -> tuple[str, Optional[int]]:
++    if exc is None:
++        return "ok", None
++    if isinstance(exc, TimeoutError):
++        return "timeout", None
++    status = getattr(exc, "status", None)
++    if type(status) is int:
++        return "http", status
++    return ("os" if isinstance(exc, OSError) else "other"), None
++
++
++def _code_identity() -> tuple[Optional[str], str, Optional[bool]]:
++    """The revision this process booted on (recorded by ``hermes_bootstrap``), never the mutable checkout HEAD;
++    ``disk_moved`` says whether the checkout has moved since."""
++    from hermes_cli.git_fingerprint import process_boot_fingerprint, read_git_revision_fingerprint
++    root = Path(__file__).resolve().parent.parent
++    boot = process_boot_fingerprint(root)
++    sha = boot.rsplit(":", 1)[-1] if boot else ""
++    if not _HEX40.fullmatch(sha):
++        return None, "none", None
++    disk = read_git_revision_fingerprint(root)
++    return sha, "boot", (disk != boot) if disk else None
++
++
++class _Mark:
++    """The earliest unserviced change/local watermark of one board."""
++    __slots__ = ("fails", "first", "l_t", "last", "n", "t")
++
++    def __init__(self, first=None, t=None, l_t=None) -> None:
++        self.first, self.last, self.n, self.t, self.l_t, self.fails = first, first, 0 if first is None else 1, t, l_t, 0
++
++    def fields(self) -> dict:
++        out = {"fails": self.fails}
++        if self.first is not None:
++            out.update(c_first=self.first, c_last=self.last, c_n=self.n, c_t=self.t)
++        if self.l_t is not None:
++            out["l_t"] = self.l_t
++        return out
++
++
++def _least(a, b):
++    return b if a is None else a if b is None else min(a, b)
++
++
++def _merge(a: Optional[_Mark], b: Optional[_Mark]) -> Optional[_Mark]:
++    if a is None or b is None:
++        return a if b is None else b
++    out = _Mark(_least(a.first, b.first), _least(a.t, b.t), _least(a.l_t, b.l_t))
++    out.last = max((x for x in (a.last, b.last) if x is not None), default=None)
++    out.n, out.fails = a.n + b.n, max(a.fails, b.fails)
++    return out
++
++
++class _Capture:
++    def __init__(self, until: float, deadline_ns: int, fd: int, run: int) -> None:
++        self.until, self.deadline_ns, self.fd, self.run = until, deadline_ns, fd, run
++        self.seq = self.lost = self.errors = self.bytes = self.flushes = self.flush_ns = self.ovh_ns = 0
++        self.queue: deque = deque()
++        self.pending: dict[int, _Mark] = {}
++        self.claims: dict[int, _Mark] = {}
++        self.write_failed = self.capped = False
++
++
++class _Null:
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *_exc) -> bool:
++        return False
++
++
++_NULL = _Null()
++
++
++class _Span:
++    def __init__(self, diag: TimingDiag, marks: dict, name: str) -> None:
++        self.diag, self.marks, self.name = diag, marks, name
++
++    def __enter__(self):
++        self.t0 = self.diag.clock_ns()
++        return self
++
++    def __exit__(self, _type, exc, _tb) -> bool:
++        t1 = self.diag.clock_ns()
++        try:
++            out, status = _outcome(exc)
++            self.marks.update({f"{self.name}_t0": self.t0, f"{self.name}_t1": t1, f"{self.name}_out": out})
++            if status is not None:
++                self.marks[f"{self.name}_st"] = status
++            self.marks["ovh_ns"] = self.marks.get("ovh_ns", 0) + self.diag.clock_ns() - t1
++        except Exception:  # health: allow BLE001 -- diagnostics must never change the reporter's outcome
++            self.diag._broken()
++        return False
++
++
++class TimingDiag:
++    """Process diagnostic state. One instance (:data:`_DIAG`) serves the sync loop; tests build their own."""
++
++    def __init__(self, *, root: Optional[Path] = None, read_doc: Optional[Callable[[Path], Any]] = None,
++                 clock_ns: Callable[[], int] = time.monotonic_ns, wall: Callable[[], float] = time.time,
++                 code_identity: Optional[Callable[[], tuple]] = None, queue_max: int = QUEUE_MAX,
++                 file_max: int = FILE_MAX_BYTES, write: Callable[[int, bytes], int] = os.write) -> None:
++        self.root, self.read_doc, self.clock_ns, self.wall = root, read_doc, clock_ns, wall
++        self.code_identity, self.queue_max, self.file_max, self.write = code_identity, queue_max, file_max, write
++        self.lock = threading.Lock()
++        self.capture: Optional[_Capture] = None
++        self._consumed: deque = deque(maxlen=64)
++        self._ords: dict[str, int] = {}
++        self._loop: Optional[int] = None
++        self._marks: Optional[dict] = None
++
++    # --- config and lifecycle (sync loop thread, at its safe boundary) ---------------------------------------
++
++    def _read_until(self) -> Any:
++        root = self.root
++        if root is None:
++            from hermes_constants import get_default_hermes_root
++            root = get_default_hermes_root()
++        read = self.read_doc
++        if read is None:
++            from hermes_cli.config_backend import read_config_doc_readonly as read
++        try:
++            node = read(Path(root) / "config.yaml")
++        except FileNotFoundError:
++            return None
++        for key in CONFIG_KEY:
++            if not isinstance(node, dict):
++                return None
++            node = node.get(key)
++        return _valid_until(node)
++
++    def boundary(self) -> None:
++        """Check the config (start/stop a capture) and flush. The loop calls this just before it waits."""
++        try:
++            self._loop = threading.get_ident()
++            try:
++                until = self._read_until()
++            except Exception:  # health: allow BLE001 -- an unreadable config only disables diagnostics
++                until = _ERROR
++            cap = self.capture
++            if cap is not None:
++                reason = self._stop_reason(cap, until)
++                if reason is None:
++                    self._flush(cap)
++                    return
++                self._stop(cap, reason)
++            if until is not _ERROR and until is not None and until not in self._consumed:
++                self._consumed.append(until)
++                remaining = until - self.wall()
++                if 0 < remaining <= MAX_ACTIVATION_S:
++                    self._start(until, remaining)
++        except Exception:  # health: allow BLE001 -- diagnostics must never break the sync loop
++            self._broken()
++
++    def _stop_reason(self, cap: _Capture, until: Any) -> Optional[str]:
++        if until is _ERROR:
++            return "config_error"
++        if until is None or until != cap.until:
++            return "disabled"
++        if self.wall() >= until:
++            return "expired"
++        if self.clock_ns() >= cap.deadline_ns:
++            return "bound"
++        return None
++
++    def _start(self, until: float, remaining: float) -> None:
++        path = log_path(self.root)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        try:
++            if path.stat().st_size >= self.file_max // 2:
++                os.replace(path, path.with_name(path.name + ".1"))
++        except FileNotFoundError:
++            pass
++        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
++        now = self.clock_ns()
++        cap = _Capture(until, now + int(remaining * 1e9), fd, random.SystemRandom().getrandbits(62))
++        cap.bytes = os.fstat(fd).st_size  # earlier captures count against the same file cap
++        try:
++            code, src, moved = (self.code_identity or _code_identity)()
++        except (ImportError, OSError, ValueError):
++            code, src, moved = None, "none", None
++        rec = {"ev": "start", "t": now, "wall_ms": int(self.wall() * 1000), "until_ms": int(until * 1000),
++               "deadline_ns": cap.deadline_ns, "pid": os.getpid(), "run": cap.run, "schema": SCHEMA,
++               "queue_max": self.queue_max, "file_max": self.file_max, "code_src": src}
++        if code is not None:
++            rec["code"] = code
++        if moved is not None:
++            rec["disk_moved"] = moved
++        with self.lock:
++            self.capture = cap
++            self._emit(cap, rec)
++        self._flush(cap)
++
++    def stop(self, reason: str = "loop_exit") -> None:
++        cap = self.capture
++        if cap is not None:
++            try:
++                self._stop(cap, reason)
++            except Exception:  # health: allow BLE001 -- diagnostics must never break the sync loop's exit
++                self._broken()
++
++    # --- record queue and file -------------------------------------------------------------------------------
++
++    def _broken(self) -> None:
++        cap = self.capture
++        if cap is not None:
++            cap.errors += 1
++
++    def _ord(self, board: str) -> int:
++        return self._ords.setdefault(board, len(self._ords))
++
++    def _emit(self, cap: _Capture, rec: dict) -> None:
++        """Caller holds the lock. A full queue still consumes the sequence number: the gap is visible."""
++        rec["seq"] = cap.seq
++        cap.seq += 1
++        if len(cap.queue) >= self.queue_max:
++            cap.lost += 1
++            return
++        cap.queue.append(rec)
++
++    def _encode(self, cap: _Capture, batch) -> list[bytes]:
++        lines = []
++        for rec in batch:
++            if all(_allowed(k, v) for k, v in rec.items()):
++                lines.append(json.dumps(rec, separators=(",", ":")).encode("ascii") + b"\n")
++            else:
++                cap.errors += 1
++                cap.lost += 1
++        return lines
++
++    def _fit(self, cap: _Capture, lines: list[bytes], budget: int) -> bytes:
++        kept, size = [], 0
++        for line in lines:
++            if size + len(line) > budget:
++                cap.lost += len(lines) - len(kept)
++                cap.capped = True
++                break
++            kept.append(line)
++            size += len(line)
++        return b"".join(kept)
++
++    def _write(self, cap: _Capture, data: bytes) -> None:
++        view = memoryview(data)
++        try:
++            while view:
++                view = view[self.write(cap.fd, view):]
++        except OSError:
++            cap.write_failed = True
++        cap.bytes += len(data) - len(view)
++
++    def _flush(self, cap: _Capture) -> None:
++        t0 = self.clock_ns()
++        with self.lock:
++            batch, cap.queue = cap.queue, deque()
++        data = self._fit(cap, self._encode(cap, batch), self.file_max - STOP_RESERVE_BYTES - cap.bytes)
++        if data and not cap.write_failed:
++            self._write(cap, data)
++        if cap.write_failed:
++            cap.lost += len(batch)
++            self._stop(cap, "write_error")
++            return
++        t1 = self.clock_ns()
++        cap.flushes += 1
++        cap.flush_ns += t1 - t0
++        with self.lock:
++            self._emit(cap, {"ev": "flush", "t0": t0, "t1": t1, "n": len(batch), "bytes": len(data)})
++        if cap.capped:
++            self._stop(cap, "file_cap")
++
++    def _stop(self, cap: _Capture, reason: str) -> None:
++        with self.lock:
++            if self.capture is cap:
++                self.capture = None
++            batch, cap.queue = cap.queue, deque()
++            marks = list(cap.pending.items())
++            for board, mark in cap.claims.items():
++                marks.append((board, mark))
++        data = self._fit(cap, self._encode(cap, batch), self.file_max - STOP_RESERVE_BYTES - cap.bytes)
++        tail = []
++        for board, mark in marks[:PEND_MAX]:
++            tail.append({"ev": "pend", "seq": cap.seq, "b": board, **mark.fields()})
++            cap.seq += 1
++        valid = reason in COMPLETE_REASONS and not (cap.lost or cap.errors or cap.write_failed)
++        tail.append({"ev": "stop", "seq": cap.seq, "t": self.clock_ns(), "wall_ms": int(self.wall() * 1000),
++                     "reason": reason, "run": cap.run, "pid": os.getpid(), "lost": cap.lost, "errors": cap.errors,
++                     "flushes": cap.flushes, "flush_ns": cap.flush_ns, "ovh_ns": cap.ovh_ns,
++                     "pend_more": max(0, len(marks) - PEND_MAX), "valid": valid})
++        cap.seq += 1
++        data += b"".join(json.dumps(r, separators=(",", ":")).encode("ascii") + b"\n" for r in tail)
++        if not cap.write_failed:
++            self._write(cap, data)
++        try:
++            os.close(cap.fd)
++        except OSError:
++            pass
++
++    # --- hooks -----------------------------------------------------------------------------------------------
++
++    def decoded_change(self, board: str, callback: Callable[[str], Any], kind: Any) -> Any:
++        """FeedWatcher, for a decoded change frame only: record it, then run ``callback`` under the same lock as
++        the round's selection, so a change is claimed by exactly one selection."""
++        if self.capture is None:
++            return callback(board)
++        t = self.clock_ns()
++        with self.lock:
++            try:
++                self._note_change(board, kind, t)
++            except Exception:  # health: allow BLE001 -- diagnostics must never drop a feed notification
++                self._broken()
++            return callback(board)
++
++    def _note_change(self, board: str, kind: Any, t: int) -> None:
++        cap = self.capture
++        if cap is None:
++            return
++        locked = self.clock_ns()
++        b = self._ord(board)
++        seq = cap.seq
++        self._emit(cap, {"ev": "chg", "b": b, "t": t, "kind": _enum(kind, "kind"), "lk": locked - t})
++        cap.pending[b] = _merge(cap.pending.get(b), _Mark(seq, t))
++        cap.ovh_ns += self.clock_ns() - locked
++
++    def select(self, fn: Callable, boards: list, now: float, pending: Callable[[list], bool]) -> list:
++        """The loop's ``SyncWork.select``: claim each selected board's pending watermark at the moment the round
++        consumes its dirty flag. Later changes stay pending for that board's next service."""
++        cap = self.capture
++        if cap is None or threading.get_ident() != self._loop:
++            return fn(boards, now, pending)
++        seen: list = []
++
++        def observed(paths):
++            got = pending(paths)
++            if got:
++                seen.append((list(paths), self.clock_ns()))
++            return got
++        t0 = self.clock_ns()
++        with self.lock:
++            out = fn(boards, now, observed)
++            t1 = self.clock_ns()
++            try:
++                self._claim(cap, boards, out, seen, t0, t1)
++            except Exception:  # health: allow BLE001 -- diagnostics must never change the selection
++                self._broken()
++        return out
++
++    def _claim(self, cap: _Capture, boards: list, out: list, seen: list, t0: int, t1: int) -> None:
++        if self.capture is not cap:
++            return
++        by_path = {path: slug for slug, path in boards}
++        local = claims = 0
++        for paths, t in seen:
++            if len(paths) == 1 and paths[0] in by_path:
++                b = self._ord(by_path[paths[0]])
++                mark = cap.pending.get(b) or cap.claims.get(b)
++                if mark is None or mark.l_t is None:
++                    cap.pending[b] = _merge(cap.pending.get(b), _Mark(l_t=t))
++                    self._emit(cap, {"ev": "loc", "b": b, "t": t})
++                    local += 1
++        for slug, _path in out:
++            b = self._ord(slug)
++            mark = _merge(cap.claims.pop(b, None), cap.pending.pop(b, None))
++            if mark is not None:
++                cap.claims[b] = mark
++                claims += 1
++        self._emit(cap, {"ev": "sel", "t0": t0, "t1": t1, "n": len(out), "nb": len(boards), "claims": claims,
++                         "local": local})
++        cap.ovh_ns += self.clock_ns() - t1
++
++    def board_start(self, slug: str, results: list) -> Optional[tuple]:
++        cap = self.capture
++        if cap is None:
++            return None
++        try:
++            with self.lock:
++                b = self._ord(slug)
++            return cap, b, len(results), threading.get_ident() == self._loop, self.clock_ns()
++        except Exception:  # health: allow BLE001 -- diagnostics must never stop a board's service
++            self._broken()
++            return None
++
++    def board_end(self, token: Optional[tuple], results: list,
++                  error: Optional[Callable[[Any], Any]] = None) -> None:
++        """After one board's service: ``results`` grew by its RoundResult, or the service raised."""
++        if token is None:
++            return
++        t1 = self.clock_ns()
++        cap, b, before, loop, t0 = token
++        try:
++            rec: dict = {"ev": "svc", "b": b, "t0": t0, "t1": t1, "loop": loop, "out": "raised"}
++            if len(results) > before:
++                result = results[-1]
++                failed = error(result) if error is not None else getattr(result, "error", None)
++                rec["out"] = "error" if failed else "ok"
++                if failed:
++                    rec["err"] = _err_class(failed)
++                if isinstance(getattr(result, "mode", None), str):
++                    rec["mode"] = _enum(result.mode, "mode")
++            with self.lock:
++                if self.capture is not cap:
++                    return
++                mark = cap.claims.pop(b, None) if loop else None
++                if mark is not None:
++                    rec.update(mark.fields())
++                    if rec["out"] != "ok":  # never a match: back to pending, its failure counted
++                        mark.fails += 1
++                        cap.pending[b] = _merge(mark, cap.pending.get(b))
++                self._emit(cap, rec)
++            cap.ovh_ns += self.clock_ns() - t1
++        except Exception:  # health: allow BLE001 -- diagnostics must never break the sync round
++            self._broken()
++
++    def report(self, fn: Callable[[], Any]) -> Any:
++        """The loop's ``Reporter.report_due``: its full outer duration, with the reporter's component spans."""
++        cap = self.capture
++        if cap is None or threading.get_ident() != self._loop:
++            return fn()
++        marks: dict = {}
++        self._marks = marks
++        t0 = self.clock_ns()
++        try:
++            result = fn()
++        except BaseException:
++            self._end_report(cap, marks, t0, "none")
++            raise
++        self._end_report(cap, marks, t0, "sent" if result is True else "not_sent" if result is False else "none")
++        return result
++
++    def _end_report(self, cap: _Capture, marks: dict, t0: int, res: str) -> None:
++        t1 = self.clock_ns()
++        self._marks = None
++        with self.lock:
++            if self.capture is cap:
++                self._emit(cap, {"ev": "rep", "t0": t0, "t1": t1, "res": res, **marks})
++
++    def span(self, name: str):
++        marks = self._marks
++        if marks is None or name not in SPANS or threading.get_ident() != self._loop:
++            return _NULL
++        return _Span(self, marks, name)
++
++    def note_cpu_sample(self, measured: Any) -> None:
++        marks = self._marks
++        if marks is None or not isinstance(measured, dict) or threading.get_ident() != self._loop:
++            return
++        for src, dst in (("cpu_busy_window_ms", "cpu_win_ms"), ("cpu_busy_sample_end_ms", "cpu_end_ms")):
++            if type(measured.get(src)) is int:
++                marks[dst] = measured[src]
++
++    def wait(self, fn: Callable[..., Any], *args: Any) -> Any:
++        """The loop's wait for work. Its start is the loop's safe boundary: config check and flush first."""
++        self.boundary()
++        cap = self.capture
++        if cap is None:
++            return fn(*args)
++        t0 = self.clock_ns()
++        why = fn(*args)
++        t1 = self.clock_ns()
++        with self.lock:
++            if self.capture is cap:
++                self._emit(cap, {"ev": "wait", "t0": t0, "t1": t1, "why": _enum(why, "why")})
++        return why
++
++
++def _allowed(key: str, value: Any) -> bool:
++    kind = FIELDS.get(key)
++    if kind is int or kind is bool:
++        return type(value) is kind
++    if kind == "hex40":
++        return isinstance(value, str) and bool(_HEX40.fullmatch(value))
++    return isinstance(kind, frozenset) and value in kind
++
++
++_DIAG = TimingDiag()
++
++
++# Facade for the sync loop, FeedWatcher, sync_all_once and Reporter: each looks the instance up at call time.
++def decoded_change(board: str, callback: Callable[[str], Any], kind: Any) -> Any:
++    return _DIAG.decoded_change(board, callback, kind)
++
++
++def select(fn: Callable, boards: list, now: float, pending: Callable[[list], bool]) -> list:
++    return _DIAG.select(fn, boards, now, pending)
++
++
++def board_start(slug: str, results: list) -> Optional[tuple]:
++    return _DIAG.board_start(slug, results)
++
++
++def board_end(token: Optional[tuple], results: list) -> None:
++    _DIAG.board_end(token, results)
++
++
++def report(fn: Callable[[], Any]) -> Any:
++    return _DIAG.report(fn)
++
++
++def span(name: str):
++    return _DIAG.span(name)
++
++
++def note_cpu_sample(measured: Any) -> None:
++    _DIAG.note_cpu_sample(measured)
++
++
++def wait(fn: Callable[..., Any], *args: Any) -> Any:
++    return _DIAG.wait(fn, *args)
++
++
++def stop(reason: str = "loop_exit") -> None:
++    _DIAG.stop(reason)
+diff --git a/hermes_cli/kanban_sync_timing_report.py b/hermes_cli/kanban_sync_timing_report.py
+new file mode 100644
+index 00000000000..1037d1a82ed
+--- /dev/null
++++ b/hermes_cli/kanban_sync_timing_report.py
+@@ -0,0 +1,164 @@
++"""Read a ``kanban-sync-timing.jsonl`` capture (``hermes_cli.kanban_sync_timing``) into neutral measurements.
++
++``python -m hermes_cli.kanban_sync_timing_report <file>`` prints one JSON summary per capture. It applies no
++threshold and no baseline: it reports validity (any lost record, sequence gap, diagnostic error, identity change,
++missing stop marker or incomplete stop reason invalidates the capture) and measured distributions only:
++
++- per decoded change served by its own board's successful service: notification-to-service latency, and how much
++  of that interval overlapped measured report spans and diagnostic flush spans; cohorts with and without report
++  overlap, plus the overlap residual (latency minus the measured overlapping report time, the same interval's own
++  measurement, not another route's median); a capture with no overlapping change has coverage ``none``;
++- failed/raised services, changes still unserviced at the stop marker (censored, never dropped);
++- full report durations (due and not-due cohorts), their components and send outcomes;
++- the diagnostic's own flush and hook overhead.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import sys
++from collections import Counter
++from pathlib import Path
++from typing import Any, Iterable
++
++COMPLETE_REASONS = frozenset({"expired", "bound", "disabled"})
++_NS_PER_MS = 1_000_000
++
++
++def load(path: Path) -> list[dict]:
++    out = []
++    for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
++        try:
++            rec = json.loads(line)
++        except ValueError:
++            rec = None
++        out.append(rec if isinstance(rec, dict) else {"ev": "_bad"})
++    return out
++
++
++def captures(records: Iterable[dict]) -> list[list[dict]]:
++    """Split at each ``start`` record; records before the first start form no capture."""
++    caps: list[list[dict]] = []
++    for rec in records:
++        if rec.get("ev") == "start":
++            caps.append([])
++        if caps:
++            caps[-1].append(rec)
++    return caps
++
++
++def validate(cap: list[dict]) -> list[str]:
++    """Reasons this capture cannot serve as evidence; empty means complete and lossless."""
++    problems = []
++    start = cap[0] if cap else {}
++    stop = cap[-1] if cap and cap[-1].get("ev") == "stop" else None
++    if start.get("ev") != "start":
++        problems.append("no_start_marker")
++    if stop is None:
++        problems.append("no_stop_marker")
++    if any(r.get("ev") == "_bad" for r in cap):
++        problems.append("unparseable_line")
++    if [r.get("seq") for r in cap] != list(range(len(cap))):
++        problems.append("sequence_gap")
++    if stop is not None:
++        if stop.get("lost"):
++            problems.append("lost_records")
++        if stop.get("errors"):
++            problems.append("diagnostic_errors")
++        if stop.get("reason") not in COMPLETE_REASONS:
++            problems.append(f"incomplete_{stop.get('reason')}")
++        if (stop.get("run"), stop.get("pid")) != (start.get("run"), start.get("pid")):
++            problems.append("identity_changed")
++        if stop.get("valid") is not True and not problems:
++            problems.append("marked_invalid")
++    return problems
++
++
++def _dist_ms(values_ns: list[int]) -> dict:
++    if not values_ns:
++        return {"n": 0}
++    ms = sorted(v / _NS_PER_MS for v in values_ns)
++
++    def rank(p: int) -> float:  # nearest-rank percentile
++        return ms[max(0, math.ceil(len(ms) * p / 100) - 1)]
++    return {"n": len(ms), "min": ms[0], "p50": rank(50), "p90": rank(90), "max": ms[-1]}
++
++
++def _overlap(a0: int, a1: int, spans: list[tuple[int, int]]) -> int:
++    return sum(max(0, min(a1, s1) - max(a0, s0)) for s0, s1 in spans)
++
++
++def _served(cap: list[dict], report_spans, flush_spans) -> list[dict]:
++    changes = {r["seq"]: r for r in cap if r.get("ev") == "chg"}
++    done: set[int] = set()
++    served = []
++    for svc in cap:
++        if svc.get("ev") != "svc" or svc.get("out") != "ok" or "c_first" not in svc:
++            continue
++        for seq in range(svc["c_first"], svc["c_last"] + 1):
++            chg = changes.get(seq)
++            if chg is None or chg["b"] != svc["b"] or seq in done:
++                continue
++            done.add(seq)
++            served.append({"seq": seq, "b": svc["b"], "latency_ns": svc["t1"] - chg["t"],
++                           "to_start_ns": svc["t0"] - chg["t"], "failed_attempts": svc.get("fails", 0),
++                           "report_overlap_ns": _overlap(chg["t"], svc["t1"], report_spans),
++                           "flush_overlap_ns": _overlap(chg["t"], svc["t1"], flush_spans)})
++    return served
++
++
++def _reports(reps: list[dict]) -> dict:
++    due = [r for r in reps if "collect_t0" in r or "send_t0" in r]
++    parts = {name: _dist_ms([r[f"{name}_t1"] - r[f"{name}_t0"] for r in due if f"{name}_t0" in r])
++             for name in ("collect", "limit", "cpu", "adv", "send")}
++    return {"due": _dist_ms([r["t1"] - r["t0"] for r in due]),
++            "not_due": _dist_ms([r["t1"] - r["t0"] for r in reps if r not in due]),
++            "components": parts,
++            "send_outcomes": dict(Counter(f"{r['send_out']}:{r.get('send_st', '')}" for r in due if "send_out" in r)),
++            "cpu_window_ms": sorted({r["cpu_win_ms"] for r in due if "cpu_win_ms" in r})}
++
++
++def summarize(cap: list[dict]) -> dict[str, Any]:
++    problems = validate(cap)
++    start, stop = cap[0], (cap[-1] if cap[-1].get("ev") == "stop" else {})
++    by = {ev: [r for r in cap if r.get("ev") == ev] for ev in ("rep", "flush", "svc", "pend", "chg", "wait")}
++    report_spans = [(r["t0"], r["t1"]) for r in by["rep"]]
++    flush_spans = [(r["t0"], r["t1"]) for r in by["flush"]]
++    served = _served(cap, report_spans, flush_spans)
++    overlap = [s for s in served if s["report_overlap_ns"] > 0]
++    plain = [s for s in served if s["report_overlap_ns"] == 0]
++    local = [r["t1"] - r["l_t"] for r in by["svc"] if r.get("out") == "ok" and r.get("loop") and "l_t" in r]
++    return {
++        "valid": not problems, "invalid": problems,
++        "identity": {k: start.get(k) for k in ("run", "pid", "code", "code_src", "disk_moved")},
++        "duration_ms": (stop["t"] - start["t"]) / _NS_PER_MS if "t" in stop else None,
++        "stop_reason": stop.get("reason"), "records": len(cap), "lost": stop.get("lost"),
++        "changes": len(by["chg"]), "served": served,
++        "coverage": "overlap" if overlap else "none",
++        "cohorts": {"overlap": _dist_ms([s["latency_ns"] for s in overlap]),
++                    "non_overlap": _dist_ms([s["latency_ns"] for s in plain]),
++                    "overlap_residual_ms": _dist_ms([s["latency_ns"] - s["report_overlap_ns"] for s in overlap]),
++                    "all": _dist_ms([s["latency_ns"] for s in served])},
++        "local_to_service": _dist_ms(local),
++        "service_failures": sum(r.get("out") != "ok" for r in by["svc"]),
++        "unserviced": sum(r.get("c_n", 0) for r in by["pend"]) + (stop.get("pend_more") or 0),
++        "reports": _reports(by["rep"]),
++        "waits": dict(Counter(r.get("why") for r in by["wait"])),
++        "overhead": {"flushes": len(by["flush"]), "flush": _dist_ms([e - s for s, e in flush_spans]),
++                     "flush_ns_total": stop.get("flush_ns"), "hook_ns_total": stop.get("ovh_ns")},
++    }
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("path", type=Path)
++    args = parser.parse_args(argv)
++    summaries = [summarize(cap) for cap in captures(load(args.path))]
++    json.dump(summaries, sys.stdout, indent=2)
++    sys.stdout.write("\n")
++    return 0 if summaries and all(s["valid"] for s in summaries) else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index b54f0f927c7..c4a22cea7cf 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -181,15 +181,21 @@ class Reporter:
+         self.next_at = 0.0
+ 
+     def _sample(self) -> dict:
++        from hermes_cli import kanban_sync_timing as timing
+         from hermes_cli import machine_cpu_metrics as cpu
+-        sample = dict((self.collect_fn or collect)())
+-        state, _limit = (self.cpu_limit_fn or cpu.root_limit)()
++        with timing.span("collect"):
++            sample = dict((self.collect_fn or collect)())
++        with timing.span("limit"):
++            state, _limit = (self.cpu_limit_fn or cpu.root_limit)()
+         if state == cpu.ON:  # only the gated hub pays the ~1 s measurement, taken last: right before sending
+-            measured = (self.cpu_sample_fn or cpu.sample)()
++            with timing.span("cpu"):
++                measured = (self.cpu_sample_fn or cpu.sample)()
++            timing.note_cpu_sample(measured)
+             if measured and all(k in measured for k in cpu.FIELDS):
+                 sample.update({k: measured[k] for k in cpu.FIELDS})
+                 try:
+-                    record_hub_cpu_sample(measured)
++                    with timing.span("adv"):
++                        record_hub_cpu_sample(measured)
+                 except OSError as exc:
+                     _log.debug("hub CPU advisory sample not recorded: %s", exc)
+         return sample
+@@ -200,8 +206,11 @@ class Reporter:
+             return False
+         self.next_at = now + REPORT_EVERY_S
+         try:
++            from hermes_cli import kanban_sync_timing as timing
+             from hermes_cli.machine_drain_metrics import send_compatible
+-            send_compatible(self.send, self._sample())
++            sample = self._sample()
++            with timing.span("send"):  # the whole send: the private bounded transport, its join and its timeout
++                send_compatible(self.send, sample)
+             return True
+         except Exception as exc:  # health: allow BLE001 -- load reporting must never stop kanban sync
+             status = getattr(exc, "status", None)
+diff --git a/tests/hermes_cli/test_kanban_sync_timing.py b/tests/hermes_cli/test_kanban_sync_timing.py
+new file mode 100644
+index 00000000000..cd49c0e1b82
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_timing.py
+@@ -0,0 +1,706 @@
++"""Bounded, application-correlated kanban sync timing diagnostics (``hermes_cli.kanban_sync_timing``).
++
++Fixed before implementation (parent plan TIMING-DIAGNOSTICS-PLAN.md § Tests): off/default/expired/nonfinite/overlong
++config changes nothing and writes nothing; activation is bounded to 600 s; a decoded change is matched to the actual
++service of its own board (changes during a round stay pending, failures never read as a successful match); real
++threaded callbacks race the flush without loss; overflow, file cap and write failure invalidate the capture
++explicitly; records carry no names, URLs or messages.
++"""
++from __future__ import annotations
++
++import json
++import math
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_sync_timing as timing
++from hermes_cli import kanban_sync_timing_report as report
++from hermes_cli.kanban_sync_work import SyncWork
++
++SHA = "0123456789abcdef0123456789abcdef01234567"
++MS = 1_000_000
++
++
++class Clock:
++    """One fake time source: monotonic ns and wall seconds advance together unless a test moves one alone."""
++
++    def __init__(self) -> None:
++        self.ns = 5_000_000_000_000
++        self.wall_s = 1_800_000_000.0
++
++    def __call__(self) -> int:
++        return self.ns
++
++    def wall(self) -> float:
++        return self.wall_s
++
++    def advance_ms(self, ms: float) -> None:
++        self.ns += int(ms * MS)
++        self.wall_s += ms / 1000
++
++
++def _doc(until):
++    return {"kanban": {"sync": {"enabled": True, "diagnostics": {"timing_until": until}}}}
++
++
++class Harness:
++    def __init__(self, tmp_path: Path, until=None, **kw) -> None:
++        self.clock = Clock()
++        self.until = [until]
++        self.raise_on_read: list[BaseException] = []
++        self.root = tmp_path
++
++        def read_doc(path: Path):
++            assert path == tmp_path / "config.yaml"
++            if self.raise_on_read:
++                raise self.raise_on_read[0]
++            return _doc(self.until[0])
++
++        kw.setdefault("code_identity", lambda: (SHA, "boot", False))
++        self.diag = timing.TimingDiag(root=tmp_path, read_doc=read_doc, clock_ns=self.clock,
++                                      wall=self.clock.wall, **kw)
++
++    @property
++    def log(self) -> Path:
++        return timing.log_path(self.root)
++
++    def records(self) -> list[dict]:
++        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
++
++    def arm(self, seconds: float = 300.0) -> None:
++        self.until[0] = self.clock.wall_s + seconds
++        self.diag.boundary()
++        assert self.diag.capture is not None
++
++
++def _exercise_every_hook(diag: timing.TimingDiag) -> list:
++    """Drive each product-facing hook once; return what each wrapped callable returned through the hook."""
++    calls = []
++    boards = [("alpha", Path("alpha.db"))]
++    out = [diag.decoded_change("alpha", lambda b: calls.append(("changed", b)) or "c", "changes")]
++    sentinel = [("alpha", Path("alpha.db"))]
++    out.append(diag.select(lambda bs, now, pending: (calls.append(("select", pending([bs[0][1]]))), sentinel)[1],
++                           boards, 1.0, lambda paths: False))
++    results: list = []
++    token = diag.board_start("alpha", results)
++    results.append("r")
++    diag.board_end(token, results)
++    out.append(diag.report(lambda: calls.append("report") or True))
++    with diag.span("send"):
++        calls.append("span")
++    diag.note_cpu_sample({"cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1})
++    out.append(diag.wait(lambda *a: calls.append(("wait", a)) or "period", "x", 2))
++    diag.stop("loop_exit")
++    return [out, calls]
++
++
++@pytest.mark.parametrize("until", [
++    None, "1800000100", True, math.nan, math.inf, -math.inf, 1_799_999_999.0,  # past
++    1_800_000_000.0 + 600.001,  # overlong: never clamped into a capture
++    {"at": 1}, [1],
++])
++def test_off_or_invalid_config_writes_nothing_and_passes_every_call_through(tmp_path, until):
++    h = Harness(tmp_path, until)
++    threads = threading.active_count()
++    h.diag.boundary()
++    assert h.diag.capture is None
++    got = _exercise_every_hook(h.diag)
++    assert got == [["c", [("alpha", Path("alpha.db"))], True, "period"],
++                   [("changed", "alpha"), ("select", False), "report", "span", ("wait", ("x", 2))]]
++    assert not (tmp_path / "logs").exists()
++    assert threading.active_count() == threads
++
++
++@pytest.mark.parametrize("failure", [FileNotFoundError("absent"), OSError("eio"), ValueError("yaml"),
++                                     RuntimeError("backend")])
++def test_unreadable_config_is_off(tmp_path, failure):
++    h = Harness(tmp_path, 1_800_000_100.0)
++    h.raise_on_read.append(failure)
++    h.diag.boundary()
++    assert h.diag.capture is None
++    _exercise_every_hook(h.diag)
++    assert not (tmp_path / "logs").exists()
++
++
++def test_malformed_config_tree_is_off(tmp_path):
++    h = Harness(tmp_path)
++    h.diag.read_doc = lambda _p: {"kanban": {"sync": "on"}}
++    h.diag.boundary()
++    assert h.diag.capture is None
++    h.diag.read_doc = lambda _p: ["not", "a", "mapping"]
++    h.diag.boundary()
++    assert h.diag.capture is None
++    assert not (tmp_path / "logs").exists()
++
++
++def test_exactly_600_s_arms_and_the_monotonic_bound_stops_it_even_if_wall_time_stalls(tmp_path):
++    h = Harness(tmp_path)
++    h.arm(600.0)
++    start = h.records()[0]
++    assert start["ev"] == "start" and start["code"] == SHA and start["code_src"] == "boot"
++    assert start["deadline_ns"] - start["t"] == 600 * 1_000_000_000
++    h.clock.ns += 599_999 * MS  # wall clock frozen: only the monotonic bound can end this
++    h.diag.boundary()
++    assert h.diag.capture is not None
++    h.clock.ns += 1 * MS
++    h.diag.boundary()
++    assert h.diag.capture is None
++    stop = h.records()[-1]
++    assert stop["ev"] == "stop" and stop["reason"] == "bound" and stop["valid"] is True
++    # The same configured value never re-arms: a finished capture cannot silently restart.
++    h.diag.boundary()
++    assert h.diag.capture is None
++    assert h.records()[-1] == stop
++
++
++def test_overlong_value_never_arms_later_when_it_comes_within_600_s(tmp_path):
++    h = Harness(tmp_path, 1_800_000_000.0 + 700)
++    h.diag.boundary()
++    h.clock.advance_ms(200_000)  # now only 500 s ahead
++    h.diag.boundary()
++    assert h.diag.capture is None
++    assert not (tmp_path / "logs").exists()
++
++
++@pytest.mark.parametrize("change,reason,valid", [
++    ("expire", "expired", True), ("disable", "disabled", True), ("read_error", "config_error", False),
++])
++def test_capture_stops_with_an_explicit_marker(tmp_path, change, reason, valid):
++    h = Harness(tmp_path)
++    h.arm(5.0)
++    if change == "expire":
++        h.clock.advance_ms(5000)
++    elif change == "disable":
++        h.until[0] = None
++    else:
++        h.raise_on_read.append(OSError("eio"))
++    h.diag.boundary()
++    assert h.diag.capture is None
++    stop = h.records()[-1]
++    assert (stop["ev"], stop["reason"], stop["valid"]) == ("stop", reason, valid)
++    size = h.log.stat().st_size
++    _exercise_every_hook(h.diag)  # stopped: every hook is a pass-through again and writes nothing
++    assert h.log.stat().st_size == size
++
++
++def _round(h: Harness, work: SyncWork, boards, outcomes: dict, during: dict | None = None,
++           pending=lambda _paths: False) -> list:
++    """One sync round through the real SyncWork selection: per-board service with ``outcomes[slug]`` in
++    {"ok", "error", "raise"}; ``during[slug]`` runs inside that board's service."""
++    selected = h.diag.select(work.select, boards, h.clock.ns / 1e9, pending)
++    results: list = []
++    for slug, _path in selected:
++        token = h.diag.board_start(slug, results)
++        try:
++            h.clock.advance_ms(50)
++            (during or {}).get(slug, lambda: None)()
++            if outcomes.get(slug, "ok") == "raise":
++                raise RuntimeError("crash")
++            results.append(slug if outcomes.get(slug, "ok") == "ok" else "error")
++        except RuntimeError:
++            pass
++        finally:
++            h.diag.board_end(token, results, error=lambda r: r == "error")
++    for slug, _path in selected:
++        work.finished(slug, outcomes.get(slug, "ok") == "ok")
++    return [s for s, _ in selected]
++
++
++def _change(h: Harness, work: SyncWork, slug: str) -> None:
++    h.diag.decoded_change(slug, work.changed, "changes")
++
++
++def test_decoded_changes_match_their_own_boards_actual_service(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    boards = [("alpha", Path("a.db")), ("beta", Path("b.db"))]
++    for slug, _ in boards:
++        work.feed_state(slug, True)
++    _round(h, work, boards, {})  # first round: the startup recovery audit services every board
++    h.clock.advance_ms(10)
++    _change(h, work, "alpha")  # chg A1, before the round
++    # Round 1: alpha is serviced; A2 arrives during alpha's own service and must stay pending.
++    assert _round(h, work, boards, {}, during={"alpha": lambda: _change(h, work, "alpha")}) == ["alpha"]
++
++    def report_fn():
++        h.clock.advance_ms(300)
++        _change(h, work, "beta")  # B1 during the report
++        h.clock.advance_ms(1200)
++        return True
++    assert h.diag.report(report_fn) is True
++    # Round 2: beta fails, alpha (A2) succeeds; beta's failure keeps B1 pending, alpha never consumes it.
++    assert _round(h, work, boards, {"beta": "error"}) == ["alpha", "beta"]
++    h.clock.advance_ms(5000)  # the poll period re-selects the failed board
++    assert _round(h, work, boards, {}) == ["beta"]
++    h.until[0] = None
++    h.diag.boundary()
++
++    recs = h.records()
++    chg = {r["seq"]: r for r in recs if r["ev"] == "chg"}
++    a1, a2, b1 = sorted(chg)
++    svc = [r for r in recs if r["ev"] == "svc" and "c_first" in r]
++    ords = {chg[a1]["b"], chg[b1]["b"]}
++    assert len(ords) == 2 and chg[a2]["b"] == chg[a1]["b"]
++    alpha, beta = chg[a1]["b"], chg[b1]["b"]
++    assert [(r["b"], r["out"], r["c_first"], r["c_last"], r["c_n"], r["fails"]) for r in svc] == [
++        (alpha, "ok", a1, a1, 1, 0), (alpha, "ok", a2, a2, 1, 0),
++        (beta, "error", b1, b1, 1, 0), (beta, "ok", b1, b1, 1, 1)]
++    summary = report.summarize(report.captures(recs)[0])
++    assert summary["valid"] is True, summary["invalid"]
++    served = {s["seq"]: s for s in summary["served"]}
++    assert set(served) == {a1, a2, b1}
++    # B1 arrived 300 ms into a 1500 ms report: 1200 ms of its latency overlaps the report block. A2 was still
++    # pending (it arrived during round 1's service) for the whole report; A1 was serviced before it began.
++    assert served[b1]["report_overlap_ns"] == 1200 * MS
++    assert served[a2]["report_overlap_ns"] == 1500 * MS
++    assert served[a1]["report_overlap_ns"] == 0
++    assert served[b1]["failed_attempts"] == 1 and served[a2]["failed_attempts"] == 0
++    rep = next(r for r in recs if r["ev"] == "rep")
++    assert rep["t1"] - rep["t0"] == 1500 * MS
++    for seq, svc_rec in ((a1, svc[0]), (a2, svc[1]), (b1, svc[3])):
++        assert served[seq]["latency_ns"] == svc_rec["t1"] - chg[seq]["t"]
++    assert summary["coverage"] == "overlap"
++    assert summary["cohorts"]["overlap"]["n"] == 2 and summary["cohorts"]["non_overlap"]["n"] == 1
++    residuals = sorted((served[s]["latency_ns"] - served[s]["report_overlap_ns"]) / MS for s in (a2, b1))
++    assert summary["cohorts"]["overlap_residual_ms"]["min"] == pytest.approx(residuals[0])
++    assert summary["cohorts"]["overlap_residual_ms"]["max"] == pytest.approx(residuals[1])
++    assert summary["service_failures"] == 1
++
++
++def test_an_interleaved_other_board_change_is_not_served_by_this_boards_claim(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    boards = [("alpha", Path("a.db")), ("beta", Path("b.db"))]
++    for slug, _ in boards:
++        work.feed_state(slug, True)
++    _round(h, work, boards, {})
++    for slug in ("alpha", "beta", "alpha"):
++        _change(h, work, slug)
++    assert _round(h, work, boards, {"beta": "raise"}) == ["alpha", "beta"]
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    a1, b1, a2 = (r["seq"] for r in recs if r["ev"] == "chg")
++    alpha_svc = next(r for r in recs if r["ev"] == "svc" and r.get("out") == "ok" and "c_first" in r)
++    assert (alpha_svc["c_first"], alpha_svc["c_last"], alpha_svc["c_n"]) == (a1, a2, 2)
++    summary = report.summarize(report.captures(recs)[0])
++    assert sorted(s["seq"] for s in summary["served"]) == [a1, a2]
++    assert summary["unserviced"] == 1 and b1 not in {s["seq"] for s in summary["served"]}
++
++
++def test_a_raised_service_is_no_match_and_keeps_the_change_pending_to_the_stop_marker(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    boards = [("alpha", Path("a.db"))]
++    work.feed_state("alpha", True)
++    _round(h, work, boards, {})
++    _change(h, work, "alpha")
++    assert _round(h, work, boards, {"alpha": "raise"}) == ["alpha"]
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    svc = [r for r in recs if r["ev"] == "svc" and "c_first" in r]
++    assert [r["out"] for r in svc] == ["raised"]
++    pend = [r for r in recs if r["ev"] == "pend"]
++    assert len(pend) == 1 and pend[0]["c_n"] == 1 and pend[0]["fails"] == 1
++    summary = report.summarize(report.captures(recs)[0])
++    assert summary["served"] == [] and summary["unserviced"] == 1
++
++
++def test_local_pending_records_first_observation_not_each_poll(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    boards = [("alpha", Path("a.db"))]
++    work.feed_state("alpha", True)
++    _round(h, work, boards, {})
++    h.clock.advance_ms(7)
++    first_seen = h.clock.ns
++    assert _round(h, work, boards, {"alpha": "error"}, pending=lambda paths: True) == ["alpha"]
++    h.clock.advance_ms(7)
++    assert _round(h, work, boards, {}, pending=lambda paths: True) == ["alpha"]
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    assert [r["t"] for r in recs if r["ev"] == "loc"] == [first_seen]
++    svc = [r for r in recs if r["ev"] == "svc" and "l_t" in r]
++    assert [(r["out"], r["l_t"]) for r in svc] == [("error", first_seen), ("ok", first_seen)]
++
++
++def test_service_from_another_thread_is_recorded_but_never_consumes_the_loops_claim(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    boards = [("alpha", Path("a.db"))]
++    work.feed_state("alpha", True)
++    _round(h, work, boards, {})
++    _change(h, work, "alpha")
++    h.diag.select(work.select, boards, h.clock.ns / 1e9, lambda _p: False)
++
++    def other():
++        results: list = []
++        token = h.diag.board_start("alpha", results)
++        results.append("alpha")
++        h.diag.board_end(token, results)
++    t = threading.Thread(target=other)
++    t.start()
++    t.join(10)
++    results: list = []
++    token = h.diag.board_start("alpha", results)
++    results.append("alpha")
++    h.diag.board_end(token, results)
++    h.until[0] = None
++    h.diag.boundary()
++    svc = [r for r in h.records() if r["ev"] == "svc"]
++    assert [(r["loop"], "c_first" in r) for r in svc[-2:]] == [(False, False), (True, True)]
++
++
++def test_threaded_feed_callbacks_race_the_flush_without_loss(tmp_path):
++    h = Harness(tmp_path)
++    h.diag.clock_ns = timing.time.monotonic_ns  # real clock for the race
++    h.arm()
++    work = SyncWork(5.0)
++    per, threads = 400, 4
++    go = threading.Event()
++
++    def feed(slug):
++        go.wait(10)
++        for _ in range(per):
++            h.diag.decoded_change(slug, work.changed, "changed")
++    workers = [threading.Thread(target=feed, args=(f"b{i}",)) for i in range(threads)]
++    for w in workers:
++        w.start()
++    go.set()
++    while any(w.is_alive() for w in workers):
++        h.diag.boundary()  # flushes while callbacks append
++    for w in workers:
++        w.join(10)
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    assert [r["seq"] for r in recs] == list(range(len(recs)))
++    assert sum(r["ev"] == "chg" for r in recs) == per * threads
++    assert recs[-1]["ev"] == "stop" and recs[-1]["lost"] == 0 and recs[-1]["valid"] is True
++    assert any(r["ev"] == "flush" for r in recs)
++    assert report.validate(report.captures(recs)[0]) == []
++
++
++def test_queue_overflow_is_counted_and_invalidates(tmp_path):
++    h = Harness(tmp_path, queue_max=3)
++    h.arm()
++    work = SyncWork(5.0)
++    for _ in range(6):
++        _change(h, work, "alpha")
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    stop = recs[-1]
++    assert stop["lost"] > 0 and stop["valid"] is False
++    problems = report.validate(report.captures(recs)[0])
++    assert "lost_records" in problems and "sequence_gap" in problems
++
++
++def test_file_cap_stops_with_marker_inside_the_cap(tmp_path):
++    cap = timing.STOP_RESERVE_BYTES + 1500
++    h = Harness(tmp_path, file_max=cap)
++    h.arm()
++    work = SyncWork(5.0)
++    for _ in range(200):
++        _change(h, work, "alpha")
++    h.diag.boundary()
++    assert h.diag.capture is None
++    assert h.log.stat().st_size <= cap
++    stop = h.records()[-1]
++    assert (stop["ev"], stop["reason"], stop["valid"]) == ("stop", "file_cap", False)
++    assert stop["lost"] > 0
++
++
++def test_write_failure_stops_capture_without_breaking_sync(tmp_path):
++    writes = []
++
++    def write(fd, data):
++        writes.append(len(data))
++        if len(writes) > 1:  # the start record lands; the next flush hits a full disk
++            raise OSError(28, "No space left on device")
++        return timing.os.write(fd, data)
++    h = Harness(tmp_path, write=write)
++    h.arm()
++    work = SyncWork(5.0)
++    _change(h, work, "alpha")
++    h.diag.boundary()
++    assert h.diag.capture is None
++    got = _exercise_every_hook(h.diag)
++    assert got[0][0] == "c"
++    recs = h.records()
++    assert [r["ev"] for r in recs] == ["start"]
++    assert report.validate(report.captures(recs)[0]) == ["no_stop_marker"]
++
++
++def test_a_failing_diagnostic_never_skips_or_repeats_the_product_call(tmp_path, monkeypatch):
++    h = Harness(tmp_path)
++    h.arm()
++
++    def broken(*_a, **_k):
++        raise KeyError("bug")
++    monkeypatch.setattr(h.diag, "_note_change", broken)
++    calls = []
++    assert h.diag.decoded_change("alpha", lambda b: calls.append(b) or 7, "changes") == 7
++    with pytest.raises(ZeroDivisionError):  # product exceptions still propagate unchanged
++        h.diag.decoded_change("alpha", lambda b: 1 / 0, "changes")
++    assert calls == ["alpha"]
++    h.until[0] = None
++    h.diag.boundary()
++    stop = h.records()[-1]
++    assert stop["errors"] == 2 and stop["valid"] is False
++
++
++def test_records_carry_no_names_urls_or_messages(tmp_path, monkeypatch):
++    from hermes_cli import machine_metrics as mm
++    from hermes_cli.kanban_sync_client import HubError
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: tmp_path)
++    h = Harness(tmp_path)
++    h.arm()
++    monkeypatch.setattr(timing, "_DIAG", h.diag)
++    work = SyncWork(5.0)
++    slug = "secret-board-slug"
++    boards = [(slug, tmp_path / "secret-path.db")]
++    _change(h, work, slug)
++    _round(h, work, boards, {slug: "error"})
++
++    def send(_sample):
++        raise HubError(503, "https://secret.example.invalid/v2 task t_secret key sk-secret")
++    reporter = mm.Reporter(send, collect_fn=lambda: {"cpus": 2}, cpu_limit_fn=lambda: ("off", None))
++    assert h.diag.report(reporter.report_due) is False
++    h.until[0] = None
++    h.diag.boundary()
++    text = h.log.read_text(encoding="utf-8")
++    assert "secret" not in text and str(tmp_path) not in text
++    for rec in h.records():
++        assert set(rec) <= set(timing.FIELDS), rec
++        for key, value in rec.items():
++            assert isinstance(value, (int, bool)) or value in timing.ENUMS.get(key, ()) or (
++                key == "code" and value == SHA), (key, value)
++
++
++def _reporter_case(h: Harness, monkeypatch, send):
++    from hermes_cli import machine_cpu_metrics as cpu
++    from hermes_cli import machine_metrics as mm
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: h.root)
++    monkeypatch.setattr(timing, "_DIAG", h.diag)
++
++    def collect():
++        h.clock.advance_ms(5)
++        return {"cpus": 4}
++
++    def sample():
++        h.clock.advance_ms(1000)
++        return {"cpu_busy_pct": 41.0, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1_800_000_001_000}
++    return mm.Reporter(send, collect_fn=collect, cpu_limit_fn=lambda: (cpu.ON, 50.0), cpu_sample_fn=sample)
++
++
++@pytest.mark.parametrize("failure,outcome,status", [
++    (None, "ok", None), (TimeoutError("budget"), "timeout", None), ("hub", "http", 503),
++    (ConnectionResetError("reset"), "os", None),
++])
++def test_report_record_spans_collect_sample_and_the_whole_send(tmp_path, monkeypatch, failure, outcome, status):
++    from hermes_cli.kanban_sync_client import HubError
++    h = Harness(tmp_path)
++    h.arm()
++    sent = []
++
++    def send(sample):
++        h.clock.advance_ms(400)
++        sent.append(sample)
++        if failure == "hub":
++            raise HubError(503, "down")
++        if failure is not None:
++            raise failure
++        return {}
++    reporter = _reporter_case(h, monkeypatch, send)
++    assert h.diag.report(reporter.report_due) is (failure is None)
++    assert h.diag.report(reporter.report_due) is False  # not due: a quiet report is recorded too
++    h.until[0] = None
++    h.diag.boundary()
++    reps = [r for r in h.records() if r["ev"] == "rep"]
++    assert len(reps) == 2
++    rep, quiet = reps
++    assert rep["res"] == ("sent" if failure is None else "not_sent")
++    assert rep["collect_t1"] - rep["collect_t0"] == 5 * MS
++    assert rep["cpu_t1"] - rep["cpu_t0"] == 1000 * MS
++    assert rep["send_t1"] - rep["send_t0"] == 400 * MS
++    assert rep["send_out"] == outcome and rep.get("send_st") == status
++    assert rep["cpu_win_ms"] == 1000 and rep["cpu_end_ms"] == 1_800_000_001_000
++    assert rep["t1"] - rep["t0"] >= 1405 * MS
++    assert rep["t0"] <= rep["collect_t0"] and rep["send_t1"] <= rep["t1"]
++    assert "send_t0" not in quiet and quiet["res"] == "not_sent"
++    assert len(sent) == 1
++
++
++def test_reporter_outside_a_report_scope_is_unchanged(tmp_path, monkeypatch):
++    h = Harness(tmp_path)
++    h.arm()
++    reporter = _reporter_case(h, monkeypatch, lambda s: {})
++    assert reporter.report_due() is True  # no report() scope: spans are no-ops
++    h.until[0] = None
++    h.diag.boundary()
++    assert not [r for r in h.records() if r["ev"] == "rep"]
++
++
++def test_flush_cost_is_recorded_as_its_own_span_outside_measured_records(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    _change(h, work, "alpha")
++    h.diag.boundary()
++    _change(h, work, "alpha")
++    h.diag.wait(lambda *a: "remote")
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    flushes = [r for r in recs if r["ev"] == "flush"]
++    assert flushes and all(r["n"] >= 1 and r["bytes"] > 0 for r in flushes)
++    waits = [r for r in recs if r["ev"] == "wait"]
++    assert [w["why"] for w in waits] == ["remote"]
++    summary = report.summarize(report.captures(recs)[0])
++    assert summary["overhead"]["flushes"] == len(flushes)
++
++
++def test_analyzer_rejects_restart_and_mixed_identity(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    recs = [json.loads(line) for line in h.log.read_text(encoding="utf-8").splitlines()]
++    # A second start without a stop (process restart): the first capture is incomplete.
++    restarted = recs + [dict(recs[0], pid=recs[0]["pid"] + 1, run=recs[0]["run"] + 1)]
++    caps = report.captures(restarted)
++    assert len(caps) == 2 and "no_stop_marker" in report.validate(caps[0])
++    h.until[0] = None
++    h.diag.boundary()
++    good = h.records()
++    mixed = good[:-1] + [dict(good[-1], run=good[0]["run"] + 1)]
++    assert "identity_changed" in report.validate(report.captures(mixed)[0])
++    assert report.validate(report.captures(good)[0]) == []
++
++
++def test_timing_key_is_a_known_config_key():
++    from hermes_cli.config import _validate_config_key
++    assert _validate_config_key("kanban.sync.diagnostics.timing_until") == (True, None)
++
++
++def test_a_changed_value_ends_the_capture_and_arms_a_new_one(tmp_path):
++    h = Harness(tmp_path)
++    h.arm(30.0)
++    h.until[0] = h.clock.wall_s + 300.0
++    h.diag.boundary()
++    recs = h.records()
++    assert [r["ev"] for r in recs if r["ev"] in ("start", "stop")] == ["start", "stop", "start"]
++    assert next(r for r in recs if r["ev"] == "stop")["reason"] == "disabled"
++    assert h.diag.capture is not None and h.diag.capture.until == h.until[0]
++
++
++def test_off_path_does_no_diagnostic_work(tmp_path):
++    def clock():
++        raise AssertionError("an off hook read the clock")
++    h = Harness(tmp_path)
++    h.diag.clock_ns = clock
++    h.diag.boundary()
++    assert _exercise_every_hook(h.diag)[0] == ["c", [("alpha", Path("alpha.db"))], True, "period"]
++
++
++def test_change_and_selection_are_atomic(tmp_path):
++    """A change whose callback is still running when the round selects is either wholly before the selection
++    (dirty and claimed) or wholly after it (pending and not claimed): the selection waits for the callback."""
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    boards = [("alpha", Path("a.db"))]
++    work.feed_state("alpha", True)
++    _round(h, work, boards, {})
++    entered, release = threading.Event(), threading.Event()
++
++    def slow_changed(board):
++        entered.set()
++        release.wait(10)
++        work.changed(board)
++    feed = threading.Thread(target=h.diag.decoded_change, args=("alpha", slow_changed, "changes"))
++    feed.start()
++    assert entered.wait(10)
++    selected = []
++
++    def loop_round():  # the round runs on its own thread: make that thread the loop's
++        h.diag._loop = threading.get_ident()
++        selected.append(_round(h, work, boards, {}))
++    sel = threading.Thread(target=loop_round)
++    sel.start()
++    sel.join(0.5)
++    assert sel.is_alive(), "the selection must wait for the in-flight change callback"
++    release.set()
++    feed.join(10)
++    sel.join(10)
++    assert selected == [["alpha"]]
++    h.diag._loop = threading.get_ident()
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    change = next(r for r in recs if r["ev"] == "chg")
++    svc = [r for r in recs if r["ev"] == "svc" and "c_first" in r]
++    assert [(r["c_first"], r["out"]) for r in svc] == [(change["seq"], "ok")]
++    assert not [r for r in recs if r["ev"] == "pend"]
++
++
++def test_hooks_off_the_loop_thread_record_no_selection_or_report(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    work = SyncWork(5.0)
++    boards = [("alpha", Path("a.db"))]
++    _change(h, work, "alpha")
++    got = []
++
++    def other():
++        got.append(h.diag.select(work.select, boards, 1.0, lambda _p: False))
++        got.append(h.diag.report(lambda: True))
++    t = threading.Thread(target=other)
++    t.start()
++    t.join(10)
++    assert got == [boards, True]
++
++    def report_fn():
++        def off_thread_span():
++            with h.diag.span("send"):
++                pass
++        side = threading.Thread(target=off_thread_span)
++        side.start()
++        side.join(10)
++        with h.diag.span("bogus"):
++            pass
++        return True
++    assert h.diag.report(report_fn) is True
++    h.until[0] = None
++    h.diag.boundary()
++    recs = h.records()
++    assert not [r for r in recs if r["ev"] == "sel"]
++    reps = [r for r in recs if r["ev"] == "rep"]
++    assert len(reps) == 1 and not any(k.endswith("_t0") and k != "t0" for k in reps[0])
++    assert recs[-1]["valid"] is True and recs[-1]["errors"] == 0
++    # The loop's change was never claimed off-thread: it is still pending at the stop marker.
++    assert [r["c_n"] for r in recs if r["ev"] == "pend"] == [1]
++
++
++def test_a_record_outside_the_allowlist_is_dropped_and_invalidates(tmp_path):
++    h = Harness(tmp_path)
++    h.arm()
++    cap = h.diag.capture
++    with h.diag.lock:
++        h.diag._emit(cap, {"ev": "chg", "b": 0, "t": 1, "slug": "secret-board"})
++        h.diag._emit(cap, {"ev": "chg", "b": 0, "t": "https://secret.invalid"})
++    h.until[0] = None
++    h.diag.boundary()
++    assert "secret" not in h.log.read_text(encoding="utf-8")
++    stop = h.records()[-1]
++    assert (stop["errors"], stop["lost"], stop["valid"]) == (2, 2, False)
+diff --git a/tests/hermes_cli/test_kanban_sync_timing_loop.py b/tests/hermes_cli/test_kanban_sync_timing_loop.py
+new file mode 100644
+index 00000000000..12ba620f9c6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_timing_loop.py
+@@ -0,0 +1,192 @@
++"""The real sync loop, real Reporter and real feed socket under bounded timing diagnostics.
++
++A controlled local Board stand-in (HTTP for the reporter's POST, a WebSocket feed for change frames) delays the
++metrics POST and sends one decoded change frame while that POST is in flight. The capture must show: the full
++reporter cost (collect, the real ~1 s CPU sample and the complete private bounded transport), the decoded change
++inside the send span, and the change matched to its own board's next actual service, after the report returned.
++An off cycle before and after the capture writes nothing. This validates the instrumentation only; it is not a
++live acceptance measurement and it subtracts no baseline.
++"""
++from __future__ import annotations
++
++import json
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_timing as timing
++from hermes_cli import kanban_sync_timing_report as report
++from hermes_cli import machine_metrics as mm
++from tests.waiting import wait_until
++
++pytest.importorskip("websockets")
++
++POST_DELAY_S = 0.4
++
++
++def _config(root: Path, until: float | None) -> None:
++    lines = ["kanban:", "  admission:", "    cpu_busy_below_pct: 50"]
++    if until is not None:
++        lines += ["  sync:", "    diagnostics:", f"      timing_until: {until}"]
++    (root / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++def _records(path: Path) -> list[dict]:
++    if not path.exists():
++        return []
++    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
++
++
++@pytest.mark.platforms("linux")  # the reporter's real CPU busy sample reads /proc/stat
++def test_real_loop_records_full_report_cost_and_matches_a_change_to_its_boards_service(tmp_path, monkeypatch):
++    from websockets.sync.server import serve
++    import hermes_constants
++
++    root = tmp_path / "root"
++    root.mkdir()
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: root)
++    monkeypatch.setattr(timing, "_DIAG", timing.TimingDiag())
++    monkeypatch.setattr(mm, "REPORT_EVERY_S", 3.0)
++    _config(root, None)
++    log = timing.log_path(root)
++
++    stop = threading.Event()
++    in_send = threading.Event()
++    frame_sent = threading.Event()
++    posts: list[dict] = []
++    delay = threading.Event()  # never set: its timed wait is the stand-in's controlled transport delay
++
++    class Board(BaseHTTPRequestHandler):
++        def log_message(self, format, *args):
++            pass
++
++        def do_POST(self):
++            body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
++            if self.path == "/v2/machines/me/metrics":
++                posts.append(body)
++                if timing._DIAG.capture is not None and not in_send.is_set():
++                    in_send.set()
++                    frame_sent.wait(5)
++                delay.wait(POST_DELAY_S)
++            data = b"{}"
++            self.send_response(200)
++            self.send_header("content-type", "application/json")
++            self.send_header("content-length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++    def feed(ws):
++        board = ws.request.path.split("/")[3]
++        if board == "alpha" and in_send.wait(30):
++            ws.send('{"type": "changes", "head": 7}')
++            frame_sent.set()
++        while not stop.is_set():
++            try:
++                ws.recv(timeout=0.2)
++            except TimeoutError:
++                continue
++            except Exception:  # the client closed: this stand-in handler just ends
++                return
++
++    services: list[tuple[str, int]] = []
++
++    def sync_board(slug, path, hub, gateway):
++        services.append((slug, time.monotonic_ns()))
++        return client.RoundResult(board=slug, mode="primary")
++
++    http = ThreadingHTTPServer(("127.0.0.1", 0), Board)
++    threading.Thread(target=http.serve_forever, daemon=True).start()
++    with serve(feed, "127.0.0.1", 0) as ws_server:
++        threading.Thread(target=ws_server.serve_forever, daemon=True).start()
++        ws_port = ws_server.socket.getsockname()[1]
++        boards = [("alpha", tmp_path / "alpha.db"), ("beta", tmp_path / "beta.db")]
++        monkeypatch.setattr(client, "load_identity",
++                            lambda: client.Identity(f"http://127.0.0.1:{http.server_address[1]}", "k", "gw"))
++        monkeypatch.setattr(client, "board_paths", lambda: boards)
++        monkeypatch.setattr(client.sync, "set_lease_client", lambda _c: None)
++        monkeypatch.setattr(client, "publish_pickup_if_changed", lambda _h: None)
++        monkeypatch.setattr(client, "reconcile_links", lambda *a, **k: None)
++        monkeypatch.setattr(client, "outbox_pending", lambda _paths: False)
++        monkeypatch.setattr(client, "sync_board", sync_board)
++        monkeypatch.setattr(client.FeedWatcher, "url", lambda self: f"ws://127.0.0.1:{ws_port}/v2/boards/{self.board}/ws")
++        loop = threading.Thread(target=client.run_forever, args=(lambda: not stop.is_set(),),
++                                kwargs={"interval": 0.3}, daemon=True)
++        loop.start()
++        try:
++            # Off cycle: a real report completes and nothing is written.
++            wait_until(lambda: len(posts) >= 1, timeout=20, what="the first (off) metrics report")
++            assert not log.exists()
++            _config(root, time.time() + 60)
++            wait_until(lambda: any(r["ev"] == "svc" and "c_first" in r for r in _records(log)), timeout=40,
++                       what="the decoded change matched to a board service")
++            _config(root, None)
++            wait_until(lambda: _records(log)[-1]["ev"] == "stop", timeout=20, what="the capture stop marker")
++            frozen = log.read_bytes()
++            seen = len(posts)
++            wait_until(lambda: len(posts) > seen, timeout=20, what="a quiet report after the capture stopped")
++        finally:
++            stop.set()
++            loop.join(15)
++            http.shutdown()
++            ws_server.shutdown()
++    assert not loop.is_alive()
++    assert log.read_bytes() == frozen  # off again: the later loop and report wrote nothing
++
++    recs = _records(log)
++    start, end = recs[0], recs[-1]
++    assert start["ev"] == "start" and start["pid"] > 0
++    assert (end["reason"], end["valid"], end["lost"], end["errors"]) == ("disabled", True, 0, 0)
++    assert [r["seq"] for r in recs] == list(range(len(recs)))
++    chg = [r for r in recs if r["ev"] == "chg"]
++    assert len(chg) == 1, "only the decoded frame counts; the connect-time catch-up call is not a notification"
++    change = chg[0]
++    rep = next(r for r in recs if r["ev"] == "rep" and "send_t0" in r)
++    assert rep["send_t0"] <= change["t"] <= rep["send_t1"], "the frame arrived while the POST was in flight"
++    assert rep["cpu_t1"] - rep["cpu_t0"] >= 1_000_000_000
++    assert rep["send_t1"] - rep["send_t0"] >= int(POST_DELAY_S * 1e9)
++    assert rep["send_out"] == "ok" and rep["res"] == "sent" and rep["cpu_win_ms"] >= 1000
++    assert rep["t1"] - rep["t0"] >= (rep["cpu_t1"] - rep["cpu_t0"]) + (rep["send_t1"] - rep["send_t0"])
++    svc = next(r for r in recs if r["ev"] == "svc" and r.get("c_first") == change["seq"])
++    assert svc["b"] == change["b"] and svc["out"] == "ok" and svc["loop"] is True
++    assert svc["t0"] >= rep["t1"], "the loop serviced the board only after the report returned"
++    assert any(slug == "alpha" and rep["t1"] <= t for slug, t in services)
++    summary = report.summarize(report.captures(recs)[0])
++    assert summary["valid"] is True, summary["invalid"]
++    served = summary["served"]
++    assert len(served) == 1 and served[0]["seq"] == change["seq"]
++    assert served[0]["report_overlap_ns"] == rep["t1"] - change["t"]
++    assert served[0]["latency_ns"] == svc["t1"] - change["t"] >= served[0]["report_overlap_ns"]
++    assert summary["coverage"] == "overlap"
++    assert summary["reports"]["due"]["n"] >= 1
++    assert summary["overhead"]["flushes"] >= 1
++
++
++def test_off_loop_creates_no_diagnostic_file_or_thread(tmp_path, monkeypatch):
++    import hermes_constants
++    root = tmp_path / "root"
++    root.mkdir()
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: root)
++    monkeypatch.setattr(timing, "_DIAG", timing.TimingDiag())
++    _config(root, None)
++    rounds = []
++    names_before = {t.name for t in threading.enumerate()}
++    monkeypatch.setattr(client, "load_identity", lambda: client.Identity("https://example.invalid", "k", "gw"))
++    monkeypatch.setattr(client, "board_paths", list)
++    monkeypatch.setattr(client.sync, "set_lease_client", lambda _c: None)
++    monkeypatch.setattr(client, "publish_pickup_if_changed", lambda _h: None)
++    monkeypatch.setattr(client, "reconcile_links", lambda *a, **k: None)
++    reports = []
++    monkeypatch.setattr(mm, "Reporter", lambda _send: type("R", (), {"report_due": lambda self: reports.append(1)})())
++
++    def wait(*_a):
++        rounds.append(1)
++        return "period"
++    monkeypatch.setattr(client, "wait_for_work", wait)
++    client.run_forever(lambda: len(rounds) < 3, interval=0.1)
++    assert len(reports) == 3
++    assert not (root / "logs").exists()
++    assert {t.name for t in threading.enumerate()} - names_before == set()
+-- 
+2.55.0
+

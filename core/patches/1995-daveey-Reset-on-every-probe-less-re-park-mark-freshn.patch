@@ -1,0 +1,174 @@
+From 1efefda9e6facb5c4f31783d5d7d910801020569 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 05:29:27 +0000
+Subject: [PATCH] [daveey] Reset on every probe-less re-park; mark freshness
+ only on local creation
+
+262ddb7 re-armed the fresh marker after each carried reset, so the next
+probe-less park skipped evidence again and an undelivered foreign episode
+(peer parks a new P after the reset) kept its age/count. A carried reset proves
+nothing about peers afterwards, so the marker is no longer re-armed: every
+probe-less re-park carries an explicit reset.
+
+The marker also came from AFTER INSERT / status-entry triggers on tasks, which
+fire for sync-imported rows and raw status writes. It is now set only by the
+local `created` event (sync never appends it), including triage creation, and
+consumed by the first probe-less park; the old triggers are dropped.
+
+test_repeated_probe_less_park_evidence_is_emitted_once (added by this PR, not
+an original acceptance test) encoded the unsafe skip; it is now
+test_every_probe_less_repark_carries_a_reset.
+
+Proof: new/changed tests in test_kanban_wake_episode_probeless.py
+(every-repark, reset->new foreign P->third park [scheduled, continued],
+sync-imported task, raw corridor entry) 5 RED on 262ddb7, GREEN here.
+Wake episode/check/triage/sync/create files: 65 files, 849 passed, 0 failed
+(--local, retries 0, 4 workers); triage atomic-park cardinality unchanged.
+---
+ hermes_cli/kanban_wake_episode.py             | 27 +++-----
+ .../test_kanban_wake_episode_probeless.py     | 65 ++++++++++++++++++-
+ 2 files changed, 72 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index 2c072e83c04..d3f03f32b90 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -47,17 +47,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = NEW.id; END""")
+     conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_exit_delete AFTER DELETE ON tasks
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = OLD.id; END""")
+-    # Fresh corridor entry (creation, or arrival from outside it): no episode can have
+-    # survived into this corridor, so its first probe-less park has nothing to clear.
+-    # Any later park in the same corridor may follow an undelivered foreign episode.
++    # Fresh local creation: no episode can predate a task this home just created, so
++    # its first probe-less park has nothing to clear. Set only by the local ``created``
++    # event (sync-imported rows never append it); consumed by the first probe-less park.
+     conn.execute("CREATE TABLE IF NOT EXISTS task_wake_episode_fresh (task_id TEXT PRIMARY KEY)")
+-    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_insert AFTER INSERT ON tasks
+-        WHEN NEW.status IN ('scheduled', 'todo', 'ready', 'running', 'review')
+-        BEGIN INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (NEW.id); END""")
+-    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_entry AFTER UPDATE OF status ON tasks
+-        WHEN OLD.status NOT IN ('scheduled', 'todo', 'ready', 'running', 'review')
+-         AND NEW.status IN ('scheduled', 'todo', 'ready', 'running', 'review')
+-        BEGIN INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (NEW.id); END""")
++    conn.execute("DROP TRIGGER IF EXISTS task_wake_episode_fresh_insert")
++    conn.execute("DROP TRIGGER IF EXISTS task_wake_episode_fresh_entry")
+     conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_delete AFTER DELETE ON tasks
+         BEGIN DELETE FROM task_wake_episode_fresh WHERE task_id = OLD.id; END""")
+ 
+@@ -143,6 +138,8 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+     """
+     status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     outside = status is not None and status[0] not in _CORRIDOR
++    if kind == "created":  # local creation only (triage too): sync imports never append it
++        conn.execute("INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (?)", (task_id,))
+     if not outside and kind not in _CARRY_EVENTS and not kind.startswith("wake_"):
+         return payload, None
+     if outside and conn.execute("SELECT 1 FROM task_wake_episode_exit WHERE task_id = ?", (task_id,)).fetchone() \
+@@ -153,19 +150,15 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+         reconcile(conn, task_id)  # judge against every delivered park, then idempotent in _snapshot
+         fresh = conn.execute("DELETE FROM task_wake_episode_fresh WHERE task_id = ?", (task_id,)).rowcount > 0
+         if fresh and not _probe_known(conn, task_id):
+-            # Fresh corridor entry or explicit reset already carried, no probe delivered
+-            # since: nothing to clear, so no evidence (keeps atomic park event contracts).
+-            # Otherwise the home's state is unknown: a later park may follow an
+-            # undelivered foreign episode, so it carries the reset below.
++            # First park after local creation, no probe delivered: nothing to clear, so
++            # no evidence (keeps atomic park event contracts). Every later park may
++            # follow an undelivered foreign episode, so it carries the reset below.
+             return payload, None
+         reset(conn, task_id)  # home state may be unknown: make the clear an explicit reset barrier
+     snapshot = _snapshot(conn, task_id, kind, payload, outside)
+     separate = probe_less or (
+         outside and kind not in _CARRY_EVENTS and kind not in _EXIT_EVENTS and not kind.startswith("wake_"))
+     if separate:
+-        if probe_less:
+-            # This evidence is an explicit reset: the next probe-less park repeats it.
+-            conn.execute("INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (?)", (task_id,))
+         return payload, snapshot
+     return {**(payload or {}), **snapshot}, None
+ 
+diff --git a/tests/hermes_cli/test_kanban_wake_episode_probeless.py b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+index 355c16df16d..b2b3958d0a2 100644
+--- a/tests/hermes_cli/test_kanban_wake_episode_probeless.py
++++ b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+@@ -41,10 +41,11 @@ def test_never_probed_park_adds_no_evidence(kanban_home):
+         assert [k for k in _kinds(conn, tid)[before:] if k != "commented"] == ["scheduled"]
+ 
+ 
+-def test_repeated_probe_less_park_evidence_is_emitted_once(parked):
++def test_every_probe_less_repark_carries_a_reset(parked):
+     conn, tid, _ = parked
+-    assert _park_without_probe(conn, tid) == [episode.EVIDENCE_EVENT, "scheduled"]
+-    assert _park_without_probe(conn, tid) == ["scheduled"]  # cleared probe already carried
++    # A carried reset proves nothing about peers afterwards: each re-park repeats it.
++    for _ in range(3):
++        assert _park_without_probe(conn, tid) == [episode.EVIDENCE_EVENT, "scheduled"]
+ 
+ 
+ def test_local_episode_without_probe_record_still_carries_evidence(parked):
+@@ -136,3 +137,61 @@ def test_in_corridor_park_resets_undelivered_foreign_episode(kanban_home, kind):
+             assert tuple(_peer_episode(peer, tid, t1)) == (t1, 1)  # same probe: old age/count gone
+         finally:
+             peer.close()
++
++
++def _park(conn, tid, kind):
++    if conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] != "running":
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++    before = len(_kinds(conn, tid))
++    if kind == "scheduled":
++        assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
++    else:
++        kb._append_event(conn, tid, "continued", {"reason": "soak"})
++    return [k for k in _kinds(conn, tid)[before:] if k not in {"claimed", "commented"}]
++
++
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_park_after_explicit_reset_resets_new_undelivered_foreign_episode(kanban_home, kind):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        assert _park(conn, tid, kind) == [kind]  # fresh local creation
++        peer = carry.replica(conn)
++        try:
++            t0 = int(time.time())
++            assert tuple(_peer_episode(peer, tid, t0)) == (t0, 1)  # undelivered to home
++            assert _park(conn, tid, kind) == [episode.EVIDENCE_EVENT, kind]  # explicit reset
++            carry.import_events(conn, peer, tid)
++            episode.reconcile(peer, tid)
++            t1 = t0 + 3600
++            assert tuple(_peer_episode(peer, tid, t1)) == (t1, 1)  # new foreign P, still undelivered
++            assert _park(conn, tid, kind) == [episode.EVIDENCE_EVENT, kind]  # third park: reset again
++            assert _episode(peer, tid)
++            carry.import_events(conn, peer, tid)
++            episode.reconcile(peer, tid)
++            # The second foreign episode's age/count are gone too (a further peer park here
++            # would trip the unrelated park-cycle guard, so read the episode row directly).
++            assert peer.execute("SELECT 1 FROM task_wake_episodes WHERE task_id = ?", (tid,)).fetchone() is None
++        finally:
++            peer.close()
++
++
++def test_sync_imported_task_is_not_fresh(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        conn.execute("DELETE FROM task_wake_episode_fresh WHERE task_id = ?", (tid,))
++        row = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
++        conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++        conn.execute(f"INSERT INTO tasks ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
++                     tuple(row.values()))  # raw row insert, as sync import does: no local 'created'
++        assert conn.execute("SELECT 1 FROM task_wake_episode_fresh WHERE task_id = ?", (tid,)).fetchone() is None
++        assert _park(conn, tid, "scheduled") == [episode.EVIDENCE_EVENT, "scheduled"]
++
++
++def test_sync_imported_corridor_entry_is_not_fresh(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        conn.execute("DELETE FROM task_wake_episode_fresh WHERE task_id = ?", (tid,))
++        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))  # raw status write
++        assert _park(conn, tid, "continued") == [episode.EVIDENCE_EVENT, "continued"]
+-- 
+2.55.0
+

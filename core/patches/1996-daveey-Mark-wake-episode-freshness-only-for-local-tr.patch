@@ -1,0 +1,209 @@
+From d146b1513b5848afb8a5e41420a85d477d44d4c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 05:54:18 +0000
+Subject: [PATCH] [daveey] Mark wake-episode freshness only for local triage
+ cards
+
+d02605e skipped the first probe-less park's evidence for ANY locally created
+card. A runnable card can reach a peer and be parked on a probe P there before
+this home's first park; that park then carried no reset and the undelivered
+foreign episode kept its age/count after delayed sync.
+
+Freshness is now set only by the local 'created' event of a triage card (not
+runnable, so no peer can have parked it first) and dropped by any status
+transition except a direct triage -> scheduled park (including raw/synced
+remote transitions, via a status trigger), by a probe park, and by the first
+probe-less park. Runnable created cards are never fresh.
+
+test_never_probed_park_adds_no_evidence and the 'fresh entry'/'fresh local
+creation' first-park assertions (added by this PR, not original acceptance)
+encoded the unsafe skip for runnable cards; they now expect the reset.
+Triage-park atomic cardinality (test_kanban_triage_park.py, six cases: direct
+triage -> scheduled appends one event) is unchanged.
+
+Proof: test_kanban_wake_episode_probeless.py on d02605 prod code: 13 FAILED,
+7 passed (new RED: created card -> foreign undelivered P -> first home no-probe
+park [scheduled, continued], plus no-status-write continued, triage exits, probe
+park); GREEN here 20/20. Broad wake episode/check/triage/sync/create set: 65
+files, 858 passed, 0 failed (retries 0). Mutations: 7/7 killed
+(mut-triage-fresh.log).
+---
+ hermes_cli/kanban_wake_episode.py             | 18 +++-
+ .../test_kanban_wake_episode_probeless.py     | 95 ++++++++++++++++++-
+ 2 files changed, 105 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index d3f03f32b90..d655ccaf807 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -47,12 +47,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = NEW.id; END""")
+     conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_exit_delete AFTER DELETE ON tasks
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = OLD.id; END""")
+-    # Fresh local creation: no episode can predate a task this home just created, so
+-    # its first probe-less park has nothing to clear. Set only by the local ``created``
+-    # event (sync-imported rows never append it); consumed by the first probe-less park.
++    # Fresh local triage creation: a triage card is not runnable, so no peer can have
++    # parked it on a probe before this home's direct triage -> scheduled park, which then
++    # has nothing to clear. Set only by the local ``created`` event of a triage card
++    # (sync-imported rows never append it; a runnable card may reach a peer and be parked
++    # there first). Any other status transition, a probe park, or the first probe-less
++    # park drops it.
+     conn.execute("CREATE TABLE IF NOT EXISTS task_wake_episode_fresh (task_id TEXT PRIMARY KEY)")
+     conn.execute("DROP TRIGGER IF EXISTS task_wake_episode_fresh_insert")
+     conn.execute("DROP TRIGGER IF EXISTS task_wake_episode_fresh_entry")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_transition AFTER UPDATE OF status ON tasks
++        WHEN NOT (OLD.status = 'triage' AND NEW.status = 'scheduled')
++        BEGIN DELETE FROM task_wake_episode_fresh WHERE task_id = NEW.id; END""")
+     conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_delete AFTER DELETE ON tasks
+         BEGIN DELETE FROM task_wake_episode_fresh WHERE task_id = OLD.id; END""")
+ 
+@@ -138,8 +144,10 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+     """
+     status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     outside = status is not None and status[0] not in _CORRIDOR
+-    if kind == "created":  # local creation only (triage too): sync imports never append it
++    if kind == "created" and status is not None and status[0] == "triage":  # local triage creation only
+         conn.execute("INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (?)", (task_id,))
++    if kind in {"scheduled", "continued"} and (payload or {}).get("wake_check"):
++        conn.execute("DELETE FROM task_wake_episode_fresh WHERE task_id = ?", (task_id,))  # probe park
+     if not outside and kind not in _CARRY_EVENTS and not kind.startswith("wake_"):
+         return payload, None
+     if outside and conn.execute("SELECT 1 FROM task_wake_episode_exit WHERE task_id = ?", (task_id,)).fetchone() \
+@@ -150,7 +158,7 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+         reconcile(conn, task_id)  # judge against every delivered park, then idempotent in _snapshot
+         fresh = conn.execute("DELETE FROM task_wake_episode_fresh WHERE task_id = ?", (task_id,)).rowcount > 0
+         if fresh and not _probe_known(conn, task_id):
+-            # First park after local creation, no probe delivered: nothing to clear, so
++            # Direct park of a locally created triage card, no probe delivered: nothing to clear, so
+             # no evidence (keeps atomic park event contracts). Every later park may
+             # follow an undelivered foreign episode, so it carries the reset below.
+             return payload, None
+diff --git a/tests/hermes_cli/test_kanban_wake_episode_probeless.py b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+index b2b3958d0a2..d74b6296ab6 100644
+--- a/tests/hermes_cli/test_kanban_wake_episode_probeless.py
++++ b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+@@ -33,12 +33,101 @@ def _episode(conn, tid):
+     return conn.execute("SELECT cmd FROM task_wake_episodes WHERE task_id = ?", (tid,)).fetchone()
+ 
+ 
+-def test_never_probed_park_adds_no_evidence(kanban_home):
++def test_first_park_of_created_runnable_card_carries_a_reset(kanban_home):
++    # A runnable card may reach a peer and be parked on a probe there before this home's
++    # first park, so local creation alone proves nothing: the first park carries a reset.
+     with kbc.connect_closing() as conn:
+         tid = helpers._running(conn)
+         before = len(_kinds(conn, tid))
+         assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
++        assert [k for k in _kinds(conn, tid)[before:] if k != "commented"] == [episode.EVIDENCE_EVENT, "scheduled"]
++
++
++def _triage(conn):
++    tid = kb.create_task(conn, title="t", assignee="worker", triage=True)
++    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "triage"
++    return tid
++
++
++def test_direct_triage_park_of_local_triage_card_adds_no_evidence(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _triage(conn)
++        before = len(_kinds(conn, tid))
++        assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
+         assert [k for k in _kinds(conn, tid)[before:] if k != "commented"] == ["scheduled"]
++        assert _park(conn, tid, "scheduled") == [episode.EVIDENCE_EVENT, "scheduled"]  # marker consumed
++
++
++@pytest.mark.parametrize("route", [("todo", "ready"), ("blocked",)])
++def test_triage_card_leaving_triage_otherwise_is_not_fresh(kanban_home, route):
++    # Raw status writes, as a synced remote transition applies them.
++    with kbc.connect_closing() as conn:
++        tid = _triage(conn)
++        for status in route:
++            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++        assert _park(conn, tid, "scheduled") == [episode.EVIDENCE_EVENT, "scheduled"]
++
++
++@pytest.mark.parametrize("status", ["running", "ready"])
++def test_triage_card_entering_corridor_is_not_fresh_without_a_further_transition(kanban_home, status):
++    # One synced remote transition out of triage, then a park with no further status write.
++    with kbc.connect_closing() as conn:
++        tid = _triage(conn)
++        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++        before = len(_kinds(conn, tid))
++        kb._append_event(conn, tid, "continued", {"reason": "soak"})
++        assert _kinds(conn, tid)[before:] == [episode.EVIDENCE_EVENT, "continued"]
++
++
++def test_created_runnable_card_first_park_without_status_write_resets_foreign_episode(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")  # no home status write before its park
++        assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] in episode._CORRIDOR
++        peer = carry.replica(conn)
++        try:
++            t0 = int(time.time())
++            assert tuple(_peer_episode(peer, tid, t0)) == (t0, 1)  # foreign P, never delivered to home
++            before = len(_kinds(conn, tid))
++            kb._append_event(conn, tid, "continued", {"reason": "soak"})
++            assert _kinds(conn, tid)[before:] == [episode.EVIDENCE_EVENT, "continued"]
++            carry.import_events(conn, peer, tid)
++            episode.reconcile(peer, tid)
++            assert _episode(peer, tid) is None
++        finally:
++            peer.close()
++
++
++def test_probe_park_of_triage_card_drops_freshness(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _triage(conn)
++        assert kb.schedule_task(conn, tid, reason="waiting", wake_check="exit 1")  # direct triage park, probe P
++        peer = carry.replica(conn)
++        try:
++            assert _park(peer, tid, "scheduled") == [episode.EVIDENCE_EVENT, "scheduled"]  # peer clears P
++            carry.import_events(peer, conn, tid)  # delivered; the peer's status write is still delayed
++            before = len(_kinds(conn, tid))
++            kb._append_event(conn, tid, "continued", {"reason": "soak"})
++            assert _kinds(conn, tid)[before:] == [episode.EVIDENCE_EVENT, "continued"]
++        finally:
++            peer.close()
++
++
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_first_home_park_resets_undelivered_foreign_episode_on_created_card(kanban_home, kind):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)  # created here, runnable: the peer receives it
++        peer = carry.replica(conn)
++        try:
++            t0 = int(time.time())
++            assert tuple(_peer_episode(peer, tid, t0)) == (t0, 1)  # foreign P, never delivered to home
++            assert _park(conn, tid, kind) == [episode.EVIDENCE_EVENT, kind]  # home's first, no-probe park
++            carry.import_events(conn, peer, tid)
++            episode.reconcile(peer, tid)
++            assert _episode(peer, tid) is None
++            t1 = t0 + 3600
++            assert tuple(_peer_episode(peer, tid, t1)) == (t1, 1)  # same probe: old age/count gone
++        finally:
++            peer.close()
+ 
+ 
+ def test_every_probe_less_repark_carries_a_reset(parked):
+@@ -117,7 +206,7 @@ def test_in_corridor_park_resets_undelivered_foreign_episode(kanban_home, kind):
+         tid = helpers._running(conn)
+         before = len(_kinds(conn, tid))
+         assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
+-        assert [k for k in _kinds(conn, tid)[before:] if k != "commented"] == ["scheduled"]  # fresh entry
++        assert [k for k in _kinds(conn, tid)[before:] if k != "commented"] == [episode.EVIDENCE_EVENT, "scheduled"]
+         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+         assert kb.claim_task(conn, tid, claimer="worker") is not None
+         peer = carry.replica(conn)
+@@ -155,7 +244,7 @@ def _park(conn, tid, kind):
+ def test_park_after_explicit_reset_resets_new_undelivered_foreign_episode(kanban_home, kind):
+     with kbc.connect_closing() as conn:
+         tid = helpers._running(conn)
+-        assert _park(conn, tid, kind) == [kind]  # fresh local creation
++        assert _park(conn, tid, kind) == [episode.EVIDENCE_EVENT, kind]  # runnable card: never fresh
+         peer = carry.replica(conn)
+         try:
+             t0 = int(time.time())
+-- 
+2.55.0
+

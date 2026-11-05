@@ -1,0 +1,314 @@
+From 5fdff78536d9948ae9c23f2fba32d69519cfd4db Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 10:02:25 +0000
+Subject: [PATCH] fix(process): background notices flag `; echo EXIT=$?` masked
+ failures [daveey]
+
+A background `hermes chat -q ... > log 2>&1; echo EXIT=$?` printed EXIT=1, but the
+shell's exit code was echo's 0 and the completion notice said "completed normally
+(exit code 0)" (self-heal defect agent-1e03ea6be2).
+
+Why: the notice text came from the exit code alone; the masked-success check that
+foreground terminal results run (terminal_hints.annotate_masked_success) never ran
+for background notices, and it only knew `| tail` / `|| echo` shapes with no rule for
+a printed status line.
+
+- terminal_hints: status-echo wrapper shape (trailing `; echo|printf ...$?`) paired
+  with the LAST whole-line printed status in the output tail (EXIT=1, rc=1, exit
+  code: 3, STATUS=127; nonzero only; read-only heads still excluded); `; true` /
+  `; :` joins the masking shapes with the existing strong failure shapes.
+- process_registry_notifications: a plain exit-0 completion whose command/output
+  show a masked failure says "exited 0 but output shows failure" plus a Warning
+  line (checked before the subagent trim); the UI title says "Exited 0 but Output
+  Shows Failure". Exit codes are never changed.
+
+Proof: 9 new tests red on 5ff44110acc, green after; 653 + 568 tests in the
+notifier/hints/terminal/process_registry files pass.
+---
+ .../test_process_notification_masked_exit.py  | 82 +++++++++++++++++++
+ tests/tools/test_terminal_hints.py            | 60 ++++++++++++++
+ tools/process_registry_notifications.py       | 28 ++++++-
+ tools/terminal_hints.py                       | 37 ++++++++-
+ 4 files changed, 201 insertions(+), 6 deletions(-)
+ create mode 100644 tests/tools/test_process_notification_masked_exit.py
+
+diff --git a/tests/tools/test_process_notification_masked_exit.py b/tests/tools/test_process_notification_masked_exit.py
+new file mode 100644
+index 00000000000..5539a4568a0
+--- /dev/null
++++ b/tests/tools/test_process_notification_masked_exit.py
+@@ -0,0 +1,82 @@
++"""Background completion notices must not call a masked failure "completed normally".
++
++Incident agent-1e03ea6be2: `hermes chat ... > log 2>&1; echo EXIT=$?` exited 0 (echo's
++status) while printing EXIT=1, and the notice said "completed normally (exit code 0)".
++"""
++
++from tools.process_registry_notifications import (
++    format_process_notification,
++    process_completion_display_text,
++)
++
++INCIDENT_CMD = ('hermes chat --resume 20261103_abc -q "review PR 818 at exact head" '
++                '> /tmp/review-818.log 2>&1; echo EXIT=$?')
++
++
++def _evt(command=INCIDENT_CMD, output="EXIT=1\n", **extra):
++    return {"type": "completion", "session_id": "proc_e81d0d005f45", "command": command,
++            "exit_code": 0, "output": output, **extra}
++
++
++def _fmt(evt) -> str:
++    text = format_process_notification(evt)
++    assert text is not None
++    return text
++
++
++def test_incident_notice_warns_instead_of_completed_normally():
++    text = _fmt(_evt())
++    assert "completed normally" not in text
++    assert "exited 0 but output shows failure" in text
++    assert "status 1" in text
++    assert "EXIT=1" in text  # the output itself is still delivered
++
++
++def test_incident_display_title_not_finished():
++    assert "Finished" not in process_completion_display_text([_evt()])
++
++
++def test_status_zero_still_completed_normally():
++    text = _fmt(_evt(output="EXIT=0\n"))
++    assert "completed normally" in text
++    assert "output shows failure" not in text
++    assert "Finished" in process_completion_display_text([_evt(output="EXIT=0\n")])
++
++
++def test_readonly_grep_not_flagged():
++    text = _fmt(_evt(command="grep EXIT= /tmp/review-818.log",
++                                            output="EXIT=1\n"))
++    assert "completed normally" in text
++
++
++def test_long_subagent_output_checked_before_trim():
++    # The failure shape sits only in the head that the subagent trim cuts away.
++    text = _fmt(_evt(command="cargo build 2>&1 | tail -400",
++                                            output="error: could not compile `x`\n" + "y" * 5000,
++                                            owner_task_id="sa-1-abc"))
++    assert "output trimmed" in text
++    assert "output shows failure" in text
++
++
++def test_long_output_status_line_at_end():
++    out = "y" * 9000 + "\nEXIT=2\n"
++    text = _fmt(_evt(command="make; echo EXIT=$?", output=out))
++    assert "status 2" in text
++    assert "completed normally" not in text
++
++
++def test_nonzero_exit_unchanged():
++    text = _fmt(_evt(exit_code=1, output="EXIT=1\n"))
++    assert "exited (exit code 1)" in text
++
++
++def test_killed_reason_unchanged():
++    text = _fmt(_evt(completion_reason="killed", exit_code=0))
++    assert "terminated by" in text
++    assert "Warning:" not in text
++
++
++def test_lost_reason_not_reinterpreted():
++    text = _fmt(_evt(completion_reason="lost", exit_code=0))
++    assert "marked lost" in text
++    assert "Warning:" not in text
+diff --git a/tests/tools/test_terminal_hints.py b/tests/tools/test_terminal_hints.py
+index ff773fdb8e3..f61dd268f1b 100644
+--- a/tests/tools/test_terminal_hints.py
++++ b/tests/tools/test_terminal_hints.py
+@@ -215,3 +215,63 @@ class TestMaskedSuccess:
+             )
+             is None
+         )
++
++
++class TestStatusEchoWrapper:
++    """`cmd; echo EXIT=$?` exits with echo's 0; the printed status is the real one."""
++
++    INCIDENT = ('hermes chat --resume 20261103_abc -q "review PR 818 at exact head" '
++                '> /tmp/review-818.log 2>&1; echo EXIT=$?')
++
++    def test_incident_command_flagged_with_status(self):
++        hint = annotate_masked_success(self.INCIDENT, "EXIT=1\n")
++        assert hint is not None
++        assert "status 1" in hint and "FAILED" in hint
++
++    def test_status_zero_not_flagged(self):
++        assert annotate_masked_success(self.INCIDENT, "EXIT=0\n") is None
++
++    def test_readonly_head_mentioning_status_not_flagged(self):
++        assert annotate_masked_success("grep EXIT= /tmp/review-818.log; echo EXIT=$?",
++                                       "EXIT=1\nEXIT=0\n") is None
++
++    def test_status_variants(self):
++        for cmd, out, n in [
++            ('make test; echo "exit=$?"', "lots\nexit=2\n", "2"),
++            ("./run.sh; printf 'rc=%s\\n' $?", "rc=1\n", "1"),
++            ('pytest -q; echo "exit code: $?"', "3 passed\nexit code: 3\n", "3"),
++            ("npm test\necho STATUS=$?", "STATUS=127\n", "127"),
++        ]:
++            hint = annotate_masked_success(cmd, out)
++            assert hint is not None, cmd
++            assert f"status {n}" in hint, (cmd, hint)
++
++    def test_status_line_beyond_head_window_still_flagged(self):
++        out = "x" * 9000 + "\nEXIT=1\n"
++        assert annotate_masked_success("make all; echo EXIT=$?", out) is not None
++
++    def test_status_text_without_echo_wrapper_not_flagged(self):
++        assert annotate_masked_success("cat notes.txt > /dev/null && ./x", "EXIT=1\n") is None
++        assert annotate_masked_success("./deploy.sh", "EXIT=1\n") is None
++        # echo not printing $? is not a status wrapper
++        assert annotate_masked_success("./deploy.sh; echo done", "EXIT=1\ndone\n") is None
++
++    def test_status_mid_line_not_flagged(self):
++        assert annotate_masked_success("./x; echo EXIT=$?",
++                                       "the job printed EXIT=1 earlier\nEXIT=0\n") is None
++
++    def test_last_status_line_wins(self):
++        # `a; echo rc=$?; b; echo rc=$?`: only the final printed status decides.
++        assert annotate_masked_success("a; echo rc=$?; b; echo rc=$?", "rc=1\nrc=0\n") is None
++        assert "status 4" in (annotate_masked_success("a; echo rc=$?; b; echo rc=$?",
++                                                      "rc=0\nrc=4\n") or "")
++
++    def test_trailing_true_with_failure_shape(self):
++        hint = annotate_masked_success("cargo build; true", "error: could not compile `x`\n")
++        assert hint is not None
++        assert annotate_masked_success("cargo build; true", "Finished release\n") is None
++
++    def test_existing_pipe_and_or_cases_unchanged(self):
++        out = "error: could not compile `x`\n"
++        assert "pipeline" in (annotate_masked_success("cargo build | tail -5", out) or "")
++        assert "`||` fallback" in (annotate_masked_success("cargo build || echo FAILED", out) or "")
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index cd09e850221..ac30f6028eb 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -387,6 +387,8 @@ def process_completion_display_text(events: list) -> str:
+         outcome = "Finished" if exit_code == 0 else "Failed"
+     cmd = _short_command(evt.get("command"))
+     detail = f" (exit {exit_code})" if reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
++    if outcome == "Finished" and _masked_failure_note(evt):
++        outcome, detail = "Exited 0", " but Output Shows Failure"
+     return f"Background Process {outcome}{detail}: {cmd}" if cmd else f"Background Process {outcome}{detail}"
+ 
+ 
+@@ -472,7 +474,22 @@ def _delegation_attribution_line(evt: dict) -> str | None:
+             + (f' Task: "{goal}"' if goal else ""))
+ 
+ 
+-def _completion_status(evt: dict) -> str:
++def _masked_failure_note(evt: dict) -> str | None:
++    """Warning when a plain exit-0 completion's command/output show a masked failure (`; echo
++    EXIT=$?` printing EXIT=1, `| tail` over a traceback). Checked on the untrimmed output.
++    Advice only: the exit code is reported unchanged."""
++    if (evt.get("completion_reason") or "exited") != "exited" or evt.get("exit_code") != 0:
++        return None
++    output = evt.get("output")
++    if not isinstance(output, str) or not output:
++        return None
++    with suppress(Exception):
++        from tools.terminal_hints import annotate_masked_success
++        return annotate_masked_success(str(evt.get("command") or ""), output)
++    return None
++
++
++def _completion_status(evt: dict, masked_note: str | None = None) -> str:
+     reason = evt.get("completion_reason") or "exited"
+     if reason == "killed":
+         if evt.get("kill_reason"):
+@@ -480,6 +497,8 @@ def _completion_status(evt: dict) -> str:
+         if evt.get("termination_source") == "core_update_pause":
+             return "killed by the Hermes update"
+         return f"terminated by {evt.get('termination_source') or 'Hermes'}"
++    if masked_note:
++        return "exited 0 but output shows failure"
+     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
+ 
+ 
+@@ -515,6 +534,9 @@ def format_process_notification(evt: dict) -> str | None:
+         _exit = "?"
+     _out = evt.get("output", "")
+     _signal = ", SIGTERM" if _exit in {-15, 143, "-15", "143"} else ""
++    # Before any trim: a status line or failure shape may sit in the part cut below.
++    _masked = _masked_failure_note(evt)
++    _warning = f"Warning: {_masked}\n" if _masked else ""
+     # A subagent-owned process's full output belongs in the child's transcript, not as
+     # a raw wall in the parent — trim hard but keep enough tail to recognise failures.
+     if _attribution and isinstance(_out, str) and len(_out) > 600:
+@@ -527,5 +549,5 @@ def format_process_notification(evt: dict) -> str | None:
+         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
+                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
+     return (
+-        f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
+-        f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
++        f"[IMPORTANT: Background process {_sid} {_completion_status(evt, _masked)} (exit code {_exit}{_signal}).\n"
++        f"{_warning}{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+diff --git a/tools/terminal_hints.py b/tools/terminal_hints.py
+index 1ff9514bac0..3a898a07c03 100644
+--- a/tools/terminal_hints.py
++++ b/tools/terminal_hints.py
+@@ -104,8 +104,36 @@ _MASKING_SHAPES: list[tuple[re.Pattern[str], str]] = [
+      "exit_code 0 here is the status of the `||` fallback (echo/true), NOT of the command before "
+      "it — and the output contains failure indicators. Treat this run as FAILED until proven "
+      "otherwise: re-run the command bare to get its real exit code."),
++    # `cmd; true` / `cmd; :` as the last statement: exit status is always 0.
++    (re.compile(r"(?:;|\n)\s*(?:true|:)\s*;?\s*$"),
++     "exit_code 0 here is the status of the trailing `; true`, NOT of the command before it — and "
++     "the output contains failure indicators. Treat this run as FAILED until proven otherwise: "
++     "re-run the command bare to get its real exit code."),
+ ]
+ 
++# Status-echo wrapper: `cmd > log 2>&1; echo EXIT=$?` (or `printf 'rc=%s' $?`) as the LAST
++# statement makes the exit code echo's 0, while the wrapped command's real status is printed.
++# Incident agent-1e03ea6be2: a background `hermes chat -q ...; echo EXIT=$?` printed EXIT=1 and
++# the completion notice said "completed normally (exit code 0)".
++_STATUS_ECHO = re.compile(r"(?:;|\n)\s*(?:echo|printf)\b[^;&|\n]*\$\{?\?[^;&|\n]*;?\s*$")
++# A whole line that is a printed status: EXIT=1, exit=2, rc=1, exit code: 3, STATUS=127.
++_PRINTED_STATUS = re.compile(
++    r"(?im)^[ \t]*[\"']?(?:exit(?:[ _-]?(?:code|status))?|rc|status|ret(?:urn)?[ _-]?code)"
++    r"[ \t]*[=:][ \t]*(\d+)[ \t]*[\"']?[ \t]*$")
++
++
++def _status_echo_note(status: int) -> str:
++    return (f"exit_code 0 here is the status of the trailing `echo ...$?`, NOT of the command it "
++            f"wraps — that command printed status {status}. Treat this run as FAILED (status "
++            f"{status}); read its output/log for the cause before reporting success.")
++
++
++def _printed_nonzero_status(output: str) -> Optional[int]:
++    """The LAST printed status line in the output's tail (the echo runs last), if nonzero."""
++    found = _PRINTED_STATUS.findall(output[-_SCAN_CHARS:])
++    status = int(found[-1]) if found else 0
++    return status or None
++
+ _READONLY_HEADS = frozenset({
+     "grep", "rg", "ag", "find", "ls", "cat", "head", "tail", "jq", "awk",
+     "sed", "strings", "zcat", "journalctl", "dmesg", "echo", "printf"})
+@@ -139,9 +167,12 @@ def _first_token(command: str) -> str:
+ def annotate_masked_success(command: str, output: str) -> Optional[str]:
+     """Warning note when an exit-0 result likely masks a failure (caller gates on exit 0)."""
+     cmd = command or ""
+-    window = (output or "")[:_SCAN_CHARS]
+-    if (not cmd or not window or _first_token(cmd) in _READONLY_HEADS
+-            or not _FAILURE_SHAPES.search(window)):
++    if not cmd or not output or _first_token(cmd) in _READONLY_HEADS:
++        return None
++    if _STATUS_ECHO.search(cmd) and (status := _printed_nonzero_status(output)):
++        return _status_echo_note(status)
++    window = output[:_SCAN_CHARS]
++    if not _FAILURE_SHAPES.search(window):
+         return None
+     return next((note for rx, note in _MASKING_SHAPES if rx.search(cmd)), None)
+ 
+-- 
+2.55.0
+

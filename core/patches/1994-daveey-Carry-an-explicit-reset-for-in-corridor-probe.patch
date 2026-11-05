@@ -1,0 +1,132 @@
+From dc089c2b593a638aa54a9c428d59326dae6da665 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 05:17:33 +0000
+Subject: [PATCH] [daveey] Carry an explicit reset for in-corridor probe-less
+ parks after unknown state
+
+A probe-less scheduled/continued park skipped evidence whenever this home knew
+no probe, so an undelivered foreign episode (peer parks P after the home's
+first no-probe park) survived delayed sync and kept its age/count on re-park P.
+
+Skip evidence only when a fresh-corridor marker is present (task creation,
+arrival from outside the corridor, or an explicit probe-less reset this home
+already carried) and no probe is known. Otherwise advance the reset barrier so
+the carried park is an explicit reset a peer accepts after delayed sync.
+
+Proof: new test_in_corridor_park_resets_undelivered_foreign_episode
+[scheduled, continued] RED on be5f625 (no evidence event), GREEN here.
+Wake episode/check + triage files: 13 files, 155 passed; existing assertions
+unchanged. Mutations: 6/7 killed; the surviving 'reset only when probe
+unknown' guard was equivalent and removed (reset is unconditional).
+---
+ hermes_cli/kanban_wake_episode.py             | 26 ++++++++++--
+ .../test_kanban_wake_episode_probeless.py     | 40 +++++++++++++++++++
+ 2 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index 86f06ec4094..2c072e83c04 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -47,6 +47,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = NEW.id; END""")
+     conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_exit_delete AFTER DELETE ON tasks
+         BEGIN DELETE FROM task_wake_episode_exit WHERE task_id = OLD.id; END""")
++    # Fresh corridor entry (creation, or arrival from outside it): no episode can have
++    # survived into this corridor, so its first probe-less park has nothing to clear.
++    # Any later park in the same corridor may follow an undelivered foreign episode.
++    conn.execute("CREATE TABLE IF NOT EXISTS task_wake_episode_fresh (task_id TEXT PRIMARY KEY)")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_insert AFTER INSERT ON tasks
++        WHEN NEW.status IN ('scheduled', 'todo', 'ready', 'running', 'review')
++        BEGIN INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (NEW.id); END""")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_entry AFTER UPDATE OF status ON tasks
++        WHEN OLD.status NOT IN ('scheduled', 'todo', 'ready', 'running', 'review')
++         AND NEW.status IN ('scheduled', 'todo', 'ready', 'running', 'review')
++        BEGIN INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (NEW.id); END""")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS task_wake_episode_fresh_delete AFTER DELETE ON tasks
++        BEGIN DELETE FROM task_wake_episode_fresh WHERE task_id = OLD.id; END""")
+ 
+ 
+ _SNAPSHOT = "_wake_episode_v1"
+@@ -138,14 +151,21 @@ def snapshot_event(conn: sqlite3.Connection, task_id: str, kind: str,
+     probe_less = kind in {"scheduled", "continued"} and not (payload or {}).get("wake_check")
+     if probe_less and not outside:
+         reconcile(conn, task_id)  # judge against every delivered park, then idempotent in _snapshot
+-        if not _probe_known(conn, task_id):
+-            # Nothing to clear here and no probe was ever delivered: the park changes no
+-            # episode state, so it adds no evidence (keeps atomic park event contracts).
++        fresh = conn.execute("DELETE FROM task_wake_episode_fresh WHERE task_id = ?", (task_id,)).rowcount > 0
++        if fresh and not _probe_known(conn, task_id):
++            # Fresh corridor entry or explicit reset already carried, no probe delivered
++            # since: nothing to clear, so no evidence (keeps atomic park event contracts).
++            # Otherwise the home's state is unknown: a later park may follow an
++            # undelivered foreign episode, so it carries the reset below.
+             return payload, None
++        reset(conn, task_id)  # home state may be unknown: make the clear an explicit reset barrier
+     snapshot = _snapshot(conn, task_id, kind, payload, outside)
+     separate = probe_less or (
+         outside and kind not in _CARRY_EVENTS and kind not in _EXIT_EVENTS and not kind.startswith("wake_"))
+     if separate:
++        if probe_less:
++            # This evidence is an explicit reset: the next probe-less park repeats it.
++            conn.execute("INSERT OR IGNORE INTO task_wake_episode_fresh VALUES (?)", (task_id,))
+         return payload, snapshot
+     return {**(payload or {}), **snapshot}, None
+ 
+diff --git a/tests/hermes_cli/test_kanban_wake_episode_probeless.py b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+index 7b68a9b8c31..355c16df16d 100644
+--- a/tests/hermes_cli/test_kanban_wake_episode_probeless.py
++++ b/tests/hermes_cli/test_kanban_wake_episode_probeless.py
+@@ -2,6 +2,8 @@
+ import json
+ import time
+ 
++import pytest
++
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_wake_check as wc
+@@ -96,3 +98,41 @@ def test_outside_probe_less_park_keeps_exit_reset_for_unobserved_episode(parked)
+         assert state is not None and state["episode_first_at"] is None
+     finally:
+         home.close()
++
++
++def _peer_episode(peer, tid, now):
++    if peer.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] != "running":
++        peer.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert kb.claim_task(peer, tid, claimer="peer") is not None
++    assert kb.schedule_task(peer, tid, reason="waiting", wake_check="exit 1")
++    state = wc.get_state(peer, tid)
++    wc.apply_result(peer, tid, state["cmd"], 1, "", generation=state["generation"], now=now)
++    return peer.execute("SELECT first_at, checks FROM task_wake_episodes WHERE task_id = ?", (tid,)).fetchone()
++
++
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_in_corridor_park_resets_undelivered_foreign_episode(kanban_home, kind):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        before = len(_kinds(conn, tid))
++        assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
++        assert [k for k in _kinds(conn, tid)[before:] if k != "commented"] == ["scheduled"]  # fresh entry
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++        peer = carry.replica(conn)
++        try:
++            t0 = int(time.time())
++            assert tuple(_peer_episode(peer, tid, t0)) == (t0, 1)  # never delivered to home
++            before = len(_kinds(conn, tid))
++            if kind == "scheduled":
++                assert kb.schedule_task(conn, tid, reason=SOAK, clock_only=True)
++            else:
++                kb._append_event(conn, tid, "continued", {"reason": "soak"})
++            added = [k for k in _kinds(conn, tid)[before:] if k != "commented"]
++            assert added == [episode.EVIDENCE_EVENT, kind]
++            carry.import_events(conn, peer, tid)
++            episode.reconcile(peer, tid)
++            t1 = t0 + 3600
++            assert tuple(_peer_episode(peer, tid, t1)) == (t1, 1)  # same probe: old age/count gone
++        finally:
++            peer.close()
+-- 
+2.55.0
+
