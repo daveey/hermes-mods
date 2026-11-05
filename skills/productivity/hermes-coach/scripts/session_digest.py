@@ -236,7 +236,7 @@ def transcript(con, sid, mcols):
     uid = "message_uid" if "message_uid" in mcols else "NULL"
     active = "active" if "active" in mcols else "1"
     meta = "display_metadata" if "display_metadata" in mcols else "NULL"
-    rows = con.execute(f"""select role, content, tool_name, tool_calls, timestamp, {uid} as uid, {active} as live,
+    rows = con.execute(f"""select id, role, content, tool_name, tool_calls, timestamp, {uid} as uid, {active} as live,
                                   {meta} as meta
                            from messages where {where} order by {order}""", (sid,)).fetchall()
     # Prefer the live copy of a uid, else its first compacted copy; keep the first position seen.
@@ -287,11 +287,37 @@ def inbox_prompts(db):
     return {sid: _ws(clean_user(pr)) for sid, pr in rows if sid and pr and pr.strip()}
 
 
+def start_writers(con):
+    """{message row id or message_uid: namespace} of the user rows core's session-start API wrote
+    (session_start_requests.user_row_id / first_turn_id): a plugin opening a chat (e.g. runners' "Repair runner"
+    brief) writes its text as the first user turn, so that turn is the plugin's words, not the user's
+    (plugin-4731e7cdc3). The uid key survives compaction re-inserting the row. Missing table -> {}."""
+    try:
+        scols = cols(con, "session_start_requests")
+    except sqlite3.Error:
+        return {}
+    if not scols or "namespace" not in scols:
+        return {}
+    keys = [c for c in ("user_row_id", "first_turn_id") if c in scols]
+    if not keys:
+        return {}
+    out = {}
+    try:
+        for row in con.execute(f"select namespace, {', '.join(keys)} from session_start_requests"):
+            for k in row[1:]:
+                if k is not None:
+                    out[k] = row[0] or "plugin"
+    except sqlite3.Error:
+        return {}
+    return out
+
+
 def digest_db(profile, db, host, since):
     doit_prompts = inbox_prompts(db)
     con = sqlite3.connect(f"file:{db}", uri=True, timeout=30)
     con.execute("pragma query_only = 1")
     con.row_factory = sqlite3.Row
+    writers = start_writers(con)
     scols = cols(con, "sessions")
     opt = lambda c, alias=None: (c if c in scols else f"NULL") + f" as {alias or c}"
     act = "coalesce(last_activity_at, ended_at, started_at)" if "last_activity_at" in scols else "coalesce(ended_at, started_at)"
@@ -338,13 +364,17 @@ def digest_db(profile, db, host, since):
                     head = text[:80]
                     sig["synthetic_" + next((k for k, w in SYNTH_KIND if w in head), "summary")] += 1
                     continue
-                for k, rx in SIGNALS.items():
-                    if rx.search(text):
-                        sig[k] += 1
-                n_real += 1
+                writer = writers.get(m["id"]) or (writers.get(m["uid"]) if m["uid"] else None)
+                if not writer:  # a plugin-written opener is no signal and no real user turn
+                    for k, rx in SIGNALS.items():
+                        if rx.search(text):
+                            sig[k] += 1
+                    n_real += 1
                 if users and users[-1]["text"] == clip_user_turn(text):
                     continue  # the same turn persisted twice (retry / steer echo)
                 turn = {"t": round(m["timestamp"]), "text": clip_user_turn(text)}
+                if writer:
+                    turn["generated"] = f"start:{writer}"  # core's session-start API wrote it (plugin-4731e7cdc3)
                 if doit_prompts.get(sid) and _ws(text) == doit_prompts[sid]:
                     turn["inbox_doit"] = True  # sent by the Inbox Do it button: the card's prompt, not the user
                 if len(text) > TURN_CHARS:

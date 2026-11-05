@@ -255,5 +255,32 @@ class DigestUserTurnClipping(unittest.TestCase):
         self.assertTrue(dg["user_turns"][0]["text_truncated"])
         self.assertEqual(dg["user_turns"][0]["text_original_chars"], len(a))
 
+class DigestPluginStartedOpener(unittest.TestCase):
+    def test_turn_written_by_the_session_start_api_is_flagged(self):
+        """plugin-4731e7cdc3: core's session-start API (a plugin opening a chat) records the user row it wrote in
+        session_start_requests.user_row_id; that turn is the plugin's text, not the user's."""
+        t = time.time() - 100
+        rows = [("user", "Diagnosis only. Inspect this runner/host.", t, 1, 0, None, None, "u1"),
+                ("assistant", "Looking.", t + 1, 1, 0, None, None, "a1"),
+                ("user", "why did it fail? root cause it", t + 2, 1, 0, None, None, "u2")]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            (dg,) = list(sd.digest_db("default", db, "test", 0))  # no table: nothing is claimed
+            self.assertNotIn("generated", dg["user_turns"][0])
+            self.assertEqual(dg["user_turns_total"], 2)
+            con = sqlite3.connect(db)
+            uid = con.execute("select id from messages where message_uid='u1'").fetchone()[0]
+            con.execute("create table session_start_requests (namespace text, stored_session_id text,"
+                        " user_row_id integer)")
+            con.execute("insert into session_start_requests values ('runners', 's1', ?)", (uid,))
+            con.commit(); con.close()
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        first, second = dg["user_turns"]
+        self.assertEqual(first.get("generated"), "start:runners")
+        self.assertNotIn("generated", second)
+        self.assertEqual(dg["user_turns_total"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

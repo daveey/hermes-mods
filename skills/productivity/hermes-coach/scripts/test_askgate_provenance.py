@@ -207,5 +207,46 @@ class InboxDoit(unittest.TestCase):
             self.assertIsNone(g.still_flags(dict(row, session_id='missing'), homes=[home], data=directory))
 
 
+def runners_brief():
+    """The real opener the runners plugin writes into a 'Repair runner' chat (plugins/runners/repairs.py)."""
+    import sys
+    from pathlib import Path
+    plugins = str(Path(__file__).resolve().parents[4] / 'plugins')
+    sys.path.insert(0, plugins)
+    try:
+        from runners.repairs import RepairService
+    finally:
+        sys.path.remove(plugins)
+    runner = {'id': 'r1', 'host_id': 'h1', 'scope_id': 's1', 'display_name': 'runner-1'}
+    return RepairService._make_brief({'id': 'repair_x', 'owner': {}, 'incident_id': 'i1', 'entity_id': 'e1'},
+                                     {'meta': {}, 'data': {'runners': [], 'scopes': []}}, runner, None, {})['text']
+
+
+class PluginStartedOpener(unittest.TestCase):
+    """plugin-4731e7cdc3: the runners plugin opens a desktop-source chat whose first user row is its fixed brief
+    ('Diagnosis only. ... use five-whys ...'); ask-gate filed it as David asking for a root-cause fix."""
+
+    def test_real_runners_brief_is_generated(self):
+        # Detection guard: a reworded brief must fail here, not leak into ask-gate as a fix request.
+        text = g.clean(runners_brief())
+        self.assertTrue(g.generated(text))
+
+    def test_collect_skips_plugin_written_openers_keeps_typed_turns(self):
+        import json, tempfile
+        from pathlib import Path
+        brief = runners_brief()
+        with tempfile.TemporaryDirectory() as directory:
+            p = Path(directory) / 'host' / 'default'
+            p.mkdir(parents=True)
+            (p / 'a.json').write_text(json.dumps({'id': 'a', 'source': 'desktop', 'user_turns': [
+                {'t': 100, 'text': brief}]}))  # old digest: no writer flag, text only
+            (p / 'b.json').write_text(json.dumps({'id': 'b', 'source': 'desktop', 'user_turns': [
+                {'t': 110, 'text': 'root cause this, use five-whys', 'generated': 'start:example'},
+                {'t': 120, 'text': 'root cause this'}]}))
+            hits, scanned = g.collect(directory, 0, 200)
+        self.assertEqual([(h['session'], h['t']) for h in hits], [('b', 120)])
+        self.assertEqual(sum(scanned.values()), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

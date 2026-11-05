@@ -45,7 +45,8 @@ SKIP = re.compile(
 # Defense in depth for old digests: generated user-role rows are not human corrections.
 GENERATED = re.compile(
     r'^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe)\]|'
-    r'\{\s*"item"\s*:|New notes? on your kanban task from another agent session\b)'
+    r'\{\s*"item"\s*:|New notes? on your kanban task from another agent session\b|'
+    r'Diagnosis only\. Inspect this runner/host)'  # runners plugin "Repair runner" brief (plugin-4731e7cdc3)
     r'|\(Roleplay test of our reply checker', re.I)
 # Same marker as plugins/coach/self_heal.py PROBE_RE: a session opener that marks a deliberate detector probe.
 PROBE = re.compile(r"^\s*(?:\[selfheal-probe\]|Live test of a detector\b)", re.I)
@@ -311,6 +312,8 @@ def collect(data, since_ts, until_ts, doit=None):
         for i, u in enumerate(turns):
             t, text = u.get("t") or 0, clean(u.get("text") or "")  # "…[N turns omitted]" rows carry t: None
             if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
+                continue
+            if u.get("generated"):  # the digest's writer flag: core recorded a plugin wrote this turn (plugin-4731e7cdc3)
                 continue
             # Provenance: the digest's `inbox_doit` flag (the Inbox store says Do it sent this prompt; the only proof
             # for a labelled card, whose prompt is not in prev), else the Inbox notice in prev.
