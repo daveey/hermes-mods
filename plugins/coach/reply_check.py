@@ -1192,6 +1192,10 @@ probabilities (0-1):
     priority or capacity also counts as started when the turn commented the stall on the owner card (kanban_comment
     saying what holds it). A `<- OK` line showing it blocked or done, ready or todo idle for over 24 h, a failed or
     crashed last run, or a bare claim with no such line, stays high.
+    An in-session subagent the agent spawned is an owner too: a `<- OK subagents:` line (from delegate_task
+    action=list this turn) showing the subagent the message names (by id or by its goal) as running counts as a
+    checked, active owner, the same as a running card; a steer sent to it this turn (`-> delegate_task(action=steer,
+    ...)`) with the fix counts as handing it the work. A subagent missing from that line, or `none live`, stays high.
   * A Kanban worker that checkpointed its own card with kanban_continue this turn has started the remaining work
     (score low) when the leftovers it lists are what the checkpoint carries to the next run of that card.
   * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
@@ -1254,7 +1258,11 @@ todo (queued, not picked up yet) with its last activity under 24 h and no failed
 created this turn), and it owns this problem: a card filed minutes ago and waiting in a normal queue is a started fix.
 A queued owner waiting on priority or capacity is also "started" when the turn commented the stall on the owner card.
 A `<- OK` line showing it blocked or done, ready or todo idle for over 24 h, a failed or crashed last run, or no such
-line, leaves it "report_only". A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
+line, leaves it "report_only". An in-session subagent the agent spawned is an owner too: a `<- OK subagents:` line
+(from delegate_task action=list this turn) showing the subagent the reply names (by id or by its goal) as running
+counts as a checked, active owner, the same as a running card; a `-> delegate_task(action=steer, ...)` sending it the
+fix counts as handing it the work. A subagent missing from that line, or `none live`, leaves it "report_only".
+A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
 made one turn earlier (this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
 Return ONLY one JSON object:

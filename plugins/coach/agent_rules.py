@@ -1224,6 +1224,14 @@ def rich_tool_line(tool: str, args: dict, arg: str = "") -> str:
         if tool == "kanban_create":
             return (f"-> kanban_create(title={str(a.get('title'))[:200]!r}, assignee={a.get('assignee')}, "
                     f"body={str(a.get('body'))[:500]!r})")
+        if tool == "delegate_task" and str(a.get("action") or "spawn") != "spawn":
+            # agent-19504d5444: list/steer/stop carry no goal; show what was checked or sent to which subagent
+            parts = [f"action={a.get('action')}"]
+            if a.get("subagent_id"):
+                parts.append(f"subagent_id={a.get('subagent_id')}")
+            if a.get("message"):
+                parts.append(f"message={str(a.get('message'))[:300]!r}")
+            return "-> delegate_task(" + ", ".join(parts) + ")"
         if tool == "delegate_task":
             ts = a.get("tasks") or [{"goal": a.get("goal")}]
             return "-> delegate_task(" + " | ".join(str((t or {}).get("goal"))[:300] for t in ts[:3]) + ")"
@@ -1507,8 +1515,42 @@ def _task_summary(task: dict, runs: list, events: list, now: float) -> str:
     return " ".join(p for p in parts if p)
 
 
+# agent-19504d5444: an orchestrator's own in-session subagent is an owner too. A `delegate_task(action=list)` that
+# found it running got no OK line, so the judges held a true "I verified its recovery subagent is running" reply.
+# A successful list gets `<- OK subagents: <id>=<status>(<running for>) goal=<head> ...` (or `none live`).
+SUBAGENT_GOAL_HEAD = 120
+
+
+def subagent_list_call(tool: str, args: Any) -> bool:
+    a = args if isinstance(args, dict) else {}
+    return (tool or "").rsplit("__", 1)[-1] == "delegate_task" and str(a.get("action") or "") == "list"
+
+
+def subagent_list_line(result: Any) -> Optional[str]:
+    d = result if isinstance(result, dict) else _as_dict(result)
+    if not isinstance(d, dict) or not isinstance(d.get("subagents"), list):
+        return None
+    segs = []
+    for e in d["subagents"]:
+        if not isinstance(e, dict):
+            continue
+        secs = e.get("running_seconds")
+        age = f"({_ago(float(secs))})" if isinstance(secs, (int, float)) else ""
+        goal = " ".join(str(e.get("goal") or "").split())[:SUBAGENT_GOAL_HEAD]
+        segs.append(f"{e.get('subagent_id')}={e.get('status')}{age}" + (f" goal={goal}" if goal else ""))
+    for e in d.get("finished_awaiting_batch") or []:
+        if isinstance(e, dict):
+            segs.append(f"{e.get('subagent_id')}={e.get('status') or 'finished'}(awaiting batch)")
+    return ("   <- OK subagents: " + (" | ".join(segs) if segs else "none live"))[:OK_LIST_LINE_MAX]
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls."""
+    if subagent_list_call(tool, args):
+        try:
+            return subagent_list_line(result)
+        except Exception:
+            return None
     if not owner_read_call(tool, args):
         return None
     now = time.time() if now is None else now
