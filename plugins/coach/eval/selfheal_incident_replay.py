@@ -121,7 +121,9 @@ def run(a, llm=None, confirm_llm=None):
             # production times a pause note from the paused turn's last assistant/tool row (pause_gap_s), not from
             # the coach file's turn-start stamp (gap_s); a turn set without that field stays quiet, as production does
             gap = x.get("pause_gap_s") if sh.is_pause_note(t.get("text") or "") else x.get("gap_s")
-            sig = sh.resume_signal(t.get("text") or "", gap)
+            stop = ({"cause": x["stop_cause"], "evidence": x.get("stop_evidence") or "", "host": "replay"}
+                    if x.get("stop_cause") else None)  # recorded on the host at detection (selfheal_detect)
+            sig = sh.resume_signal(t.get("text") or "", gap, stop=stop)
             r["c_pre"] = False
             if sig:
                 r.update(c_p=sig["p_defect"], c_kind=sig["kind"], c_comp=sig["component"], c_sym=sig["symptom"],

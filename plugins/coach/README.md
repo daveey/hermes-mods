@@ -766,6 +766,11 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   "agent" or "check", let a report_only signal close against a Kanban owner-death fix).
   A backend that stops mid-turn never reaches this hook: the next user turn, core's `[System note: Your previous turn
   was interrupted mid-run` resume note, files `turn interrupted (backend stopped)` with the gap since the last activity.
+  The cause is read on that host when the note is detected (`stop_cause`, window = cut turn's last row/start to the
+  resume): an update receipt → `(backend stopped: core update)`, a hermes-sync `mods-reload:` line → `plugin reload`,
+  a gateway exit/shutdown diagnostic → `gateway shutdown`, a macOS `pmset` Sleep line → `machine slept`, each its
+  own fingerprint; none keeps `gateway-9aaf151a15`. `selfheal_detect` carries `stop_cause`/`stop_evidence`/
+  `stop_host` (<= 600 chars of the matched lines) and the investigation card shows them as "Stop evidence".
   Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
   errors, a turn-end audit by the same judge; only self-admissions file (the other audit kinds cost more false alarms
   than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set).
