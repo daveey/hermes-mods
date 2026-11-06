@@ -1581,11 +1581,38 @@ def live_subagents_line(sid: str, records: list, now: Optional[float] = None) ->
     return ("   <- OK subagents: " + " | ".join(segs))[:OK_LIST_LINE_MAX - len(tail)] + tail
 
 
+# agent-ef1e146131 (dup of agent-f4adc31e67): a steer-only turn showed the judges `-> delegate_task(action=steer, ...)`
+# and nothing else, both for a live subagent and for one that had already finished (core answers the latter with a
+# non-error `already_finished`/`finishing` payload, tools/delegate_tool_registry._finished_payload). Core returns
+# `queued` only for a live record that accepts steering, so a queued steer is itself a liveness read of that subagent.
+def subagent_steer_call(tool: str, args: Any) -> bool:
+    a = args if isinstance(args, dict) else {}
+    return (tool or "").rsplit("__", 1)[-1] == "delegate_task" and str(a.get("action") or "") == "steer"
+
+
+def subagent_steer_line(args: Any, result: Any) -> Optional[str]:
+    d = result if isinstance(result, dict) else _as_dict(result)
+    if not isinstance(d, dict) or d.get("error"):
+        return None
+    sid = d.get("subagent_id") or (args if isinstance(args, dict) else {}).get("subagent_id")
+    status = str(d.get("status") or "")
+    if not sid or not status:
+        return None
+    if status == "queued":
+        return f"   <- OK steer queued: {sid} (live, accepting steer)"
+    return f"   <- OK steer NOT delivered: {sid}={status} (not running)"
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls."""
     if subagent_list_call(tool, args):
         try:
             return subagent_list_line(result)
+        except Exception:
+            return None
+    if subagent_steer_call(tool, args):
+        try:
+            return subagent_steer_line(args, result)
         except Exception:
             return None
     if not owner_read_call(tool, args):

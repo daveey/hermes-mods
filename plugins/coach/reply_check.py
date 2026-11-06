@@ -1227,8 +1227,11 @@ probabilities (0-1):
     action=list this turn, or ending `[live registry]`: the runtime's own read of the subagents this session started,
     still running, under 1 h old, often spawned a turn earlier) showing the subagent the message names (by id or by
     its goal) as running counts as a checked, active owner, the same as a running card; a steer sent to it this turn
-    (`-> delegate_task(action=steer, ...)`) with the fix counts as handing it the work. A subagent missing from that
-    line, or `none live`, stays high.
+    (`-> delegate_task(action=steer, ...)`) with the fix counts as handing it the work. A `<- OK steer queued: <id>`
+    line is the runtime confirming that subagent is live and took the steer: it counts as a running check of it
+    when the message names it (by id, or the notice or a spawn/subagents line ties its goal to this work). A
+    subagent missing from that line, `none live`, or `<- OK steer NOT delivered: <id>=...` (it already finished)
+    stays high.
   * A Kanban worker that checkpointed its own card with kanban_continue this turn has started the remaining work
     (score low) when the leftovers it lists are what the checkpoint carries to the next run of that card.
   * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
@@ -1301,7 +1304,10 @@ line, leaves it "report_only". An in-session subagent the agent spawned is an ow
 session started, still running, under 1 h old, often spawned a turn earlier) showing the subagent the reply names (by
 id or by its goal) as running
 counts as a checked, active owner, the same as a running card; a `-> delegate_task(action=steer, ...)` sending it the
-fix counts as handing it the work. A subagent missing from that line, or `none live`, leaves it "report_only".
+fix counts as handing it the work. A `<- OK steer queued: <id>` line is the runtime confirming that subagent is live
+and took the steer: it counts as a running check of it when the reply names it (by id, or the notice or a
+spawn/subagents line ties its goal to this work). A subagent missing from that line, `none live`, or
+`<- OK steer NOT delivered: <id>=...` (it already finished) leaves it "report_only".
 A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
 made one turn earlier (this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
