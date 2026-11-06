@@ -1,0 +1,557 @@
+From d9484acb9d3158bad78466793541023278597149 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 05:06:59 +0000
+Subject: [PATCH] [daveey] Treat an owner's unknown task scope as
+ unknown-not-yet with bounded wake backoff
+
+Problem: mini's detector t_01a199d0b888e8e8 (wait-check task t_01a188a461c0178c --gateway macbook),
+correctly retained on rc 3 by 2a6c4ae61b, woke at 1793939646 after three rc 2 results:
+"error: replica macbook: missing successful task-scope observation for macbook/default". macbook's
+gateway/info task_scopes were all {state: unknown} with no observed_at; the producer record was still in
+the replica.
+
+Why 1: kanban_wait_replica.read_task raises a generic ValueError for any non-ok matched scope, before the
+StaleReplica (rc 3) classification; check() maps it to rc 2 (hermes_cli/kanban_wait_replica.py L57-59).
+Why 2: kanban_wake_check counts rc 2 toward BROKEN_AFTER=3 and wakes as "broken probe"; each repark
+resets the streak, so an unchanged unknown scope re-wakes every 3 probes and bypasses the offline
+cooldown, which only matches stale_age results.
+Why 3: a9ed7fc9ff (10-28) wrote the reader when "not ok" could only mean missing/unreadable; the
+hermes-hub collector's `state: unknown` (collect_all + scope_heartbeats: a board read failing past the
+450 s carry window, records kept, never tombstoned) is a well-formed "owner cannot vouch now" state
+that was never given a type.
+Root (happened): no typed classification for a well-formed owner-published unknown scope.
+Why macbook's reads failed: UNDETERMINED (macbook unreachable; needs its hermes-hub log `collect ...
+failed` lines). Not attributed.
+Root (not caught): tests covered only a stale successful scope (observed_at aged) and missing scopes;
+no fixture used the producer's unknown shape, and no repark test drove a non-stale unknown result.
+Recurrence: second gap in the same wait path after 2a6c4ae61b (offline repark backoff).
+
+Fix:
+- read_task raises typed UnknownScope (carries the last-seen task) only for exactly one matched scope
+  with state == "unknown" and no observed_at. check() returns rc 3 with `source_state=unknown
+  gateway=<gw>`, no stale_age (no observation time is invented) and never `error:`. Unknown is never
+  met: until/since are not evaluated. Missing, ambiguous, other states, unknown+observed_at, future
+  stamps, invalid tasks and DB errors stay rc 2.
+- kanban_wake_check.source_unknown() recognizes that result. It is never counted toward
+  BROKEN_AFTER. First result: one typed wake (wake_check_broken reason=gateway_scope_unknown, fails=0,
+  own context header). Same task/probe/gateway while a gateway_offline or gateway_scope_unknown
+  receipt is under 24 h old: probe row updated, card stays scheduled. Re-escalates at most once per
+  24 h. A successful scope restores normal 0/1/stale handling. The offline path shares the same
+  receipt family. Dry run accepts it so the acknowledging repark is not refused;
+  _remote_completed_at reads the last-seen record as it does for StaleReplica.
+- recently_escalated takes a reason family (default unchanged: gateway_offline only).
+
+Proof:
+- RED on 2a6c4ae61b: 26 of 41 tests in the new/changed files fail (unknown scope -> `assert 2 == 3`).
+- GREEN: 410 passed across 24 wait/wake/awaiting/remote/placement files; scripts/check ok.
+- 18/18 mutants killed (each new condition, both reason-family call sites, row update, header).
+- Cross-repo: real hermes-hub collect_all/stage (default read failing past the floor) -> outbox ->
+  real client pull() into a reader hub.db -> core check: old core rc 2 with the incident's exact
+  message; this commit rc 3 source_state=unknown; then a clean read with status done gives rc 0.
+---
+ hermes_cli/kanban_offline_backoff.py          |   8 +-
+ hermes_cli/kanban_wait_replica.py             |  28 ++
+ hermes_cli/kanban_wake_check.py               |  54 +++-
+ .../hermes_cli/test_kanban_offline_backoff.py |  16 ++
+ .../test_kanban_wait_replica_unknown_scope.py | 259 ++++++++++++++++++
+ 5 files changed, 357 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wait_replica_unknown_scope.py
+
+diff --git a/hermes_cli/kanban_offline_backoff.py b/hermes_cli/kanban_offline_backoff.py
+index b17933099ce..8c3b72d3cbc 100644
+--- a/hermes_cli/kanban_offline_backoff.py
++++ b/hermes_cli/kanban_offline_backoff.py
+@@ -6,12 +6,14 @@ import sqlite3
+ 
+ 
+ def recently_escalated(conn: sqlite3.Connection, task_id: str, cmd: str,
+-                       gateway: str, now: int, cooldown: int) -> bool:
++                       gateway: str, now: int, cooldown: int,
++                       reasons: tuple[str, ...] = ("gateway_offline",)) -> bool:
+     """Read durable (also pre-fix) wake receipts, not the disposable probe row.
+ 
+     Age in the output continually increases and is not a new premise. A bounded
+     persisted wall-clock deadline survives process restart and board replication.
+-    Only offline escalations are throttled; success and unexpected faults bypass it.
++    Only source-unavailable escalations (``reasons``: offline, or the owner's board
++    scope unknown) are throttled; success and unexpected faults bypass it.
+     """
+     rows = conn.execute(
+         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'wake_check_broken' "
+@@ -22,7 +24,7 @@ def recently_escalated(conn: sqlite3.Connection, task_id: str, cmd: str,
+             payload = json.loads(raw or "{}")
+         except (TypeError, ValueError):
+             continue
+-        if (isinstance(payload, dict) and payload.get("reason") == "gateway_offline"
++        if (isinstance(payload, dict) and payload.get("reason") in reasons
+                 and payload.get("wake_check") == cmd and payload.get("gateway") == gateway):
+             return True
+     return False
+diff --git a/hermes_cli/kanban_wait_replica.py b/hermes_cli/kanban_wait_replica.py
+index d27a44d1e91..051d4f72c10 100644
+--- a/hermes_cli/kanban_wait_replica.py
++++ b/hermes_cli/kanban_wait_replica.py
+@@ -29,6 +29,20 @@ class StaleReplica(ValueError):
+         self.gateway, self.board, self.age, self.task, self.limit = gateway, board, age, task, limit
+ 
+ 
++class UnknownScope(ValueError):
++    """The card was seen in the gateway's replica, but its owner published this board's scope as ``unknown``.
++
++    The owner's collector (hermes-hub ``collect_all``/``scope_heartbeats``) writes ``state: unknown`` with no
++    ``observed_at`` when it could not read the board for longer than its carry window; the task records it published
++    before are kept, never tombstoned. So the last-seen status is known and nothing vouches for it now: "cannot tell,
++    not yet", like a stale replica, but with no observation time to report as an age. [daveey]
++    """
++
++    def __init__(self, gateway, board, task):
++        super().__init__(f"task scope unknown for {gateway}/{board}")
++        self.gateway, self.board, self.task = gateway, board, task
++
++
+ def read_task(gateway, target, board=None):
+     """Exact owner-qualified match, including completed/archived records, with fresh scope proof."""
+     board = board or "default"
+@@ -55,6 +69,8 @@ def read_task(gateway, target, board=None):
+             # readers still count as fresh (kanban_scope_heartbeat). [daveey]
+             limit = max(limit, scope_window(info))
+         matched = [s for s in scopes if s.get("profile") == "default" and s.get("board") == board]
++        if len(matched) == 1 and matched[0].get("state") == "unknown" and "observed_at" not in matched[0]:
++            raise UnknownScope(gateway, board, task)
+         if len(matched) != 1 or matched[0].get("state") != "ok":
+             raise ValueError(f"missing successful task-scope observation for {gateway}/{board}")
+         age = time.time() - float(matched[0].get("observed_at") or 0)
+@@ -100,6 +116,16 @@ def stale_message(target, stale):
+             f"stale_age={stale.age:.0f}s, limit={stale.limit:.0f}s; last seen {status}, unknown now: not yet)")
+ 
+ 
++def unknown_message(target, unknown):
++    """Like ``stale_message``: words 0-1 keep the reader shape; ``source_state=unknown`` and ``gateway=`` are what the
++    wake-check dispatcher reads (``kanban_wake_check.source_unknown``). No ``stale_age=``: the owner published no
++    observation time, so none is invented. Never starts with ``error:``."""
++    status = unknown.task.get("status")
++    orphan = " orphan producer;" if orphan_reason(unknown.task) else ""
++    return (f"{target} {status} (replica scope unknown:{orphan} gateway={unknown.gateway} could not read board "
++            f"{unknown.board} (source_state=unknown); last seen {status}, unknown now: not yet)")
++
++
+ def check(gateway, target, *, board=None, until=(), since=(), live_timeout=None):
+     try:
+         source = "replica"
+@@ -113,6 +139,8 @@ def check(gateway, target, *, board=None, until=(), since=(), live_timeout=None)
+             source = "live owner"
+         except StaleReplica as stale:
+             return STALE_RC, stale_message(target, stale)
++        except UnknownScope as unknown:
++            return STALE_RC, unknown_message(target, unknown)
+         status = task["status"]
+         orphan = orphan_reason(task)
+         suffix = f" ({source}; orphan producer)" if orphan else f" ({source})"
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 17e45b9e6e4..699e94a48d6 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -14,6 +14,12 @@ dispatcher probes it off-thread on each tick:
+   then the card wakes (``wake_check_broken`` with ``reason=gateway_offline``) saying how long the
+   gateway has been offline. Identical task/probe/gateway escalations are limited to once per
+   24 hours across worker reparks; regular probes and successful-condition wakes are unchanged;
++* exit 3 with ``source_state=unknown`` and ``gateway=<name>`` -> unknown, not yet: the producer's gateway
++  published that board's scope as ``unknown`` (its collector could not read the board), so nothing vouches
++  for the last-seen status and there is no observation age. Never counted toward ``BROKEN_AFTER``; the
++  first such result wakes the card once (``wake_check_broken`` with ``reason=gateway_scope_unknown``), and
++  later ones for the same task/probe/gateway are held while a source-unavailable escalation
++  (``gateway_offline`` or ``gateway_scope_unknown``) is under 24 hours old;
+ * anything else, or a timeout, ``BROKEN_AFTER`` times in a row -> the card wakes with a
+   ``wake_check_broken`` event so a worker fixes the probe. A broken probe is never silent.
+ 
+@@ -62,6 +68,11 @@ UNKNOWN_RC = 3
+ STALE_WAKE_AFTER = 24 * 3600
+ STALE_AGE_RE = re.compile(r"\bstale_age=(\d+)s\b")
+ STALE_GATEWAY_RE = re.compile(r"\bgateway=(\S+)")
++# kanban_wait_replica.unknown_message: the owner published this board's scope as ``unknown``. [daveey]
++SOURCE_UNKNOWN_RE = re.compile(r"\bsource_state=unknown\b")
++SCOPE_UNKNOWN_REASON = "gateway_scope_unknown"
++# Escalations meaning "the producer's owner cannot vouch for its card": one acknowledges the other.
++SOURCE_UNAVAILABLE_REASONS = ("gateway_offline", SCOPE_UNKNOWN_REASON)
+ GUARD_SECONDS = 2 * 3600
+ OUTPUT_TAIL_CHARS = 500
+ MAX_CMD_CHARS = 2000
+@@ -98,6 +109,15 @@ def stale_age(rc: Any, out: str) -> Optional[int]:
+     return int(m.group(1)) if m else None
+ 
+ 
++def source_unknown(rc: Any, out: str) -> Optional[str]:
++    """The producer's gateway when this result is "owner scope unknown, not yet", else None. [daveey]"""
++    text = out or ""
++    if rc != UNKNOWN_RC or output_error(text) or STALE_AGE_RE.search(text) or not SOURCE_UNKNOWN_RE.search(text):
++        return None
++    m = STALE_GATEWAY_RE.search(text)
++    return (m.group(1).rstrip(",;)") or None) if m else None
++
++
+ def output_error(out: str) -> Optional[str]:
+     """The matching error line when a probe's output shows it crashed, else None."""
+     m = ERROR_OUTPUT_RE.search(out or "")
+@@ -148,8 +168,8 @@ def dry_run_error(cmd: Optional[str], *, cwd: Optional[str] = None, env: Optiona
+     if rc == 0 and not output_error(out):
+         return already_true_message(out, blocker_id=blocker_id)
+     bad = None
+-    if stale_age(rc, out) is not None:
+-        return None  # unknown, not yet: the producer's gateway is offline right now
++    if stale_age(rc, out) is not None or source_unknown(rc, out):
++        return None  # unknown, not yet: the producer's gateway is offline or cannot read its board right now
+     if not isinstance(rc, int) or rc >= 2:
+         bad = f"exited {rc}"
+     elif output_error(out):
+@@ -678,10 +698,10 @@ def _remote_producer(gateway: str, ref: str, board: Optional[str]) -> tuple[int,
+ def _remote_completed_at(gateway: str, ref: str, board: Optional[str]) -> Optional[int]:
+     """The remote card's ``completed_at`` from this host's hermes-hub replica, when it has one. Best effort."""
+     try:
+-        from hermes_cli.kanban_wait_replica import StaleReplica, read_task
++        from hermes_cli.kanban_wait_replica import StaleReplica, UnknownScope, read_task
+         try:
+             task = read_task(gateway, ref, board=board)
+-        except StaleReplica as exc:
++        except (StaleReplica, UnknownScope) as exc:
+             task = exc.task
+         value = task.get("completed_at")
+         return int(value) if value else None
+@@ -863,7 +883,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             from hermes_cli.kanban_offline_backoff import recently_escalated
+             m = STALE_GATEWAY_RE.search(out or "")
+             gw = m.group(1).rstrip(",;)") if m else "the producer's gateway"
+-            if age >= STALE_WAKE_AFTER and not recently_escalated(conn, task_id, cmd, gw, now, STALE_WAKE_AFTER):
++            if age >= STALE_WAKE_AFTER and not recently_escalated(conn, task_id, cmd, gw, now, STALE_WAKE_AFTER,
++                                                                  reasons=SOURCE_UNAVAILABLE_REASONS):
+                 hours = age / 3600
+                 return _wake(conn, task_id, BROKEN_EVENT, {
+                     "wake_check": cmd, "rc": rc, "fails": 0, "output": tail, "reason": "gateway_offline",
+@@ -877,6 +898,26 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 "next_at = ? WHERE task_id = ?", (now, rc, tail, now + int(state["every"]), task_id))
+             _note_alive(conn, task_id, cmd, now)
+             return None
++        gw = source_unknown(rc, out)
++        if gw is not None:
++            # The owner is publishing but says it could not read this board: unknown, not yet, never "broken".
++            # Escalate once; while that (or an offline) escalation is under 24 h old the same probe stays parked.
++            from hermes_cli.kanban_offline_backoff import recently_escalated
++            if not recently_escalated(conn, task_id, cmd, gw, now, STALE_WAKE_AFTER,
++                                      reasons=SOURCE_UNAVAILABLE_REASONS):
++                return _wake(conn, task_id, BROKEN_EVENT, {
++                    "wake_check": cmd, "rc": rc, "fails": 0, "output": tail, "reason": SCOPE_UNKNOWN_REASON,
++                    "gateway": gw,
++                    "note": (f"Gateway {gw} is syncing but reports it could not read its board, so the producer "
++                             "card's status is unknown (its last-seen status is kept, not trusted). Check that "
++                             "gateway's Hermes runtime and hermes-hub collector, then re-check and park again on "
++                             "the same probe (identical unknown results are then held for 24 h), or replan.")})
++            # Same unchanged source state, already escalated: keep any real-failure streak as it was.
++            conn.execute(
++                "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, "
++                "next_at = ? WHERE task_id = ?", (now, rc, tail, now + int(state["every"]), task_id))
++            _note_alive(conn, task_id, cmd, now)
++            return None
+         fails = int(state["fails"] or 0) + 1
+         if rc == 1:  # exit 1 with error output: a crashed probe posing as "not yet"
+             rc, rc_col = f"exit 1 with error output: {output_error(out)}", 1
+@@ -1030,6 +1071,9 @@ def _render_wake_context(conn: sqlite3.Connection, task_id: str) -> str:
+         elif payload.get("reason") == "gateway_offline":
+             lines.append("## Woken because the producer's gateway is offline")
+             lines.append(f"{payload.get('note')} Probe: `{payload.get('wake_check')}`. Last output:")
++        elif payload.get("reason") == SCOPE_UNKNOWN_REASON:
++            lines.append("## Woken because the producer's gateway could not read its board")
++            lines.append(f"{payload.get('note')} Probe: `{payload.get('wake_check')}`. Last output:")
+         else:
+             lines.append("## Woken because the wake check is broken")
+             lines.append(f"The park's wake_check `{payload.get('wake_check')}` failed "
+diff --git a/tests/hermes_cli/test_kanban_offline_backoff.py b/tests/hermes_cli/test_kanban_offline_backoff.py
+index 56d1177fceb..1e938559550 100644
+--- a/tests/hermes_cli/test_kanban_offline_backoff.py
++++ b/tests/hermes_cli/test_kanban_offline_backoff.py
+@@ -31,3 +31,19 @@ def test_receipt_identity_and_deadline(change, expected):
+         conn.execute("CREATE TABLE task_events(task_id TEXT, kind TEXT, created_at INTEGER, payload TEXT)")
+         conn.execute("INSERT INTO task_events VALUES(:task_id, :kind, :created_at, :payload)", row)
+         assert recently_escalated(conn, "waiter", "probe", "other", 1000, 100) is expected
++
++
++@pytest.mark.parametrize("reason, reasons, expected", [
++    ("gateway_scope_unknown", None, False),  # default family is offline only (pre-existing callers)
++    ("gateway_scope_unknown", ("gateway_offline", "gateway_scope_unknown"), True),
++    ("gateway_offline", ("gateway_offline", "gateway_scope_unknown"), True),
++    (None, ("gateway_offline", "gateway_scope_unknown"), False),  # a broken-probe wake is never a receipt
++    ("other", ("gateway_offline", "gateway_scope_unknown"), False),
++])
++def test_receipt_reason_family(reason, reasons, expected):
++    payload = {"reason": reason, "wake_check": "probe", "gateway": "other"}
++    with sqlite3.connect(":memory:") as conn:
++        conn.execute("CREATE TABLE task_events(task_id TEXT, kind TEXT, created_at INTEGER, payload TEXT)")
++        conn.execute("INSERT INTO task_events VALUES('waiter', 'wake_check_broken', 999, ?)", (json.dumps(payload),))
++        kwargs = {} if reasons is None else {"reasons": reasons}
++        assert recently_escalated(conn, "waiter", "probe", "other", 1000, 100, **kwargs) is expected
+diff --git a/tests/hermes_cli/test_kanban_wait_replica_unknown_scope.py b/tests/hermes_cli/test_kanban_wait_replica_unknown_scope.py
+new file mode 100644
+index 00000000000..83203200aca
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_replica_unknown_scope.py
+@@ -0,0 +1,259 @@
++"""An owner that publishes its board scope as ``unknown`` is "unknown, not yet", never met and never a broken probe.
++
++The hermes-hub collector (``client/hermes_hub.py`` ``collect_all`` + ``scope_heartbeats``) publishes
++``{"profile", "board", "state": "unknown"}`` with no ``observed_at`` when it could not read that board for longer
++than its 450 s carry window. The task records it published before stay in the replica, so the waiter knows the
++last-seen status but nothing vouches for it now: the same "cannot tell" as a stale (offline) replica. [daveey]
++"""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_wait_check as wait
++from hermes_cli import kanban_wake_check as wake
++from tests.hermes_cli import test_kanban_wait_replica as base
++
++TID = base.TID
++replica = base.replica
++board = base.board
++put = base.put
++make_stale = base.make_stale
++probe_results = base._probe_results
++DAY = wake.STALE_WAKE_AFTER
++
++
++def set_scopes(db, *scopes):
++    db.execute("UPDATE replica SET data=? WHERE coll='gateway'", (json.dumps({"task_scopes": list(scopes)}),))
++    db.commit()
++
++
++def producer_unknown(profile="default", board_name="default"):
++    """Exactly the record the hermes-hub collector writes for a scope whose read failed past its carry window."""
++    records = None  # collect_tasks failed: the source is not tombstoned
++    scope = {"profile": profile, "board": board_name, "state": "unknown" if records is None else "ok"}
++    if records is not None:
++        scope["observed_at"] = time.time()
++    return scope
++
++
++def make_unknown(db):
++    set_scopes(db, producer_unknown())
++
++
++@pytest.mark.parametrize("status", ["done", "running", "blocked", "archived"])
++def test_unknown_scope_is_unknown_not_yet_never_met(replica, status):
++    put(replica, status)
++    make_unknown(replica)
++    rc, out = wait.check_remote("other", "task", TID, until=("done", "blocked"))
++    assert rc == 3, out
++    assert out.split()[:2] == [TID, status]
++    assert "source_state=unknown" in out and "gateway=other" in out
++    assert "stale_age=" not in out  # no observation time exists: never invent one
++    assert not wake.output_error(out)
++    assert wake.source_unknown(rc, out) == "other"
++    assert wake.stale_age(rc, out) is None
++
++
++@pytest.mark.parametrize("scopes", [
++    [],  # nothing published for this board
++    [{"profile": "default", "board": "default", "state": "unknown"}] * 2,  # ambiguous
++    [{"profile": "default", "board": "default", "state": "error"}],  # unrecognised state
++    [{"profile": "default", "board": "default", "state": None}],
++    [{"profile": "default", "board": "default"}],
++    [{"profile": "default", "board": "default", "state": "unknown", "observed_at": 1}],  # contradictory
++    [{"profile": "default", "board": "default", "state": "ok", "observed_at": time.time()},
++     {"profile": "default", "board": "default", "state": "unknown"}],
++])
++def test_malformed_or_ambiguous_scopes_stay_errors(replica, scopes):
++    put(replica, "done")
++    set_scopes(replica, *scopes)
++    rc, out = wait.check_remote("other", "task", TID)
++    assert rc == 2 and out.startswith("error: replica other:"), out
++    assert wake.source_unknown(rc, out) is None
++
++
++def test_unknown_scope_on_missing_or_invalid_task_stays_error(replica):
++    make_unknown(replica)
++    assert wait.check_remote("other", "task", TID)[0] == 2  # nothing to have seen
++    put(replica, "done")
++    assert wait.check_remote("other", "task", TID, board="elsewhere")[0] == 2
++
++
++def test_other_profile_unknown_does_not_shadow_fresh_scope(replica):
++    put(replica, "done")
++    set_scopes(replica, {"profile": "default", "board": "default", "state": "ok", "observed_at": time.time()},
++               producer_unknown(profile="household"))
++    assert wait.check_remote("other", "task", TID, until=("done",))[0] == 0
++
++
++def test_lookalike_output_is_not_source_unknown():
++    assert wake.source_unknown(2, "x running (replica scope unknown: gateway=other source_state=unknown)") is None
++    assert wake.source_unknown(3, "error: replica other: source_state=unknown gateway=other") is None
++    assert wake.source_unknown(3, "x running (source_state=unknown)") is None  # no gateway named
++    assert wake.source_unknown(3, "x running (gateway=other)") is None
++    # A stale-age result is the offline path, never the scope-unknown one.
++    assert wake.source_unknown(3, "x running (gateway=other stale_age=9s source_state=unknown)") is None
++
++
++def test_offline_after_acknowledged_unknown_is_the_same_source_state(replica, board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    conn, tid = board
++    now = int(base.pin_replica_clock(monkeypatch))
++    put(replica, "running")
++    make_unknown(replica)
++    cmd = f"hermes kanban wait-check task {TID} --gateway other"
++    rc, out = wait.check_remote("other", "task", TID)
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, 1, start=now)
++    assert _broken(conn, tid)[-1]["reason"] == "gateway_scope_unknown"
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    _park(conn, tid, cmd)
++    make_stale(replica, DAY + 3600)  # then the owner stops syncing entirely
++    rc, out = wait.check_remote("other", "task", TID)
++    assert wake.stale_age(rc, out) is not None
++    probe_results(conn, tid, cmd, rc, out, 1, start=now + 900)
++    assert kb.get_task(conn, tid).status == "scheduled" and len(_broken(conn, tid)) == 1
++
++
++def test_dry_run_accepts_unknown_scope_park(replica, monkeypatch):
++    put(replica, "running")
++    make_unknown(replica)
++    monkeypatch.delenv("HERMES_KANBAN_WAKE_DRYRUN", raising=False)
++    rc, out = wait.check_remote("other", "task", TID)
++    monkeypatch.setattr(wake, "_run_probe", lambda *a, **kw: (rc, out))
++    assert wake.dry_run_error(f"hermes kanban wait-check task {TID} --gateway other") is None
++    monkeypatch.setattr(wake, "_run_probe", lambda *a, **kw: (2, "error: replica other: missing scope"))
++    assert "exited 2" in wake.dry_run_error(f"hermes kanban wait-check task {TID} --gateway other")
++
++
++def _park(conn, tid, cmd, every=900):
++    from hermes_cli import kanban_db as kb
++    assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", wake_check=cmd,
++                            check_every=every)
++
++
++def _broken(conn, tid):
++    from hermes_cli import kanban_db as kb
++    return [e.payload for e in kb.list_events(conn, tid) if e.kind == wake.BROKEN_EVENT]
++
++
++def test_unknown_scope_escalates_once_then_backs_off_across_repark(replica, board, monkeypatch):
++    """The observed incident: wake -> claim -> repark on the same probe must not re-wake every 3 probes."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn, tid = board
++    now = int(base.pin_replica_clock(monkeypatch))
++    put(replica, "running")
++    make_unknown(replica)
++    cmd = f"hermes kanban wait-check task {TID} --gateway other --until done,blocked"
++    rc, out = wait.check_remote("other", "task", TID, until=("done", "blocked"))
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, 1, start=now)
++    # Initial escalation: one typed wake, not a "broken probe" after BROKEN_AFTER faults.
++    assert kb.get_task(conn, tid).status == "ready"
++    first = _broken(conn, tid)
++    assert len(first) == 1 and first[0]["reason"] == "gateway_scope_unknown" and first[0]["gateway"] == "other"
++    assert first[0]["fails"] == 0
++    context = wake.render_wake_context(conn, tid)
++    assert "could not read its board" in context and "Fix the probe" not in context
++    # Acknowledged: the worker re-parks on the same probe. Unchanged unknown results never wake within 24 h.
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, wake.BROKEN_AFTER + 3, start=now + 60)
++    assert kb.get_task(conn, tid).status == "scheduled"
++    state = wake.get_state(conn, tid)
++    assert state["last_rc"] == 3 and state["fails"] == 0 and state["next_at"] > now
++    # Durable receipt: a fresh connection (another dispatcher process) sees the acknowledgement.
++    with kbc.connect_closing() as reopened:
++        probe_results(reopened, tid, cmd, rc, out, 1, start=now + 7200)
++        assert kb.get_task(reopened, tid).status == "scheduled"
++    assert len(_broken(conn, tid)) == 1
++    # Bounded: still unknown a day later -> one more escalation, never a silent forever.
++    probe_results(conn, tid, cmd, rc, out, 1, start=now + DAY + 1)
++    assert kb.get_task(conn, tid).status == "ready" and len(_broken(conn, tid)) == 2
++
++
++def test_unknown_after_acknowledged_offline_is_the_same_source_state(replica, board, monkeypatch):
++    """The detector was retained on rc 3 after a gateway_offline wake; the owner's scope then turned unknown."""
++    from hermes_cli import kanban_db as kb
++    conn, tid = board
++    now = int(base.pin_replica_clock(monkeypatch))
++    put(replica, "running")
++    make_stale(replica, DAY + 3600)
++    cmd = f"hermes kanban wait-check task {TID} --gateway other --until done,blocked"
++    rc, out = wait.check_remote("other", "task", TID, until=("done", "blocked"))
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, 1, start=now)
++    assert _broken(conn, tid)[-1]["reason"] == "gateway_offline"
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    _park(conn, tid, cmd)
++    make_unknown(replica)
++    rc, out = wait.check_remote("other", "task", TID, until=("done", "blocked"))
++    probe_results(conn, tid, cmd, rc, out, wake.BROKEN_AFTER + 1, start=now + 900)
++    assert kb.get_task(conn, tid).status == "scheduled" and len(_broken(conn, tid)) == 1
++
++
++@pytest.mark.parametrize("change", ["probe", "gateway"])
++def test_backoff_is_scoped_to_probe_and_gateway(replica, board, monkeypatch, change):
++    from hermes_cli import kanban_db as kb
++    conn, tid = board
++    now = int(base.pin_replica_clock(monkeypatch))
++    put(replica, "running")
++    make_unknown(replica)
++    cmd = f"hermes kanban wait-check task {TID} --gateway other"
++    rc, out = wait.check_remote("other", "task", TID)
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, 1, start=now)
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    if change == "probe":
++        cmd += " --until done"
++    else:
++        out = out.replace("gateway=other", "gateway=third")
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, 1, start=now + 60)
++    assert kb.get_task(conn, tid).status == "ready" and len(_broken(conn, tid)) == 2
++
++
++@pytest.mark.parametrize("next_result", ["done", "fault", "fresh_running"])
++def test_recovery_and_fault_controls_after_backoff(replica, board, monkeypatch, next_result):
++    from hermes_cli import kanban_db as kb
++    conn, tid = board
++    now = int(base.pin_replica_clock(monkeypatch))
++    put(replica, "running")
++    make_unknown(replica)
++    cmd = f"hermes kanban wait-check task {TID} --gateway other --until done,blocked"
++    rc, out = wait.check_remote("other", "task", TID, until=("done", "blocked"))
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, 1, start=now)
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    _park(conn, tid, cmd)
++    probe_results(conn, tid, cmd, rc, out, 2, start=now + 60)
++    assert kb.get_task(conn, tid).status == "scheduled"
++    if next_result == "fault":
++        # A genuine probe fault is never swallowed by the unknown-scope backoff.
++        probe_results(conn, tid, cmd, 2, "error: replica other: ambiguous replica records", wake.BROKEN_AFTER,
++                      start=now + 3600)
++        assert kb.get_task(conn, tid).status == "ready"
++        last = _broken(conn, tid)[-1]
++        assert last.get("reason") is None and last["fails"] == wake.BROKEN_AFTER
++        return
++    # The owner reads its board again: a fresh successful scope.
++    set_scopes(replica, {"profile": "default", "board": "default", "state": "ok", "observed_at": time.time()})
++    if next_result == "done":
++        replica.execute("DELETE FROM replica WHERE coll='tasks'")
++        put(replica, "done")
++    rc, out = wait.check_remote("other", "task", TID, until=("done", "blocked"))
++    probe_results(conn, tid, cmd, rc, out, 1, start=now + 3600)
++    if next_result == "done":
++        assert rc == 0 and kb.get_task(conn, tid).status == "ready"
++        assert any(e.kind == wake.CONDITION_MET_EVENT for e in kb.list_events(conn, tid))
++    else:
++        assert rc == 1 and kb.get_task(conn, tid).status == "scheduled"
++        assert wake.get_state(conn, tid)["last_rc"] == 1
++
++
++def test_unknown_scope_keeps_last_seen_completed_at(replica):
++    put(replica, "done", completed_at=1234)
++    make_unknown(replica)
++    assert wake._remote_completed_at("other", TID, None) == 1234
+-- 
+2.55.0
+
