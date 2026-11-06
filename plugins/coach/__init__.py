@@ -704,11 +704,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 store.log({"event": "report_only_confirm_capped", "session_id": session_id, "used": used, "cap": cap,
                            **tag})
                 return None
+            board = rc.named_card_facts(reply, coach.turn_rich(session_id)) if hasattr(rc, "named_card_facts") else []
             raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), reply,
-                                                                        prev_turn=prev))
+                                                                        prev_turn=prev, board=board))
             res = rc.parse_confirm(raw)
             store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
                        "p": res[0] if res else None, "evidence": res[1] if res else "", **tag,
+                       **({"board": [b.strip()[:200] for b in board]} if board else {}),
                        **((ref() if callable(ref) else ref) or {})})
             return res
         return confirm

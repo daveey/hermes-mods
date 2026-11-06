@@ -255,3 +255,35 @@ def test_blocked_parent_shows_as_blocked(tmp_path):
     db = _board_61f(tmp_path, parent_status="blocked")
     facts = rules.board_card_facts(DEPLOY, now=T_61F, dbs=[db])
     assert facts and facts["waits_on"] == [(FIXCARD, "blocked", 93.0)], facts
+
+
+# ── the live hook path: pre_verify -> second opinion reads the board and logs what it added ────────────────────────
+def test_live_hook_path_sends_and_logs_the_board_line(tmp_path, monkeypatch):
+    import time as _t
+    now = _t.time()
+    db = _board(tmp_path / "kanban.db",
+                tasks=[{"id": CORE, "status": "running", "created_at": int(now - 5000), "run": 1}],
+                events=[(CORE, "claimed", int(now - 600)), (CORE, "heartbeat", int(now - 20))],
+                runs=[(CORE, "running", None, int(now - 600))])
+    monkeypatch.setenv("COACH_BOARD_DBS", db)
+    for k in ("COACH_REPLY_RULES", "COACH_DRAFTS"):
+        monkeypatch.delenv(k, raising=False)
+    spec = importlib.util.spec_from_file_location("coach_init_namedcard", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core, rcl = mod._load("core"), mod._load("reply_check")
+    seen = []
+    monkeypatch.setattr(rcl, "aux_judge", lambda s, p: json.dumps(
+        {"handoff": 0, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0.93, "evidence": "screen"}))
+    monkeypatch.setattr(rcl, "aux_confirm", lambda s, p: (seen.append(p), json.dumps(
+        {"outcome": "handed_off", "agent_fixable": True, "quote": "running"}))[1])
+    store = core.Store(root=tmp_path / "coach")
+    _coach, hooks = mod.build(store=store, checkout=None)
+    hooks["pre_llm_call"](session_id="nc", user_message="why is the usage panel stale?")
+    reply = ("The panel reads a cached snapshot that never refreshes after a restart. I haven't fixed it; the cache "
+             f"refresh is not fixed yet. Card {CORE} owns that fix and is running now.")
+    hooks["pre_verify"](session_id="nc", attempt=0, final_response=reply)
+    assert seen and f"<- BOARD task={CORE} status=running" in seen[0], (seen[:1] or ["no confirm call"])[0][-600:]
+    logged = [json.loads(l) for l in (store.root / "log.jsonl").read_text().splitlines()]
+    conf = next(r for r in logged if r["event"] == "report_only_confirm")
+    assert conf["board"] and conf["board"][0].startswith(f"<- BOARD task={CORE} status=running"), conf
