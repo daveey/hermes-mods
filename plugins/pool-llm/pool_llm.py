@@ -280,7 +280,7 @@ def _chat_to_responses(messages: list, model: str) -> dict:
 
 def complete(messages: list, *, provider: str = "anthropic", model: Optional[str] = None, tier: Optional[str] = None,
              max_tokens: int = 4096, thinking: Optional[dict] = None) -> dict:
-    """One chat turn on the pool. Returns {text, provider, model, route}.
+    """One chat turn on the pool. Returns {text, provider, model, route}, plus Anthropic stop_reason.
 
     ``thinking`` is the Anthropic ``thinking`` field (e.g. ``{"type": "disabled"}`` for a short classifier answer,
     which adaptive thinking would otherwise eat); other providers ignore it."""
@@ -297,7 +297,10 @@ def complete(messages: list, *, provider: str = "anthropic", model: Optional[str
         resp = codex_responses(_chat_to_responses(messages, model), route=route)
         text = "".join(c.get("text", "") for it in resp.get("output", []) if it.get("type") == "message"
                        for c in it.get("content", []) if c.get("type") == "output_text")
-    return {"text": text, "provider": provider, "model": model, "route": route}
+    result = {"text": text, "provider": provider, "model": model, "route": route}
+    if provider == "anthropic":
+        result["stop_reason"] = resp.get("stop_reason")
+    return result
 
 
 class _Completions:
@@ -461,7 +464,7 @@ def main(argv: Optional[list] = None) -> int:
     a.add_argument("--tier", choices=TIERS)
     a.add_argument("--system", default="")
     a.add_argument("--max-tokens", type=int, default=4096)
-    a.add_argument("--json", action="store_true", help="print {text, provider, model, route}")
+    a.add_argument("--json", action="store_true", help="print result metadata (including Anthropic stop_reason)")
     sub.add_parser("models", help="subscription models the pool serves")
     sub.add_parser("check", help="one ping per pool; exit 0 when both answer")
     s = sub.add_parser("serve", help="local Anthropic/OpenAI-compatible endpoint on the pool")
@@ -496,6 +499,12 @@ def main(argv: Optional[list] = None) -> int:
         print(f"hermes-pool-llm: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(r) if args.json else r["text"])
+    stop_reason = r.get("stop_reason")
+    if r["provider"] == "anthropic" and (
+        stop_reason == "refusal" or (stop_reason == "max_tokens" and not r["text"].strip())
+    ):
+        print(f"hermes-pool-llm: completion failed (stop_reason={stop_reason})", file=sys.stderr)
+        return 2
     return 0
 
 

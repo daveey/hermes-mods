@@ -18,6 +18,14 @@ $B ask --provider openai --tier fast --json - < prompt.txt   # {text, provider, 
 $B serve --port 8765                                         # local SDK-compatible endpoint
 ```
 
+`ask --json` includes Anthropic's `stop_reason`. A `refusal` (even with text), or
+`max_tokens` with empty/whitespace-only text, exits 2 and names the stop reason on stderr;
+stdout still contains the result in the requested format. These semantic failures are not
+retried on other accounts. Nonempty partial answers remain successful. `complete()` preserves
+the stop reason as metadata; this exit-status policy applies to `ask`, not the raw API proxy.
+Regression coverage: `tests/test_ask.py` exercises both CLI output modes with mocked provider
+responses, including thinking-only failures, successful answers and Codex compatibility.
+
 `serve` lets an unmodified harness use the pool: `ANTHROPIC_BASE_URL=http://127.0.0.1:8765`,
 `OPENAI_BASE_URL=http://127.0.0.1:8765/v1`, any non-empty API key. It serves Anthropic `POST /v1/messages` (Claude
 Code system prefix and `mcp__` tool names added for the OAuth token, tool names restored in the reply) and OpenAI
