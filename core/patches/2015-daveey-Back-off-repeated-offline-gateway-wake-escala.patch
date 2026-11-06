@@ -1,0 +1,184 @@
+From 2a6c4ae61b9c13e847cfb320a3e609fcc32ea5f8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 18:31:40 -0800
+Subject: [PATCH] [daveey] Back off repeated offline gateway wake escalations
+ across reparks
+
+---
+ hermes_cli/kanban_offline_backoff.py          | 28 ++++++++++
+ hermes_cli/kanban_wake_check.py               | 10 ++--
+ .../hermes_cli/test_kanban_offline_backoff.py | 33 ++++++++++++
+ tests/hermes_cli/test_kanban_wait_replica.py  | 54 +++++++++++++++++++
+ 4 files changed, 121 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_offline_backoff.py
+ create mode 100644 tests/hermes_cli/test_kanban_offline_backoff.py
+
+diff --git a/hermes_cli/kanban_offline_backoff.py b/hermes_cli/kanban_offline_backoff.py
+new file mode 100644
+index 00000000000..b17933099ce
+--- /dev/null
++++ b/hermes_cli/kanban_offline_backoff.py
+@@ -0,0 +1,28 @@
++"""Bound repeated offline escalations across probe deletion/repark. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++
++def recently_escalated(conn: sqlite3.Connection, task_id: str, cmd: str,
++                       gateway: str, now: int, cooldown: int) -> bool:
++    """Read durable (also pre-fix) wake receipts, not the disposable probe row.
++
++    Age in the output continually increases and is not a new premise. A bounded
++    persisted wall-clock deadline survives process restart and board replication.
++    Only offline escalations are throttled; success and unexpected faults bypass it.
++    """
++    rows = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'wake_check_broken' "
++        "AND created_at > ? AND created_at <= ?",
++        (task_id, now - cooldown, now))
++    for (raw,) in rows:
++        try:
++            payload = json.loads(raw or "{}")
++        except (TypeError, ValueError):
++            continue
++        if (isinstance(payload, dict) and payload.get("reason") == "gateway_offline"
++                and payload.get("wake_check") == cmd and payload.get("gateway") == gateway):
++            return True
++    return False
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index f964e9831c4..17e45b9e6e4 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -12,7 +12,8 @@ dispatcher probes it off-thread on each tick:
+   wait-check`` read the card from a stale replica of an offline gateway (a sleeping Mac). Probed
+   again without counting toward ``BROKEN_AFTER``, until the replica is ``STALE_WAKE_AFTER`` old;
+   then the card wakes (``wake_check_broken`` with ``reason=gateway_offline``) saying how long the
+-  gateway has been offline;
++  gateway has been offline. Identical task/probe/gateway escalations are limited to once per
++  24 hours across worker reparks; regular probes and successful-condition wakes are unchanged;
+ * anything else, or a timeout, ``BROKEN_AFTER`` times in a row -> the card wakes with a
+   ``wake_check_broken`` event so a worker fixes the probe. A broken probe is never silent.
+ 
+@@ -859,9 +860,10 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             return None
+         age = stale_age(rc, out)
+         if age is not None:
+-            if age >= STALE_WAKE_AFTER:
+-                m = STALE_GATEWAY_RE.search(out or "")
+-                gw = m.group(1).rstrip(",;)") if m else "the producer's gateway"
++            from hermes_cli.kanban_offline_backoff import recently_escalated
++            m = STALE_GATEWAY_RE.search(out or "")
++            gw = m.group(1).rstrip(",;)") if m else "the producer's gateway"
++            if age >= STALE_WAKE_AFTER and not recently_escalated(conn, task_id, cmd, gw, now, STALE_WAKE_AFTER):
+                 hours = age / 3600
+                 return _wake(conn, task_id, BROKEN_EVENT, {
+                     "wake_check": cmd, "rc": rc, "fails": 0, "output": tail, "reason": "gateway_offline",
+diff --git a/tests/hermes_cli/test_kanban_offline_backoff.py b/tests/hermes_cli/test_kanban_offline_backoff.py
+new file mode 100644
+index 00000000000..56d1177fceb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_offline_backoff.py
+@@ -0,0 +1,33 @@
++"""Offline cooldown receipts remain scoped and bounded, including legacy events."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_offline_backoff import recently_escalated
++
++
++@pytest.mark.parametrize("change, expected", [
++    ({}, True),
++    ({"task_id": "different"}, False),
++    ({"kind": "condition_met"}, False),
++    ({"created_at": 900}, False),
++    ({"created_at": 1001}, False),
++    ({"created_at": 901}, True),
++    ({"payload": "bad json"}, False),
++    ({"payload": "[]"}, False),
++    ({"payload": None}, False),
++    ({"reason": "different"}, False),
++    ({"wake_check": "different"}, False),
++    ({"gateway": "different"}, False),
++])
++def test_receipt_identity_and_deadline(change, expected):
++    payload = {"reason": "gateway_offline", "wake_check": "probe", "gateway": "other"}
++    payload.update({k: v for k, v in change.items() if k in payload})
++    row = {"task_id": "waiter", "kind": "wake_check_broken", "created_at": 999,
++           "payload": json.dumps(payload)}
++    row.update({k: v for k, v in change.items() if k in row})
++    with sqlite3.connect(":memory:") as conn:
++        conn.execute("CREATE TABLE task_events(task_id TEXT, kind TEXT, created_at INTEGER, payload TEXT)")
++        conn.execute("INSERT INTO task_events VALUES(:task_id, :kind, :created_at, :payload)", row)
++        assert recently_escalated(conn, "waiter", "probe", "other", 1000, 100) is expected
+diff --git a/tests/hermes_cli/test_kanban_wait_replica.py b/tests/hermes_cli/test_kanban_wait_replica.py
+index 10932d317de..746db749b86 100644
+--- a/tests/hermes_cli/test_kanban_wait_replica.py
++++ b/tests/hermes_cli/test_kanban_wait_replica.py
+@@ -167,6 +167,60 @@ def test_gateway_offline_past_cap_wakes_with_offline_note(replica, board):
+     assert "producer's gateway is offline" in wake.render_wake_context(conn, tid)
+ 
+ 
++@pytest.mark.parametrize("next_result", ["offline", "met", "fault", "changed_probe", "cooldown"])
++def test_offline_escalation_repark_backoff(replica, board, monkeypatch, next_result):
++    from hermes_cli import kanban_db as kb
++
++    conn, tid = board
++    now = pin_replica_clock(monkeypatch)
++    put(replica, "blocked")
++    make_stale(replica, wake.STALE_WAKE_AFTER + 3600)
++    rc, out = wait.check_remote("other", "task", TID, since=("blocked",))
++    cmd = f"hermes kanban wait-check task {TID} --gateway other --from blocked"
++
++    def park(command):
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++                                wake_check=command, check_every=3600)
++
++    park(cmd)
++    _probe_results(conn, tid, cmd, rc, out, 1, start=int(now))
++    assert kb.get_task(conn, tid).status == "ready"
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    if next_result == "changed_probe":
++        cmd += " --until done"
++    park(cmd)
++    if next_result == "met":
++        make_stale(replica, 0)
++        replica.execute("DELETE FROM replica WHERE coll='tasks'")
++        put(replica, "done")
++        rc, out = wait.check_remote("other", "task", TID, since=("blocked",))
++        assert rc == 0
++    elif next_result == "fault":
++        rc, out = 2, "error: unexpected probe fault"
++    start = int(now) + (wake.STALE_WAKE_AFTER if next_result == "cooldown" else 2)
++    _probe_results(conn, tid, cmd, rc, out, 1, start=start)
++    if next_result == "offline":
++        assert kb.get_task(conn, tid).status == "scheduled"
++        state = wake.get_state(conn, tid)
++        assert state["next_at"] == start + 3600
++        assert state["last_rc"] == 3 and state["fails"] == 0
++        # A new connection sees the durable acknowledgement, not process state.
++        from hermes_cli import kanban_db_connect as kbc
++        with kbc.connect_closing() as reopened:
++            _probe_results(reopened, tid, cmd, rc, out.replace("90000", "93600"), 1, start=start + 3600)
++            assert kb.get_task(reopened, tid).status == "scheduled"
++    elif next_result == "fault":
++        assert kb.get_task(conn, tid).status == "scheduled"
++        _probe_results(conn, tid, cmd, rc, out, wake.BROKEN_AFTER - 1, start=start + 3600)
++        assert kb.get_task(conn, tid).status == "ready"
++        event = [e for e in kb.list_events(conn, tid) if e.kind == wake.BROKEN_EVENT][-1]
++        assert event.payload["output"] == out and event.payload["fails"] == wake.BROKEN_AFTER
++    else:
++        assert kb.get_task(conn, tid).status == "ready"
++        if next_result == "met":
++            assert any(e.kind == wake.CONDITION_MET_EVENT for e in kb.list_events(conn, tid))
++
++
+ def test_schedule_awaiting_card_on_stale_replica_is_accepted(replica, board, monkeypatch):
+     from hermes_cli import kanban_db as kb
+     from tools import kanban_tools as kt
+-- 
+2.55.0
+

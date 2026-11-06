@@ -1,0 +1,413 @@
+From d70c6e1b95694222b79b8976ec2460972ba0155b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 20:50:33 +0000
+Subject: [PATCH] [daveey] Preserve scratch used by live owner-tagged jobs
+
+Veto completion, deferred parent and GC deletion while a same-user live job has a local card owner tag and cwd under the workspace. Recheck birth identity and retry naturally after exit; never signal jobs or grant permanent retention from marker files.
+
+Proof: four real-writer regressions fail on base; two shared/child-writer regressions fail before review correction. Initial focused suite 1136 passed; revised authority/integration suite 33 passed. Opus review fixes addressed; final review, mutations, hub replay and CI pending.
+---
+ hermes_cli/kanban_db_workspace.py             |   6 +-
+ hermes_cli/kanban_workspace_jobs.py           |  84 +++++++++++
+ hermes_cli/kanban_worktree_gc.py              |   6 +-
+ .../test_kanban_scratch_owned_jobs.py         |  97 +++++++++++++
+ .../hermes_cli/test_kanban_workspace_jobs.py  | 130 ++++++++++++++++++
+ 5 files changed, 321 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_workspace_jobs.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_owned_jobs.py
+ create mode 100644 tests/hermes_cli/test_kanban_workspace_jobs.py
+
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index 55b076f6855..b63a05af23d 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
+ import contextlib
+ 
+ from hermes_cli.worktree_ops import release_lsp_clients
++from hermes_cli.kanban_workspace_jobs import defer_owned_job_cleanup
+ 
+ if TYPE_CHECKING:
+     from hermes_cli.kanban_db import Task
+@@ -454,7 +455,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+             if _is_managed_scratch_path(wp):
+                 if not _scratch_tree_removable(wp):
+                     _kb._log.info("Preserving scratch workspace with Git metadata or scan uncertainty: %s", wp)
+-                elif not _defer_shared_workspace_cleanup(conn, task_id, path):
++                elif (not _defer_shared_workspace_cleanup(conn, task_id, path)
++                      and not defer_owned_job_cleanup(task_id, wp)):
+                     release_lsp_clients(str(wp))
+                     shutil.rmtree(wp, ignore_errors=True)
+                     _log_scratch_removal(conn, task_id, wp, "scratch workspace")
+@@ -607,6 +609,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
+                     continue
+                 if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
+                     continue
++                if defer_owned_job_cleanup(parent_id, wp):
++                    continue
+                 release_lsp_clients(str(wp))
+                 shutil.rmtree(wp, ignore_errors=True)
+                 _log_scratch_removal(conn, parent_id, wp, f"deferred parent scratch workspace (child {task_id} done)")
+diff --git a/hermes_cli/kanban_workspace_jobs.py b/hermes_cli/kanban_workspace_jobs.py
+new file mode 100644
+index 00000000000..a35893f086e
+--- /dev/null
++++ b/hermes_cli/kanban_workspace_jobs.py
+@@ -0,0 +1,84 @@
++"""Read-only scratch deletion veto for externally supervised, card-owned jobs.
++
++The external-job convention is HERMES_OWNER_CARD=<card>@<hostname>. A marker
++file or a stored PID is not authority: inspect a same-user process's current cwd,
++exact owner tag and start identity on every cleanup attempt. Never signal it.
++Existing GC retries after exit; no retention setting or permanent marker changes.
++This deliberately covers cwd dependencies, not arbitrary absolute output paths.
++"""
++from __future__ import annotations
++
++import logging
++import re
++import stat
++import time
++from pathlib import Path
++
++import psutil
++
++from gateway.status import get_process_start_time
++from hermes_cli.kanban_host_identity import hostname_prefix
++
++log = logging.getLogger(__name__)
++_SCAN_SECONDS = 1.0
++
++
++def _local_owner_tag(tag: str, hostname: str) -> bool:
++    # The job may belong to a child or another card sharing this directory.
++    # Its live cwd, not equality with the row being cleaned, establishes use.
++    match = re.fullmatch(r't_[0-9a-f]+@([A-Za-z0-9.-]+)', tag)
++    return bool(match and match[1].lower().split('.')[0] == hostname.lower().split('.')[0])
++
++
++def _holds_workspace(proc, path: Path, hostname: str, username: str) -> bool:
++    """Unknown identity after a matching tag conservatively keeps this attempt."""
++    depends_on_path = False
++    try:
++        if proc.username() != username:
++            return False
++        birth = get_process_start_time(proc.pid)
++        cwd = proc.cwd()
++        if not cwd or not Path(cwd).is_relative_to(path):
++            return False
++        depends_on_path = True
++        if not _local_owner_tag(proc.environ().get('HERMES_OWNER_CARD', ''), hostname):
++            return False
++        if proc.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
++            return False
++        current = get_process_start_time(proc.pid)
++        # A known replacement is not the process whose authority we observed.
++        return birth is None or current is None or current == birth
++    except psutil.NoSuchProcess:
++        return False
++    except (psutil.AccessDenied, OSError):
++        # Only a demonstrated cwd dependency earns an uncertainty veto. A root
++        # service we cannot even inspect must not pin every task on the machine.
++        return depends_on_path
++
++
++def defer_owned_job_cleanup(task_id: str, path: Path | str) -> bool:
++    """True means keep scratch this pass; all four removal paths use this veto.
++
++    A bounded incomplete scan fails closed. No cached verdict: a stale tag or
++    exited PID cannot retain a directory on the next successful GC pass.
++    """
++    path = Path(path)
++    try:
++        if not stat.S_ISDIR(path.lstat().st_mode):
++            return True
++        path = path.resolve(strict=True)
++        hostname = hostname_prefix()[:-1]
++        username = psutil.Process().username()
++        deadline = time.monotonic() + _SCAN_SECONDS
++        for proc in psutil.process_iter():
++            if time.monotonic() >= deadline:
++                log.warning('Deferring scratch cleanup for %s: owned-job scan budget exhausted', task_id)
++                return True
++            if _holds_workspace(proc, path, hostname, username):
++                log.info('Deferring scratch cleanup for %s: live/uncertain owned job pid=%s cwd under %s',
++                         task_id, proc.pid, path)
++                return True
++    except (psutil.Error, OSError, RuntimeError):
++        log.info('Deferring scratch cleanup for %s: owned-job scan unavailable', task_id)
++        return True
++    return False
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index e5c09849de4..11e65458625 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -18,6 +18,7 @@ from pathlib import Path
+ 
+ from hermes_cli import kanban_db_workspace as ws
+ from hermes_cli import kanban_lockguard
++from hermes_cli.kanban_workspace_jobs import defer_owned_job_cleanup
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -78,6 +79,8 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+                 continue
+             if ws._defer_shared_workspace_cleanup(conn, row["id"], path):
+                 continue
++            if defer_owned_job_cleanup(row["id"], path):
++                continue
+             if not removable:
+                 aged.append((row["id"], path, row["completed_at"]))
+                 continue
+@@ -130,7 +133,8 @@ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Pa
+     trash = path.with_name(f".{path.name}.gc-{os.getpid()}")
+     with kb.write_txn(conn):
+         if (not ws._is_terminal_task(conn, task_id) or ws._has_active_children(conn, task_id)
+-                or ws._defer_shared_workspace_cleanup(conn, task_id, path)):
++                or ws._defer_shared_workspace_cleanup(conn, task_id, path)
++                or defer_owned_job_cleanup(task_id, path)):
+             log.info("Keeping scratch workspace for task %s after archiving it to %s: "
+                      "the card is live again or shares the path: %s", task_id, final, path)
+             return 0
+diff --git a/tests/hermes_cli/test_kanban_scratch_owned_jobs.py b/tests/hermes_cli/test_kanban_scratch_owned_jobs.py
+new file mode 100644
+index 00000000000..9cabe0a75ac
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_owned_jobs.py
+@@ -0,0 +1,97 @@
++"""Completion/GC must not remove the cwd of a live, explicitly owned job."""
++from contextlib import contextmanager
++import socket
++import subprocess
++import sys
++
++import psutil
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_git_preservation as helpers
++from tests.waiting import wait_until
++from tools.environments.local import build_subprocess_env
++
++board = helpers.board
++
++
++@contextmanager
++def writer(path, task_id, monkeypatch):
++    script = (
++        "from pathlib import Path; import sys; "
++        "Path('ready').write_text('ready'); sys.stdin.readline(); "
++        "Path('after-completion').write_text('still writing')"
++    )
++    env = build_subprocess_env()
++    env['HERMES_OWNER_CARD'] = f'{task_id}@{socket.gethostname()}'
++    proc = subprocess.Popen(
++        [sys.executable, '-c', script], cwd=path, env=env, stdin=subprocess.PIPE,
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8',
++    )
++    try:
++        wait_until(lambda: (path / 'ready').exists(), timeout=10)
++        # Keep discovery isolated; all identity/cwd/environment reads are real.
++        monkeypatch.setattr(psutil, 'process_iter', lambda *args, **kwargs: iter([psutil.Process(proc.pid)]))
++        yield proc
++    finally:
++        if proc.poll() is None:
++            proc.terminate()
++        proc.communicate(timeout=10)
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('entry', ['complete', 'parent', 'gc', 'archive'])
++def test_owned_writer_survives_cleanup_then_gc_reclaims(board, monkeypatch, entry):
++    tid, path = helpers.scratch(board)
++    child = None
++    if entry == 'parent':
++        child = kb.create_task(board, title='child', workspace_kind='dir', workspace_path=str(path / 'child'))
++        kb.link_tasks(board, tid, child)
++    with writer(path, tid, monkeypatch) as proc:
++        if entry == 'archive':
++            # Exercise the destructive post-archive recheck independently of the first GC guard.
++            from hermes_cli import kanban_scratch_archive as archive
++            monkeypatch.setattr(archive, 'archive_workspace', lambda *a, **kw: path.parent / 'saved')
++            with kb.write_txn(board):
++                board.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++            assert gc._archive_and_remove_scratch(board, tid, path, None) == 0
++        elif entry == 'gc':
++            with kb.write_txn(board):
++                board.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++            assert gc.gc_task_scratch(board) == 0
++        else:
++            assert kb.complete_task(board, tid, result='done')
++            if child:
++                assert kb.complete_task(board, child, result='done')
++        assert path.is_dir(), 'cleanup removed a live owned writer cwd'
++        stdout, stderr = proc.communicate('write\n', timeout=10)
++        assert proc.returncode == 0, (stdout, stderr)
++        assert (path / 'after-completion').read_text() == 'still writing'
++        monkeypatch.setattr(psutil, 'process_iter', lambda *args, **kwargs: iter([]))
++        assert gc.gc_task_scratch(board) == 1
++        assert not path.exists()
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('relation', ['sharer', 'child'])
++def test_other_card_owned_writer_keeps_shared_scratch(board, monkeypatch, relation):
++    tid, path = helpers.scratch(board)
++    other = kb.create_task(board, title='other owner', workspace_kind='dir', workspace_path=str(path))
++    if relation == 'child':
++        kb.link_tasks(board, tid, other)
++    with writer(path, other, monkeypatch) as proc:
++        assert kb.complete_task(board, other if relation == 'sharer' else tid, result='done')
++        assert kb.complete_task(board, tid if relation == 'sharer' else other, result='done')
++        assert path.is_dir(), 'the remaining writer belongs to the other card'
++        stdout, stderr = proc.communicate('write\n', timeout=10)
++        assert proc.returncode == 0, (stdout, stderr)
++        assert (path / 'after-completion').read_text() == 'still writing'
++
++
++def test_inactive_owner_note_does_not_pin_workspace(board, monkeypatch):
++    tid, path = helpers.scratch(board)
++    (path / 'OWNER.md').write_text(f'card: {tid}@{socket.gethostname()}\npid: 12345\n')
++    monkeypatch.setattr(psutil, 'process_iter', lambda *args, **kwargs: iter([]))
++    assert kb.complete_task(board, tid, result='done')
++    assert not path.exists()
+diff --git a/tests/hermes_cli/test_kanban_workspace_jobs.py b/tests/hermes_cli/test_kanban_workspace_jobs.py
+new file mode 100644
+index 00000000000..ec5cc638a9b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_workspace_jobs.py
+@@ -0,0 +1,130 @@
++"""Authority, identity and uncertainty controls for the read-only cleanup veto."""
++from unittest.mock import Mock
++
++import psutil
++import pytest
++
++from hermes_cli import kanban_workspace_jobs as jobs
++
++
++@pytest.fixture
++def authority(tmp_path, monkeypatch):
++    proc = Mock(pid=987654321)
++    proc.username.return_value = 'fixture-user'
++    proc.cwd.return_value = str(tmp_path)
++    proc.environ.return_value = {'HERMES_OWNER_CARD': 't_abcdef01@fixture-host'}
++    proc.status.return_value = psutil.STATUS_SLEEPING
++    monkeypatch.setattr(jobs, 'get_process_start_time', lambda pid: 'boot:100')
++    monkeypatch.setattr(jobs, 'hostname_prefix', lambda: 'fixture-host:')
++    monkeypatch.setattr(psutil, 'Process', lambda: proc)
++    monkeypatch.setattr(psutil, 'process_iter', lambda: iter([proc]))
++    return proc, tmp_path
++
++
++@pytest.mark.parametrize('tag', ['t_abcd1234@fixture-host', 't_abcdef01@FIXTURE-HOST.example'])
++def test_local_shared_owner_or_fqdn_holds(authority, tag):
++    proc, path = authority
++    proc.environ.return_value = {'HERMES_OWNER_CARD': tag}
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++def test_fqdn_hostname_accepts_short_tag(authority, monkeypatch):
++    _, path = authority
++    monkeypatch.setattr(jobs, 'hostname_prefix', lambda: 'FIXTURE-HOST.example:')
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++def test_exact_live_owner_holds(authority):
++    _, path = authority
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++@pytest.mark.parametrize('method,value', [
++    ('username', 'another-user'),
++    ('environ', {'HERMES_OWNER_CARD': 't_other@fixture-host'}),
++    ('environ', {'HERMES_OWNER_CARD': 't_abcdef01@foreign-host'}),
++    ('environ', {}),
++    ('cwd', ''),
++    ('status', psutil.STATUS_ZOMBIE),
++    ('status', psutil.STATUS_DEAD),
++])
++def test_non_authorities_do_not_hold(authority, monkeypatch, method, value):
++    proc, path = authority
++    monkeypatch.setattr(psutil, 'Process', lambda: Mock(username=lambda: 'fixture-user'))
++    getattr(proc, method).return_value = value
++    assert not jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++@pytest.mark.parametrize('location', ['outside', 'prefix-sibling'])
++def test_unrelated_cwd_does_not_hold(authority, location):
++    proc, path = authority
++    proc.cwd.return_value = {'outside': str(path.parent), 'prefix-sibling': str(path) + '-other'}[location]
++    assert not jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++def test_vanished_process_does_not_hold(authority):
++    proc, path = authority
++    proc.environ.side_effect = psutil.NoSuchProcess(proc.pid)
++    assert not jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++def test_reused_pid_does_not_hold(authority, monkeypatch):
++    _, path = authority
++    stamps = iter(['boot:100', 'boot:200'])
++    monkeypatch.setattr(jobs, 'get_process_start_time', lambda pid: next(stamps))
++    assert not jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++@pytest.mark.parametrize('stamps', [(None, 'boot:100'), ('boot:100', None)])
++def test_matching_candidate_unknown_birth_defers(authority, monkeypatch, stamps):
++    _, path = authority
++    values = iter(stamps)
++    monkeypatch.setattr(jobs, 'get_process_start_time', lambda pid: next(values))
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++@pytest.mark.parametrize('stage,expected', [('cwd', False), ('environ', True)])
++def test_access_denial_requires_known_path_dependency(authority, stage, expected):
++    proc, path = authority
++    getattr(proc, stage).side_effect = psutil.AccessDenied(proc.pid)
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path) is expected
++
++
++def test_scan_budget_defers_without_process_read(authority, monkeypatch):
++    proc, path = authority
++    ticks = iter([10.0, 12.0])
++    monkeypatch.setattr(jobs.time, 'monotonic', lambda: next(ticks))
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path)
++    proc.cwd.assert_not_called()
++
++
++def test_discovery_failure_defers(authority, monkeypatch):
++    _, path = authority
++    def broken():
++        raise OSError('unavailable')
++    monkeypatch.setattr(psutil, 'process_iter', broken)
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++@pytest.mark.parametrize('kind', ['file', 'symlink', 'absent'])
++def test_non_directory_never_authorizes_deletion(authority, kind):
++    proc, path = authority
++    target = path / 'target'
++    if kind == 'file':
++        target.write_text('not a directory')
++    elif kind == 'symlink':
++        target.symlink_to(path, target_is_directory=True)
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', target)
++    proc.cwd.assert_not_called()
++
++
++def test_descendant_cwd_holds(authority):
++    proc, path = authority
++    proc.cwd.return_value = str(path / 'nested')
++    assert jobs.defer_owned_job_cleanup('t_abcdef01', path)
++
++
++def test_empty_inventory_allows_cleanup(authority, monkeypatch):
++    _, path = authority
++    monkeypatch.setattr(psutil, 'process_iter', lambda: iter([]))
++    assert not jobs.defer_owned_job_cleanup('t_abcdef01', path)
+-- 
+2.55.0
+

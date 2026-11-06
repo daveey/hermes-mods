@@ -1,0 +1,989 @@
+diff --git a/agent/redact.py b/agent/redact.py
+index 9c038894297..164d92d635f 100644
+--- a/agent/redact.py
++++ b/agent/redact.py
+@@ -15,6 +15,7 @@ from urllib.parse import unquote_plus
+ # Shared with agent/file_safety's read-block list so the two defenses can't
+ # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
+ from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
++from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_strings
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -24,63 +25,12 @@ logger = logging.getLogger(__name__)
+ REDACT_WALK_MAX_DEPTH = 320
+ REDACT_WALK_DEPTH_MARKER = "[redacted: nesting limit]"
+ 
+-# ---------------------------------------------------------------------------
+-# Vault-value redaction registry (profile-scoped, bounded)
+-# ---------------------------------------------------------------------------
+-# Exact secret values that transited a server-side vault fill (browser_vault). Generic
+-# credential-shaped regexes cannot catch an arbitrary user password, so the fill path registers
+-# the exact bytes and every browser_* tool result (including browser_cdp Runtime.evaluate
+-# passthrough) is scrubbed against them before it can reach the model. Memory only: never
+-# persisted or logged. Keyed by profile home so a multiplex gateway never scrubs profile B's
+-# output with profile A's passwords (which would also confirm to B that the bytes exist), and
+-# bounded per profile: a fill-heavy session evicts its oldest entries rather than growing forever.
+-_VAULT_REDACTION_MAX_PER_PROFILE = 64
+-_VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
+-_VAULT_REDACTION_LOCK = threading.Lock()
+-
+-
+-def _vault_scope() -> str:
+-    from hermes_constants import get_hermes_home
+-    return str(get_hermes_home())
+-
+-
+-def register_vault_redaction_value(value) -> None:
+-    """Register an exact vault secret value for model-facing redaction.
+-
+-    Called by the vault fill path BEFORE the injection happens, so no later browser tool result
+-    can echo the value back into model context. Also registers the form a text input normalizes
+-    it to (CR/LF stripped), since that is what the page holds.
+-    """
+-    if not isinstance(value, str) or not value:
+-        return
+-    normalized = value.replace("\r", "").replace("\n", "")
+-    with _VAULT_REDACTION_LOCK:
+-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
+-        for v in (value, normalized):
+-            if v:
+-                bucket.pop(v, None)  # re-registering refreshes recency
+-                bucket[v] = None
+-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+-            del bucket[next(iter(bucket))]
+-
+-
+-def clear_vault_redaction_values() -> None:
+-    """Drop the current profile's registered values (profile teardown / explicit lock)."""
+-    with _VAULT_REDACTION_LOCK:
+-        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+-
+-
+-def redact_registered_vault_values(text: str) -> str:
+-    """Exact-substring scrub of every vault secret value registered for the current profile."""
+-    if not isinstance(text, str) or not text:
+-        return text
+-    with _VAULT_REDACTION_LOCK:
+-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
+-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
+-    for value in values:
+-        if value in text:
+-            text = text.replace(value, "«redacted-vault-secret»")
+-    return text
++# Public facade for vault-fill callers; keep the registry in its topical sibling.
++from agent.redact_vault import (
++    clear_vault_redaction_values,
++    redact_registered_vault_values,
++    register_vault_redaction_value,
++)
+ 
+ # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
+ # codes / pre-signed signatures with no vendor prefix.
+@@ -355,11 +305,9 @@ _CFG_ANCHORED_RE = re.compile(
+     re.IGNORECASE | re.MULTILINE,
+ )
+ 
+-# Unquoted YAML / colon config (``password: secret``): keyword in the KEY
+-# (anchored to line start) and a single whitespace-free value, so ``note:
+-# secret meeting`` is left alone. Bare ``auth`` excluded so ``Authorization:``
+-# (masked by _AUTH_HEADER_RE) / ``author:`` don't match; ``auth_token`` still
+-# matches via ``token``. Quoted values defer to _JSON_FIELD_RE (lookahead).
++# YAML / colon config: bare-key quoted scalars cannot match _JSON_FIELD_RE.
++# Match escaped double quotes, doubled single quotes, or an unquoted token.
++# An unterminated quote masks to end-of-line; no branch crosses LF or CRLF.
+ # NOTE(perf): possessive where the successor is disjoint; the leading class
+ # stays backtrackable (see _CFG_DOTTED_RE).
+ _YAML_CFG_NAMES = (
+@@ -367,10 +315,13 @@ _YAML_CFG_NAMES = (
+     r"|client[ _.\-]?key[ _.\-]?data|(?:private|signing|encryption|master|hmac)[ _.\-]?key)"
+ )
+ _YAML_ASSIGN_RE = re.compile(
+-    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
++    rf"(^[ \t]*+{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)"
++    r"(\"(?:\\[^\r\n]|[^\"\\\r\n])*\"|'(?:''|[^'\r\n])*'|['\"][^\r\n]*|[^\s&]++)",
+     re.IGNORECASE | re.MULTILINE,
+ )
+ 
++_YAML_CFG_WORD_RE = re.compile(_YAML_CFG_NAMES, re.IGNORECASE)
++
+ # Word-boundary validation for the key patterns above: their classes allow
+ # arbitrary affixes (``client_secret``, ``s3.secret-key``), which also matched
+ # prose CONTAINING a keyword (``Secretary:``, ``tokenizer:``). A keyword counts
+@@ -449,9 +400,30 @@ def _has_word_bounded_keyword(key: str, keyword_re: re.Pattern[str]) -> bool:
+     return any(_is_word_start(key, m.start()) and _is_word_end(key, m.end()) for m in keyword_re.finditer(key))
+ 
+ 
++_PASSWORD_WORD_RE = re.compile(r"passwd|password", re.IGNORECASE)
++
++
++def _has_password_keyword(key: str) -> bool:
++    """``password``/``passwd`` ending a word, wherever it starts: no prose word ends in them, so
++    concatenated keys (``dbpassword``, ``rootpasswd``) are credentials, while ``passwordless``
++    is not. Requiring a word START too passed ``dbpassword: <v>`` through in clear."""
++    return any(_is_word_end(key, m.end()) for m in _PASSWORD_WORD_RE.finditer(key))
++
++
++# Tool-defined env names that glue the keyword onto a prefix with no separator, so the
++# word-boundary test can never see it: libpq's ``PGPASSWORD``, MySQL's ``MYSQL_PWD`` (bare
++# ``PWD`` is the shell's working directory, so only this exact name), sshpass's ``SSHPASS``.
++_GLUED_CREDENTIAL_ENV_RE = re.compile(r"PGPASSWORD|MYSQL_PWD|SSHPASS", re.IGNORECASE)
++
++
++def _is_glued_credential_env(key: str) -> bool:
++    return _GLUED_CREDENTIAL_ENV_RE.fullmatch(key.strip("\"'")) is not None
++
++
+ def _key_has_secret_keyword(key: str) -> bool:
+     """Post-match key validator: ``API_KEY``/``DB_PW`` count, ``KEYBOARD``/``secretary`` do not."""
+-    return _has_word_bounded_keyword(key, _KEY_KEYWORD_RE)
++    return (_has_word_bounded_keyword(key, _KEY_KEYWORD_RE) or _has_password_keyword(key)
++            or _is_glued_credential_env(key))
+ 
+ 
+ def _looks_like_opaque_credential(value: str) -> bool:
+@@ -489,7 +461,8 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
+         return False
+     # A shell rc's ``SSH_AUTH_SOCK=$HOME/.ssh/agent.sock`` is configuration the agent must keep
+     # readable; only password-class keys mask a path/variable reference.
+-    if _PATH_OR_VAR_VALUE_RE.match(value) and not _has_word_bounded_keyword(key, _PASSWORD_KEY_RE):
++    password_key = _has_word_bounded_keyword(key, _PASSWORD_KEY_RE) or _has_password_keyword(key)
++    if _PATH_OR_VAR_VALUE_RE.match(value) and not password_key:
+         # ``$VAR`` is an unambiguous reference. A bare ``/...`` or ``~...`` is not:
+         # ``/home/u/.docker`` and ``/8f3kd9sKd0als...`` have the same shape, so every
+         # segment has to look like a path (see _OPAQUE_PATH_SEGMENT_RE) before the
+@@ -498,7 +471,8 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
+             return False
+     # ``signing_key`` / ``privateKey`` are credentials at any length, the same policy
+     # is_secret_field_name applies to mappings, so JSON text and dicts agree.
+-    return (_has_word_bounded_keyword(key, _STRONG_KEY_KEYWORD_RE)
++    return (password_key or _has_word_bounded_keyword(key, _STRONG_KEY_KEYWORD_RE)
++            or _is_glued_credential_env(key)
+             or (_is_qualified_key_name(key) and not _CONFIG_PLACEHOLDER_VALUE_RE.fullmatch(value))
+             or _looks_like_opaque_credential(value))
+ 
+@@ -513,7 +487,7 @@ _KEY_QUALIFIED_NAME = (
+     r"[_.\-]?(?:key|Key|KEY)"
+ )
+ _JSON_KEY_NAMES = (
+-    r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer"
++    r"(?:api_?[Kk]ey|token|secret|password|pgpassword|mysql_pwd|sshpass|access_token|refresh_token|auth_token|bearer"
+     r"|secret_value|raw_secret|secret_input|key_material|client[_.\-]?key[_.\-]?data"
+     rf"|{_KEY_QUALIFIED_NAME})"
+ )
+@@ -523,6 +497,16 @@ _JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORE
+ # The backreference keeps the key's and value's escape depth equal. ``(?<!\\)`` starts a match only at the head
+ # of a backslash run: retrying from every backslash of a long run was quadratic.
+ _JSON_FIELD_ESCAPED_RE = re.compile(rf'((?<!\\)(\\+)"{_JSON_KEY_NAMES}\2")\s*:\s*\2"([^"\\]+)\2"', re.IGNORECASE)
++# Any other identifier-shaped key (``"API_TOKEN"``, ``"DB_PASSWORD"``, ``"client_secret"``): the closed
++# list above misses affixed names that the ENV and YAML passes already accept (#147240). The callback
++# applies the YAML pass's word set at a word boundary, then the shared assignment gate.
++# The value may carry JSON escapes (``"s3cret\\value"``): ``\\.`` consumes each escape pair whole.
++_JSON_ANY_KEY_FIELD_RE = re.compile(r'("([A-Za-z0-9_.\-]{1,128}+)")\s*+:\s*+"((?:[^"\\\n]|\\.)++)"')
++# The same field inside a JSON-encoded string (``{"output": "{\\"DB_PASSWORD\\": \\"…\\"}"}``),
++# like _JSON_FIELD_ESCAPED_RE does for the closed key list: group 2 is the escape run.
++_JSON_ANY_KEY_FIELD_ESCAPED_RE = re.compile(
++    r'((?<!\\)(\\++)"([A-Za-z0-9_.\-]{1,128}+)\2")\s*+:\s*+\2"([^"\\\n]++)\2"')
++_JSON_KEY_NAMES_FULL_RE = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
+ 
+ # Python ``repr`` uses single-quoted mapping fields, so opaque credentials in
+ # tracebacks and pytest failure introspection bypass the double-quoted JSON rule
+@@ -668,10 +652,11 @@ _DB_CONNSTR_RE = re.compile(
+ # belong to _DB_CONNSTR_RE. 8+ char floor skips short usernames; the class
+ # forbids ``/`` so an ``@`` in a path/query (``?q=user@example.com``) never counts.
+ # This is the ``git remote set-url origin https://PASSWORD@github.com/...`` shape from issue #6396 — a
+-# single opaque credential in the userinfo position with NO ``user:pass`` colon. The colon form
+-# ``user:pass@`` is deliberately left to pass through (commit "pass web URLs through unchanged", #34029) and
+-# is NOT matched here — the token class forbids ``:``. DB schemes are handled by _DB_CONNSTR_RE above and
+-# excluded here. Guards against false positives:
++# single opaque credential in the userinfo position with NO ``user:pass`` colon. The colon form's
++# PASSWORD is masked separately by _redact_userinfo_passwords (issue #125664) — #34029's pass-through
++# was about query-string round-trip tokens (magic links / OAuth callbacks / pre-signed URLs live in
++# the query, never in userinfo), and a userinfo password is a credential, not a workflow token. DB
++# schemes are handled by _DB_CONNSTR_RE above and excluded here. Guards against false positives:
+ _URL_BARE_TOKEN_RE = re.compile(
+     r"((?:https?|wss?|git|ssh|ftp|ftps|sftp)://)"  # scheme
+     r"([^\s:@/]{8,})"                               # bare token (no colon/slash/@), 8+ chars
+@@ -706,6 +691,56 @@ _STRICT_URL_PARAM_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]
+ # ``//`` — an optional-scheme prefix backtracked O(n²) on long alphanumeric runs
+ # (~55s per sub() on a 320KB compaction payload).
+ _STRICT_URL_USERINFO_RE = re.compile(r"//[^/\s?#@]+@")
++# The same authority span with the delimiter and userinfo captured, for _redact_userinfo_passwords.
++_URL_USERINFO_PAIR_RE = re.compile(r"(//)([^/\s?#@]+)@")
++
++# ``NAME=user:pass`` where NAME carries no secret keyword — an HTTP Basic auth pair is often stored
++# this way (#125664). Shape-only on arbitrary names, so it runs force-only (persistence boundary,
++# debug dumps, session export all pass force=True): ordinary prose/config keeps today's behaviour.
++# Guards against non-secret colon values: the password needs an 8-char floor AND a letter (ports and
++# digit-only tags fail it), the password group is a single token (no whitespace, quotes or ``/`` —
++# so ``registry.example.com:5000/repo`` keeps its path, and an ISO timestamp's ``:00:00`` tail
++# truncates the group to digits), and a version-shaped tail (``24.04-noble``, ``v1.2.3-alpine``)
++# is rejected outright. The value is the WHOLE assignment (``user`` cannot contain ``:``/``@``/``/``),
++# and the ``:(?!//)`` lookahead keeps ``scheme://`` values (``MY_URL=https://example.com``) out.
++# ``user`` must also be at least 2 characters: a single-letter ``user:`` is a Windows drive
++# (``SRC=C:\Users\...``), and masking the whole path as ``SRC=C:***`` at a force boundary is
++# unrecoverable data loss — no real Basic pair has a one-letter user, and a secret-keyword NAME
++# still masks via the ENV pass (#125680 review).
++# ``@`` is not a password character here either: a ``user:pass@host``-shaped value belongs to the
++# userinfo pass below, which knows the f-string ``{...}`` template exemption; excluding it lets that
++# pass see the pure brace expression (``BASIC="user:{pw}@host"`` keeps its template verbatim).
++_BASIC_PAIR_ASSIGN_RE = re.compile(
++    r"(?<![A-Za-z0-9_.\-])([A-Za-z][A-Za-z0-9_.\-]{0,63})=([\"']?)"
++    r"([A-Za-z0-9._~\-]{2,})(?::(?!//)([^\s'\"/:@]+))\2(?![^\s;,&|)\]}\"'`])"
++)
++
++# ``24.04-noble`` / ``v1.2.3-alpine`` image tags: digit-led dotted versions, optionally ``v``-prefixed
++# — long and letter-bearing enough to pass the floor, yet never a credential.
++_VERSION_TAG_RE = re.compile(r"^[vV]?\d+(\.\d+)+")
++# ``nginx:stable-alpine`` / ``myrepo:latest-release``: lower-case words joined by ``-``/``.``
++# are image tags and labels; a password carries a digit, a capital or a symbol.
++_WORD_TAG_RE = re.compile(r"[a-z]++(?:[.\-][a-z]++)*+")
++
++# ``CHECKSUM=sha256:1234…`` digest labels: the hex body is long and letter-bearing, but a hash
++# algorithm name as the ``user`` half marks the pair as an algorithm:digest, not a credential
++# (#125680 review). No real Basic pair has one of these as its username.
++_HASH_ALGO_NAMES = frozenset({
++    "md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha3-224", "sha3-256",
++    "sha3-384", "sha3-512", "blake2b", "blake2s", "ripemd160", "crc32", "crc32c",
++})
++
++# ``NAME=user:pass`` is only a Basic pair when NAME says it holds one: ``IMAGE=redis:7-alpine``,
++# ``BRANCH=origin:feature2``, ``LS_COLORS=...:mh=00:...`` and ``Server=tcp:db,1433`` are colon
++# values under names that never carry credentials (#149435 review).
++_BASIC_PAIR_NAME_RE = re.compile(r"auth|basic|cred|login|proxy|userpass|userinfo", re.IGNORECASE)
++
++
++def _is_basic_pair_password(password: str) -> bool:
++    """8+ chars with a letter and not a version-shaped tail — a secret, not a tag or timestamp."""
++    if _VERSION_TAG_RE.search(password) or _WORD_TAG_RE.fullmatch(password):
++        return False
++    return len(password) >= 8 and any(c.isalpha() for c in password)
+ 
+ # Form-urlencoded body: only when the ENTIRE text is a k=v&k=v string.
+ _FORM_BODY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$")
+@@ -724,7 +759,41 @@ def _compile_prefix_matcher(patterns: list) -> re.Pattern[str]:
+     return re.compile(r"(?<![A-Za-z0-9_-])(" + "|".join(patterns) + r")(?![A-Za-z0-9_-])")
+ 
+ 
++def _compile_prefix_sub_matcher(patterns: list) -> re.Pattern[str]:
++    """_PREFIX_RE for the masking pass, also admitting a key glued to an identifier by ``-``/``_``
++    (``backup-sk-…``, ``x-ghp_…``), which _PREFIX_RE rejects so ``scikit-learn`` stays whole. One
++    fixed-width lookbehind keeps main's single scan; _mask_prefix_match masks a glued match only
++    when its body is opaque, so ``backup-sk-learn`` stays whole too (#147240)."""
++    # Branches grouped by their literal first char (every pattern opens on one, see
++    # register_redaction_patterns): admitting ``-``/``_`` before a key makes every separator a
++    # candidate, and a flat 60-way alternation per candidate doubled the cost of a ``_ghp_`` flood.
++    # Groups are disjoint by first char, so leftmost-first match order is unchanged.
++    by_first: dict = {}
++    for pattern in patterns:
++        by_first.setdefault(pattern[0], []).append(pattern[1:])
++    body = "|".join(f"{re.escape(c)}(?:{'|'.join(rest)})" for c, rest in by_first.items())
++    return re.compile(r"(?<![A-Za-z0-9])(" + body + r")(?![A-Za-z0-9_-])")
++
++
+ _PREFIX_RE = _compile_prefix_matcher(_PREFIX_PATTERNS)
++_PREFIX_SUB_RE = _compile_prefix_sub_matcher(_PREFIX_PATTERNS)
++# A real key body has a 16+ char run with no separator mixing two of lower/upper/digit;
++# ``sk-prod-deployment-01`` and ``fc-feature-flags-v2`` do not.
++_LONG_ALNUM_RUN_RE = re.compile(r"[A-Za-z0-9]{16,}+")
++
++
++def _is_opaque_prefixed_token(token: str) -> bool:
++    for run in _LONG_ALNUM_RUN_RE.finditer(token):
++        run = run.group(0)
++        if (run.isalpha() and (run.islower() or run.isupper())) or run.isdigit():
++            continue
++        return True
++    return False
++
++
++def _mask_prefix_match(m: "re.Match[str]", mask) -> str:
++    glued = m.start() > 0 and m.string[m.start() - 1] in "-_"
++    return m.group(0) if glued and not _is_opaque_prefixed_token(m.group(1)) else mask(m.group(1))
+ 
+ # Zhipu API keys use an unprefixed ``id.secret`` form. Keep this deliberately
+ # provider-shaped instead of applying a generic high-entropy dotted-token rule:
+@@ -1237,6 +1306,38 @@ def _assignment_sub(render, *, check_keyword: bool):
+     return _sub
+ 
+ 
++_JSON_FLAG_VALUES = frozenset({"true", "false", "yes", "no", "null", "none"})
++_JSON_VALUE_SUFFIX_RE = re.compile(r"[_.\-]?(?:value|Value|VALUE)$")
++
++
++def _json_affixed_key_secret(key: str, value: str) -> bool:
++    """Whether ``"key": "value"`` holds a credential under an affixed secret-word key (#147240)."""
++    if _JSON_KEY_NAMES_FULL_RE.fullmatch(key):  # the closed-list pass already decided this field
++        return False
++    if not (_has_word_bounded_keyword(key, _YAML_CFG_WORD_RE) or _has_password_keyword(key)):
++        return False
++    if _DSN_PW_PLACEHOLDER_RE.fullmatch(value) or not _should_redact_assignment(key, value, check_keyword=True):
++        return False
++    # A key that does not END in the credential word is metadata about one: ``passwordChanged``,
++    # ``password_expires_at``, ``tokenUrl``, ``secret_id``, ``secret_arn``, ``PASSWORD_STORE_DIR``
++    # carry timestamps, URLs and ids that look opaque, so the value shape cannot decide (#149435
++    # review). A boolean answers ``has_password``, it does not hold one.
++    # ``api_key_value`` / ``passwordValue`` hold the credential itself: drop that one suffix first.
++    return _is_python_repr_secret_key(_JSON_VALUE_SUFFIX_RE.sub("", key)) and value.casefold() not in _JSON_FLAG_VALUES
++
++
++def _redact_json_affixed_key(m: "re.Match[str]", mask) -> str:
++    if not _json_affixed_key_secret(m.group(2), m.group(3)):
++        return m.group(0)
++    return f'{m.group(1)}: "{mask(m.group(3))}"'
++
++
++def _redact_json_affixed_key_escaped(m: "re.Match[str]", mask) -> str:
++    if not _json_affixed_key_secret(m.group(3), m.group(4)):
++        return m.group(0)
++    return f'{m.group(1)}: {m.group(2)}"{mask(m.group(4))}{m.group(2)}"'
++
++
+ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
+     """ENV / config / JSON / YAML assignment passes (skipped for code files). Passes
+     that would match ``token=``/``key=`` URL params skip ``://`` text (web-URL query
+@@ -1275,16 +1376,31 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
+         if '\\"' in text:
+             text = _JSON_FIELD_ESCAPED_RE.sub(
+                 _assignment_sub(lambda g: f'{g[0]}: {g[1]}"{mask(g[2])}{g[1]}"', check_keyword=False), text)
++        text = _JSON_ANY_KEY_FIELD_RE.sub(lambda m: _redact_json_affixed_key(m, mask), text)
++        if '\\"' in text:
++            text = _JSON_ANY_KEY_FIELD_ESCAPED_RE.sub(lambda m: _redact_json_affixed_key_escaped(m, mask), text)
+ 
+     # Python mapping repr fields ({'API_KEY': '…'}): single-quoted, so the JSON rule
+     # above never sees them — the traceback / pytest-introspection leak shape.
+     if ":" in text and "'" in text:
+         text = _redact_python_repr_fields(text)
+ 
+-    # YAML after JSON: quoted values are handled there (_YAML_ASSIGN_RE skips quotes).
++    # YAML after JSON; unwrap scalars before the shared assignment gate so
++    # quoted programmatic env lookups retain the same exemption as bare ones.
+     if ":" in text and "://" not in text:
+-        text = _YAML_ASSIGN_RE.sub(
+-            _assignment_sub(lambda g: f"{g[0]}{g[1]}{mask(g[2])}", check_keyword=True), text)
++        def _redact_yaml(m):
++            key, sep, value = m.groups()
++            quote = value[0] if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0] else ""
++            inner = value[1:-1] if quote else value
++            # An empty or docs-placeholder scalar (``""``, ``"<your key>"``, ``"${API_KEY}"``) is not
++            # a credential; masking it hides what the config expects, as _redact_db already rules.
++            if quote and (not inner or _DSN_PW_PLACEHOLDER_RE.fullmatch(inner)
++                          or (inner.startswith("{{") and inner.endswith("}}"))):  # Helm/Jinja template
++                return m.group(0)
++            if not _should_redact_assignment(key, inner, check_keyword=True):
++                return m.group(0)
++            return f"{key}{sep}{quote}{mask(inner)}{quote}"
++        text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
+     return text
+ 
+ 
+@@ -1294,8 +1410,36 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
+ _DSN_PW_PLACEHOLDER_RE = re.compile(r"<(?:[a-z][a-z_ -]*|[A-Z][A-Z_ -]*)>|\$\{?[A-Z_][A-Z0-9_]*\}?")
+ 
+ 
++# ``https://user:password@host`` in docs names the field instead of filling it in.
++_USERINFO_PLACEHOLDER_WORDS = frozenset({"password", "passwd", "pass", "pw", "pwd", "secret", "token"})
++
++
++def _is_userinfo_placeholder(password: str) -> bool:
++    """A template (``{pw}``, ``{{ pw }}``), docs placeholder or field name, never a literal secret."""
++    return ((password.startswith("{") and password.endswith("}"))
++            or _DSN_PW_PLACEHOLDER_RE.fullmatch(password) is not None
++            or password.casefold() in _USERINFO_PLACEHOLDER_WORDS)
++
++
++def _redact_userinfo_passwords(text: str) -> str:
++    """Mask the password half of ``scheme://user:pass@host`` userinfo (#125664).
++
++    #34029's pass-through was about query-string round-trip tokens (magic links, OAuth callbacks,
++    pre-signed URLs live in the query, never in userinfo); the userinfo password is a credential —
++    the same reasoning #6396 used to mask the bare-token form. Keeps scheme, username and host
++    visible. Templates and docs samples (``{pw}``, ``${TOKEN}``, ``password``) stay as written."""
++    def _sub(m):
++        user, sep, password = m.group(2).partition(":")
++        # f-string / Jinja templates and docs samples (``user:{pw}@``, ``user:${TOKEN}@``,
++        # ``user:password@``) in prose and logs as much as in code files.
++        if not sep or not password or _is_userinfo_placeholder(password):
++            return m.group(0)
++        return f"{m.group(1)}{user}:***@"
++    return _URL_USERINFO_PAIR_RE.sub(_sub, text)
++
++
+ def _redact_url_credentials(text: str, code_file: bool) -> str:
+-    """DB connection-string passwords and bare-token URL userinfo (``://`` text only)."""
++    """DB connection-string passwords, bare-token and ``user:pass`` URL userinfo (``://`` text only)."""
+     def _redact_db(m):
+         # code_file: a pure ``{...}`` password is an f-string template reference
+         # (f"postgresql://{user}:{pass}@{host}"), not a literal credential.
+@@ -1307,7 +1451,8 @@ def _redact_url_credentials(text: str, code_file: bool) -> str:
+             return m.group(0)
+         return f"{m.group(1)}***{m.group(3)}"
+     text = _DB_CONNSTR_RE.sub(_redact_db, text)
+-    return _URL_BARE_TOKEN_RE.sub(lambda m: f"{m.group(1)}{_mask_token(m.group(2))}{m.group(3)}", text)
++    text = _URL_BARE_TOKEN_RE.sub(lambda m: f"{m.group(1)}{_mask_token(m.group(2))}{m.group(3)}", text)
++    return _redact_userinfo_passwords(text)
+ 
+ 
+ def _redact_phone(m):
+@@ -1377,7 +1522,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
+         # runs by first matching on a control-stripped copy, then re-masking the corresponding span in the
+         # original (the stripped copy and the original are aligned 1:1 for non-control chars).
+         text = _mask_control_split_tokens(text, _prefix_sub)
+-        text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
++        text = _PREFIX_SUB_RE.sub(lambda m: _mask_prefix_match(m, _prefix_sub), text)
+ 
+     if "." in text:
+         _zhipu_sub = _mask_token_nonreusable if file_read else _mask_token
+@@ -1397,6 +1542,25 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
+     text = _redact_private_key_blocks(text)
+     text = _redact_cli_secrets(text, _mask_token_nonreusable if file_read else None)
+ 
++    if force and "=" in text:
++        # ``NAME=user:pass`` under an innocuous name (#125664): shape-only, so force-only — every
++        # force=True caller (persistence boundary, debug dumps, session export) is a safety boundary
++        # that must not return raw secrets; ordinary flows keep today's pass-through.
++        def _basic_pair(m):
++            password = m.group(4)
++            if password is None or not _BASIC_PAIR_NAME_RE.search(m.group(1)) \
++                    or not _is_basic_pair_password(password):
++                return m.group(0)
++            # ``CHECKSUM=sha256:<hex>``: an algorithm:digest label, not a user:credential pair.
++            if m.group(3).lower() in _HASH_ALGO_NAMES:
++                return m.group(0)
++            # A template or docs placeholder, not a literal credential — the rule
++            # _redact_userinfo_passwords applies below.
++            if _is_userinfo_placeholder(password):
++                return m.group(0)
++            return f"{m.group(1)}={m.group(2)}{m.group(3)}:***{m.group(2)}"
++        text = _BASIC_PAIR_ASSIGN_RE.sub(_basic_pair, text)
++
+     if "uthorization" in text or "UTHORIZATION" in text:  # cheapest gate over every casing
+         text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
+ 
+@@ -1412,6 +1576,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
+     if "://" in text:
+         text = _redact_url_credentials(text, code_file)
+ 
++    # Keyword/value connection strings (``Host=…;Password=…``, libpq ``host=… password=…``):
++    # the forms the URL pass above never sees. Gate: a ``password=``/``pwd=`` key in any casing;
++    # the per-line companion-key check in _redact_kv_connection_strings keeps prose out.
++    if _KV_CONNSTR_GATE_RE.search(text):
++        text = _redact_kv_connection_strings(text, code_file)
++
+     if "eyJ" in text:
+         text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
+ 
+@@ -1734,9 +1904,10 @@ def _plugin_patterns() -> list:
+ def _rebuild_prefix_matcher() -> None:
+     """Recompile the prefix alternation and pre-screen substrings; callers read the
+     module globals at call time, so the swap propagates immediately."""
+-    global _PREFIX_RE, _PREFIX_SUBSTRINGS
++    global _PREFIX_RE, _PREFIX_SUB_RE, _PREFIX_SUBSTRINGS
+     combined = _PREFIX_PATTERNS + _plugin_patterns()
+     _PREFIX_RE = _compile_prefix_matcher(combined)
++    _PREFIX_SUB_RE = _compile_prefix_sub_matcher(combined)
+     _PREFIX_SUBSTRINGS = tuple(_extract_literal_prefix(p) for p in combined)
+ 
+ 
+diff --git a/agent/redact_connstr.py b/agent/redact_connstr.py
+new file mode 100644
+index 00000000000..e29faf547f4
+--- /dev/null
++++ b/agent/redact_connstr.py
+@@ -0,0 +1,147 @@
++"""Keyword/value connection-string password masking for agent.redact.
++
++ADO.NET / ODBC / JDBC ``Host=db;Password=…`` and libpq ``host=db password=…`` conninfo; the
++URL form (``scheme://user:pass@host``) stays in agent/redact.py.
++"""
++
++import re
++
++
++# Keyword/value connection strings (ADO.NET, Npgsql, ODBC, JDBC SQL Server):
++# ``Host=db;Username=app;Password=s3cret;Database=x``, and libpq's space-delimited conninfo
++# (``psql "host=db user=app password=s3cret dbname=x"``). _DB_CONNSTR_RE only covers the
++# ``scheme://user:pass@`` URL form, so a .NET connection string printed by ``kubectl get
++# configmap``, ``cat appsettings.json`` or ``env`` leaked its password verbatim.
++#
++# Every key pattern starts AT the key name behind a fixed-width lookbehind. A leading
++# ``(?:^|[;\s])\s*`` rescans runs of whitespace from every start position: quadratic, and
++# a 16K-space line took ~30s. Value extents are found by _kv_value_end, not by regex, so
++# each grammar (ODBC braces, ADO.NET doubled quotes, libpq backslash escapes) is exact.
++_KV_KEY_BOUNDARY = r"(?<![^\s;\"'])"
++_KV_CONNSTR_PW_RE = re.compile(
++    _KV_KEY_BOUNDARY + r"(?:password|pwd)[ \t]*=[ \t]*", re.IGNORECASE)
++_KV_CONNSTR_GATE_RE = re.compile(r"(?:password|pwd)\s*=", re.IGNORECASE)
++# A ``password=``/``pwd=`` key is only treated as a connection-string field when its line
++# also carries a companion connection key (``host=``, ``user=``, ``dbname=``...). Keeps prose
++# (``the password= field``), form bodies (handled by _redact_form_body) and lone CLI flags out.
++_KV_CONNSTR_KEYS = (
++    r"host|server|data\s+source|address|addr|network\s+address|user\s*id|uid|"
++    r"user(?:name)?|database|dbname|hostaddr|initial\s+catalog|port")
++_KV_CONNSTR_COMPANION_RE = re.compile(
++    _KV_KEY_BOUNDARY + r"(?:" + _KV_CONNSTR_KEYS + r")[ \t]*=", re.IGNORECASE)
++# ``;``-delimited grammar (ADO.NET/ODBC/JDBC) when a ``;`` is followed by a known field.
++# libpq values may contain a bare ``;`` (``password=a;b dbname=x``), so a ``;`` alone
++# does not decide the grammar.
++_KV_SEMICOLON_FIELD_RE = re.compile(
++    r";[ \t]*(?:" + _KV_CONNSTR_KEYS + r"|password|pwd|driver|encrypt|pooling|"
++    r"integrated\s+security|trusted_connection|trustservercertificate|sslmode|ssl\s+mode|"
++    r"timeout|connect(?:ion)?\s+timeout|application\s+name|search\s+path)[ \t]*=",
++    re.IGNORECASE)
++
++
++# ``{0}`` / ``{pw}`` / ``{cfg['pw']}`` / ``{pw!r}`` / ``{ get_pw() }``: a str.format, f-string or C#
++# interpolation slot. An ODBC-braced literal is the rest: ``;`` inside, a ``}}`` escape, or content
++# that does not open like an expression (``{Zq7x;LmP2}``).
++# ``@ $ & #`` and a ``!`` that is not a ``!r``/``!s``/``!a`` conversion never appear in such a slot but
++# do in passwords (``{P@ssw0rd!}``, ``{Tr0ub4dor&3}``).
++_FORMAT_SLOT_RE = re.compile(r"\{\s*+(?:[A-Za-z0-9_](?:[^;{}@$&#!]|![rsa](?=\s*+[:}]))*+)?\}")
++
++
++def _kv_value_end(line: str, i: int, semicolon: bool) -> int:
++    """End index of the value starting at ``line[i]``; the scan never backtracks."""
++    n = len(line)
++    if i >= n:
++        return i
++    c = line[i]
++    if semicolon:
++        if c == "{":  # ODBC braced value, ``}}`` escapes a brace
++            j = i + 1
++            while j < n:
++                if line[j] == "}":
++                    if j + 1 < n and line[j + 1] == "}":
++                        j += 2
++                        continue
++                    return j + 1
++                j += 1
++            return n
++        if c in "\"'":  # ADO.NET quoting, doubled quote escapes
++            j = i + 1
++            while j < n:
++                if line[j] == c:
++                    if j + 1 < n and line[j + 1] == c:
++                        j += 2
++                        continue
++                    return j + 1
++                j += 1
++            return n
++        j = i
++        while j < n and line[j] not in ";\"'\r\n":
++            j += 1
++        while j > i and line[j - 1] in " \t":  # trailing padding stays visible
++            j -= 1
++        return j
++    # libpq conninfo: quoted or unquoted, backslash escapes any character.
++    if c in "\"'":
++        j = i + 1
++        while j < n:
++            if line[j] == "\\":
++                j += 2
++                continue
++            if line[j] == c:
++                return j + 1
++            j += 1
++        return n
++    j = i
++    while j < n:
++        if line[j] == "\\":
++            j += 2
++            continue
++        if line[j] in " \t\r\n\"'":  # quotes: the shell quoting that wraps the conninfo
++            break
++        j += 1
++    return min(j, n)
++
++
++def _redact_kv_connection_line(line: str, code_file: bool) -> str:
++    if not _KV_CONNSTR_GATE_RE.search(line) or not _KV_CONNSTR_COMPANION_RE.search(line):
++        return line
++    semicolon = _KV_SEMICOLON_FIELD_RE.search(line) is not None
++    out, pos = [], 0
++    for m in _KV_CONNSTR_PW_RE.finditer(line):
++        if m.start() < pos:  # inside a value already masked
++            continue
++        vstart = m.end()
++        vend = _kv_value_end(line, vstart, semicolon)
++        value = line[vstart:vend]
++        # ``the pwd= flag``: space after ``=`` but not before it is prose, not an empty value followed
++        # by the next word. Padding on both sides (``password = x``) is still a conninfo field.
++        eq = line.rindex("=", m.start(), m.end())
++        if not value or (not semicolon and line[m.end() - 1] in " \t" and line[eq - 1] not in " \t"):
++            continue
++        bare = value.strip("\"'")
++        # Templates, not credentials: ``Password={0}``, ``Password=${DB_PASS}``, ``{pw}``. ODBC braces a
++        # literal value (``PWD={Zq7x;LmP2}``), so on a ``;`` line only a format slot or an identifier
++        # counts as a template; ``cat appsettings.json`` output is read as code_file.
++        if code_file and bare.startswith(("{", "${")) and bare.endswith("}") and (
++                not semicolon or bare.startswith("${") or _FORMAT_SLOT_RE.fullmatch(bare)):
++            continue
++        if value[0] == "{" and semicolon:
++            masked = "{***}"
++        elif value[0] in "\"'" and len(value) > 1 and value[-1] == value[0]:
++            masked = f"{value[0]}***{value[0]}"
++        else:
++            masked = "***"
++        out.append(line[pos:vstart])
++        out.append(masked)
++        pos = vend
++    if not out:
++        return line
++    out.append(line[pos:])
++    return "".join(out)
++
++
++def _redact_kv_connection_strings(text: str, code_file: bool) -> str:
++    """Mask ``Password=``/``Pwd=`` values inside keyword/value connection strings, one
++    companion-key scan per line."""
++    return "".join(_redact_kv_connection_line(line, code_file)
++                   for line in text.splitlines(keepends=True))
+diff --git a/agent/redact_vault.py b/agent/redact_vault.py
+new file mode 100644
+index 00000000000..e2e12247413
+--- /dev/null
++++ b/agent/redact_vault.py
+@@ -0,0 +1,48 @@
++"""Profile-scoped, bounded exact-value redaction for vault-filled secrets."""
++
++import threading
++
++# Memory only: never persist or log vault values. Profiles must not reveal each
++# other's values, and a fill-heavy session must not grow the registry forever.
++_VAULT_REDACTION_MAX_PER_PROFILE = 64
++_VAULT_REDACTION_VALUES: dict = {}
++_VAULT_REDACTION_LOCK = threading.Lock()
++
++
++def _vault_scope() -> str:
++    from hermes_constants import get_hermes_home
++    return str(get_hermes_home())
++
++
++def register_vault_redaction_value(value) -> None:
++    """Register before injection, including the CR/LF-stripped input value."""
++    if not isinstance(value, str) or not value:
++        return
++    normalized = value.replace("\r", "").replace("\n", "")
++    with _VAULT_REDACTION_LOCK:
++        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
++        for v in (value, normalized):
++            if v:
++                bucket.pop(v, None)  # re-registering refreshes recency
++                bucket[v] = None
++        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
++            del bucket[next(iter(bucket))]
++
++
++def clear_vault_redaction_values() -> None:
++    """Drop the current profile's registered values on teardown or lock."""
++    with _VAULT_REDACTION_LOCK:
++        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
++
++
++def redact_registered_vault_values(text: str) -> str:
++    """Scrub longest values first so a substring never shadows its superstring."""
++    if not isinstance(text, str) or not text:
++        return text
++    with _VAULT_REDACTION_LOCK:
++        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
++        values = sorted(bucket, key=len, reverse=True) if bucket else ()
++    for value in values:
++        if value in text:
++            text = text.replace(value, "«redacted-vault-secret»")
++    return text
+diff --git a/contributors/emails/arbianshkodra@users.noreply.github.com b/contributors/emails/arbianshkodra@users.noreply.github.com
+new file mode 100644
+index 00000000000..7617bc7cd76
+--- /dev/null
++++ b/contributors/emails/arbianshkodra@users.noreply.github.com
+@@ -0,0 +1 @@
++arbianshkodra
+diff --git a/contributors/emails/mark@mtp44.net b/contributors/emails/mark@mtp44.net
+new file mode 100644
+index 00000000000..0591741f22a
+--- /dev/null
++++ b/contributors/emails/mark@mtp44.net
+@@ -0,0 +1 @@
++mtp-44
+diff --git a/tests/agent/test_redact.py b/tests/agent/test_redact.py
+index befbbdbf991..63c1f06c621 100644
+--- a/tests/agent/test_redact.py
++++ b/tests/agent/test_redact.py
+@@ -848,10 +848,11 @@ class TestBareTokenUserinfoRedaction:
+         assert "ftptoken123456" not in result
+ 
+ 
+-    def test_user_pass_form_still_passes_through(self):
+-        """The ``user:pass@`` colon form must NOT be redacted (#34029)."""
++    def test_user_pass_form_password_redacted(self):
++        """The ``user:pass@`` colon form's PASSWORD is redacted (#125664): #34029's pass-through
++        is about query-string round-trip tokens, never userinfo. Username, host and path stay."""
+         text = "URL: https://user:supersecretpw@host.example.com/path"
+-        assert redact_sensitive_text(text) == text
++        assert redact_sensitive_text(text) == "URL: https://user:***@host.example.com/path"
+ 
+     def test_short_username_not_redacted(self):
+         """Short userinfo (git, admin, deploy) below the 8-char floor passes."""
+diff --git a/tests/agent/test_redact_leak_shapes.py b/tests/agent/test_redact_leak_shapes.py
+new file mode 100644
+index 00000000000..da5a135001f
+--- /dev/null
++++ b/tests/agent/test_redact_leak_shapes.py
+@@ -0,0 +1,161 @@
++"""Credential shapes that leaked past agent.redact (#53741, #125680, #134475, #141283, #147240).
++
++Each class pins one family: the leak is masked in both the default (head/tail) mask and the
++non-reusable ``file_read`` + ``secret_file`` sentinel, and the look-alike identifiers or docs
++samples next to it stay byte-identical.
++"""
++
++import pytest
++
++from agent.redact import redact_sensitive_text, redact_terminal_output
++
++V = "q7Zr4Lm9Xc2Vb5Nw8Kd3Hf6J"
++SK = "sk-" + "q7Zr4Lm9Xc2Vb5Nw8Kd3Hf6Jt1Pa0Sg7Ye4Uo2"
++GH = "ghp_" + "Ab3dE5gH7jK9mN1pQ3sT5vX7zB9dF1hJ3kL5"
++
++
++@pytest.fixture(autouse=True)
++def _ensure_redaction_enabled(monkeypatch):
++    monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
++    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
++
++
++def _both_modes(text: str) -> list[str]:
++    return [redact_sensitive_text(text, force=True),
++            redact_sensitive_text(text, force=True, file_read=True, secret_file=True)]
++
++
++def _assert_masked(text: str, secret: str) -> None:
++    for out in _both_modes(text):
++        assert secret not in out, out
++
++
++def _assert_unchanged(text: str) -> None:
++    assert _both_modes(text) == [text, text]
++
++
++class TestQuotedYamlScalars:
++    """#53741 / #147240 family 1: ``api_key: "v"`` skipped the YAML pass on its quote."""
++
++    @pytest.mark.parametrize("text", [f'api_key: "{V}"', f"api_key: '{V}'", 'password: "hunter2"',
++                                      f'  5|  secret: "{V}"'])
++    def test_quoted_value_masked(self, text):
++        _assert_masked(text, V if V in text else "hunter2")
++
++    @pytest.mark.parametrize("text", ['api_key: "<your key>"', 'api_key: "${API_KEY}"', 'password: ""',
++                                      'Secretary: "J. Smith"', "api_key: 'process.env.OPENAI_API_KEY'"])
++    def test_placeholders_and_prose_kept(self, text):
++        _assert_unchanged(text)
++
++
++class TestConcatenatedPasswordKeys:
++    """#134475: ``dbpassword`` / ``rootpasswd`` never put the keyword on a word start."""
++
++    @pytest.mark.parametrize("text, secret", [("dbpassword: hunter2xyz", "hunter2xyz"),
++                                              ("rootpasswd: s3cr3tzz", "s3cr3tzz"),
++                                              ("app.dbpassword=hunter2xyz", "hunter2xyz")])
++    def test_masked(self, text, secret):
++        _assert_masked(text, secret)
++
++    @pytest.mark.parametrize("text", ["passwordless: true", "passwordless=true"])
++    def test_passwordless_kept(self, text):
++        _assert_unchanged(text)
++
++
++class TestDatabaseClientCredentials:
++    """#141283: keyword/value connection strings and glued client env names."""
++
++    @pytest.mark.parametrize("text, secret", [
++        ("Host=db;Username=app;Password=s3cretpw;Database=x", "s3cretpw"),
++        ("Server=db;UID=app;PWD={Zq7x;LmP2};Database=core", "Zq7x;LmP2"),
++        ('psql "host=db user=app password=s3cretpw dbname=x"', "s3cretpw"),
++        ("PGPASSWORD=s3cretpw psql -h db", "s3cretpw"),
++        ("MYSQL_PWD=s3cretpw", "s3cretpw"),
++        ("SSHPASS=s3cretpw sshpass -e ssh host", "s3cretpw"),
++    ])
++    def test_masked(self, text, secret):
++        _assert_masked(text, secret)
++
++    def test_braced_odbc_password_masked_in_a_file_read(self):
++        # ``cat`` output is read as code, where ``{pw}`` is a template; an ODBC brace is a literal.
++        out = redact_terminal_output("Server=db;UID=app;PWD={Zq7x;LmP2};Database=core",
++                                     "cat appsettings.json", force=True)
++        assert "Zq7x" not in out
++        # A brace literal that opens like an identifier still carries password characters.
++        assert "ssw0rd" not in redact_terminal_output("Server=db;UID=app;PWD={P@ssw0rd!};Database=core",
++                                                      "cat appsettings.json", force=True)
++        for template in ("{0}", "{cfg['pw']}", "{pw!r}", "{ get_pw() }"):
++            line = f"Server=db;PWD={template};Database=x"
++            assert redact_terminal_output(line, "cat app.py", force=True) == line
++
++    @pytest.mark.parametrize("text", ["PWD=/home/app/project", "PGPASSFILE=/home/app/.pgpass",
++                                      "the password= field", "the pwd= flag and host= flag",
++                                      "host=db port=5432 dbname=x",
++                                      "Data Source=db;Initial Catalog=x;Integrated Security=true"])
++    def test_non_credentials_kept(self, text):
++        _assert_unchanged(text)
++
++
++class TestUserinfoAndBasicPairs:
++    """#125680: ``scheme://user:pass@`` userinfo, and ``NAME=user:pass`` at force boundaries."""
++
++    @pytest.mark.parametrize("text, expected", [
++        ("https://user:s3cretpw@host/path", "https://user:***@host/path"),
++        ("git remote set-url origin https://me:hunter2pass@github.com/o/r.git",
++         "git remote set-url origin https://me:***@github.com/o/r.git"),
++        ("MY_PROXY_BASIC=user:s3cretpw", "MY_PROXY_BASIC=user:***"),
++        ('env = ["MY_PROXY_BASIC=user:s3cretpw", "X=1"]', 'env = ["MY_PROXY_BASIC=user:***", "X=1"]'),
++    ])
++    def test_masked(self, text, expected):
++        assert redact_sensitive_text(text, force=True) == expected
++        assert "s3cretpw" not in redact_sensitive_text(text, force=True, file_read=True, secret_file=True)
++
++    @pytest.mark.parametrize("text", [
++        "https://example.com/path", "git@github.com:org/repo.git", "ssh user@host", "user@example.com",
++        "postgres://user@host/db", "https://user:${TOKEN}@host/x", "https://api.x.com/cb?code=abc123&s=1",
++        "IMAGE=ubuntu:24.04-noble", "TAG=myrepo:latest-release", "SRC=C:\\Users\\me",
++        "CHECKSUM=sha256:" + "ab12" * 16, "TS=2026-01-01T10:00:00", "HOST=localhost:5432",
++        # Colon values under names that never hold a Basic pair, and userinfo docs samples.
++        "IMAGE=redis:7-alpine", "BRANCH=origin:feature-login2", "Server=tcp:db,1433;Initial Catalog=x",
++        'url = f"https://{user}:{pw}@host"', "The format is https://user:password@host",
++        "PROXY_DEST=buildhost:Release2026/artifact.tar",
++    ])
++    def test_non_credentials_kept(self, text):
++        _assert_unchanged(text)
++
++
++class TestAffixedJsonKeys:
++    """#147240 family 2: JSON keys containing a secret word outside the closed key list."""
++
++    @pytest.mark.parametrize("key", ["API_TOKEN", "DB_PASSWORD", "client_secret", "my_api_key_value"])
++    def test_masked(self, key):
++        _assert_masked(f'{{"{key}": "{V}"}}', V)
++
++    @pytest.mark.parametrize("text", [f'{{"output": "{{\\"DB_PASSWORD\\": \\"{V}\\"}}"}}',
++                                      f'{{"DB_PASSWORD": "{V[:8]}\\\\{V[8:]}"}}'])
++    def test_escaped_json_masked(self, text):
++        # A tool result wrapping a config dump escapes its quotes; a value may carry escapes too.
++        _assert_masked(text, V[8:])
++
++    @pytest.mark.parametrize("text", ['{"token_count": 12}', '{"password_policy": "strict-min12"}',
++                                      '{"passwordChanged": "2015-09-03T16:41:46.000Z"}', '{"has_password": "true"}',
++                                      '{"tokenUrl": "https://login.example.com/oauth2/token"}',
++                                      '{"secret_id": "3f2a9c1e-1b2c-4d5e-8f90-123456789abc"}',
++                                      '{"secret_name": "prod-db-creds"}', '{"API_TOKEN": "<your token>"}',
++                                      '{"secretary": "Jane Smith"}', '{"tokenizer": "cl100k_base"}'])
++    def test_metadata_kept(self, text):
++        _assert_unchanged(text)
++
++
++class TestPrefixedKeyAfterSeparator:
++    """#147240 family 3: a known-prefix key glued to an identifier by ``-`` / ``_``."""
++
++    @pytest.mark.parametrize("text, secret", [(f"backup-{SK}.txt", SK[3:]), (f"backup_{SK}.txt", SK[3:]),
++                                              (f"x-{GH}", GH[4:])])
++    def test_masked(self, text, secret):
++        _assert_masked(text, secret)
++
++    @pytest.mark.parametrize("text", ["backup-sk-learn.txt", "scikit-learn", "x-request-id",
++                                      "deploy-sk-prod-deployment-01", "build_hf_transformers_cache"])
++    def test_identifiers_kept(self, text):
++        _assert_unchanged(text)
+diff --git a/tests/agent/test_redact_outbox_secrets.py b/tests/agent/test_redact_outbox_secrets.py
+index 86d4e3148f6..a82b17adec0 100644
+--- a/tests/agent/test_redact_outbox_secrets.py
++++ b/tests/agent/test_redact_outbox_secrets.py
+@@ -162,7 +162,7 @@ class TestSubprocessArgvDiagnostics:
+ 
+     def test_escaped_json_backslash_run_stays_linear(self):
+         import time
+-        text = "\\" * 40_000 + '\\"token\\": \\"x'
++        text = "\\" * 200_000 + '\\"token\\": \\"x'
+         start = time.perf_counter()
+         redact_sensitive_text(text, force=True, code_file=True)
+         redact_sensitive_text(text, force=True)
+diff --git a/tests/tools/test_browser_use_harness.py b/tests/tools/test_browser_use_harness.py
+index ba4ee1c02d8..ee44d2beb05 100644
+--- a/tests/tools/test_browser_use_harness.py
++++ b/tests/tools/test_browser_use_harness.py
+@@ -30,8 +30,13 @@ def test_browser_exec_child_environment(tmp_path, monkeypatch):
+     from tools import browser_session, browser_supervisor
+ 
+     probe = tmp_path / "probe.py"
++    # The child's view goes to a file: browser_exec output is redacted, so an env dump on stdout
++    # would show its API keys as *** rather than what the child actually received.
++    child_view = tmp_path / "child.json"
+     probe.write_text("import json, os, sys\n"
+-                     "print(json.dumps({'argv': sys.argv, 'stdin': sys.stdin.read(), 'env': dict(os.environ)}))\n",
++                     f"open({str(child_view)!r}, 'w', encoding='utf-8').write(json.dumps("
++                     "{'argv': sys.argv, 'stdin': sys.stdin.read(), 'env': dict(os.environ)}))\n"
++                     "print('ok')\n",
+                      encoding="utf-8")
+     monkeypatch.setattr(bu, "_find_cli", lambda: [sys.executable, str(probe)])
+     monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda: {"browser": {}})
+@@ -55,7 +60,7 @@ def test_browser_exec_child_environment(tmp_path, monkeypatch):
+     monkeypatch.delenv("ANONYMIZED_TELEMETRY", raising=False)
+     result = json.loads(bu.browser_exec("print('payload')", session="research", task_id="owner"))
+     assert result["success"], result
+-    child = json.loads(result["output"])
++    child = json.loads(child_view.read_text(encoding="utf-8"))
+     assert child["stdin"] == "print('payload')"
+     for key in ("PYTHONHOME", "OPENAI_API_KEY", "BROWSERBASE_API_KEY", "_HERMES_BU_PRIVATE_BROWSER"):
+         assert key not in child["env"]
+diff --git a/tests/tools/test_file_tools_live.py b/tests/tools/test_file_tools_live.py
+index 9252b607a24..b740a81d8b2 100644
+--- a/tests/tools/test_file_tools_live.py
++++ b/tests/tools/test_file_tools_live.py
+@@ -10,7 +10,9 @@ asserts zero contamination from shell noise via _assert_clean().
+ 
+ import pytest
+ 
++import json
+ import os
++import shlex
+ import sys
+ from pathlib import Path
+ 
+@@ -96,6 +98,39 @@ class TestLocalEnvironmentExecute:
+ 
+ # ── _has_command ─────────────────────────────────────────────────────────
+ 
++
++@pytest.mark.parametrize("secret_source", [True, False])
++def test_quoted_yaml_reads_preserve_source_policy(ops, env, tmp_path, monkeypatch, secret_source):
++    """Real file and terminal output mask secret config while preserving code examples."""
++    from tools import file_tools
++    from tools.terminal_tool_result import finalize_foreground_result
++
++    home = tmp_path / "profile"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    config = (home if secret_source else tmp_path) / "config.yaml"
++    text = 'password: "shortsecret"\napi_key: "os.getenv(\'OPENAI_API_KEY\')"\n'
++    config.write_text(text, encoding="utf-8")
++    monkeypatch.setattr(file_tools, "_get_file_ops", lambda task_id: ops)
++    read = json.loads(file_tools.read_file_tool(str(config), task_id="quoted-yaml"))
++    assert not read.get("error")
++    assert 'api_key: "os.getenv(\'OPENAI_API_KEY\')"' in read["content"]
++    expected = 'password: "«redacted-secret»"' if secret_source else 'password: "shortsecret"'
++    assert expected in read["content"]
++    assert "1|" in read["content"]
++
++    command = "cat " + shlex.quote(str(config))
++    raw = env.execute(command)
++    assert raw["returncode"] == 0
++    result = json.loads(finalize_foreground_result(
++        command=command, result=raw, env=env, env_type="local", effective_task_id="quoted-yaml",
++        task_id="quoted-yaml", session_id=None, session_key="quoted-yaml", workdir=str(tmp_path),
++        command_cwd=str(tmp_path), approval_note=None,
++    ))
++    expected = text.replace('"shortsecret"', '"***"') if secret_source else text
++    assert result["output"] == expected.strip()
++
++
+ class TestHasCommand:
+     def test_finds_echo(self, ops):
+         assert ops._has_command("echo") is True
