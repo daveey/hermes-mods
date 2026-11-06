@@ -358,7 +358,9 @@ def test_recurrence_on_the_day_it_was_filed_and_fixed_is_not_swallowed(store):
 def _git(cwd, *args):
     import subprocess
     env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
-           "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+           "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+           # Freeze the CI failure's instant: B's short SHA is numeric-only (01347127096).
+           "GIT_AUTHOR_DATE": "1793927183 +0000", "GIT_COMMITTER_DATE": "1793927183 +0000"}
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True,
                           env=env).stdout.strip()
 
@@ -397,7 +399,9 @@ def _fixed_with_sha(store, r, d, sha, fixed_at):
                    budget_fn=OPEN)
     sh.record_event("proposed", fp, "t_00000001", store=store, now=fixed_at - 19000)
     sh.file_fix(fp, store=store, runner=r, now=fixed_at - 18000, budget_fn=OPEN)
-    sh.record_event("fixed", fp, "t_00000002", note=f"{sha[:11]} (hermes-mods abc1234)", store=store, now=fixed_at)
+    # A numeric-only abbreviation is intentionally ignored as a possible timestamp.
+    # Keep the full identity, including its hex letters, regardless of the short SHA.
+    sh.record_event("fixed", fp, "t_00000002", note=f"{sha} (hermes-mods abc1234)", store=store, now=fixed_at)
     return fp
 
 
