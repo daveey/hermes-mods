@@ -3,6 +3,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 spec = importlib.util.spec_from_file_location('notice_rc', Path(__file__).resolve().parents[1] / 'reply_check.py')
 assert spec is not None and spec.loader is not None
 rc = importlib.util.module_from_spec(spec)
@@ -212,3 +214,115 @@ def test_every_synthetic_envelope_is_classified_for_reply_check():
             assert isinstance(verdict, str) and verdict
     missing = [branches[i] for i in range(len(branches)) if i not in covered]
     assert not missing, f'new SYNTHETIC_RE branch(es) need a SYNTHETIC_SAMPLES entry and a notice decision: {missing}'
+
+
+# ---- core's delegation / background-job envelopes (agent-ef895c63a9, agent-cf237a946c) -----------------------------
+# Core writes subagent results and background-process exits into the chat as user-role turns. status_only read the
+# batch notice's fixed clause "If you are still waiting on siblings" as David asking for status (7 holds, 2 chats).
+CORE_ENVELOPES = {
+    'batch': '[ASYNC DELEGATION BATCH COMPLETE — deleg_ab12cd]\nA background fan-out unit you dispatched earlier — 2 '
+             'subagent(s) — has finished. If you are still waiting on siblings, end your turn after acting on this one.',
+    'single': '[ASYNC DELEGATION COMPLETE — deleg_ab12cd]\nA background subagent you dispatched earlier has finished.',
+    'failed': '[ASYNC DELEGATION TASK FAILED — deleg_ab12cd, task 2/3]\nOne subagent in a background fan-out failed.',
+    'exit': '[IMPORTANT: Background process proc_1a2b completed normally (exit code 0).\nCommand: ls\nOutput:\nx]',
+    'watch': '[IMPORTANT: Background process proc_1a2b matched watch pattern "ready".\nCommand: srv\nMatched output:\nok]',
+    'heartbeat': '[Background process proc_1a2b heartbeat #3 — still running after 5m (next in 60s when there is new '
+                 'output; you will also be told when it exits).\nCommand: make\nOutput since last heartbeat:\nx]',
+    'jobs_stopped': '[System note: background job results from this chat were pending when the Hermes backend shut '
+                    'down. This stands in for their completion notices.]',
+}
+HUMAN_LOOKALIKES = (
+    '[IMPORTANT: The user launched this CLI session with the "five-whys" skill preloaded.]\n\nwhat is the status?',
+    '[OUT-OF-BAND USER MESSAGE — a direct message from the user]\nwhy is it still waiting?',
+    'Why did I get an [ASYNC DELEGATION BATCH COMPLETE — x] notice? what is going on?',
+    '[IMPORTANT: Background processes keep piling up] why is it still slow?',
+)
+
+
+@pytest.mark.parametrize('name', sorted(CORE_ENVELOPES))
+def test_core_delegation_and_job_envelopes_are_automation(name):
+    ask = CORE_ENVELOPES[name]
+    assert rc.notice_turn(ask) and rc.automation_prompt(ask)
+    assert rc.notice_turn(' '.join(ask.split())[:40]), 'the 40-char template head must classify the same way'
+
+
+@pytest.mark.parametrize('ask', HUMAN_LOOKALIKES)
+def test_human_turns_mentioning_envelopes_stay_human(ask):
+    assert not rc.notice_turn(ask) and not rc.automation_prompt(ask)
+
+
+def test_status_only_skips_a_delegation_batch_turn():
+    log = ["-> kanban_show({'task_id': 't_example'})"]
+    assert rc.PROGRESS_ASK_RE.search(CORE_ENVELOPES['batch'])  # the fixed clause that caused the holds
+    assert rc.status_only(CORE_ENVELOPES['batch'], 'Waiting on the other units.', log) is None
+
+
+def _core_root():
+    import os
+    root = Path(os.environ.get('HERMES_TEST_CORE') or Path.home() / '.hermes/hermes-agent')
+    if not (root / 'agent/context_compressor.py').exists():
+        if os.environ.get('HERMES_TEST_CORE'):
+            raise AssertionError(f'HERMES_TEST_CORE set but {root} has no agent/context_compressor.py')
+        pytest.skip('Hermes core checkout not found')
+    return root
+
+
+def _core_render():
+    """Core's own formatters' output, rendered in a child interpreter so core's `tools` package never shadows ours."""
+    import subprocess
+    import sys
+    root = _core_root()
+    code = r'''
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+import tools.process_registry_notifications as n
+from tui_gateway.exit_job_receipts import jobs_stopped_note
+now = time.time()
+evt = {"results": [{"task_index": 0, "status": "completed", "summary": "ok"}], "goals": ["g"], "dispatched_at": now - 60}
+out = {
+  "batch": n._format_batch_delegation(evt, "deleg_ab12cd", now),
+  "single": n._format_async_delegation({"delegation_id": "deleg_ab12cd", "status": "completed", "summary": "ok",
+                                        "goal": "g", "dispatched_at": now - 60, "completed_at": now}),
+  "failed": n._format_task_failure_notice({"results": [{"task_index": 1, "status": "failed", "error": "boom"}],
+                                           "goals": ["a", "b"]}, "deleg_ab12cd"),
+  "exit": n.format_process_notification({"type": "completion", "session_id": "proc_1a2b", "exit_code": 0,
+                                         "command": "ls", "output": "x"}),
+  "watch": n.format_process_notification({"type": "watch_match", "session_id": "proc_1a2b", "pattern": "ready",
+                                          "command": "srv", "output": "ok"}),
+  "jobs_stopped": jobs_stopped_note([]),
+}
+print(json.dumps(out))
+'''
+    r = subprocess.run([sys.executable, '-c', code, str(root)], capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        pytest.skip(f'core formatters not importable with {sys.executable}: {r.stderr.strip()[-300:]}')
+    return json.loads(r.stdout)
+
+
+def test_core_rendered_envelopes_are_automation_and_skip_status_only():
+    log = ["-> kanban_show({'task_id': 't_example'})"]
+    for name, text in _core_render().items():
+        assert text, name
+        assert rc.notice_turn(text) and rc.automation_prompt(text), f'core {name} envelope not a notice: {text[:80]!r}'
+        assert rc.status_only(text, 'Still waiting on the rest.', log) is None, name
+
+
+def test_every_core_synthetic_user_prefix_is_classified():
+    """Contract: each prefix in core's _SYNTHETIC_USER_ROW_PREFIXES is a notice (a sample here) or listed in
+    reply_check.NOT_NOTICES with a reason. A new core envelope fails here instead of causing live holds."""
+    import ast
+    src = (_core_root() / 'agent/context_compressor.py').read_text()
+    node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign)
+                and any(getattr(t, 'id', '') == '_SYNTHETIC_USER_ROW_PREFIXES' for t in n.targets))
+    prefixes = ast.literal_eval(node.value)
+    assert prefixes
+    samples = {'[ASYNC DELEGATION': CORE_ENVELOPES['batch'], '[IMPORTANT: Background': CORE_ENVELOPES['exit']}
+    unclassified = []
+    for p in prefixes:
+        if p in rc.NOT_NOTICES:
+            assert rc.NOT_NOTICES[p].strip(), p
+        elif p in samples:
+            assert samples[p].startswith(p) and rc.notice_turn(samples[p]), p
+        else:
+            unclassified.append(p)
+    assert not unclassified, f'classify in reply_check.NOTICE_RE (+ a sample) or NOT_NOTICES: {unclassified}'

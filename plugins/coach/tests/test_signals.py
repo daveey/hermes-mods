@@ -1959,7 +1959,8 @@ def test_one_notice_held_in_three_chats_is_one_prompt_not_a_template(tmp_path):
     assert _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW)) == []
 
 
-@pytest.mark.parametrize("head", [NOTICE_HEAD, RELAY_HEAD])
+@pytest.mark.parametrize("head", [NOTICE_HEAD, RELAY_HEAD, "[ASYNC DELEGATION BATCH COMPLETE — deleg",
+                                  "[IMPORTANT: Background process proc_1a2b"])
 def test_report_only_holds_on_notice_openings_file_nothing(tmp_path, head):
     """report_only judges Kanban notices and session relays on purpose (reply_check NOTICE_CONTEXT)."""
     rows = [{**_tpl_nudge(i, f"s{i}", head=head, rule="report_only"), "ask_len": 500 + i, "ask_fp": f"fp{i:08d}"}

@@ -1368,10 +1368,34 @@ def confirm_system() -> str:
 CROSS_SESSION_HEADER = "[Message from another Hermes session"
 CROSS_SESSION_RE = re.escape(CROSS_SESSION_HEADER) + r"(?:\s|\])"
 
+# Core's subagent-result and background-job envelopes, written into the chat as user-role turns
+# (tools/process_registry_notifications.py _format_*delegation*/format_process_notification,
+# tui_gateway/exit_job_receipts.py jobs_stopped_note). Anchored on the full opening, never a bare "[IMPORTANT:": the
+# skill-preload preamble before David's own words must stay human. The id part is optional so the coach's 40-char
+# template head classifies like the whole ask (agent-ef895c63a9: status_only read the batch notice's fixed clause
+# "If you are still waiting on siblings" as David asking for status).
+CORE_JOB_RE = (r"\[ASYNC DELEGATION (?:BATCH COMPLETE|COMPLETE|TASK FAILED) — "
+               r"|\[IMPORTANT: Background process \S+(?:\s|$)"
+               r"|\[Background process \S+ heartbeat\b"
+               r"|\[System note: background job results")
+
+# The Hermes-plugin envelopes stay case-insensitive; core's envelopes are fixed-case.
 NOTICE_RE = re.compile(
-    r"^\s*(?:\[(?:chat-closeout|kanban close-out|false-stop recovery|owner-wake|goal continuation|babysitter)[^\]]*\]"
-    r"|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b"
-    r"|" + CROSS_SESSION_RE + r")", re.I)
+    r"^\s*(?:(?i:\[(?:chat-closeout|kanban close-out|false-stop recovery|owner-wake|goal continuation|babysitter)"
+    r"[^\]]*\]|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b|" + CROSS_SESSION_RE + r")|" + CORE_JOB_RE + r")")
+
+# Core's _SYNTHETIC_USER_ROW_PREFIXES (agent/context_compressor.py) that are deliberately NOT reply_check notices.
+# test_every_core_synthetic_user_prefix_is_classified fails on any core prefix that is neither here nor a notice.
+NOT_NOTICES = {
+    "[System:": "in-turn loop continuation (truncated reply, verification stop): the agent continues the human's "
+                "own turn, which stays the ask being judged",
+    "[CONTEXT": "compaction summary scaffold, not a new ask",
+    "[PRIOR CONTEXT": "merged prior-context scaffold, not a new ask",
+    "[Your active task list": "todo list re-injected after compaction, not a new ask",
+    "[Planning state preserved": "planning state re-injected after compaction, not a new ask",
+    "[OUT-OF-BAND": "David's own mid-turn steering message: judged as a live human ask",
+    "Cronjob Response:": "cron output delivered to a messaging platform, never a chat's user turn reply_check judges",
+}
 
 
 def notice_turn(user_ask: str) -> bool:
