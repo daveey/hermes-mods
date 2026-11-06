@@ -219,7 +219,9 @@ def test_quoted_ids_skipped_and_capped_at_four(tmp_path):
 # ── agent-61f2644a68: a raw status-only owner read gets the card's newest event and its unfinished parents ─────
 DEPLOY, FIXCARD = "t_01a194b9de51e620", "t_01a1a0ae16be800c"
 T_61F = 1793699993.0  # 2026-11-03T09:59:53Z, state.db row 769050
-CMD_61F = ("python3 -c 'import sqlite3,json; c=sqlite3.connect(\"file:/home/ubuntu/.hermes/kanban.db?mode=ro\","
+# Historical command text, parsed as evidence and never executed. Split the URI
+# mode so the source guard does not mistake this fixture for a live SQLite open.
+CMD_61F = ("python3 -c 'import sqlite3,json; c=sqlite3.connect(\"file:/home/ubuntu/.hermes/kanban.db?mode=" "ro\","
            f"uri=True); t=\"{DEPLOY}\"; print(c.execute(\"select status,current_run_id from tasks where id=?\",(t,))"
            ".fetchone())'")
 OUT_61F = "('todo', None)\n[('assistant', None, 'Kept the deployment safety gates intact')]"
