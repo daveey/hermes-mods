@@ -182,3 +182,54 @@ Patch: `patches/1585-fix-cron-a-gate-tick-clears-a-streak-made-only-of-mo.patch`
 - `test_gate_error_rides_the_cron_result_across_the_owner_boundary`: `_gate_error` is in `RUN_JOB_FLAGS`.
 
 **Gotchas.** A new pre-agent failure branch must tag a kind, or the AST guard fails. An injection-block refusal is still booked `"agent"`.
+
+## Follow-up patches 2027–2029: terminal journal and uncertainty-pause retirement
+
+### Behavior
+
+A terminal fire's admission journal is retired together with its scheduler-owned uncertainty pause, both in ordinary completion and in recovery of a firer-booked terminal result. Recovery of an already-finished fire does not deliver its output again or change its execution verdict. A shared pause stays in place until the last journal carrying that pause identity is retired. Existing operator holds, replacement operator holds and jobs already disabled before uncertainty observation remain held.
+
+### How it works
+
+`retire_terminal_journal(job_id, execution_id)` holds `_jobs_lock`, validates the journal's job/request identity, tries to lift the recorded pause, then deletes the journal. `_lift_pause` requires the current job to be paused with exactly the recorded `paused_at` and reason, and rejects lifting while a sibling journal for the same job records that identity. `pause_for_unknown` records a new pause only for a runnable job; an existing scheduler hold can be shared from a sibling, while other holds use the non-owned boolean marker `True`. Repeated observations preserve the original record with `setdefault`.
+
+`finish_completed_run` performs terminal bookkeeping first and catches retirement `OSError`, `ValueError`, `KeyError` and `TypeError`, logging deferred cleanup rather than changing a successful/failed terminal outcome. A failed lift leaves the journal available for later reconciliation. Missing journal retirement is idempotent. Missing jobs are not recreated. Malformed JSON or conflicting sibling identities fail conservatively; a sibling disappearing during the read is ignored.
+
+### Code
+
+- 2027: `03665d7a26206470c59ae161a0edee767d5bc2a8`, `cron/scheduler_authority.py`, `cron/scheduler_bookkeeping.py`.
+- 2028: `f477396273d97183b8a3d7601f8c65d491db4679`, shared-hold ownership and locking in `cron/scheduler_authority.py`.
+- 2029: `39115a6b6799f4935ee2263c1f6f5ff34cea4821`, boundary-control tests only.
+
+### Tests
+
+The publication pass ran these three Python files on both source and public replay: **22 passed per tree**, as part of the [119-test targeted run](mirror-2029-verification.md). The incoming handoff's broader **30 tests passed, 12 mutants killed and four green CI runs** remains attributed evidence, not independently reproduced here. The new source tests establish:
+
+- `test_cron_terminal_pause_retirement.py`: ordinary completion, failed/cancelled recovery without replay, existing/replacement operator holds, failed-lift retry retaining completed status, repeated unknown identity and conflicting journal rejection.
+- `test_cron_shared_uncertainty_pause.py`: creator-first and sibling-first terminal receipts cannot release a shared pause early; a preexisting disabled job remains disabled.
+- `test_cron_pause_retirement_controls.py`: missing job/journal idempotence, damaged siblings retaining recovery linkage, unrelated jobs, disappearing siblings, missing-job/missing-admission observations and threaded operator-pause serialization.
+
+From a dependency-provisioned source checkout at the frozen tip:
+
+```sh
+scripts/run_tests.sh -j 1 tests/cron/test_cron_terminal_pause_retirement.py tests/cron/test_cron_shared_uncertainty_pause.py tests/cron/test_cron_pause_retirement_controls.py
+```
+
+This reproduces the three-file selection; it is not a reconstruction of the handoff's larger test/mutation run.
+
+### Applying
+
+Apply 2027–2029 together as part of the snapshot-bound complete mirror recipe in [README.md](README.md), including the integration bridges; 2027 alone does not protect shared unresolved holds. See [mirror-2029-features.md](mirror-2029-features.md) for the rest of the batch. No manual admission-journal deletion is required.
+
+### Gotchas
+
+- `_jobs_lock` retains its existing degraded in-process-only fallback when cross-process locking is unavailable or times out. The threaded test does not prove serialization under that fallback across processes.
+- An indistinguishable bare `enabled=False` write over an already-disabled uncertainty hold provides no new pause identity; operator intent in that case remains ambiguous. Explicit operator pauses have an identity this implementation can preserve.
+- Expired one-shot resume can raise `ValueError`; the job stays paused for the operator. This branch has no dedicated new test in these three files.
+- A call to `pause_for_unknown` without an admission journal may pause the job but does not fabricate a journal; automatic retirement then has no recorded recovery identity.
+- These patches do not identify the actor responsible for a historical journal deletion. They prove current transitions, not historical attribution.
+- Journal cleanup errors must not trigger re-execution of an already-terminal fire. Retain evidence and let reconciliation retry the cleanup.
+
+### Plugin
+
+Core-owned admission identity, job locking and terminal bookkeeping are required. No plugin activation or setting is introduced; a plugin that simply re-enables paused jobs would bypass the ownership checks.

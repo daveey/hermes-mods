@@ -1,0 +1,107 @@
+From 82b069021392d39971232815600a8596adb67c5d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 19:42:04 +0000
+Subject: [PATCH] fix(kanban): normalize bounded socket deadline expiry
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              |  4 +--
+ hermes_cli/kanban_sync_client_attempt.py      | 12 ++++++-
+ .../test_kanban_sync_metrics_budget.py        | 36 +++++++++++++++++++
+ 3 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 3602739f80f..1d4f33d6bc5 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -43,7 +43,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+-from hermes_cli.kanban_sync_client_attempt import note_attempt, replay_after_timeout
++from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -229,7 +229,7 @@ def _bounded_call(ident: Identity, method: str, path: str, body: Optional[dict],
+                 cut(box["conn"])
+         raise TimeoutError(f"Board request exceeded its {budget_s:g} s total budget")
+     if "error" in box:
+-        raise box["error"]
++        raise_bounded_error(box["error"], deadline, time.monotonic(), budget_s)
+     return box["result"]
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_client_attempt.py b/hermes_cli/kanban_sync_client_attempt.py
+index f7b828daee9..6dafbcb184d 100644
+--- a/hermes_cli/kanban_sync_client_attempt.py
++++ b/hermes_cli/kanban_sync_client_attempt.py
+@@ -4,7 +4,17 @@ Kept apart from ``kanban_sync_client`` (the HTTP client) and ``kanban_queue_reas
+ records it), so neither imports the other's layer for it.
+ """
+ import logging
+-from typing import Optional
++import urllib.error
++from typing import NoReturn, Optional
++
++
++def raise_bounded_error(error: BaseException, deadline: float, now: float, budget_s: float) -> NoReturn:
++    """Normalize deadline expiry even when the socket worker finishes before the joining caller."""
++    # Preserve early socket timeouts and unrelated failures as Hub's transport errors.
++    if (isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError)
++            and now >= deadline):
++        raise TimeoutError(f"Board request exceeded its {budget_s:g} s total budget") from error
++    raise error
+ 
+ ATTEMPT_ATTR = "board_attempt"
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_metrics_budget.py b/tests/hermes_cli/test_kanban_sync_metrics_budget.py
+index 04cff646373..721b27c7d27 100644
+--- a/tests/hermes_cli/test_kanban_sync_metrics_budget.py
++++ b/tests/hermes_cli/test_kanban_sync_metrics_budget.py
+@@ -94,6 +94,42 @@ def test_cpu_report_budget_is_two_seconds():
+     assert ksc.CPU_REPORT_BUDGET_S == 2.0
+ 
+ 
++@pytest.mark.parametrize("elapsed,reason,exhausted", [
++    (1.0, TimeoutError("timed out"), True),
++    (0.5, TimeoutError("timed out"), False),
++    (1.0, ConnectionResetError("reset"), False),
++])
++def test_bounded_call_worker_timeout_wins_race(monkeypatch, elapsed, reason, exhausted):
++    """Both deadline contenders must expose the same timeout, without hiding transport failures."""
++    from types import SimpleNamespace
++    import urllib.error
++
++    clock = [100.0]
++    error = urllib.error.URLError(reason)
++    real_thread = threading.Thread
++
++    class FinishedWorker(real_thread):
++        def join(self, timeout=None):
++            # Select the worker-wins ordering regardless of host scheduling.
++            super().join(10)
++            assert not self.is_alive()
++
++    def fail(self, *args):
++        clock[0] += elapsed
++        raise error
++
++    monkeypatch.setattr(ksc, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++    monkeypatch.setattr(ksc.Hub, "_call", fail)
++    monkeypatch.setattr(ksc._hub_threading, "Thread", FinishedWorker)
++    with pytest.raises(TimeoutError if exhausted else urllib.error.URLError) as caught:
++        ksc._bounded_call(ksc.Identity(url="http://unused", key="k" * 16, gateway="gw"),
++                          "POST", "/metrics", {}, 1.0)
++    if exhausted:
++        assert caught.value.__cause__ is error
++    else:
++        assert caught.value is error
++
++
+ @pytest.mark.parametrize("server", ["stall", "trickle"], indirect=True)
+ def test_abandoned_bounded_call_thread_ends_promptly_after_the_budget(server, monkeypatch):
+     """HX012 trace: a trickling response keeps every recv inside its socket timeout, so the abandoned request thread
+-- 
+2.55.0
+

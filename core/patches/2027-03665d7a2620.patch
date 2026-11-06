@@ -1,0 +1,273 @@
+From 03665d7a26206470c59ae161a0edee767d5bc2a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 21:52:44 +0000
+Subject: [PATCH] fix(cron): retire terminal fires with their uncertainty pause
+ [daveey]
+
+---
+ cron/scheduler_authority.py                   |  63 +++++++---
+ cron/scheduler_bookkeeping.py                 |   8 +-
+ .../test_cron_terminal_pause_retirement.py    | 114 ++++++++++++++++++
+ 3 files changed, 164 insertions(+), 21 deletions(-)
+ create mode 100644 tests/cron/test_cron_terminal_pause_retirement.py
+
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index 3e6985fb1c1..d40fb79192b 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -68,30 +68,58 @@ def replayable_completions(job_id, completions):
+     return [eid for eid in completions or () if journal_path(job_id, eid).exists()]
+ 
+ 
++def _pause_unless_held(job_id, reason):
++    """An uncertain observer cannot replace a pause the operator already owns."""
++    from cron.jobs import _jobs_lock, get_job, pause_job
++    with _jobs_lock():
++        job = get_job(job_id)
++        if job is None or job.get('state') == 'paused':
++            return True
++        return _pause_identity(pause_job(job_id, reason=reason))
++
++
+ def pause_for_unknown(job_id, execution_id, reason):
+     """The firer pauses the job for this fire's unverified admission and records that exact pause
+     on the fire's journal, so the receipt that later proves the run terminal can lift it."""
+-    from cron.jobs import pause_job
+     from utils import atomic_json_write
+-    paused = pause_job(job_id, reason=reason)
++    paused = _pause_unless_held(job_id, reason)
+     journal = journal_path(job_id, execution_id)
+-    if paused and journal.exists():
++    if journal.exists():
+         record = json.loads(journal.read_text(encoding='utf-8-sig'))
+-        record['pause_recorded'] = _pause_identity(paused)
++        record.setdefault('pause_recorded', paused)
+         atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+ 
+ 
+ def _lift_pause(job_id, pause):
+     """A verified terminal receipt resolved the uncertainty that paused the schedule: resume it iff
+     the job is still held by exactly that pause (an operator's own pause/resume is never touched)."""
+-    from cron.jobs import get_job, resume_job
+-    job = get_job(job_id) if isinstance(pause, dict) else None
+-    if (job is not None and job.get('state') == 'paused'
+-            and (job.get('paused_at'), job.get('paused_reason')) == (pause['paused_at'], pause['reason'])):
+-        try:
+-            resume_job(job_id)
+-        except ValueError:  # a one-shot whose instant has passed stays paused for the operator
+-            pass
++    from cron.jobs import _jobs_lock, get_job, resume_job
++    with _jobs_lock():
++        job = get_job(job_id) if isinstance(pause, dict) else None
++        if (job is not None and job.get('state') == 'paused'
++                and (job.get('paused_at'), job.get('paused_reason')) == (pause['paused_at'], pause['reason'])):
++            try:
++                resume_job(job_id)
++            except ValueError:  # a one-shot whose instant has passed stays paused for the operator
++                pass
++
++
++def retire_terminal_journal(job_id, execution_id):
++    """Retire a terminal fire's uncertainty pause before discarding its recovery identity.
++
++    Called only after terminal bookkeeping, never to replay output or retry the old fire.
++    Keep the journal if lifting the pause fails so a later reconciliation can retry.
++    """
++    journal = journal_path(job_id, execution_id)
++    try:
++        record = json.loads(journal.read_text(encoding='utf-8-sig'))
++    except FileNotFoundError:
++        return
++    params = record['params']
++    if (params['job_id'], params['request_id']) != (job_id, execution_id):
++        raise ValueError('cron journal identity conflict')
++    _lift_pause(job_id, record.get('pause_recorded'))
++    journal.unlink(missing_ok=True)
+ 
+ 
+ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
+@@ -217,7 +245,7 @@ def reconcile_pending(*, allow_connect=True):
+     from hermes_constants import get_hermes_home
+     from hermes_cli.gateway_client import connect_gateway
+     from cron.executions import FIRER_FINISHED_STATES, execution_owner_live, get_execution
+-    from cron.jobs import get_job, pause_job
++    from cron.jobs import get_job
+     from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
+                                 _save_compose_deliver)
+     from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
+@@ -238,8 +266,8 @@ def reconcile_pending(*, allow_connect=True):
+             row = get_execution(params['request_id'])
+             if row is not None and row['job_id'] == params['job_id'] and row['status'] in FIRER_FINISHED_STATES:
+                 # The firer booked this attempt's terminal outcome itself (ownership lost, shutdown
+-                # interrupt, a crashed tail): the receipt is not a result to save or deliver again.
+-                journal.unlink(missing_ok=True)
++                # interrupt, a crashed tail): lift only its own pause, never save or deliver again.
++                retire_terminal_journal(params['job_id'], params['request_id'])
+                 continue
+             if 'refusal' in record:
+                 state = {'status': 'terminal', 'result': record['refusal'], 'job': record['job']}
+@@ -269,7 +297,7 @@ def reconcile_pending(*, allow_connect=True):
+             if state['status'] != 'terminal':
+                 if state['status'] == 'unknown' and not record.get('pause_recorded'):
+                     reason = 'Canonical cron unknown; no automatic re-execution'
+-                    record['pause_recorded'] = _pause_identity(pause_job(params['job_id'], reason=reason))
++                    record['pause_recorded'] = _pause_unless_held(params['job_id'], reason)
+                     atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+                 continue
+             success, output, answer, error = state['result']
+@@ -285,7 +313,6 @@ def reconcile_pending(*, allow_connect=True):
+             _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
+                                  verbose=False, execution_token=None)
+             fail_empty_response(delivery, answer)
+-            if finish_completed_run(delivery, None, params['request_id'], recovered=True):
+-                _lift_pause(params['job_id'], record.get('pause_recorded'))
++            finish_completed_run(delivery, None, params['request_id'], recovered=True)
+         except Exception:
+             logging.getLogger(__name__).warning('Cron receipt recovery deferred: %s', journal, exc_info=True)
+diff --git a/cron/scheduler_bookkeeping.py b/cron/scheduler_bookkeeping.py
+index 3369ad2f3da..c577eecca0f 100644
+--- a/cron/scheduler_bookkeeping.py
++++ b/cron/scheduler_bookkeeping.py
+@@ -61,8 +61,7 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
+         update_job(job["id"], {"last_delivery_queued": None})
+         job["last_delivery_queued"] = None
+     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+-    from cron.scheduler_authority import journal_path
+-    journal = journal_path(job['id'], execution_id)
++    from cron.scheduler_authority import retire_terminal_journal
+     if not job.get('no_agent'):
+         mark_kwargs['execution_id'] = execution_id
+     if not d.success and job.pop("_model_unreachable", False):
+@@ -139,5 +138,8 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
+     if job.get("last_delivery_queued"):
+         # A drain that settled before this run's own bookkeeping landed found nothing to fence on.
+         settle_quietly(job["id"], execution_id)
+-    journal.unlink(missing_ok=True)
++    try:
++        retire_terminal_journal(job['id'], execution_id)
++    except (OSError, ValueError, KeyError, TypeError):
++        scheduler.logger.warning('Cron terminal pause retirement deferred: %s', execution_id, exc_info=True)
+     return True
+diff --git a/tests/cron/test_cron_terminal_pause_retirement.py b/tests/cron/test_cron_terminal_pause_retirement.py
+new file mode 100644
+index 00000000000..3b72ab5eaf7
+--- /dev/null
++++ b/tests/cron/test_cron_terminal_pause_retirement.py
+@@ -0,0 +1,114 @@
++"""A firer-booked terminal outcome must retire its uncertainty pause too."""
++import json
++
++import pytest
++
++from cron import executions, jobs, scheduler, scheduler_authority
++from cron.scheduler_bookkeeping import finish_completed_run
++
++
++def _paused_fire(job):
++    fire = executions.create_execution(job['id'], source='test')['id']
++    executions.mark_execution_running(fire)
++    journal = scheduler_authority.journal_path(job['id'], fire)
++    journal.parent.mkdir(parents=True, exist_ok=True)
++    journal.write_text(json.dumps({'params': {'job_id': job['id'], 'request_id': fire,
++                                             'extra_prompt': None}, 'receipt': None}))
++    scheduler_authority.pause_for_unknown(job['id'], fire, 'Cron execution unverified: observer lost')
++    return fire, journal
++
++
++@pytest.mark.parametrize('operator_hold', [False, True])
++def test_firer_finished_recovery_retires_only_its_pause(tmp_path, monkeypatch, operator_hold):
++    with jobs.use_cron_store(tmp_path / 'cron'):
++        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
++        fire, journal = _paused_fire(job)
++        executions.finish_execution(fire, success=False, error='stopped')
++        before = executions.get_execution(fire)
++        if operator_hold:
++            jobs.pause_job(job['id'], reason='operator hold')
++        monkeypatch.setattr(scheduler, '_save_compose_deliver',
++                            lambda *a, **kw: pytest.fail('terminal result must not be replayed'))
++        scheduler_authority.reconcile_pending(allow_connect=False)
++        saved = jobs.get_job(job['id'])
++        assert saved['enabled'] is (not operator_hold)
++        assert saved['paused_reason'] == ('operator hold' if operator_hold else None)
++        assert executions.get_execution(fire) == before
++        assert not journal.exists()
++
++
++@pytest.mark.parametrize('operator_hold', [False, True])
++def test_ordinary_tail_retires_only_its_pause(tmp_path, operator_hold):
++    with jobs.use_cron_store(tmp_path / 'cron'):
++        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
++        fire, journal = _paused_fire(job)
++        if operator_hold:
++            jobs.pause_job(job['id'], reason='operator hold')
++        delivery = scheduler._RunDelivery(dict(job, execution_id=fire), False, 'stopped')
++        assert finish_completed_run(delivery, None, fire)
++        saved = jobs.get_job(job['id'])
++        assert saved['enabled'] is (not operator_hold)
++        assert saved['paused_reason'] == ('operator hold' if operator_hold else None)
++        assert executions.get_execution(fire)['status'] == 'failed'
++        assert not journal.exists()
++
++
++def test_failed_lift_keeps_terminal_verdict_and_retries(tmp_path, monkeypatch):
++    with jobs.use_cron_store(tmp_path / 'cron'):
++        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
++        fire, journal = _paused_fire(job)
++        original_resume = jobs.resume_job
++
++        def unavailable(*args):
++            raise OSError('store temporarily unavailable')
++
++        monkeypatch.setattr(jobs, 'resume_job', unavailable)
++        delivery = scheduler._RunDelivery(dict(job, execution_id=fire), True, None)
++        assert finish_completed_run(delivery, None, fire)
++        assert executions.get_execution(fire)['status'] == 'completed'
++        assert jobs.get_job(job['id'])['last_status'] == 'ok'
++        assert journal.exists()
++        monkeypatch.setattr(jobs, 'resume_job', original_resume)
++        scheduler_authority.reconcile_pending(allow_connect=False)
++        assert jobs.get_job(job['id'])['enabled'] is True
++        assert not journal.exists()
++
++
++def test_existing_operator_hold_survives_unknown_and_retirement(tmp_path):
++    with jobs.use_cron_store(tmp_path / 'cron'):
++        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
++        held = jobs.pause_job(job['id'], reason='operator hold')
++        fire, journal = _paused_fire(job)
++        assert json.loads(journal.read_text())['pause_recorded'] is True
++        executions.finish_execution(fire, success=False, error='stopped')
++        scheduler_authority.reconcile_pending(allow_connect=False)
++        saved = jobs.get_job(job['id'])
++        assert saved['paused_at'] == held['paused_at']
++        assert saved['paused_reason'] == 'operator hold'
++        assert not saved['enabled']
++        assert not journal.exists()
++
++
++def test_repeated_unknown_keeps_its_original_pause_identity(tmp_path):
++    with jobs.use_cron_store(tmp_path / 'cron'):
++        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
++        fire, journal = _paused_fire(job)
++        original = json.loads(journal.read_text())['pause_recorded']
++        scheduler_authority.pause_for_unknown(job['id'], fire, 'second observer lost')
++        assert json.loads(journal.read_text())['pause_recorded'] == original
++        executions.finish_execution(fire, success=False, error='stopped')
++        scheduler_authority.reconcile_pending(allow_connect=False)
++        assert jobs.get_job(job['id'])['enabled'] is True
++
++
++def test_conflicting_journal_is_retained(tmp_path):
++    with jobs.use_cron_store(tmp_path / 'cron'):
++        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
++        fire, journal = _paused_fire(job)
++        record = json.loads(journal.read_text())
++        record['params']['request_id'] = 'another-fire'
++        journal.write_text(json.dumps(record))
++        with pytest.raises(ValueError, match='identity conflict'):
++            scheduler_authority.retire_terminal_journal(job['id'], fire)
++        assert journal.exists()
++        assert not jobs.get_job(job['id'])['enabled']
+-- 
+2.55.0
+

@@ -1,0 +1,791 @@
+From b513e412e96a6ff63b5ed356ac2b154e80446439 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 14:48:14 +0000
+Subject: [PATCH] fix(sync): preserve refusal details and pnpm install lanes
+ [daveey]
+
+---
+ .../scripts/check-runtime-driver-imports.mjs  |   2 +-
+ .github/workflows/js-tests.yml                |  14 +-
+ acp_adapter/server.py                         |   4 +-
+ agent/conversation_loop.py                    |  22 +-
+ agent/managed_worker.py                       |   2 +-
+ agent/turn_context.py                         |  12 +
+ agent/turn_failure_copy.py                    |  90 +++++--
+ agent/turn_recovery.py                        |   5 +-
+ agent/turn_truncation.py                      |   5 +-
+ gateway/run_turn_persistence.py               |  13 +-
+ gateway/session_managed_worker.py             |   2 +-
+ hermes_cli/cli_chat_turn_mixin.py             |   4 +-
+ ...est_content_policy_refusal_stop_details.py | 237 ++++++++++++++----
+ tests/ci/test_runtime_install_shape.py        |   8 +-
+ tests/ci/test_tui_install_shape.py            |  16 +-
+ tests/hermes_cli/test_source_build.py         |   2 +-
+ tui_gateway/prompt_turn.py                    |   4 +-
+ 17 files changed, 323 insertions(+), 119 deletions(-)
+
+diff --git a/.github/scripts/check-runtime-driver-imports.mjs b/.github/scripts/check-runtime-driver-imports.mjs
+index 0a6a067e729..db675d8d791 100644
+--- a/.github/scripts/check-runtime-driver-imports.mjs
++++ b/.github/scripts/check-runtime-driver-imports.mjs
+@@ -1,6 +1,6 @@
+ // Proves the E2E driver entry points resolve every import under the
+ // runtime-only tests-js install the release workflows use:
+-//   npm ci --workspace tests-js --include-workspace-root --omit=dev --ignore-scripts
++//   pnpm install --frozen-lockfile --filter "{./tests-js}..." --prod --ignore-scripts
+ // That install has no devDependencies (vitest, jsdom, node-pty, ...), so a
+ // driver that imports one only fails on a hosted macOS/Windows release runner.
+ // This walks each entry point's static import graph (import/export-from,
+diff --git a/.github/workflows/js-tests.yml b/.github/workflows/js-tests.yml
+index 8d36d21c935..117fbacf2d7 100644
+--- a/.github/workflows/js-tests.yml
++++ b/.github/workflows/js-tests.yml
+@@ -177,8 +177,8 @@ jobs:
+         # (a half-extracted download, a worktree its later cleanup never removed).
+         uses: ./.github/actions/check-clean-worktree
+ 
+-  # The Prebuilt TUI job of termux-verify.yml installs ONLY ui-tui + tests-js
+-  # (npm adds apps/shared and ui-tui/packages/hermes-ink), not the full
++  # The Prebuilt TUI job of termux-verify.yml installs ui-tui + tests-js +
++  # apps/desktop and their dependency closure, not the full
+   # workspace the job above installs. A tests-js or ui-tui change that assumes
+   # another workspace is installed passes `check` above and first fails there,
+   # on some unrelated scripts/termux or pm PR: termux-verify's path filter never
+@@ -203,12 +203,12 @@ jobs:
+           extras: '[]'
+           cache-node: false
+       - name: Install the locked JS workspace
+-        run: npm ci --workspace ui-tui --workspace tests-js --include-workspace-root --include=dev --no-fund --no-audit
++        run: pnpm install --frozen-lockfile --filter "{./ui-tui}..." --filter "{./tests-js}..." --filter "{./apps/desktop}..."
+       - name: Check and bundle the TUI
+         run: |
+-          npm run check --workspace tests-js
+-          npm run check --workspace ui-tui
+-          npm run build --workspace ui-tui
++          pnpm --dir tests-js run check
++          pnpm --dir ui-tui run check
++          pnpm --dir ui-tui run build
+       - name: Check the checkout is clean
+         uses: ./.github/actions/check-clean-worktree
+ 
+@@ -235,7 +235,7 @@ jobs:
+           extras: '[]'
+           cache-node: false
+       - name: Install locked chat driver dependencies
+-        run: npm ci --workspace tests-js --include-workspace-root --omit=dev --ignore-scripts --no-audit --no-fund
++        run: pnpm install --frozen-lockfile --filter "{./tests-js}..." --prod --ignore-scripts
+       - name: Resolve every driver import
+         run: |
+           node .github/scripts/check-runtime-driver-imports.mjs
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index 135bf559dc2..0484857e113 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -1012,11 +1012,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+                 if (result.get("failure_reason") == "content_policy_blocked"
+                         and _adb is not None and _adb is self.session_manager._get_db()
+                         and getattr(state.agent, "_session_db_created", False)):
+-                    from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
++                    from agent.turn_failure_copy import refused_turn_display_notice
+                     from hermes_state_rewind import retain_refused_turn_for_display
+                     retain_refused_turn_for_display(
+                         _adb, getattr(state.agent, "session_id", session_id),
+-                        notice=CONTENT_REFUSED_NOTICE,
++                        notice=refused_turn_display_notice(result),
+                         boundary_row_id=result.get("refused_turn_boundary_row_id"))
+ 
+             # Head rotated (compression split): emit provenance so clients can render the boundary.
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 95fad2cae91..cf29c357578 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1143,20 +1143,14 @@ def _content_policy_blocked_result(
+     messages: list[dict], api_call_count: int, *, final_response: str, error_detail: str,
+     refusal_category: Any = None,
+     boundary_row_id: Optional[int] = None,
++    ran_actions: bool = False,
+ ) -> dict[str, Any]:
+-    """Terminal turn result for a content-policy block (deterministic for the unchanged
+-    prompt, so no retry); shared by the HTTP-200 and exception paths. ``messages`` is the
+-    CLEAN pre-refusal history (the refused turn is dropped from it). ``boundary_row_id`` is
+-    the durable row that started the refused run, so the owner drops the exact turn."""
+-    result = {
+-        "final_response": final_response, "messages": messages, "api_calls": api_call_count,
+-        "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
+-        "failure_reason": "content_policy_blocked", "failure_retryable": False,
+-        "refusal_category": refusal_category,
+-    }
+-    if boundary_row_id is not None:
+-        result["refused_turn_boundary_row_id"] = boundary_row_id
+-    return result
++    """Shared refusal result; keep the public loop seam while copy lives in its topical module."""
++    from agent.turn_failure_copy import content_policy_blocked_result
++    return content_policy_blocked_result(
++        messages, api_call_count, final_response=final_response, error_detail=error_detail,
++        refusal_category=refusal_category, boundary_row_id=boundary_row_id, ran_actions=ran_actions,
++    )
+ 
+ 
+ def _partial_turn_result(
+@@ -1973,7 +1967,7 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
+         # hedge over the whole list rather than under-report a possible side effect.
+         start = result.get("current_turn_user_idx")
+         turn_messages = messages[start:] if isinstance(start, int) and 0 <= start < len(messages) else messages
+-        content = failed_turn_notice(turn_messages, restarted=_stopped_by_backend_exit(agent, result), result=result)
++        content = failed_turn_notice(turn_messages, restarted=_stopped_by_backend_exit(agent, result))
+         # [daveey] A turn nobody typed (a Kanban notice, a background-job report) is never "sent again" by a
+         # person: its host supplies copy that says what failed and what happens next (TUI: automation replay).
+         override = getattr(agent, "_failed_turn_notice_override", None)
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index 7a02f67cc3b..a43d7a84240 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -34,7 +34,7 @@ RESULT_FIELDS = ('final_response', 'failed', 'interrupted', 'completed', 'partia
+                  'estimated_cost_usd', 'cost_status', 'cost_source', 'service_tier', 'failure_reason',
+                  'session_id', 'requested_model', 'served_model', '_turn_input_tokens', '_turn_output_tokens',
+                  'failure_retryable', 'failure_resets_at', 'billing_block', 'free_tier', 'usage_window_message',
+-                 'refused_turn_boundary_row_id')
++                 'refused_turn_boundary_row_id', 'refusal_category', 'refused_turn_ran_actions')
+ # The structured fields and their allowed keys: ``billing_block`` (``agent/billing_links.BillingBlock``
+ # plus ``unverified``) and ``free_tier`` (``agent/turn_recovery._stamp_free_tier``). With
+ # ``failure_reason``, ``failure_retryable`` and ``failure_resets_at`` they are what
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index e8685517159..a13eab7b01d 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -340,6 +340,18 @@ def history_before_current_turn(
+     return list(fallback) if isinstance(fallback, list) else []
+ 
+ 
++def current_turn_ran_actions(messages: Any, current_turn_user_idx: Any) -> bool:
++    """[daveey] Whether the current (refused) turn ran a tool. Scoped to this turn when its user row
++    index is usable; otherwise hedges over the whole working set rather than under-report a possible
++    side effect."""
++    from agent.turn_failure_copy import turn_ran_actions
++    if not isinstance(messages, list):
++        return False
++    if isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages):
++        return turn_ran_actions(messages[current_turn_user_idx:])
++    return turn_ran_actions(messages)
++
++
+ def refused_turn_boundary_row_id(messages: Any, current_turn_user_idx: Any) -> Optional[int]:
+     """The durable row id that STARTED the current (refused) turn, or ``None``.
+ 
+diff --git a/agent/turn_failure_copy.py b/agent/turn_failure_copy.py
+index f6352458c7d..a5179c811d5 100644
+--- a/agent/turn_failure_copy.py
++++ b/agent/turn_failure_copy.py
+@@ -95,6 +95,70 @@ CONTENT_REFUSED_NOTICE = (
+ )
+ # messages.display_metadata key carrying the stored notice, so every surface renders one copy.
+ CONTENT_REFUSED_METADATA_KEY = "content_refused"
++# [daveey] A refused turn may have run tools before the filter tripped: erasing it from the model's
++# context does not undo their effects, so the notice must not read as "nothing happened".
++REFUSED_TURN_ACTIONS_WARNING = "Some actions may already have run; verify their effects."
++
++
++def safe_refusal_category(category: Any) -> Optional[str]:
++    """[daveey] A provider refusal category fit for display: a short ASCII machine identifier, never
++    provider prose, markup or reasoning (``None`` otherwise)."""
++    if (isinstance(category, str) and 0 < len(category) <= 80
++            and all(c.isascii() and (c.isalnum() or c in "_-") for c in category)):
++        return category
++    return None
++
++
++def turn_ran_actions(turn_messages: Any) -> bool:
++    """True when the turn's rows show a tool call or result (a side effect may already have happened)."""
++    return any(
++        isinstance(row, dict) and (
++            row.get("role") == "tool" or (row.get("role") == "assistant" and row.get("tool_calls"))
++        ) for row in turn_messages or ()
++    )
++
++
++def content_refused_notice(category: Any = None, *, ran_actions: bool = False) -> str:
++    """[daveey] The ``content_refused`` display notice: upstream's copy, plus the validated provider
++    category and the possible-side-effect warning. Display-only — never part of the model's context."""
++    safe = safe_refusal_category(category)
++    notice = (CONTENT_REFUSED_NOTICE if safe is None else
++              f"This message was refused by the model's safety filter (category: {safe}) — try a different query.")
++    return f"{notice} {REFUSED_TURN_ACTIONS_WARNING}" if ran_actions else notice
++
++
++def content_policy_blocked_result(
++    messages: list[dict], api_call_count: int, *, final_response: str, error_detail: str,
++    refusal_category: Any = None, boundary_row_id: Optional[int] = None,
++    ran_actions: bool = False,
++) -> dict[str, Any]:
++    """Terminal refusal result shared by HTTP-200 and exception paths. ``messages`` is clean
++    pre-refusal history; the category and possible-side-effect warning stay display-only.
++    ``boundary_row_id`` identifies the exact durable turn for owner-side retention."""
++    ran_actions = ran_actions is True
++    if ran_actions:
++        final_response = f"{final_response}\n\n{REFUSED_TURN_ACTIONS_WARNING}"
++    result = {
++        "final_response": final_response, "messages": messages, "api_calls": api_call_count,
++        "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
++        "failure_reason": "content_policy_blocked", "failure_retryable": False,
++        "refusal_category": refusal_category,
++        "refused_turn_ran_actions": ran_actions,
++        "refused_turn_notice": content_refused_notice(refusal_category, ran_actions=ran_actions),
++    }
++    if boundary_row_id is not None:
++        result["refused_turn_boundary_row_id"] = boundary_row_id
++    return result
++
++
++def refused_turn_display_notice(result: Any) -> str:
++    """[daveey] Owner side: the notice to retain for a refused turn's result. Rebuilt from the result's
++    typed fields (re-validated, since a managed worker's result crosses a process boundary), never a
++    free-text field."""
++    if not isinstance(result, dict):
++        return CONTENT_REFUSED_NOTICE
++    return content_refused_notice(
++        result.get("refusal_category"), ran_actions=result.get("refused_turn_ran_actions") is True)
+ 
+ 
+ def untyped_failed_turn_display_kind(role: Any, content: Any) -> Optional[str]:
+@@ -107,26 +171,12 @@ def untyped_failed_turn_display_kind(role: Any, content: Any) -> Optional[str]:
+     return None
+ 
+ 
+-def failed_turn_notice(turn_messages: Any, *, restarted: bool = False, result: Any = None) -> str:
+-    """Display-only boundary: preserve refusal categories and possible tool effects, not raw provider prose."""
+-    partial = any(
+-        isinstance(row, dict) and (
+-            row.get("role") == "tool" or (row.get("role") == "assistant" and row.get("tool_calls"))
+-        ) for row in turn_messages or ()
+-    )
+-    if isinstance(result, dict) and result.get("failure_reason") == "content_policy_blocked":
+-        category = result.get("refusal_category")
+-        # Category is a machine identifier, not arbitrary provider prose/markup or reasoning.
+-        safe = (isinstance(category, str) and 0 < len(category) <= 80
+-                and all(c.isascii() and (c.isalnum() or c in "_-") for c in category))
+-        detail = f" (category: {category})" if safe else ""
+-        notice = (
+-            f"The model provider's content filter refused this turn{detail}. "
+-            "Try to rephrase your question, or start a new chat or fork from before the problematic context; "
+-            "a long conversation can contribute to a filter trigger."
+-        )
+-        return notice + (" Some actions may already have run; verify their effects." if partial else "")
+-    if partial:
++def failed_turn_notice(turn_messages: Any, *, restarted: bool = False) -> str:
++    """Boundary copy for a failed turn: never claim "not processed" when a tool may have run. ``restarted``:
++    the turn was stopped by a backend restart, whose recovery continues a turn that ran no tool. A
++    content-policy refusal never gets this boundary (it is retained as ``content_refused`` instead:
++    ``content_refused_notice``)."""
++    if turn_ran_actions(turn_messages):
+         return PARTIAL_FAILED_TURN_NOTICE
+     return RESTART_FAILED_TURN_NOTICE if restarted else FAILED_TURN_NOTICE
+ 
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index ac8525d0a24..b884a06033f 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1082,13 +1082,16 @@ def nonretryable_client_error_result(
+         # deterministic for the unchanged conversation, so a persisted refused turn re-trips the
+         # filter on every later message and locks the chat (the "stuck session" report); the owner
+         # erases the durable turn-start row after the lease releases. Mirrors #1630.
+-        from agent.turn_context import history_before_current_turn, refused_turn_boundary_row_id
++        from agent.turn_context import (
++            current_turn_ran_actions, history_before_current_turn, refused_turn_boundary_row_id,
++        )
+         _clean = history_before_current_turn(messages, current_turn_user_idx, conversation_history)
+         return _content_policy_blocked_result(
+             _clean, api_call_count,
+             final_response="⚠️ " + content_policy_copy(label=_plabel, summary=_nonretryable_summary),
+             error_detail=_nonretryable_summary,
+             boundary_row_id=refused_turn_boundary_row_id(messages, current_turn_user_idx),
++            ran_actions=current_turn_ran_actions(messages, current_turn_user_idx),
+         )
+     # Skip persistence on likely context-overflow (400 + large session): persisting the
+     # failed message grows the session and repeats the failure.
+diff --git a/agent/turn_truncation.py b/agent/turn_truncation.py
+index a0ab8d76d22..95460792c3e 100644
+--- a/agent/turn_truncation.py
++++ b/agent/turn_truncation.py
+@@ -812,7 +812,9 @@ def handle_content_policy_refusal(
+     # set including the refused request + tool rounds — so returning it would re-poison CLI/ACP memory
+     # even after the owner cleans the durable transcript (#149708 review). Build it from the real
+     # turn boundary, and carry the refused run's durable boundary row so the owner drops the exact turn.
+-    from agent.turn_context import history_before_current_turn, refused_turn_boundary_row_id
++    from agent.turn_context import (
++        current_turn_ran_actions, history_before_current_turn, refused_turn_boundary_row_id,
++    )
+     clean_history = history_before_current_turn(messages, current_turn_user_idx, conversation_history)
+     _boundary_row_id = refused_turn_boundary_row_id(messages, current_turn_user_idx)
+     return RefusalVerdict("return", _content_policy_blocked_result(
+@@ -820,4 +822,5 @@ def handle_content_policy_refusal(
+         error_detail=_refusal_text or "model declined (content_filter)",
+         refusal_category=_stop_details.get("category") if isinstance(_stop_details, dict) else None,
+         boundary_row_id=_boundary_row_id,
++        ran_actions=current_turn_ran_actions(messages, current_turn_user_idx),
+     ), active_system_prompt)
+diff --git a/gateway/run_turn_persistence.py b/gateway/run_turn_persistence.py
+index 4e8cf06f330..d0036f23c9e 100644
+--- a/gateway/run_turn_persistence.py
++++ b/gateway/run_turn_persistence.py
+@@ -537,7 +537,8 @@ class GatewayTurnPersistenceMixin:
+             # Mirrors the context_overflow no-grow rule (#1630); only a non-retryable block drops.
+             if agent_persisted:
+                 await self._hmwa_retain_content_policy_refused_turn(
+-                    sid, session_key, agent_result.get("refused_turn_boundary_row_id"))
++                    sid, session_key, agent_result.get("refused_turn_boundary_row_id"),
++                    notice_result=agent_result)
+         else:
+             if not history and source.platform != Platform.LOCAL:
+                 # Fresh session: the tool definitions (as sent in the API request) make the transcript
+@@ -607,7 +608,8 @@ class GatewayTurnPersistenceMixin:
+         # trigger a rebuild next turn (destroying prompt caching).
+         await self._refresh_agent_cache_message_count(session_key, sid)
+ 
+-    async def _hmwa_retain_content_policy_refused_turn(self, sid, session_key, boundary_row_id=None):
++    async def _hmwa_retain_content_policy_refused_turn(self, sid, session_key, boundary_row_id=None,
++                                                       notice_result=None):
+         """Retain a safety-refused turn for display while forcing the next turn to rebuild from the
+         clean (model) transcript. The ONE owner-side refusal cleanup for every durable gateway owner:
+         the in-process runner (this persist path), the managed worker (Bot Chat / safe-mode, via
+@@ -629,11 +631,14 @@ class GatewayTurnPersistenceMixin:
+         ``retain_refused_turn_for_display`` reports failure by returning ``None`` (it swallows its own
+         errors), so only evict on a confirmed retention and warn otherwise — a silently-failed
+         un-stick leaves the chat locked, and that is the one outcome worth a visible signal.
++
++        [daveey] ``notice_result`` (the turn's result) supplies the validated refusal category and the
++        possible-side-effect warning for the retained notice (``refused_turn_display_notice``).
+         """
+-        from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
++        from agent.turn_failure_copy import refused_turn_display_notice
+         try:
+             outcome = await self.async_session_store.retain_refused_turn_for_display(
+-                sid, notice=CONTENT_REFUSED_NOTICE, boundary_row_id=boundary_row_id)
++                sid, notice=refused_turn_display_notice(notice_result), boundary_row_id=boundary_row_id)
+         except Exception as e:  # health: allow BLE001 -- best-effort; a refusal must never crash turn teardown
+             logger.warning("content-policy refusal: retaining the refused turn for %s raised: %s", sid, e)
+             return
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index 984d9575ae0..bec67a47262 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -658,7 +658,7 @@ async def _finalize_managed_refusal(authority, session_id, accepted):
+         return
+     with suppress(Exception):
+         await authority.runner._hmwa_retain_content_policy_refused_turn(
+-            session_id, None, accepted.get('refused_turn_boundary_row_id'))
++            session_id, None, accepted.get('refused_turn_boundary_row_id'), notice_result=accepted)
+ 
+ 
+ async def execute_managed(authority, ref, row, policy):
+diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.py
+index 301ec58d8f7..a7889e290e6 100644
+--- a/hermes_cli/cli_chat_turn_mixin.py
++++ b/hermes_cli/cli_chat_turn_mixin.py
+@@ -392,11 +392,11 @@ class CLIChatTurnMixin:
+             # refused notice. The in-memory history (result["messages"]) is already the clean
+             # pre-refusal history; this makes the durable model read match it.
+             if (turn.result or {}).get("failure_reason") == "content_policy_blocked":
+-                from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
++                from agent.turn_failure_copy import refused_turn_display_notice
+                 from hermes_state_rewind import retain_refused_turn_for_display
+                 retain_refused_turn_for_display(
+                     getattr(self.agent, "_session_db", None), getattr(self.agent, "session_id", None),
+-                    notice=CONTENT_REFUSED_NOTICE,
++                    notice=refused_turn_display_notice(turn.result),
+                     boundary_row_id=(turn.result or {}).get("refused_turn_boundary_row_id"))
+             # A reused thread must never hold stale references to a disposed CLI instance.
+             try:
+diff --git a/tests/agent/test_content_policy_refusal_stop_details.py b/tests/agent/test_content_policy_refusal_stop_details.py
+index ba225586484..f42d91c9dc5 100644
+--- a/tests/agent/test_content_policy_refusal_stop_details.py
++++ b/tests/agent/test_content_policy_refusal_stop_details.py
+@@ -1,13 +1,30 @@
+-"""handle_content_policy_refusal: an Anthropic refusal with an empty body still tells the user why."""
++"""handle_content_policy_refusal: an Anthropic refusal with an empty body still tells the user why.
++
++[daveey] The refused turn leaves the MODEL's context (upstream) and is retained for display only as a
++``content_refused`` row. These tests pin that the fork's validated refusal category and the
++possible-side-effect warning reach that real display boundary (the stored notice) and the live result,
++end to end from the production refusal handler, while nothing refused re-enters model history.
++"""
++import asyncio
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
+ import pytest
+ 
++from agent.context_compressor import _DB_PERSISTED_MARKER
+ from agent.conversation_loop import _close_durable_failed_turn
+-from agent.turn_failure_copy import FAILED_TURN_NOTICE, failed_turn_notice
++from agent.managed_worker import accept_result, result_frame
++from agent.turn_failure_copy import (
++    CONTENT_REFUSED_DISPLAY_KIND, CONTENT_REFUSED_METADATA_KEY, CONTENT_REFUSED_NOTICE, FAILED_TURN_NOTICE,
++    REFUSED_TURN_ACTIONS_WARNING, refused_turn_display_notice,
++)
+ from agent.turn_retry_state import TurnRetryState
+ from agent.turn_truncation import handle_content_policy_refusal
++from hermes_state import SessionDB
++from hermes_state_rewind import retain_refused_turn_for_display
++
++_ASK = "Why choose this host?"
++_TOOL_CALL = {"id": "call", "type": "function", "function": {"name": "shell", "arguments": "{}"}}
+ 
+ 
+ def _agent():
+@@ -21,76 +38,192 @@ def _agent():
+     agent._has_pending_fallback.return_value = False
+     agent._try_activate_fallback.return_value = False
+     agent._extract_reasoning.return_value = ""
++    agent._persist_disabled = False
++    agent._failed_turn_notice_override = None
++    agent.session_id = "refusal-test"
+     return agent
+ 
+ 
+-def test_empty_refusal_reports_stop_details_explanation():
+-    response = SimpleNamespace(
+-        content=[], stop_reason="refusal", usage=None, model="claude",
+-        stop_details={"type": "refusal", "category": "general_harms", "explanation": "classifier halt"},
+-    )
+-    verdict = handle_content_policy_refusal(
+-        _agent(), response, TurnRetryState(), thinking_spinner=None, messages=[], api_messages=[], api_kwargs={},
+-        active_system_prompt=None, conversation_history=[], api_call_count=1, effective_task_id="t", turn_id="u",
+-        api_request_id="r", api_start_time=0.0, retry_count=0, max_retries=0,
++def _refuse(agent, messages, stop_details, *, current_turn_user_idx=None):
++    response = SimpleNamespace(content=[], stop_reason="refusal", usage=None, model="claude",
++                               stop_details=stop_details)
++    return handle_content_policy_refusal(
++        agent, response, TurnRetryState(), thinking_spinner=None, messages=messages,
++        api_messages=[], api_kwargs={}, active_system_prompt=None, conversation_history=[],
++        api_call_count=1, effective_task_id="t", turn_id="u", api_request_id="r",
++        api_start_time=0.0, retry_count=0, max_retries=0, current_turn_user_idx=current_turn_user_idx,
+     )
++
++
++def _db_with_refused_turn(tmp_path, partial):
++    """A real state.db holding a prior exchange plus the refused turn the agent flushed at turn start;
++    returns the db and the loop's working set (turn rows stamped as committed, as the flush does)."""
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("s", "cli")
++    db.append_message("s", "user", "hello")
++    db.append_message("s", "assistant", "hi there")
++    rows = [("user", _ASK, {})]
++    if partial:
++        rows += [("assistant", "", {"tool_calls": [_TOOL_CALL]}), ("tool", "done", {"tool_call_id": "call"})]
++    working = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi there"}]
++    for role, content, extra in rows:
++        row_id = db.append_message("s", role, content, **extra)
++        working.append({"role": role, "content": content, **extra, "_row_id": row_id, _DB_PERSISTED_MARKER: True})
++    return db, working
++
++
++def _model(db):
++    return [(m["role"], m["content"]) for m in db.get_messages_as_conversation("s") if m["role"] != "session_meta"]
++
++
++def _display(db):
++    return [m for m in db.get_messages_as_conversation("s", include_compacted=True) if m["role"] != "session_meta"]
++
++
++def test_empty_refusal_reports_stop_details_explanation():
++    verdict = _refuse(_agent(), [], {"type": "refusal", "category": "general_harms", "explanation": "classifier halt"})
+     assert verdict.action == "return"
+     assert "classifier halt" in verdict.result["error"]
+ 
+ 
+ @pytest.mark.parametrize("explanation", [None, "classifier halt"])
+ @pytest.mark.parametrize("partial", [False, True])
+-def test_refusal_category_reaches_visible_boundary(explanation, partial):
++def test_refusal_category_and_actions_reach_the_retained_display_notice(tmp_path, explanation, partial):
++    """Production path: refusal handler → (no-op) failed-turn closer → owner retention in a real db."""
+     agent = _agent()
+-    agent._persist_disabled = False
+-    agent._failed_turn_notice_override = None
+-    agent.session_id = "refusal-test"
+-    agent._session_db.latest_conversation_role.return_value = "tool" if partial else "user"
+-    messages = [{"role": "user", "content": "Why choose this host?"}]
++    db, working = _db_with_refused_turn(tmp_path, partial)
++    agent._session_db = db
++    try:
++        verdict = _refuse(agent, working, {"category": "reasoning_extraction", "explanation": explanation},
++                          current_turn_user_idx=2)
++        result = verdict.result
++        # Upstream: the refused turn never re-enters model history (CLI/ACP/TUI keep result["messages"]).
++        assert result["messages"] == working[:2]
++        # The core closer adds no failed_turn boundary for a refusal (it would only be rewound).
++        _close_durable_failed_turn(agent, result)
++        assert result["messages"] == working[:2]
++        assert not any(m.get("display_kind") == "failed_turn" for m in _display(db))
++        # Live result: provider guidance, plus the actions warning iff a tool ran.
++        assert "safety filter refused" in result["final_response"]
++        assert "left out of this conversation" in result["final_response"]
++        assert (REFUSED_TURN_ACTIONS_WARNING in result["final_response"]) == partial
++        assert result["refused_turn_ran_actions"] is partial
++        assert "(category: reasoning_extraction)" in result["refused_turn_notice"]
++        assert (REFUSED_TURN_ACTIONS_WARNING in result["refused_turn_notice"]) == partial
++
++        # Real display boundary: the owner retains the turn with the notice built from the result.
++        assert retain_refused_turn_for_display(
++            db, "s", notice=refused_turn_display_notice(result),
++            boundary_row_id=result["refused_turn_boundary_row_id"]) is True
++        assert _model(db) == [("user", "hello"), ("assistant", "hi there")]
++        refused = _display(db)[-1]
++        assert (refused["role"], refused["content"], refused["display_kind"]) == (
++            "user", _ASK, CONTENT_REFUSED_DISPLAY_KIND)
++        notice = refused["display_metadata"][CONTENT_REFUSED_METADATA_KEY]["notice"]
++        assert notice == result["refused_turn_notice"]
++        assert "refused by the model's safety filter" in notice and "reasoning_extraction" in notice
++        assert "Your request was not processed" not in notice
++        assert ("Some actions may already have run" in notice) == partial
++        # Display-only: neither the notice nor the refused ask is in the model read.
++        assert all(notice not in str(c) and _ASK != c for _, c in _model(db))
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize("category", [None, {}, "", "x" * 81, "<script>bad</script>", "secret\ntext", "naïve"])
++def test_missing_or_malformed_category_never_reaches_the_display(tmp_path, category):
++    """Production path control: a malformed provider category is dropped from both the live notice
++    and the stored ``content_refused`` notice, which fall back to upstream's exact copy."""
++    agent = _agent()
++    db, working = _db_with_refused_turn(tmp_path, partial=False)
++    agent._session_db = db
++    try:
++        result = _refuse(agent, working, {"category": category}, current_turn_user_idx=2).result
++        assert result["refused_turn_notice"] == CONTENT_REFUSED_NOTICE
++        assert retain_refused_turn_for_display(
++            db, "s", notice=refused_turn_display_notice(result),
++            boundary_row_id=result["refused_turn_boundary_row_id"]) is True
++        notice = _display(db)[-1]["display_metadata"][CONTENT_REFUSED_METADATA_KEY]["notice"]
++        assert notice == CONTENT_REFUSED_NOTICE
++        for leaked in ("category:", "<script>", "secret", "naïve", "x" * 81):
++            assert leaked not in notice
++    finally:
++        db.close()
++
++
++def test_owner_rebuilds_the_notice_instead_of_trusting_result_text():
++    """A tampered/crossed-boundary result cannot inject text: the owner re-validates the typed fields."""
++    tampered = {"failure_reason": "content_policy_blocked", "refusal_category": "<b>x</b>",
++                "refused_turn_ran_actions": "yes", "refused_turn_notice": "<script>pwn</script>"}
++    assert refused_turn_display_notice(tampered) == CONTENT_REFUSED_NOTICE
++    assert refused_turn_display_notice(None) == CONTENT_REFUSED_NOTICE
++
++
++@pytest.mark.parametrize("partial", [False, True])
++def test_managed_worker_frame_carries_category_and_actions_to_the_owner_notice(tmp_path, partial):
++    """Bot Chat: the worker's result crosses ``result_frame``/``accept_result``; the owner's gateway
++    cleanup (``_finalize_managed_refusal``) must still store the category and the warning."""
++    from gateway.config import GatewayConfig, Platform
++    from gateway.run import GatewayRunner
++    from gateway.session import AsyncSessionStore, SessionSource, SessionStore
++    from gateway.session_managed_worker import _finalize_managed_refusal
++
++    worker_messages = [{"role": "user", "content": _ASK}]
+     if partial:
+-        messages.append({"role": "tool", "content": "done", "tool_call_id": "call"})
+-    response = SimpleNamespace(
+-        content=[], stop_reason="refusal", usage=None, model="claude",
+-        stop_details={"category": "reasoning_extraction", "explanation": explanation},
+-    )
+-    verdict = handle_content_policy_refusal(
+-        agent, response, TurnRetryState(), thinking_spinner=None, messages=messages,
+-        api_messages=[], api_kwargs={}, active_system_prompt=None, conversation_history=[],
+-        api_call_count=1, effective_task_id="t", turn_id="u", api_request_id="r",
+-        api_start_time=0.0, retry_count=0, max_retries=0,
+-    )
+-    _close_durable_failed_turn(agent, verdict.result)
+-    boundary = messages[-1]
+-    assert boundary["display_kind"] == "failed_turn"
+-    assert "provider" in boundary["content"]
+-    assert "refused" in boundary["content"]
+-    assert "reasoning_extraction" in boundary["content"]
+-    assert "new chat" in boundary["content"]
+-    assert "rephrase" in boundary["content"]
+-    assert "Your request was not processed" not in boundary["content"]
+-    assert ("Some actions may already have run" in boundary["content"]) == partial
+-    agent._flush_messages_to_session_db.assert_called_once_with(messages)
++        worker_messages += [{"role": "assistant", "content": "", "tool_calls": [_TOOL_CALL]},
++                            {"role": "tool", "content": "done", "tool_call_id": "call"}]
++    result = _refuse(_agent(), worker_messages, {"category": "general_harms"}, current_turn_user_idx=0).result
++    accepted, _usage = accept_result(result_frame(result))
++    assert accepted["refusal_category"] == "general_harms"
++    assert accepted["refused_turn_ran_actions"] is partial
++
++    async def check():
++        store = SessionStore(tmp_path / "sessions", GatewayConfig())
++        runner = object.__new__(GatewayRunner)
++        runner.session_store = store
++        runner._async_session_store = AsyncSessionStore(store)
++        runner._session_db = object()
++        runner._evict_cached_agent = lambda *a, **k: None
++        entry = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="c", user_id="u"))
++        sid = entry.session_id
++        db = store._db_for_session_id(sid)
++        db.append_message(sid, "user", "hello")
++        db.append_message(sid, "assistant", "hi there")
++        boundary = db.append_message(sid, "user", _ASK)
++        if partial:
++            db.append_message(sid, "assistant", "", tool_calls=[_TOOL_CALL])
++            db.append_message(sid, "tool", "done", tool_call_id="call")
++        await _finalize_managed_refusal(SimpleNamespace(runner=runner), sid,
++                                        {**accepted, "refused_turn_boundary_row_id": boundary})
++        model = [(m["role"], m["content"]) for m in db.get_messages_as_conversation(sid)
++                 if m["role"] != "session_meta"]
++        assert model == [("user", "hello"), ("assistant", "hi there")]
++        refused = [m for m in db.get_messages_as_conversation(sid, include_compacted=True)
++                   if m["role"] != "session_meta"][-1]
++        assert refused["display_kind"] == CONTENT_REFUSED_DISPLAY_KIND
++        notice = refused["display_metadata"][CONTENT_REFUSED_METADATA_KEY]["notice"]
++        assert "(category: general_harms)" in notice
++        assert (REFUSED_TURN_ACTIONS_WARNING in notice) == partial
++        db.close()
++
++    asyncio.run(check())
++
++
++def test_managed_worker_frame_drops_a_non_string_category():
++    result = _refuse(_agent(), [{"role": "user", "content": _ASK}], {"category": {"nested": "x"}},
++                     current_turn_user_idx=0).result
++    accepted, _usage = accept_result(result_frame(result))
++    assert "refusal_category" not in accepted
++    assert refused_turn_display_notice(accepted) == CONTENT_REFUSED_NOTICE
+ 
+ 
+ def test_other_failure_keeps_generic_visible_boundary():
+     agent = _agent()
+-    agent._persist_disabled = False
+-    agent._failed_turn_notice_override = None
+     agent.session_id = "failure-test"
+     agent._session_db.latest_conversation_role.return_value = "user"
+     messages = [{"role": "user", "content": "Hello"}]
+     _close_durable_failed_turn(agent, {
+         "messages": messages, "completed": False, "failed": True, "failure_reason": "server_error",
+     })
++    assert messages[-1]["display_kind"] == "failed_turn"
+     assert messages[-1]["content"] == FAILED_TURN_NOTICE
+-
+-
+-@pytest.mark.parametrize("category", [None, {}, "", "x" * 81, "<script>bad</script>", "secret\ntext"])
+-def test_missing_or_malformed_category_still_explains_refusal(category):
+-    notice = failed_turn_notice([], result={
+-        "failure_reason": "content_policy_blocked", "refusal_category": category,
+-    })
+-    assert "provider's content filter refused" in notice
+-    assert "category:" not in notice
+-    assert "<script>" not in notice
+-    assert "secret" not in notice
+diff --git a/tests/ci/test_runtime_install_shape.py b/tests/ci/test_runtime_install_shape.py
+index 36dc69a33bd..da5ccab8b1c 100644
+--- a/tests/ci/test_runtime_install_shape.py
++++ b/tests/ci/test_runtime_install_shape.py
+@@ -1,7 +1,7 @@
+ """The runtime-only tests-js install shape is checked on the PRs that can break it.
+ 
+ desktop-bundle-smoke.yml and the install-e2e-*-run.yml workflows install
+-``npm ci --workspace tests-js --include-workspace-root --omit=dev`` and launch
++``pnpm install --filter "{./tests-js}..." --prod`` and launch
+ tests/install/e2e-assets drivers. They run on release/dispatch only, so a driver
+ importing a devDependency first failed at release time. js-tests.yml's
+ ``runtime-install-shape`` job installs the same shape on every frontend-lane PR
+@@ -33,7 +33,7 @@ _WORKFLOWS = [
+     "install-e2e-macos-run.yml",
+     "install-e2e-windows-run.yml",
+ ]
+-_INSTALL = re.compile(r"^\s*run:\s*(npm ci --workspace tests-js .*)$", re.MULTILINE)
++_INSTALL = re.compile(r'^\s*run:\s*(pnpm install .*--filter "\{\./tests-js\}\.\.\." .*)$', re.MULTILINE)
+ _ASSETS = _REPO / "tests/install/e2e-assets"
+ _CHECKER = (_REPO / ".github/scripts/check-runtime-driver-imports.mjs").read_text(
+     encoding="utf-8"
+@@ -53,7 +53,7 @@ def _install_commands(workflow: str) -> list[str]:
+ def test_every_runtime_install_in_the_workflows_is_one_shape():
+     shapes = {c for w in _WORKFLOWS for c in _install_commands(w)}
+     assert len(shapes) == 1, shapes
+-    assert "--omit=dev" in next(iter(shapes))
++    assert next(iter(shapes)) == 'pnpm install --frozen-lockfile --filter "{./tests-js}..." --prod --ignore-scripts'
+     # desktop-bundle-smoke 1, install-e2e-run 1, macos 2, windows 2: a new
+     # install step must be added to this count on purpose.
+     assert sum(len(_install_commands(w)) for w in _WORKFLOWS) == 6
+@@ -111,6 +111,8 @@ def test_checker_covers_every_node_script_the_launchers_run():
+         "scripts/generate-icons.mjs",
+         ".github/scripts/check-runtime-driver-imports.mjs",
+         "tests-js/scripts/mock-provider-config.ts",
++        "pnpm-lock.yaml",
++        "pnpm-workspace.yaml",
+     ],
+ )
+ def test_every_input_of_the_shape_selects_the_frontend_lane(path):
+diff --git a/tests/ci/test_tui_install_shape.py b/tests/ci/test_tui_install_shape.py
+index 12d8d6d4a00..9d2f175cbcd 100644
+--- a/tests/ci/test_tui_install_shape.py
++++ b/tests/ci/test_tui_install_shape.py
+@@ -1,7 +1,7 @@
+ """The Prebuilt TUI install shape is checked on the PRs that can break it.
+ 
+-termux-verify.yml's ``tui`` job installs only ui-tui + tests-js (npm adds
+-apps/shared and ui-tui/packages/hermes-ink) and runs their checks. Its path
++termux-verify.yml's ``tui`` job installs ui-tui + tests-js + apps/desktop and
++their dependency closure, then runs the TUI checks. Its path
+ filter covers scripts/termux, pm and its own tests, so a tests-js or ui-tui
+ change never ran it on its own PR: 7a33a706f5 added a tests-js test that
+ assumed apps/desktop was installed, passed the main CI's full install, and
+@@ -50,10 +50,11 @@ def test_main_ci_job_matches_the_termux_prebuilt_tui_job():
+     assert _shape(main) == _shape(termux)
+     runs = [cmd for kind, cmd in _shape(main) if kind == "run"]
+     # The point of the job: a minimal install, not the full workspace.
+-    assert any("npm ci --workspace ui-tui --workspace tests-js --include-workspace-root" in r for r in runs)
+-    assert not any(r.startswith("npm ci") and "apps/desktop" in r for r in runs)
+-    assert "npm run check --workspace tests-js" in runs[-1]
+-    assert "npm run build --workspace ui-tui" in runs[-1]
++    assert runs[0] == ('pnpm install --frozen-lockfile --filter "{./ui-tui}..." '
++                       '--filter "{./tests-js}..." --filter "{./apps/desktop}..."')
++    assert "pnpm --dir tests-js run check" in runs[-1]
++    assert "pnpm --dir ui-tui run check" in runs[-1]
++    assert "pnpm --dir ui-tui run build" in runs[-1]
+     assert not main.get("continue-on-error")
+ 
+ 
+@@ -73,7 +74,8 @@ def test_job_gates_the_merge_through_js_tests():
+     "apps/shared/src/index.ts",
+     ".github/scripts/run-workspace-checks.mjs",
+     "package.json",
+-    "package-lock.json",
++    "pnpm-lock.yaml",
++    "pnpm-workspace.yaml",
+     "scripts/build/tui.mjs",
+     "eslint.config.shared.mjs",
+     ".npmrc",
+diff --git a/tests/hermes_cli/test_source_build.py b/tests/hermes_cli/test_source_build.py
+index 52a66c3e991..b5ad711c8a1 100644
+--- a/tests/hermes_cli/test_source_build.py
++++ b/tests/hermes_cli/test_source_build.py
+@@ -654,7 +654,7 @@ def test_without_the_defer_flag_a_running_desktop_is_swapped_as_upstream(tmp_pat
+ 
+ 
+ @pytest.mark.platforms("macos")
+-@pytest.mark.parametrize("change", ["apps/desktop/src/a.ts", "apps/shared/src/x.ts", "package-lock.json"])
++@pytest.mark.parametrize("change", ["apps/desktop/src/a.ts", "apps/shared/src/x.ts", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+ def test_update_builds_when_a_desktop_input_changed_since_the_prebuilt_commit(tmp_path, monkeypatch, capsys, change):
+     from hermes_cli.source_build import _build_desktop_product
+ 
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 0055bb8f68b..21400e666a8 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1160,11 +1160,11 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
+     # deterministic filter re-locks the chat (#149708 review). Best-effort; the live refusal notice was
+     # already delivered.
+     if result.get("failure_reason") == "content_policy_blocked":
+-        from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
++        from agent.turn_failure_copy import refused_turn_display_notice
+         from hermes_state_rewind import retain_refused_turn_for_display
+         retain_refused_turn_for_display(
+             getattr(agent, "_session_db", None), getattr(agent, "session_id", None),
+-            notice=CONTENT_REFUSED_NOTICE, boundary_row_id=result.get("refused_turn_boundary_row_id"))
++            notice=refused_turn_display_notice(result), boundary_row_id=result.get("refused_turn_boundary_row_id"))
+     # The receipt verifies the stored row's body, which keeps the model's text as written;
+     # only the delivered copy drops a silence marker.
+     receipt = _persisted_turn_receipt(st, raw, status)
+-- 
+2.55.0
+
