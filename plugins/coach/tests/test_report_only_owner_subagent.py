@@ -167,7 +167,9 @@ def test_rubrics_read_steer_lines():
 # real-format read that yields an `<- OK` line, or the judges cannot see the check and hold a true reply. The fifth
 # false hold in this class (8d8563ea, 1d0803fa, 7649f1d4, 1cd30bb2, this one) came from a kind with no such read.
 NOW = 1793737054.0
+SESSION = json.loads((HERE / "tests/fixtures/owner_read_cross_session.json").read_text())
 OWNER_KIND_READS = {
+    "other session": [("cross_session", SESSION["call"], SESSION["result"])],
     "card": [("kanban_show", {"task_id": "t_01a1a273a0cccc63"},
               {"task": {"id": "t_01a1a273a0cccc63", "status": "running"}, "runs": [], "events": []})],
     "worker": [("terminal", {"command": "ps -p 4242 -o pid,etime,cmd; hermes kanban show t_01a1a273a0cccc63"},
@@ -176,7 +178,7 @@ OWNER_KIND_READS = {
                  ("delegate_task", STEER["steer_call"], STEER["steer_result"])],
 }
 # A kind the rubric names with no OK-producing read yet; each entry names the card that owns adding it.
-KNOWN_OWNER_KIND_GAPS = {"other session": "t_01a1ae3198a0eb11: cross_session(action=read) needs an <- OK line"}
+KNOWN_OWNER_KIND_GAPS = {}
 
 
 def _rubric_owner_kinds():

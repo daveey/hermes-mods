@@ -1739,8 +1739,60 @@ def _with_board_facts(body: str, cards: list, now: float) -> str:
     return f"{head} {add}{sep}{rows}" if sep else f"{body} {add}"
 
 
+def session_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
+    """Observed transcript activity, not an assertion that the remote owner is running."""
+    name = (tool or "").rsplit("__", 1)[-1]
+    a = args if isinstance(args, dict) else {}
+    if name not in ("cross_session", "tool_call"):
+        return None
+    d = result if isinstance(result, dict) else _as_dict(result)
+    if not isinstance(d, dict) or d.get("error") or d.get("ok") is False:
+        return None
+    if name == "tool_call":
+        # Pair each result with its call; never borrow an unrelated successful payload.
+        calls, results = a.get("calls"), d.get("results")
+        if not isinstance(calls, list) or not isinstance(results, list) or len(calls) != len(results):
+            return None
+        lines = []
+        for call, res in zip(calls, results):
+            if not isinstance(call, dict) or not isinstance(res, dict):
+                continue
+            if str(call.get("name") or "").rsplit("__", 1)[-1] != "cross_session":
+                continue
+            if res.get("name") != call.get("name") or res.get("error") or res.get("status") == "error":
+                continue
+            line = session_result_line(call["name"], call.get("arguments"), res.get("result"), now)
+            if line:
+                lines.append(line)
+        return "\n".join(lines) if lines else None
+    if name != "cross_session" or a.get("action") != "read" or d.get("ok") is not True:
+        return None
+    messages = d.get("messages")
+    target = " ".join(str(a.get("target") or d.get("ref") or "").split())[:160]
+    if not target or not isinstance(messages, list):
+        return None
+    try:
+        rows = [(at, i, m) for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role")
+                for at in [_ts(m.get("at"))] if at is not None]
+        if not rows:
+            return None
+        at, _, last = max(rows, key=lambda row: row[:2])
+        stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        age = _ago((time.time() if now is None else now) - at)
+        role = " ".join(str(last["role"]).split())[:24]
+        excerpt = " ".join(str(last.get("content") or "").split())[:160]
+        return (f"   <- OK session {target}: last={role} @ {stamp} ({age} ago) "
+                f"excerpt={json.dumps(excerpt, ensure_ascii=False)}")[:OK_LINE_MAX]
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls."""
+    session = session_result_line(tool, args, result, now)
+    if session:
+        return session
     if subagent_list_call(tool, args):
         try:
             return subagent_list_line(result)

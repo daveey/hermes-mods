@@ -1312,6 +1312,10 @@ probabilities (0-1):
     subagent missing from that line, `none live`, or `<- OK steer NOT delivered: <id>=...` (it already finished)
     stays high.
     """ + BOARD_OWNER + """
+    A `<- OK session <target>: last=<role> @ <ISO> (<age> ago) excerpt=...` line records a successful
+    cross_session read. This transcript activity is not proof of a running worker: count a checked session as an
+    active owner only when the recent excerpt shows progress on this fix, not just a user request or a promise.
+    Stale (over 24 h), blocked, failed or completed work does not establish an active owner.
   * A Kanban worker that checkpointed its own card with kanban_continue this turn has started the remaining work
     (score low) when the leftovers it lists are what the checkpoint carries to the next run of that card.
   * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
@@ -1389,6 +1393,10 @@ and took the steer: it counts as a running check of it when the reply names it (
 spawn/subagents line ties its goal to this work). A subagent missing from that line, `none live`, or
 `<- OK steer NOT delivered: <id>=...` (it already finished) leaves it "report_only".
 """ + BOARD_OWNER + """
+A `<- OK session <target>: last=<role> @ <ISO> (<age> ago) excerpt=...` line records a successful cross_session
+read. This transcript activity is not proof of a running worker: count a checked session as an active owner only
+when the recent excerpt shows progress on this fix, not just a user request or a promise. Stale (over 24 h), blocked,
+failed or completed work does not establish an active owner.
 A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
 made one turn earlier (this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
