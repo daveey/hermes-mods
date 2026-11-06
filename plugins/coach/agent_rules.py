@@ -1603,6 +1603,142 @@ def subagent_steer_line(args: Any, result: Any) -> Optional[str]:
     return f"   <- OK steer NOT delivered: {sid}={status} (not running)"
 
 
+# agent-9ac78980e2 / agent-61f2644a68: owner credit came only from what the agent's own read printed. A true "that
+# card is running now" with no read this turn failed, and a status-only sqlite read of a todo card behind a running
+# parent showed no age. The coach runs on the host that holds the board, so it reads the card itself: read-only,
+# one indexed query per table, 2 s busy timeout, every error fail-open (None).
+BOARD_TIMEOUT_S = 2.0
+BOARD_MAX_PARENTS = 2
+_OPEN_PARENT_ORDER = ("running", "claimed", "review", "ready", "todo", "scheduled", "triage", "blocked")
+_FAILED_RUN_RE = re.compile(r"crash|fail|timed_out|timeout|error|gave_up|spawn_failed", re.I)
+
+
+def board_dbs() -> list:
+    """This host's Kanban board dbs: COACH_BOARD_DBS (os.pathsep list, set by tests and replays) when set, else
+    core's board list, else HERMES_KANBAN_DB / <home>/kanban.db plus <home>/kanban/boards/*/kanban.db."""
+    env = os.environ.get("COACH_BOARD_DBS")
+    if env is not None:
+        return [p for p in env.split(os.pathsep) if p and Path(p).is_file()]
+    try:
+        from hermes_cli import kanban_session_activity as ksa  # type: ignore
+        return [str(p) for p in ksa._board_db_paths()]
+    except Exception:
+        pass
+    root = Path(os.environ.get("HERMES_KANBAN_HOME") or os.environ.get("HERMES_HOME")
+                or Path.home() / ".hermes")
+    paths = [Path(os.environ["HERMES_KANBAN_DB"])] if os.environ.get("HERMES_KANBAN_DB") else [root / "kanban.db"]
+    paths += sorted((root / "kanban" / "boards").glob("*/kanban.db"))
+    return [str(p) for p in paths if p.is_file()]
+
+
+def _board_connect(path: str):
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=BOARD_TIMEOUT_S)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:  # a WAL db with its -wal/-shm gone: rw + query_only reads the same rows
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=BOARD_TIMEOUT_S)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
+def board_card_facts(card_id: str, now: Optional[float] = None, dbs: Optional[list] = None) -> Optional[dict]:
+    """A card's state on this host's boards as of `now` (events after `now` are ignored, for replays):
+    {id, status, created_at, claimed_at, last_kind, last_at, run, run_failed, waits_on: [(id, status, age_s)]}.
+    None when no board has the card or every read fails."""
+    now = time.time() if now is None else now
+    for path in (board_dbs() if dbs is None else dbs):
+        try:
+            conn = _board_connect(path)
+        except Exception:
+            continue
+        try:
+            row = conn.execute("select status, created_at from tasks where id=?", (card_id,)).fetchone()
+            if not row:
+                continue
+            ev = conn.execute("select kind, created_at from task_events where task_id=? and created_at<=? "
+                              "order by created_at desc, id desc limit 1", (card_id, now)).fetchone()
+            cl = conn.execute("select max(created_at) from task_events where task_id=? and kind='claimed' "
+                              "and created_at<=?", (card_id, now)).fetchone()
+            try:
+                run = conn.execute("select coalesce(outcome, status) from task_runs where task_id=? and "
+                                   "started_at<=? order by started_at desc, id desc limit 1",
+                                   (card_id, now)).fetchone()
+            except Exception:
+                run = None
+            waits = []
+            try:
+                for pid, st in conn.execute(
+                        "select t.id, t.status from task_links l join tasks t on t.id=l.parent_id "
+                        "where l.child_id=? and t.status not in ('done','archived')", (card_id,)).fetchall():
+                    pe = conn.execute("select max(created_at) from task_events where task_id=? and created_at<=?",
+                                      (pid, now)).fetchone()
+                    age = (now - pe[0]) if pe and pe[0] else None
+                    waits.append((str(pid), str(st), age))
+            except Exception:
+                waits = []
+            rank = {s: i for i, s in enumerate(_OPEN_PARENT_ORDER)}
+            waits.sort(key=lambda w: (rank.get(w[1], len(rank)), w[2] if w[2] is not None else 1e18))
+            run_state = str(run[0]) if run and run[0] else None
+            return {"id": card_id, "status": str(row[0]), "created_at": _ts(row[1]),
+                    "claimed_at": _ts(cl[0]) if cl and cl[0] else None,
+                    "last_kind": str(ev[0]) if ev else None, "last_at": _ts(ev[1]) if ev else None,
+                    "run": run_state, "run_failed": bool(run_state and _FAILED_RUN_RE.search(run_state)),
+                    "waits_on": waits[:BOARD_MAX_PARENTS], "db": str(path)}
+        except Exception:
+            continue
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return None
+
+
+def _waits_text(facts: dict) -> str:
+    return " ".join(f"waits_on={pid}:{st}" + (f"({_ago(age)})" if age is not None else "")
+                    for pid, st, age in facts.get("waits_on") or [])
+
+
+BOARD_LINE_PREFIX = "   <- BOARD"
+
+
+def board_fact_line(facts: dict, now: Optional[float] = None) -> str:
+    """`   <- BOARD task=<id> status=<s> created=<age> claimed=<age|never> run=<state|none> last=<age>(<kind>)
+    [waits_on=<parent>:<status>(<age>)]`: the coach's own read of a card the reply names (reply_check)."""
+    now = time.time() if now is None else now
+
+    def age(t):
+        return _ago(now - t) if t else "?"
+    parts = [f"task={facts['id']}", f"status={facts['status']}", f"created={age(facts.get('created_at'))}",
+             f"claimed={age(facts['claimed_at']) if facts.get('claimed_at') else 'never'}",
+             f"run={facts.get('run') or 'none'}"]
+    if facts.get("last_at"):
+        parts.append(f"last={age(facts['last_at'])}({facts.get('last_kind')})")
+    w = _waits_text(facts)
+    return (f"{BOARD_LINE_PREFIX} " + " ".join(parts) + (f" {w}" if w else ""))[:OK_LINE_MAX]
+
+
+def _with_board_facts(body: str, cards: list, now: float) -> str:
+    """A raw owner-read body that printed no timestamp gets the card's newest event (and, for a queued or parked
+    card, its unfinished parents) from this host's board (agent-61f2644a68). Unchanged when the board has nothing."""
+    if "last=" in body or not cards:
+        return body
+    try:
+        facts = board_card_facts(cards[0], now=now)
+    except Exception:
+        facts = None
+    if not facts or not facts.get("last_at"):
+        return body
+    add = (f"last={facts.get('last_kind')} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(facts['last_at']))} "
+           f"({_ago(now - facts['last_at'])} ago)")
+    if facts["status"] in ("todo", "ready", "scheduled", "blocked", "triage") and facts.get("waits_on"):
+        add += " " + _waits_text(facts)
+    head, sep, rows = body.partition(" rows: ")
+    return f"{head} {add}{sep}{rows}" if sep else f"{body} {add}"
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls."""
     if subagent_list_call(tool, args):
@@ -1637,7 +1773,7 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
             a = args if isinstance(args, dict) else {}
             if not m and owner_read_forms(name, a):
                 cards = list(dict.fromkeys(_CARD_ID_RE.findall(_shell_text(name, a))))
-                body = _raw_owner_body(text, cards, now)
+                body = _with_board_facts(_raw_owner_body(text, cards, now), cards, now)
             else:
                 body = (f"status={m.group(1)} " if m else "") + " ".join(text.split())[:160]
     except Exception:

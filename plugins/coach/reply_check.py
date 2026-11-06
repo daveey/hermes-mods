@@ -333,6 +333,71 @@ def closed_owner(reply: str, card_status: Optional[Callable[[str], Optional[str]
     return None
 
 
+# agent-9ac78980e2 (with agent-6504f6447c, agent-fabde565ec): the judges learned an owner card's state only from the
+# agent's own reads, so a true "that card is running now" with no read this turn failed (p 0.9) and a false one got no
+# counter-evidence. For up to NAMED_CARD_MAX cards the reply's ending names that no `<- OK` line read, the coach reads
+# this host's boards itself and both judge prompts get one `<- BOARD ...` line per card (agent_rules.board_fact_line).
+# Cards on another gateway's board are not found and add nothing (the old behaviour).
+NAMED_CARD_MAX = 4
+NAMED_CARD_RE = re.compile(r"\bt_[0-9a-f]{8,}\b")
+_DQUOTES = "\"“”"
+
+
+def _in_dquotes(text: str, start: int) -> bool:
+    """Inside a "..." quotation on its line (a reply quoting an old note), not a card the reply itself names.
+    Backticks are code formatting here, not quoting: `t_…` is how replies usually write a card id."""
+    line = text[text.rfind("\n", 0, start) + 1:start]
+    return sum(line.count(q) for q in _DQUOTES) % 2 == 1
+
+
+def _read_this_turn(cid: str, tool_log: Optional[list]) -> bool:
+    for line in tool_log or []:
+        s = (line or "").lstrip()
+        if not (s.startswith("<- OK") or s.startswith("<- BOARD")) or cid not in s:
+            continue
+        if re.search(r"task=[\w,]*" + re.escape(cid) + r"\b[^|]*\bstatus=", s) or f"{cid}=" in s:
+            return True
+    return False
+
+
+def named_card_facts(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None,
+                     dbs: Optional[list] = None) -> list[str]:
+    """`<- BOARD task=...` lines for cards the reply's ending names (unquoted) that this turn's tool log never read
+    with a status; [] when there are none, no board has them, or a read fails (fail-open)."""
+    try:
+        tail = (reply or "")[-1500:]
+        ids: list[str] = []
+        for m in NAMED_CARD_RE.finditer(tail):
+            cid = m.group(0)
+            if cid in ids or _in_dquotes(tail, m.start()) or _read_this_turn(cid, tool_log):
+                continue
+            ids.append(cid)
+            if len(ids) >= NAMED_CARD_MAX:
+                break
+        if not ids:
+            return []
+        ar = _cache.load_sibling(_HERE, "agent_rules")
+        now = time.time() if now is None else now
+        out = []
+        for cid in ids:
+            facts = ar.board_card_facts(cid, now=now, dbs=dbs)
+            if facts:
+                out.append(ar.board_fact_line(facts, now=now))
+        return out
+    except Exception:
+        return []
+
+
+def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = None) -> str:
+    """The prompt section with the coach's own board read ("" when it has no lines). `board=None` reads now."""
+    lines = named_card_facts(reply, tool_log) if board is None else list(board)
+    if not lines:
+        return ""
+    return ("COACH'S OWN BOARD READ (this host's Kanban boards, read just now for cards the final message names "
+            "that the tool log did not read; counts as a check of these cards this turn):\n"
+            + "\n".join(lines) + "\n\n")
+
+
 # status_only: the user asks why it's waiting / what's going on / to finish it, and the turn only reopened, unblocked,
 # commented on or looked at cards (defect agent-38a817308d: four "reopened the card / verified ready" replies while the
 # rollout card sat unstarted for 4 days). Deterministic, before the judge: the report_only owner-check exemption
@@ -1167,6 +1232,20 @@ def wake_sources(session_id: str, tool_log: Optional[list] = None) -> list[str]:
 STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible route) is not a started fix: do it in "
                  "this chat if your model can, or re-place it (`placement`) on a gateway with capacity, and say which.")
 
+# agent-9ac78980e2 / agent-61f2644a68: one clause for both report_only judges on the coach's own board read and on
+# dependency-gated owners.
+BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the coach's own read of a card the message "
+               "names, made from this host's boards when judging: count it as a check of that card this turn, the "
+               "same as an `<- OK` line. It shows status=, created= (card age), claimed= (newest claim, or never), "
+               "run= (newest run state) and last=<age>(<event>). The named card is a started owner when it is "
+               "running or claimed with its last event under 24 h; or ready or todo, created under 24 h ago, with "
+               "no failed, crashed or timed_out run; or todo, scheduled or blocked on a dependency with `waits_on=` "
+               "a parent that is running or claimed with activity under 24 h (the work is sequenced behind a started "
+               "fix; the same holds for `waits_on=` on an `<- OK` line). Ready or todo idle over 24 h, blocked with "
+               "no such parent, a failed run, or done/archived is not. A BOARD status that contradicts the message "
+               "(it says running, the board says ready, blocked or done) is evidence the claim is false: score "
+               "that hand-off high.")
+
 
 JUDGE_SYS = """You review an AI agent's final message for a turn, right before the turn ends, for a power user who wants
 the agent to self-serve and to verify its own work. Judge ONLY from the evidence shown. A PREVIOUS TURN TOOL LOG, when
@@ -1232,6 +1311,7 @@ probabilities (0-1):
     when the message names it (by id, or the notice or a spawn/subagents line ties its goal to this work). A
     subagent missing from that line, `none live`, or `<- OK steer NOT delivered: <id>=...` (it already finished)
     stays high.
+    """ + BOARD_OWNER + """
   * A Kanban worker that checkpointed its own card with kanban_continue this turn has started the remaining work
     (score low) when the leftovers it lists are what the checkpoint carries to the next run of that card.
   * Handing THIS problem's fix to another agent this turn counts as starting it (score low): the tool log has a
@@ -1308,6 +1388,7 @@ fix counts as handing it the work. A `<- OK steer queued: <id>` line is the runt
 and took the steer: it counts as a running check of it when the reply names it (by id, or the notice or a
 spawn/subagents line ties its goal to this work). A subagent missing from that line, `none live`, or
 `<- OK steer NOT delivered: <id>=...` (it already finished) leaves it "report_only".
+""" + BOARD_OWNER + """
 A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
 made one turn earlier (this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
@@ -1451,7 +1532,9 @@ def render_tool_log(tool_log: list[str], budget: int) -> str:
     return "\n".join(lines)
 
 
-def confirm_prompt(user_ask: str, rich_log: list[str], reply: str, prev_turn: Optional[dict] = None) -> str:
+def confirm_prompt(user_ask: str, rich_log: list[str], reply: str, prev_turn: Optional[dict] = None,
+                   board: Optional[list] = None) -> str:
+    """`board`: the coach's own `<- BOARD` lines (named_card_facts); None reads this host's boards now."""
     log = render_tool_log(rich_log, 7000)
     ask = user_ask or ""
     notice = notice_turn(ask)
@@ -1459,7 +1542,7 @@ def confirm_prompt(user_ask: str, rich_log: list[str], reply: str, prev_turn: Op
     request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else request_excerpt(ask)
     context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
     return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
-            f"truncated):\n{log}\n\n{prev_turn_section(prev_turn, rich_log)}"
+            f"truncated):\n{log}\n\n{board_section(reply, rich_log, board)}{prev_turn_section(prev_turn, rich_log)}"
             f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
@@ -1663,10 +1746,12 @@ def judge_system() -> str:
                         if prof.strip() else "")
 
 
-def judge_prompt(user_ask: str, tool_log: list[str], reply: str, prev_turn: Optional[dict] = None) -> str:
+def judge_prompt(user_ask: str, tool_log: list[str], reply: str, prev_turn: Optional[dict] = None,
+                 board: Optional[list] = None) -> str:
     log = render_tool_log(tool_log, 5000)
     return (f"USER'S REQUEST (latest):\n{request_excerpt(user_ask)}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
-            f"{log}\n\n{prev_turn_section(prev_turn, tool_log)}AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
+            f"{log}\n\n{board_section(reply, tool_log, board)}{prev_turn_section(prev_turn, tool_log)}"
+            f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
 def parse_verdict(raw: str) -> Optional[dict]:
