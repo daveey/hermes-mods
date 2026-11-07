@@ -201,6 +201,7 @@ Countermeasures:
 ### 8. Check Done means (below), fix at most 2 rounds, then report what still fails
 
 ## Done means
+- [ ] For a 'forwarder has not reported' card, did you first compare `hosts.json` reach values across hosts and check whether synced `selfheal-config.json` gives several hosts the same reach, causing the hub to probe the wrong machine?
 - [ ] For a cron fingerprint that "came back", did you diff the current stderr against the previous fix card's error and establish whether the cause is the same before calling the earlier fix broken?
 - [ ] For SQLite I/O errors or truncated disk-failure signals, is disk-owner adoption scoped to the same host and incident time (bounded local journal evidence is allowed), never cached in an unscoped generic family lane?
 - [ ] Every why cites evidence (log line, test, `file:line`, commit, metric) or is labelled `(hypothesis)`?
