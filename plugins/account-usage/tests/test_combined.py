@@ -200,7 +200,9 @@ class Combined(unittest.TestCase):
                             skip_memory=True, enabled_toolsets=[], max_iterations=1, platform='desktop',
                             session_id='durable-A', fallback_model=[{'provider': 'zai', 'model': 'test-fallback'}])
                     self.record['agent'] = a
-                    a._disable_streaming = True
+                    # This fixture exercises the nonstreaming wire seam across fallback.
+                    # A new route restores the configured seed, not the previous verdict.
+                    a._disable_streaming = a._disable_streaming_seed = True
                     a._credential_pool = pool = CredentialPool('anthropic', rows)
                     a._credential_pool_entry_id = 'A'
                     a._api_max_retries = 2
