@@ -26,7 +26,9 @@ p = c.p(ans, "urgent")                       # None when unavailable: keep your 
 |---|---|---|
 | coach | screen before the fix-loop and hand-off/confirm LLM judges | on |
 | prompt-coach | screen before the stage-1 LLM | on |
-| topic-shift | new-task detection | shadow |
+
+The experimental topic-shift screen has been removed; topic-shift uses its auxiliary LLM directly.
+Legacy `SYSTEM_ONE_MODE_TOPIC_SHIFT` settings no longer affect it.
 
 ## Tests
 

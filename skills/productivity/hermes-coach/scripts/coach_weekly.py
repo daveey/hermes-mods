@@ -678,7 +678,6 @@ GUARDS = [
      ("selfheal_would_file",)),
     ("goal_disposition (abandonment guard)", "coach/goal-disposition.json", "mode", None, "off", ("enforce",),
      ("goal_disposition", "goal_disposition_unknown")),
-    ("topic-shift Jev screen", None, None, "SYSTEM_ONE_MODE_TOPIC_SHIFT", "shadow", ("on",), ()),
 ]
 GUARD_LIMBO_DAYS = 7
 

@@ -405,7 +405,7 @@ class GuardShadowAge(unittest.TestCase):
         self.assertIn("Shadow-age: ", out)
         self.assertIn("self-heal lane shadow 9d, 3 fires", out)
         self.assertNotIn("goal_disposition", out)
-        self.assertNotIn("topic-shift", out)  # default shadow, no config or events: first sight = now, age 0
+        self.assertNotIn("topic-shift", out)  # experimental screen retired
         self.assertIn("Kanban card", out)
         self.assertNotIn("Inbox card)", out.replace("never an Inbox card", ""))
 
@@ -423,6 +423,18 @@ class GuardShadowAge(unittest.TestCase):
         self.cfg("selfheal-config.json", "live", 30)
         self.cfg("goal-disposition.json", "enforce", 30)
         self.assertIn("Shadow-age: none", self.section())
+
+    def test_retired_screen_stale_state_cannot_file_another_card(self):
+        (self.home / "coach" / "guard-modes.json").write_text(json.dumps({
+            "topic-shift Jev screen": {"mode": "shadow", "since": self.NOW - 30 * self.DAY}
+        }))
+        (self.home / ".env").write_text("SYSTEM_ONE_MODE_TOPIC_SHIFT=shadow\n")
+        self.cfg("selfheal-config.json", "live", 30)
+        self.cfg("goal-disposition.json", "enforce", 30)
+        calls = []
+        out = self.section(file_cards=True, run=lambda *a, **k: calls.append(a))
+        self.assertNotIn("topic-shift", out)
+        self.assertEqual(calls, [])
 
     def test_file_cards_opens_one_idempotent_kanban_card_per_guard_never_inbox(self):
         self.cfg("selfheal-config.json", "shadow", 10)
