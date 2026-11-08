@@ -1002,9 +1002,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             except Exception:
                 pass
 
-    return coach, {"pre_final_gate": goal_gate, "pre_final_gate:compute_envelope": envelope_gate,
+    hooks = {"pre_final_gate": goal_gate, "pre_final_gate:compute_envelope": envelope_gate,
                    "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
                    "transform_tool_result": transform_tool_result}
+    # Retirement removes the registered gate, not merely its enforcement mode.
+    # Existing held callbacks still preserve the unresolved fallback on recheck.
+    if _load("goal_disposition").settings()['mode'] == 'retired':
+        hooks.pop("pre_final_gate")
+    return coach, hooks
 
 
 def register(ctx) -> None:

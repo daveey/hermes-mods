@@ -763,10 +763,11 @@ def section_guards(home, now, host=None, file_cards=False, run=None, state_path=
     import subprocess
     host = host or socket.gethostname().split(".")[0]
     rows = guard_modes(home, now, state_path)
-    limbo = [g for g in rows if not g["active"] and g["days"] > GUARD_LIMBO_DAYS]
+    limbo = [g for g in rows if not g["active"] and g["mode"] != "retired"
+             and g["days"] > GUARD_LIMBO_DAYS]
     out = [f"## Guards in shadow/off > {GUARD_LIMBO_DAYS} days ({host})", ""]
     if not limbo:
-        out.append(f"Shadow-age: none. Every mode-switched detector/guard on {host} is enforcing or changed mode within "
+        out.append(f"Shadow-age: none. Every mode-switched detector/guard on {host} is enforcing, retired, or changed mode within "
                    f"{GUARD_LIMBO_DAYS} days.")
         return out
     out.append("Shadow-age: " + "; ".join(f"{g['name']} {g['mode']} {g['days']:.0f}d, {g['fires']} fires"

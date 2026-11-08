@@ -418,6 +418,22 @@ class GuardShadowAge(unittest.TestCase):
         later = coach_weekly.section_guards(self.home, self.NOW + 3 * self.DAY, host="hub")
         self.assertNotIn("self-heal lane", "\n".join(later))
 
+    def test_retired_guard_is_not_active_and_never_refiles(self):
+        self.cfg("goal-disposition.json", "retired", 30)
+        calls = []
+        out = self.section(file_cards=True, run=lambda *a, **kw: calls.append(a))
+        self.assertEqual(calls, [])
+        self.assertNotIn("goal_disposition", out)
+        row = next(g for g in coach_weekly.guard_modes(self.home, self.NOW)
+                   if g['name'].startswith('goal_disposition'))
+        self.assertEqual(row['mode'], 'retired')
+        self.assertFalse(row['active'])
+        # Explicit reactivation is still tracked; retirement is not a permanent exemption.
+        self.cfg("goal-disposition.json", "off", 0)
+        self.section()
+        later = '\n'.join(coach_weekly.section_guards(self.home, self.NOW + 8 * self.DAY))
+        self.assertIn('goal_disposition', later)
+
     def test_none_in_limbo_says_so(self):
         (self.home / ".env").write_text("SYSTEM_ONE_MODE_TOPIC_SHIFT=on\n")
         self.cfg("selfheal-config.json", "live", 30)

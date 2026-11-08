@@ -70,7 +70,7 @@ def settings():
     from hermes_constants import get_hermes_home
     try:
         cfg = json.loads((Path(get_hermes_home()) / 'coach' / 'goal-disposition.json').read_text())
-        return cfg if cfg.get('mode') in ('off', 'shadow', 'enforce') else {'mode': 'off'}
+        return cfg if cfg.get('mode') in ('off', 'shadow', 'enforce', 'retired') else {'mode': 'off'}
     except (OSError, ValueError, AttributeError):
         return {'mode': 'off'}
 
@@ -275,7 +275,7 @@ def build_gate(store):
 
     def capture(session_id='', user_message=None, conversation_history=None,
                 canonical_user_content=None, **_):
-        if not session_id or settings()['mode'] == 'off':
+        if not session_id or settings()['mode'] in ('off', 'retired'):
             return
         try:
             rows = recover_scope(session_id, user_message, conversation_history,
@@ -291,7 +291,7 @@ def build_gate(store):
 
     def observe(session_id='', tool_name='', args=None, result=None, status=None,
                 tool_call_id=None, **_):
-        if not session_id or not tool_call_id or settings()['mode'] == 'off':
+        if not session_id or not tool_call_id or settings()['mode'] in ('off', 'retired'):
             return
         with lock:
             key = (_profile_key(), session_id)
@@ -323,7 +323,7 @@ def build_gate(store):
             store.log({'event': 'goal_disposition_unknown', 'session_id': session_id,
                        'reason': 'enforcing_recheck_unavailable'})
             raise ValueError('enforcing_recheck_unavailable')
-        if cfg['mode'] == 'off':
+        if cfg['mode'] in ('off', 'retired'):
             return None
         if cfg['mode'] == 'enforce' and not gate.needs_buffer:
             store.log({'event': 'goal_disposition_unknown', 'session_id': session_id,

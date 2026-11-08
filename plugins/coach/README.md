@@ -430,7 +430,13 @@ to continue **only already-authorized** work. The hook never repairs anything, c
 retries approvals, sends messages, or changes self-heal configuration.
 
 Profile-local `<HERMES_HOME>/coach/goal-disposition.json` accepts `{"mode":"off"}` (default),
-`{"mode":"shadow"}` (judge/log only), or `{"mode":"enforce"}`. Reload the plugin after enabling
+`{"mode":"shadow"}` (judge/log only), `{"mode":"enforce"}`, or `{"mode":"retired"}`.
+Retirement removes this profile's disposition hook at registration, disables its scope/tool
+capture and judge calls, and excludes it from the weekly shadow/off activation queue.
+The experimental code/tests remain available; retirement is not evidence of enforcement.
+Reload after retiring to remove the registered hook; already-held callbacks retain their
+unresolved fallback. Other coach guards remain registered. Tests: `test_goal_retirement.py`.
+Reload the plugin after enabling
 enforcement: buffering is selected at registration so the disabled hook does not buffer every
 answer. Switching off takes effect on the next fresh check; reload also removes buffering.
 An already held reply is never accepted merely because configuration disappears,
