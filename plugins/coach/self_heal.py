@@ -2331,6 +2331,20 @@ def _not_deployed(d: dict, st: dict, at: float, now: float, cfg: Optional[dict])
     return None
 
 
+def _cron_error(d: dict) -> str:
+    """First error, excluding collect_cron's job/script envelope; legacy state kept only symptom."""
+    if d.get("cron_error"):
+        return str(d["cron_error"])
+    lines = str(d.get("details") or "").strip().splitlines()
+    if len(lines) >= 3 and lines[0].startswith("job ") and lines[1].startswith("script="):
+        error = lines[2]
+    else:
+        symptom = str(d.get("symptom") or "")
+        error = re.sub(r"^cron job .*? failed on [^:]+: ", "", symptom).split("\n", 1)[0]
+    error = re.sub(r"(?:~?/|[A-Za-z]:\\)[^\s'\"]+", "<path>", error)
+    return re.sub(r"\d+", "#", error).strip()
+
+
 def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
     """Dedupe / suppression / recurrence decision for one defect against its lane state. Pure except one probe:
     a post-fix occurrence checks whether the checkout that raised it contains the fix (stale_checkout).
@@ -2351,6 +2365,15 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
         return {"action": "skip", "why": f"closed as not a defect within {NOT_DEFECT_DAYS} days"}
     g = generation(st) + 1  # every filing gets a fresh generation, so its keys never name an earlier card
     if status == "fixed":
+        if fp.startswith("cron-"):
+            old = _cron_error(st)
+            # Legacy lane state kept only the producer's 120-character symptom error.
+            # Compare that same representation, not its missing suffix against new full details.
+            new = _cron_error(d if st.get("cron_error") else {"symptom": d.get("symptom")})
+            if old and new and old != new:
+                why = f"same job, different error than the fixed one ({old} vs {new})"
+                return {"action": "file", "why": why, "key": inv_key(fp, g), "gen": g,
+                        "previous": None, "different_error": why}
         # The fix can only have failed where it runs. A pinned runtime cut before the fix still raises the old
         # error; that is a missing backport, not "the fix didn't hold" (desktop-e05d9218fa: Ask Eve's pinned core).
         try:
@@ -2385,11 +2408,13 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
     return {"action": "file", "why": "new", "key": inv_key(fp, g), "gen": g, "previous": None}
 
 
-def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> dict:
+def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[dict] = None,
+              different_error: str = "") -> dict:
     r = route(d, cfg)
     sym = re.sub(r"\s+", " ", d.get("symptom") or "defect").strip()[:90]
     return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
-            "body": investigation_brief(d, previous, cfg), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+            "body": investigation_brief(d, previous, cfg) + (f"\n\n{different_error}\n" if different_error else ""),
+            "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
 
@@ -3352,7 +3377,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                 if commented["action"] == "error":
                     return commented
             return owner
-    args = card_args(d, dec["key"], dec.get("previous"), cfg)
+    args = card_args(d, dec["key"], dec.get("previous"), cfg, dec.get("different_error", ""))
     if m == "live" and hub and args.get("board") and not board_present(args["board"]):
         return _defer_missing_board(d, args["board"], store, now)
     b = (budget_fn or budget)(args.get("board"), now)
@@ -3385,13 +3410,14 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
             break
         store.log({"event": "selfheal_key_collision", "fingerprint": fp, "key": args["idempotency_key"], "card": tid})
         gen += 1
-        args = card_args(d, inv_key(fp, gen), dec.get("previous"), cfg)
+        args = card_args(d, inv_key(fp, gen), dec.get("previous"), cfg, dec.get("different_error", ""))
     if not tid or tid in known:
         why = (err or out).strip()[-300:] if not tid else f"idempotency keys keep returning earlier card {tid}"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
         return {"action": "error", "why": why}
     prev = dec.get("previous")
     kw: dict = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
+              cron_error=_cron_error(d) if fp.startswith("cron-") else None,
               filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
               fix_card=None if not prev else st.get("fix_card"), gen=gen,
               cards=sorted(known | {tid}), proposed_at=None, family=root_family(d), held=[],

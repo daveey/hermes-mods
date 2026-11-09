@@ -990,10 +990,11 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                 continue  # core parked this failure behind a closed provider window (cron.quota_hold): not counted
             name = job.get("name") or job.get("id")
             detail = str(lf.get("detail") or job.get("last_error") or "run failed")
+            if detail.startswith("Gateway shutdown ("):
+                continue  # owner's lifecycle interrupt is never a job defect, even with an old inflated streak
             streak = int(job.get("failure_streak") or 0)
             recent = [t for t in fails.get(k, []) if t > at - CRON_WINDOW_S]
-            if not detail.startswith("Gateway shutdown ("):
-                recent.append(at)  # a run killed by a gateway restart is not the job's fault: never counted
+            recent.append(at)
             fails[k] = recent
             if streak < threshold and len(recent) < threshold:
                 continue  # one-off / under core's own nudge threshold (cursor advanced): counted, not filed

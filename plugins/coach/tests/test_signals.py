@@ -721,7 +721,7 @@ def test_failed_cron_runs(home):
     assert all(s["fp"].startswith("cron-") for s in crons)
 
 
-def test_gateway_shutdown_cron_kill_is_one_off_unless_repeated(home):
+def test_gateway_shutdown_cron_kill_never_files_even_at_threshold(home):
     gw = "Gateway shutdown (post-interrupt) killed the job's tool subprocess before the run finished."
 
     def job(i, streak, detail):
@@ -731,7 +731,7 @@ def test_gateway_shutdown_cron_kill_is_one_off_unless_repeated(home):
         job("g1", 1, gw), job("g3", 3, gw), job("o3", 3, "Script exited with code 1")]}))
     cur = {}
     names = sorted(s["symptom"].split("'")[1] for s in sg.collect_cron(home, cur, NOW, "macbook"))
-    assert names == ["job g3", "job o3"]
+    assert names == ["job o3"]
     assert "default:g1" not in cur["cron_fails"]  # a gateway kill never counts toward the 24h burst
     # the suppressed run still advanced the seen cursor: no re-emit on the next pass
     assert cur["cron"]["default:g1"] > 0

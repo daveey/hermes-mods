@@ -233,6 +233,50 @@ def test_recurrence_of_a_fixed_fingerprint_says_previous_fix_didnt_hold(store):
         assert weekly.selfheal_fp(k) == fp and weekly.DEFECT_FP_RX.search(weekly.selfheal_fp(k))
 
 
+@pytest.mark.parametrize("new_error,recurrence", [
+    ("RuntimeError: cron fire ownership was lost", False),
+    ("quota refused at /other/cache/job.py after 99 seconds", True),
+])
+def test_fixed_cron_compares_error_not_job_fingerprint(store, new_error, recurrence):
+    r = Runner()
+    old = "quota refused at /tmp/cache/job.py after 12 seconds"
+    d = defect(component="cron", source="signal", fingerprint="cron-0123456789",
+               symptom=f"cron job 'export' failed on host: {new_error}",
+               details=f"job j (export, profile default) failure_streak=3\nscript=/jobs/run.py\n{new_error}",
+               at=NOW)
+    sh.LaneState(store.root).update(d["fingerprint"], status="fixed", card="t_00000009",
+                                   fix_card="t_0000000a", fixed_at=NOW - 3 * 86400,
+                                   symptom=f"cron job 'export' failed on host: {old}")
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed"
+    assert ev(store, "selfheal_filed")[-1]["recurrence"] is recurrence
+    body = opt(r.creates()[-1], "--body")
+    if recurrence:
+        assert "previous fix t_0000000a didn't hold" in body
+    else:
+        assert "same job, different error than the fixed one" in body
+        assert " vs " in body
+        assert "didn't hold" not in body
+        assert "(came back)" not in r.creates()[-1][r.creates()[-1].index("create") + 1]
+
+
+@pytest.mark.parametrize("canonical,different,recurrence", [
+    (False, False, True), (False, True, True), (True, True, False),
+])
+def test_cron_legacy_truncation_is_not_a_different_error(canonical, different, recurrence):
+    prefix = "RuntimeError: " + "long diagnostic message " * 8
+    old, new = prefix + "old suffix", prefix + ("new suffix" if different else "old suffix")
+    st = {"status": "fixed", "fixed_at": NOW - 3 * 86400,
+          "symptom": f"cron job 'export' failed on host: {old[:120]}"}
+    if canonical:
+        st["cron_error"] = old
+    d = {"fingerprint": "cron-0123456789", "at": NOW,
+         "symptom": f"cron job 'export' failed on host: {new[:120]}",
+         "details": f"job j (export)\nscript=/jobs/run.py\n{new}"}
+    decision = sh.decide(d, st, NOW, {"deploy_grace_hours": 0})
+    assert bool(decision.get("previous")) is recurrence
+
+
 # ── rollout window: "pushed" is not "running on every host" ──
 FIXED_AT = 1793163024.0  # agent-664ecedaaf: fix 48913b6339 recorded 2026-10-28 04:50:24Z
 SEEN_AT = 1793166654.0   # the MacBook's errors.log line from a process still on old code, 05:50:54Z
