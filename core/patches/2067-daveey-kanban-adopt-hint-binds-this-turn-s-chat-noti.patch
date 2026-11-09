@@ -1,0 +1,267 @@
+From bae8bbe067b0fd44a9a482076b87534da63a5f37 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:27:27 +0000
+Subject: [PATCH] [daveey] kanban: adopt hint binds this turn's chat;
+ notify-subscribe names the chat it binds (agent-884fdd96f8)
+
+adopt_next_step read HERMES_SESSION_ID from os.environ. A gateway/Desktop backend serving
+several chats keeps whichever chat wrote it last there, so the kanban_origin_adopt hint told
+chat aaaaaa to run notify-subscribe --chat-id bbbbbb (an unrelated chat). It now reads the
+session ContextVar (get_session_env) unless an explicit env is passed.
+
+notify-subscribe --platform tui prints the target chat's title from state.db and, when the
+calling agent's chat (HERMES_SESSION_KEY/ID in its env, compared by compression tip) is a
+different chat, a WARNING line naming it, so a wrong bind is visible at the command.
+---
+ hermes_cli/kanban.py                          |  3 +
+ hermes_cli/kanban_notify_target.py            | 58 +++++++++++++
+ hermes_cli/kanban_origin.py                   | 18 +++-
+ .../test_kanban_notify_subscribe_target.py    | 83 +++++++++++++++++++
+ .../hermes_cli/test_kanban_origin_adoption.py | 22 +++++
+ 5 files changed, 183 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_notify_target.py
+ create mode 100644 tests/hermes_cli/test_kanban_notify_subscribe_target.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index ba563dc3ef9..731129b51ce 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1698,6 +1698,9 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
+         )
+     print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
+           + f" to {args.task_id}")
++    if args.platform == "tui":
++        from hermes_cli.kanban_notify_target import print_tui_target
++        print_tui_target(args.task_id, args.chat_id)
+     return 0
+ 
+ 
+diff --git a/hermes_cli/kanban_notify_target.py b/hermes_cli/kanban_notify_target.py
+new file mode 100644
+index 00000000000..0f3891b686d
+--- /dev/null
++++ b/hermes_cli/kanban_notify_target.py
+@@ -0,0 +1,58 @@
++"""Say which chat a ``notify-subscribe --platform tui`` binds, and warn on a different chat. [daveey]
++
++An agent once ran the subscribe with another chat's id (a hint read the process-global session env), read back the
++subscriber ids and reported its own chat linked (agent-884fdd96f8). The command now prints the target chat's
++title, and a WARNING when the calling agent's chat is a different one.
++"""
++
++from __future__ import annotations
++
++import os
++import sqlite3
++import sys
++from typing import Optional
++
++
++def _title_and_tip(session_id: str) -> tuple[Optional[str], Optional[str], bool]:
++    """``(title, compression tip, found)`` of a chat in this profile's state.db; ``(None, None, False)`` when it
++    is not there or the db cannot be read."""
++    try:
++        from hermes_constants import get_hermes_home
++        from hermes_state import SessionDB
++        db = SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
++    except (ImportError, OSError, sqlite3.Error):
++        return None, None, False
++    try:
++        row = db.get_session(session_id)
++        if not row:
++            return None, None, False
++        try:
++            tip = db.get_compression_tip(session_id) or session_id
++        except sqlite3.Error:
++            tip = session_id
++        return (str(row.get("title") or "").strip() or None), tip, True
++    except sqlite3.Error:
++        return None, None, False
++    finally:
++        db.close()
++
++
++def print_tui_target(task_id: str, chat_id: str) -> None:
++    """Print the bound chat's title; warn on stderr when it is not the calling agent's own chat.
++
++    The subprocess env names the calling chat: ``HERMES_SESSION_KEY`` (what the tui poller listens on) or
++    ``HERMES_SESSION_ID``. Two ids of one compacted lineage (same compression tip) are the same chat. A plain shell
++    (neither set) and a Kanban worker are never warned."""
++    title, tip, found = _title_and_tip(chat_id)
++    label = title or "untitled"
++    print(f"  chat {chat_id}: {label}" if found else
++          f"  chat {chat_id} is not a chat in this profile's state.db (check the id)")
++    mine = (os.environ.get("HERMES_SESSION_KEY") or os.environ.get("HERMES_SESSION_ID") or "").strip()
++    if os.environ.get("HERMES_KANBAN_TASK") or not mine or mine == chat_id:
++        return
++    _mine_title, mine_tip, mine_found = _title_and_tip(mine)
++    if found and mine_found and tip == mine_tip:
++        return
++    print(f"WARNING: binding a different chat ({label}): this command runs from chat {mine}, but --chat-id is "
++          f"{chat_id}. To link the card to this chat, re-run with --chat-id {mine} and "
++          f"`hermes kanban notify-unsubscribe {task_id} --platform tui --chat-id {chat_id}`.", file=sys.stderr)
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index a4c3fc1b99d..c30ac22220e 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -181,6 +181,21 @@ def _safe(value: Any, placeholder: str) -> str:
+     return text if _SAFE_NAME.match(text) else placeholder
+ 
+ 
++def _turn_session_id(env: Mapping[str, str], explicit_env: bool) -> str:
++    """The chat this turn runs for. A gateway or Desktop backend serves several chats in one process, and
++    ``os.environ["HERMES_SESSION_ID"]`` holds whichever chat wrote it last: the current turn's id is the session
++    ContextVar (``get_session_env`` falls back to the env only when none is bound). A hint built from the env
++    told chat aaaaaa to subscribe chat bbbbbb to its cards (agent-884fdd96f8). An explicit ``env`` (tests, a
++    caller replaying a child's env) is used as given. [daveey]"""
++    if explicit_env:
++        return str(env.get("HERMES_SESSION_ID") or "")
++    try:
++        from gateway.session_context import get_session_env
++    except ImportError:
++        return str(env.get("HERMES_SESSION_ID") or "")
++    return str(get_session_env("HERMES_SESSION_ID", "") or "")
++
++
+ def adopt_next_step(task_id: str, board: str, *, env: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
+     """The supported way to attach an existing card to a chat, for a ``kanban_origin_adopt`` call that has no
+     courier context. That tool only runs inside a courier-delivered adoption; a chat (or a worker) gets the
+@@ -190,6 +205,7 @@ def adopt_next_step(task_id: str, board: str, *, env: Optional[Mapping[str, str]
+     another gateway: a ``hermes-hub create-task`` that gets the command run there. Unknown or unsafe parts stay
+     ``<placeholders>`` and ``complete`` is False: such a command must be filled in before it is run.
+     """
++    explicit_env = env is not None
+     env = os.environ if env is None else env
+     me, _ = gateway_names()
+     me = _safe(me, "")
+@@ -218,7 +234,7 @@ def adopt_next_step(task_id: str, board: str, *, env: Optional[Mapping[str, str]
+         owner_gw, owner_profile = ((_safe(owners[0][0], "<owner-gateway>"), _safe(owners[0][1], "<owner-profile>"))
+                                    if len(owners) == 1 else ("<owner-gateway>", "<owner-profile>"))
+         run_on = me or "<this-gateway>"
+-        session = _safe(env.get("HERMES_SESSION_ID"), "<origin-session-id>")
++        session = _safe(_turn_session_id(env, explicit_env), "<origin-session-id>")
+         # "custom" = a HERMES_HOME outside ~/.hermes: no profile name to pass; the CLI resolves its own.
+         origin_profile = my_profile if my_profile != "custom" else ""
+     if me and owner_gw == me and (not worker or run_on == me):
+diff --git a/tests/hermes_cli/test_kanban_notify_subscribe_target.py b/tests/hermes_cli/test_kanban_notify_subscribe_target.py
+new file mode 100644
+index 00000000000..5d0b4c0b569
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_notify_subscribe_target.py
+@@ -0,0 +1,83 @@
++"""``hermes kanban notify-subscribe --platform tui`` says which chat it binds. [daveey]
++
++agent-884fdd96f8: an agent ran the subscribe with another chat's id (a wrong hint), read back the subscriber ids
++and reported the card linked to its own chat. The command now prints the target chat's title, and a WARNING when
++the calling agent's chat (HERMES_SESSION_KEY / HERMES_SESSION_ID in its env) is a different chat.
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++import pytest
++
++import gateway.session_context as sc
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++MINE, OTHER = "20261103_032737_aaaaaa", "20261102_172718_bbbbbb"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in ("HERMES_SESSION_KEY", "HERMES_SESSION_ID", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(var, raising=False)
++    kb.init_db()
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db.create_session(session_id=MINE, source="desktop")
++        db.set_session_title(MINE, "Repair cards for the forwarder")
++        db.create_session(session_id=OTHER, source="desktop")
++        db.set_session_title(OTHER, "Unrelated research chat")
++    finally:
++        db.close()
++    tokens = [var.set(sc._UNSET) for var in sc._VAR_MAP.values()]  # a CLI subprocess: env only
++    engaged = sc._session_context_engaged
++    sc._session_context_engaged = False
++    yield home
++    sc._session_context_engaged = engaged
++    for var, tok in zip(sc._VAR_MAP.values(), tokens):
++        var.reset(tok)
++
++
++def _subscribe(chat_id: str) -> tuple[int, str]:
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="repair", assignee="default")
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    args = root.parse_args(["kanban", "notify-subscribe", tid, "--platform", "tui", "--chat-id", chat_id])
++    return kc._cmd_notify_subscribe(args), tid
++
++
++def test_subscribe_names_the_target_chat(home, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_SESSION_ID", MINE)
++    rc, _ = _subscribe(MINE)
++    out = capsys.readouterr()
++    assert rc == 0
++    assert "Repair cards for the forwarder" in out.out
++    assert "WARNING" not in out.out + out.err
++
++
++def test_subscribe_warns_when_binding_a_different_chat(home, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_SESSION_ID", MINE)
++    rc, _ = _subscribe(OTHER)
++    out = capsys.readouterr()
++    text = out.out + out.err
++    assert rc == 0
++    assert "WARNING: binding a different chat (Unrelated research chat)" in text, text
++    assert MINE in text
++
++
++def test_subscribe_from_a_plain_shell_does_not_warn(home, capsys):
++    rc, _ = _subscribe(OTHER)
++    out = capsys.readouterr()
++    assert rc == 0 and "WARNING" not in out.out + out.err
++    assert "Unrelated research chat" in out.out
+diff --git a/tests/hermes_cli/test_kanban_origin_adoption.py b/tests/hermes_cli/test_kanban_origin_adoption.py
+index a7191b7375c..1f468f59d6b 100644
+--- a/tests/hermes_cli/test_kanban_origin_adoption.py
++++ b/tests/hermes_cli/test_kanban_origin_adoption.py
+@@ -320,3 +320,25 @@ def test_worker_with_origin_on_same_gateway_gets_no_self_addressed_delegate(boar
+     assert "delegate" not in refused
+     assert refused["next_step"] == f"hermes kanban --board default notify-subscribe {tid} --platform tui --chat-id s_here"
+     assert "cross_session" in refused["error"]
++
++
++def test_chat_refusal_names_this_turns_chat_not_the_process_env(board, tmp_path, monkeypatch):
++    """[daveey] agent-884fdd96f8: a gateway serving several chats keeps whichever chat wrote os.environ last in
++    HERMES_SESSION_ID; the current turn's chat is the session ContextVar. The hint must bind the calling chat,
++    or the agent subscribes an unrelated chat to its card (hub 2026-11-03, chat bbbbbb got aaaaaa's cards)."""
++    import contextvars
++    import gateway.session_context as sc
++    _conn, tid = board
++    _hub_state(tmp_path, monkeypatch, "hub", [("hub", f"default/default/{tid}")])
++    monkeypatch.setenv("HERMES_SESSION_ID", "s_other_chat")  # the chat that ran last in this process
++
++    def turn():
++        tokens = sc.set_session_vars(session_id="s_this_chat", session_key="s_this_chat", source="desktop")
++        try:
++            return _refuse(tid)
++        finally:
++            sc.clear_session_vars(tokens)
++
++    refused = contextvars.copy_context().run(turn)
++    assert refused["next_step"] == (f"hermes kanban --board default notify-subscribe {tid} "
++                                    "--platform tui --chat-id s_this_chat"), refused
+-- 
+2.55.0
+

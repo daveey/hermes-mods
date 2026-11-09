@@ -1,0 +1,140 @@
+From ee2d235b148f075c2baf11506c5a195f23be8c8f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:17:03 +0000
+Subject: [PATCH] [daveey] fix(cron): exclude gateway shutdown interrupts from
+ failure streaks
+
+---
+ cron/jobs.py                          | 11 ++++++--
+ cron/scheduler.py                     |  3 ++-
+ tests/cron/test_shutdown_interrupt.py | 36 +++++++++++++++++++++++++--
+ 3 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index e540a57d9b4..c5e3e168661 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2433,7 +2433,7 @@ _PRE_AGENT_ERROR_KINDS = ("fire", "gate")
+ def _record_run_outcome(
+     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
+     status: Optional[str], now: str, *, agent_skipped: bool = False, fire_error: bool = False,
+-    gate_error: bool = False,
++    gate_error: bool = False, shutdown_interrupted: bool = False,
+ ) -> None:
+     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims.
+ 
+@@ -2466,6 +2466,9 @@ def _record_run_outcome(
+         job.pop("last_fire_error", None)
+         job["failure_streak"] = 0
+         job.pop("last_error_kind", None)
++    elif shutdown_interrupted:
++        # Preserve diagnostic evidence without blaming the job for its owner's shutdown.
++        job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
+     elif not cancelled:
+         prior = job.get("last_error_kind") if int(job.get("failure_streak") or 0) else None
+         if not (fire_error or gate_error) or prior not in (None, *_PRE_AGENT_ERROR_KINDS):
+@@ -2559,6 +2562,7 @@ def mark_job_run(
+     agent_skipped: bool = False,
+     fire_error: bool = False,
+     gate_error: bool = False,
++    shutdown_interrupted: bool = False,
+ ) -> bool:
+     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
+     and retire the record as a terminal completion when the repeat limit is reached. A manual run
+@@ -2594,6 +2598,9 @@ def mark_job_run(
+ 
+     ``gate_error``: this failed run stopped at a pre-agent gate (monitor source failure,
+     unparseable config); booked as ``last_error_kind = "gate"``. [daveey]
++
++    ``shutdown_interrupted``: the gateway stopped this execution; preserve its error evidence
++    without changing ``failure_streak`` or ``last_error_kind``. [daveey]
+     """
+     def apply(jobs, _i, job):
+         if execution_id is not None and execution_id in job.get("canonical_completions", []):
+@@ -2610,7 +2617,7 @@ def mark_job_run(
+         held = extra_fire.held_markers(job) if extra else {}
+         _record_run_outcome(job, success, error, delivery_error, status, now,
+                             agent_skipped=agent_skipped, fire_error=fire_error,
+-                            gate_error=gate_error)
++                            gate_error=gate_error, shutdown_interrupted=shutdown_interrupted)
+         job.update(held)  # a run-now queued mid-run is its own fire, not this one
+         if execution_id is not None:  # retire ids recovery can no longer replay; latest stays last
+             from cron.scheduler_authority import replayable_completions as live
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index bc59d542815..c0b88079d4b 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1197,7 +1197,8 @@ def mark_running_jobs_interrupted(
+         try:
+             with use_cron_store(profile_home):
+                 if mark_job_run(
+-                    job_id, False, reason, expected_fire_owner=fire_owner):
++                    job_id, False, reason, expected_fire_owner=fire_owner,
++                    shutdown_interrupted=True):
+                     marked.append(job_id)
+         except Exception as e:
+             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
+diff --git a/tests/cron/test_shutdown_interrupt.py b/tests/cron/test_shutdown_interrupt.py
+index 070bd7c8adf..16e7e0e601c 100644
+--- a/tests/cron/test_shutdown_interrupt.py
++++ b/tests/cron/test_shutdown_interrupt.py
+@@ -58,6 +58,36 @@ class TestGetRunningJobIds:
+ 
+ 
+ class TestMarkRunningJobsInterrupted:
++    @pytest.mark.parametrize("streak,kind", [(0, None), (2, "gate"), (3, "agent")])
++    def test_shutdown_preserves_failure_accounting(self, tmp_path, streak, kind):
++        from cron import jobs
++        import cron.scheduler as sched
++
++        home = tmp_path / "profile"
++        home.mkdir()
++        with jobs.use_cron_store(home):
++            job = jobs.create_job(prompt="x", schedule="every 5m", name="owned")
++            job = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++            assert isinstance(job, dict)
++            job["failure_streak"] = streak
++            if kind is not None:
++                job["last_error_kind"] = kind
++            jobs.save_jobs([job])
++            key = sched._inflight_key(job["id"])
++            sched._running_job_ids.add(key)
++            sched._running_fire_owners[key] = {object(): (job["fire_claim"]["by"], home)}
++            reason = "Gateway shutdown (post-interrupt) killed the job's tool subprocess."
++            assert sched.mark_running_jobs_interrupted(reason) == [job["id"]]
++            saved = jobs.load_jobs()[0]
++            assert saved["last_status"] == "error"
++            assert saved["last_failure"]["detail"] == reason
++            assert saved["failure_streak"] == streak
++            assert saved.get("last_error_kind") == kind
++            assert jobs.mark_job_run(job["id"], False, "real agent failure")
++            saved = jobs.load_jobs()[0]
++            assert saved["failure_streak"] == streak + 1
++            assert saved["last_error_kind"] == "agent"
++
+     def test_no_op_when_nothing_running(self):
+         import cron.scheduler as sched
+ 
+@@ -194,7 +224,8 @@ class TestRunningFireOwnerRegistry:
+             release.wait(timeout=2)
+             return True
+ 
+-        def mark(_job_id, _success, _reason, *, expected_fire_owner):
++        def mark(_job_id, _success, _reason, *, expected_fire_owner, shutdown_interrupted):
++            assert shutdown_interrupted is True
+             marked_owners.append(expected_fire_owner)
+             return True
+ 
+@@ -232,7 +263,8 @@ class TestRunningFireOwnerRegistry:
+             object(): ("owner-b", profile_b),
+         }
+ 
+-        def mark(job_id, success, reason, *, expected_fire_owner):
++        def mark(job_id, success, reason, *, expected_fire_owner, shutdown_interrupted):
++            assert shutdown_interrupted is True
+             observed.append(
+                 (
+                     job_id,
+-- 
+2.55.0
+
