@@ -78,6 +78,36 @@ def test_queued_backstop_row_with_plugin_quote_is_withdrawn(tmp_path):
                and r.get("fingerprint") == "agent-b3f86b6bb7" for r in rows)
 
 
+def test_pending_synthetic_row_is_withdrawn_even_behind_a_cap_denial(tmp_path):
+    """Hub, 11-09: [runtime] row agent-820df70fab sat 3.5 days overdue because every retry pass stopped at the first
+    cap denial before reaching it. Withdrawal runs in the pre-pass, so the cap never shields a synthetic row."""
+    import sqlite3
+    store = core.Store(tmp_path / "coach")
+    db = sh._pending_db(store)
+    real = {"fingerprint": "agent-real", "source": "backstop", "quote": "it is still broken", "at": 99.0,
+            "p_defect": 0.9}
+    fake = {"fingerprint": "agent-820df70fab", "source": "backstop", "at": 99.0, "p_defect": 0.5,
+            "quote": "[runtime] Your draft above was NOT shown to the user. Your next reply replaces it"}
+    with db:
+        for d in (real, fake):
+            db.execute("INSERT INTO pending VALUES (?, ?, ?, ?)", (d["fingerprint"], json.dumps(d), 1.0, "v1"))
+    db.close()
+    filed = []
+
+    def deny(d, **k):
+        filed.append(d["fingerprint"])
+        return {"action": "deferred", "why": "self-heal concurrency limit reached"}
+
+    out = sh.retry_deferred(store, now=100.0, filer=deny)
+    assert {"action": "skip", "why": "synthetic_tag"} in out
+    assert filed == ["agent-real"]  # the synthetic row never reached the filer
+    left = [r[0] for r in sqlite3.connect(tmp_path / "coach" / "selfheal_pending.sqlite").execute(
+        "SELECT fp FROM pending")]
+    assert left == ["agent-real"]
+    rows = [json.loads(ln) for ln in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert any(r.get("event") == "selfheal_withdrawn" and r.get("fingerprint") == "agent-820df70fab" for r in rows)
+
+
 def test_machine_signal_quote_is_not_withdrawn():
     """Only user-text sources are withdrawn: a cron/kanban signal quoting a tagged log line is still a defect."""
     assert sh.synthetic_user_row({"source": "cron", "quote": "[kanban] dispatcher crashed"}) is False

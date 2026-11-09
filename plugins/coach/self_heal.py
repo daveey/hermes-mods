@@ -2126,6 +2126,14 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                            "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
                 out.append({"action": "skip", "why": "stale pending"})
                 continue
+            if synthetic_user_row(d):  # before the cap-ordered pass: a denial stops that pass before late rows
+                with db:
+                    db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
+                store.log({"event": "selfheal_withdrawn", "mode": "live", "fingerprint": fp, "why": "synthetic_tag",
+                           "source": d.get("source"), "session_id": d.get("session_id"),
+                           "quote": str(d.get("quote") or "")[:200]})
+                out.append({"action": "skip", "why": "synthetic_tag"})
+                continue
             closed = (_sqlite_incident_over(d, store, now)
                       or kanban_trigger_closed(d, now=now) or _monitor_withdrawn(d, store))
             if closed:  # the owner closed the card, or the monitor withdrew its verdict, while this waited
