@@ -153,7 +153,14 @@ OWNER_HANDOFF_RE = re.compile(
     r"|\b(?:that'?s|it'?s|this is) (?:for )?" + _WHO + r"(?:'s)? (?:to fix|problem|job|change)\b"
     # agent-a806f203ab: "the follow-up lives on PR #248, owned by card t_…" named a card as owner without a check.
     r"|\b(?:owned by|lives (?:on|with)|belongs to) (?:the )?(?:card|task) t_[0-9a-f]+\b"
-    r"|\bowned by (?:that |another |the other |its )?(?:card|task|session)\b",
+    r"|\bowned by (?:that |another |the other |its )?(?:card|task|session)\b"
+    # agent-48e909978c: "Clarification queued to my subagent: ...; hub owns any source or association repair" was a
+    # whole status reply. Handoffs to a subagent/worker/coordinator or to the hub, not only to a session or card.
+    r"|\b(?:queued|handed|passed|delegated|deferred)\b[^.;:\n]{0,40}?\bto (?:my |the |a |our )?"
+    r"(?:[\w-]+ ){0,2}?(?:sub-?agent|worker|coordinator)s?\b"
+    r"|\b(?:the )?(?:hub|gateway|sub-?agent|worker|coordinator) (?:owns|has|is handling|is on) "
+    r"(?:any |the |all |that |this )?(?:[\w-]+ ){0,3}?(?:repairs?|fix(?:es)?|work|changes?|rollout|deploy(?:ment)?)\b"
+    r"|\bthe (?:coordinator|worker|sub-?agent) has (?:it|this|that|them)\b",
     re.I)
 # The card ids a reply names as the owner of the remaining work ("owned by card t_…", "belongs to task t_…").
 OWNER_CARD_RE = re.compile(
@@ -402,16 +409,30 @@ def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = 
 # commented on or looked at cards (defect agent-38a817308d: four "reopened the card / verified ready" replies while the
 # rollout card sat unstarted for 4 days). Deterministic, before the judge: the report_only owner-check exemption
 # counts exactly those card operations as acting, so the judge path let all four through.
-PROGRESS_ASK_RE = re.compile(
+# Shared with relay_repeat.REPEAT_RE so both see the same progress phrasings.
+PROGRESS_ASK_EXTRA = (
+    r"|\bwhat(?:'s|’s|s| is) the deal\b|\bhow(?:'s|’s|s| is)? (?:it |things |this |that |everything )?go(?:es|ing)\b"
+    r"|\bcan we (?:un-?block|fix\b|get\b[^.?!\n]{0,40}\b(?:working|done|unblocked|fixed|moving|going))"
+    r"|\b(?:what(?:'s|’s|s| is| are)?|where)\b[^.?!\n]{0,40}\bblocked on\b")
+# The question half of the progress ask (status_plain reads only this: "still not working" or "finish it" is a fix
+# report or an order, not a request for a status).
+_STATUS_QUESTION = (
     r"\bwhya?\b[^.?!\n]{0,40}\b(?:wait\w*|block\w*|stuck|slow|tak\w+ so long|still|stall\w*|not (?:done|finished|"
     r"started|running|moving))\b"
     r"|\bwhat(?:'s|’s| is| are)? (?:you |we |it )?(?:doing|going on|happening|the (?:status|hold-?up|delay))\b"
     r"|\bwhats going on\b|\b(?:status|progress)\b\s*\??\s*$|\bany (?:update|news|progress)\b"
     r"|\bis (?:it|this|that) (?:done|finished|live|deployed|merged) yet\b|\bhow long\b|\bwhere are we\b"
-    r"|\bstill (?:waiting|blocked|not)\b|\bwhy (?:hasn'?t|isn'?t|aren'?t|haven'?t)\b"
+    r"|\bwhy (?:hasn'?t|isn'?t|aren'?t|haven'?t)\b")
+PLAIN_STATUS_ASK_RE = re.compile(_STATUS_QUESTION + PROGRESS_ASK_EXTRA, re.I | re.M)
+PROGRESS_ASK_RE = re.compile(
+    _STATUS_QUESTION +
+    r"|\bstill (?:waiting|blocked|not)\b"
     r"|\b(?:finish|complete|ship|deploy|land) (?:it|this|that|them)\b|\bjust (?:finish|complete|ship|deploy|land)\b"
     r"|\bcan you just\b"
-    r"|\bget (?:it|this) done\b|\bmake (?:all )?the (?:corrections|changes|fix(?:es)?)\b", re.I | re.M)
+    r"|\bget (?:it|this) done\b|\bmake (?:all )?the (?:corrections|changes|fix(?:es)?)\b"
+    # agent-48e909978c: the user's real wording a 9-day chat missed: "how goes?", "what's the deal, can we unblock
+    # ...?", "what are the cards blocked on"
+    + PROGRESS_ASK_EXTRA, re.I | re.M)
 # A wall only the user (or an outside party) can clear, named in the reply: then a status turn is the right answer.
 WALL_RE = re.compile(
     r"\bonly you\b|\bneeds? (?:you|your)\b|\byour (?:password|approval|login|2fa|decision|click|hands)\b"
@@ -478,6 +499,48 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
         return None
     ops = [l.strip()[3:].split("(", 1)[0] for l in tool_log or [] if _tool_kind(l) == "card"]
     return f"asked \"{(user_ask or '').strip()[:80]}\"; this turn only ran {', '.join(dict.fromkeys(ops))}"
+
+
+# status_plain (agent-48e909978c): in a long chat most turns answer automated notices, so replies drift into
+# internal coordination ("queued to my subagent", "hub owns the repair") and a person's progress ask gets no outcome:
+# four asks over 9 days, 276 queued / 0 repaired never stated. A person's progress ask (never a notice, a Hermes-written
+# row, a cron run, a subagent or a Kanban worker) gets one advisory hint per turn. It never holds a reply.
+# Off switch: env COACH_STATUS_PLAIN=off, or config plugins.entries.coach.settings.status_plain: false.
+SYNTHETIC_USER_RE = re.compile(
+    r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
+STATUS_PLAIN_HINT = (
+    "[coach] status_plain: the user asked about progress (\"{ask}\"). Open with the state of their original ask in "
+    "plain words: what works, what's still broken (a number), the one thing stopping it, who acts next. No card ids "
+    "or subagent/owner/coordinator/detector words in the first paragraph.")
+
+
+def status_plain_enabled() -> bool:
+    """Env COACH_STATUS_PLAIN, then config plugins.entries.coach.settings.status_plain; default on."""
+    raw = os.environ.get("COACH_STATUS_PLAIN")
+    if raw is None:
+        try:
+            raw = _cache.load_sibling(_HERE, "second_opinion")._config_settings().get("status_plain")
+        except Exception:
+            raw = None
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("0", "off", "false", "no")
+
+
+def status_plain_hint(user_ask: str, platform: str = "", parent_session_id: str = "") -> Optional[str]:
+    """The outcome-first hint when a person typed a progress ask in a live chat, else None."""
+    if not isinstance(user_ask, str) or not user_ask.strip():
+        return None
+    if platform in ("cron", "kanban", "subagent") or parent_session_id:
+        return None
+    ask = user_ask[:ASK_HEAD]
+    if automation_prompt(ask) or SYNTHETIC_USER_RE.match(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
+        return None
+    if not status_plain_enabled():
+        return None
+    return STATUS_PLAIN_HINT.format(ask=" ".join(ask.split())[:80])
 
 
 STATUS_ONLY_NUDGE = (

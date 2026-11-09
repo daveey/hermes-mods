@@ -658,6 +658,27 @@ Off switch: `COACH_RELAY_REPEAT=off`, or `plugins.entries.coach.settings.relay_r
 hub chats (398 live sessions): 7 hits, 4 of them this defect's turns; the other 3 were repeat asks after "in progress" /
 "queued for" relays. Tests: `tests/test_relay_repeat.py` (the defect chat's real replies and user turns).
 
+### Outcome-first status replies (`pre_llm_call`, `status_plain`)
+
+Defect agent-48e909978c (2026-11-02): a 9-day issue-repair chat (126 automated notices) answered David's fourth status
+ask ("what's the deal, can we unblock ... issues?") after a reply that was only coordination: "Clarification queued to
+my subagent ...; hub owns any source or association repair. The detector remains OPEN". 276 issues queued, 0 repaired,
+never stated. Two of his four phrasings ("how goes?", "what's the deal ...") matched no progress pattern, and the
+subagent/hub handoff matched no owner pattern, so status_only and relay_repeat could not see it.
+
+- `PROGRESS_ASK_EXTRA` widens `PROGRESS_ASK_RE` (status_only) and `relay_repeat.REPEAT_RE` alike: "what's the deal",
+  "how goes / how's it going", "can we unblock / fix / get ... working", "what ... blocked on".
+- `OWNER_HANDOFF_RE` (report_only's unverified owner, relay_repeat) also reads handoffs to a subagent, worker or
+  coordinator ("queued to my subagent", "sent that to the worker"), "the hub/worker owns ... repair", "the worker has it".
+- New hint `status_plain`: a person's progress ask in a live chat (never a notice, a Hermes-written row, cron, a
+  subagent or a Kanban worker) gets one context line per turn: open with the state of the original ask in plain
+  words (what works, what's still broken as a number, the one thing stopping it, who acts next), no card ids or
+  subagent/owner/coordinator/detector words in the first paragraph. Advisory, never holds a reply. Logged as
+  `agent_hint` with `rule=status_plain`.
+
+Off switch: `COACH_STATUS_PLAIN=off`, or `plugins.entries.coach.settings.status_plain: false`. Tests:
+`tests/test_status_plain.py` (the chat's real asks, turns 3/10/15/18, and the reply before turn 18).
+
 ### Checkout-local sibling cache
 
 The sibling loader keys modules by canonical source directory as well as module name. Discovering an installed

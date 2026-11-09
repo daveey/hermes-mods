@@ -52,7 +52,9 @@ REPEAT_RE = re.compile(
     r"resolved?|unblock|move|moving|happen)"
     r"|\bwhat'?s (?:going on|happening|the (?:hold ?up|status|delay))\b|\bwhat is going on\b"
     r"|\blook again\b|\bcheck again\b|\bany (?:update|progress|news)\b|\bis it (?:fixed|done|working|unblocked) (?:yet|now)\b"
-    r"|\bstill (?:red|blocked|broken|stuck|failing|waiting|down|not)\b|\bwhere are we\b",
+    r"|\bstill (?:red|blocked|broken|stuck|failing|waiting|down|not)\b|\bwhere are we\b"
+    # agent-48e909978c: "how goes?", "what's the deal, can we unblock ...?" (same phrasings as status_only's ask)
+    + _rc().PROGRESS_ASK_EXTRA,
     re.I)
 
 # the reply says the work is not finished yet ...
@@ -128,7 +130,7 @@ def relay_owner(reply: str) -> Optional[dict]:
 
 
 def _automated(user_text: str) -> bool:
-    return bool(_rc().automation_prompt(user_text) or _SYNTHETIC_RE.match(user_text or ""))
+    return bool(_rc().automation_prompt(user_text) or _SYNTHETIC_RE.match(user_text or ""))  # == rc.SYNTHETIC_USER_RE
 
 
 def repeat_ask(user_text: str) -> bool:

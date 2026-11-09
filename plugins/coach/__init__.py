@@ -191,9 +191,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           (turn_at - last_seen) if isinstance(last_seen, (int, float)) else None, turn_at)
             loop_hint = _fix_loop(session_id, user_message, turn)
             relay_hint = _relay_repeat(session_id, user_message, platform, parent_session_id)
+            plain_hint = _status_plain(session_id, user_message, platform, parent_session_id)
             stall_hint = _stalled_goal(session_id, platform)
             hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", relay_hint or "",
-                                        stall_hint or "") if h)
+                                        plain_hint or "", stall_hint or "") if h)
             return {"context": hint} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
@@ -486,6 +487,24 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             return hit["hint"]
         except Exception as exc:
             log.debug("coach relay_repeat: %s", exc)
+            return None
+
+    def _status_plain(session_id, user_message, platform="", parent_session_id=""):
+        """A person's progress ask in a live chat -> one outcome-first hint per turn (reply_check.status_plain_hint,
+        agent-48e909978c). Advisory only; never holds a reply. Fail-open."""
+        try:
+            hint = _load("reply_check").status_plain_hint(user_message, platform or "", parent_session_id or "")
+            if not hint:
+                return None
+            st, turn = coach.loop_state(session_id), coach.turn_number(session_id)
+            if st.get("status_plain_turn") == turn:
+                return None
+            st["status_plain_turn"] = turn
+            store.log({"event": "agent_hint", "session_id": session_id, "rule": "status_plain", "turn": turn,
+                       "evidence": " ".join(str(user_message).split())[:200]})
+            return hint
+        except Exception as exc:
+            log.debug("coach status_plain: %s", exc)
             return None
 
     def _stalled_goal(session_id, platform=""):
