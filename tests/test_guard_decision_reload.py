@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
-PLUGINS = "stash-worktree-guard push-guard mac-heavy-guard branch-pin-guard cpu-load-guard crontab-guard sqlite-live-guard live-checkout-guard".split()
+PLUGINS = "stash-worktree-guard push-guard mac-heavy-guard branch-pin-guard cpu-load-guard crontab-guard sqlite-live-guard live-checkout-guard evidence-clobber-guard".split()
 ROOT = Path(__file__).resolve().parents[1]
 
 
