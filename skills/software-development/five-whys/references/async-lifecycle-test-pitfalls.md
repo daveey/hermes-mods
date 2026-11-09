@@ -4,6 +4,8 @@ Reference for skill `five-whys`: its SKILL.md links this file from the step that
 
 ## Pitfalls
 
+- For FIFO fixtures whose busy follow-up never admits, inspect whether live-turn policy consumed it before extending timeouts. Pin queue policy explicitly when the assertion requires separate turns, and wait for the real agent to replace its startup sentinel: a model HTTP-thread event can precede routing-visible publication. Prove the adverse published-agent ordering fails without the policy and passes with it, including descendant starvation; a passing sentinel bypass does not exercise busy routing.
+
 - For blocked-model admission fixtures, budget nested watchdogs together: progress waits must tolerate descheduling, the model-release gate must outlive admission observation, and the subprocess cap must contain the scenario. Reproduce the exact admission phase with a controlled peer SIGSTOP/SIGCONT as well as full descendant duty-cycle starvation; remove temporary signal instrumentation before shipping and preserve every FIFO/auth/delivery assertion. A larger polling budget alone can merely move failure into the model gate.
 
 - For startup-cancellation tests, scope a process-global `threading.Thread` capture to scheduling the controlled worker, then restore real threads before executing the foreground wrapper: lazy plugin discovery may need `args` and real `start/join` semantics. Keep ordering scenarios' event/join and cancellation watchdogs generous and test-local; retain separate production-deadline coverage. Reproduce with external SIGSTOP/SIGCONT on pytest descendants, selecting exact argv tokens (`-m pytest`), not substring matches: compileall's source-file arguments can themselves contain `pytest` and accidentally throttle setup instead of the test.
