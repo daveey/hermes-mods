@@ -4,6 +4,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.credential_pool import CredentialPool, PooledCredential
 from run_agent import AIAgent
 
@@ -18,7 +20,8 @@ class LongResetRateLimit(Exception):
         self.response = SimpleNamespace(headers={"retry-after": str(36 * 3600)})
 
 
-def test_long_reset_falls_back_when_rotation_cannot_recover():
+@pytest.mark.parametrize("disable_streaming", [True, False])
+def test_long_reset_falls_back_when_rotation_cannot_recover(disable_streaming):
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),
@@ -30,7 +33,7 @@ def test_long_reset_falls_back_when_rotation_cannot_recover():
             skip_context_files=True, skip_memory=True,
             fallback_model=[{"provider": "zai", "model": "test-fallback"}],
         )
-    agent._disable_streaming = True
+    agent._disable_streaming = disable_streaming
     pool = CredentialPool("anthropic", [
         PooledCredential(
             provider="anthropic", id="primary", label="primary", auth_type="api_key",
@@ -50,7 +53,7 @@ def test_long_reset_falls_back_when_rotation_cannot_recover():
     agent._api_max_retries = 2
     calls = []
 
-    def api_call(kwargs):
+    def api_call(kwargs, *, on_first_delta=None):
         calls.append((agent.provider, agent.model))
         if agent.provider == "anthropic":
             raise LongResetRateLimit()
@@ -66,6 +69,9 @@ def test_long_reset_falls_back_when_rotation_cannot_recover():
     fallback_client.default_headers = None
     with (
         patch.object(agent, "_interruptible_api_call", side_effect=api_call),
+        # Streaming is a per-route verdict: fallback may reset the primary's
+        # override. Both entry points return the same normalized response shape.
+        patch.object(agent, "_interruptible_streaming_api_call", side_effect=api_call),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
