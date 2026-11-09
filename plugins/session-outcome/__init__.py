@@ -5,7 +5,9 @@ Contract: side-session-notes session-outcome-contract.md, "Mods". Core owns stor
 
 - tool ``session_outcome`` (desktop/tui/cli chats only): ``done`` (summary), ``decide`` (questions with >=2 choices,
   written to the user-steps ledger first, so the For you tiles show them) or ``wait`` (named cards, processes,
-  cron, times, capacity or subagents). Each call is ``declare_outcome(sid, outcome)``.
+  cron, times, capacity or subagents). Each call is ``declare_outcome(sid, outcome)``. A ``wait`` on a card found on
+  this gateway's boards also shepherd-subscribes the chat to it (``via: outcome-wait``), so the chat's task list
+  shows what it waits on; a card it cannot find comes back in ``not_linked`` with the adopt command.
 - an outcome provider: open user-steps steps -> ``decision_items``.
 - an outcome judge: is the last assistant message a closing summary? Pool model, ``fast`` tier, thinking off, 6 s budget,
   None (core falls back to its heuristic) on any failure or timeout.
@@ -347,10 +349,89 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
             return _err(f"outcome rejected (nothing kept): {exc}")
         _note_call(session_id, _current_tool_call_id(tool_call_id))
         result.update(declared=True, outcome=outcome)
+        if spec["kind"] == "wait":
+            cards = [w["id"] for w in spec["on"] if w["kind"] == "card"]
+            if cards:
+                linked, not_linked = _link_cards(session_id, cards)
+                result["linked"] = linked
+                if not_linked:
+                    result["not_linked"] = not_linked
         return json.dumps(result)
     except Exception as exc:  # never crash the agent loop
         log.exception("session_outcome failed")
         return _err(f"{type(exc).__name__}: {exc}")
+
+
+# ---- wait on a card: link it to the chat ---------------------------------------------------------------
+#
+# A declared wait only stored the outcome, so a chat said "the remaining work is ours" while its task list showed
+# none of the cards it waited on (agent-884fdd96f8, hub 11-03). Each named card found on this gateway's boards
+# gets a ``tui`` shepherd subscription for the chat (the same row ``hermes kanban notify-subscribe`` writes; it
+# keeps the chat's sidebar busy and becomes a ``task_chat_links`` shepherd link). Stamped ``via: outcome-wait`` so
+# these rows can be told apart and released. A chat's existing owning (create/shepherd/origin) sub is left as is.
+
+_OWNING_REASONS = frozenset({"create", "shepherd", "origin"})
+
+
+def _adopt_hint(card: str, board: str = "default") -> str:
+    try:
+        from hermes_cli.kanban_origin import adopt_next_step  # type: ignore
+
+        return str(adopt_next_step(card, board).get("next_step") or "")
+    except Exception:
+        return ""
+
+
+def _link_wait_cards(session_id: str, cards: list[str]) -> tuple[list[str], list[str]]:
+    """Shepherd-subscribe ``session_id`` to each card found on this gateway. Returns ``(linked, notes)``: linked
+    card ids (already linked ones included) and one note per card it could not link. Never raises."""
+    linked: list[str] = []
+    notes: list[str] = []
+    try:
+        from hermes_cli import kanban_db as kb  # type: ignore
+        from hermes_cli import kanban_db_boards as kbb  # type: ignore
+        from hermes_cli import kanban_db_connect as kbc  # type: ignore
+        from hermes_cli import kanban_db_notify as kbn  # type: ignore
+        boards = [b.get("slug") or "default" for b in kbb.list_boards(include_archived=False)]
+    except Exception as exc:
+        log.debug("session-outcome: kanban unavailable for wait links", exc_info=True)
+        return [], [f"{c}: not linked (kanban unavailable: {type(exc).__name__})" for c in cards]
+    try:
+        from hermes_cli.profiles import current_profile_name  # type: ignore
+
+        profile = current_profile_name("default")
+    except Exception:
+        profile = None
+    for card in dict.fromkeys(cards):
+        done = False
+        for board in boards:
+            try:
+                with kbc.connect_closing(board=board) as conn:
+                    if kb.get_task(conn, card) is None:
+                        continue
+                    mine = [sub for sub in kbn.list_notify_subs(conn, card)
+                            if sub["platform"] == "tui" and sub["chat_id"] == session_id]
+                    if not any(((sub.get("delivery_metadata") or {}).get("reason") or "create") in _OWNING_REASONS
+                               for sub in mine):
+                        kbn.add_notify_sub(conn, task_id=card, platform="tui", chat_id=session_id,
+                                           notifier_profile=profile,
+                                           delivery_metadata={"reason": "shepherd", "via": "outcome-wait"})
+                    linked.append(card)
+                    done = True
+                    break
+            except Exception as exc:
+                log.warning("session-outcome: linking %s on board %s failed: %r", card, board, exc)
+                notes.append(f"{card}: not linked on board {board} ({type(exc).__name__}: {exc})")
+                done = True
+                break
+        if not done:
+            hint = _adopt_hint(card)
+            notes.append(f"{card}: not on this gateway's boards, so the chat does not show it yet"
+                         + (f"; link it with: {hint}" if hint else ""))
+    return linked, notes
+
+
+_link_cards = _link_wait_cards
 
 
 # ---- provider: open user-steps steps -> decision items ---------------------------------------------------

@@ -101,6 +101,7 @@ def fake(monkeypatch):
 def plugin(home, fake):
     mod = _load()
     mod._llm = lambda system, user: "NO"
+    mod._link_cards = lambda sid, cards: ([], [])  # the real kanban link runs in test_real_core.py
     mod.register(Ctx())
     fake.providers.clear()
     fake.judges.clear()

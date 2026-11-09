@@ -14,7 +14,10 @@ the outcome and feeds core the two things only plugins know: open user decisions
     declares `{"kind": "decision", "items": [{id, question, choices, state: "open", card_id?}]}`. Nothing is
     written when any item is malformed.
   - `{"kind": "wait", "on": [{"kind": "card|process|cron|time|capacity|subagent", "id", "label"?, "state"?,
-    "eta"?}]}` declares `{"kind": "waiting", "on": [...]}`.
+    "eta"?}]}` declares `{"kind": "waiting", "on": [...]}`. Each `card` found on this gateway's boards also gets a
+    `tui` shepherd subscription for the chat (`delivery_metadata.via = "outcome-wait"`), so the chat's task list and
+    sidebar show what it waits on; the result lists `linked` and, for cards it could not find, `not_linked` with the
+    `kanban_origin_adopt` command. An owning (create/shepherd/origin) sub the chat already has is left as is.
 - **Provider** `user-steps`: user-steps `open_steps(sid)` → `{"decision_items": [...], "waiting_on": []}`, or None
   when the chat has no open steps.
 - **Judge**: is the last assistant message a closing summary? Desktop, tui and cli chats only: any other

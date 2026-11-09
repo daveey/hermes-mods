@@ -110,3 +110,33 @@ def test_open_step_makes_real_core_say_decision(real, monkeypatch):
     plugin._llm = lambda s, u: "YES"
     plugin._JUDGED.clear()
     assert gate(plugin, SUMMARY) is None
+
+
+def test_wait_on_a_card_links_it_to_the_waiting_chat(real, monkeypatch):
+    """agent-884fdd96f8: a chat that declares it waits on a card must show that card in its task list. A declared
+    wait only stored the outcome, so the chat said "the remaining work is ours" with nothing scheduled in view."""
+    so, plugin = real
+    monkeypatch.setenv("HERMES_KANBAN_HOME", os.environ["HERMES_HOME"])
+    for k in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(k, raising=False)
+    for name in [m for m in sys.modules if m.startswith("hermes_cli.kanban")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="repair the forwarder", assignee="default")
+        assert kbn.list_notify_subs(conn, tid) == []
+    out = plugin.handle({"kind": "wait", "on": [{"kind": "card", "id": tid}, {"kind": "card", "id": "t_nowhere"}]},
+                        session_id="chat")
+    import json as _json
+    res = _json.loads(out)
+    assert res.get("declared") is True, res
+    with kbc.connect_closing() as conn:
+        subs = kbn.list_notify_subs(conn, tid)
+    assert [(s["platform"], s["chat_id"]) for s in subs] == [("tui", "chat")], subs
+    assert subs[0]["delivery_metadata"]["reason"] == "shepherd"
+    assert subs[0]["delivery_metadata"]["via"] == "outcome-wait"
+    assert res["linked"] == [tid]
+    assert "t_nowhere" in " ".join(res.get("not_linked", [])), res
