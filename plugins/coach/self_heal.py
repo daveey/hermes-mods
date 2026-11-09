@@ -1228,7 +1228,9 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #                     investigations persist for admission retry, and fixes keep the Do-it outcome retryable.
 # Events (coach log.jsonl, read by coach_weekly's self-heal section): selfheal_would_file, selfheal_filed,
 # selfheal_recurrence, selfheal_recurrence_held (an occurrence inside `deploy_grace_hours` after fixed: hosts may
-# still run old code; the 3rd held occurrence files anyway), selfheal_skip, selfheal_proposed, selfheal_approved,
+# still run old code; the 3rd held occurrence files anyway), selfheal_not_deployed (a post-fix occurrence from a host
+# whose `sync: <label>` commits on the hub's hermes-state clone didn't contain the state-branch fix yet: held, and
+# one "host <label> hasn't synced fix" card once that lasts `undeployed_file_hours`), selfheal_skip, selfheal_proposed, selfheal_approved,
 # selfheal_fixed, selfheal_reverted, selfheal_not_defect, selfheal_declined.
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -2222,10 +2224,119 @@ def backport_key(fp: str, checkout: str, sha: str) -> str:
     return f"selfheal:{fp}:backport:{sha[:12]}:{hashlib.sha1(checkout.encode()).hexdigest()[:8]}"
 
 
+# ── sync-delivered fixes: has the host that raised it synced the fix yet? (cron-b2c33e9921) ──
+# A fix on the private state branch reaches a host only when that host's hermes-sync merges and imports it; a laptop
+# asleep for days runs the old script long after the 6 h rollout window. Each host's sync commits ("sync: <label>
+# <date>") on origin/state show when its tree first contained the fix.
+STATE_REPO = "~/.hermes/repos/hermes-state"
+STATE_REF = "origin/state"
+UNDEPLOYED_FILE_HOURS = 72.0  # a host still without the fix this long after it files one card instead of holding
+_ON_LABEL = re.compile(r"\bon ([A-Za-z0-9][A-Za-z0-9._-]{0,62}[A-Za-z0-9])\b")
+
+
+def _sync_grep(label: str) -> str:
+    return "^sync: " + re.sub(r"([.\\^$*+?()\[\]{}|])", r"\\\1", label) + "( |$)"
+
+
+def host_sync_labels(d: dict, cfg: Optional[dict]) -> list:
+    """Candidate sync labels for the host that raised `d`: `on <label>` in its details/symptom (scripts name their
+    host that way), then `host_sync_labels[host]` from selfheal-config.json, then the host name itself."""
+    out: list = []
+    for text in (d.get("details"), d.get("symptom")):
+        out += _ON_LABEL.findall(str(text or ""))
+    m = (cfg or {}).get("host_sync_labels") or {}
+    if isinstance(m, dict) and d.get("host") and m.get(d["host"]):
+        out.append(str(m[d["host"]]))
+    if d.get("host"):
+        out.append(str(d["host"]))
+    seen: list = []
+    for x in out:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
+def sync_deploy(d: dict, shas: list, cfg: Optional[dict] = None) -> Optional[dict]:
+    """When the host that raised `d` first synced fix `shas` (the ones that are commits on the state ref). ->
+    {label, sha, deployed_at (committer time of its first `sync: <label>` commit containing every fix sha, or
+    None), last_sync (its newest sync commit), ref_at (the ref's tip time)}; None when git can't tell (no state
+    clone, no sha on the ref, no label with sync commits)."""
+    cfg = cfg or {}
+    repo = os.path.expanduser(str(cfg.get("state_repo") or STATE_REPO))
+    ref = str(cfg.get("state_ref") or STATE_REF)
+    if not shas or not os.path.isdir(repo):
+        return None
+    rc, tip = _git_rc(repo, "log", "-1", "--format=%ct", ref)
+    if rc != 0 or not tip.strip():
+        return None
+    ref_at = float(tip.strip())
+    fulls = []
+    for sha in shas:
+        rc, full = _git_rc(repo, "rev-parse", "--verify", "-q", f"{sha}^{{commit}}")
+        full = full.strip()
+        if rc != 0 or not full:
+            continue  # not a state commit (e.g. the hermes-mods half of the fix)
+        anc, _ = _git_rc(repo, "merge-base", "--is-ancestor", full, ref)
+        if anc == 0:
+            fulls.append(full)
+    if not fulls:
+        return None
+    for label in host_sync_labels(d, cfg):
+        pat = _sync_grep(label)
+        rc, last = _git_rc(repo, "log", "-1", "--format=%ct", "-E", f"--grep={pat}", ref)
+        if rc != 0 or not last.strip():
+            continue  # not a hermes-sync label
+        deployed: Optional[float] = 0.0
+        for full in fulls:
+            rc, out = _git_rc(repo, "log", "--ancestry-path", "--format=%ct", "-E", f"--grep={pat}", f"{full}..{ref}")
+            if rc != 0:
+                return None
+            ts = [float(x) for x in out.split() if x.strip()]
+            if not ts:
+                deployed = None
+                break
+            deployed = max(deployed or 0.0, min(ts))
+        return {"label": label, "sha": fulls[0], "deployed_at": deployed, "last_sync": float(last.strip()),
+                "ref_at": ref_at}
+    return None
+
+
+def undeployed_key(fp: str, label: str, sha: str) -> str:
+    return f"selfheal:{fp}:undeployed:{re.sub(r'[^A-Za-z0-9._-]', '_', label)}:{sha[:12]}"
+
+
+def _not_deployed(d: dict, st: dict, at: float, now: float, cfg: Optional[dict]) -> Optional[dict]:
+    """A post-fix occurrence from a host whose sync had not delivered the fix when it happened -> a not_deployed
+    decision (overdue once the host still lacks it UNDEPLOYED_FILE_HOURS after the fix), else None."""
+    dep = sync_deploy(d, list(st.get("fix_shas") or []), cfg)
+    if not dep:
+        return None
+    fixed_at = float(st.get("fixed_at") or 0)
+    label, sha = dep["label"], dep["sha"]
+    if dep["deployed_at"] is None:
+        if dep["ref_at"] < at:
+            return None  # the clone hasn't fetched past the occurrence: no post-fix sync proves nothing
+        try:
+            hours = float((cfg or {}).get("undeployed_file_hours", UNDEPLOYED_FILE_HOURS))
+        except (TypeError, ValueError):
+            hours = UNDEPLOYED_FILE_HOURS
+        overdue = bool(fixed_at) and now - fixed_at >= hours * 3600
+        why = (f"host {label} hasn't synced fix {sha[:11]} (last sync {_iso(dep['last_sync'])}"
+               f"{', over %g h after the fix' % hours if overdue else ''})")
+        return {"action": "not_deployed", **dep, "overdue": overdue, "why": why,
+                "key": undeployed_key(d["fingerprint"], label, sha) if overdue else None}
+    if at < dep["deployed_at"]:
+        return {"action": "not_deployed", **dep, "overdue": False, "key": None,
+                "why": f"happened {_iso(at)}, before host {label} synced fix {sha[:11]} ({_iso(dep['deployed_at'])})"}
+    return None
+
+
 def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
     """Dedupe / suppression / recurrence decision for one defect against its lane state. Pure except one probe:
     a post-fix occurrence checks whether the checkout that raised it contains the fix (stale_checkout).
-    -> {"action": "file"|"skip"|"hold"|"stale_runtime", "why", "key", "previous"}"""
+    a post-fix occurrence on another host checks whether its hermes-sync had delivered a state-branch fix yet
+    (sync_deploy, read-only git on the hub's hermes-state clone).
+    -> {"action": "file"|"skip"|"hold"|"stale_runtime"|"not_deployed", "why", "key", "previous"}"""
     fp = d["fingerprint"]
     status = st.get("status")
     if st.get("suppressed"):
@@ -2253,6 +2364,14 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
         # host still running pre-fix code. Held occurrences are deduped by time so a replay never counts twice.
         at = _detected_at(d)
         at = now if at is None else at
+        # A sync-delivered fix (state branch) holds wherever the host's own sync commits show it wasn't there yet,
+        # however long the host was away (cron-b2c33e9921); git that can't tell keeps the time rule below.
+        try:
+            nd = _not_deployed(d, st, at, now, cfg)
+        except Exception:  # health: allow BLE001 -- the probe is advisory; fall back to the time-based decision
+            nd = None
+        if nd:
+            return {**nd, "at": at}
         grace = deploy_grace_s(cfg)
         held = [h for h in (st.get("held") or []) if h.get("at") != at]
         if grace and st.get("fixed_at") and at - float(st["fixed_at"]) < grace and len(held) + 1 < HELD_FILE_AFTER:
@@ -3196,6 +3315,8 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     dec = decide(d, st, now, cfg)
     if dec["action"] == "stale_runtime":
         return _file_backport(d, fp, st, dec, store, m, runner, now, cfg, budget_fn)
+    if dec["action"] == "not_deployed":
+        return _file_undeployed(d, fp, st, dec, store, m, runner, now, cfg, budget_fn)
     if dec["action"] == "hold":
         held = dec["held"] + [{"at": dec["at"], "host": d.get("host"), "source": d.get("source"), "seen": now}]
         lane.update(fp, held=held)
@@ -3373,6 +3494,69 @@ def _file_backport(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[str
     lane.update(fp, backports=backports, cards=sorted(known_cards(st) | {tid}))
     store.log({**rec, "card": tid})
     return {"action": "stale_runtime", "card": tid, "key": key, "why": dec["why"]}
+
+
+def undeployed_brief(d: dict, fp: str, st: dict, dec: dict) -> str:
+    return f"""Self-heal DEPLOY check for defect `{fp}`: fix {dec['sha'][:12]} (card {st.get('fix_card') or '?'}) landed
+on the state branch at about {_iso(float(st.get('fixed_at') or 0))}, and host `{dec['label']}` ({d.get('host')}) still
+has no `sync: {dec['label']}` commit containing it. Its newest sync commit is {_iso(dec['last_sync'])}. Its post-fix
+occurrences are held as "not deployed", not filed as "the fix didn't hold"; this card exists so that hold doesn't
+go on silently.
+
+Latest occurrence: {_iso(float(dec.get('at') or 0))}: {d.get('symptom')}
+
+Do this:
+1. Find out why the host isn't syncing: is it reachable (`tailscale status`, the hub's hosts view), and when did
+   its hermes-sync last run (its `sync: {dec['label']}` commits on origin/state; on the host,
+   `~/.hermes/logs/hermes-sync.log`)? A sleeping laptop needs nothing: complete with "away; holds until it syncs".
+2. A host that syncs but never merges origin (diverged, a failing import) is the defect: fix the sync there, per
+   the hermes-mods-repo skill.
+3. A retired host or renamed label: correct `host_sync_labels` in the hub's <coach>/selfheal-config.json.
+Do not post to the Inbox. If only David can act (power the host on, sign in), kanban_block with the exact ask.
+"""
+
+
+def _file_undeployed(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[str], runner, now: float,
+                     cfg: Optional[dict], budget_fn: Optional[Callable]) -> dict:
+    """Hold a not-yet-deployed occurrence (selfheal_not_deployed, nothing filed); once overdue, file ONE card per
+    host label + fix sha ("host <label> hasn't synced fix <sha>"). The fingerprint stays fixed either way."""
+    lane = LaneState(store.root)
+    rec = {"event": "selfheal_not_deployed", "mode": m, "fingerprint": fp, "host": d.get("host"),
+           "label": dec["label"], "sha": dec["sha"], "at": dec.get("at"), "last_sync": dec["last_sync"],
+           "deployed_at": dec["deployed_at"], "overdue": dec["overdue"], "source": d.get("source"),
+           "component": d.get("component"), "previous": st.get("fix_card"), "why": dec["why"]}
+    if not dec["overdue"]:
+        store.log(rec)
+        return {"action": "skip", "why": dec["why"], "not_deployed": True}
+    key = dec["key"]
+    filed = dict(st.get("undeployed") or {})
+    if filed.get(key):
+        why = f"undeployed card already filed: {filed[key]} ({dec['why']})"
+        store.log({**rec, "card": filed[key]})
+        return {"action": "skip", "why": why, "not_deployed": True}
+    r = route(d, cfg)
+    args = {"title": f"host {dec['label']} hasn't synced fix {dec['sha'][:11]}"[:200],
+            "body": undeployed_brief(d, fp, st, dec), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+            "max_runtime": INVESTIGATION_RUNTIME, "skills": ["hermes-mods-repo"], "board": r["board"],
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
+    if m != "live" or not is_hub(cfg):
+        store.log({**rec, "would_file": True, "args": args})
+        return {"action": "not_deployed", "card": None, "key": key, "why": dec["why"]}
+    b = (budget_fn or budget)(args.get("board"), now)
+    if not b.get("ok_usd", True) or not b.get("ok_running", True):
+        why = f"undeployed card deferred: {b.get('why') or 'self-heal budget/concurrency'}; the next occurrence retries"
+        store.log({**rec, "deferred": why})
+        return {"action": "skip", "why": why, "not_deployed": True}
+    rc, out, err = _run(kanban_argv(args), runner)
+    tid = _task_id(out) if rc == 0 else None
+    if not tid:
+        why = (err or out).strip()[-300:]
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "key": key})
+        return {"action": "error", "why": why}
+    filed[key] = tid
+    lane.update(fp, undeployed=filed, cards=sorted(known_cards(st) | {tid}))
+    store.log({**rec, "card": tid})
+    return {"action": "not_deployed", "card": tid, "key": key, "why": dec["why"]}
 
 
 def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budget_fn=None,
