@@ -2099,7 +2099,8 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
     cur = load_cursor(home)
     sigs = collect(home, cur, host, now)
     cfg = cfg if cfg is not None else config(home)
-    beat = {"kind": "heartbeat", "host": host, "at": now or time.time(), "n": len(sigs), "reach": reach_target(cfg)}
+    beat = {"kind": "heartbeat", "host": host, "at": now or time.time(), "n": len(sigs),
+            "reach": reach_target(cfg, host, home)}
     payload = "".join(json.dumps(s) + "\n" for s in [beat] + sigs)
     run = runner or (lambda argv, stdin: subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=90))
     try:
@@ -2132,11 +2133,20 @@ def _tailscale_name() -> Optional[str]:
     return None
 
 
-def reach_target(cfg: dict) -> str:
-    """The ssh target the hub probes when this host's forwarder goes quiet (plugin-8a7e4507f0): `reach_as` in
-    selfheal-config.json, else <user>@<tailscale short name>, else <user>@<hostname>."""
-    if cfg.get("reach_as"):
-        return str(cfg["reach_as"])[:120]
+def reach_target(cfg: dict, host: Optional[str] = None, home: Optional[Path] = None) -> str:
+    """The ssh target the hub probes when this host's forwarder goes quiet (plugin-8a7e4507f0): `reach_as[<host>]`
+    in selfheal-config.json, else <user>@<tailscale short name>, else <user>@<hostname>. selfheal-config.json is
+    synced to EVERY host, so `reach_as` is a map keyed by forwarder host name; a plain string can't say whose
+    address it is (the mini's once rode the MacBook's heartbeat) and is ignored with a logged warning."""
+    ra = cfg.get("reach_as")
+    if isinstance(ra, dict):
+        if host and ra.get(host):
+            return str(ra[host])[:120]
+    elif ra:
+        if home is not None:
+            _coach_log(home, {"event": "forwarder_reach_as_string", "ts": time.time(), "host": host,
+                              "reach_as": str(ra)[:120],
+                              "why": "reach_as must be a map {<forwarder host>: <user@host>}; string ignored"})
     try:
         user = getpass.getuser()
     except Exception:
@@ -2226,6 +2236,12 @@ def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[
     new_state = {}
     cfg = None
     out = []
+    # A reach several hosts' heartbeats carry proves nothing about any one of them (plugin-8a7e4507f0: the mini's
+    # address rode the MacBook's beat, so the asleep MacBook looked "awake"): never probe it, keep the age-only check.
+    by_reach: Dict[str, List[str]] = {}
+    for h, v in hosts.items():
+        if isinstance(v, dict) and v.get("reach"):
+            by_reach.setdefault(str(v["reach"]), []).append(h)
     for h, v in sorted(hosts.items()):
         last = float(v.get("at") or 0)
         age = now - last
@@ -2234,7 +2250,14 @@ def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[
         reach = v.get("reach")
         last_s = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(last))
         note = ""
-        if age <= GONE_S and reach:
+        others = sorted(x for x in by_reach.get(str(reach), []) if x != h) if reach else []
+        if age <= GONE_S and reach and others:
+            _coach_log(home, {"event": "forwarder_reach_shared", "ts": now, "host": h, "age_h": round(age / 3600, 1),
+                              "reach": reach, "shared_with": others})
+            note = (f"; its heartbeat's reach {reach} is shared with {', '.join(others)}, so the hub cannot tell "
+                    f"asleep from broken (reach_as in selfheal-config.json must be a map keyed by host, e.g. "
+                    f"{{\"{h}\": \"<user>@<its tailscale name>\"}})")
+        elif age <= GONE_S and reach:
             if prober is None:
                 cfg = cfg if cfg is not None else config(home)
                 prober = lambda r: probe_host(r, cfg)  # noqa: E731
@@ -2244,7 +2267,7 @@ def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[
                 # An unusable reach can't tell asleep from dead: keep the age-only check and say why.
                 _coach_log(home, {"event": "forwarder_reach_unresolvable", **rec})
                 note = (f"; its heartbeat's reach {reach} does not resolve from the hub, so the hub cannot tell "
-                        f"asleep from broken (set reach_as in that host's selfheal-config.json)")
+                        f"asleep from broken (set reach_as[\"{h}\"] in selfheal-config.json)")
             elif not up:
                 _coach_log(home, {"event": "forwarder_silent_host_down", **rec})
                 continue

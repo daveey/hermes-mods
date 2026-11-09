@@ -981,9 +981,13 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
   files them); the cursor only moves when the hub accepted the batch. Every pass sends a heartbeat first (even with
   no signals), recorded in the hub's `coach/signals/hosts.json`; the hub sweep files a `plugin` defect for a host
   whose forwarder has been silent > 6 h. A sleeping laptop is silent too (plugin-8a7e4507f0), so the heartbeat
-  carries `reach` (`reach_as` in `coach/selfheal-config.json`, else `<user>@<tailscale short name>`, else
+  carries `reach` (`reach_as[<host>]` in `coach/selfheal-config.json`, a map keyed by forwarder host name such as
+  `{"mini": "you@mini-ts", "macbook": "you@mac-ts"}` since that file is synced to every host; a plain string is
+  ignored with a `forwarder_reach_as_string` warning; else `<user>@<tailscale short name>`, else
   `<user>@<hostname>` minus `.local`) and the hub probes a silent host with one BatchMode ssh first: unreachable
-  (connect timeout, no route) logs `forwarder_silent_host_down` to `coach/log.jsonl` and files nothing; a reach the
+  (connect timeout, no route) logs `forwarder_silent_host_down` to `coach/log.jsonl` and files nothing; a reach
+  two or more hosts' heartbeats share logs `forwarder_reach_shared`, is never probed and keeps the age-only filing
+  ("shared with <hosts>"); a reach the
   hub cannot resolve (MagicDNS still resolves sleeping peers, so the reach itself is bad) logs
   `forwarder_reach_unresolvable` and keeps the age-only filing, naming the bad reach; an
   answering sshd (login ok, or even `Permission denied`) counts as awake, logs `forwarder_silent_host_up_waiting`,

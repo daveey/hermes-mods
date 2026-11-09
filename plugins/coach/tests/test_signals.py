@@ -980,7 +980,8 @@ def test_heartbeat_carries_reach_into_hosts_json(home, tmp_path, monkeypatch):
     def good(argv, stdin):
         sent.append(stdin)
         return SimpleNamespace(returncode=0, stdout='{"ingested": 0}', stderr="")
-    sg.forward(home, "macbook", "you@hub.example.com", runner=good, now=NOW, cfg={"reach_as": "you@mac.example.com"})
+    sg.forward(home, "macbook", "you@hub.example.com", runner=good, now=NOW,
+               cfg={"reach_as": {"macbook": "you@mac.example.com"}})
     beat = json.loads(sent[0].splitlines()[0])
     assert beat["reach"] == "you@mac.example.com"
     hub = tmp_path / "hub"
@@ -993,6 +994,52 @@ def test_heartbeat_carries_reach_into_hosts_json(home, tmp_path, monkeypatch):
     monkeypatch.setattr(sg, "_tailscale_name", lambda: None)
     monkeypatch.setattr(sg.socket, "gethostname", lambda: "mac.local")
     assert sg.reach_target({}) == "you@mac"
+
+
+def _sent_reach(home, host, cfg, monkeypatch):
+    monkeypatch.setattr(sg, "_tailscale_name", lambda: f"{host}-ts")
+    monkeypatch.setattr(sg.getpass, "getuser", lambda: "you")
+    sent = []
+    sg.forward(home, host, "you@hub.example.com", now=NOW, cfg=cfg,
+               runner=lambda argv, stdin: sent.append(stdin) or SimpleNamespace(returncode=0, stdout="{}", stderr=""))
+    return json.loads(sent[0].splitlines()[0])["reach"]
+
+
+def test_reach_as_is_a_map_keyed_by_forwarder_host(home, monkeypatch):
+    # plugin-8a7e4507f0 (2026-11-07): selfheal-config.json is synced to EVERY host, so a single reach_as string set
+    # for the mini also rode the MacBook's heartbeat, and the hub probed the mini when the MacBook went quiet.
+    shared = {"reach_as": {"mini": "you@mini.example.com", "macbook": "you@mac.example.com"}}
+    assert _sent_reach(home, "macbook", shared, monkeypatch) == "you@mac.example.com"
+    assert _sent_reach(home, "mini", shared, monkeypatch) == "you@mini.example.com"
+    # a host missing from the map uses its own tailscale name, never another host's entry
+    assert _sent_reach(home, "laptop2", shared, monkeypatch) == "you@laptop2-ts"
+
+
+def test_a_plain_string_reach_as_is_ignored_with_a_warning(home, monkeypatch):
+    # One string can't say which host it belongs to: using it on every host is what broke (plugin-8a7e4507f0).
+    assert _sent_reach(home, "macbook", {"reach_as": "you@mini.example.com"}, monkeypatch) == "you@macbook-ts"
+    warn = _log_events(home, "forwarder_reach_as_string")
+    assert warn and warn[-1]["host"] == "macbook" and warn[-1]["reach_as"] == "you@mini.example.com"
+
+
+def test_a_reach_shared_by_two_hosts_never_marks_a_silent_host_awake(tmp_path):
+    # Live 2026-11-07: hosts.json had the mini's reach for macbook AND mini. The MacBook was asleep,
+    # the hub probed the (awake) mini, called the MacBook "awake for 30 min" and filed. A reach shared by several
+    # hosts proves nothing about any one of them: skip the probe, log it, keep the age-only check and name it.
+    hub = tmp_path / "hub"
+    _beat(hub, reach="you@mini.example.com")
+    sg.ingest(hub, json.dumps({"kind": "heartbeat", "host": "mini", "n": 0, "reach": "you@mini.example.com"}) + "\n",
+              now=NOW + 7 * 3600)
+    probed = []
+    t0 = NOW + 7 * 3600
+    got = sg.silent_forwarders(hub, now=t0, prober=lambda r: probed.append(r) or UP(r))
+    assert probed == []  # never probes the shared address
+    assert _log_events(hub, "forwarder_silent_host_up_waiting") == []
+    assert [s["host"] for s in got] == ["macbook"]
+    assert "shared with mini" in got[0]["details"] and "reachable" not in got[0]["details"]
+    shared = _log_events(hub, "forwarder_reach_shared")
+    assert [(r["host"], r["reach"], r["shared_with"]) for r in shared] == [("macbook", "you@mini.example.com",
+                                                                            ["mini"])]
 
 
 def test_probe_counts_an_answering_sshd_as_awake():
