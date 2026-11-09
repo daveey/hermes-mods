@@ -416,8 +416,15 @@ def _link_wait_cards(session_id: str, cards: list[str]) -> tuple[list[str], list
                         kbn.add_notify_sub(conn, task_id=card, platform="tui", chat_id=session_id,
                                            notifier_profile=profile,
                                            delivery_metadata={"reason": "shepherd", "via": "outcome-wait"})
-                    linked.append(card)
+                    # Read it back: core drops a headless or placeholder session id without error, and a "linked"
+                    # that wrote nothing is the exact false claim this link exists to prevent.
                     done = True
+                    if any(sub["platform"] == "tui" and sub["chat_id"] == session_id
+                           for sub in kbn.list_notify_subs(conn, card)):
+                        linked.append(card)
+                    else:
+                        notes.append(f"{card}: not linked: this session ({session_id}) is not a chat a card can "
+                                     "be linked to (headless or placeholder id)")
                     break
             except Exception as exc:
                 log.warning("session-outcome: linking %s on board %s failed: %r", card, board, exc)

@@ -140,3 +140,25 @@ def test_wait_on_a_card_links_it_to_the_waiting_chat(real, monkeypatch):
     assert subs[0]["delivery_metadata"]["via"] == "outcome-wait"
     assert res["linked"] == [tid]
     assert "t_nowhere" in " ".join(res.get("not_linked", [])), res
+
+
+def test_wait_from_a_headless_session_reports_not_linked(real, monkeypatch):
+    """Core drops a tui sub for a headless ``local-<sha256>`` id (a one-shot/worker run); the plugin must say so
+    instead of reporting the card linked (seen live on the hub: ``linked`` with no row written)."""
+    so, plugin = real
+    monkeypatch.setenv("HERMES_KANBAN_HOME", os.environ["HERMES_HOME"])
+    for k in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(k, raising=False)
+    for name in [m for m in sys.modules if m.startswith("hermes_cli.kanban")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="repair", assignee="default")
+    headless = "local-" + "a" * 64
+    res = plugin._link_wait_cards(headless, [tid])
+    with kbc.connect_closing() as conn:
+        assert kbn.list_notify_subs(conn, tid) == []
+    assert res[0] == [] and "not linked" in res[1][0], res
