@@ -311,6 +311,20 @@ _NOT_ASK = re.compile(
     r"you (said|answered|approved|asked)|don'?t need (anything|you)|no (more|further) (input|action)|"
     r"the card asks|it asked|would have asked|next time)\b",
     re.I)
+# An optional offer that states what the assistant does if the user stays silent. It blocks nothing, so it must not mint
+# a For-you request even under a "Decision for you" label. Checked on the whole source paragraph, not only the span.
+_SILENT_DEFAULT = re.compile(
+    r"\bi(?:'ll| will|'m going to| am going to)\s+(?:just\s+)?(?:leave|keep|stay|stick|go with)\b[^.?!]{0,120}?\bunless you\b"
+    r"|\bif you (?:say|reply|respond|tell me) nothing\b|\bif you (?:don'?t|do not) (?:reply|respond|say|answer|object)\b"
+    r"|\bsilence (?:means|=|is)\b|\botherwise,? i(?:'ll| will) (?:keep|leave|go with|stay|stick)\b"
+    r"|\b(?:the|my) default is\b"
+    r"|\bunless you\b[^.?!]{0,100}\b(?:it )?(?:stays?|remains?)\b",
+    re.I)
+# What still counts as a real, blocking ask inside a paragraph that states a default: a question, or an explicit
+# demand for a yes/no or a reply. A bare imperative ("Decide whether...") is exactly how an optional offer is worded.
+_BLOCKING_ASK = re.compile(
+    r"\?|\b(?:reply|answer|say|tell me|let me know)\b[^.!]{0,25}\b(?:yes|no|go|ok|okay)\b|\bplease\b|"
+    r"\bwaiting (?:on|for) (?:you|your)\b|\bneeds? your\b", re.I)
 _APPROVE = re.compile(r"\b(want me to|should i|shall i|do you want me to|would you like me to|ok(ay)? (for me )?to|"
                       r"go-ahead|go/no-go|approve|approval)\b", re.I)
 _DO = re.compile(r"\b(can you|could you|please) (check|click|tap|open|plug|sign|log|restart|run)\b", re.I)
@@ -370,6 +384,9 @@ Rules:
 - ELSEWHERE lists asks open in other chats. A sentence restating one of these points at an ask that lives
   elsewhere: never a new step. Put {"title": "<exact ELSEWHERE title>", "verbatim_span": "<exact sentence>"} in
   "elsewhere" instead. Those are neither minted nor framed.
+- An optional offer that states what the assistant does if the user stays silent ("I'll leave it there unless you
+  want...", "if you say nothing it stays") is not a step, even under a "Decision for you" label, and even when the
+  default is stated in a later sentence of the same paragraph.
 - If the reply says nothing is needed from the user, return no steps unless a sentence explicitly asks the user.
 - No asks: {"steps":[],"resolved":[...],"repeats":[...],"elsewhere":[...]}."""
 
@@ -792,6 +809,13 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             opts = []
         if _NOT_ASK.search(span):
             continue  # hypothetical / mention-only, whatever the model said
+        _blk = locate(reply, span)
+        if _blk is not None and _SILENT_DEFAULT.search(_plain(_blk["text"])) \
+                and not _BLOCKING_ASK.search(_QUOTED.sub('""', _plain(_blk["text"]))):
+            logging.getLogger("user-steps").info("user-steps: silent_default_suppressed span=%r", span[:120])
+            if dropped is not None:
+                dropped.append("silent_default: " + text)
+            continue  # optional offer with a silent default elsewhere in the paragraph: not a blocking ask
         if assent_echo(span) or assent_echo(text):
             continue  # "I'd say yes." echoes assent; it asks nothing
         if quiet and not directly_asks(span):

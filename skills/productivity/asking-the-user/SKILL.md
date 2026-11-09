@@ -93,6 +93,9 @@ Hand it over only when it can't.
 
 ## Done means
 
+- [ ] An optional offer is worded "Optional: I'll keep X; say if you want Y." in a plain sentence, never under a
+  "Decision for you:" header, and is not restated next turn. user-steps drops it, so no For-you request opens and the
+  chat is not painted red. A choice that really blocks you gets a direct question instead ("Should I add it? yes/no").
 - [ ] No reply asks the user to paste or run a command; `run_in_user_terminal` was used instead.
 - [ ] Every Chrome ask came after a `browser_focus` that returned that tab.
 - [ ] Every other-Mac GUI ask tried `remote_approve_dialog` first (for prompts) and carries a verified `::screenshare` button.
