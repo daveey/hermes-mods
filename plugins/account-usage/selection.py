@@ -587,9 +587,11 @@ LEASE_UNAVAILABLE = 'Chat ownership lease is unavailable'
 
 
 class LeaseMissing(SelectionRejected):
-    """The chat's own lease is gone from the registry, no other writer holds the session, and the registry
-    could not be repaired. Only a queued selection must refuse on it; otherwise the call takes the default
-    route (``consume_for_agent``)."""
+    """Owner resolution could not prove this runtime owns the chat (its lease is gone or unrepairable, another
+    writer holds the session, the lease names another runtime). Selection only picks which account pays and
+    is not the ownership authority (core's lease is), so only a queued selection must refuse on it; otherwise
+    the call takes the default route (``consume_for_agent``, self-heal agent-c46bf512ae / agent-235b66c443).
+    ``put()``/``get()`` still refuse visibly: it is a SelectionRejected."""
 
 
 class NotSelectable(SelectionRejected):
@@ -619,7 +621,9 @@ def _recover_missing_lease(registry, home, lease, runtime_id, entries):
     - a same-writer entry (this pid + this runtime id, core's ``_is_same_writer``) for the session proves
       ownership: core swapped the lease id under a stale session record;
     - no entry for the session: re-register this exact lease under the registry lock (restores the fence);
-    - a different writer holds the session: still refused by the caller (empty result).
+    - only provably dead holders (pid gone or reused, self-heal agent-235b66c443): replace them under the lock
+      with this lease;
+    - a live different writer holds the session: still refused by the caller (empty result).
     Returns the matching entries ([] = unrecoverable). Logs ``selection_lease_missing`` with the holders, so the
     writer that dropped it can be found from the log."""
     import logging
@@ -627,7 +631,15 @@ def _recover_missing_lease(registry, home, lease, runtime_id, entries):
     from pathlib import Path
     log = logging.getLogger(__name__)
     sids = {str(lease.session_id)}
-    held = [e for e in entries if str(e.get('session_id') or '') in sids]
+
+    def ours(e):
+        return str(e.get('session_id') or '') in sids
+
+    def dead(e):  # provably dead only (False); unknown liveness still counts as a holder
+        return registry._pid_liveness(e.get('pid'), e.get('process_start_time')) is False
+
+    # A dead earlier backend's entry is not an owner (self-heal agent-235b66c443: it killed every later turn).
+    held = [e for e in entries if ours(e) and not dead(e)]
     same = [e for e in held if e.get('pid') == os.getpid()
             and (e.get('metadata') or {}).get('live_session_id') == runtime_id]
     tag = f'session={lease.session_id} runtime={runtime_id} lease={str(lease.lease_id)[:8]} pid={os.getpid()}'
@@ -642,13 +654,18 @@ def _recover_missing_lease(registry, home, lease, runtime_id, entries):
     with registry._FileLock(lock_path, timeout=5):
         current = registry._read_entries(state_path, strict=True)
         back = [e for e in current if e.get('lease_id') == lease.lease_id]
-        if back or any(str(e.get('session_id') or '') in sids for e in current):
+        stale = [e for e in current if ours(e) and dead(e)]
+        if back or any(ours(e) and e not in stale for e in current):
             return back  # raced with a writer: decide on what is there now
         entry = registry._lease_entry(lease_id=lease.lease_id, session_id=lease.session_id, surface=lease.surface,
                                       metadata={'live_session_id': runtime_id},
                                       track_liveness=bool(getattr(lease, 'track_liveness', False)))
-        registry._write_entries(state_path, [*current, entry])
-    log.warning('selection_lease_missing: %s; no registry holder, re-registered the lease', tag)
+        registry._write_entries(state_path, [*(e for e in current if e not in stale), entry])
+    if stale:
+        log.warning('selection_lease_missing: %s; dead holder(s) %s replaced by this lease', tag,
+                    _lease_holders(stale, sids))
+    else:
+        log.warning('selection_lease_missing: %s; no registry holder, re-registered the lease', tag)
     return [entry]
 
 
@@ -692,7 +709,7 @@ def _resolve_owner_locked(runtime_id, *, profile_home, server, agent=None):
     if lease is not None:
         borrowed = not lease.enabled and str(lease.lease_id).startswith('borrowed:')
         if lease.released or not lease.enabled and not borrowed:
-            raise SelectionRejected('Chat ownership lease is not current')
+            raise LeaseMissing('Chat ownership lease is not current')
         lease_id = lease.lease_id.removeprefix('borrowed:') if borrowed else lease.lease_id
         matches = [e for e in entries if e.get('lease_id') == lease_id]
         if not matches and not borrowed:
@@ -705,14 +722,14 @@ def _resolve_owner_locked(runtime_id, *, profile_home, server, agent=None):
                     lease.session_id, runtime_id, exc)
                 raise LeaseMissing(LEASE_UNAVAILABLE) from None
         if len(matches) != 1:
-            raise SelectionRejected(LEASE_UNAVAILABLE)
+            raise LeaseMissing(LEASE_UNAVAILABLE)
         holder = matches[0]
         if (not borrowed and holder.get('pid') != os.getpid()
                 or holder.get('metadata', {}).get('live_session_id') != runtime_id
                 or registry._pid_liveness(holder.get('pid'), holder.get('process_start_time')) is not True):
-            raise SelectionRejected('Chat has a different runtime owner')
+            raise LeaseMissing('Chat has a different runtime owner')
     elif session.get('running') or any(e.get('session_id') == durable for e in entries):
-        raise SelectionRejected('Chat ownership cannot be proven')
+        raise LeaseMissing('Chat ownership cannot be proven')
     ids = {durable, agent_id}
     if holder is not None:
         ids.update((str(holder['session_id']), str(lease.session_id)))
@@ -1347,14 +1364,14 @@ class SelectionService:
                     'selection_not_selectable: source=%s session=%s; default route for this chat',
                     exc.source, exc.session_id)
             return None
-        except LeaseMissing:  # raised only by owner resolution, never by _consume
+        except LeaseMissing as exc:  # ownership refusals from owner resolution only, never from _consume
             from pathlib import Path
             path = Path(self.home) / 'account_usage_selection.sqlite3'
             if path.exists() and PendingStore(path).has_pending(self.home):
                 raise  # a chosen account must never be silently ignored
             import logging
             logging.getLogger(__name__).warning(
-                'selection_lease_missing: no queued selection in %s; default route for this call', self.home)
+                'selection_lease_missing: %s; no queued selection in %s; default route for this call', exc, self.home)
             return None
 
     def _consume(self, owner):

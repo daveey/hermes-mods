@@ -462,6 +462,74 @@ class Backend(unittest.TestCase):
             with self.assertRaises(self.s.SelectionRejected):
                 service.consume_for_agent(self.agent)  # a chosen account is never silently ignored
 
+    # --- self-heal agent-235b66c443: a dead backend's stale registry entry for the chat killed every turn ---
+    def _dead_pid(self):
+        import subprocess
+        proc = subprocess.Popen([sys.executable, '-c', 'pass'])
+        proc.wait()
+        return proc.pid
+
+    def _foreign_holder(self, lease, *, pid, start=None):
+        """Replace the chat's registry entry with another writer's entry for the same session."""
+        registry, path = self._registry()
+        entries = registry._read_entries(path, strict=True)
+        entries[0].update(lease_id='stale-lease', pid=pid, metadata={'live_session_id': 'runtime-old'})
+        if start is not None:
+            entries[0]['process_start_time'] = start
+        registry._write_entries(path, entries)
+        return registry, path
+
+    def test_dead_pid_holder_is_replaced_and_the_call_proceeds(self):
+        lease = self.lease()
+        registry, path = self._foreign_holder(lease, pid=self._dead_pid(), start=12345.0)
+        with self.assertLogs(self.s.__name__, 'WARNING') as logs:
+            owner = self.s.resolve_owner('runtime-A', profile_home=self.home, server=self.server)
+        self.assertEqual(owner.runtime_id, 'runtime-A')
+        out = '\n'.join(logs.output)
+        self.assertIn('selection_lease_missing', out)
+        self.assertIn('dead holder', out)
+        now = registry._read_entries(path, strict=True)
+        self.assertEqual([(e['lease_id'], e['pid']) for e in now], [(lease.lease_id, os.getpid())])
+        # The replacement is a real fence: another runtime is refused the chat.
+        _lease, refusal = try_acquire_active_session(session_id='durable-A', surface='desktop', config={},
+            registry_home=self.home, metadata={'live_session_id': 'runtime-B'})
+        self.assertIsNotNone(refusal)
+
+    def test_live_other_owner_with_no_queued_choice_takes_the_default_route(self):
+        lease = self.lease()
+        registry, path = self._foreign_holder(lease, pid=os.getpid())  # live, different runtime
+        service = self.s.SelectionService(self.home, server=self.server)
+        with self.assertLogs(self.s.__name__, 'WARNING') as logs:
+            self.assertIsNone(service.consume_for_agent(self.agent))  # default route, no exception
+        self.assertTrue(any('selection_lease_missing' in l and 'default route' in l for l in logs.output),
+                        logs.output)
+        self.assertEqual([e['lease_id'] for e in registry._read_entries(path, strict=True)], ['stale-lease'])
+
+    def test_live_other_owner_with_a_queued_choice_still_refuses(self):
+        lease = self.lease()
+        row = entry(source='manual')
+        self.credentials([row.to_dict()])
+        from agent.account_usage_cache import _identity_id_for
+        service = self.s.SelectionService(self.home, server=self.server)
+        service.put('runtime-A', provider='anthropic', account_id=_identity_id_for('anthropic', row),
+                    expected_revision=0)
+        self._foreign_holder(lease, pid=os.getpid())
+        with self.assertRaises(self.s.SelectionRejected):
+            service.consume_for_agent(self.agent)  # a chosen account is never silently ignored
+
+    def test_other_runtime_owner_with_no_queued_choice_takes_the_default_route(self):
+        """Any ownership refusal from owner resolution (here: the registry lease names another runtime) must not
+        end a turn that has no account choice queued."""
+        lease = self.lease()
+        registry, path = self._registry()
+        entries = registry._read_entries(path, strict=True)
+        entries[0]['metadata'] = {'live_session_id': 'runtime-other'}
+        registry._write_entries(path, entries)
+        service = self.s.SelectionService(self.home, server=self.server)
+        with self.assertLogs(self.s.__name__, 'WARNING') as logs:
+            self.assertIsNone(service.consume_for_agent(self.agent))
+        self.assertIn('default route', '\n'.join(logs.output))
+
     # --- self-heal agent-e744d241e7: a non-desktop/tui ('scratch') chat died on every turn ---
     def test_non_selectable_source_takes_the_default_route_on_every_request(self):
         self.lease()
