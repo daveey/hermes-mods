@@ -508,6 +508,7 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
 # Off switch: env COACH_STATUS_PLAIN=off, or config plugins.entries.coach.settings.status_plain: false.
 SYNTHETIC_USER_RE = re.compile(
     r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
+PROBE_TAG_RE = re.compile(r"^\s*\[selfheal-probe\]\s*", re.I)
 STATUS_PLAIN_HINT = (
     "[coach] status_plain: the user asked about progress (\"{ask}\"). Open with the state of their original ask in "
     "plain words: what works, what's still broken (a number), the one thing stopping it, who acts next. No card ids "
@@ -535,7 +536,8 @@ def status_plain_hint(user_ask: str, platform: str = "", parent_session_id: str 
         return None
     if platform in ("cron", "kanban", "subagent") or parent_session_id:
         return None
-    ask = user_ask[:ASK_HEAD]
+    # a `[selfheal-probe]` live test stands in for a person (self_heal._NOT_HERMES_TAGS); it is not a Hermes row
+    ask = PROBE_TAG_RE.sub("", user_ask[:ASK_HEAD], count=1)
     if automation_prompt(ask) or SYNTHETIC_USER_RE.match(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
         return None
     if not status_plain_enabled():

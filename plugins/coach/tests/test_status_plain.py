@@ -83,6 +83,8 @@ def test_status_plain_hint_on_real_asks_only():
     # orders and failed-fix reports are progress asks for status_only, but not requests for a status
     for t in ("still not working", "finish it", "deploy this", "can you just merge it"):
         assert rc.PROGRESS_ASK_RE.search(t) and rc.status_plain_hint(t) is None, t
+    # a live probe stands in for a person; it is not a Hermes-written row
+    assert rc.status_plain_hint("[selfheal-probe] how goes?")
     for platform in ("cron", "kanban", "subagent"):
         assert rc.status_plain_hint(TURN_18, platform=platform) is None
     assert rc.status_plain_hint(TURN_18, parent_session_id="p1") is None
