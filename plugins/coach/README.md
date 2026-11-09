@@ -1154,6 +1154,19 @@ matcher or skill guidance that let them through. `--dry-run` prints the JSON and
 `tests/test_create_overlap_watch.py` (only recent archived overrides count across boards; exactly 2 files nothing,
 3 files one card with a stable week key; dry-run files nothing).
 
+### Reply-check latency (`pre_verify_latency_watch.py`, no agent, no LLM)
+
+The reply check runs after the answer has streamed, so its time is time the user watches a finished-looking answer
+spin (agent-7aa110cfd7: a confirm pass held a Desktop turn 23 s). Core shows "Checking the reply before finishing…"
+while `pre_verify` hooks run and logs `pre_verify done session=<id> seconds=<n> continued=<bool>`; the coach adds
+`elapsed_s` to `report_only_scored` and `reply_checked` so a slow judge is visible. A hermes cron job on hermes-hub
+(no-agent, hourly, "pre_verify latency watch (hub)") runs `pre_verify_latency_watch.py`: it keeps a rolling 24 h window
+of those lines in `<coach>/pre_verify_latency/state.json` (agent.log rotates hourly) and, once the window spans a day
+with >= 20 turns and p90 > 20 s, files ONE card per host and day (`--idempotency-key pre-verify-latency:<host>:<date>`)
+on the coach, never an Inbox post. `--dry-run` prints the window's stats and files nothing. Tests:
+`tests/test_pre_verify_latency_watch.py` (anchored line match, one card after a slow day, fast day files nothing,
+rotation/no double count, dry-run) and `tests/test_reply_check_elapsed.py`.
+
 ### Bare ask-gate notices (`withheld_notice_watch.py`, no agent, no LLM)
 
 ask-gate used to swap a whole reply for "I withheld a request ..." (17 in 7 sessions, Oct 27-29). It now holds

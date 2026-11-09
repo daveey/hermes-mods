@@ -1771,6 +1771,16 @@ def reset_budget(token) -> None:
     _BUDGET.reset(token)
 
 
+def budget_elapsed() -> Optional[float]:
+    """Seconds since this thread's pre_verify budget started (None outside pre_verify). Logged as `elapsed_s` on
+    report_only_scored / reply_checked: that time is spent after the answer streamed (agent-7aa110cfd7)."""
+    b = _BUDGET.get()
+    try:
+        return None if b is None else round(float(b.elapsed()), 2)
+    except Exception:
+        return None
+
+
 def call_timeout(cap: float) -> float:
     """Timeout for one model call: `cap` outside pre_verify, else capped by what is left of its budget (raises
     BudgetExhausted when too little is left, which the reply check treats as no verdict)."""
@@ -2276,6 +2286,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
+                   **({"elapsed_s": budget_elapsed()} if budget_elapsed() is not None else {}),
                    **({"suppressed": "unconfirmed"} if suppressed else {})})
         except Exception:
             pass  # telemetry never changes a verdict

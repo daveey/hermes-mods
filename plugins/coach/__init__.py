@@ -927,8 +927,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                                      card_closed=rc.card_closed(log_lines), platform=platform)}
             if not hit:
                 guard = rc.report_only_guard(ask, final_response, log_lines)
+                _el = rc.budget_elapsed()
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response), "ask_len": len(ask or ""),
+                           **({"elapsed_s": _el} if _el is not None else {}),
                            **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {})})
                 return None
             tracked = hit["rule"] in rc.RULES
