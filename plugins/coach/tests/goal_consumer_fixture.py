@@ -36,24 +36,28 @@ def consumer(owner, monkeypatch, request):
              _maybe_fire_tui_heartbeat_tick=lambda *a: None,
              _notif_take_parked=lambda *a: None,
              _notif_handle_ready=lambda *a: None)
-    collector_globals = dict(g, Path=Path)
-    collector_globals['_kb_poll_board'] = types.FunctionType(
-        notifications._kb_poll_board.__code__, collector_globals,
-        argdefs=notifications._kb_poll_board.__defaults__)
-    # Core split the per-board claim loop (the formatter call site) out of _kb_poll_board into
-    # _kb_poll_board_now: rebind it too, or the real formatter runs instead of the test formatter.
-    if hasattr(notifications, '_kb_poll_board_now'):
-        collector_globals['_kb_poll_board_now'] = types.FunctionType(
-            notifications._kb_poll_board_now.__code__, collector_globals,
-            argdefs=notifications._kb_poll_board_now.__defaults__)
-    collector_globals['_kb_board_key'] = types.FunctionType(
-        notifications._kb_board_key.__code__, collector_globals)
+    from contextlib import closing
+    from hermes_state import SessionDB
+    from tui_gateway.method_ctx import rebind
+
+    def session_db(current):
+        # The delegate-subscription lookup must use the owner's isolated store,
+        # never server globals or a live profile's database.
+        assert current['profile_home'] == str(owner[0].parent)
+        return closing(SessionDB(owner[0].parent / 'state.db'))
+
+    collector_globals = dict(g, Path=Path, _session_db=session_db)
+    # Bind the whole helper graph, not a hand-maintained list that drifts when
+    # core extracts/adds helpers. Use core's binder to preserve kw-only defaults
+    # and closures as well as positional defaults.
+    for name, fn in notifications.__dict__.items():
+        if isinstance(fn, types.FunctionType) and fn.__module__ == notifications.__name__:
+            collector_globals[name] = rebind(fn, collector_globals)
     # Formatter is pure but its helper globals are rebound by the server too.
     collector_globals['_format_kanban_event_text'] = lambda sub, task, ev, slug: (
         f"{sub['chat_id']}:{task.id}:{ev.kind}" if ev.kind == 'completed' else None)
     collector_globals['_KANBAN_NOTIFY_KINDS'] = ('completed',)
-    collect = types.FunctionType(notifications._collect_kanban_notifications.__code__, collector_globals,
-                                 argdefs=notifications._collect_kanban_notifications.__defaults__)
+    collect = collector_globals['_collect_kanban_notifications']
     def poll(sid, session):
         notices.extend(collect(session))
         ready.set()
