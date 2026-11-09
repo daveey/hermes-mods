@@ -4136,8 +4136,20 @@ def check_stuck(store=None, now: Optional[float] = None, budget_fn=None, runner=
     now = now or time.time()
     stuck = stuck_proposals(store, now, budget_fn, auto=auto)
     path = Path(store.root) / "selfheal_stuck.json"
+    seen_p = Path(store.root) / "selfheal_stuck_seen.json"
     if not stuck:
+        seen_p.unlink(missing_ok=True)
         return {"action": "ok"}
+    # Open capacity at one instant is not a dead lane: a slot can free minutes before the next lane pass fills it
+    # (t_01a1c00ca6bc0945 was filed that way, and that pass then approved 3 fixes). Alarm only when capacity was
+    # open at an earlier sweep too and the lane approved nothing since.
+    try:
+        first = float(json.loads(seen_p.read_text()).get("at") or 0)
+    except Exception:
+        first = 0.0
+    if not first or first >= now or _recent_events(store.root, "selfheal_approved", first):
+        seen_p.write_text(json.dumps({"at": now}))
+        return {"action": "watch", "n": len(stuck), "since": now}
     open_card = _open_card(path, runner)
     rec = {"event": "selfheal_stuck", "n": len(stuck), "oldest": stuck[0][0], "oldest_h": round(stuck[0][1] / 3600, 1),
            "card": open_card}

@@ -230,6 +230,9 @@ def test_stuck_proposal_files_one_lane_card_per_incident(store):
     stuck(store)
     stuck(store, "plugin-8a7e4507f0", age=5 * 3600)
     b = Board()
+    # first open-capacity sighting only starts the watch: a lane pass may not have run since the slot freed
+    first = sh.check_stuck(store, now=NOW - 1800, budget_fn=OPEN, runner=b, auto=True)
+    assert first["action"] == "watch" and not b.creates()
     r = sh.check_stuck(store, now=NOW, budget_fn=OPEN, runner=b, auto=True, lane_status="353210256a77 error")
     assert r["action"] == "filed" and r["n"] == 2 and r["oldest"] == "plugin-8a7e4507f0"
     (argv,) = b.creates()
@@ -241,6 +244,17 @@ def test_stuck_proposal_files_one_lane_card_per_incident(store):
     b.status = "done"
     sh.check_stuck(store, now=NOW + 86400, budget_fn=OPEN, runner=b, auto=True)
     assert len(b.creates()) == 2
+
+
+def test_no_stuck_card_when_the_lane_approved_a_fix_since_the_first_sighting(store):
+    """2026-11-09 11:23 (t_01a1c00ca6bc0945): the sweep saw a slot that had freed minutes before the next lane pass,
+    which then approved fixes. Capacity open at one instant is not a dead lane; open across a pass with no approval is."""
+    stuck(store)
+    b = Board()
+    assert sh.check_stuck(store, now=NOW - 1800, budget_fn=OPEN, runner=b, auto=True)["action"] == "watch"
+    store.log({"event": "selfheal_approved", "fingerprint": "agent-0000000000", "card": "t_x", "ts": NOW - 900})
+    r = sh.check_stuck(store, now=NOW, budget_fn=OPEN, runner=b, auto=True)
+    assert r["action"] == "watch" and not b.creates()
 
 
 @pytest.mark.parametrize("case", ["young", "budget_closed", "manual", "has_fix_card"])
