@@ -40,6 +40,7 @@ import os
 import shutil
 import importlib.util
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -524,7 +525,8 @@ def _item_lines(it):
     return lines
 
 
-def review_card(items, now):
+def review_card(items, now, gateway=None):
+    """``gateway`` (this host's hermes-hub name) goes in the title: each host reviews its own action store."""
     script = '~/.hermes/plugins/user-steps/stale_watch.py'
     listing = '\n'.join(line for it in items for line in _item_lines(it)) or '- (none)'
     body = (f"User-steps requests still undecided more than 72 h after they were asked, not reviewed in the last "
@@ -543,9 +545,45 @@ def review_card(items, now):
             f"Never decide a request for the user. Withdrawal is refused for recorded decisions and card-bound "
             f"requests. A chat that is on another gateway, unknown or unreadable is not evidence: keep those.\n"
             f"Source: plugins/user-steps/stale_watch.py (old-ask review).")
-    return {'title': f'user-steps: review {len(items)} undecided request(s) older than 72 h', 'body': body,
+    where = f' ({gateway})' if gateway else ''
+    return {'title': f'user-steps{where}: review {len(items)} undecided request(s) older than 72 h', 'body': body,
             'idempotency_key': REVIEW_KEY + _pt(now, '%Y-%m-%d'), 'assignee': 'default',
-            'placement': 'local', 'requires': list(REVIEW_REQUIRES)}
+            'placement': 'local', 'requires': list(REVIEW_REQUIRES), 'gateway': gateway}
+
+
+# Any host's review card, with or without the gateway in its title (older hosts omit it).
+_REVIEW_TITLE = re.compile(r'^user-steps(?: \([^()]+\))?: review \d+ undecided request\(s\) older than 72 h$')
+_HUB_ALIASES = frozenset({'hub', 'hermes-hub'})
+
+
+def _self_gateway():
+    """This host's hermes-hub gateway name (what create_overlap matches carry), or None."""
+    try:
+        from hermes_cli import kanban_capability_registry as reg
+        return reg.self_gateway()
+    except Exception:  # health: allow BLE001 -- no name only drops it from the title and disables the retry
+        return None
+
+
+def _same_gateway(a, b):
+    return bool(a and b) and (a == b or {a, b} <= _HUB_ALIASES)
+
+
+def _other_gateway_reviews(res, self_gw):
+    """The matches of a create_overlap refusal when EVERY one is another gateway's old-ask review card, else None.
+
+    Each host reviews its own action store, so another host's review card is separate work (cron-d7cb391a4c).
+    A match on this gateway, an unrelated card, a truncated match list or an unknown own name stays a refusal."""
+    matches = res.get('matches')
+    if res.get('code') != 'create_overlap' or not self_gw or not isinstance(matches, list) or not matches:
+        return None
+    if res.get('total_matches', len(matches)) != len(matches):
+        return None
+    for m in matches:
+        if (not isinstance(m, dict) or not m.get('id') or not _REVIEW_TITLE.match(m.get('title') or '')
+                or not m.get('gateway') or m['gateway'] == 'local' or _same_gateway(m['gateway'], self_gw)):
+            return None
+    return matches
 
 
 def review_old_asks(core, store, now=None, create=None, *, local_gateway=None, owner_db=None, boards=None):
@@ -561,7 +599,7 @@ def review_old_asks(core, store, now=None, create=None, *, local_gateway=None, o
     for it in items:
         it['chat'] = chat_facts(core, it['owner'], local_gateway=local_gateway, owner_db=owner_db)
         it['cards'], it['problems'] = linked_cards(core, it['request'], it['owner'], boards)
-    create(review_card(items, now))  # idempotent on the daily key
+    create(review_card(items, now, gateway=_self_gateway()))  # idempotent on the daily key
     return [it['requestId'] for it in items]
 
 
@@ -576,11 +614,24 @@ def create_review_card(c, registry=None):
     if entry is None or missing:
         raise RuntimeError(f'kanban_create tool unavailable or lacks {missing}: refusing to create the review card')
     args = {k: c[k] for k in ('title', 'body', 'assignee', 'idempotency_key', 'placement', 'requires')}
-    out = entry.handler(args)
-    try:
-        res = json.loads(out) if isinstance(out, str) else out
-    except ValueError:
-        raise RuntimeError(f'kanban_create returned non-JSON: {str(out)[:300]}')
+
+    def call(a):
+        out = entry.handler(a)
+        try:
+            return out, (json.loads(out) if isinstance(out, str) else out)
+        except ValueError:
+            raise RuntimeError(f'kanban_create returned non-JSON: {str(out)[:300]}')
+
+    out, res = call(args)
+    if isinstance(res, dict) and not res.get('task_id') and res.get('code') == 'create_overlap':
+        self_gw = c.get('gateway') or _self_gateway()
+        others = _other_gateway_reviews(res, self_gw)
+        if others and {'distinct_from', 'distinct_reason'} <= set(props):
+            # One retry: another host's review card covers ITS action store, never this one's.
+            reason = ('per-host action store; '
+                      + '; '.join(f"{m['id']} reviews {m['gateway']}'s requests" for m in others)
+                      + f"; this card reviews {self_gw}'s")
+            out, res = call({**args, 'distinct_from': [m['id'] for m in others], 'distinct_reason': reason})
     if not isinstance(res, dict) or res.get('error') or not res.get('task_id'):
         raise RuntimeError(f'kanban_create failed: {str(out)[:500]}')
     return res['task_id']

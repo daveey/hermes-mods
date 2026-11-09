@@ -402,6 +402,99 @@ def test_create_review_card_raises_on_tool_error():
         sw.create_review_card(sw.review_card([], NOW), registry=reg)
 
 
+# ---- another host's review card is separate work: per-host action stores (cron-d7cb391a4c) -------------
+
+class SeqRegistry(FakeRegistry):
+    """Returns ``results`` in order, one per handler call."""
+    def __init__(self, props, results):
+        super().__init__(props)
+        self.results = list(results)
+        outer = self
+
+        class Entry:
+            @staticmethod
+            def handler(args, **kw):
+                outer.calls.append(args)
+                return outer.results.pop(0)
+        self.entry = Entry
+
+
+OVERLAP_PROPS = {**PROPS, 'distinct_from': {}, 'distinct_reason': {}}
+CREATED = '{"ok": true, "task_id": "t_0000beef"}'
+
+
+def overlap(*matches):
+    return json.dumps({'ok': False, 'created': False, 'code': 'create_overlap', 'total_matches': len(matches),
+                       'matches': [dict(id=i, board='default', gateway=g, status='ready', title=t, chats=[],
+                                        why='titles share 8 words') for i, g, t in matches]})
+
+
+MAC_REVIEW = ('t_01a1bb3f5dafa11e', 'macbook', 'user-steps: review 1 undecided request(s) older than 72 h')
+
+
+def test_review_card_title_names_the_gateway():
+    c = sw.review_card([], NOW, gateway='hub')
+    assert c['title'] == 'user-steps (hub): review 0 undecided request(s) older than 72 h'
+    assert sw._REVIEW_TITLE.match(c['title']) and sw._REVIEW_TITLE.match(MAC_REVIEW[2])
+
+
+def test_overlap_with_only_another_gateways_review_card_retries_distinct():
+    reg = SeqRegistry(OVERLAP_PROPS, [overlap(MAC_REVIEW), CREATED])
+    c = sw.review_card([], NOW, gateway='hub')
+    assert sw.create_review_card(c, registry=reg) == 't_0000beef'
+    first, retry = reg.calls
+    assert 'distinct_from' not in first
+    assert retry['distinct_from'] == ['t_01a1bb3f5dafa11e']
+    assert 'per-host action store' in retry['distinct_reason'] and "macbook's requests" in retry['distinct_reason']
+    assert {k: v for k, v in retry.items() if not k.startswith('distinct_')} == first
+
+
+def test_overlap_retry_happens_once():
+    reg = SeqRegistry(OVERLAP_PROPS, [overlap(MAC_REVIEW), overlap(MAC_REVIEW)])
+    with pytest.raises(RuntimeError, match='create_overlap'):
+        sw.create_review_card(sw.review_card([], NOW, gateway='hub'), registry=reg)
+    assert len(reg.calls) == 2
+
+
+@pytest.mark.parametrize('matches', [
+    [('t_0000aaaa', 'macbook', 'Fix the user-steps review of undecided requests older than 72 h')],  # unrelated
+    [('t_0000aaaa', 'hub', 'user-steps (hub): review 2 undecided request(s) older than 72 h')],  # same gateway
+    [('t_0000aaaa', 'hermes-hub', 'user-steps: review 2 undecided request(s) older than 72 h')],  # hub alias
+    [('t_0000aaaa', 'local', 'user-steps: review 2 undecided request(s) older than 72 h')],  # local board row
+    [MAC_REVIEW, ('t_0000aaaa', 'mini', 'Review undecided user-steps requests older than 72 h')],  # one unrelated
+], ids=['unrelated', 'same-gateway', 'hub-alias', 'local', 'mixed'])
+def test_overlap_naming_unrelated_or_same_gateway_card_raises(matches):
+    reg = SeqRegistry(OVERLAP_PROPS, [overlap(*matches), CREATED])
+    with pytest.raises(RuntimeError, match='create_overlap'):
+        sw.create_review_card(sw.review_card([], NOW, gateway='hub'), registry=reg)
+    assert len(reg.calls) == 1
+
+
+def test_overlap_retry_needs_own_gateway_name_and_full_match_list(monkeypatch):
+    monkeypatch.setattr(sw, '_self_gateway', lambda: None)
+    reg = SeqRegistry(OVERLAP_PROPS, [overlap(MAC_REVIEW), CREATED])
+    with pytest.raises(RuntimeError):
+        sw.create_review_card(sw.review_card([], NOW), registry=reg)  # unknown own name: no retry
+    truncated = json.loads(overlap(MAC_REVIEW))
+    truncated['total_matches'] = 7  # only the first matches are shown; the rest are unknown
+    reg = SeqRegistry(OVERLAP_PROPS, [json.dumps(truncated), CREATED])
+    with pytest.raises(RuntimeError):
+        sw.create_review_card(sw.review_card([], NOW, gateway='hub'), registry=reg)
+    reg = SeqRegistry(PROPS, [overlap(MAC_REVIEW), CREATED])  # tool lacks distinct_from: no retry
+    with pytest.raises(RuntimeError):
+        sw.create_review_card(sw.review_card([], NOW, gateway='hub'), registry=reg)
+    assert len(reg.calls) == 1
+
+
+def test_review_old_asks_titles_card_with_self_gateway(env, monkeypatch):
+    monkeypatch.setattr(sw, '_self_gateway', lambda: 'hub')
+    make(env['store'], 80)
+    made = []
+    sw.review_old_asks(core, env['store'], now=NOW, create=made.append, local_gateway=GW,
+                       owner_db=lambda o: None, boards=[])
+    assert made and made[0]['title'].startswith('user-steps (hub): review 1 ')
+
+
 def test_real_kanban_create_schema_declares_placement_and_requires():
     pytest.importorskip('tools.kanban_tools')
     from tools.registry import registry
