@@ -165,6 +165,15 @@ def test_board_line_and_kanban_show_summary_carry_the_probe(tmp_path, monkeypatc
     assert line and "status=scheduled" in line and "probe=live(" in line, line
 
 
+def test_plain_kanban_show_text_carries_the_probe(tmp_path, monkeypatch):
+    """`hermes kanban show <id>` (plain text, `status: scheduled` row) gets the probe too (live check on the hub)."""
+    monkeypatch.setenv("COACH_BOARD_DBS", _board(tmp_path))
+    text = f"Task {OWNER}: Desktop primary recovery live proof\n  status:    scheduled\n  assignee:  default\n"
+    line = rules.owner_result_line("terminal", {"command": f"hermes kanban show {OWNER}"}, _res(text), now=T)
+    assert line and f"task={OWNER} status=scheduled probe=live(" in line, line
+    assert len(line) <= rules.OK_LINE_MAX, line
+
+
 # ── 2. detection guard: report_only_scored.owner_probe_live ────────────────────────────────────────────────────
 def _scored(tmp_path, monkeypatch, **board):
     log = ["-> terminal(" + CMD[:120] + ")", _owner_line(monkeypatch, _board(tmp_path, **board))]

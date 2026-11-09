@@ -1897,6 +1897,11 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
                 body = _with_board_facts(_raw_owner_body(text, cards, now), cards, now)
             else:
                 body = (f"status={m.group(1)} " if m else "") + " ".join(text.split())[:160]
+                if m and m.group(1) == "scheduled":  # `hermes kanban show <id>` text: is its probe still running?
+                    cards = list(dict.fromkeys(_CARD_ID_RE.findall(_shell_text(name, a) + " " + text[:400])))
+                    pr = _card_probe_text(cards[0], now) if cards else ""
+                    if pr:
+                        body = f"task={cards[0]} status=scheduled {pr} " + " ".join(text.split())[:100]
     except Exception:
         return None
     return f"   <- OK {body}"[:OK_LINE_MAX]
