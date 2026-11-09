@@ -1997,6 +1997,22 @@ def _monitor_withdrawn(d: dict, store=None) -> Optional[str]:
     return None
 
 
+def _sqlite_incident_over(d: dict, store, now: float) -> Optional[str]:
+    """Expire a quiet incident, not a later-hour recurrence on the same source DB."""
+    inc = d.get("incident")
+    at = _detected_at(d)
+    if (not isinstance(inc, dict) or not inc.get("db") or not inc.get("host")
+            or not isinstance(inc.get("hour"), int) or at is None or now - at <= 86400):
+        return None
+    for fp, state in LaneState(store.root).read().items():
+        later = state.get("incident") if isinstance(state, dict) else None
+        if (fp.startswith("sqlitecorrupt-") and isinstance(later, dict)
+                and later.get("db") == inc["db"] and later.get("host") == inc["host"]
+                and isinstance(later.get("hour"), int) and later["hour"] > inc["hour"]):
+            return None
+    return f"sqlite incident over (no occurrence since {_iso(at)})"
+
+
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     """Recheck due investigations through normal admission, never automatically release a card.
 
@@ -2022,7 +2038,8 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                            "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
                 out.append({"action": "skip", "why": "stale pending"})
                 continue
-            closed = kanban_trigger_closed(d, now=now) or _monitor_withdrawn(d, store)
+            closed = (_sqlite_incident_over(d, store, now)
+                      or kanban_trigger_closed(d, now=now) or _monitor_withdrawn(d, store))
             if closed:  # the owner closed the card, or the monitor withdrew its verdict, while this waited
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
@@ -3109,6 +3126,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         if disk_owner:
             return disk_owner
     lane = LaneState(store.root)
+    if d.get("incident") and m == "live" and hub:
+        # Retain recurrence identity even when admission is capped; fingerprints alone are hashes.
+        lane.update(fp, incident=d["incident"])
     st = lane.get(fp)
     if st.get("status") == "adopted" and m == "live" and hub:
         owner = _adopt_complaint_lane(d, fp, store, now)

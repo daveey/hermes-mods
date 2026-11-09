@@ -538,6 +538,40 @@ def _queue(store, *ds):
         sh.file_defect(d, store=store, m="live", runner=Runner(), now=NOW, cfg=HUB, budget_fn=busy)
 
 
+@pytest.mark.parametrize("age_hours,later,expected", [
+    (30, None, "skip"), (30, "same", "filed"), (2, None, "filed"),
+    (24, None, "filed"), (30, "other_db", "skip"), (30, "other_host", "skip"),
+    (30, "same_hour", "skip"),
+])
+def test_pending_sqlite_incident_freshness(store, age_hours, later, expected):
+    at = NOW + 3601 - age_hours * 3600
+    d = defect(symptom="database disk image is malformed", source="signal",
+               db_path="~/.hermes/state.db", at=at)
+    _queue(store, d)
+    if later:
+        newer = {**d, "at": at + (0 if later == "same_hour" else 3600)}
+        if later == "other_db":
+            newer["db_path"] = "~/.hermes/other.db"
+        if later == "other_host":
+            newer["host"] = "other-host"
+        # Real detection, not a hand-seeded lane entry: even cap-deferred recurrences count.
+        _queue(store, newer)
+    got = []
+    out = sh.retry_deferred(store, now=NOW + 3601,
+                            filer=lambda d, **kw: got.append(d) or {"action": "filed"})
+    original = [r for r in got if r["at"] == at and r["host"] == d["host"]
+                and r["db_path"] == d["db_path"]]
+    if expected == "skip":
+        assert not original
+        assert any(e["why"] == f"sqlite incident over (no occurrence since {sh._iso(at)})"
+                   for e in ev(store, "selfheal_skip"))
+    else:
+        assert len(original) == 1
+    assert any(r["action"] == expected for r in out)
+    assert sh.retry_deferred(store, now=NOW + 7200,
+                             filer=lambda *a, **kw: pytest.fail("resurrected")) == []
+
+
 def test_pending_drains_complaints_then_signals_then_backstop_likelier_first(store):
     sig = defect(symptom="traceback a", source="signal", p_defect=None, at=NOW - 30)
     weak = defect(symptom="weak complaint", source="backstop", p_defect=0.7, at=NOW - 20)
