@@ -234,10 +234,16 @@ def register_markers(since: float, env, extra_dirs: list[str] | None = None, tex
         if text is not None and not _ours(path, text, tool, env, bases):
             _log(f"SKIP {path}: born during a 'worktree add' call but not named by it")
             continue
-        rec = dict(owner, path=path, registered_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), host=os.uname().nodename.split(".")[0])
+        card = _workspace_card(path, owner) if path else None
+        who = dict(card, made_by=owner) if card else owner
+        rec = dict(who, path=path, registered_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), host=os.uname().nodename.split(".")[0])
         try:
             Path(gd, MARKER).write_text(json.dumps(rec, indent=1))
-            _log(f"REGISTER {path} owner={owner}")
+            if card:
+                _log(f"REGISTER {path} owner={card['task_id']} (open card on {card['board_db']} whose workspace this "
+                     f"is; made by {owner})")
+            else:
+                _log(f"REGISTER {path} owner={owner}")
             out.append(rec)
         except OSError as e:
             _log(f"WARN cannot write marker in {gd}: {e}")
@@ -257,17 +263,82 @@ def _ro_connect(path, timeout=10):
         return c
 
 
+KANBAN_ROOT = H / ".hermes"  # holds kanban.db + kanban/boards/<slug>/kanban.db (core's kanban_home())
+OPEN_SQL = "status not in ('done','archived') and coalesce(workspace_path,'') != ''"
+
+
+def _ws_key(p: str) -> str:
+    """A workspace_path as the tree it names: rows may store `~` or a symlinked spelling."""
+    return os.path.realpath(os.path.expanduser(p))
+
+
+def _board_root(db: str) -> Path:
+    p = Path(db).expanduser().resolve()
+    if p.parent.parent.name == "boards" and p.parent.parent.parent.name == "kanban":
+        return p.parent.parent.parent.parent
+    return p.parent
+
+
+def board_dbs(db: str | None = None) -> list[str]:
+    """Every Kanban board on this host: *db* plus kanban.db and kanban/boards/*/kanban.db under the Kanban root
+    (and under *db*'s own root). A tree one board's card made can be another board's card workspace (mini
+    2026-11-03: a default-board supervisor re-added a bb-board card's tree), so "still in use?" reads them all."""
+    roots = [Path(KANBAN_ROOT)] + ([_board_root(db)] if db else [])
+    cands = [db] if db else []
+    for r in roots:
+        cands.append(str(r / "kanban.db"))
+        cands += sorted(glob.glob(str(r / "kanban" / "boards" / "*" / "kanban.db")))
+    seen, out = set(), []
+    for c in cands:
+        rp = os.path.realpath(c)
+        if rp not in seen and os.path.isfile(rp):
+            seen.add(rp)
+            out.append(rp)
+    return out
+
+
+def open_workspaces(db: str | None = None, skip: str | None = None) -> tuple[dict[str, list[tuple[str, str]]], list[str]]:
+    """({tree realpath: [(task_id, board_db), ...]} of open cards on every board (minus board *skip*),
+    [boards that could not be read]). An unreadable board means "maybe in use": callers keep the tree."""
+    found: dict[str, list[tuple[str, str]]] = {}
+    bad = []
+    for b in board_dbs(db):
+        if skip and b == os.path.realpath(skip):
+            continue
+        try:
+            with closing(_ro_connect(b, timeout=10)) as c:
+                rows = c.execute(f"select id, workspace_path from tasks where {OPEN_SQL}").fetchall()
+        except Exception:  # noqa: BLE001
+            bad.append(b)
+            continue
+        for task, ws in rows:
+            found.setdefault(_ws_key(ws), []).append((task, b))
+    return found, bad
+
+
 def live_workspace_paths(exclude: str | None = None) -> set[str]:
-    """Realpaths of workspace_path of open cards on the worker's board (minus *exclude*). Unreadable => {'*'}."""
-    db = os.environ.get("HERMES_KANBAN_DB") or str(H / ".hermes" / "kanban.db")
-    try:
-        c = _ro_connect(db, timeout=10)
-        rows = c.execute("select workspace_path from tasks where status not in ('done','archived') and id != ? "
-                         "and coalesce(workspace_path,'') != ''", (exclude or "",)).fetchall()
-        c.close()
-        return {os.path.realpath(r[0]) for r in rows}
-    except Exception:  # noqa: BLE001 - unknown means "maybe in use": keep everything
+    """Realpaths of workspace_path of open cards on every board (minus card *exclude*). Unreadable => {'*'}."""
+    found, bad = open_workspaces(os.environ.get("HERMES_KANBAN_DB") or str(KANBAN_ROOT / "kanban.db"))
+    if bad:
         return {"*"}
+    return {p for p, cards in found.items() if any(t != exclude for t, _ in cards)}
+
+
+def _workspace_card(path: str, owner: dict) -> dict | None:
+    """The open card (any board) whose workspace_path IS *path*, when it is not *owner*'s own card: a recovery
+    agent re-adding another card's tree makes it for that card, so that card owns it. Its latest run fences the
+    marker (any run of the card passes the teardown fence; no run => legacy, the GC's)."""
+    found, _ = open_workspaces(owner.get("board_db"))
+    for task, b in found.get(_ws_key(path), []):
+        if task == owner.get("task_id") and b == owner.get("board_db"):
+            return None
+        try:
+            with closing(_ro_connect(b, timeout=10)) as c:
+                run = c.execute("select id from task_runs where task_id=? order by id desc limit 1", (task,)).fetchone()
+        except Exception:  # noqa: BLE001
+            run = None
+        return {k: v for k, v in dict(task_id=task, board_db=b, run_id=str(run[0]) if run else None).items() if v}
+    return None
 
 
 def _disposable_untracked(path: str, entry: str) -> bool:
@@ -539,13 +610,16 @@ def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0,
                 _log(f"KEEP {path} (registered to {task_id}): open child card(s) {', '.join(kids[:5])}; "
                      "torn down when they finish")
             return []
-        live = {os.path.realpath(r[0]) for r in c.execute(
-            "select workspace_path from tasks where status not in ('done','archived') and id != ? and coalesce(workspace_path,'') != ''", (task_id,))}
+        live = {_ws_key(r[0]) for r in c.execute(
+            f"select workspace_path from tasks where {OPEN_SQL} and id != ?", (task_id,))}
+        # ...and on every OTHER board: a card there may name this card's tree as its workspace.
+        others, unreadable = open_workspaces(db, skip=db)
+        live |= set(others)
         # A tree made by ANY run of this card counts: review/retry loops finish in a later run than the one that
         # created the tree. The completing run was just verified to be the card's latest run.
         runs = {str(r[0]) for r in c.execute('select id from task_runs where task_id=?', (task_id,))}
         env = {'HERMES_KANBAN_DB': db, 'HERMES_KANBAN_RUN_ID': str(ended[0])}
-        return _teardown_locked(task_id, env, row[2] or '', live, runs)
+        return _teardown_locked(task_id, env, row[2] or '', live, runs, unreadable)
 
 
 def _markers(extra: list[str] | None = None):
@@ -655,9 +729,13 @@ def _marker_fence(rec: dict, task_id: str, env, runs: set[str] | None) -> str | 
     return None
 
 
-def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] | None = None) -> list[dict]:
+def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] | None = None,
+                     unreadable: list[str] | None = None) -> list[dict]:
     results = []
     def remove(path, why):
+        if unreadable:
+            _log(f"KEEP {path} ({why}): cannot read board {', '.join(unreadable)}; an open card there may use it")
+            return dict(path=path, action='kept: a kanban board is unreadable')
         if any(_overlap(path, other) for other in live):
             _log(f"KEEP {path} ({why}): shared with an open card")
             return dict(path=path, action='kept: shared with an open card')

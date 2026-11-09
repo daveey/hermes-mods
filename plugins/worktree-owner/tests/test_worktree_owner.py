@@ -110,6 +110,7 @@ def load():
     atexit.register(shutil.rmtree, scratch, True)
     m.LOG = scratch / "worktree-owner.log"
     m.SWEEP_STAMP = scratch / "sweep.stamp"
+    m.KANBAN_ROOT = scratch / "kanban-root"  # cross-board checks read only boards a test makes
     m.spawned_sweeps = []
     m._real_spawn_sweep = m._spawn_sweep
     m._spawn_sweep = lambda: m.spawned_sweeps.append(time.time())
