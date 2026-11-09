@@ -51,8 +51,40 @@ OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF
 # Hermes-written user-role text: "[IMPORTANT: ...", "[System note: ...", kanban completion notices.
 # Keep coordination notices out of the user-complaint lane. Their underlying failures
 # belong to the machine-signal collector, not a second complaint filed by the recipient.
+# Lowercase bracket tags are Hermes-written when the tag is a Hermes tag (agent-b3f86b6bb7: "[ask-gate ...]",
+# "[owner-wake]", "[kanban]", "[runtime]" were filed as David's complaints, one hand-listed tag at a time). The set
+# is derived from the plugin directories (this repo's plugins/ and <home>/plugins/, read at import), each name's first
+# segment too ("[kanban-honest-done]" -> kanban), plus tags written by core or by a plugin under another name.
+# tests/test_selfheal_synthetic_tags.py fails CI when a plugin writes a "[<tag>" notice this set does not cover.
+EXTRA_HERMES_TAGS = ("kanban", "runtime", "owner-wake", "coach", "chat-closeout")
+_NOT_HERMES_TAGS = ("selfheal-probe", "selfheal")  # probes must reach PROBE_RE (selfheal_skip why=probe)
+
+
+def _hermes_tags() -> frozenset:
+    dirs = [Path(__file__).resolve().parent.parent]
+    env = os.environ.get("HERMES_HOME", "").strip()
+    dirs.append((Path(env).expanduser() if env else Path.home() / ".hermes") / "plugins")
+    tags: set = set(EXTRA_HERMES_TAGS)
+    for d in dirs:
+        try:
+            names = [p.name for p in d.iterdir() if p.is_dir()]
+        except OSError:
+            continue
+        for n in names:
+            n = n.lower()
+            if re.fullmatch(r"[a-z][a-z0-9_-]{1,40}", n):
+                tags.add(n)
+                first = re.split(r"[-_]", n, maxsplit=1)[0]
+                if len(first) >= 3:
+                    tags.add(first)
+    return frozenset(tags - set(_NOT_HERMES_TAGS))
+
+
+HERMES_TAGS = _hermes_tags()
+_HERMES_TAG_RE = (r"\[(?:" + "|".join(re.escape(t) for t in sorted(HERMES_TAGS, key=lambda t: (-len(t), t)))
+                  + r")(?=[\] :_,]|\s)")
 SYNTHETIC_RE = re.compile(
-    r"^\s*(?:" + CROSS_SESSION_RE + r"|\[chat-closeout\]|"
+    r"^\s*(?:" + CROSS_SESSION_RE + r"|" + _HERMES_TAG_RE + r"|"
     r"⏸\ufe0f?\s+\[[^\]\n]+\]\s+(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
     r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum|[✔✓✗✖⚠] )")
 # `[coach]` nudges are stored as user-role turns but are the coach's own text (agent-3ba1979f34): whether the nudge
@@ -377,6 +409,15 @@ HANDOFF_RE = re.compile(
     r"please (?:run|open|tap|click|log ?in|sign ?in|approve|check|confirm|enable|install)|let me know|once you|"
     r"reply with|do you want|should i|want me to|on your (?:phone|mac|iphone|end)|your call|needs? you|"
     r"for you to|waiting on you|manual step)\b", re.I)
+
+
+def synthetic_user_row(d: dict) -> bool:
+    """A user-text finding (backstop/complaint) whose quote is Hermes-written text, not David's words. Machine-signal
+    sources (cron, kanban, ...) quote logs, so a tagged log line there is still a real defect."""
+    if (d or {}).get("source") not in ("backstop", "complaint"):
+        return False
+    q = clean_user(d.get("quote") or "")
+    return bool(q) and not PROBE_RE.match(q) and bool(SYNTHETIC_RE.match(q))
 
 
 def prefilter(user_text) -> bool:
@@ -3293,6 +3334,11 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": "probe",
                    "session_id": d.get("session_id")})
         return {"action": "skip", "why": "probe"}
+    if synthetic_user_row(d):  # queued before the classifier knew this tag: withdraw, never file (agent-b3f86b6bb7)
+        store.log({"event": "selfheal_withdrawn", "mode": m, "fingerprint": fp, "why": "synthetic_tag",
+                   "source": d.get("source"), "session_id": d.get("session_id"),
+                   "quote": str(d.get("quote") or "")[:200]})
+        return {"action": "skip", "why": "synthetic_tag"}
     hub = is_hub(cfg)
     if m == "live" and not hub:
         rc, out, err = _run(hub_ssh_argv(cfg) + [cfg["hub_ssh"],

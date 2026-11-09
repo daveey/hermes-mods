@@ -1,0 +1,135 @@
+"""Hermes-written plugin notices are never judged as David's complaints (agent-b3f86b6bb7).
+
+The backstop filed "[ask-gate superseding_work] Your reply says ..." as David's complaint because SYNTHETIC_RE only
+knew capitalised tags plus a hand-kept list ([chat-closeout], [coach]). Lowercase plugin tags ([ask-gate],
+[owner-wake], [kanban], [runtime]) leaked one at a time. The fix derives the tag set from the plugin directories,
+and the guard below fails CI when a plugin writes a new bracket-tag notice the classifier does not recognise.
+"""
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+PLUGINS = ROOT.parent
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+sh = load("coach_self_heal_synthetic_tags_test", ROOT / "self_heal.py")
+core = load("coach_core_synthetic_tags_test", ROOT / "core.py")
+
+# Real evidence strings from coach/log.jsonl selfheal_detect rows (source=backstop/complaint).
+REAL_NOTICES = [
+    "[ask-gate superseding_work] Your reply says there is no sign of a change the user named, but these open or "
+    "recently decided cards touch it",
+    "[ask-gate, private: David has NOT seen your draft.] Your draft asked David for something that fails the "
+    "pre-send check",
+    "[owner-wake] Card(s) this chat owns parked for a reason only an agent can clear; nothing else will produce "
+    "what they wait on",
+    "[kanban] Task t_01a18c02e0a94004 blocked; needs attention.\nTitle: Disk H5: mini hit 15 GB",
+    "[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its full content",
+    "[kanban-honest-done] The card you completed still has failing acceptance",
+]
+
+
+@pytest.mark.parametrize("text", REAL_NOTICES)
+def test_plugin_notice_is_not_judged(text):
+    assert sh.SYNTHETIC_RE.match(text), text
+    assert sh.prefilter(text) is False
+
+
+@pytest.mark.parametrize("text", [
+    "[screenshot] still broken",
+    "[selfheal-probe] run x three times",
+    "why is the kanban board still showing the old card? you said it was fixed",
+    "[asked] this is still broken",          # an unknown lowercase tag is still the user's words
+    "[kanbanish] nope",                       # a tag only counts when it is a whole Hermes tag
+])
+def test_user_text_still_judged(text):
+    assert not sh.SYNTHETIC_RE.match(text), text
+    assert sh.prefilter(text) is True
+
+
+def test_probe_still_reaches_probe_path():
+    assert sh.PROBE_RE.match("[selfheal-probe] run x")
+    assert "selfheal-probe" not in sh.HERMES_TAGS
+
+
+def test_queued_backstop_row_with_plugin_quote_is_withdrawn(tmp_path):
+    """Rows queued before the classifier knew a tag are withdrawn when the lane next handles them."""
+    store = core.Store(tmp_path / "coach")
+    d = {"fingerprint": "agent-b3f86b6bb7", "component": "agent", "symptom": "omitted relevant ongoing work",
+         "source": "backstop", "session_id": "s1", "quote": REAL_NOTICES[0], "host": "h", "at": 1.0,
+         "p_defect": 0.8}
+    res = sh.file_defect(d, store=store, m="live", cfg={})
+    assert res == {"action": "skip", "why": "synthetic_tag"}
+    rows = [json.loads(ln) for ln in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert any(r.get("event") == "selfheal_withdrawn" and r.get("why") == "synthetic_tag"
+               and r.get("fingerprint") == "agent-b3f86b6bb7" for r in rows)
+
+
+def test_machine_signal_quote_is_not_withdrawn():
+    """Only user-text sources are withdrawn: a cron/kanban signal quoting a tagged log line is still a defect."""
+    assert sh.synthetic_user_row({"source": "cron", "quote": "[kanban] dispatcher crashed"}) is False
+    assert sh.synthetic_user_row({"source": "backstop", "quote": "[kanban] Task t_1 blocked"}) is True
+    assert sh.synthetic_user_row({"source": "complaint", "quote": "[owner-wake] Card(s) ..."}) is True
+    assert sh.synthetic_user_row({"source": "backstop", "quote": "it is still broken"}) is False
+
+
+# ── Detection guard: every plugin's bracket-tag notice prefix counts as Hermes-written ──
+# A literal that starts a user-role string with "[<lowercase-tag>" followed by "]", space, ":" or ",".
+# Raw strings are regexes here, and a tag needs a 2+ char first segment, so char classes ("[a-z0-9]") never count.
+NOTICE_LIT = re.compile(r"""(?<![\w\\])[fF]?["']\[([a-z][a-z0-9]+(?:-[a-z0-9]{2,})*)(?=[\] :,])""")
+# Bracket literals in plugin source that are not user-role notices (log prefixes, placeholders, markers).
+NOT_NOTICES = {
+    "pid": "coach/signals.py: crash-log line prefix, never a user turn",
+    "older": "coach/reply_check.py: '[older tool calls omitted]' placeholder inside a tool log",
+    "redacted": "tailnet/runner.py: redaction placeholder in command output",
+    "hermes": "coach/backend_timeouts.py: parses a '[hermes] ' log prefix",
+    "unparseable-query-dropped": "loop-watch/reqtrace.py: placeholder in a request trace",
+    "selfheal-probe": "PROBE_RE: probes must reach the probe path (selfheal_skip why=probe), not be dropped",
+    "message": "coach/signals.py: lowercased match key for the cross-session relay header (CROSS_SESSION_RE)",
+    "on": "quiet-mode/__init__.py: slash-command args_hint \"[on [2h]|off|status]\"",
+    "image": "placeholder for an attached image in rendered transcripts",
+    "screenshot": "clean_user: stands in for David's own screenshot, must still be judged",
+}
+
+
+def _plugin_sources():
+    for p in sorted(PLUGINS.rglob("*")):
+        if p.suffix not in (".py", ".js", ".mjs") or not p.is_file():
+            continue
+        rel = p.relative_to(PLUGINS).parts
+        if any(part in ("tests", "node_modules", "__pycache__") or part.startswith("test") for part in rel):
+            continue
+        if p.name.startswith("test") or p.name.startswith("tests_"):
+            continue
+        yield p
+
+
+def test_every_plugin_notice_tag_is_synthetic():
+    found = {}
+    for p in _plugin_sources():
+        for m in NOTICE_LIT.finditer(p.read_text(errors="replace")):
+            found.setdefault(m.group(1), str(p.relative_to(PLUGINS)))
+    assert {"ask-gate", "owner-wake", "chat-closeout", "coach"} <= set(found), found
+    leaked = {tag: src for tag, src in found.items()
+              if tag not in NOT_NOTICES and not sh.SYNTHETIC_RE.match(f"[{tag}] notice text")}
+    assert not leaked, ("plugin notice tags the self-heal backstop would judge as David's words; name the plugin "
+                        f"dir after the tag, add it to self_heal.EXTRA_HERMES_TAGS, or list it in NOT_NOTICES: {leaked}")
+
+
+def test_core_notice_tags_are_synthetic():
+    """Hermes core (not in this repo) writes [kanban] notifier notices and [runtime] pre-final-gate notices."""
+    for tag in ("kanban", "runtime", "owner-wake", "coach", "chat-closeout"):
+        assert sh.SYNTHETIC_RE.match(f"[{tag}] notice"), tag
