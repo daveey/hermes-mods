@@ -27,6 +27,7 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               reason class; `cause: unrecorded` = an exit path with no cause note); a `gateway.exit_signal`
               (unplanned SIGTERM bounce) or `gateway.start_refused` (second start refused next to a live
               gateway) only as a storm: 3+ in 10 min per profile; a refusal by a dead owner pid always;
+              `gateway.launchd_budget_missing` (a launchd gateway that lost its job label) always, per reason;
 - coach       coach `fixloop_card` (2nd confirmed failure of a fix) and reply_check `reply_nudge` events (any
               rule) whose `reply_nudge_outcome` says the revised reply still fails (or none came within 15 min);
               a failed revision that is in no assistant row of its session (a detached fork's text the user never
@@ -73,7 +74,10 @@ MAX_READ = 4 * 1024 * 1024        # never read more than this from one log per p
 MAX_PER_KIND = 25                 # cap per collector per pass: a log storm files a handful, not hundreds
 FAIL_OUTCOMES = ("crashed", "timed_out", "spawn_failed")
 GATEWAY_TAGS = ("gateway.previous_unclean_exit", "asyncio.run.exception", "gateway.exit_nonzero", "gateway.exit_signal",
-                "gateway.start_refused")
+                "gateway.start_refused", "gateway.launchd_budget_missing")
+# gateway.launchd_budget_missing = a darwin --external-supervisor gateway booted without reading launchd's live
+# ExitTimeOut (no job label reached it, or launchctl print failed) and assumed the 60 s clamp. That label loss let
+# the MacBook drain past launchd's SIGKILL for weeks unseen (gateway-cc28b19bca): a defect at once, per reason.
 # gateway.exit_signal = an unplanned stop signal (bootout, kickstart -k, systemctl stop): exit 1 on purpose
 # so the supervisor revives it. gateway.start_refused = a second start refused because another gateway owns
 # the home/host (already_running / pid_claim / host_refused). One of either is a bounce, not a defect; only a
@@ -1281,6 +1285,15 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                             "comment_open_card": True})
                 if (sig := _wedged_owner(cur, prof, r, at, host)) is not None:
                     out.append(sig)
+                continue
+            if tag == "gateway.launchd_budget_missing":
+                reason = str(r.get("reason") or "unknown")
+                out.append({"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
+                            "symptom": f"gateway ({prof}) on {host} cannot read its launchd stop budget ({reason}, "
+                                       f"label {r.get('label') or 'unset'}): assumed "
+                                       f"{r.get('assumed_exit_timeout_s')}s",
+                            "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
+                            "fp": fp("gateway", host, prof, tag, reason)})
                 continue
             if tag in ("gateway.exit_signal", "gateway.start_refused"):
                 if (sig := _signal_storm(cur, prof, r, at, host)) is not None:
