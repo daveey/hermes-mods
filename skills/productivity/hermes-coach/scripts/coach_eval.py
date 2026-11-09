@@ -1480,7 +1480,15 @@ def main(argv=None):
     v.add_argument("--target", required=True)
     v.add_argument("--out")
     v.add_argument("--json", action="store_true")
+    for parser in (d, h, v):
+        parser.add_argument("--no-publish", action="store_true", help="leave reports and accounting local")
     a = ap.parse_args(argv)
+    from coach_publish import publish_run
+    with publish_run(data_dir(), a.out, enabled=a.cmd != "bench-build" and not a.no_publish):
+        return _execute(a)
+
+
+def _execute(a):
     if a.cmd == "detector":
         r = run_detector(a.set, a.rule, a.baseline, a.candidate, a.sets)
         md = detector_markdown(r)

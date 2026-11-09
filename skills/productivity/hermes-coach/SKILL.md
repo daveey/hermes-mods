@@ -61,6 +61,15 @@ summaries, which are counted as `synthetic_*` signals), base64 image parts, and 
 tokens, JWTs, private keys, `token=…` values with digits, long opaque blobs). Home paths become `~/`.
 Never included: tool output, system prompts, reasoning.
 
+## Eval publication
+
+`coach_eval.py` report commands and `coach_model_bench.py run` automatically commit changed
+`research/state/spend.jsonl` and in-repo `--out` reports (Markdown, JSON, and bench replay cache)
+to the `COACH_DATA` checkout, then push with union-JSONL/rebase retries. Use `--no-publish`
+to leave them local. Publication errors go to stderr without changing the evaluation exit code;
+check that diagnostic as well as the verdict. Files outside the checkout are never published.
+Tests use local bare Git remotes and offline model stubs (`scripts/test_coach_publish.py`).
+
 ## Setup on a host
 
 ```bash

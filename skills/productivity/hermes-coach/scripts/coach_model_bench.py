@@ -731,13 +731,23 @@ def main(argv=None):
     r.add_argument("--cut", choices=("final", "start"), default="final",
                    help="final: next request after the original investigation; start: the whole turn from David's message")
     r.add_argument("--sim-model", help="cut start: the tool-output simulator (default gpt-6-astra on openai-codex)")
+    r.add_argument("--no-publish", action="store_true", help="leave reports and accounting local")
     a = ap.parse_args(argv)
+    from coach_publish import publish_run
+    with publish_run(ce.data_dir(), a.out, enabled=a.cmd == "run" and not a.no_publish, replies=True):
+        return _execute(a)
+
+
+def _execute(a):
     if a.cmd == "build":
         if Path(a.out).exists():
             raise SystemExit(f"{a.out} exists: the benchmark is frozen")
         print(json.dumps(build(a.eval_set, a.state_db, a.control, a.tools, a.out, per_family=a.per_family,
                                agents_md=Path(a.agents_md).read_text() if a.agents_md else None)))
         return 0
+    if a.out:
+        # The replay cache is appended during run(), before the final report.
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     res = run(a.bench, a.model, a.repeats, a.budget, a.jobs, limit=a.limit,
               log=lambda s: print(s, file=sys.stderr, flush=True),
               replies_path=Path(a.out).with_suffix(".replies.jsonl") if a.out else None, max_steps=a.max_steps,
