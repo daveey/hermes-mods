@@ -2291,3 +2291,80 @@ def test_coach_server_error_types_cover_core_verdicts():
     assert codes, "core maps no provider code to server_error: the guard lost its producer"
     for code in codes:
         assert sg.PROVIDER_5XX_TYPE_RE.search(f"{{'type': '{code}'}}"), code
+
+
+# ── provider 5xx known by its SDK exception TYPE, whatever the body (agent-ee16fb8bb9, 3rd occurrence) ─────────
+# The Anthropic/OpenAI SDKs raise `InternalServerError` only for HTTP status >= 500 (anthropic/_client.py
+# `_make_status_error`, openai/_client.py likewise), and core retries it. Matching the body text to infer "5xx" let
+# every new proxy body shape (HTML page, in-stream type, now Envoy's plain-text reset) file again.
+
+ENVOY = "upstream connect error or disconnect/reset before headers. reset reason: connection termination"
+
+
+def _envoy_reset_record():
+    """The MacBook's 2026-11-02 18:43 PST record (hub spool.jsonl, agent-ee16fb8bb9; paths anonymised): Envoy in
+    front of the provider reset the connection before headers; core retried and the card finished."""
+    return (FIX / "errors-envoy-reset.txt").read_text().splitlines()
+
+
+def test_provider_internal_server_error_with_envoy_body_is_transient():
+    lines = _envoy_reset_record()
+    assert lines[-1] == f"anthropic.InternalServerError: {ENVOY}"
+    assert sg.parse_errors(lines) == []
+
+
+@pytest.mark.parametrize("exc_line", [
+    "anthropic.InternalServerError: brand new text",
+    "openai.InternalServerError: brand new text",
+    "anthropic._exceptions.InternalServerError: brand new text",
+    "anthropic.ServiceUnavailableError: brand new text",
+    "anthropic.DeadlineExceededError: brand new text",
+    "anthropic.OverloadedError: brand new text",
+])
+def test_sdk_internal_server_error_with_unknown_body_is_transient(exc_line):
+    assert sg.parse_errors(_stream_fail(exc_line)) == []
+
+
+@pytest.mark.parametrize("exc_line", [
+    "InternalServerError: brand new text",                 # our own (or an unknown module's) class
+    f"anthropic.BadRequestError: {ENVOY}",                 # a provider 4xx stays a defect whatever its text
+    "mylib.InternalServerError: brand new text",
+    "openai.ServiceUnavailableError: brand new text",     # not an openai class: no type-only skip
+])
+def test_non_sdk_or_client_error_still_files(exc_line):
+    assert len(sg.parse_errors(_stream_fail(exc_line))) == 1
+
+
+def test_worker_crash_with_sdk_internal_server_error_is_transient():
+    head = ["managed worker failed", "Traceback (most recent call last):",
+            '  File "/home/you/.hermes/hermes-agent/agent/managed_worker.py", line 464, in main',
+            "    execute(frame, channel)"]
+    assert sg.parse_worker_crashes([f"[pid 41] {l}" for l in head + [f"anthropic.InternalServerError: {ENVOY}"]]) == []
+    ctl = [f"[pid 42] {l}" for l in head + [f"anthropic.BadRequestError: {ENVOY}"]]
+    assert len(sg.parse_worker_crashes(ctl)) == 1
+
+
+def _core_error_classifier():
+    import os
+    root = Path(os.environ.get("HERMES_TEST_CORE") or Path.home() / ".hermes/hermes-agent")
+    if not (root / "agent/error_classifier.py").exists():
+        if os.environ.get("HERMES_TEST_CORE"):
+            raise AssertionError(f"HERMES_TEST_CORE set but {root}/agent/error_classifier.py is missing")
+        pytest.skip("Hermes core checkout not found")
+    sys.path.insert(0, str(root))
+    try:
+        return importlib.import_module("agent.error_classifier")
+    except ImportError as e:
+        pytest.skip(f"core error_classifier not importable here: {e}")
+    finally:
+        sys.path.remove(str(root))
+
+
+def test_coach_skips_core_connection_phrases():
+    """Drift guard: every connection phrase core retries (error_classifier._CONNECTION_MESSAGE_PATTERNS) inside a
+    provider status error must be skipped, so a phrase core adds later turns this red until coach follows."""
+    phrases = _core_error_classifier()._CONNECTION_MESSAGE_PATTERNS
+    assert phrases, "core lists no connection phrases: the guard lost its producer"
+    for p in phrases:
+        for t in ("anthropic.APIStatusError", "openai.APIError", "anthropic.ServiceUnavailableError"):
+            assert sg.parse_errors(_stream_fail(f"{t}: {p}")) == [], (t, p)

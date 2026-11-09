@@ -107,6 +107,20 @@ PROXY_5XX_RE = re.compile(r"<title>\s*5\d\d\b|\b5\d\d\s+(?:Bad Gateway|Service|G
 # server-failure sign (agent-117687e1c2). These are the codes core retries as server_error
 # (agent/error_classifier.py `_PROVIDER_CODE_VERDICTS`); test_coach_server_error_types_cover_core_verdicts pins them.
 PROVIDER_5XX_TYPE_RE = re.compile(r"""['"]type['"]:\s*['"](?:api_error|server_error|internal)['"]""")
+# The exception TYPE already says 5xx: the Anthropic/OpenAI SDKs raise InternalServerError only for status >= 500
+# (`_make_status_error`), and core retries it. Matching the body instead let each new proxy body shape file again
+# (HTML page, in-stream type, then Envoy's plain-text "upstream connect error ..." reset: agent-ee16fb8bb9).
+# Anthropic's fixed-status 5xx classes (anthropic/_exceptions.py: 503/504/529) count too. Module-qualified only: our
+# own (or another library's) InternalServerError still files.
+SDK_5XX_EXC_RE = re.compile(r"^(?:(?:anthropic|openai)(?:\.\w+)*\.InternalServerError|"
+                            r"anthropic(?:\.\w+)*\.(?:ServiceUnavailable|DeadlineExceeded|Overloaded)Error)$")
+# Core's retryable connection phrases (agent/error_classifier.py `_CONNECTION_MESSAGE_PATTERNS`;
+# test_coach_skips_core_connection_phrases pins this to the producer) inside a provider status error.
+PROVIDER_CONN_EXC_RE = re.compile(r"^[A-Za-z_][\w.]*\.(?:\w*ServerError|APIStatusError|APIError)$")
+CONNECTION_PHRASE_RE = re.compile(
+    r"connection refused|econnrefused|no route to host|network (?:is )?unreachable|name or service not known|"
+    r"temporary failure in name resolution|nodename nor servname provided|getaddrinfo (?:failed|enotfound)|"
+    r"eai_again|fetch failed|failed to fetch|upstream connect error", re.I)
 EXC_BODY_LINES, EXC_BODY_CHARS = 20, 2000
 # Match only core's final offline exception, never generic DNS failures or a message quoting it. OFFLINE_MSG is core's
 # exact sentence (agent/api_error_summary.py `_summarize_api_error`; test_offline_message_matches_core pins it to the
@@ -140,10 +154,17 @@ def _exc_body(block: List[str], exc_line: str) -> str:
 def provider_5xx(exc_type: str, exc_line: str, body: str) -> bool:
     """A provider status error (by exception type) whose message, including its continuation lines, carries a
     5xx status, a proxy 5xx page marker, or a provider server-error type (an in-stream error, PROVIDER_5XX_TYPE_RE).
-    Transient: core retries it; a real outage files via retry-exhausted."""
-    if not PROVIDER_STATUS_EXC_RE.search(exc_type or ""):
-        return False
+    Transient: core retries it; a real outage files via retry-exhausted. An SDK InternalServerError (SDK_5XX_EXC_RE)
+    is a 5xx whatever its body; a provider status error carrying one of core's connection phrases is a retried
+    connection failure."""
+    exc_type = exc_type or ""
     text = (exc_line or "") + "\n" + (body or "")
+    if SDK_5XX_EXC_RE.match(exc_type):
+        return True
+    if PROVIDER_CONN_EXC_RE.match(exc_type) and CONNECTION_PHRASE_RE.search(text):
+        return True
+    if not PROVIDER_STATUS_EXC_RE.search(exc_type):
+        return False
     return bool(PROXY_5XX_RE.search(text) or TRANSIENT_RE.search(text) or PROVIDER_5XX_TYPE_RE.search(text)
                 or re.search(r"InternalServerError[\s\S]{0,600}?\b5\d\d\b", text))
 
