@@ -1512,6 +1512,8 @@ def _task_summary(task: dict, runs: list, events: list, now: float) -> str:
     if evs:
         at, _, e = max(evs, key=lambda tie: tie[:2])  # same-second events: the later-listed one is newer
         parts.append(f"last={e.get('kind')} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(at))} ({_ago(now - at)} ago)")
+    if str(task.get("status")) == "scheduled" and task.get("id"):
+        parts.append(_card_probe_text(str(task["id"]), now))  # agent-61b50f34ae: is its wake probe still running?
     return " ".join(p for p in parts if p)
 
 
@@ -1681,11 +1683,12 @@ def board_card_facts(card_id: str, now: Optional[float] = None, dbs: Optional[li
             rank = {s: i for i, s in enumerate(_OPEN_PARENT_ORDER)}
             waits.sort(key=lambda w: (rank.get(w[1], len(rank)), w[2] if w[2] is not None else 1e18))
             run_state = str(run[0]) if run and run[0] else None
+            probe = _wake_probe(conn, card_id, now) if str(row[0]) == "scheduled" else None
             return {"id": card_id, "status": str(row[0]), "created_at": _ts(row[1]),
                     "claimed_at": _ts(cl[0]) if cl and cl[0] else None,
                     "last_kind": str(ev[0]) if ev else None, "last_at": _ts(ev[1]) if ev else None,
                     "run": run_state, "run_failed": bool(run_state and _FAILED_RUN_RE.search(run_state)),
-                    "waits_on": waits[:BOARD_MAX_PARENTS], "db": str(path)}
+                    "waits_on": waits[:BOARD_MAX_PARENTS], "probe": probe, "db": str(path)}
         except Exception:
             continue
         finally:
@@ -1694,6 +1697,61 @@ def board_card_facts(card_id: str, now: Optional[float] = None, dbs: Optional[li
             except Exception:
                 pass
     return None
+
+
+# agent-61b50f34ae: a scheduled card parked on a wake_check probe (the Kanban protocol's own wait: kanban_schedule +
+# wake_check + awaiting) looked identical to a dead park, since its newest event is the episode start, often days old.
+# The probe's own run record (task_wake_checks.last_at/every/last_rc) says whether the dispatcher is still checking:
+# live = it ran within one extra interval of its schedule (at least PROBE_SLACK_S) and last exited 0/1 (met / not
+# yet); a probe that stopped running or exits 2+ (broken) is stale. Episode checks/first_at are shown when present.
+PROBE_SLACK_S = 900
+
+
+def _wake_probe(conn, card_id: str, now: float) -> Optional[dict]:
+    """{live, last_s, every, rc, checks, since_s} for a card's wake probe, or None (no probe row / no table)."""
+    try:
+        w = conn.execute("select every, last_at, last_rc, fails from task_wake_checks where task_id=? and "
+                         "coalesce(purpose,'wake')='wake'", (card_id,)).fetchone()
+    except Exception:
+        return None
+    if not w:
+        return None
+    try:
+        ep = conn.execute("select first_at, checks from task_wake_episodes where task_id=?", (card_id,)).fetchone()
+    except Exception:
+        ep = None
+    every = int(w[0] or 0)
+    last = _ts(w[1]) if w[1] else None
+    last_s = (now - last) if last else None
+    rc = w[2]
+    live = bool(last_s is not None and -120 <= last_s <= every + max(every, PROBE_SLACK_S)
+                and rc in (0, 1) and int(w[3] or 0) < 3)
+    return {"live": live, "last_s": last_s, "every": every, "rc": rc,
+            "checks": int(ep[1]) if ep and ep[1] is not None else None,
+            "since_s": (now - ep[0]) if ep and ep[0] else None}
+
+
+def probe_text(facts: dict) -> str:
+    """`probe=live(rc=1 last=10m every=30m checks=77 since=1d)` / `probe=stale(...)`, or "" without a probe."""
+    p = facts.get("probe") if isinstance(facts, dict) else None
+    if not p:
+        return ""
+    bits = [f"rc={p['rc']}" if p.get("rc") is not None else "rc=?",
+            f"last={_ago(p['last_s'])}" if p.get("last_s") is not None else "last=never",
+            f"every={_ago(p['every'])}" if p.get("every") else ""]
+    if p.get("checks") is not None:
+        bits.append(f"checks={p['checks']}")
+    if p.get("since_s") is not None:
+        bits.append(f"since={_ago(p['since_s'])}")
+    return f"probe={'live' if p.get('live') else 'stale'}(" + " ".join(b for b in bits if b) + ")"
+
+
+def _card_probe_text(card_id: str, now: float) -> str:
+    try:
+        facts = board_card_facts(card_id, now=now)
+    except Exception:
+        return ""
+    return probe_text(facts) if facts else ""
 
 
 def _waits_text(facts: dict) -> str:
@@ -1716,6 +1774,9 @@ def board_fact_line(facts: dict, now: Optional[float] = None) -> str:
              f"run={facts.get('run') or 'none'}"]
     if facts.get("last_at"):
         parts.append(f"last={age(facts['last_at'])}({facts.get('last_kind')})")
+    pr = probe_text(facts)
+    if pr:
+        parts.append(pr)
     w = _waits_text(facts)
     return (f"{BOARD_LINE_PREFIX} " + " ".join(parts) + (f" {w}" if w else ""))[:OK_LINE_MAX]
 
@@ -1723,8 +1784,14 @@ def board_fact_line(facts: dict, now: Optional[float] = None) -> str:
 def _with_board_facts(body: str, cards: list, now: float) -> str:
     """A raw owner-read body that printed no timestamp gets the card's newest event (and, for a queued or parked
     card, its unfinished parents) from this host's board (agent-61f2644a68). Unchanged when the board has nothing."""
-    if "last=" in body or not cards:
+    if not cards:
         return body
+    if "last=" in body:
+        pr = _card_probe_text(cards[0], now) if "status=scheduled" in body else ""
+        if not pr:
+            return body
+        head, sep, rows = body.partition(" rows: ")
+        return f"{head} {pr}{sep}{rows}" if sep else f"{body} {pr}"
     try:
         facts = board_card_facts(cards[0], now=now)
     except Exception:
@@ -1733,6 +1800,8 @@ def _with_board_facts(body: str, cards: list, now: float) -> str:
         return body
     add = (f"last={facts.get('last_kind')} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(facts['last_at']))} "
            f"({_ago(now - facts['last_at'])} ago)")
+    if probe_text(facts):
+        add += " " + probe_text(facts)
     if facts["status"] in ("todo", "ready", "scheduled", "blocked", "triage") and facts.get("waits_on"):
         add += " " + _waits_text(facts)
     head, sep, rows = body.partition(" rows: ")

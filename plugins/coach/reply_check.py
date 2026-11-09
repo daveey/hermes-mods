@@ -265,6 +265,53 @@ _FAILED_RUN_RE = re.compile(r"crash|fail|timed_out|timeout|error|gave_up", re.I)
 FRESH_OWNER_S = 24 * 3600
 
 
+# agent-61b50f34ae: telemetry only (report_only_scored.owner_probe_live): the reply names a scheduled card whose owner
+# read (`<- OK`, or the coach's own `<- BOARD` line) shows its wake probe still running. The judges read the same
+# `probe=live(...)` fact through BOARD_OWNER; this records whether the case was present when they scored.
+_PROBE_LIVE_RE = re.compile(r"task=(?:[\w,]*?)(t_[0-9a-zA-Z_]+)\b[^|]*?\bprobe=live\(")
+
+
+def owner_probe_live(reply: str, tool_log: Optional[list] = None) -> list[str]:
+    """Card ids the reply names whose owner line in `tool_log` shows `probe=live(...)`. Empty when none."""
+    named = set(NAMED_CARD_RE.findall(reply or ""))
+    out: list[str] = []
+    for line in tool_log or []:
+        s = (line or "").lstrip()
+        if not (s.startswith("<- OK") or s.startswith("<- BOARD")):
+            continue
+        for m in _PROBE_LIVE_RE.finditer(s):
+            if m.group(1) in named and m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
+# agent-61b50f34ae: the ids (card, PR, commit) of the reply paragraph a verdict quotes, logged on reply_nudge and
+# reply_nudge_outcome so the self-heal collector (signals.same_item) can tell a paraphrase of the nudged item from a
+# different one: a judge quotes ~20 words and rarely repeats the nudge's wording, but both paragraphs name the card.
+_ITEM_ID_RE = re.compile(r"\bt_[0-9a-f]{8,}\b|(?<![\w&])#\d{2,6}\b|\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+_ITEM_WORD_RE = re.compile(r"[a-z0-9]{3,}")
+
+
+def evidence_ids(reply: str, evidence: str) -> list[str]:
+    """Card / PR / commit ids (commits cut to 7 hex) in the paragraph of `reply` sharing the most words with
+    `evidence` (the evidence's own ids first). [] when no paragraph shares a word."""
+    def ids(text):
+        out = []
+        for m in _ITEM_ID_RE.finditer(text or ""):
+            v = m.group(0)
+            v = v if v.startswith(("t_", "#")) else v[:7]
+            if v not in out:
+                out.append(v)
+        return out
+    words = set(_ITEM_WORD_RE.findall((evidence or "").lower()))
+    best, score = "", 0
+    for para in re.split(r"\n\s*\n", reply or ""):
+        n = len(words & set(_ITEM_WORD_RE.findall(para.lower())))
+        if n > score:
+            best, score = para, n
+    return list(dict.fromkeys(ids(evidence) + ids(best)))[:12]
+
+
 def fresh_ready_owner(reply: str, tool_log: Optional[list] = None) -> list[str]:
     """Card ids the reply names whose `<- OK` owner check shows them ready/todo, last activity under 24 h, and no
     failed/crashed/timed-out last run. Empty when none (or no such check ran)."""
@@ -1370,7 +1417,14 @@ BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the co
                "running or claimed with its last event under 24 h; or ready or todo, created under 24 h ago, with "
                "no failed, crashed or timed_out run; or todo, scheduled or blocked on a dependency with `waits_on=` "
                "a parent that is running or claimed with activity under 24 h (the work is sequenced behind a started "
-               "fix; the same holds for `waits_on=` on an `<- OK` line). Ready or todo idle over 24 h, blocked with "
+               "fix; the same holds for `waits_on=` on an `<- OK` line). A scheduled card whose `<- BOARD` or `<- OK` "
+               "line shows `probe=live(...)` (its wake_check probe still runs on schedule and exits 0 or 1) is a "
+               "started owner too, however old its last event, when the message names the non-agent producer it "
+               "waits on (an install, an updater, a release or deploy, CI, a clock or date): the dispatcher re-runs "
+               "the probe and wakes the card the moment the condition holds, which is the wait the Kanban protocol "
+               "prescribes. `probe=stale(...)` (the probe stopped running or is broken), a scheduled card with no "
+               "`probe=` fact and no such parent, or a live probe waiting on agent work nobody is doing, is not. "
+               "Ready or todo idle over 24 h, blocked with "
                "no such parent, a failed run, or done/archived is not. A BOARD status that contradicts the message "
                "(it says running, the board says ready, blocked or done) is evidence the claim is false: score "
                "that hand-off high.")
@@ -2349,6 +2403,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
                    "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
+                   "owner_probe_live": bool(owner_probe_live(reply, list(tool_log or []) + list(
+                       named_card_facts(reply, tool_log) or []))),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
                    **({"elapsed_s": budget_elapsed()} if budget_elapsed() is not None else {}),

@@ -357,6 +357,19 @@ gains `owner_fresh_ready` (`reply_check.fresh_ready_owner`), so held replies wit
 replay through the real aux judges: second opinion 0.9 → 0.1, outcome 0.85 → 0.6 (threshold 0.7); the same turn with
 the owners 3 days idle or with a crashed run stays held (0.9 / 0.9).
 
+Probe-parked owners (self-heal agent-61b50f34ae, 2026-11-06). A completion-notice reply's one open item was a merged
+fix not yet installed on the MacBook; its owner card was `scheduled` on a `wake_check` rollout probe every 30 min (77
+runs) waiting for the updater to install on the next quit. Its newest event was the 39 h old episode start, so the
+owner looked stalled and both judges held it (0.9). A scheduled card's board facts (`agent_rules.board_card_facts`,
+used by `<- BOARD` lines, raw owner reads and `kanban_show` summaries) now carry `probe=live(rc= last= every= checks=
+since=)` from `task_wake_checks`: live = last run within one extra interval (at least 15 min) of its schedule and exit
+0/1; stopped or exit 2+ = `probe=stale(...)`. `BOARD_OWNER` counts a live probe as a started owner when the message
+names the non-agent producer (install, updater, release, CI, clock). `report_only_scored` gains `owner_probe_live`.
+Live replay through the real second opinion: 0.9 → 0.1; the probe frozen 2.5 h stays 0.9. The self-heal collector
+(`signals.same_item`) treats a nudge and its outcome as one item when both name a card/PR/commit id (`item_ids`,
+logged on `reply_nudge` / `reply_nudge_outcome` by `reply_check.evidence_ids`) or overlap by half their content
+words, so a paraphrase is no longer filed as "a different problem". Tests: `tests/test_report_only_wake_probe_owner.py`.
+
 **Closed cards (agent-a806f203ab).** A Kanban worker called `kanban_complete`, then an operator note reopened the work
 in the same turn; it pushed a fix and ended with CI unwatched, a proof never run and a done card named as "owner".
 Three changes: (1) when this turn's tool log shows a `kanban_complete` that did not error (tool, deferred `tool_call`

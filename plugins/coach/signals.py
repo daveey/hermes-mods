@@ -1343,6 +1343,35 @@ def item_key(evidence: str) -> str:
     return h10(re.sub(r"[^a-z0-9]", "", str(evidence or "").lower())[:80])
 
 
+# agent-61b50f34ae: a judge quotes ~20 words of the reply and the revision rewords the paragraph, so an exact item_key
+# called a paraphrase of the nudged item "a different problem". Same item = same key, or both verdicts' paragraphs
+# name a common card / PR / commit id (reply_check.evidence_ids, logged as item_ids), or their content words overlap
+# by at least half of the shorter one's.
+_SAME_ID_RE = re.compile(r"\bt_[0-9a-f]{8,}\b|(?<![\w&])#\d{2,6}\b|\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+_SAME_STOP = frozenset("the and for that this with from was were are has have had not but its it's into onto when "
+                       "then than you your our all any one still yet now just also only can will would should".split())
+SAME_ITEM_OVERLAP = 0.5
+
+
+def _item_words(text: str) -> set:
+    return {w[:6] for w in re.findall(r"[a-z0-9]{3,}", str(text or "").lower()) if w not in _SAME_STOP}
+
+
+def same_item(a: str, b: str, a_ids=None, b_ids=None) -> bool:
+    if item_key(a) == item_key(b):
+        return True
+
+    def ids(text, extra):
+        out = set()
+        for v in list(_SAME_ID_RE.findall(str(text or ""))) + [str(x) for x in (extra or [])]:
+            out.add(v if v.startswith(("t_", "#")) else v[:7])
+        return out
+    if ids(a, a_ids) & ids(b, b_ids):
+        return True
+    wa, wb = _item_words(a), _item_words(b)
+    return bool(wa and wb) and len(wa & wb) / min(len(wa), len(wb)) >= SAME_ITEM_OVERLAP
+
+
 def _handoff_signal(r: dict, why: str) -> dict:
     """`r` is the nudge record. A failed outcome adds `outcome_evidence` (what the re-check failed the revised reply
     on): that item names and keys the defect, since one long session can fail on several unrelated items and the
@@ -1358,7 +1387,7 @@ def _handoff_signal(r: dict, why: str) -> dict:
     if "outcome_evidence" in r:
         item = oev or ev
         key = item_key(item)
-        other = bool(oev) and key != item_key(ev)
+        other = bool(oev) and not same_item(oev, ev, r.get("outcome_item_ids"), r.get("item_ids"))
         symptom = (f"{what} (revised reply left a different problem): {item[:120]}" if other
                    else f"{what}: {item[:120]}")
         details = (f"coach reply_check {rule} outcome failed on: {item}; {why}"
@@ -1867,7 +1896,7 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
         elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
             pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id", "platform",
-                                                     "nudge_id") + BACKEND_KEYS},
+                                                     "nudge_id", "item_ids") + BACKEND_KEYS},
                             "ts": at})
         elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
@@ -1889,8 +1918,10 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                 why = f"the revised reply {still} (outcome p={r.get('p')})"
                 rec = {**n, "reply": r.get("reply") or "",
                        # a judged failure names its own item; resolved=None carries a status text, not an item
-                       "outcome_evidence": str(r.get("evidence") or "") if r.get("resolved") is False else ""}
-                if rec["outcome_evidence"] and item_key(rec["outcome_evidence"]) != item_key(n.get("evidence") or ""):
+                       "outcome_evidence": str(r.get("evidence") or "") if r.get("resolved") is False else "",
+                       "outcome_item_ids": r.get("item_ids") or []}
+                if rec["outcome_evidence"] and not same_item(rec["outcome_evidence"], n.get("evidence") or "",
+                                                             rec["outcome_item_ids"], n.get("item_ids")):
                     # detection guard (agent-e5b6dcf428): the revision fixed the nudged line and failed on another
                     _coach_log(home, {"ts": now, "event": "nudge_outcome_other_item",
                                       "session_id": n.get("session_id") or "", "rule": rule, "nudge_ts": n.get("ts"),

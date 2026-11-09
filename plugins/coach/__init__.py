@@ -954,6 +954,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 return None
             tracked = hit["rule"] in rc.RULES
             nid = _new_nudge_id()
+            try:  # signals.same_item: ids of the paragraph the evidence quotes (agent-61b50f34ae)
+                item_ids = rc.evidence_ids(final_response, hit.get("evidence") or "")
+            except Exception:
+                item_ids = []
             out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"], "nudge_id": nid,
                           "p": hit["p"], "evidence": hit["evidence"], "ask_len": len(ask or ""),
                           # signals.template_holds groups on it: one rule holding the same fixed text in many chats
@@ -963,6 +967,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           **({"reason": hit["reason"]} if hit.get("reason") else {}),
                           **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
                           **({"asks": hit["asks"]} if "asks" in hit else {}),  # denied_ask: which cards (agent-5c9b041010)
+                          **({"item_ids": item_ids} if item_ids else {}),
                           **({"outcome": True} if tracked else {})}
             if tracked:  # judged again on attempt 1 (any rule): self-heal files the outcome, not the nudge
                 st = coach.loop_state(session_id)
@@ -1028,8 +1033,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                                                 ref=nid_ref, via="outcome"),
                                    confirm_floor=rc.CONFIRM_FLOOR, human_confirm_floor=rc.human_confirm_floor(plat),
                                    report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK))
+            try:
+                out_ids = rc.evidence_ids(final_response, res.get("evidence") or "") if res.get("evidence") else []
+            except Exception:
+                out_ids = []
             _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
                          judged=res["judged"], evidence=res["evidence"], reply=(final_response or "")[:300],
+                         **({"item_ids": out_ids} if out_ids else {}),
                          **({"asks": res["asks"]} if "asks" in res else {}),
                          **({"src": res["src"]} if "src" in res else {}),
                          **({"unconfirmed": True} if res.get("unconfirmed") else {}),
