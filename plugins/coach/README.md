@@ -626,6 +626,35 @@ frontier card that is `running`, `scheduled`, `ready` or `todo` is agent work, s
 
 Measured 2026-10-28 on the hub (its own boards plus the MacBook replica), before the frontier split: 8 distinct stalled delivery cards, among them this defect's rollout card (122 h, 168 runs by its own chat's cards). After the split, a card whose open-ancestor frontier is entirely a human wait is `waiting_on_human` instead; a frontier card that is running, scheduled, ready or todo keeps it a stall. Tests: `tests/test_stalled_goal.py`, on the real graph's rows copied from the replica (`tests/fixtures/stalled_goal_balancer.json`, titles scrubbed) plus synthetic frontiers (human wait walked past an open intermediate, blocked with a human_request and no block_kind, mixed frontier, scheduled/todo/ready/running agent parent).
 
+### Repeat asks while relaying an owner (`pre_llm_call`, `relay_repeat.py`)
+
+Defect agent-1406d53913 (2026-11-02): a chat bumped a repair card for a blocked builder, then for over 4 h only relayed
+its progress ("the repair hasn't been deployed", "I sent that evidence to the active repair worker") while David asked
+again five times ("session still red", "why cant you fix it, what's going on"). Every rule passed it: the owner was
+committing, so the 24 h owner budget held; report_only's screen scored the relays 0.12-0.30, under the second-opinion
+floor; fix_loop scores low when the agent had said it was not done yet; stalled_goal waits 24 h.
+
+The rule: in a live chat, a repeat ask about the same unresolved state ends the owner's budget unless the owner
+delivered since the last reply. `pre_llm_call` adds one context line (once per turn) when (a) the user's message is a
+repeat ask (fix_loop's prefilter, or "why can't you fix / what's going on / look again / still red"), typed by a
+person: notices, worker prompts, compaction re-injections and other Hermes-written rows never count; (b) the previous
+final reply relayed an unfinished owner (OWNER_HANDOFF_RE / OWNER_CARD_RE, or an unfinished marker such as
+"underway", "not deployed", "still being tested", "waits for capacity" with an owner noun: a card id, a
+worker/agent/session/lane, "the repair"); and (c) no card that reply names is done/archived on this host's boards and
+no Kanban completion notice for it arrived since (when it named no card: no completion notice at all since). The line
+tells the agent to take the next step itself this turn or `delegate_task` with fix authority, and to link an unlinked
+card to the chat. Logged as `agent_hint` with `rule=relay_repeat` (`n` = repeat asks in the current run of relays).
+Cron, Kanban and subagent turns are skipped.
+
+Detection guard: the hook marks the turn (`relay_repeat_turn` in the loop state), and the reply check passes
+`relay_repeat=True` to `reply_check.check`: report_only joins the candidates (unless a scope limit excludes it), the
+second opinion runs whatever the screen scored, and `report_only_scored` records `relay_repeat: true`
+(`forced: relay_repeat`).
+
+Off switch: `COACH_RELAY_REPEAT=off`, or `plugins.entries.coach.settings.relay_repeat: false`. Backtest on 10 days of
+hub chats (398 live sessions): 7 hits, 4 of them this defect's turns; the other 3 were repeat asks after "in progress" /
+"queued for" relays. Tests: `tests/test_relay_repeat.py` (the defect chat's real replies and user turns).
+
 ### Checkout-local sibling cache
 
 The sibling loader keys modules by canonical source directory as well as module name. Discovering an installed
@@ -1177,6 +1206,7 @@ nothing).
   `report_only_confirm` events link to by `draft_id`.
 - `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the
   neutral reviewer prompt); `eval/second_opinion_replay.py` counts how often each would fire over `state.db`.
+- `relay_repeat.py`: the repeat-ask-while-relaying detector (a user asks again while the last reply relayed an unfinished owner), hook helper
 - `stalled_goal.py`: the stalled-goal detector (a chat's delivery card idle while its graph spends runs; a human-wait ancestor frontier is `waiting_on_human`, not a takeover), hook helper
   and read-only CLI.
 - `curriculum.py` + `curriculum.yaml`: the tips (loading/overlay, live triggers, spacing, adoption read).

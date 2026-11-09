@@ -2054,8 +2054,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           card_status: Optional[Callable[[str], Optional[str]]] = None,
           capped_nudge: bool = True,
           report_only_fallback: str = REPORT_ONLY_FALLBACK,
-          prev_turn: Optional[dict] = None, deny_quoted: bool = False, platform: str = "") -> Optional[dict]:
+          prev_turn: Optional[dict] = None, deny_quoted: bool = False, platform: str = "",
+          relay_repeat: bool = False) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `relay_repeat` (relay_repeat.py, agent-1406d53913): this turn's user asked again while the previous reply relayed
+    an unfinished owner. report_only joins the candidates (unless scoped), the second opinion always runs whatever the
+    screen scored, and report_only_scored records relay_repeat: true.
     `platform` (the turn's platform) picks the report_only nudge's Kanban park exits (agent-0e5f1ab1f9).
     `deny_quoted` (nudge_outcome only): a denied_ask phrase inside quote marks still counts, so a correction that
     quotes its old denial resolves only by telling the ask (agent-747c4fc95b).
@@ -2139,10 +2143,16 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                     "verdict": {"status_only": 1.0, "evidence": ev},
                     "nudge": STATUS_ONLY_NUDGE.format(evidence=ev[:200])}
     cands = [r for r in prefilter(reply) if not only or r in only]
+    if relay_repeat and "report_only" not in cands and (not only or "report_only" in only):
+        cands.append("report_only")
     if "report_only" in cands and scoped:
         cands.remove("report_only")
     # agent-a3c36a6f70: a fix left inactive "until the next restart" gets the second opinion whatever its scores
     forced = ("report_only" in cands and confirm is not None and restart_deferral(reply, tool_log)) or None
+    forced_by = "restart_deferral" if forced else None
+    # agent-1406d53913: a reply to a repeat ask while relaying an unfinished owner gets it too
+    if not forced and relay_repeat and "report_only" in cands and confirm is not None:
+        forced, forced_by = "relay_repeat", "relay_repeat"
     if "unwatched" in cands:
         try:
             if wake is None or wake():
@@ -2207,7 +2217,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
                    "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
-                   **({"forced": "restart_deferral"} if forced and confirm_attempted else {}),
+                   **({"forced": forced_by} if forced and confirm_attempted else {}),
+                   **({"relay_repeat": True} if relay_repeat else {}),
                    **({"suppressed": "unconfirmed"} if suppressed else {})})
         except Exception:
             pass  # telemetry never changes a verdict

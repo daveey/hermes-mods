@@ -190,8 +190,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           list(coach.loop_state(session_id).get("last_log") or []),
                           (turn_at - last_seen) if isinstance(last_seen, (int, float)) else None, turn_at)
             loop_hint = _fix_loop(session_id, user_message, turn)
+            relay_hint = _relay_repeat(session_id, user_message, platform, parent_session_id)
             stall_hint = _stalled_goal(session_id, platform)
-            hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", stall_hint or "") if h)
+            hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", relay_hint or "",
+                                        stall_hint or "") if h)
             return {"context": hint} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
@@ -463,6 +465,27 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             return " ".join(h for h in (hit["hint"], _fixloop_card(session_id, st, hit, user_message, turn)) if h)
         except Exception as exc:
             log.debug("coach fix_loop: %s", exc)
+            return None
+
+    def _relay_repeat(session_id, user_message, platform="", parent_session_id=""):
+        """The user asked again while the last reply relayed an unfinished owner (relay_repeat.py, agent-1406d53913):
+        one "take over" hint per turn, and the turn is marked so its reply gets the report_only second opinion.
+        Live chats only: a cron run, a subagent or a Kanban worker has no one asking again. Fail-open."""
+        try:
+            if platform in ("cron", "kanban", "subagent") or parent_session_id:
+                return None
+            rr = _load("relay_repeat")
+            if not rr.enabled():
+                return None
+            turn = coach.turn_number(session_id)
+            hit = rr.assess(coach.loop_state(session_id), turn, user_message)
+            if not hit:
+                return None
+            store.log({"event": "agent_hint", "session_id": session_id, "rule": "relay_repeat", "n": hit["n"],
+                       "turn": turn, "cards": hit["cards"][:5], "evidence": hit["phrase"][:200]})
+            return hit["hint"]
+        except Exception as exc:
+            log.debug("coach relay_repeat: %s", exc)
             return None
 
     def _stalled_goal(session_id, platform=""):
@@ -880,6 +903,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                                           "notice": rc.notice_turn(ask), "platform": platform}),
                            report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK),
                            prev_turn=prev, platform=platform,
+                           # the user asked again while the last reply relayed an unfinished owner: always get the
+                           # report_only second opinion on this reply (relay_repeat.py, agent-1406d53913)
+                           relay_repeat=(coach.loop_state(session_id).get("relay_repeat_turn")
+                                         == coach.turn_number(session_id)),
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
