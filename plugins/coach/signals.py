@@ -2267,6 +2267,33 @@ def _summ(res: List[dict]) -> List[str]:
     return lines
 
 
+def lane_status(home: Path) -> str:
+    """One line on the hub's `self-heal lane` cron job from <home>/cron/jobs.json ("" when unknown)."""
+    try:
+        jobs = json.loads((Path(home) / "cron" / "jobs.json").read_text())
+        jobs = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs
+        for j in jobs:
+            if j.get("script") == "selfheal_lane.py":
+                err = str(j.get("last_error") or "").strip().splitlines()
+                return (f"{j.get('id')} last_status={j.get('last_status')} failure_streak={j.get('failure_streak')} "
+                        f"last_run={j.get('last_run_at')}" + (f" last_error={err[-1][:200]}" if err else ""))
+    except Exception:
+        pass
+    return ""
+
+
+def lane_check(home: Path, m: Optional[str] = None, sh=None) -> Optional[dict]:
+    """Backstop for the lane, from this separate cron: proposals the lane should have filed as fix cards (live
+    mode only). The lane cannot report its own death: its fix cards are filed by the pass that is down."""
+    sh = sh or _self_heal()
+    if (m or sh.mode()) != "live":
+        return None
+    try:
+        return sh.check_stuck(lane_status=lane_status(home))
+    except Exception as exc:
+        return {"action": "error", "why": f"{type(exc).__name__}: {exc}"[:300]}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="signals.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--home", default=os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
@@ -2288,6 +2315,10 @@ def main(argv=None) -> int:
         res = sweep(home, host, m=a.mode)
         for ln in _summ(res) if not a.verbose else [json.dumps(r)[:400] for r in res]:
             print(ln)
+        lc = lane_check(home, a.mode)
+        if lc and lc.get("action") not in ("ok", "skip"):
+            print(f"lane: {lc.get('action')} {lc.get('card') or lc.get('why') or ''} "
+                  f"({lc.get('n')} stuck, oldest {lc.get('oldest')})")
     elif a.cmd == "collect":
         cur = load_cursor(home)
         for sg in collect(home, cur, host):

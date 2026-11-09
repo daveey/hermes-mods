@@ -1246,6 +1246,11 @@ SAME_QUOTE_MIN_CHARS = 120  # a quote this long, shared by other sessions, is on
 SKILLS = ("five-whys", "hermes-mods-repo")
 BB_SKILLS = ("five-whys", "bb-self-fix")
 FIX_SKILLS = ("five-whys", "hermes-mods-repo", "systematic-debugging")
+# Every self-heal card declares what its worker needs: core refuses an agent-run create that omits it
+# (requires_declaration_missing under kanban.require_capability_declaration), which silently dropped investigations.
+SELFHEAL_REQUIRES = ("terminal", "file", "git", "host_repo")
+STUCK_PROPOSAL_S = 2 * 3600  # proposed, budget open, no fix card for this long = the lane is not filing
+PULL_FAIL_CARD_AFTER = 3     # consecutive coach-data pull failures before the lane files its own card
 CREATED_BY = "self-heal"
 INBOX_TYPE = "selfheal"
 RESULT_TYPE = "selfheal-result"  # legacy Inbox card type; results are no longer posted (see RESULTS_DIR)
@@ -2205,7 +2210,7 @@ def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[
     return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
             "body": investigation_brief(d, previous, cfg), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY}
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
 
 
 def kanban_argv(args: dict, hermes: str = "hermes") -> list:
@@ -2217,6 +2222,8 @@ def kanban_argv(args: dict, hermes: str = "hermes") -> list:
         argv += ["--provider", args["provider"]]
     for s in args.get("skills") or []:
         argv += ["--skill", s]
+    req = args.get("requires", SELFHEAL_REQUIRES)
+    argv += [x for c in req for x in ("--requires", c)] if req else ["--no-requires"]
     return argv
 
 
@@ -3329,7 +3336,7 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     args = {"title": f"self-heal fix: {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
             "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY}
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
     if args.get("board") and not board_present(args["board"]):
         why = f"kanban board {args['board']!r} does not exist"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args["board"]})
@@ -3350,7 +3357,12 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args.get("board")})
         return {"action": "error", "why": why, "board": args.get("board")}
     if not tid:
-        return {"action": "error", "why": (err or out).strip()[-300:]}
+        # Log every refused create: this bare return hid refusals from log.jsonl (only the cron's 50-run stdout saw
+        # them). status stays proposed, so the next pass retries.
+        why = (err or out).strip()[-300:] or f"kanban create exited {rc} with no task id"
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "rc": rc, "key": key,
+                   "board": args.get("board"), "stage": "fix"})
+        return {"action": "error", "why": why}
     if tid in known_cards(st):
         why = f"fix key {key} returned earlier card {tid}"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
@@ -3899,9 +3911,195 @@ def drain(store=None, m: Optional[str] = None, filer: Optional[Callable] = None)
     return out
 
 
+# ── coach-data refresh and lane self-checks (cron-7b7df72ab4: a strict pull killed the lane for 4 days) ──
+def _git(data: Path, *args, runner=None):
+    import subprocess
+    r = (runner or subprocess.run)(["git", "-C", str(data), *args], capture_output=True, text=True, timeout=180)
+    return r.returncode, (r.stdout or ""), (r.stderr or "")
+
+
+def _heal_unmerged(data: Path, runner=None) -> list:
+    """Resolve a conflicted index a failed autostash pop left: append-only *.jsonl become the deduped union of
+    base/ours/theirs (same rule as coach_feed.resolve_unmerged). Returns the paths it could NOT resolve."""
+    _, out, _ = _git(data, "diff", "--name-only", "--diff-filter=U", runner=runner)
+    bad, healed = [], []
+    for path in sorted(set(out.split())):
+        if not path.endswith(".jsonl"):
+            bad.append(path)
+            continue
+        seen, lines = set(), []
+        for stage in "123":
+            rc, txt, _ = _git(data, "show", f":{stage}:{path}", runner=runner)
+            for ln in (txt.splitlines() if rc == 0 else []):
+                if ln.strip() and ln not in seen:
+                    seen.add(ln)
+                    lines.append(ln)
+        (Path(data) / path).write_text("\n".join(lines) + "\n")
+        _git(data, "add", "--", path, runner=runner)
+        healed.append(path)
+    if healed and not bad:
+        _git(data, "reset", "-q", runner=runner)  # leave the merged rows as ordinary local edits, nothing staged
+        _, top, _ = _git(data, "stash", "list", "-1", "--format=%gs", runner=runner)
+        if top.strip().endswith("autostash"):
+            _git(data, "stash", "drop", "-q", runner=runner)  # its content is merged in above
+    return bad
+
+
+def pull_data(data: Path, runner=None) -> Optional[str]:
+    """Refresh the coach digests: `git pull --rebase --autostash` (local writers such as coach_eval leave tracked
+    jsonl rows uncommitted in this clone; --ff-only refused every pull once upstream touched the same file).
+    *.jsonl merge with the union driver. Never raises: None = pulled (or `data` is not a git checkout), else git's
+    error text. The caller carries on with the digests it already has."""
+    data = Path(data)
+    if not (data / ".git").exists():
+        return None
+    try:
+        rc, gp, _ = _git(data, "rev-parse", "--git-path", "info/attributes", runner=runner)
+        if rc == 0 and gp.strip():
+            f = data / gp.strip()
+            cur = f.read_text() if f.exists() else ""
+            if "*.jsonl merge=union" not in cur.splitlines():
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(cur + ("" if not cur or cur.endswith("\n") else "\n") + "*.jsonl merge=union\n")
+        bad = _heal_unmerged(data, runner)
+        if bad:
+            return f"unmerged paths from an earlier pull: {', '.join(bad)[:300]}"
+        rc, out, err = _git(data, "pull", "-q", "--rebase", "--autostash", runner=runner)
+        bad = _heal_unmerged(data, runner)
+        if rc:
+            for d in ("rebase-merge", "rebase-apply"):
+                r2, p, _ = _git(data, "rev-parse", "--git-path", d, runner=runner)
+                if r2 == 0 and (data / p.strip()).exists():
+                    _git(data, "rebase", "--abort", runner=runner)
+                    break
+            return ((err or out).strip() or f"git pull exited {rc}")[-600:]
+        if bad:
+            return f"autostash left unmerged paths: {', '.join(bad)[:300]}"
+        return None
+    except Exception as exc:  # a refresh failure never stops the lane
+        return f"{type(exc).__name__}: {exc}"[:600]
+
+
+def _lane_card(title: str, body: str, key: str, runner=None) -> dict:
+    """A plain Kanban card for a lane defect (not an investigation: those need this lane to become fix cards)."""
+    args = {"title": title, "body": body, "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+            "max_runtime": FIX_RUNTIME, "skills": list(FIX_SKILLS), "board": None, "assignee": "default",
+            "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
+    try:
+        rc, out, err = _run(kanban_argv(args), runner)
+    except Exception as exc:
+        return {"action": "error", "why": f"{type(exc).__name__}: {exc}"[:300]}
+    tid = _task_id(out) if rc == 0 else None
+    return {"action": "filed", "card": tid} if tid else {"action": "error", "why": (err or out).strip()[-300:]}
+
+
+def _open_card(path: Path, runner=None) -> Optional[str]:
+    """The card recorded in a lane alert state file while it is still open (one card per incident)."""
+    try:
+        card = json.loads(path.read_text()).get("card")
+    except Exception:
+        return None
+    if not card:
+        return None
+    # done/archived/missing/unreadable = no open owner: file a fresh card (its key carries the UTC day, so an
+    # unreadable board files at most one a day)
+    return None if card_status(card, None, runner) in ENDED + (None,) else card
+
+
+def note_pull(store, err: Optional[str], now: float, runner=None) -> Optional[dict]:
+    """Track consecutive pull failures in <coach>/selfheal_pull.json; at PULL_FAIL_CARD_AFTER file ONE card for the
+    streak (a later streak, or the same one after its card ended, files a fresh card)."""
+    path = Path(store.root) / "selfheal_pull.json"
+    try:
+        st = json.loads(path.read_text())
+    except Exception:
+        st = {}
+    if err is None:
+        if st.get("fails"):
+            store.log({"event": "selfheal_data_pull_recovered", "fails": st.get("fails"), "since": st.get("since")})
+        if st:
+            path.write_text(json.dumps({"card": st.get("card")}))
+        return None
+    st["fails"] = int(st.get("fails") or 0) + 1
+    st.setdefault("since", now)
+    st["error"] = err[-600:]
+    store.log({"event": "selfheal_data_pull_failed", "fails": st["fails"], "since": st["since"], "error": err[-300:]})
+    res = None
+    if st["fails"] >= PULL_FAIL_CARD_AFTER and not _open_card(path, runner):
+        host = host_name()
+        body = (f"The self-heal lane on {host} could not refresh the coach digests {st['fails']} runs in a row "
+                f"(since {_iso(st['since'])}). It keeps running on the digests it has (Inbox outcomes, queue drain and "
+                f"fix filing still work), but the digest backstop judges stale turns.\n\n"
+                f"git error:\n```\n{st['error']}\n```\n\n"
+                "Find what leaves the coach data clone unpullable (uncommitted tracked edits from a local writer, a "
+                "conflicted index, auth), fix it at the writer, and preserve its rows (commit + push, never discard). "
+                "Done when `selfheal_data_pull_recovered` appears in <coach>/log.jsonl.")
+        res = _lane_card(f"self-heal lane: coach-data pull failing on {host}", body,
+                         f"selfheal-data-pull:{host}:{time.strftime('%Y-%m-%d', time.gmtime(now))}", runner)
+        if res.get("card"):
+            st["card"] = res["card"]
+        store.log({"event": "selfheal_data_pull_card", **res})
+    path.write_text(json.dumps(st))
+    return res
+
+
+def stuck_proposals(store=None, now: Optional[float] = None, budget_fn=None, min_age: float = STUCK_PROPOSAL_S,
+                    auto: Optional[bool] = None) -> list:
+    """[(fp, age_s)] proposed for more than `min_age` with no fix card while the budget would admit one. Empty when
+    auto-approve is off (a proposal then legitimately waits on David) or the budget is closed/unknown (deferral)."""
+    store = _store(store)
+    now = now or time.time()
+    if not (auto_approve() if auto is None else auto):
+        return []
+    old = [(fp, now - float(st.get("proposed_at") or 0)) for fp, st in LaneState(store.root).read().items()
+           if st.get("status") == "proposed" and not st.get("fix_card") and st.get("proposed_at")
+           and now - float(st["proposed_at"]) > min_age]
+    if not old:
+        return []
+    b = (budget_fn or (lambda bd, n: budget(bd, n, new_card_usd=FIX_BUDGET)))(None, now)
+    if not (b.get("available", True) and b.get("ok_usd") and b.get("ok_running")):
+        return []
+    return sorted(old, key=lambda x: -x[1])
+
+
+def check_stuck(store=None, now: Optional[float] = None, budget_fn=None, runner=None, auto: Optional[bool] = None,
+                lane_status: str = "") -> dict:
+    """Detection for the lane itself (run from a pass that does not depend on it, e.g. the signals sweep): files ONE
+    Kanban card per incident while proposals sit unfiled (cron-7b7df72ab4's own proposal waited 4 days on the dead
+    lane it described). Logs `selfheal_stuck`."""
+    store = _store(store)
+    now = now or time.time()
+    stuck = stuck_proposals(store, now, budget_fn, auto=auto)
+    path = Path(store.root) / "selfheal_stuck.json"
+    if not stuck:
+        return {"action": "ok"}
+    open_card = _open_card(path, runner)
+    rec = {"event": "selfheal_stuck", "n": len(stuck), "oldest": stuck[0][0], "oldest_h": round(stuck[0][1] / 3600, 1),
+           "card": open_card}
+    if open_card:
+        store.log(rec)
+        return {"action": "skip", "why": f"open: {open_card}", **rec}
+    errs = [r.get("error") for r in _recent_events(store.root, "selfheal_file_error", now - 86400)][-3:]
+    host = host_name()
+    lines = "\n".join(f"- {fp}: proposed {a / 3600:.1f} h ago" for fp, a in stuck[:20])
+    body = (f"{len(stuck)} self-heal fingerprint(s) on {host} are `proposed` with no fix card although the budget "
+            f"admits one (oldest {stuck[0][1] / 3600:.1f} h; threshold {STUCK_PROPOSAL_S // 3600} h). The lane cron "
+            f"(`self_heal.cron` -> `sync`) files these every 5 min, so it is failing or not running.\n\n{lines}\n\n"
+            + (f"Lane cron: {lane_status}\n\n" if lane_status else "")
+            + (f"Recent selfheal_file_error: {json.dumps(errs)[:900]}\n\n" if errs else "")
+            + "Fix the lane (read the cron's last output, `self_heal.py status`), then confirm the next pass logs "
+              "`selfheal_approved` for these. Do not file fix cards by hand for fingerprints another card owns.")
+    res = _lane_card(f"self-heal lane: {len(stuck)} proposals stuck without fix cards on {host}", body,
+                     f"selfheal-stuck:{host}:{time.strftime('%Y-%m-%d', time.gmtime(now))}", runner)
+    if res.get("card"):
+        path.write_text(json.dumps({"card": res["card"], "at": now}))
+    store.log({**rec, "filed": res})
+    return {**res, **rec}
+
+
 def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: float = 25 * 60,
          backstop_fn: Optional[Callable] = None, liveness_every: float = 3600,
-         liveness_fn: Optional[Callable] = None) -> list:
+         liveness_fn: Optional[Callable] = None, pull_fn: Optional[Callable] = None) -> list:
     """The hub's pass (no agent, hermes cron every 5 min): Inbox outcomes (Do it -> fix card within 5 min), queue
     drain, and the digest backstop at most every `backstop_every` seconds. Prints only what it did.
 
@@ -3912,6 +4110,17 @@ def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: fl
         return lines
     store = _store(store)
     now = now or time.time()
+    perr = (pull_fn or pull_data)(data)
+    if perr is not None:
+        # Fix filing, queue drain and Inbox outcomes need no digests: only the digest backstop is skipped (stale
+        # intake, d499a5a), and the streak files its own card (note_pull).
+        lines.append(f"pull: failed (digest backstop skipped): {perr[-300:]}")
+    try:
+        pc = note_pull(store, perr, now)
+        if pc:
+            lines.append(f"pull: card {pc.get('card') or pc.get('why')}")
+    except Exception as exc:
+        lines.append(f"pull: streak tracking failed: {exc}")
     if mode() == "live":
         for r in retry_deferred(store, now=now):
             lines.append(f"deferred: {json.dumps(r)[:300]}")
@@ -3925,7 +4134,7 @@ def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: fl
         last = float(stamp.read_text().strip() or 0)
     except Exception:
         last = 0.0
-    if now - last >= backstop_every:
+    if perr is None and now - last >= backstop_every:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(str(now))
         try:
