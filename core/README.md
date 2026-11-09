@@ -17,7 +17,7 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 
-2029 patches, one entry per non-merge source commit through `39115a6b6799f4935ee2263c1f6f5ff34cea4821`.
+2065 patches, one entry per non-merge source commit through `134eca6553a85e6424e05373fd5b340ab49db811`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -25,12 +25,40 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip and current merge-base: `6b21d0564de0492e2ebd0d8f63fca86c03b5c892`.
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All twenty-four earlier bridges remain unchanged; three normalized integration bridges are added before 2019, 2021 and 2026. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Current snapshot: [mirror-replay-2029.json](mirror-replay-2029.json), [mirror-policy-2029.json](mirror-policy-2029.json), and [executed proof](mirror-2029-verification.md). The following links retain historical verification:
+Upstream exclusion tip: `496706271914b585f402bfd070b01070cf289553`; current merge-base: `0b82ddc96c39449d30763d0fdd50ac22fed0fb31`.
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All twenty-seven earlier bridges remain unchanged; eleven normalized integration bridges are added before 2033, 2035, 2040–2044, 2050, 2053, 2055 and 2062. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Current snapshot: [mirror-replay-2065.json](mirror-replay-2065.json), [mirror-policy-2065.json](mirror-policy-2065.json), and [executed proof](mirror-2065-verification.md). Previous snapshot: [mirror-2029-verification.md](mirror-2029-verification.md). The following links retain historical verification:
 Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 2030–2065
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Mirror 2030 follow-ups: test hardening and a catalog revalidation](mirror-2030-test-and-catalog-followups.md) | 2030, 2040, 2042, 2044–2045 | Stall-probe cleanup, catalog annotation, observable daemon argv and shared revoke clock. |
+| [Kanban dependency review: mixed prefix reviews resume repair, never approval](kanban-dependency-review-prefix-repairs.md) | 2031 | Mixed-prefix review requests resume repairs, never grant approval. |
+| [Desktop: unminted native gateway descriptors surface the ticket mint error](native-gateway-unminted-ticket-errors.md) | 2032 | Preserve mint-required native ticket errors. |
+| [Kanban scratch GC: explain preserved scratch without expanding deletion authority](kanban-scratch-preservation-diagnostics.md) | 2033–2034 | Explain retention, recognize nested owners and isolate inventory failures. |
+| [Idle sweeps reuse structural scans until a SQLite commit](idle-commit-keyed-scan-memos.md) | 2035, 2037–2039 | Commit-keyed structural scans with clock checks every pass. |
+| [TUI notification poller: commit-driven idle waits](notification-poller-commit-driven.md) | 2036 | Due-time waits and commit-keyed empty proofs. |
+| [Desktop preview: a parked bystander window declines vault requests](preview-vault-parked-decline.md) | 2041 | Leave vault claims to the visible owner window. |
+| [CLI: a typed empty `-t ''` is a no-tools pick](typed-empty-toolsets.md) | 2043 | An explicit empty CLI toolset pick disables tools. |
+| [Background plugin checks never resurrect a retired profile home](profile-retirement-background-writes.md) | 2046–2047 | Do not recreate retired homes during background plugin checks. |
+| [Evicted scratch custody](kanban-scratch-custody-2048.md) | 2048–2049, 2054 | Host-local receipts, retention fencing, resync preservation and clock-pinned tests. |
+| [Relay authority test progress and FIFO policy](relay-authority-test-progress-2048.md) | 2050, 2059 | Progress watchdogs, explicit FIFO and published busy-agent waits. |
+| [Locked ripgrep in reusable test jobs](ci-locked-ripgrep-2048.md) | 2051 | Provision test-job ripgrep through locked PM setup. |
+| [TUI startup timeout process evidence](tui-startup-timeout-evidence-2048.md) | 2052 | Show screens and owned processes on startup timeout. |
+| [Disk plugin refresh exclusion during queued scans](desktop-disk-refresh-exclusion-2048.md) | 2053 | Respect queued scanner in-flight exclusion. |
+| [Delegate subscription reclaim error isolation](delegate-reclaim-error-isolation-2048.md) | 2055 | Keep healthy-board and remote notices despite reclamation errors. |
+| [Diké catalog corpus annotation](dike-catalog-corpus-2048.md) | 2056 | Comment-only pinned corpus clarification. |
+| [Reserved child configuration owner seeding](reserved-child-owner-seed-2048.md) | 2057–2058 | Preserve and classify reserved child first-turn configuration. |
+| [WAL replica heartbeat test fixture](replica-heartbeat-wal-fixture-2048.md) | 2060 | Match production WAL concurrency in the fixture. |
+| [Replica idempotency-key families in overlap checks](replica-overlap-key-family-2048.md) | 2061 | Consume published remote key families conservatively. |
+| [Busy-board activity fallback](kanban-busy-board-activity-2048.md) | 2062 | Reuse stale busy-board rows without suppressing healthy boards. |
+| [Launchd label propagation and missing-budget fallback](launchd-label-stop-budget-2048.md) | 2063 | Carry job label and diagnose assumed external stop budgets. |
+| [Exact-pin credential recheck](exact-pin-credential-recheck-2048.md) | 2064 | Retry brief credential misses once without pin failover. |
+| [Compaction output stubs and missing-image sibling hints](compaction-output-stubs.md) | 2065 | Decoded line counts, bounded edges, explicit elision and local image sibling hints. |
 
 ## Mirror follow-ups 2019–2029
 
@@ -1164,16 +1192,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **2029-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply twenty-seven bridges and three ancestry-only markers from `mirror-replay-2029.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **2065-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply thirty-eight bridges and three ancestry-only markers from `mirror-replay-2065.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 39115a6b6799f4935ee2263c1f6f5ff34cea4821 \
-  --base 6b21d0564de0492e2ebd0d8f63fca86c03b5c892 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2029.json" \
-  --replay-plan "$MODS/core/mirror-replay-2029.json"
+  --source-tip 134eca6553a85e6424e05373fd5b340ab49db811 \
+  --base 496706271914b585f402bfd070b01070cf289553 \
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2065.json" \
+  --replay-plan "$MODS/core/mirror-replay-2065.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1263,7 +1291,40 @@ git commit -m 'Explicit upstream integration bridge before 2021'
 git am -3 --empty=keep "${patches[@]:2020:5}"
 git apply --index --3way "$MODS/core/bridges/upstream-before-2026.diff"
 git commit -m 'Explicit upstream integration bridge before 2026'
-git am -3 --empty=keep "${patches[@]:2025:4}"
+git am -3 --empty=keep "${patches[@]:2025:7}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2033.diff"
+git commit -m 'Explicit upstream integration bridge before 2033'
+git am -3 --empty=keep "${patches[@]:2032:2}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2035.diff"
+git commit -m 'Explicit upstream integration bridge before 2035'
+git am -3 --empty=keep "${patches[@]:2034:5}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2040.diff"
+git commit -m 'Explicit upstream integration bridge before 2040'
+git am -3 --empty=keep "${patches[@]:2039:1}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2041.diff"
+git commit -m 'Explicit upstream integration bridge before 2041'
+git am -3 --empty=keep "${patches[@]:2040:1}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2042.diff"
+git commit -m 'Explicit upstream integration bridge before 2042'
+git am -3 --empty=keep "${patches[@]:2041:1}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2043.diff"
+git commit -m 'Explicit upstream integration bridge before 2043'
+git am -3 --empty=keep "${patches[@]:2042:1}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2044.diff"
+git commit -m 'Explicit upstream integration bridge before 2044'
+git am -3 --empty=keep "${patches[@]:2043:6}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2050.diff"
+git commit -m 'Explicit upstream integration bridge before 2050'
+git am -3 --empty=keep "${patches[@]:2049:3}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2053.diff"
+git commit -m 'Explicit upstream integration bridge before 2053'
+git am -3 --empty=keep "${patches[@]:2052:2}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2055.diff"
+git commit -m 'Explicit upstream integration bridge before 2055'
+git am -3 --empty=keep "${patches[@]:2054:7}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2062.diff"
+git commit -m 'Explicit upstream integration bridge before 2062'
+git am -3 --empty=keep "${patches[@]:2061:4}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

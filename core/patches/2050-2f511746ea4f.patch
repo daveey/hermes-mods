@@ -1,0 +1,165 @@
+From 2f511746ea4f2293d5cdc6fdfc022e56f2972c5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 13:13:20 +0000
+Subject: [PATCH] test: tolerate descheduled relay authority progress [daveey]
+
+---
+ .../gateway/fixtures/shared_authority_peer.py |  2 +-
+ tests/gateway/test_relay_authority.py         | 38 +++++++++++--------
+ 2 files changed, 24 insertions(+), 16 deletions(-)
+
+diff --git a/tests/gateway/fixtures/shared_authority_peer.py b/tests/gateway/fixtures/shared_authority_peer.py
+index c0b3c2bc1a4..3a483aa09e9 100644
+--- a/tests/gateway/fixtures/shared_authority_peer.py
++++ b/tests/gateway/fixtures/shared_authority_peer.py
+@@ -30,7 +30,7 @@ class ModelPeer(BaseHTTPRequestHandler):
+         reply = f"LOCAL_ACK_{marker}"
+         if 'BLOCK_FIFO' in json.dumps(last):
+             self.server.blocked.set()
+-            assert self.server.release.wait(15), 'fixture model gate timed out'
++            assert self.server.release.wait(getattr(self.server, 'release_timeout', 15)), 'fixture model gate timed out'
+         self.server.requests.append(request) if 'messages' in request else self.server.metadata_requests.append(request)
+         base = {"id": "chatcmpl-local", "model": "local-wire-stub", "created": 1}
+         self.send_response(200)
+diff --git a/tests/gateway/test_relay_authority.py b/tests/gateway/test_relay_authority.py
+index 04b40fd1537..13ccfaae28c 100644
+--- a/tests/gateway/test_relay_authority.py
++++ b/tests/gateway/test_relay_authority.py
+@@ -12,10 +12,17 @@ import sys
+ import time
+ 
+ 
++# Hang watchdogs, not latency assertions: shared runners can deschedule both
++# the websocket reader and database executor. Conditions still return at once.
++PROGRESS_TIMEOUT = 60
++MODEL_GATE_TIMEOUT = 2 * PROGRESS_TIMEOUT
++PROBE_TIMEOUT = 5 * PROGRESS_TIMEOUT
++
++
+ def test_authenticated_relay_uses_canonical_admission(tmp_path):
+     env = dict(os.environ, HOME=str(tmp_path), HERMES_HOME=str(tmp_path), PYTHONUNBUFFERED='1')
+     result = subprocess.run([sys.executable, __file__, 'peer'], env=env,
+-                            capture_output=True, text=True, timeout=100, check=False)
++                            capture_output=True, text=True, timeout=PROBE_TIMEOUT, check=False)
+     assert result.returncode == 0, result.stdout + result.stderr
+     receipt = json.loads((tmp_path / 'relay-receipt.json').read_text())
+     assert receipt['same_agent'] and receipt['negative_controls']
+@@ -82,15 +89,15 @@ async def probe(peer):
+         runner._wire_adapter_handlers(adapter)
+         api = await start_gateway_api(runner)
+         assert await adapter.connect()
+-        connector_ws = await asyncio.wait_for(ready.get(), 5)
++        connector_ws = await asyncio.wait_for(ready.get(), PROGRESS_TIMEOUT)
+         raw = {'text': 'MESSAGING_WARM', 'message_id': 'relay-1', 'source': {
+             'platform': 'telegram', 'chat_id': 'relay-chat', 'chat_type': 'dm', 'user_id': 'relay-user'}}
+ 
+         async def send(raw_event):
+             await connector_ws.send(json.dumps({'type': 'inbound', 'event': raw_event,
+                                                'bufferId': raw_event['message_id']}) + '\n')
+-            deadline = time.monotonic() + 25
+-            async with asyncio.timeout(25):
++            deadline = time.monotonic() + PROGRESS_TIMEOUT
++            async with asyncio.timeout(PROGRESS_TIMEOUT):
+                 while time.monotonic() < deadline:
+                     entries = list(authority.sessions.values())
+                     rows = list_session_admissions(authority.db, session_id=next(iter(authority.sessions)),
+@@ -102,7 +109,7 @@ async def probe(peer):
+                         # returned. Closing the connector before then drops the final mid-send.
+                         await async_wait_until(lambda: not adapter._active_sessions
+                                                and settled[0]['admission_id'] not in authority.pending_deliveries,
+-                                               timeout=25, what='the settled reply handed to the connector')
++                                               timeout=PROGRESS_TIMEOUT, what='the settled reply handed to the connector')
+                         assert any(f.get('type') == 'inbound_ack' and f.get('bufferId') == raw_event['message_id']
+                                    for f in outgoing), outgoing
+                         return rows
+@@ -119,9 +126,9 @@ async def probe(peer):
+             authority.db._execute_write(lambda conn: conn.execute("CREATE TRIGGER fail_relay BEFORE INSERT ON session_admissions BEGIN SELECT ingress_failure_witness(); SELECT RAISE(ABORT, 'owned storage failure'); END"))
+             await connector_ws.send(json.dumps({'type': 'inbound', 'event': raw,
+                                                'bufferId': 'durable-buffer-1'}) + '\n')
+-            await asyncio.wait_for(failed_insert.wait(), 10)
++            await asyncio.wait_for(failed_insert.wait(), PROGRESS_TIMEOUT)
+             await connector_ws.close()
+-            connector_ws = await asyncio.wait_for(ready.get(), 5)
++            connector_ws = await asyncio.wait_for(ready.get(), PROGRESS_TIMEOUT)
+             assert not any(f.get('type') == 'inbound_ack' for f in outgoing), outgoing
+             assert not peer.requests
+             authority.db._execute_write(lambda conn: conn.execute('DROP TRIGGER fail_relay'))
+@@ -133,7 +140,7 @@ async def probe(peer):
+             async with websockets.connect(f'ws://127.0.0.1:{port}/api/ws?token={web_server._SESSION_TOKEN}') as ws:
+                 async def rpc(method, **params):
+                     await ws.send(json.dumps({'jsonrpc': '2.0', 'id': method, 'method': method, 'params': params}))
+-                    async with asyncio.timeout(20):
++                    async with asyncio.timeout(PROGRESS_TIMEOUT):
+                         while True:
+                             frame = json.loads(await ws.recv())
+                             frames.append(frame)
+@@ -142,7 +149,7 @@ async def probe(peer):
+                 resumed = await rpc('session.resume', session_id=sid)
+                 assert 'result' in resumed, resumed
+                 await connector_ws.close()
+-                connector_ws = await asyncio.wait_for(ready.get(), 5)
++                connector_ws = await asyncio.wait_for(ready.get(), PROGRESS_TIMEOUT)
+                 # Replayed delivery must not infer or produce another final.
+                 await connector_ws.send(json.dumps({'type': 'inbound', 'event': raw}) + '\n')
+                 second = deepcopy(raw)
+@@ -151,7 +158,7 @@ async def probe(peer):
+                 # Settlement and an RPC reply do not drain the fanout writer.
+                 # Observe this admission's terminal event before taking a snapshot.
+                 admission_id = next(r['admission_id'] for r in rows if r['request_id'] == 'relay-2')
+-                async with asyncio.timeout(10):
++                async with asyncio.timeout(PROGRESS_TIMEOUT):
+                     while not any(f.get('params', {}).get('type') == 'message.complete'
+                                   and f['params'].get('admission_id') == admission_id for f in frames):
+                         frames.append(json.loads(await ws.recv()))
+@@ -170,19 +177,19 @@ async def probe(peer):
+                 blocked = deepcopy(raw)
+                 blocked.update(message_id='relay-3', text='BLOCK_FIFO')
+                 await connector_ws.send(json.dumps({'type': 'inbound', 'event': blocked}) + '\n')
+-                assert await asyncio.to_thread(peer.blocked.wait, 5)
++                assert await asyncio.to_thread(peer.blocked.wait, PROGRESS_TIMEOUT)
+                 queued = deepcopy(raw)
+                 queued.update(message_id='relay-4', text='QUEUED_AFTER_BLOCK')
+                 await connector_ws.send(json.dumps({'type': 'inbound', 'event': queued}) + '\n')
+                 try:
+                     await async_wait_until(lambda: any(r['request_id'] == 'relay-4' for r in list_session_admissions(
+-                        authority.db, session_id=sid, pending_only=False)), timeout=5, what='relay-4 admitted')
++                        authority.db, session_id=sid, pending_only=False)), timeout=PROGRESS_TIMEOUT, what='relay-4 admitted')
+                     assert not adapter._pending_messages
+                 finally:
+                     peer.release.set()
+                 await async_wait_until(lambda: not (any(not task.done() for task in adapter._background_tasks) or any(
+                     r['status'] != 'terminal' for r in list_session_admissions(authority.db, session_id=sid, pending_only=False))
+-                    or authority.pending_deliveries), timeout=10, what='every relay admission settled and delivered')
++                    or authority.pending_deliveries), timeout=PROGRESS_TIMEOUT, what='every relay admission settled and delivered')
+                 rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+                 assert len(peer.requests) == 4, peer.requests
+                 payload = rows[0]['payload']
+@@ -223,7 +230,7 @@ async def probe(peer):
+                 runner._wire_adapter_handlers(replacement)
+                 try:
+                     assert await replacement.connect()
+-                    await asyncio.wait_for(ready.get(), 5)
++                    await asyncio.wait_for(ready.get(), PROGRESS_TIMEOUT)
+                     try:
+                         restore_native(payload, runner)
+                     except RuntimeStoreError:
+@@ -238,7 +245,7 @@ async def probe(peer):
+                 # 4401 must revoke queued provenance, not grant on a cached descriptor.
+                 revoke = True
+                 await connector_ws.close(code=4401, reason='revoked')
+-                await async_wait_until(lambda: transport.auth_revoked, timeout=5, what='the connector auth revoked')
++                await async_wait_until(lambda: transport.auth_revoked, timeout=PROGRESS_TIMEOUT, what='the connector auth revoked')
+                 try:
+                     restore_native(payload, runner)
+                 except RuntimeStoreError:
+@@ -268,6 +275,7 @@ def main():
+     peer = ThreadingHTTPServer(('127.0.0.1', 0), ModelPeer)
+     peer.requests, peer.metadata_requests = [], []
+     peer.blocked, peer.release = threading.Event(), threading.Event()
++    peer.release_timeout = MODEL_GATE_TIMEOUT
+     threading.Thread(target=peer.serve_forever, daemon=True).start()
+     url = f'http://127.0.0.1:{peer.server_port}/v1'
+     os.environ.update(OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+-- 
+2.55.0
+

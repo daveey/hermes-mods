@@ -1,0 +1,832 @@
+diff --git a/agent/auxiliary_error_policy.py b/agent/auxiliary_error_policy.py
+index 2dbeac5673e..49d7979a555 100644
+--- a/agent/auxiliary_error_policy.py
++++ b/agent/auxiliary_error_policy.py
+@@ -53,6 +53,8 @@ def classify_attempt(error: Exception, provider: Optional[str], client: Any = No
+                      base_url: Optional[str] = "") -> ClassifiedError:
+     """``classify_api_error`` on the backend, model, endpoint and credential ``client`` was sent to."""
+     slug = str(provider or "").strip().lower()
++    import httpx  # late: this module sits on the bootstrap/conftest import chain, which has no httpx
++
+     url, key = getattr(client, "base_url", None), getattr(client, "api_key", None)
+     if is_cancellation(error):  # a cancelled task: no retry, no other provider
+         return ClassifiedError(_R.unknown, provider=slug, retryable=False, message=str(error),
+diff --git a/contributors/emails/yzwang0408@proton.me b/contributors/emails/yzwang0408@proton.me
+new file mode 100644
+index 00000000000..5e144715396
+--- /dev/null
++++ b/contributors/emails/yzwang0408@proton.me
+@@ -0,0 +1 @@
++n0ctx
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index cf0a7116b9d..2f5ac0773f0 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -504,6 +504,27 @@ def stamp_legacy_hub_sub_provenance(conn: sqlite3.Connection) -> int:
+     return len(rows)
+ 
+ 
++def retarget_notify_subs(
++    conn: sqlite3.Connection, *, platform: str, from_chat_ids: Iterable[str], to_chat_id: str,
++) -> int:
++    """Re-key subscriptions bound to any of ``from_chat_ids`` onto ``to_chat_id`` (cursor kept), returning
++    how many moved. A row whose new key already exists is dropped: the owner's own subscription wins."""
++    ids = sorted({c for c in from_chat_ids if c and c != to_chat_id})
++    if not ids:
++        return 0
++    moved = 0
++    with _kb.write_txn(conn):
++        for start in range(0, len(ids), 500):
++            chunk = ids[start:start + 500]
++            where = f"LOWER(platform) = LOWER(?) AND chat_id IN ({','.join('?' * len(chunk))})"
++            moved += conn.execute(
++                f"UPDATE OR IGNORE kanban_notify_subs SET chat_id = ? WHERE {where}", (to_chat_id, platform, *chunk),
++            ).rowcount
++            conn.execute(f"DELETE FROM kanban_notify_subs WHERE {where}", (platform, *chunk))
++    return moved
++
++
++
+ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int = 30) -> int:
+     """Delete notify subs whose task sat in ``done``/``blocked`` untouched for
+     longer than ``max_age_days`` (``<= 0`` disables); returns rows deleted.
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 4b405b02ab4..d1ff044b122 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -299,7 +299,8 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
+ # (schema_read_probe_statements), never by this number, and its catch-up is the declarative
+ # executescript(SCHEMA_SQL) + _reconcile_columns() every writable open already runs (additive,
+ # idempotent). The bump only records that the declared shape changed; a new table or column needs no bump.
+-SCHEMA_VERSION = 32
++# v33: data-only — re-tag delegate subagent rows that lost ``_delegate_from`` (see _run_data_migrations).
++SCHEMA_VERSION = 33
+ 
+ # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
+ # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
+diff --git a/hermes_state_delegate_children.py b/hermes_state_delegate_children.py
+new file mode 100644
+index 00000000000..cfffb42787a
+--- /dev/null
++++ b/hermes_state_delegate_children.py
+@@ -0,0 +1,39 @@
++"""Marked delegate subagents owned by one session's lineage (#150198).
++
++Kept beside hermes_state_sessions (at its line cap): the TUI kanban poller uses it to reclaim
++subscriptions that ``kanban_create`` bound to a subagent while that subagent's row lacked its
++``_delegate_from`` marker.
++"""
++
++from __future__ import annotations
++
++from hermes_state_sessions import _collect_delegate_child_ids, _parse_model_config
++
++
++def delegate_descendant_ids(db, session_id: str) -> list[str]:
++    """Marked delegate subagents (recursive, with their compression continuations) of ``session_id`` and the
++    compression segments it continues.
++
++    The walk up stops at a delegate or branch row: those are not continuations of their parent, and a
++    subagent must never claim its parent's children. A delegate ``session_id`` itself has none.
++    """
++    seeds: list[str] = []
++    for sid in reversed(db._session_lineage_root_to_tip(session_id)):
++        row = db._read_one("SELECT model_config FROM sessions WHERE id = ?", (sid,))
++        config = _parse_model_config(row[0]) if row is not None else {}
++        if config.get("_delegate_from"):
++            break
++        seeds.append(sid)
++        if config.get("_branched_from"):
++            break
++    # A misrouted child resumed as the chat can have compression continuations; v33 leaves those
++    # unmarked (they ARE continuations), but the pre-fix resolver saved subscriptions under their ids.
++    found: list[str] = []
++    frontier = seeds
++    while frontier:
++        with db._read_ctx() as conn:
++            children = [c for c in _collect_delegate_child_ids(conn, frontier) if c not in found]
++        segments = [seg for c in children for seg in db.get_compression_chain(c)]
++        frontier = [seg for seg in dict.fromkeys(segments) if seg not in found]
++        found.extend(frontier)
++    return found
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 20e8a32fb26..cb38c7500c3 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -1103,6 +1103,24 @@ class SessionSchemaMixin:
+         if current_version < 25:
+             # v25: de-duplicate system prompt snapshots (old column stays a read fallback).
+             self._dedupe_legacy_system_prompts(cursor)
++        if current_version < 33:
++            # v33: re-tag delegate subagent rows whose reservation-time row lost ``_delegate_from`` to the
++            # keep-existing upsert (an early first-turn model_config patch froze it). Untagged, the parent's
++            # resume tip walk followed the child as a continuation and opened the subagent transcript.
++            # source='subagent' alone: the reservation path always wrote it, and v16 already covered the rest.
++            # Skip compression continuations of subagent rows: a misrouted child resumed as the chat wrote
++            # its continuation as source='subagent' without the marker, and it must stay a continuation.
++            # json_valid: one malformed model_config would make json_set raise and drop the whole UPDATE.
++            with contextlib.suppress(sqlite3.OperationalError):
++                cursor.execute(
++                    "UPDATE sessions SET model_config = json_set("
++                    "COALESCE(model_config, '{}'), '$._delegate_from', parent_session_id) "
++                    "WHERE source = 'subagent' AND parent_session_id IS NOT NULL "
++                    "AND json_valid(COALESCE(model_config, '{}')) "
++                    f"AND {_sql_json_extract('model_config', '$._delegate_from')} IS NULL "
++                    "AND NOT EXISTS (SELECT 1 FROM sessions p WHERE p.id = sessions.parent_session_id "
++                    "AND p.source = 'subagent' AND p.end_reason = 'compression')"
++                )
+         self._advance_message_uid_backfill(cursor)
+         fts_migrations_complete = True
+         if current_version < 30 and fts5_available:
+diff --git a/plugin-catalog/fitbit-mcp.yaml b/plugin-catalog/fitbit-mcp.yaml
+new file mode 100644
+index 00000000000..05cb1ab3c62
+--- /dev/null
++++ b/plugin-catalog/fitbit-mcp.yaml
+@@ -0,0 +1,19 @@
++name: fitbit-mcp
++title: Fitbit
++repo: https://github.com/davidmosiah/fitbit-mcp
++sha: "c669895c6c96ded8c35978c7461c02dbed7fa0fc"
++subdir: agent-plugin
++description: "Read the user's Fitbit activity, heart rate, sleep and body data through the local fitbit MCP server. Portable Agent Plugins v1 package (mcp.json + skills/). Disclosure — Unofficial connector, not affiliated with Fitbit. Runs the `fitbit-mcp-unofficial@0.7.0` npm package locally over stdio through `npx` (Node.js 20+ required); the package and its dependencies are downloaded from npm on first start. Data source: the official Fitbit Web API. The user creates their own Fitbit developer app; its client ID and secret and the OAuth tokens are created by the connector's own `setup`/`auth` commands in the user's terminal, stored under `~/.fitbit-mcp/` and refreshed by the connector itself, and sent only to Fitbit's API; the plugin declares no environment variables and reads no Hermes credentials. It also keeps a wellness profile shared with the author's other connectors at `~/.delx-wellness/profile.json` (first run copies an existing `~/.hermes/profiles/delx-wellness/wellness-profile.json` there), and its connection-status tool reads `~/.hermes/config.yaml` to check for an MCP block. Tools that change state: fitbit_profile_update (local profile only); fitbit_exchange_code (stores OAuth tokens locally); fitbit_revoke_access (revokes the Fitbit grant and deletes local tokens). The tool set comes from the pinned npm version, not from this repository's source tree."
++maintainer: davidmosiah
++tier: community
++category: tools
++version: "0.7.0"
++requires_hermes: ">=0.21.5"
++docs_url: https://github.com/davidmosiah/fitbit-mcp/blob/c669895c6c96ded8c35978c7461c02dbed7fa0fc/agent-plugin/README.md
++image: https://raw.githubusercontent.com/davidmosiah/fitbit-mcp/c669895c6c96ded8c35978c7461c02dbed7fa0fc/assets/banner.png
++platforms: []
++capabilities:
++  provides_tools: []
++  provides_hooks: []
++  provides_middleware: []
++  requires_env: []
+diff --git a/plugin-catalog/oura-mcp.yaml b/plugin-catalog/oura-mcp.yaml
+new file mode 100644
+index 00000000000..cba31b32a22
+--- /dev/null
++++ b/plugin-catalog/oura-mcp.yaml
+@@ -0,0 +1,19 @@
++name: oura-mcp
++title: Oura
++repo: https://github.com/davidmosiah/oura-mcp
++sha: "0f73130546ddfc0f9714f9fe1ea06578b6564ac1"
++subdir: agent-plugin
++description: "Read the user's Oura Ring readiness, sleep, HRV and activity through the local oura MCP server. Portable Agent Plugins v1 package (mcp.json + skills/). Disclosure — Unofficial connector, not affiliated with Oura. Runs the `oura-mcp-unofficial@0.8.0` npm package locally over stdio through `npx` (Node.js 20+ required); the package and its dependencies are downloaded from npm on first start. Data source: the official Oura Cloud API v2. The user creates their own Oura developer app; its client ID and secret and the OAuth tokens are created by the connector's own `setup`/`auth` commands in the user's terminal, stored under `~/.oura-mcp/` and refreshed by the connector itself, and sent only to Oura's API; the plugin declares no environment variables and reads no Hermes credentials. It also keeps a wellness profile shared with the author's other connectors at `~/.delx-wellness/profile.json` (first run copies an existing `~/.hermes/profiles/delx-wellness/wellness-profile.json` there), and its connection-status tool reads `~/.hermes/config.yaml` to check for an MCP block. Tools that change state: oura_profile_update (local profile only); oura_exchange_code (stores OAuth tokens locally); oura_revoke_access (revokes the Oura grant and deletes local tokens). The tool set comes from the pinned npm version, not from this repository's source tree."
++maintainer: davidmosiah
++tier: community
++category: tools
++version: "0.8.0"
++requires_hermes: ">=0.21.5"
++docs_url: https://github.com/davidmosiah/oura-mcp/blob/0f73130546ddfc0f9714f9fe1ea06578b6564ac1/agent-plugin/README.md
++image: https://raw.githubusercontent.com/davidmosiah/oura-mcp/0f73130546ddfc0f9714f9fe1ea06578b6564ac1/assets/banner.png
++platforms: []
++capabilities:
++  provides_tools: []
++  provides_hooks: []
++  provides_middleware: []
++  requires_env: []
+diff --git a/plugin-catalog/whoop-mcp.yaml b/plugin-catalog/whoop-mcp.yaml
+new file mode 100644
+index 00000000000..703a3c99f35
+--- /dev/null
++++ b/plugin-catalog/whoop-mcp.yaml
+@@ -0,0 +1,19 @@
++name: whoop-mcp
++title: WHOOP
++repo: https://github.com/davidmosiah/whoop-mcp
++sha: "d15516fa2671e9749d43531fe0f1f447d5632686"
++subdir: agent-plugin
++description: "Read the user's WHOOP recovery, HRV, sleep and strain through the local whoop MCP server. Portable Agent Plugins v1 package (mcp.json + skills/). Disclosure — Unofficial connector, not affiliated with WHOOP. Runs the `whoop-mcp-unofficial@0.7.0` npm package locally over stdio through `npx` (Node.js 20+ required); the package and its dependencies are downloaded from npm on first start. Data source: the official WHOOP OAuth API (v2). The user creates their own WHOOP developer app; its client ID and secret and the OAuth tokens are created by the connector's own `setup`/`auth` commands in the user's terminal, stored under `~/.whoop-mcp/` and refreshed by the connector itself, and sent only to WHOOP's API; the plugin declares no environment variables and reads no Hermes credentials. It also keeps a wellness profile shared with the author's other connectors at `~/.delx-wellness/profile.json` (first run copies an existing `~/.hermes/profiles/delx-wellness/wellness-profile.json` there), and its connection-status tool reads `~/.hermes/config.yaml` to check for an MCP block. Tools that change state: whoop_profile_update (local profile only); whoop_exchange_code (stores OAuth tokens locally); whoop_revoke_access (revokes the WHOOP grant and deletes local tokens). The tool set comes from the pinned npm version, not from this repository's source tree."
++maintainer: davidmosiah
++tier: community
++category: tools
++version: "0.7.0"
++requires_hermes: ">=0.21.5"
++docs_url: https://github.com/davidmosiah/whoop-mcp/blob/d15516fa2671e9749d43531fe0f1f447d5632686/agent-plugin/README.md
++image: https://raw.githubusercontent.com/davidmosiah/whoop-mcp/d15516fa2671e9749d43531fe0f1f447d5632686/assets/banner.png
++platforms: []
++capabilities:
++  provides_tools: []
++  provides_hooks: []
++  provides_middleware: []
++  requires_env: []
+diff --git a/run_agent.py b/run_agent.py
+index 8932df9972b..1a7faa58f65 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -342,6 +342,13 @@ class AIAgent(
+                 origin_json=_gateway_origin_json(self), parent_session_id=self._parent_session_id,
+                 cwd=_launch_cwd_for_session(source), profile_name=profile_for_session,
+             )
++            if getattr(self, "_session_db_reserved", False) is True:
++                # A reserved child row already exists, and first-turn writers (prompt-refresh epoch,
++                # usage anchor) may have patched its model_config before this create, so the
++                # keep-existing upsert dropped the constructor config. Merge it beside them.
++                patch = {k: v for k, v in (self._session_row_model_config() or {}).items() if v is not None}
++                if patch:
++                    self._session_db.patch_session_model_config(self.session_id, patch)
+             self._session_db_created = True
+             if source == "kanban":
+                 from hermes_cli.kanban_worker_recovery import register_worker_session
+diff --git a/scripts/whatsapp-bridge/passkey_socket.test.mjs b/scripts/whatsapp-bridge/passkey_socket.test.mjs
+index fb8e9686b9d..e3d55ba913e 100644
+--- a/scripts/whatsapp-bridge/passkey_socket.test.mjs
++++ b/scripts/whatsapp-bridge/passkey_socket.test.mjs
+@@ -248,6 +248,28 @@ test('a superseding prologue request proves the handoff with the secret from the
+   sock.ev.emit('connection.update', { connection: 'close' });
+ });
+ 
++test('a request after the first prologue was sent still proves the handoff with the QR secret', async () => {
++  const sock = socket();
++  const qrSecret = sock.authState.creds.advSecretKey;
++  const prologues = [];
++  sock.query = async node => {
++    if (node.content[0].tag === 'passkey_prologue') prologues.push(node.content[0].content);
++    return refReply();
++  };
++  attachPasskeyFlow(sock, { logger, confirmCode: async () => {}, signAssertion: async () => assertion });
++  sock.ws.emit('CB:notification', request());
++  await settle();
++  sock.ws.emit('CB:notification', request());
++  await settle();
++  assert.equal(prologues.length, 2);
++  const key = hkdf(Buffer.from(qrSecret, 'base64'), 32, { info: 'shortcake-passkey-handoff-v1' });
++  for (const prologue of prologues) {
++    const leaf = name => prologue.find(child => child.tag === name)?.content;
++    assert.deepEqual(Buffer.from(leaf('pairing_handoff_proof')), Buffer.from(hmacSign(leaf('prologue_payload'), key)));
++  }
++  sock.ev.emit('connection.update', { connection: 'close' });
++});
++
+ test('superseding an attempt whose browser call fails with a plain error keeps the bridge pairing', async () => {
+   const sock = socket();
+   const errors = [];
+diff --git a/tests/hermes_state/test_delegate_marker_backfill_v33.py b/tests/hermes_state/test_delegate_marker_backfill_v33.py
+new file mode 100644
+index 00000000000..13559b2504d
+--- /dev/null
++++ b/tests/hermes_state/test_delegate_marker_backfill_v33.py
+@@ -0,0 +1,109 @@
++"""v33 re-tags subagent rows that lost ``_delegate_from`` before their first turn.
++
++A reserved child row whose model_config was patched before the constructor
++create kept the patch and dropped the marker. The parent's resume tip walk then
++followed the child as a continuation, so opening the parent showed the subagent.
++"""
++
++from __future__ import annotations
++
++import json
++
++from hermes_state import SessionDB
++from hermes_state_common import SCHEMA_VERSION
++
++
++def _config(db: SessionDB, session_id: str) -> dict:
++    raw = db._conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()[0]
++    return json.loads(raw) if raw else {}
++
++
++def test_v33_retags_unmarked_subagent_children_and_parent_resumes_itself(tmp_path):
++    db_path = tmp_path / "state.db"
++    old = SessionDB(db_path=db_path)
++    old.create_session("parent", source="desktop")
++    old.create_session("kid", source="subagent", parent_session_id="parent")
++    # The shape the regression left behind: the early patch survived, the marker did not.
++    old._conn.execute("UPDATE sessions SET model_config = ? WHERE id = 'kid'",
++                      (json.dumps({"prompt_refresh_epoch": 17}),))
++    # A continuation that is not a subagent must stay a continuation.
++    old.create_session("cont-root", source="cli")
++    old.create_session("cont", source="cli", parent_session_id="cont-root")
++    old.append_message("parent", "user", "parent turn")
++    old.append_message("kid", "assistant", "child report")
++    old.append_message("cont", "user", "continued turn")
++    old._conn.commit()
++    assert old.resolve_resume_session_id("parent") == "kid"
++    old._conn.execute("UPDATE schema_version SET version = 32")
++    old._conn.commit()
++    old.close()
++
++    migrated = SessionDB(db_path=db_path)
++    try:
++        assert _config(migrated, "kid") == {"prompt_refresh_epoch": 17, "_delegate_from": "parent"}
++        assert "_delegate_from" not in _config(migrated, "cont")
++        assert migrated.resolve_resume_session_id("parent") == "parent"
++        assert migrated.resolve_resume_session_id("cont-root") == "cont"
++        assert migrated._conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
++    finally:
++        migrated.close()
++
++
++def _downgrade_to_v32(db: SessionDB) -> None:
++    db._conn.execute("UPDATE schema_version SET version = 32")
++    db._conn.commit()
++    db.close()
++
++
++def test_v33_skips_compression_continuation_of_an_unmarked_child(tmp_path):
++    # While the bug was live, Desktop resumed the child as the chat on an agent without the marker. If
++    # that conversation compressed, the continuation was written source='subagent' with no marker.
++    db_path = tmp_path / "state.db"
++    old = SessionDB(db_path=db_path)
++    old.create_session("parent", source="desktop")
++    old.create_session("kid", source="subagent", parent_session_id="parent")
++    old._conn.execute("UPDATE sessions SET model_config = ? WHERE id = 'kid'",
++                      (json.dumps({"prompt_refresh_epoch": 17}),))
++    old.append_message("parent", "user", "parent turn")
++    old.append_message("kid", "assistant", "child report")
++    old.end_session("kid", "compression")
++    old.create_session("kid-cont", source="subagent", parent_session_id="kid")
++    old.append_message("kid-cont", "user", "typed after compression")
++    old._conn.commit()
++    assert old.get_compression_tip("kid") == "kid-cont"
++    _downgrade_to_v32(old)
++
++    migrated = SessionDB(db_path=db_path)
++    try:
++        assert _config(migrated, "kid")["_delegate_from"] == "parent"
++        assert "_delegate_from" not in _config(migrated, "kid-cont")
++        assert migrated.get_compression_tip("kid") == "kid-cont"
++        assert migrated.resolve_resume_session_id("kid") == "kid-cont"
++        assert migrated.resolve_resume_session_id("parent") == "parent"
++    finally:
++        migrated.close()
++
++
++def test_v33_heals_the_rest_of_the_store_past_a_malformed_model_config(tmp_path):
++    db_path = tmp_path / "state.db"
++    old = SessionDB(db_path=db_path)
++    old.create_session("parent", source="desktop")
++    old.create_session("bad", source="subagent", parent_session_id="parent")
++    old.create_session("kid", source="subagent", parent_session_id="parent")
++    old._conn.execute("UPDATE sessions SET model_config = '{not json' WHERE id = 'bad'")
++    old._conn.execute("UPDATE sessions SET model_config = ? WHERE id = 'kid'",
++                      (json.dumps({"prompt_refresh_epoch": 17}),))
++    old.append_message("parent", "user", "parent turn")
++    old.append_message("kid", "assistant", "child report")
++    old._conn.commit()
++    assert old.resolve_resume_session_id("parent") == "kid"
++    _downgrade_to_v32(old)
++
++    migrated = SessionDB(db_path=db_path)
++    try:
++        assert _config(migrated, "kid") == {"prompt_refresh_epoch": 17, "_delegate_from": "parent"}
++        raw_bad = migrated._conn.execute("SELECT model_config FROM sessions WHERE id = 'bad'").fetchone()[0]
++        assert raw_bad == "{not json"
++        assert migrated.resolve_resume_session_id("parent") == "parent"
++    finally:
++        migrated.close()
+diff --git a/tests/tools/test_delegate_transcript_readiness.py b/tests/tools/test_delegate_transcript_readiness.py
+index 1a63e9889a3..24b50646afe 100644
+--- a/tests/tools/test_delegate_transcript_readiness.py
++++ b/tests/tools/test_delegate_transcript_readiness.py
+@@ -9,6 +9,7 @@ from types import SimpleNamespace
+ import pytest
+ 
+ from tests.gateway.test_stored_history_mount import _connect
++from agent.prompt_refresh import stamp_prompt_epoch
+ from agent.turn_facade_lease import admit_durable_turn_lease
+ from tools.delegate_tool import _build_child_agent
+ 
+@@ -96,7 +97,8 @@ async def test_published_children_open_before_any_child_starts(
+             assert row is not None
+             assert row["source"] == "subagent"
+             assert row["parent_session_id"] == parent_ref.session_id
+-            assert row["model_config"] is None
++            # Only the lineage marker: the rest of the constructor config lands on the first turn.
++            assert json.loads(row["model_config"]) == {"_delegate_from": parent_ref.session_id}
+             assert not child._session_db_created
+             reply = await connection.dispatch(
+                 {
+@@ -128,11 +130,23 @@ async def test_published_children_open_before_any_child_starts(
+                 assert not child._session_db_created
+                 child._session_init_model_config["synthetic_startup_setting"] = "ready"
+                 child._cached_system_prompt = "Synthetic completed prompt"
++                # The real first turn stamps the prompt-refresh epoch (any profile that ran
++                # refresh-prompts) BEFORE the constructor create; that early patch must not
++                # freeze the reserved row's config and drop the lineage marker.
++                stamp_prompt_epoch(child, 17)
+                 child._ensure_db_session()
+                 ready = connection.authority.db.get_session(sid)
+                 config = json.loads(ready["model_config"])
+                 assert config["_delegate_from"] == parent_ref.session_id
+                 assert config["synthetic_startup_setting"] == "ready"
++                assert config["max_iterations"] == 2
++                assert config["prompt_refresh_epoch"] == 17
++                # Without the marker the parent's resume followed the child as a continuation,
++                # so opening the parent showed the subagent transcript.
++                db = connection.authority.db
++                db.append_message(parent_ref.session_id, "user", "parent turn")
++                db.append_message(sid, "assistant", "child report")
++                assert db.resolve_resume_session_id(parent_ref.session_id) == parent_ref.session_id
+                 assert ready["system_prompt"] == "Synthetic completed prompt"
+                 assert ready["model"] == "synthetic-model"
+                 assert child._session_db_created
+diff --git a/tests/tools/test_process_registry.py b/tests/tools/test_process_registry.py
+index 7ba89d762c7..775a0aa46fe 100644
+--- a/tests/tools/test_process_registry.py
++++ b/tests/tools/test_process_registry.py
+@@ -26,8 +26,9 @@ orphan_pipe = process_registry_fixtures.orphan_pipe
+ 
+ 
+ @pytest.fixture()
+-def registry():
+-    """Create a fresh ProcessRegistry."""
++def registry(monkeypatch):
++    """A fresh ProcessRegistry. Fake Popen pids never reach the owner-death supervisor: a live pgid would start it."""
++    monkeypatch.setattr("hermes_cli.process_identity._update_supervised_pgids", lambda verb, pgids: None)
+     return ProcessRegistry()
+ 
+ 
+@@ -1191,7 +1192,6 @@ class TestSpawnRewriteCompoundBackground:
+         # The command handed to the login shell (via env) is the REWRITTEN version
+         assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd
+ 
+-
+     def test_pty_path_uses_rewritten_command(self, registry):
+         """PTY spawn path must also use the rewritten command (issue #68915)."""
+         mock_pty_proc = MagicMock()
+diff --git a/tests/tui_gateway/test_delegate_completion_routing.py b/tests/tui_gateway/test_delegate_completion_routing.py
+new file mode 100644
+index 00000000000..d0291377811
+--- /dev/null
++++ b/tests/tui_gateway/test_delegate_completion_routing.py
+@@ -0,0 +1,103 @@
++"""A delegate child must never claim its parent's completion as a continuation.
++
++Regression for the completion-routing repro on PR #150198: use the real child
++reservation, first-turn metadata writers and SessionDB, not a stubbed resolver.
++"""
++
++import queue
++import threading
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from agent.prompt_refresh import stamp_prompt_epoch
++from hermes_state import SessionDB
++from tests.tools import test_delegate_transcript_readiness as transcript_readiness
++from tools.delegate_tool import _build_child_agent
++from tools.process_registry_notifications import format_process_notification
++from tui_gateway import server
++
++
++offline_children = transcript_readiness.offline_children
++
++
++@pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
++@pytest.mark.parametrize("compressed", [False, True], ids=["parent", "compression-tip"])
++def test_parent_completion_never_delivered_to_delegate_child(
++    tmp_path, monkeypatch, offline_children, event_type, compressed
++):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    child = None
++    try:
++        db.create_session("parent", source="desktop")
++        db.append_message("parent", "user", "Delegate an inspection")
++        owner_key = "parent"
++        if compressed:
++            db.publish_compression_child(
++                parent_session_id="parent", child_session_id="tip", source="desktop",
++                messages=[{"role": "user", "content": "Continue the inspection"}],
++                require_compression_lease=False,
++            )
++            owner_key = "tip"
++        child = _build_child_agent(
++            task_index=0, goal="Synthetic inspection", context=None, toolsets=["file"],
++            model=None, max_iterations=2, task_count=1,
++            parent_agent=transcript_readiness._parent(db, owner_key, lambda *a, **kw: None),
++        )
++        # On a refreshed profile this precedes _ensure_db_session. Without the
++        # writer fix it freezes model_config without _delegate_from.
++        stamp_prompt_epoch(child, 17)
++        child._ensure_db_session()
++        db.append_message(child.session_id, "assistant", "Inspection complete")
++
++        owner = {"session_key": owner_key, "agent": None, "running": False,
++                 "history_lock": threading.RLock()}
++        child_ui = {"session_key": child.session_id, "agent": None, "running": False,
++                    "history_lock": threading.RLock()}
++        monkeypatch.setattr(server, "_sessions", {"parent-ui": owner, "child-ui": child_ui})
++        # Keep the real profile-aware DB context and resolver; only select the
++        # isolated store. No model turn or unrelated delivery ledger is needed.
++        monkeypatch.setattr(server, "_get_db", lambda: db)
++        submit = Mock(return_value=True)
++        emit = Mock()
++        monkeypatch.setattr(server, "_run_prompt_submit", submit)
++        monkeypatch.setattr(server, "_emit", emit)
++        monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda *a: "claim")
++        monkeypatch.setattr("tools.async_delegation.complete_event_delivery", lambda *a: None)
++        registry = SimpleNamespace(completion_queue=queue.Queue(), is_completion_consumed=lambda _sid: False)
++        event = {"type": event_type, "session_key": "parent"}
++        if event_type == "async_delegation":
++            # The original tab is gone, so the durable lineage must decide who
++            # receives the result; a live origin would bypass the faulty walk.
++            event.update(delegation_id="parent-batch", origin_ui_session_id="closed-ui",
++                         results=[{"status": "completed", "summary": "Inspection complete"}])
++        else:
++            event.update(session_id="proc-parent", command="inspect", exit_code=0,
++                         completion_reason="exited", output="Inspection complete")
++
++        # Let the delegate's poller see it first, as in the live incident. It
++        # must neither emit a status nor inject a turn, and must retain the event.
++        deferred = []
++        server._notif_handle_ready(
++            "child-ui", child_ui, [event], set(), registry, format_process_notification, deferred)
++        submit.assert_not_called()
++        emit.assert_not_called()
++        assert deferred == [event]
++        assert not child_ui["running"]
++
++        # The parent (or its real compression continuation) must still receive
++        # the retained event. This prevents a false fix that merely drops it.
++        retained = []
++        server._notif_handle_ready(
++            "parent-ui", owner, deferred, set(), registry, format_process_notification, retained)
++        submit.assert_called_once()
++        assert submit.call_args.args[1] == "parent-ui"
++        assert submit.call_args.args[2] is owner
++        assert "Inspection complete" in submit.call_args.args[3]
++        assert retained == []
++        assert registry.completion_queue.empty()
++    finally:
++        if child is not None:
++            child.close()
++        db.close()
+diff --git a/tests/tui_gateway/test_kanban_stray_delegate_subs.py b/tests/tui_gateway/test_kanban_stray_delegate_subs.py
+new file mode 100644
+index 00000000000..fe4e920978f
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_stray_delegate_subs.py
+@@ -0,0 +1,142 @@
++"""Kanban subscriptions bound to a parent's own subagent are reclaimed by the parent (#150198).
++
++Before the reserved child kept its ``_delegate_from`` marker, ``kanban_create`` resolved the parent's
++key to the unmarked child and saved the card's subscription under the child's id. v33 re-tags the
++session row but never touches kanban.db, so those cards kept notifying the subagent.
++"""
++
++import sqlite3
++from unittest.mock import patch
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_state import SessionDB
++from hermes_state_delegate_children import delegate_descendant_ids
++from tui_gateway import server
++
++
++def _subscribed_task(chat_id: str) -> str:
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="stray sub", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat_id)
++        kb.complete_task(conn, tid, summary="shipped")
++        return tid
++    finally:
++        conn.close()
++
++
++def _chat_ids(tid: str) -> list:
++    conn = kbc.connect()
++    try:
++        return [row["chat_id"] for row in kbn.list_notify_subs(conn, task_id=tid)]
++    finally:
++        conn.close()
++
++
++def test_parent_reclaims_a_subscription_bound_to_its_own_subagent(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session(session_id="parent", source="desktop")
++        db.create_session(session_id="child", source="subagent", parent_session_id="parent",
++                          model_config={"_delegate_from": "parent"})
++        db.create_session(session_id="other", source="desktop")
++        db.create_session(session_id="other-child", source="subagent", parent_session_id="other",
++                          model_config={"_delegate_from": "other"})
++        mine, theirs = _subscribed_task("child"), _subscribed_task("other-child")
++
++        with patch.object(server, "_get_db", lambda: db):
++            texts = server._collect_kanban_notifications({"session_key": "parent"})
++
++        assert len(texts) == 1 and mine in texts[0]
++        assert _chat_ids(mine) == ["parent"]
++        assert _chat_ids(theirs) == ["other-child"]  # another session's subagent is left alone
++        # A subagent's own tab never claims its parent's (or siblings') subscriptions.
++        assert delegate_descendant_ids(db, "child") == []
++    finally:
++        db.close()
++
++
++def test_a_transient_db_error_does_not_end_the_reclaim(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session(session_id="parent", source="desktop")
++        db.create_session(session_id="child", source="subagent", parent_session_id="parent",
++                          model_config={"_delegate_from": "parent"})
++        tid = _subscribed_task("child")
++        session = {"session_key": "parent"}
++        real_count = kbn.count_notify_subs
++
++        def locked(*args, **kwargs):
++            if kwargs.get("chat_id") == "child":
++                raise sqlite3.OperationalError("database is locked")
++            return real_count(*args, **kwargs)
++
++        with patch.object(server, "_get_db", lambda: db):
++            with patch.object(kbn, "count_notify_subs", locked):
++                assert server._collect_kanban_notifications(session) == []
++            texts = server._collect_kanban_notifications(session)
++
++        assert len(texts) == 1 and tid in texts[0]
++        assert _chat_ids(tid) == ["parent"]
++    finally:
++        db.close()
++
++
++def test_reclaim_precedes_quiet_board_cache_and_keeps_durable_claims(tmp_path):
++    """Fork quiet-board caching must not swallow upstream reclaim or its transient retry."""
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session(session_id="parent", source="desktop")
++        db.create_session(session_id="child", source="subagent", parent_session_id="parent",
++                          model_config={"_delegate_from": "parent"})
++        tid = _subscribed_task("child")
++        path = str(kb.kanban_db_path(board=kb.DEFAULT_BOARD))
++        session = {"session_key": "parent", "_kb_board_seen": {path: ("parent", "unchanged")}}
++        real_count = kbn.count_notify_subs
++
++        def locked(*args, **kwargs):
++            if kwargs.get("chat_id") == "child":
++                raise sqlite3.OperationalError("database is locked")
++            return real_count(*args, **kwargs)
++
++        with patch.object(server, "_get_db", lambda: db), \
++                patch.object(server, "_kb_board_file_sig", return_value="unchanged"):
++            with patch.object(kbn, "count_notify_subs", locked):
++                assert server._collect_kanban_notifications(session) == []
++            assert session["_kanban_stray_keys"] == ("child",)
++            assert path not in session["_kb_board_seen"]
++            claims = []
++            texts = server._collect_kanban_notifications(session, claims)
++        assert len(texts) == 1 and tid in texts[0]
++        assert _chat_ids(tid) == ["parent"]
++        assert len(claims) == 1 and claims[0]["chat_id"] == "parent"
++        assert claims[0]["texts"] == texts
++        assert session["_kanban_stray_keys"] == ()
++    finally:
++        db.close()
++
++
++def test_reclaims_a_subscription_bound_to_a_misrouted_childs_continuation(tmp_path):
++    """A child resumed as the chat compressed into an unmarked continuation; the pre-fix resolver subscribed
++    the card under that tip, and v33 rightly leaves the continuation unmarked."""
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session(session_id="parent", source="desktop")
++        db.append_message("parent", "user", "parent question")
++        db.create_session(session_id="child", source="subagent", parent_session_id="parent",
++                          model_config={"_delegate_from": "parent"})
++        db.append_message("child", "assistant", "child work")
++        db.publish_compression_child(parent_session_id="child", child_session_id="child-tip", source="subagent",
++                                     messages=[{"role": "user", "content": "typed after misrouted resume"}],
++                                     require_compression_lease=False)
++        tid = _subscribed_task("child-tip")
++
++        with patch.object(server, "_get_db", lambda: db):
++            texts = server._collect_kanban_notifications({"session_key": "parent"})
++
++        assert len(texts) == 1 and tid in texts[0]
++        assert _chat_ids(tid) == ["parent"]
++    finally:
++        db.close()
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index af96802434b..c86bbdb1709 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -36,11 +36,15 @@ def _reserve_child_transcript(child: Any) -> None:
+         # children retain their existing no-transcript behavior.
+         return
+     try:
+-        # Leave model_config and the prompt unset. The constructor upsert keeps
+-        # existing values, so a partial config here would freeze first-turn state.
++        # Only the lineage marker: every marker-keyed reader (pickers, resume tip
++        # walk, FTS, cascade delete) must see a subagent, not a continuation, from
++        # the moment its id is published. The first turn merges the rest of the
++        # constructor config in (``AIAgent._ensure_db_session``); the prompt stays unset.
++        parent_sid = child._parent_session_id
+         db.create_session(
+             session_id=child.session_id, source="subagent",
+-            parent_session_id=child._parent_session_id,
++            parent_session_id=parent_sid,
++            model_config={"_delegate_from": parent_sid} if parent_sid else None,
+         )
+         child._session_db_reserved = True
+     except BaseException:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 023bc5c5511..7fbd5d9fe64 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -664,7 +664,8 @@ def _kb_board_file_sig(db_path) -> tuple | None:
+         return None  # unreadable never means unchanged
+ 
+ 
+-def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None, seen: dict | None = None) -> list:
++def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None, seen: dict | None = None,
++                   *, stray: tuple = (), unreclaimed: list | None = None) -> list:
+     """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
+     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
+     falls through so delivery is preserved).
+@@ -675,28 +676,68 @@ def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None,
+     before the poll, so a commit during it is polled again next tick."""
+     from hermes_cli import kanban_db_connect as _kbc
+     from hermes_cli import kanban_db_notify as _kbn
++    from hermes_cli.kanban_placement import is_placeholder_session
++    if is_placeholder_session(session_key):
++        return []
++    # Reclaim before the quiet-board shortcut: a failed reclaim must retry even without a board commit.
++    reclaimed = not stray or _kb_reclaim_stray_subs(_kbn, slug, session_key, stray)
++    if not reclaimed and unreclaimed is not None:
++        unreclaimed.append(slug)
+     db_path = sig = None
+     if seen is not None:
+         with contextlib.suppress(Exception):
+             db_path = str(_kb.kanban_db_path(board=slug))
+             sig = _kb_board_file_sig(db_path)
+-        if sig is not None and seen.get(db_path) == (session_key, sig):
++        if reclaimed and sig is not None and seen.get(db_path) == (session_key, sig):
+             from hermes_constants import get_hermes_home
+             from tui_gateway.kanban_consumer_health import polled
+             polled(get_hermes_home(), session_key, db_path)
+             return []
+-    from hermes_cli.kanban_placement import is_placeholder_session
+-    if is_placeholder_session(session_key):
+-        return []
+     texts = _kb_poll_board_now(_kb, _kbc, _kbn, slug, session_key, claims)
+     from tui_gateway.notification_idle import board_quiet
+-    if sig is not None and board_quiet(db_path, session_key):
++    if reclaimed and sig is not None and board_quiet(db_path, session_key):
+         seen[db_path] = (session_key, sig)
+     elif seen is not None:
+         seen.pop(db_path, None)
+     return texts
+ 
+ 
++def _kb_stray_delegate_keys(session: dict, session_key: str) -> tuple:
++    """This session's marked delegate subagent ids, looked up once per live session. Before the reserved child
++    kept its ``_delegate_from`` marker, ``kanban_create`` resolved the parent's key to the unmarked child and
++    subscribed the card under the child's id, so its completions went to the subagent (#150198)."""
++    if (cached := session.get("_kanban_stray_keys")) is not None:
++        return cached
++    import sqlite3
++    try:
++        with _session_db(session) as db:
++            if db is None:
++                return ()  # store unavailable: not cached, so a later poll retries
++            from hermes_state_delegate_children import delegate_descendant_ids
++            keys = tuple(delegate_descendant_ids(db, session_key))
++    except sqlite3.Error as exc:  # busy/locked store: not cached, so a later poll retries
++        _notif_log_failure("kanban stray-subscription lookup failed", exc)
++        return ()
++    session["_kanban_stray_keys"] = keys
++    return keys
++
++
++def _kb_reclaim_stray_subs(_kbn, slug: str, session_key: str, stray: tuple) -> bool:
++    """Re-key ``tui`` subscriptions bound to this session's own subagents back onto it. True when the board is
++    clean afterwards (nothing to move, or moved); False on a DB error so the caller retries next poll."""
++    import sqlite3
++    from hermes_cli import kanban_db_connect as _kbc
++    try:
++        if not any(_kbn.count_notify_subs(board=slug, platform="tui", chat_id=k) for k in stray):
++            return True
++        with contextlib.closing(_kbc.connect(board=slug)) as conn:
++            _kbn.retarget_notify_subs(conn, platform="tui", from_chat_ids=stray, to_chat_id=session_key)
++        return True
++    except sqlite3.Error as exc:  # busy/locked board: the caller retries next poll
++        _notif_log_failure(f"kanban stray-subscription reclaim failed on {slug}", exc)
++        return False
++
++
+ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: list | None) -> list:
+     with contextlib.suppress(Exception):
+         if _kbn.count_notify_subs(board=slug, platform="tui", chat_id=session_key) == 0:
+@@ -794,7 +835,11 @@ def _collect_kanban_notifications(session: dict, claims: list | None = None) ->
+     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
+         unique.setdefault(resolved, slug)
+     seen = session.setdefault("_kb_board_seen", {})
+-    texts = [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, claims, seen)]
++    stray, unreclaimed = _kb_stray_delegate_keys(session, session_key), []
++    texts = [t for slug in unique.values() for t in _kb_poll_board(
++        _kb, slug, session_key, claims, seen, stray=stray, unreclaimed=unreclaimed)]
++    if stray and not unreclaimed:
++        session["_kanban_stray_keys"] = ()  # every board is clean; stop probing
+     return texts + _collect_remote_kanban_notifications(session_key, claims)
+ 
+ 

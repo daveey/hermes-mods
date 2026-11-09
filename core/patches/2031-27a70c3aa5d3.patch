@@ -1,0 +1,196 @@
+From 27a70c3aa5d3da545961670227b7c66fdbbec250 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:49:46 +0000
+Subject: [PATCH] fix(kanban): resume mixed prefix review repairs without
+ approval [daveey]
+
+---
+ hermes_cli/kanban_dependency_review.py        |  29 ++++-
+ hermes_cli/kanban_dependency_review_notice.py |   2 +-
+ .../test_kanban_dependency_review_prefixes.py | 107 ++++++++++++++++++
+ 3 files changed, 135 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_review_prefixes.py
+
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 870438f3263..73bf1ae3201 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -146,6 +146,28 @@ def _requests_changes(row, data) -> bool:
+     return bool(_SUMMARY_VERDICT.search(row["summary"] or ""))
+ 
+ 
++def _prefix_repair_head(data) -> bool:
++    """Mixed prefix findings permit repair only, never an approval inference.
++
++    Producers can review a PR and its stacked follow-up together. Require a
++    complete exact-head/verdict pairing, an explicit change request and named PR;
++    canonical single-head handoffs remain the preferred producer format.
++    """
++    verdicts = data.get("verdicts")
++    heads = {key.removeprefix("reviewed_sha_"): value for key, value in data.items()
++             if key.startswith("reviewed_sha_prefix")}
++    if data.get("verdict") is not None or not isinstance(verdicts, dict):
++        return False
++    if set(heads) != set(verdicts) or not (data.get("pr") or data.get("reviewed_pr")):
++        return False
++    if not all(re.fullmatch(r"prefix[1-9][0-9]*", key)
++               and isinstance(value, str) and _SHA.fullmatch(value) for key, value in heads.items()):
++        return False
++    values = list(verdicts.values())
++    return (all(isinstance(v, str) and v in {"APPROVE", "REQUEST_CHANGES"} for v in values)
++            and "REQUEST_CHANGES" in values)
++
++
+ def _reviewed_prs(conn, parent_id, parked_at, owner_run_id, captured: set[str]) -> set[str]:
+     """Repair evidence: changes or an unknown verdict at an exact head, PR-bound.
+ 
+@@ -162,7 +184,8 @@ def _reviewed_prs(conn, parent_id, parked_at, owner_run_id, captured: set[str])
+     approval = isinstance(verdict, str) and verdict.strip().lower() in _APPROVALS
+     # Respawn is not merge approval. An unrecognised/absent verdict still hands
+     # findings back to the parked owner; keep explicit approvals on their all-parent path.
+-    if not _exact_head(data) or (approval and not _requests_changes(row, data)):
++    exact_repair = _exact_head(data) or _prefix_repair_head(data)
++    if not exact_repair or (approval and not _requests_changes(row, data)):
+         return set()
+     named = _named_prs(data, captured)
+     if named is not None:
+@@ -216,7 +239,9 @@ def is_review_result(metadata, summary, captured) -> bool:
+     prose and names the PR is held too, and a review that keeps its outcome under other
+     keys is treated as a prerequisite. [daveey]
+     """
+-    if any(key in metadata for key in _REVIEW_KEYS) or _SUMMARY_VERDICT.search(summary or ""):
++    if (any(key in metadata for key in _REVIEW_KEYS)
++            or any(key.startswith("reviewed_sha_prefix") for key in metadata)
++            or _SUMMARY_VERDICT.search(summary or "")):
+         return True
+     prs = {u.rstrip("/").lower() for u in captured or () if isinstance(u, str)}
+     if not prs or not set(metadata) <= _LOST_REVIEW_KEYS:
+diff --git a/hermes_cli/kanban_dependency_review_notice.py b/hermes_cli/kanban_dependency_review_notice.py
+index 176767cc6b5..7742ee85f7c 100644
+--- a/hermes_cli/kanban_dependency_review_notice.py
++++ b/hermes_cli/kanban_dependency_review_notice.py
+@@ -49,7 +49,7 @@ def _refusal(conn, parent, run, owner, evidence, parked_at):
+     if review._completed_review_run(conn, parent, parked_at, owner["id"]) is None:
+         return "completed_review_run refused (claimed, completed, independent run required)"
+     data = kb._json_dict(run["metadata"])
+-    if not review._exact_head(data):
++    if not (review._exact_head(data) or review._prefix_repair_head(data)):
+         return "exact_head refused (reviewed_sha/head/exact_head must be 40 hex)"
+     captured = evidence.get("prs")
+     if not isinstance(captured, list) or not all(isinstance(u, str) for u in captured):
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_prefixes.py b/tests/hermes_cli/test_kanban_dependency_review_prefixes.py
+new file mode 100644
+index 00000000000..43bc1563591
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_review_prefixes.py
+@@ -0,0 +1,107 @@
++"""Mixed prefix reviews hand findings back without granting approval."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_dependency_review as review
++from hermes_cli import kanban_dependency_review_notice as notice
++from hermes_cli import kanban_db_dispatch as dispatch
++from tests.hermes_cli import test_kanban_dependency_review as helpers
++
++board = helpers.board
++
++
++def mixed_review():
++    return {
++        "reviewed_pr": helpers.PR,
++        "reviewed_sha_prefix1": helpers.HEAD,
++        "reviewed_sha_prefix2": "b" * 40,
++        "verdicts": {"prefix1": "APPROVE", "prefix2": "REQUEST_CHANGES"},
++    }
++
++
++def test_mixed_prefix_review_resumes_once(board):
++    task, parents = helpers.parked(board)
++    helpers._finish(board, parents, mixed_review(), "VERDICT: REQUEST_CHANGES for prefix 2")
++    assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("updates", [
++    {"reviewed_sha_prefix1": "a" * 39},
++    {"reviewed_sha_prefix2": "g" * 40},
++    {"reviewed_sha_prefix2": []},
++    {"reviewed_sha_prefix2": "b" * 40 + "\n"},
++    {"reviewed_sha_prefix0": "a" * 40,
++     "verdicts": {"prefix0": "APPROVE", "prefix1": "APPROVE", "prefix2": "REQUEST_CHANGES"}},
++    {"verdicts": []},
++    {"verdicts": ["prefix1", "prefix2"]},
++    {"verdicts": {"prefix1": "APPROVE"}},
++    {"verdicts": {"prefix1": "APPROVE", "prefix2": "APPROVE"}},
++    {"verdicts": {"prefix1": [], "prefix2": "REQUEST_CHANGES"}},
++    {"verdicts": {"prefix1": "unknown", "prefix2": "REQUEST_CHANGES"}},
++    {"verdict": "APPROVE"},
++    {"verdict": "REQUEST_CHANGES"},
++    {"reviewed_pr": None},
++    {"reviewed_pr": helpers.PR + "1"},
++])
++def test_incomplete_or_unbound_prefix_review_stays_held(board, updates):
++    task, parents = helpers.parked(board)
++    data = mixed_review() | updates
++    helpers.finish_reviews(board, parents, metadata=data)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_prefix_review_is_not_approval_or_ordering_handoff(board):
++    task, parents = helpers.parked(board)
++    data = mixed_review()
++    helpers.finish_reviews(board, parents, metadata=data)
++    assert review.is_review_result(data, "Review complete", {helpers.PR})
++    assert not review._exact_head(data)
++    assert dispatch.check_respawn_guard(board, task) is None
++    diagnostic = notice.finished_review_hold(board, task)
++    assert "exact_head refused" not in diagnostic
++
++
++@pytest.mark.parametrize("authenticated", [False, True])
++def test_prefix_review_retains_checkpoint_scope(board, authenticated):
++    task, parents = helpers.parked(board, authenticated=authenticated)
++    helpers._finish(board, parents, mixed_review(), "VERDICT: REQUEST_CHANGES")
++    if authenticated:
++        helpers.worker_comment(board, task, "dev", helpers.PR + "1")
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_unrelated_verdicts_do_not_mark_prerequisite_as_review():
++    # Live implementation/research handoffs also carry plural verdicts.
++    assert not review.is_review_result({
++        "verdicts": {"benchmark": "PASS"}, "merge_sha": helpers.HEAD,
++        "tests_run": 10, "pr": helpers.PR,
++    }, "Implementation and benchmark complete", {helpers.PR})
++
++
++def test_no_prefix_heads_is_not_repair():
++    assert not review._prefix_repair_head({
++        "reviewed_pr": helpers.PR, "verdicts": {"prefix1": "REQUEST_CHANGES"},
++    })
++
++
++@pytest.mark.parametrize("data", [
++    {"reviewed_pr": 10, "reviewed_sha_prefix1": "abc"},
++    {"reviewed_pr": 10, "reviewed_sha_prefix1": helpers.HEAD},
++    {"reviewed_pr": 10, "reviewed_sha_prefix1": helpers.HEAD,
++     "verdict_prefix1": "APPROVE"},
++])
++def test_prefix_hash_without_verdicts_cannot_use_ordering(board, data):
++    task, parents = helpers.parked(board)
++    helpers.finish_reviews(board, parents, metadata=data)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_integer_pr_mixed_review_uses_repair_not_approval(board):
++    task, parents = helpers.parked(board)
++    helpers.finish_reviews(board, parents, metadata=mixed_review() | {"reviewed_pr": 10})
++    owner = board.execute("SELECT * FROM task_runs WHERE task_id=?", (task,)).fetchone()
++    assert review._reviewed_prs(board, parents[0], 0, owner["id"], {helpers.PR}) == {helpers.PR}
++    assert not review._approval_prs(board, parents[0], 0, owner["id"], {helpers.PR})
++    assert dispatch.check_respawn_guard(board, task) is None
+-- 
+2.55.0
+

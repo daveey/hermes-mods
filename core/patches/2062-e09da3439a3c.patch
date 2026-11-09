@@ -1,0 +1,429 @@
+From e09da3439a3ceb94b0313414872eb53e14bbaf82 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 10:30:05 +0000
+Subject: [PATCH] fix(kanban): one busy board degrades only itself in sidebar
+ activity reads [daveey]
+
+kanban-359833be53: while another thread held a board's lifecycle lock, board_memo_key()
+re-opened the board the cheap content probe had just found busy (the probe falls back to
+the stat exactly then), raised "database is locked: board lifecycle is busy" with no SQLite
+error code, and annotate_kanban_activity marked EVERY chat row kanban_unknown.
+session_tasks failed the same way (66 hits in always-on-dashboard.log).
+
+- kanban_generation: lifecycle_access raises BoardLifecycleBusy (OperationalError,
+  sqlite_errorcode=SQLITE_BUSY); shared is_busy() predicate (retry_open uses it).
+- revalidate.board_memo_key: busy -> (stat key, BusyToken(error)), never matching a memo row.
+- new kanban_session_activity_busy: a busy board with a usable memo row reuses its last
+  good counts (never a second busy budget after a busy memo key), keeps that memo row, logs
+  one WARNING "kanban board %s busy; reused last counts" (no traceback) and marks the
+  published counts non-revalidatable; session_tasks on a busy board serves its last good
+  list for the same query with every row stale=True (bounded memo, 512 entries).
+- A busy board never read before still raises: unknown, never "no work".
+
+Tests: tests/hermes_cli/test_kanban_busy_board_activity.py (4 red before, 5 green after).
+---
+ hermes_cli/kanban_generation.py               |  23 +++-
+ hermes_cli/kanban_session_activity.py         |  18 ++-
+ hermes_cli/kanban_session_activity_busy.py    |  85 ++++++++++++
+ .../kanban_session_activity_revalidate.py     |  27 +++-
+ .../test_kanban_busy_board_activity.py        | 128 ++++++++++++++++++
+ 5 files changed, 269 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity_busy.py
+ create mode 100644 tests/hermes_cli/test_kanban_busy_board_activity.py
+
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index 5c943f1a9fa..c6ed8c2d6e0 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -39,12 +39,30 @@ def lifecycle_lock(database):
+         return lock
+ 
+ 
++class BoardLifecycleBusy(sqlite3.OperationalError):
++    """Another thread holds this board's open/close transition. [daveey]
++
++    Carries ``SQLITE_BUSY`` like a native busy error, so every busy check (``retry_open``, readers that degrade a
++    busy board to its last good answer) treats it as "busy, retry later" rather than a broken board
++    (kanban-359833be53: without the code one busy board marked every sidebar row ``kanban_unknown``)."""
++
++    def __init__(self, message="database is locked: board lifecycle is busy"):
++        super().__init__(message)
++        self.sqlite_errorcode = sqlite3.SQLITE_BUSY
++        self.sqlite_errorname = "SQLITE_BUSY"
++
++
++def is_busy(exc) -> bool:
++    """True for a busy/locked board (native SQLite or ``BoardLifecycleBusy``), not a corrupt or missing one."""
++    return (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
++
++
+ @contextmanager
+ def lifecycle_access(database, timeout):
+     """A reader keeps its own busy budget even behind a long-timeout opener."""
+     lock = lifecycle_lock(database)
+     if not lock.acquire(timeout=max(0.0, float(timeout))):
+-        raise sqlite3.OperationalError("database is locked: board lifecycle is busy")
++        raise BoardLifecycleBusy()
+     try:
+         yield lock
+     finally:
+@@ -107,8 +125,7 @@ def retry_open(open_once, timeout):
+         try:
+             return open_once(max(0.0, deadline - time.monotonic()))
+         except sqlite3.OperationalError as exc:
+-            code = getattr(exc, "sqlite_errorcode", 0) & 0xff
+-            if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
++            if not is_busy(exc):
+                 raise
+             remaining = deadline - time.monotonic()
+             if remaining <= 0:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 5fb2d669be4..e5bdf70448b 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -19,6 +19,7 @@ from hermes_cli import kanban_activity_identity as _identity
+ from hermes_cli import kanban_annotation_disk as _annotation_copy
+ from hermes_cli import kanban_annotation_refresh as _bounded
+ from hermes_cli import kanban_activity_revision as _revision
++from hermes_cli import kanban_session_activity_busy as _busy
+ from hermes_cli import kanban_session_activity_hub as _hub_signature
+ from hermes_cli import kanban_session_activity_revalidate as _revalidate
+ from hermes_cli import kanban_counts_scopes as _count_scopes
+@@ -921,7 +922,7 @@ def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
+     def contains(path: Path, sid: str, task_id: str) -> bool:
+         key = (path, sid)
+         if key not in task_ids:
+-            task_ids[key] = {t['id'] for t in _read_session_tasks(path, [sid], LISTED_STATUSES)}
++            task_ids[key] = {t['id'] for t in _busy.session_tasks(path, [sid], LISTED_STATUSES, _read_session_tasks)}
+         return task_id in task_ids[key]
+ 
+     for row in local:
+@@ -1240,6 +1241,7 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+     _parked_sink.stalled = stalled
+     local_keys: dict[str, set[tuple[str, str, bool]]] = {}
+     _local_keys_sink.keys = local_keys
++    _busy.begin_recompute()
+     try:
+         pairs = _read_local_pairs_into(active, blocked, unseen)
+     finally:
+@@ -1286,7 +1288,7 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         _cache_scope = scope
+         _cache = (now + _CACHE_TTL_S, *counts)
+         _cache_read_at = now
+-        _cache_revalidatable = wall is not None and _revalidate.revalidatable(fingerprint, wall)
++        _cache_revalidatable = wall is not None and not _busy.reused() and _revalidate.revalidatable(fingerprint, wall)
+         _cache_fingerprint = fingerprint
+         _counts_generation += 1
+         _cache_generation = _counts_generation
+@@ -1377,10 +1379,11 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+         if reads is not None and ((sink is not None and "parked" not in reads)
+                                   or (stalled is not None and "stall_rows" not in reads)):
+             reads = None
+-        if reads is None:
+-            _board_memo.pop(str(path), None)
+-            reads, complete = _read_board(path, parked=sink is not None, stalled=stalled is not None)
+-            if complete:
++        if reads is None:  # [daveey] a busy board reuses its last good counts (kanban-359833be53)
++            reads, complete, fresh = _busy.board_reads(path, key, hit, sink is not None, stalled is not None, _read_board)
++            if fresh:
++                _board_memo.pop(str(path), None)
++            if fresh and complete:
+                 _board_memo[str(path)] = (key, reads)
+         for src, into in ((reads["unseen"], unseen), (reads["active"], active), (reads["blocked"], blocked)):
+             for sid, n in src.items():
+@@ -1652,7 +1655,7 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+         return []
+     out: list[dict[str, Any]] = []
+     for path in _board_db_paths():
+-        out.extend(_read_session_tasks(path, ids, statuses))
++        out.extend(_busy.session_tasks(path, ids, statuses, _read_session_tasks))  # busy board: last list, stale
+     for t in out:
+         t.setdefault("key", f"{t['board']}/{t['id']}")
+     # [daveey] Cards on other gateways this lineage owns: the same rows the counts use, owner-qualified
+@@ -1975,6 +1978,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+     _annotation_copy.reset()
+     with _pairs_lock:
+         _board_memo.clear()
++    _busy.reset()
+     with _links_lock:
+         _links_cache = None
+     with _cache_lock:
+diff --git a/hermes_cli/kanban_session_activity_busy.py b/hermes_cli/kanban_session_activity_busy.py
+new file mode 100644
+index 00000000000..f5be1c11a96
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_busy.py
+@@ -0,0 +1,85 @@
++"""A busy board degrades only itself in the sidebar activity reads. [daveey]
++
++kanban-359833be53: while another thread held one board's lifecycle lock, the count read aborted as a whole and the
++sidebar marked EVERY chat row ``kanban_unknown``; ``session_tasks`` failed the same way. Like the content probe and the
++origin-work snapshot save, a busy board now means "degrade, retry next time": it serves its last good answer, logs
++one WARNING line (no traceback, so self-heal sees a rate rather than a crash) and is read again on the next pass. A
++board never read successfully before still raises: unknown, never "no work". A corrupt or missing board is not busy
++and still raises.
++
++State is per process; ``kanban_session_activity`` resets it with its caches.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++from pathlib import Path
++from typing import Any, Callable
++
++from hermes_cli.kanban_generation import is_busy
++from hermes_cli.kanban_session_activity_revalidate import is_busy_key
++
++_log = logging.getLogger("hermes_cli.kanban_session_activity")
++
++# .reused: a busy board's last good counts stood in for a read in this thread's recompute. Such counts must not be
++# revalidated past the TTL on an unchanged fingerprint: only a real read of that board may extend them.
++reuse_sink = threading.local()
++
++_tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # last good per-board task list, by (board, ids, statuses)
++_tasks_lock = threading.Lock()
++TASKS_MEMO_MAX = 512
++
++
++def begin_recompute() -> None:
++    reuse_sink.reused = False
++
++
++def reused() -> bool:
++    return bool(getattr(reuse_sink, "reused", False))
++
++
++def board_reads(path: Path, key: tuple, hit: tuple | None, parked: bool, stalled: bool,
++                read: Callable[..., tuple[dict[str, Any], bool]]) -> tuple[dict[str, Any], bool, bool]:
++    """``(reads, complete, fresh)`` for one board whose memo row did not match ``key``. A busy board with a usable
++    memo row ``hit`` returns its last good reads (``fresh`` False: keep that row, so the next pass re-reads); a busy
++    memo key (``is_busy_key``) already spent this board's busy budget, so it never waits out a second one."""
++    usable = hit is not None and (not parked or "parked" in hit[1]) and (not stalled or "stall_rows" in hit[1])
++    try:
++        if is_busy_key(key):
++            raise key[1].error
++        reads, complete = read(path, parked=parked, stalled=stalled)
++    except sqlite3.OperationalError as exc:
++        if hit is None or not usable or not is_busy(exc):
++            raise
++        _log.warning("kanban board %s busy; reused last counts", path)
++        reuse_sink.reused = True
++        return hit[1], False, False
++    return reads, complete, True
++
++
++def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
++                  read: Callable[[Path, list[str], tuple[str, ...]], list[dict[str, Any]]]) -> list[dict[str, Any]]:
++    """``read(path, ids, statuses)``, or on a busy board its last good list for the same query, every row ``stale``."""
++    key = (str(path), tuple(ids), tuple(statuses))
++    try:
++        tasks = read(path, ids, statuses)
++    except sqlite3.OperationalError as exc:
++        with _tasks_lock:
++            last = _tasks_memo.get(key)
++        if last is None or not is_busy(exc):
++            raise
++        _log.warning("kanban board %s busy; reused last counts", path)
++        return [{**t, "stale": True} for t in last]
++    with _tasks_lock:
++        _tasks_memo.pop(key, None)
++        _tasks_memo[key] = tasks
++        while len(_tasks_memo) > TASKS_MEMO_MAX:
++            _tasks_memo.pop(next(iter(_tasks_memo)))
++    return tasks
++
++
++def reset() -> None:
++    with _tasks_lock:
++        _tasks_memo.clear()
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index d0c2ee8050c..a39f815680d 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -12,9 +12,12 @@ State stays in ``kanban_session_activity`` (late-bound ``_ksa``: that module imp
+ from __future__ import annotations
+ 
+ import logging
++import sqlite3
+ import threading
+ import time
+ 
++from hermes_cli.kanban_generation import is_busy
++
+ _log = logging.getLogger("hermes_cli.kanban_session_activity")
+ 
+ STAT_SETTLED_S = 2.0
+@@ -44,11 +47,31 @@ def board_memo_key(path) -> tuple:
+     key = _ksa._board_content_key(path)
+     if key[:1] == ("stat",):
+         # data_version is connection-local: retain identity to reject a replacement reader.
+-        with _ksa.cached_ro(path) as conn:
+-            return key, conn, conn.execute("PRAGMA data_version").fetchone()[0]
++        try:
++            with _ksa.cached_ro(path) as conn:
++                return key, conn, conn.execute("PRAGMA data_version").fetchone()[0]
++        except sqlite3.OperationalError as exc:
++            # [daveey] The probe falls back to the stat exactly when the board is busy: a busy board has no key that
++            # vouches for its memo row. The token matches no memo row and carries the error, so the reader reuses
++            # that board's last good counts or re-raises it without spending a second busy budget; the other
++            # boards' counts are never aborted (kanban-359833be53).
++            if not is_busy(exc):
++                raise
++            return key, BusyToken(exc)
+     return key
+ 
+ 
++class BusyToken:
++    """Ends a memo key whose board was busy: equal to nothing, so it never matches a memo row. [daveey]"""
++
++    def __init__(self, error: sqlite3.OperationalError):
++        self.error = error
++
++
++def is_busy_key(key) -> bool:
++    return isinstance(key, tuple) and len(key) == 2 and isinstance(key[1], BusyToken)
++
++
+ def counts_fresh(scope: tuple[str, ...], fingerprint: tuple, now: float) -> bool:
+     """Caller holds ``_ksa._cache_lock``. The cached counts answer for ``fingerprint``: same scope and inputs, and
+     either within the TTL or (``revalidatable`` fingerprint) younger than ``_ksa._COUNTS_MAX_AGE_S``."""
+diff --git a/tests/hermes_cli/test_kanban_busy_board_activity.py b/tests/hermes_cli/test_kanban_busy_board_activity.py
+new file mode 100644
+index 00000000000..743271f8838
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_busy_board_activity.py
+@@ -0,0 +1,128 @@
++"""One busy board degrades only itself, never every sidebar row (kanban-359833be53). [daveey]
++
++While another thread holds a board's lifecycle lock (an opener recovering a WAL generation, a long writer open),
++the sidebar count read used to abort as a whole: ``board_memo_key`` re-opened the board the cheap probe had just
++found busy, raised "database is locked: board lifecycle is busy" and ``annotate_kanban_activity`` marked every
++row ``kanban_unknown``.
++"""
++
++import logging
++import sqlite3
++import threading
++from contextlib import contextmanager
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_generation as gen
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_session_activity_revalidate as revalidate
++
++
++def _make_board(path: Path, rows: list[tuple[str, str, str | None]]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)")
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
++    conn.commit()
++    conn.close()
++
++
++@pytest.fixture
++def kanban_root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))  # never the real hermes-hub replica
++    ksa._reset_cache_for_tests()
++    yield tmp_path
++    ksa._reset_cache_for_tests()
++
++
++@contextmanager
++def _held(path: Path):
++    """Hold ``path``'s lifecycle lock from another thread (the lock is reentrant for its own thread)."""
++    acquired, release = threading.Event(), threading.Event()
++
++    def hold():
++        with gen.lifecycle_access(path, timeout=5):
++            acquired.set()
++            release.wait(10)
++
++    t = threading.Thread(target=hold, daemon=True)
++    t.start()
++    assert acquired.wait(5)
++    try:
++        yield
++    finally:
++        release.set()
++        t.join(5)
++
++
++def test_lifecycle_busy_error_carries_sqlite_busy(tmp_path):
++    db = tmp_path / "kanban.db"
++    _make_board(db, [])
++    with _held(db):
++        with pytest.raises(sqlite3.OperationalError) as info:
++            with gen.lifecycle_access(db, timeout=0.05):
++                pass
++    assert isinstance(info.value, gen.BoardLifecycleBusy)
++    assert info.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++    assert gen.is_busy(info.value)
++    assert not gen.is_busy(sqlite3.OperationalError("no such table: tasks"))
++
++
++def test_board_memo_key_of_a_held_board_returns_a_never_matching_key(kanban_root):
++    db = kanban_root / "kanban.db"
++    _make_board(db, [("t1", "running", "s1")])
++    with _held(db):
++        key = revalidate.board_memo_key(db)
++        again = revalidate.board_memo_key(db)
++    assert key[0][:1] == ("stat",)
++    assert key != again  # never reuses a memo row it could not vouch for
++
++
++def test_one_held_board_keeps_every_row_known_and_reuses_its_last_counts(kanban_root, caplog):
++    busy_db = kanban_root / "kanban.db"
++    free_db = kanban_root / "kanban" / "boards" / "other" / "kanban.db"
++    _make_board(busy_db, [("t1", "running", "s_busy")])
++    _make_board(free_db, [("t2", "running", "s_free")])
++    rows = [{"id": "s_busy"}, {"id": "s_free"}]
++    ksa.annotate_kanban_activity(rows)  # warm: the busy board's last good counts are memoized
++    assert [r.get("kanban_active") for r in rows] == [1, 1]
++
++    with sqlite3.connect(free_db) as conn:  # the free board moves, so the counts are recomputed
++        conn.execute("INSERT INTO tasks VALUES ('t3', 'running', 's_free')")
++    rows = [{"id": "s_busy"}, {"id": "s_free"}]
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_session_activity"), _held(busy_db):
++        ksa._cache = None  # past the counts TTL
++        ksa.annotate_kanban_activity(rows)
++    assert not any(r.get("kanban_unknown") for r in rows), rows
++    assert rows[0].get("kanban_active") == 1  # last good counts of the held board
++    assert rows[1].get("kanban_active") == 2  # the free board is read fresh
++    assert ksa._cache_revalidatable is False  # reused counts never outlive the TTL on an unchanged fingerprint
++    busy_lines = [r for r in caplog.records if "busy; reused last counts" in r.getMessage()]
++    assert busy_lines and all(r.exc_info is None for r in busy_lines)
++    assert not [r for r in caplog.records if "rows marked kanban_unknown" in r.getMessage()]
++
++
++def test_session_tasks_on_a_held_board_reuse_the_last_rows_marked_stale(kanban_root):
++    busy_db = kanban_root / "kanban.db"
++    free_db = kanban_root / "kanban" / "boards" / "other" / "kanban.db"
++    _make_board(busy_db, [("t1", "running", "s1")])
++    _make_board(free_db, [("t2", "running", "s1")])
++    assert {t["id"] for t in ksa.session_tasks(["s1"])} == {"t1", "t2"}
++    with _held(busy_db):
++        tasks = {t["id"]: t for t in ksa.session_tasks(["s1"])}
++    assert set(tasks) == {"t1", "t2"}
++    assert tasks["t1"].get("stale") is True
++    assert not tasks["t2"].get("stale")
++
++
++def test_held_board_with_no_previous_read_is_still_an_error_not_an_empty_list(kanban_root):
++    db = kanban_root / "kanban.db"
++    _make_board(db, [("t1", "running", "s1")])
++    with _held(db):
++        with pytest.raises(sqlite3.OperationalError):
++            ksa.session_tasks(["s1"])
++        rows = [{"id": "s1"}]
++        ksa.annotate_kanban_activity(rows)
++    assert rows[0].get("kanban_unknown") is True  # never "no work" for a board it has never read
+-- 
+2.55.0
+

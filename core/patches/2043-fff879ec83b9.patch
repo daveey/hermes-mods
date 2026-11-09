@@ -1,0 +1,116 @@
+From fff879ec83b9784fd70f1f9887a5ce91081457eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 05:02:54 +0000
+Subject: [PATCH] fix(cli): a typed empty -t '' is a no-tools pick, not the
+ profile default [daveey]
+
+hermes chat -Q -t '' (x-presence auto_options' no-tools drafting call) sent no toolsets
+on session.create because _build_cli_from_args treated the empty string as 'no -t'. The
+gateway froze the full profile default (code_execution, terminal, ...); the model called
+execute_code, the single-query guard blocked it, the 1-iteration budget was spent and the
+turn ended partial -> exit 1 despite a valid final answer on stdout.
+
+- cli: an empty/comma-only -t is an explicit [] pick (unset stays None).
+- gateway: an explicit empty pick resolves to no toolsets, not the enabled MCP servers and
+  default-on plugin toolsets _get_platform_tools folds into a list naming none of them.
+- tests: RED before (3 fail), GREEN after.
+---
+ cli.py                                        | 14 ++++++---
+ gateway/session_policy.py                     |  4 +++
+ tests/hermes_cli/test_cli_profile_toolsets.py | 29 +++++++++++++++++++
+ 3 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/cli.py b/cli.py
+index 929ba6cdeea..aedbacee103 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1524,13 +1524,19 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
+ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
+     toolsets_list = None
++    # [daveey] A typed empty pick (`-t ''`, `-t ,`) is "no tools", not "no pick": unset is None. Treating
++    # it as no pick sent nothing on session.create, so the gateway froze the full profile default and a
++    # no-tools one-shot ran (and ended partial on) tool calls.
++    typed = toolsets is not None and not (isinstance(toolsets, (list, tuple)) and not toolsets)
+     if isinstance(toolsets, str) and toolsets:
+-        toolsets_list = [t.strip() for t in toolsets.split(",")]
++        toolsets_list = [t.strip() for t in toolsets.split(",") if t.strip()]
++    elif isinstance(toolsets, str):
++        toolsets_list = []
+     elif isinstance(toolsets, (list, tuple)) and toolsets:
+         # Fire may pass multiple --toolsets as a tuple
+         toolsets_list = []
+         for t in toolsets:
+-            toolsets_list.extend([x.strip() for x in t.split(",")] if isinstance(t, str) else [str(t)])
++            toolsets_list.extend([x.strip() for x in t.split(",") if x.strip()] if isinstance(t, str) else [str(t)])
+     elif not toolsets:
+         # Coding posture inside a code workspace, else the profile default the gateway resolves (its
+         # platform resolver reads plugin toolsets, which only the gateway loads: adopted when the session
+@@ -1567,10 +1573,10 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
+         if emit_partial_update_hint(e):
+             sys.exit(1)
+         raise
+-    if not toolsets:
++    if not typed:
+         cli._explicit_toolsets = False  # the gateway resolves the default and coding posture itself
+     # Only a typed -t is checked against a resumed session's frozen toolsets.
+-    cli._typed_toolsets = toolsets_list if toolsets else None
++    cli._typed_toolsets = toolsets_list if typed else None
+ 
+     # skills.auto_load rides the same background preload as -s; --ignore-rules skips it with
+     # the rest of the auto-injected context. Resolved here (not lazily in the agent) so the
+diff --git a/gateway/session_policy.py b/gateway/session_policy.py
+index a3161ec9878..04224f107d6 100644
+--- a/gateway/session_policy.py
++++ b/gateway/session_policy.py
+@@ -727,6 +727,10 @@ def _resolve_toolsets(params, config, source, safe_mode, coding_posture=False, b
+         if 'desktop_ui' in explicit and source != 'gui':
+             _refuse('toolsets', f'desktop_ui is only available on the Desktop, not on {source}')
+         config.setdefault('platform_toolsets', {})['acp' if source == 'acp' else 'cli'] = explicit
++        if not explicit:
++            # [daveey] An explicit empty pick (`-t ''`) is no tools: not the profile's enabled MCP servers or
++            # default-on plugin toolsets, which _get_platform_tools folds into any list naming none of them.
++            return set()
+     posture = None
+     if explicit is None and coding_posture:
+         from agent.coding_context import focus_toolsets
+diff --git a/tests/hermes_cli/test_cli_profile_toolsets.py b/tests/hermes_cli/test_cli_profile_toolsets.py
+index 07a3c166f36..475fbc9ad9b 100644
+--- a/tests/hermes_cli/test_cli_profile_toolsets.py
++++ b/tests/hermes_cli/test_cli_profile_toolsets.py
+@@ -101,3 +101,32 @@ def test_coding_posture_is_left_to_the_gateway(store, monkeypatch):
+     host, _printed = _launch(monkeypatch, db, coding=["terminal"])
+     assert host.enabled_toolsets == ["terminal"]  # the local display still shows the posture
+     assert "toolsets" not in _created(client)
++
++
++@pytest.mark.parametrize("typed", ["", ","])
++def test_typed_empty_toolsets_is_a_no_tools_pick(store, monkeypatch, typed):
++    """`hermes chat -Q -t ''` (auto_options' no-tools drafting call) is an explicit empty pick: it rides
++    session.create as ``toolsets: []`` and the gateway policy carries no tools, not the profile default
++    (whose code_execution/terminal the model then called, ending the 1-turn run partial, exit 1)."""
++    from gateway.session_local_inventory import _policy_tools
++    from gateway.session_policy import build_policy
++    db, client = store
++    host, _printed = _launch(monkeypatch, db, toolsets=typed, coding=["terminal"])
++    assert host.enabled_toolsets == [] and host._explicit_toolsets is True and host._typed_toolsets == []
++    params = _created(client)
++    assert params["toolsets"] == []
++    policy = build_policy(params, CONFIG)
++    assert policy.toolsets == ()
++    assert _policy_tools(policy, CONFIG)[1] == []
++
++
++def test_explicit_empty_pick_skips_default_mcp_servers_and_plugin_toolsets(monkeypatch):
++    """The gateway folds every enabled MCP server (and default-on plugin toolsets) into a list naming
++    none of them; for an empty pick that would hand a no-tools session the tool_search bridge."""
++    from gateway.session_policy import _resolve_toolsets
++    config = {"agent": {}, "platform_toolsets": {"cli": ["terminal"]},
++              "mcp_servers": {"srv": {"command": "true"}}}
++    import copy
++    assert "srv" in _resolve_toolsets({"toolsets": ["terminal"]}, copy.deepcopy(config), "oneshot", False)
++    assert _resolve_toolsets({"toolsets": []}, copy.deepcopy(config), "oneshot", False) == set()
++    assert _resolve_toolsets({"toolsets": []}, copy.deepcopy(config), "oneshot", False, bypass=True) == set()
+-- 
+2.55.0
+

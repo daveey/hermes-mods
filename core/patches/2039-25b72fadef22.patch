@@ -1,0 +1,382 @@
+From 25b72fadef22b090f5e25b6c96cb9a1a25f03e38 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 11:17:11 +0000
+Subject: [PATCH] [daveey] Gate content repair scans independently of feed
+ cursor
+
+---
+ hermes_cli/kanban_sync_client.py              |   6 +-
+ hermes_cli/kanban_sync_repair_content.py      |  69 +++++
+ .../test_kanban_sync_repair_content.py        | 260 ++++++++++++++++++
+ 3 files changed, 333 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_repair_content.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_repair_content.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 1d4f33d6bc5..8c9c78caa28 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -988,8 +988,8 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                 if deferred:
+                     result.repair_deferred = True
+                 else:
+-                    result.repaired = repair_divergence(live, replica, gateway)
+-                    repair_missing_children(live, replica, gateway)
++                    from hermes_cli.kanban_sync_repair_content import run
++                    result.repaired = run(live, replica, gateway, path=path, inputs=inputs, rebuilt=rebuilt)
+                     retire_lost_placeholder_links(live, replica, gateway)
+                     if inputs is not None:
+                         _REPAIRED[key] = inputs
+@@ -1344,6 +1344,8 @@ def _repair_clock() -> float:
+ 
+ def reset_board_watch() -> None:
+     """Tests: close the kept connections and forget completed repair passes."""
++    from hermes_cli.kanban_sync_repair_content import reset
++    reset()
+     _WATCH.reset()
+     _REPAIRED.clear()
+     _REPAIRED_AT.clear()
+diff --git a/hermes_cli/kanban_sync_repair_content.py b/hermes_cli/kanban_sync_repair_content.py
+new file mode 100644
+index 00000000000..c375cbdbea5
+--- /dev/null
++++ b/hermes_cli/kanban_sync_repair_content.py
+@@ -0,0 +1,69 @@
++"""Content-only repair reuse; the outer cursor-dependent repair window stays authoritative."""
++from __future__ import annotations
++
++from collections import OrderedDict
++from pathlib import Path
++import sqlite3
++import threading
++
++from hermes_cli.kanban_sync_repair_revision import ensure_revision
++
++_LIMIT = 32
++_done: OrderedDict[str, tuple] = OrderedDict()
++_lock = threading.Lock()
++
++
++def reset() -> None:
++    with _lock:
++        _done.clear()
++
++
++def _revision(conn: sqlite3.Connection) -> tuple | None:
++    if conn.in_transaction:
++        return None
++    name = conn.execute("PRAGMA database_list").fetchone()[2]
++    if not name:
++        return None
++    stat = Path(name).stat()
++    row = conn.execute(
++        "SELECT revision, schema_version FROM kanban_repair_revision, pragma_schema_version WHERE id = 1"
++    ).fetchone()
++    if row is None:
++        return None
++    # Main-file timestamps deliberately over-invalidate at checkpoint. Unlike
++    # dev/inode/counter alone they also fence an external in-place rebuild.
++    # Connection identity also fences a pathname replaced during this borrow:
++    # a fresh handle must not inherit a stamp combining new stat with old rows.
++    return (conn, name, stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size, tuple(row))
++
++
++def run(live, replica, gateway, *, path, inputs, rebuilt=False) -> dict[str, list[str]]:
++    from hermes_cli import kanban_sync_client as client
++
++    key = str(path)
++    stamp = None
++    try:
++        # Repair counter triggers independently of capture triggers: a capture
++        # gap is exactly what these scans must find. Unknown inputs never skip.
++        if not replica.in_transaction:
++            ensure_revision(replica)
++        left, right = _revision(live), _revision(replica)
++        if inputs is not None and left is not None and right is not None:
++            stamp = left, right, tuple(inputs[2:])
++    except (OSError, sqlite3.Error):
++        stamp = None
++    with _lock:
++        previous = _done.pop(key, None)
++        if not rebuilt and stamp is not None and previous == stamp:
++            _done[key] = stamp
++            return {}
++    # Save the PRE-scan key only after both calls succeed. Own repair writes and
++    # concurrent relevant commits therefore re-arm the next pass, never vanish.
++    repaired = client.repair_divergence(live, replica, gateway)
++    client.repair_missing_children(live, replica, gateway)
++    if stamp is not None:
++        with _lock:
++            _done[key] = stamp
++            while len(_done) > _LIMIT:
++                _done.popitem(last=False)
++    return repaired
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_content.py b/tests/hermes_cli/test_kanban_sync_repair_content.py
+new file mode 100644
+index 00000000000..8b6335ea7f3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_repair_content.py
+@@ -0,0 +1,260 @@
++"""Cursor-only feed arrivals must not repeat content repair scans."""
++from __future__ import annotations
++
++from pathlib import Path
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_repair_content as content
++from hermes_cli.kanban_sync_repair_revision import ensure_revision
++
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_sync_connections import connection_scope
++from tests.hermes_cli import test_kanban_sync_repair_window as window
++
++kanban_home = window.kanban_home
++svc = window.svc
++live = window.live
++clock = window.clock
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_event_only_feed_skips_content_but_keeps_partition_repairs(
++    live, svc, kanban_home, monkeypatch, clock, mode,
++):
++    with connection_scope():
++        parent, _ = window._settle(live, svc, kanban_home, mode)
++        window._round(kanban_home, svc)
++        calls = window._spy(monkeypatch, (
++            "repair_divergence", "repair_missing_children", "repair_partition_links",
++            "repair_partition_chat_links", "retire_lost_placeholder_links",
++        ))
++        clock[0] += ksc.REPLICA_REPAIR_MIN_S + 1
++        window._remote(svc, table="task_events", uid="event-foreign", fields={
++            "task_id": parent, "kind": "commented", "created_at": 1, "payload": "{}",
++        })
++        result = window._round(kanban_home, svc)
++        assert result.error is None and result.pulled > 0
++        assert not result.repair_deferred
++        assert calls == {
++            "repair_divergence": 0, "repair_missing_children": 0,
++            "repair_partition_links": 1, "repair_partition_chat_links": 1,
++            "retire_lost_placeholder_links": 1,
++        }
++
++
++@pytest.fixture
++def pair(live, svc, kanban_home, monkeypatch):
++    parent, child = window._settle(live, svc, kanban_home, "shadow")
++    replica = ksc.open_shadow(window.BOARD, window.ME)
++    ensure_revision(live)
++    ensure_revision(replica)
++    path = kanban_home / "kanban.db"
++    inputs = ksc._repair_inputs(path, replica, "shadow", window.ME)
++    assert inputs is not None
++    content.reset()
++    calls = window._spy(monkeypatch, ("repair_divergence", "repair_missing_children"))
++
++    def run(**kwargs):
++        return content.run(live, replica, window.ME, path=path, inputs=inputs, **kwargs)
++
++    for _ in range(3):
++        run()
++    calls.update({name: 0 for name in calls})
++    assert run() == {}
++    assert not any(calls.values())
++    try:
++        yield SimpleNamespace(live=live, replica=replica, path=path, inputs=inputs,
++                              parent=parent, child=child, calls=calls, run=run)
++    finally:
++        replica.close()
++        content.reset()
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++@pytest.mark.parametrize("change", ["task", "link", "schema", "trigger"])
++def test_relevant_changes_rearm(pair, side, change):
++    conn = getattr(pair, side)
++    with kbc.write_txn(conn):
++        if change == "task":
++            conn.execute("UPDATE tasks SET title = 'changed' WHERE id = ?", (pair.parent,))
++        elif change == "link":
++            conn.execute("DELETE FROM task_links WHERE parent_id = ?", (pair.parent,))
++        elif change == "schema":
++            conn.execute("CREATE TABLE extra_schema (id INTEGER)")
++        else:
++            conn.execute("DROP TRIGGER kanban_repair_tasks_update")
++            conn.execute("UPDATE tasks SET title = 'capture gap' WHERE id = ?", (pair.parent,))
++    pair.run()
++    assert pair.calls == {"repair_divergence": 1, "repair_missing_children": 1}
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++def test_uncommitted_then_rollback_never_caches(pair, side):
++    conn = getattr(pair, side)
++    conn.execute("BEGIN")
++    try:
++        for _ in range(2):
++            if side == "live":
++                # Preserve the original scans' refusal to nest write_txn.
++                with pytest.raises(RuntimeError, match="already inside a transaction"):
++                    pair.run()
++            else:
++                pair.run()
++        assert pair.calls == {"repair_divergence": 2, "repair_missing_children": 2}
++    finally:
++        conn.rollback()
++    pair.run()
++    assert pair.calls == {"repair_divergence": 3, "repair_missing_children": 3}
++
++
++@pytest.mark.parametrize("field", ["mode", "gateway", "config"])
++def test_outer_scope_changes_rearm(pair, field):
++    inputs = list(pair.inputs)
++    inputs[{"mode": 2, "gateway": 3, "config": 4}[field]] = "different"
++    content.run(pair.live, pair.replica, window.ME, path=pair.path, inputs=tuple(inputs))
++    assert pair.calls == {"repair_divergence": 1, "repair_missing_children": 1}
++
++
++def test_rebuilt_and_unknown_inputs_always_scan(pair):
++    pair.run(rebuilt=True)
++    for _ in range(2):
++        content.run(pair.live, pair.replica, window.ME, path=pair.path, inputs=None)
++    assert pair.calls == {"repair_divergence": 3, "repair_missing_children": 3}
++
++
++def test_revision_error_evicts_and_retries(pair, monkeypatch):
++    real = content.ensure_revision
++    def broken(_conn):
++        raise sqlite3.OperationalError("transient read failure")
++    monkeypatch.setattr(content, "ensure_revision", broken)
++    pair.run()
++    pair.run()
++    assert pair.calls == {"repair_divergence": 2, "repair_missing_children": 2}
++    monkeypatch.setattr(content, "ensure_revision", real)
++    pair.run()
++    pair.run()
++    assert pair.calls == {"repair_divergence": 3, "repair_missing_children": 3}
++
++
++def test_second_scan_error_cannot_publish_success(pair, monkeypatch):
++    real = ksc.repair_missing_children
++    def broken(*_args):
++        raise sqlite3.OperationalError("scan failed")
++    monkeypatch.setattr(ksc, "repair_missing_children", broken)
++    with pytest.raises(sqlite3.OperationalError, match="scan failed"):
++        pair.run(rebuilt=True)
++    monkeypatch.setattr(ksc, "repair_missing_children", real)
++    pair.run()
++    assert pair.calls == {"repair_divergence": 2, "repair_missing_children": 1}
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++def test_concurrent_commit_during_scan_is_seen_next_pass(pair, monkeypatch, side):
++    target = getattr(pair, side)
++    filename = target.execute("PRAGMA database_list").fetchone()[2]
++    other = kbc.connect(Path(filename))
++    real = ksc.repair_missing_children
++    def changed(*args):
++        real(*args)
++        with kbc.write_txn(other):
++            other.execute("UPDATE tasks SET title = title WHERE id = ?", (pair.parent,))
++    monkeypatch.setattr(ksc, "repair_missing_children", changed)
++    try:
++        pair.run(rebuilt=True)
++        monkeypatch.setattr(ksc, "repair_missing_children", real)
++        pair.run()
++        assert pair.calls == {"repair_divergence": 2, "repair_missing_children": 2}
++    finally:
++        other.close()
++
++
++def test_reset_and_lru_bound_force_rescan(pair, monkeypatch):
++    monkeypatch.setattr(content, "_LIMIT", 2)
++    for name in ("other-a", "other-b"):
++        content.run(pair.live, pair.replica, window.ME, path=name, inputs=pair.inputs)
++    assert len(content._done) == 2
++    pair.run()
++    assert pair.calls == {"repair_divergence": 3, "repair_missing_children": 3}
++    ksc.reset_board_watch()
++    assert not content._done
++    pair.run()
++    assert pair.calls == {"repair_divergence": 4, "repair_missing_children": 4}
++
++
++def test_trigger_reinstallation_observes_the_following_write(pair):
++    with kbc.write_txn(pair.replica):
++        pair.replica.execute("DROP TRIGGER kanban_repair_tasks_update")
++    pair.run()
++    pair.run()
++    before = dict(pair.calls)
++    with kbc.write_txn(pair.replica):
++        pair.replica.execute("UPDATE tasks SET title = title WHERE id = ?", (pair.parent,))
++    pair.run()
++    assert pair.calls == {name: count + 1 for name, count in before.items()}
++
++
++def test_missing_replica_trigger_inside_transaction_preserves_scan(pair):
++    pair.replica.execute("BEGIN")
++    try:
++        pair.replica.execute("DROP TRIGGER kanban_repair_tasks_update")
++        pair.run()
++        pair.run()
++        assert pair.calls == {"repair_divergence": 2, "repair_missing_children": 2}
++    finally:
++        pair.replica.rollback()
++
++
++@pytest.mark.parametrize("change", ["row", "table"])
++def test_unknown_live_revision_never_caches(pair, change):
++    with kbc.write_txn(pair.live):
++        pair.live.execute("DELETE FROM kanban_repair_revision" if change == "row"
++                          else "DROP TABLE kanban_repair_revision")
++    pair.run()
++    pair.run()
++    assert pair.calls == {"repair_divergence": 2, "repair_missing_children": 2}
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++def test_new_handle_cannot_inherit_old_handle_stamp(pair, side):
++    conn = getattr(pair, side)
++    other = kbc.connect(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
++    try:
++        args = [pair.live, pair.replica]
++        args[0 if side == "live" else 1] = other
++        # No file/schema/revision change: ONLY connection identity differs.
++        content.run(args[0], args[1], window.ME, path=pair.path, inputs=pair.inputs)
++        assert pair.calls == {"repair_divergence": 1, "repair_missing_children": 1}
++    finally:
++        other.close()
++
++
++def test_main_file_rewrite_with_same_identity_and_counter_rearms(pair, monkeypatch):
++    path = Path(pair.replica.execute("PRAGMA database_list").fetchone()[2])
++    pair.replica.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++    pair.run()
++    pair.run()
++    before = dict(pair.calls)
++    stat = path.stat()
++    # Rewrite identical bytes through a real descriptor. No inode, schema,
++    # revision or size change; pin mtime to isolate the non-restorable ctime.
++    with path.open("r+b") as handle:
++        data = handle.read()
++        handle.seek(0)
++        handle.write(data)
++        handle.flush()
++    actual = path.stat()
++    assert actual.st_ino == stat.st_ino and actual.st_ctime_ns != stat.st_ctime_ns
++    real_stat = Path.stat
++    def stamp(p, *args, **kwargs):
++        got = real_stat(p, *args, **kwargs)
++        if p == path:
++            return SimpleNamespace(st_dev=got.st_dev, st_ino=got.st_ino, st_size=got.st_size,
++                                   st_mtime_ns=stat.st_mtime_ns, st_ctime_ns=got.st_ctime_ns)
++        return got
++    monkeypatch.setattr(Path, "stat", stamp)
++    pair.run()
++    assert pair.calls == {name: count + 1 for name, count in before.items()}
+-- 
+2.55.0
+

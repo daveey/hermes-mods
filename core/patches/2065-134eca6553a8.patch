@@ -1,0 +1,413 @@
+From 134eca6553a85e6424e05373fd5b340ab49db811 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:08:34 +0000
+Subject: [PATCH] [daveey] compaction: terminal/execute_code stubs count
+ decoded lines, keep edges, say output was elided; image miss lists siblings
+
+A hub session compacted a 16-path figure listing to '[terminal] ran ... -> exit 0, 1 lines output'
+(newlines counted in the JSON-escaped result, no path kept), then asked vision_analyze for four
+invented figure names. Now: line counts come from the decoded output field; the stub keeps the first
+and last line and ends '(output elided: re-run or list the dir to see it)'; short listings (<=12 lines,
+<=600 chars) stay verbatim through the ordinary prune pass; a local-backend media miss names up to 10
+real sibling files sharing the stem prefix. Self-heal defect agent-6b77b9f55a.
+---
+ agent/context_compressor.py                | 39 +++-------
+ agent/context_compressor_output_stubs.py   | 86 ++++++++++++++++++++++
+ tests/agent/test_tool_result_summaries.py  | 79 ++++++++++++++++++++
+ tests/tools/test_image_source_not_found.py | 62 ++++++++++++++++
+ tools/image_source.py                      | 29 +++++++-
+ 5 files changed, 264 insertions(+), 31 deletions(-)
+ create mode 100644 agent/context_compressor_output_stubs.py
+ create mode 100644 tests/agent/test_tool_result_summaries.py
+ create mode 100644 tests/tools/test_image_source_not_found.py
+
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index e567b4434f9..233fc5f63a3 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -34,6 +34,9 @@ from agent.context_compressor_prellm import PreLlmSkipMixin
+ from agent.context_compressor_window import CompactionWindowMixin
+ from agent.context_compressor_prune import ProactivePruneMixin
+ from agent.context_compressor_summary import SummaryDispatchMixin
++from agent.context_compressor_output_stubs import (
++    _json_dict, _output_lines, _short_output_kept_verbatim, _str_arg, _sum_execute_code, _sum_terminal,
++)
+ from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
+ from agent.context_compressor_retry import retryable_user_text, typed_prompt_content
+ from agent.context_compressor_tail import (
+@@ -1669,12 +1672,6 @@ def _image_part_label(part: dict[str, Any]) -> str:
+     return f"[image: {url}]" if isinstance(url, str) and url.startswith(("http://", "https://")) else "[image]"
+ 
+ 
+-def _str_arg(args: dict, key: str, default: str = "") -> str:
+-    """Coerce a parsed tool arg to ``str`` (models emit non-string values)."""
+-    val = args.get(key, default)
+-    return val if isinstance(val, str) else default if val is None else str(val)
+-
+-
+ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
+     """1-line summary of a tool call + result. Never raises: a malformed historical call must not crash-loop compression."""
+     try:
+@@ -1685,13 +1682,6 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
+         return f"[{tool_name}] ({_len:,} chars result)"
+ 
+ 
+-def _sum_terminal(name, args, content, content_len, line_count):
+-    cmd = _str_arg(args, "command")
+-    cmd = cmd if len(cmd) <= 80 else cmd[:77] + "..."
+-    exit_code = m.group(1) if (m := re.search(r'"exit_code"\s*:\s*(-?\d+)', content)) else "?"
+-    return f"[terminal] ran `{cmd}` -> exit {exit_code}, {line_count} lines output"
+-
+-
+ def _sum_write_file(name, args, content, content_len, line_count):
+     # A refused write (stale-write guard, sensitive path, I/O error) changed nothing; summarized as
+     # "wrote to" it compresses into a success the post-compaction agent then reports.
+@@ -1735,12 +1725,6 @@ def _sum_delegate_task(name, args, content, content_len, line_count):
+     return f"[delegate_task] '{goal}' ({content_len:,} chars result)" + _result_failure_suffix(content)
+ 
+ 
+-def _sum_execute_code(name, args, content, content_len, line_count):
+-    code_str = _str_arg(args, "code")
+-    code_preview = code_str[:60].replace("\n", " ") + ("..." if len(code_str) > 60 else "")
+-    return f"[execute_code] `{code_preview}` ({line_count} lines output)"
+-
+-
+ def _sum_skill_view(name, args, content, content_len, line_count):
+     skill = args.get("name", "?")
+     # Ghost-skill defense: any loaded body, however small, leaves the marker saying it is gone and how to reload.
+@@ -1998,15 +1982,7 @@ _TOOL_RESULT_SUMMARIZERS = {
+ }
+ 
+ 
+-def _json_dict(text: Any) -> dict:
+-    """Parse ``text`` as a JSON object; ``{}`` for empty, invalid, or non-object input."""
+-    try:
+-        parsed = json.loads(text) if text else {}
+-    # Just-loaded / actively-referenced skills survive verbatim (#32106). Pass-4 pressure demotion overrides
+-    # this.
+-    except (json.JSONDecodeError, TypeError):
+-        return {}
+-    return parsed if isinstance(parsed, dict) else {}
++
+ 
+ 
+ def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> str | None:
+@@ -2040,7 +2016,7 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
+     if (refused := _summarize_refused_tool_result(tool_name, args, content)) is not None:
+         return refused
+     content_len = len(content)
+-    line_count = content.count("\n") + 1 if content.strip() else 0
++    line_count = len(_output_lines(content))
+     summarizer = _TOOL_RESULT_SUMMARIZERS.get(tool_name)
+     if summarizer is not None:
+         return summarizer(tool_name, args, content, content_len, line_count)
+@@ -3199,7 +3175,8 @@ class ContextCompressor(
+         min_prune_chars: int, protected_skills: Optional[set[str]] = None,
+     ) -> bool:
+         """Replace the tool result at ``idx`` with a 1-line summary; True if modified.
+-        ``protected_skills`` (lower-cased) spares matching skill_view bodies; None (pressure pass) overrides the guard."""
++        ``protected_skills`` (lower-cased) spares matching skill_view bodies and short terminal/execute_code
++        listings; None (pressure pass) overrides both guards."""
+         msg = result[idx]
+         if msg.get("role") != "tool":
+             return False
+@@ -3221,6 +3198,8 @@ class ContextCompressor(
+             _skill = _json_dict(tool_args).get("name", "")
+             if isinstance(_skill, str) and _skill.lower() in protected_skills:
+                 return False
++        if protected_skills is not None and _short_output_kept_verbatim(tool_name, content):
++            return False
+         result[idx] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
+         return True
+ 
+diff --git a/agent/context_compressor_output_stubs.py b/agent/context_compressor_output_stubs.py
+new file mode 100644
+index 00000000000..20143e463d8
+--- /dev/null
++++ b/agent/context_compressor_output_stubs.py
+@@ -0,0 +1,86 @@
++"""Terminal/execute_code tool-result stubs for context compaction (split from context_compressor).
++
++Lossy stubs say so: a stub reading "1 lines output" for a 16-path listing let the post-compaction agent
++guess file names that were never written instead of re-listing the dir.
++"""
++
++import json
++import re
++from typing import Any
++
++
++def _json_dict(text: Any) -> dict:
++    """Parse ``text`` as a JSON object; ``{}`` for empty, invalid, or non-object input."""
++    try:
++        parsed = json.loads(text) if text else {}
++    except (json.JSONDecodeError, TypeError):
++        return {}
++    return parsed if isinstance(parsed, dict) else {}
++
++
++def _str_arg(args: dict, key: str, default: str = "") -> str:
++    """Coerce a parsed tool arg to ``str`` (models emit non-string values)."""
++    val = args.get(key, default)
++    return val if isinstance(val, str) else default if val is None else str(val)
++
++
++_OUTPUT_ELIDED_NOTE = "(output elided: re-run or list the dir to see it)"
++# Outputs this small stay verbatim through the ordinary prune pass (pressure demotion still stubs them).
++_KEEP_VERBATIM_MAX_LINES = 12
++_KEEP_VERBATIM_MAX_CHARS = 600
++_STUB_EDGE_LINE_CHARS = 80
++
++
++def _decoded_tool_output(content: str) -> str:
++    """The ``output`` text of a JSON terminal/execute_code result, else ``content`` itself. Counting
++    newlines in the JSON string saw only escaped newlines and reported every output as 1 line."""
++    parsed = _json_dict(content)
++    if not parsed:
++        return content
++    output = parsed.get("output")
++    return output if isinstance(output, str) else ""
++
++
++def _output_lines(content: str) -> list[str]:
++    text = _decoded_tool_output(content)
++    return text.splitlines() if text.strip() else []
++
++
++def _short_output_kept_verbatim(tool_name: str, content: str) -> bool:
++    """True when a terminal/execute_code result's output is a short listing worth keeping whole."""
++    if tool_name not in ("terminal", "execute_code"):
++        return False
++    lines = _output_lines(content)
++    return 0 < len(lines) <= _KEEP_VERBATIM_MAX_LINES and sum(len(x) for x in lines) <= _KEEP_VERBATIM_MAX_CHARS
++
++
++def _output_edges(content: str, content_len: int) -> str:
++    """`` (N chars); first: ...; last: ... (output elided ...)``: the stub keeps the output's first and last
++    non-blank lines and says the rest was dropped. Contains `` chars)`` so later passes see a stub."""
++    lines = [x.strip() for x in _output_lines(content) if x.strip()]
++
++    def clip(x: str) -> str:
++        return x if len(x) <= _STUB_EDGE_LINE_CHARS else x[:_STUB_EDGE_LINE_CHARS - 3] + "..."
++
++    if not lines:
++        return ""
++    edges = f"; first: {clip(lines[0])}"
++    if len(lines) > 1:
++        edges += f"; last: {clip(lines[-1])}"
++    return f" ({content_len:,} chars){edges} {_OUTPUT_ELIDED_NOTE}"
++
++
++def _sum_terminal(name, args, content, content_len, line_count):
++    cmd = _str_arg(args, "command")
++    cmd = cmd if len(cmd) <= 80 else cmd[:77] + "..."
++    exit_code = m.group(1) if (m := re.search(r'"exit_code"\s*:\s*(-?\d+)', content)) else "?"
++    return (
++        f"[terminal] ran `{cmd}` -> exit {exit_code}, {line_count} lines output"
++        + _output_edges(content, content_len)
++    )
++
++
++def _sum_execute_code(name, args, content, content_len, line_count):
++    code_str = _str_arg(args, "code")
++    code_preview = code_str[:60].replace("\n", " ") + ("..." if len(code_str) > 60 else "")
++    return f"[execute_code] `{code_preview}` ({line_count} lines output)" + _output_edges(content, content_len)
+diff --git a/tests/agent/test_tool_result_summaries.py b/tests/agent/test_tool_result_summaries.py
+new file mode 100644
+index 00000000000..afb98c8a59e
+--- /dev/null
++++ b/tests/agent/test_tool_result_summaries.py
+@@ -0,0 +1,79 @@
++"""Compaction stubs for terminal/execute_code results must say what they dropped.
++
++Regression for a hub session where 16 extracted figure paths compacted to
++"[terminal] ran ... -> exit 0, 1 lines output": the line count read the JSON-escaped
++newlines and no path survived, so the agent guessed four file names that never existed.
++"""
++
++import json
++
++from agent.context_compressor import (
++    ContextCompressor,
++    _is_summary_stub,
++    _summarize_tool_result,
++)
++
++PATHS = [f"/home/ubuntu/scratch/beam/figure-page-{n}-0.png" for n in range(3, 150, 9)][:16]
++ELIDED = "(output elided: re-run or list the dir to see it)"
++
++
++def _terminal_result(lines):
++    return json.dumps({"output": "\n".join(lines), "exit_code": 0, "error": None})
++
++
++def _demote(tool_name, args, content):
++    call = {"id": "c1", "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}
++    result = [
++        {"role": "assistant", "content": "", "tool_calls": [call]},
++        {"role": "tool", "tool_call_id": "c1", "content": content},
++    ]
++    changed = ContextCompressor._demote_tool_result_at(
++        result, 1, {"c1": (tool_name, json.dumps(args))}, 200, set(),
++    )
++    return changed, result[1]["content"]
++
++
++def test_terminal_stub_counts_decoded_output_lines_and_keeps_first_and_last():
++    assert len(PATHS) == 16
++    stub = _summarize_tool_result("terminal", json.dumps({"command": "python3 extract.py"}), _terminal_result(PATHS))
++    assert "16 lines output" in stub
++    assert PATHS[0] in stub
++    assert PATHS[-1] in stub
++    assert stub.endswith(ELIDED)
++    assert len(stub) < 400 and _is_summary_stub(stub), "a later pass must recognize the stub, not re-summarize it"
++
++
++def test_execute_code_stub_counts_decoded_lines_and_says_output_was_elided():
++    content = json.dumps({"status": "success", "output": "\n".join(PATHS), "tool_calls_made": 0})
++    stub = _summarize_tool_result("execute_code", json.dumps({"code": "print(paths)"}), content)
++    assert "16 lines output" in stub
++    assert PATHS[0] in stub and PATHS[-1] in stub
++    assert stub.endswith(ELIDED)
++
++
++def test_non_json_terminal_content_falls_back_to_raw_text():
++    stub = _summarize_tool_result("terminal", json.dumps({"command": "ls"}), "a\nb\nc")
++    assert "3 lines output" in stub
++
++
++def test_short_terminal_listing_is_kept_verbatim_by_the_ordinary_prune_pass():
++    short = PATHS[:6]
++    content = _terminal_result(short)
++    assert len(content) > 200
++    changed, kept = _demote("terminal", {"command": "ls figures"}, content)
++    assert not changed
++    assert kept == content
++
++
++def test_long_terminal_listing_is_demoted_to_an_honest_stub():
++    changed, stub = _demote("terminal", {"command": "ls figures"}, _terminal_result(PATHS))
++    assert changed
++    assert "16 lines output" in stub and PATHS[0] in stub and PATHS[-1] in stub
++    assert stub.endswith(ELIDED)
++
++
++def test_json_result_without_output_field_is_not_reported_as_output():
++    stub = _summarize_tool_result("terminal", json.dumps({"command": "true"}), '{"exit_code": 0}')
++    assert "0 lines output" in stub
++    assert "exit_code" not in stub.split("->", 1)[1]
++    assert ELIDED not in stub
+diff --git a/tests/tools/test_image_source_not_found.py b/tests/tools/test_image_source_not_found.py
+new file mode 100644
+index 00000000000..f679bcbc3d9
+--- /dev/null
++++ b/tests/tools/test_image_source_not_found.py
+@@ -0,0 +1,62 @@
++"""A local-backend miss names the real files beside the missing one.
++
++Regression: an agent that lost a figure list to compaction asked vision_analyze for four
++invented ``figure-page-N-0.png`` names; each miss said only "media file not found", so it
++kept guessing until the loop guard fired.
++"""
++
++import importlib
++from pathlib import Path
++
++import pytest
++
++
++def _reload(monkeypatch, hermes_home: Path):
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("TERMINAL_ENV", "local")
++    import hermes_constants
++    importlib.reload(hermes_constants)
++    import tools.image_source as isrc
++    importlib.reload(isrc)
++    return isrc
++
++
++@pytest.mark.asyncio
++async def test_miss_lists_matching_siblings(tmp_path, monkeypatch):
++    isrc = _reload(monkeypatch, tmp_path / "hermes")
++    figs = tmp_path / "figs"
++    figs.mkdir()
++    real = [f"figure-page-{n}-0.png" for n in (3, 12, 75, 88)]
++    for name in real + ["notes.txt"]:
++        (figs / name).write_bytes(b"x")
++    with pytest.raises(isrc.SourceNotFound) as excinfo:
++        await isrc.resolve_image_source(str(figs / "figure-page-79-0.png"), isrc.ResolveContext())
++    msg = str(excinfo.value)
++    assert msg.startswith(f"media file not found: '{figs / 'figure-page-79-0.png'}'")
++    assert "files in that dir:" in msg
++    for name in real:
++        assert name in msg
++    assert "notes.txt" not in msg
++
++
++@pytest.mark.asyncio
++async def test_miss_caps_sibling_list_at_ten(tmp_path, monkeypatch):
++    isrc = _reload(monkeypatch, tmp_path / "hermes")
++    figs = tmp_path / "figs"
++    figs.mkdir()
++    for n in range(30):
++        (figs / f"figure-page-{n}-0.png").write_bytes(b"x")
++    with pytest.raises(isrc.SourceNotFound) as excinfo:
++        await isrc.resolve_image_source(str(figs / "figure-page-99-0.png"), isrc.ResolveContext())
++    listed = str(excinfo.value).split("files in that dir:", 1)[1]
++    assert listed.count("figure-page-") == 10
++    assert "(+20 more)" in listed
++
++
++@pytest.mark.asyncio
++async def test_miss_in_missing_dir_keeps_plain_message(tmp_path, monkeypatch):
++    isrc = _reload(monkeypatch, tmp_path / "hermes")
++    target = tmp_path / "nope" / "figure-page-1-0.png"
++    with pytest.raises(isrc.SourceNotFound) as excinfo:
++        await isrc.resolve_image_source(str(target), isrc.ResolveContext())
++    assert str(excinfo.value) == f"media file not found: '{target}'"
+diff --git a/tools/image_source.py b/tools/image_source.py
+index ac72704e696..aef740a143c 100644
+--- a/tools/image_source.py
++++ b/tools/image_source.py
+@@ -89,10 +89,37 @@ async def resolve_image_source(
+         return _finalize(data, "", "file", s, permitted)
+     if _is_local_terminal_backend():
+         # Any path was host-readable, so a miss means the file doesn't exist.
+-        raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
++        raise SourceNotFound(f"media file not found: '{p}'{_sibling_hint(p)}", src=s, origin="file")
+     return await _resolve_container_fallback(p, ctx, s, permitted)
+ 
+ 
++_SIBLING_HINT_MAX = 10
++_SIBLING_SCAN_MAX = 5000  # a miss in a huge dir must not stall on a full listing
++
++
++def _sibling_hint(p: Path) -> str:
++    """``; files in that dir: a.png, b.png (+N more)`` naming real files that share the missing name's
++    non-digit stem prefix and suffix (``figure-page-79-0.png`` -> ``figure-page-*.png``), else "".
++    An agent that lost a file list to compaction otherwise guesses names until a loop guard fires."""
++    try:
++        parent = p.expanduser().parent
++        prefix = re.split(r"\d", p.stem, maxsplit=1)[0]
++        suffix = p.suffix.lower()
++        with os.scandir(parent) as it:
++            entries = [e for _, e in zip(range(_SIBLING_SCAN_MAX), it)]
++        names = sorted(
++            (e.name for e in entries
++             if e.name.startswith(prefix) and e.name.lower().endswith(suffix) and e.is_file()),
++            key=lambda n: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", n)],
++        )
++    except OSError:
++        return ""
++    if not names:
++        return ""
++    more = f" (+{len(names) - _SIBLING_HINT_MAX} more)" if len(names) > _SIBLING_HINT_MAX else ""
++    return f"; files in that dir: {', '.join(names[:_SIBLING_HINT_MAX])}{more}"
++
++
+ def _read_host_bytes_bounded(path: Path, src: str, cap: int) -> bytes:
+     """Read a host file with ``cap`` enforced DURING the read. ``read_bytes()`` buffered the whole
+     file before ``_finalize`` checked its size. ``read(n)`` preallocates n bytes, so the first read
+-- 
+2.55.0
+

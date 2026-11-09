@@ -1,0 +1,236 @@
+From 82f8549c66c58335189fd4da39efa3d616362612 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 12:44:32 +0000
+Subject: [PATCH] [daveey] model routing: re-check an exact pin's briefly
+ unselectable credential once, then raise typed PinnedRouteUnavailable
+
+A sticky exact pin whose own pool had no selectable entry (select() None after a silently failed
+single-use-token refresh, or has_available() false outside a quota wall) was refused with the generic
+"Exact pinned route cannot fail over" (mini bb-aux 2026-11-05, self-heal agent-36e9ac084a). Now
+resolve_class_runtime records why each route left the candidate list, reloads the pools from disk and
+re-checks once (1 s pause) for a credential miss, and otherwise raises PinnedRouteUnavailable naming
+provider/model and the reason, logged at WARNING with the session id. Class routes are unchanged.
+---
+ agent/model_routing_runtime.py            | 54 ++++++++++++-
+ tests/agent/test_model_routing_runtime.py | 98 +++++++++++++++++++++++
+ 2 files changed, 151 insertions(+), 1 deletion(-)
+ create mode 100644 tests/agent/test_model_routing_runtime.py
+
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 6b9890b1d15..0212753a9c4 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -1,10 +1,32 @@
+ """Class routing's credential boundary: no generic provider/billing fallback."""
+ from __future__ import annotations
+ 
++import logging
++import time
++
+ from agent.model_routing import ModelRoutingError, resolve_model_route
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ 
++logger = logging.getLogger(__name__)
++
++# [daveey] One re-check of an exact pin whose own credential was unselectable, after this pause.
++PIN_RECHECK_DELAY_SECONDS = 1.0
++_CREDENTIAL_MISSES = ("no available credential", "select() returned no credential")
++
++
++class PinnedRouteUnavailable(ModelRoutingError):
++    """[daveey] A session's exact pin lost its own route to a credential/provider check (not a quota wall).
++
++    Before this, the allocator refused such a turn as "Exact pinned route cannot fail over", the same text a
++    switch/record mismatch raises, so a transient credential miss (mini bb-aux 2026-11-05, self-heal
++    agent-36e9ac084a) looked like a routing-store bug and nothing said why the pin was dropped."""
++
++    def __init__(self, provider, model, reason, rechecked=False):
++        self.provider, self.model, self.reason, self.rechecked = provider, model, reason, rechecked
++        suffix = " (still missing after a pool reload)" if rechecked else ""
++        super().__init__(f"Pinned route {provider}/{model} is unavailable: {reason}{suffix}")
++
+ _temporary_resolution = ContextVar("temporary_model_resolution", default=False)
+ _routing_session = ContextVar("model_routing_session", default=None)
+ 
+@@ -54,6 +76,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+     pools = {}
+     unavailable = []
+     available = []
++    dropped = {}  # (provider, model) -> why that route left the candidate list
+     if _temporary_resolution.get():
+         state_path = ":memory:"
+ 
+@@ -61,6 +84,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         from hermes_cli.config import is_provider_enabled
+         block = config.get("providers", {}).get(route["provider"], {})
+         if not is_provider_enabled(block):
++            dropped[route["provider"], route["model"]] = "provider disabled"
+             return False
+         key = route["provider"], route["billing"]
+         if key not in pools:
+@@ -69,6 +93,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         if pools[key].has_available(model=route["model"]):
+             available.append(route)
+             return True
++        dropped[route["provider"], route["model"]] = "no available credential"
+         if route["billing"] == "subscription":
+             from agent.model_routing_unavailable import quota_unavailable
+             if error := quota_unavailable(pools[key], route["model"]):
+@@ -90,6 +115,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+             # Roll back the unready selection before trying another same-class
+             # candidate. Never enter the legacy environment-key ladder.
+             failed.append((selected, selected_model))
++            dropped[selected, selected_model] = "select() returned no credential"
+             raise UnavailableCredential
+         cfg = {"provider": selected, "default": selected_model}
+         resolved.update(runtime._resolve_runtime_from_pool_entry(
+@@ -100,6 +126,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         if prepare_runtime is not None:
+             prepare_runtime(resolved)
+ 
++    rechecked = False
+     while True:
+         unavailable.clear()
+         available.clear()
+@@ -117,7 +144,32 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+             # never enter eligible(), and a prepared runtime's errors stay fatal.
+             if unavailable and not available and not resolved:
+                 raise min(unavailable, key=lambda error: error.resets_at) from None
+-            raise
++            if not exact_pin or available or resolved or not dropped:
++                raise
++            # [daveey] The pin's own route was dropped by a credential/provider check, not by policy or
++            # the routing store. A credential miss is often momentary (a concurrent single-use-token
++            # refresh fails silently and select() returns None): reload the pools from disk and re-check
++            # once before refusing. A pin still never moves to another model.
++            if not rechecked and any(why in _CREDENTIAL_MISSES for why in dropped.values()):
++                rechecked = True
++                logger.info("model routing: exact pin %s for session %s lost its credential (%s); "
++                            "reloading the pool and re-checking once", _describe(dropped), session_id,
++                            _describe(dropped, reasons=True))
++                time.sleep(PIN_RECHECK_DELAY_SECONDS)
++                pools.clear()
++                dropped.clear()
++                failed[:] = list(excluded)
++                continue
++            (provider_name, model_name), reason = sorted(dropped.items())[0]
++            error = PinnedRouteUnavailable(provider_name, model_name, reason, rechecked=rechecked)
++            logger.warning("model routing: session %s: %s", session_id, error)
++            raise error from None
++
++
++def _describe(dropped, reasons=False):
++    if reasons:
++        return ", ".join(f"{p}/{m}: {why}" for (p, m), why in sorted(dropped.items()))
++    return ", ".join(f"{p}/{m}" for p, m in sorted(dropped))
+ 
+ 
+ def refresh_class_anthropic_token(agent):
+diff --git a/tests/agent/test_model_routing_runtime.py b/tests/agent/test_model_routing_runtime.py
+new file mode 100644
+index 00000000000..c00d8e4b869
+--- /dev/null
++++ b/tests/agent/test_model_routing_runtime.py
+@@ -0,0 +1,98 @@
++"""A sticky exact pin whose own credential is briefly unselectable is re-checked, not refused.
++
++Mini bb-aux, 2026-11-05 04:42 PT (self-heal agent-36e9ac084a): an api_server session pinned to gpt-6-luna got
++a second request 40 ms after the first. The fresh agent build re-resolved the pin while the pool had no
++selectable entry (``select()`` returned None: a concurrent single-use-token refresh fails silently), so the
++pin's own route left the candidate list and the allocator refused with the generic "Exact pinned route cannot
++fail over". The pool was healthy again a moment later. [daveey]
++"""
++import logging
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_runtime import resolve_class_runtime
++from tests.hermes_cli import test_model_routing_runtime
++
++routing_home = test_model_routing_runtime.routing_home
++
++
++def _allocate_pin(cfg, session):
++    """First build: the session's exact pin to the class's only route, written to the routing store."""
++    rt = resolve_class_runtime("class:deep", "auto", config=cfg, session_id=session, exact_pin=True,
++                               pin_source="explicit")
++    assert rt["model_routing"]["exact_pin"] is True
++    return rt
++
++
++def _flaky(monkeypatch, method, misses):
++    """``CredentialPool.<method>`` misses ``misses`` times across all pools, then behaves normally."""
++    from agent.credential_pool import CredentialPool
++    real = getattr(CredentialPool, method)
++    calls = {"n": 0}
++
++    def flaky(self, *args, **kwargs):
++        calls["n"] += 1
++        if calls["n"] <= misses:
++            return False if method == "has_available" else None
++        return real(self, *args, **kwargs)
++
++    monkeypatch.setattr(CredentialPool, method, flaky)
++    return calls
++
++
++@pytest.fixture(autouse=True)
++def _no_sleep(monkeypatch):
++    monkeypatch.setattr("time.sleep", lambda s: None)
++
++
++@pytest.mark.parametrize("method", ["select", "has_available"])
++def test_pinned_credential_briefly_unselectable_succeeds_on_recheck(routing_home, monkeypatch, method):
++    first = _allocate_pin(routing_home, "api-session")
++    calls = _flaky(monkeypatch, method, misses=1)
++    second = resolve_class_runtime("class:deep", "auto", config=routing_home, session_id="api-session",
++                                   exact_pin=True, pin_source="explicit")
++    assert calls["n"] >= 2  # the miss happened, then the reloaded pool was asked again
++    assert (second["provider"], second["model"]) == (first["provider"], first["model"])
++    assert second["model_routing"]["exact_pin"] is True
++
++
++@pytest.mark.parametrize("method,reason", [("select", "select() returned no credential"),
++                                           ("has_available", "no available credential")])
++def test_pinned_credential_still_missing_raises_typed_reason(routing_home, monkeypatch, caplog, method, reason):
++    from agent.model_routing_runtime import PinnedRouteUnavailable
++    _allocate_pin(routing_home, "api-session")
++    _flaky(monkeypatch, method, misses=10_000)
++    with caplog.at_level(logging.WARNING, logger="agent.model_routing_runtime"):
++        with pytest.raises(PinnedRouteUnavailable) as caught:
++            resolve_class_runtime("class:deep", "auto", config=routing_home, session_id="api-session",
++                                  exact_pin=True, pin_source="explicit")
++    error = caught.value
++    assert isinstance(error, ModelRoutingError)
++    assert "cannot fail over" not in str(error)
++    assert "anthropic/anthropic-deep" in str(error) and reason in str(error)
++    assert (error.provider, error.model, error.reason) == ("anthropic", "anthropic-deep", reason)
++    assert any("api-session" in r.getMessage() and "anthropic/anthropic-deep" in r.getMessage()
++               for r in caplog.records if r.levelno == logging.WARNING)
++
++
++def test_recheck_is_bounded_to_one_retry(routing_home, monkeypatch):
++    from agent.model_routing_runtime import PinnedRouteUnavailable
++    _allocate_pin(routing_home, "api-session")
++    calls = _flaky(monkeypatch, "select", misses=10_000)
++    with pytest.raises(PinnedRouteUnavailable):
++        resolve_class_runtime("class:deep", "auto", config=routing_home, session_id="api-session",
++                              exact_pin=True, pin_source="explicit")
++    assert calls["n"] == 2  # the first build's miss and exactly one re-check
++    from agent import model_routing_runtime
++    assert 0 < model_routing_runtime.PIN_RECHECK_DELAY_SECONDS <= 2
++
++
++def test_unpinned_class_route_is_not_rechecked(routing_home, monkeypatch):
++    """A class selection that loses its only route still refuses as before: the re-check is the pin's alone."""
++    resolve_class_runtime("class:deep", "auto", config=routing_home, session_id="class-session")
++    calls = _flaky(monkeypatch, "select", misses=10_000)
++    with pytest.raises(ModelRoutingError) as caught:
++        resolve_class_runtime("class:deep", "auto", config=routing_home, session_id="class-session")
++    assert calls["n"] == 1
++    assert type(caught.value) is ModelRoutingError
+-- 
+2.55.0
+

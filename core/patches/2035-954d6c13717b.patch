@@ -1,0 +1,365 @@
+From 954d6c13717b6550603d718d8041802d67b3c04c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:42:40 +0000
+Subject: [PATCH] [daveey] Gate unloaded sweeper subscription scans on SQLite
+ commits
+
+Retain structural candidates across connections; leave recovery and positive delivery checks active each pass. Preserve caller transactions and cache row isolation. Tests: 47 passed including 12 idle regressions; six key/filter mutations killed. Same-input projection benchmark ~38ms to ~0.55ms; not a whole-gateway CPU claim. Full cadence replay and publication remain pending.
+---
+ .../tui_gateway/test_kanban_unloaded_idle.py  | 237 ++++++++++++++++++
+ tui_gateway/kanban_unloaded.py                |  15 +-
+ tui_gateway/kanban_unloaded_candidates.py     |  56 +++++
+ 3 files changed, 307 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tui_gateway/test_kanban_unloaded_idle.py
+ create mode 100644 tui_gateway/kanban_unloaded_candidates.py
+
+diff --git a/tests/tui_gateway/test_kanban_unloaded_idle.py b/tests/tui_gateway/test_kanban_unloaded_idle.py
+new file mode 100644
+index 00000000000..9608997862f
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_unloaded_idle.py
+@@ -0,0 +1,237 @@
++"""Structural idle sweep proofs: unchanged rows do not imply unchanged clocks."""
++import contextlib
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from tui_gateway import kanban_unloaded as sweep
++
++
++def _sub():
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title='idle projection', assignee='worker')
++        notify.add_notify_sub(conn, task_id=tid, platform='tui', chat_id='idle-chat')
++    return tid
++
++
++def test_unchanged_sweep_skips_subscription_and_event_scans(monkeypatch):
++    _sub()
++    monkeypatch.setattr(sweep, '_board_slugs', lambda kb: ['default'])
++    assert sweep.sweep_once(set()) == []
++    calls = []
++    original = notify.list_notify_subs
++    original_events = notify.unseen_events_for_sub
++    def listed(*args, **kwargs):
++        calls.append('subscriptions')
++        return original(*args, **kwargs)
++    def events(*args, **kwargs):
++        calls.append('events')
++        return original_events(*args, **kwargs)
++    monkeypatch.setattr(notify, 'list_notify_subs', listed)
++    monkeypatch.setattr(notify, 'unseen_events_for_sub', events)
++    assert sweep.sweep_once(set()) == []
++    assert calls == []
++
++
++def test_new_event_is_candidate_on_next_sweep_and_retried(monkeypatch):
++    tid = _sub()
++    monkeypatch.setattr(sweep, '_board_slugs', lambda kb: ['default'])
++    reached = []
++    monkeypatch.setattr(sweep, '_sweep_sub', lambda conn, slug, sub, *args:
++                        reached.append(sub['task_id']))
++    sweep.sweep_once(set())
++    assert reached == []
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++    sweep.sweep_once(set())
++    assert reached == [tid]
++    sweep.sweep_once(set())
++    assert reached == [tid, tid]  # grace/holder changes need no commit
++
++
++def test_warm_observer_skips_candidate_query_across_reopened_connections(monkeypatch):
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    _sub()
++    with contextlib.closing(kbc.connect()) as conn:
++        assert candidates.subscriptions(conn, kinds) == []
++    def forbidden(*args):
++        raise AssertionError('unchanged candidate SQL ran')
++    monkeypatch.setattr(candidates, '_read_candidates', forbidden)
++    with contextlib.closing(kbc.connect()) as conn:
++        assert candidates.subscriptions(conn, kinds) == []
++
++
++def test_transaction_and_observer_failure_use_caller(monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_reader_retention as retention
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    tid = _sub()
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++        @contextlib.contextmanager
++        def unavailable(path):
++            raise sqlite3.OperationalError('observer unavailable')
++            yield
++        monkeypatch.setattr(retention, 'reader', unavailable)
++        assert [s['task_id'] for s in candidates.subscriptions(conn, kinds)] == [tid]
++        conn.execute('BEGIN')
++        conn.execute('UPDATE kanban_notify_subs SET last_event_id = (SELECT MAX(id) FROM task_events)')
++        assert candidates.subscriptions(conn, kinds) == []
++        conn.rollback()
++        assert [s['task_id'] for s in candidates.subscriptions(conn, kinds)] == [tid]
++
++
++def test_transaction_reads_uncommitted_caller_with_available_observer():
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    tid = _sub()
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++        assert candidates.subscriptions(conn, kinds)[0]['task_id'] == tid
++        conn.execute('BEGIN')
++        conn.execute('UPDATE kanban_notify_subs SET last_event_id=(SELECT MAX(id) FROM task_events)')
++        assert candidates.subscriptions(conn, kinds) == []
++        conn.rollback()
++        assert candidates.subscriptions(conn, kinds)[0]['task_id'] == tid
++
++
++def test_cursor_and_inflight_commits_invalidate_warm_memo():
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    tid = _sub()
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++        assert [s['task_id'] for s in candidates.subscriptions(conn, kinds)] == [tid]
++        with kb.write_txn(conn):
++            conn.execute('UPDATE kanban_notify_subs SET last_event_id = (SELECT MAX(id) FROM task_events)')
++        assert candidates.subscriptions(conn, kinds) == []
++        with kb.write_txn(conn):
++            conn.execute('UPDATE kanban_notify_subs SET inflight_from = 0')
++        assert [s['task_id'] for s in candidates.subscriptions(conn, kinds)] == [tid]
++        with kb.write_txn(conn):
++            conn.execute('DELETE FROM kanban_notify_subs')
++        assert candidates.subscriptions(conn, kinds) == []
++
++
++def test_warm_claim_recovers_when_holder_dies(monkeypatch):
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    tid = _sub()
++    monkeypatch.setattr(sweep, '_board_slugs', lambda kb: ['default'])
++    monkeypatch.setattr(notify, '_holder_is_me', lambda row: False)
++    alive = [True]
++    monkeypatch.setattr(notify, '_holder_alive', lambda row: alive[0])
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++        with kb.write_txn(conn):
++            conn.execute('UPDATE kanban_notify_subs SET inflight_from=0, inflight_pid=123, '
++                         'last_event_id=(SELECT MAX(id) FROM task_events)')
++        assert candidates.subscriptions(conn, kinds)[0]['inflight_from'] == 0
++    reached = []
++    def observe(conn, slug, sub, *args):
++        reached.append((sub['inflight_from'], sub['last_event_id']))
++    monkeypatch.setattr(sweep, '_sweep_sub', observe)
++    sweep.sweep_once(set())
++    assert reached[-1][0] == 0
++    alive[0] = False  # no database commit; recovery must still run
++    sweep.sweep_once(set())
++    assert reached[-1] == (None, 0)
++
++
++def test_drained_and_deleted_stalls_clear_without_affecting_other_boards(monkeypatch):
++    tid = _sub()
++    monkeypatch.setattr(sweep, '_board_slugs', lambda kb: ['default'])
++    monkeypatch.setattr(sweep, '_sweep_sub', lambda *args: None)
++    key = ('default', tid, 'idle-chat')
++    other = ('other', tid, 'idle-chat')
++    monkeypatch.setattr(sweep, '_stalls', {key: 'busy', other: 'busy'})
++    monkeypatch.setattr(sweep, '_overdue_warned', {key, other})
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++        sweep.sweep_once({'idle-chat'})
++        assert key in sweep._stalls  # live positive candidate stays tracked
++        with kb.write_txn(conn):
++            conn.execute('UPDATE kanban_notify_subs SET last_event_id=(SELECT MAX(id) FROM task_events)')
++        sweep.sweep_once(set())
++        assert sweep._stalls == {other: 'busy'}
++        assert sweep._overdue_warned == {other}
++        sweep._stalls[key] = 'busy'
++        sweep._overdue_warned.add(key)
++        with kb.write_txn(conn):
++            conn.execute('DELETE FROM kanban_notify_subs')
++        sweep.sweep_once(set())
++        assert sweep._stalls == {other: 'busy'}
++        assert sweep._overdue_warned == {other}
++
++
++def test_candidate_rows_match_original_projection_and_are_independent():
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    tid = _sub()
++    with contextlib.closing(kbc.connect()) as conn:
++        for platform, chat, thread in [('TuI', 'mixed', 'thread'), ('tui', '', ''), ('slack', 'foreign', '')]:
++            notify.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat, thread_id=thread)
++        kb.complete_task(conn, tid, summary='ready')
++        with kb.write_txn(conn):
++            conn.execute('UPDATE kanban_notify_subs SET delivery_metadata=?', ('{"nested":{"value":1}}',))
++        expected = [s for s in notify.list_notify_subs(conn)
++                    if s['platform'].lower() == 'tui' and s['chat_id']]
++        rows = candidates.subscriptions(conn, kinds)
++        assert sorted(rows, key=lambda s: s['chat_id']) == sorted(expected, key=lambda s: s['chat_id'])
++        rows[0]['delivery_metadata']['test_mutation'] = 2
++        assert 'test_mutation' not in candidates.subscriptions(conn, kinds)[0]['delivery_metadata']
++
++
++def test_kind_key_and_same_connection_writes_are_visible():
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    tid = _sub()
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++        assert candidates._on_connection(conn, ('unrelated-kind',)) == []
++        assert candidates._on_connection(conn, ())[0]['task_id'] == tid
++        assert [s['task_id'] for s in candidates._on_connection(conn, ('completed',))] == [tid]
++        with kb.write_txn(conn):
++            conn.execute('UPDATE kanban_notify_subs SET last_event_id=(SELECT MAX(id) FROM task_events)')
++        assert candidates._on_connection(conn, ('completed',)) == []
++
++
++def test_commit_during_scan_is_not_cached_under_new_version(monkeypatch):
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    tid = _sub()
++    original = candidates._read_candidates
++    def raced(conn, requested):
++        rows = original(conn, requested)
++        with contextlib.closing(kbc.connect()) as writer:
++            kb.complete_task(writer, tid, summary='ready')
++        return rows
++    with contextlib.closing(kbc.connect()) as conn:
++        with monkeypatch.context() as m:
++            m.setattr(candidates, '_read_candidates', raced)
++            assert candidates.subscriptions(conn, kinds) == []
++        assert [s['task_id'] for s in candidates.subscriptions(conn, kinds)] == [tid]
++
++
++def test_replaced_database_does_not_reuse_old_candidates(tmp_path):
++    import sqlite3
++    from hermes_cli import kanban_reader_retention as retention
++    from tui_gateway import kanban_unloaded_candidates as candidates
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS as kinds
++    tid = _sub()
++    with contextlib.closing(kbc.connect()) as conn:
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++        assert candidates.subscriptions(conn, kinds) == []
++        replacement = tmp_path / 'replacement.db'
++        with contextlib.closing(sqlite3.connect(replacement)) as copy:
++            conn.backup(copy)
++            copy.execute('UPDATE kanban_notify_subs SET inflight_from=0')
++            copy.commit()
++    # Release the observer before replacing the file, as board rebuild does.
++    retention.close_all()
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
++    replacement.replace(path)
++    with contextlib.closing(kbc.connect()) as conn:
++        assert [s['task_id'] for s in candidates.subscriptions(conn, kinds)] == [tid]
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index bf55c721756..87f1825eadc 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -94,6 +94,15 @@ def _clear_stall(key: tuple[str, str, str]) -> None:
+         _overdue_warned.discard(key)
+ 
+ 
++def _clear_drained_stalls(slug: str, subs: list[dict]) -> None:
++    active = {_stall_key(slug, sub) for sub in subs}
++    with _stall_lock:
++        for key in list(_stalls.keys() | _overdue_warned):
++            if key[0] == slug and key not in active:
++                _stalls.pop(key, None)
++                _overdue_warned.discard(key)
++
++
+ def _warn_if_overdue(key: tuple[str, str, str], age_s: float) -> None:
+     with _stall_lock:
+         reason = _stalls.get(key)
+@@ -310,6 +319,7 @@ def sweep_once(
+     for slug in _board_slugs(_kb):
+         try:
+             if _kbn.count_notify_subs(board=slug, platform="tui") == 0:
++                _clear_drained_stalls(slug, [])
+                 continue
+             conn = _kbc.connect(board=slug)
+         except Exception:
+@@ -321,9 +331,12 @@ def sweep_once(
+             with contextlib.suppress(Exception):
+                 _kbn.recover_orphaned_notify_claims(conn, platform="tui")
+             try:
+-                subs = _kbn.list_notify_subs(conn)
++                from tui_gateway.kanban_unloaded_candidates import subscriptions
++                subs = subscriptions(conn, _KANBAN_NOTIFY_KINDS)
+             except Exception:
+                 continue
++            # Candidates omit drained rows; preserve their old stall cleanup.
++            _clear_drained_stalls(slug, subs)
+             for sub in subs:
+                 chat_id = sub.get("chat_id") or ""
+                 if (sub.get("platform") or "").lower() != "tui" or not chat_id or chat_id in live_ids:
+diff --git a/tui_gateway/kanban_unloaded_candidates.py b/tui_gateway/kanban_unloaded_candidates.py
+new file mode 100644
+index 00000000000..81ee3150111
+--- /dev/null
++++ b/tui_gateway/kanban_unloaded_candidates.py
+@@ -0,0 +1,56 @@
++"""Published-input candidates for the unloaded sweeper, not delivery decisions."""
++from copy import deepcopy
++from pathlib import Path
++import sqlite3
++
++
++def subscriptions(conn: sqlite3.Connection, kinds: tuple[str, ...]) -> list[dict]:
++    """Reuse structural rows across reopened sweep connections.
++
++    A retained, generation-guarded observer sees WAL commits via data_version.
++    Transactions use the caller directly. Positive candidates always reach the
++    normal event/grace/holder checks; no clock or process result is memoized.
++    """
++    from hermes_cli.kanban_reader_retention import reader
++
++    if not conn.in_transaction:
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++        if path:
++            try:
++                with reader(Path(path).resolve()) as observer:
++                    return _on_connection(observer, kinds)
++            except (sqlite3.Error, OSError):
++                pass  # optimization failure must not suppress the caller's scan
++    return _on_connection(conn, kinds)
++
++
++def _on_connection(conn, kinds):
++    stamp = None
++    if not conn.in_transaction and hasattr(conn, '__dict__'):
++        stamp = (conn.execute('PRAGMA data_version').fetchone()[0], conn.total_changes, kinds)
++    memo = getattr(conn, '_unloaded_subscriptions', None)
++    if stamp is not None and memo is not None and memo[0] == stamp:
++        return deepcopy(memo[1])
++    rows = _read_candidates(conn, kinds)
++    if stamp is not None:
++        conn._unloaded_subscriptions = (stamp, rows)
++    return deepcopy(rows)
++
++
++def _read_candidates(conn, kinds):
++    from hermes_cli.kanban_db_notify import _decode_notify_delivery_metadata
++
++    # Preserve in-flight rows as a conservative superset. Dead-holder recovery
++    # runs before this query; downstream live-holder behavior stays unchanged.
++    kind_filter = f"AND e.kind IN ({','.join('?' * len(kinds))})" if kinds else ""
++    sql = ("SELECT s.* FROM kanban_notify_subs s WHERE LOWER(s.platform) = 'tui' "
++           "AND s.chat_id != '' AND (s.inflight_from IS NOT NULL OR EXISTS "
++           "(SELECT 1 FROM task_events e WHERE e.task_id=s.task_id AND e.id>s.last_event_id "
++           f"{kind_filter}))")
++    cursor = conn.execute(sql, kinds)
++    columns = [column[0] for column in cursor.description]
++    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
++    for row in rows:
++        if 'delivery_metadata' in row:
++            row['delivery_metadata'] = _decode_notify_delivery_metadata(row['delivery_metadata'])
++    return rows
+-- 
+2.55.0
+

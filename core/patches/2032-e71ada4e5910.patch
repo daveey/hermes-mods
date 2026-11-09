@@ -1,0 +1,131 @@
+From e71ada4e5910b0a38e09066fe12458ea4678765d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 01:01:53 +0000
+Subject: [PATCH] [daveey] Preserve unminted native gateway ticket errors
+
+---
+ apps/desktop/src/lib/gateway-ws-url.test.ts   | 11 +++---
+ .../gateway-local-ticket-reconnect.test.ts    | 37 ++++++++++++++-----
+ apps/shared/src/websocket-url.ts              |  9 +++--
+ 3 files changed, 38 insertions(+), 19 deletions(-)
+
+diff --git a/apps/desktop/src/lib/gateway-ws-url.test.ts b/apps/desktop/src/lib/gateway-ws-url.test.ts
+index ac45b09ac7c..600a95f6245 100644
+--- a/apps/desktop/src/lib/gateway-ws-url.test.ts
++++ b/apps/desktop/src/lib/gateway-ws-url.test.ts
+@@ -199,21 +199,20 @@ describe('resolveGatewayWsUrl', () => {
+     })
+   })
+ 
+-  // Local Electron dials its own gateway through main: a failed mint falls back to the descriptor
+-  // URL, so the reconnect loop owns the retry.
++  // Local Electron's unminted descriptor is also credential-free: retain the mint failure.
+   describe('local Electron native dial', () => {
+     const localConn = { authMode: 'native' as const, wsUrl: 'ws://127.0.0.1:8642/api/ws?native_dial=unminted' }
+ 
+-    it('falls back to the descriptor URL when the mint rejects', async () => {
++    it('surfaces the original error when the mint rejects', async () => {
+       const getGatewayWsUrl = vi.fn().mockRejectedValue(new Error('control socket busy'))
+ 
+-      await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, localConn)).resolves.toBe(localConn.wsUrl)
++      await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, localConn)).rejects.toThrow('control socket busy')
+     })
+ 
+-    it('falls back to the descriptor URL when the mint refuses', async () => {
++    it('surfaces the original error when the mint refuses', async () => {
+       const getGatewayWsUrl = vi.fn().mockResolvedValue({ error: 'gateway restarting', ok: false })
+ 
+-      await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, localConn)).resolves.toBe(localConn.wsUrl)
++      await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, localConn)).rejects.toThrow('gateway restarting')
+     })
+ 
+     it('dials the freshly minted URL', async () => {
+diff --git a/apps/desktop/src/store/gateway-local-ticket-reconnect.test.ts b/apps/desktop/src/store/gateway-local-ticket-reconnect.test.ts
+index 30333654b24..44eecb8f20c 100644
+--- a/apps/desktop/src/store/gateway-local-ticket-reconnect.test.ts
++++ b/apps/desktop/src/store/gateway-local-ticket-reconnect.test.ts
+@@ -118,17 +118,33 @@ it.each(['factory', 'constructor'] as const)('recovers after a synchronous %s re
+   expect(client.connectionState).toBe('closed')
+ })
+ 
++it('surfaces an unminted IPC refusal to the registry caller before opening a socket', async () => {
++  const wsUrl = localUrl.replace('native_dial=1', 'native_dial=unminted')
++
++  const failure = new Error('control socket busy')
++
++  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
++    getConnectionFor: vi.fn(async () => ({ mode: 'local', authMode: 'native', profile: 'default', wsUrl })),
++    getGatewayWsUrlFor: vi.fn().mockRejectedValue(failure)
++  }
++  configureGatewayRegistry({ activeConnectionId: () => 'hub', foregroundScopes: () => new Set(), onEvent: vi.fn() })
++
++  await expect(openGatewayForAgent('local', 'default')).rejects.toThrow('control socket busy')
++  expect(sockets).toHaveLength(0)
++})
++
+ it.each([
+-  { mode: 'local', recovery: 'backoff' },
+-  { mode: 'local', recovery: 'request' },
+-  { mode: 'remote', recovery: 'backoff' }
+-] as const)('recovers a retained $mode secondary via $recovery while the hub primary stays open', async ({ mode, recovery }) => {
++  { mode: 'local', recovery: 'backoff', descriptor: localUrl },
++  { mode: 'local', recovery: 'request', descriptor: localUrl },
++  { mode: 'local', recovery: 'backoff', descriptor: localUrl.replace('native_dial=1', 'native_dial=unminted') },
++  { mode: 'local', recovery: 'request', descriptor: localUrl.replace('native_dial=1', 'native_dial=unminted') },
++  { mode: 'remote', recovery: 'backoff', descriptor: remoteUrl }
++] as const)('recovers a retained $mode secondary via $recovery ($descriptor) while the hub primary stays open', async ({ mode, recovery, descriptor: url }) => {
+   const owner = { connectionId: mode === 'local' ? 'local' : 'other-remote', mode, profile: 'default' }
+-  const url = mode === 'local' ? localUrl : remoteUrl
+   const mint = vi.fn(async () => `${url}${mode === 'local' ? '&ticket=fresh' : ''}`)
+   mint.mockResolvedValueOnce(mode === 'local' ? `${url}&ticket=initial` : url)
+-  // Native descriptor is credential-free: a transient IPC mint failure falls
+-  // back to it, and the real openGatewaySocket refuses it synchronously.
++  // Unminted descriptors surface the IPC failure; legacy native descriptors
++  // still fall back and are refused by the real socket factory.
+   mint.mockRejectedValueOnce(new Error('gateway restarting'))
+   const onActiveRouteChanged = vi.fn()
+ 
+@@ -155,7 +171,7 @@ it.each([
+ 
+   if (mode === 'local') {
+     expect(original.protocols).toEqual(['hermes-gateway-v1', 'hermes-gateway-ticket.initial'])
+-    expect(original.url).toBe(localUrl)
++    expect(original.url).toBe(url)
+   }
+ 
+   original.drop()
+@@ -180,7 +196,10 @@ it.each([
+   }
+ 
+   if (mode === 'local') {
+-    expect(errors).toHaveBeenCalledWith(expect.stringContaining('conn:local::default'), expect.objectContaining({ message: 'Native gateway requires a fresh private ticket' }))
++    if (!url.includes('native_dial=unminted')) {
++      expect(errors).toHaveBeenCalledWith(expect.stringContaining('conn:local::default'), expect.objectContaining({ message: 'Native gateway requires a fresh private ticket' }))
++    }
++
+     expect(mint.mock.calls.length).toBeGreaterThanOrEqual(3)
+   }
+ 
+diff --git a/apps/shared/src/websocket-url.ts b/apps/shared/src/websocket-url.ts
+index b66ae816a24..c2511da3976 100644
+--- a/apps/shared/src/websocket-url.ts
++++ b/apps/shared/src/websocket-url.ts
+@@ -78,10 +78,11 @@ export async function resolveGatewayWsUrl(deps: ResolveGatewayWsUrlDeps, conn: G
+     }
+   }
+ 
+-  // The Webapp's descriptor URL carries no credential of its own, so a failed mint IS the answer
+-  // (a gateway that cannot attach says why); falling back to that URL only fails later, nameless.
+-  // Every other descriptor falls back to its cached URL and leaves the retry to the reconnect loop.
+-  const mintRequired = nativeDialOf(conn.wsUrl) === BROWSER_NATIVE_DIAL
++  // Browser and unminted Electron descriptors carry no credential of their own: falling back
++  // after a failed mint only loses its error to a later socket-factory refusal.
++  // Other descriptors retain their cached-URL fallback.
++  const nativeDial = nativeDialOf(conn.wsUrl)
++  const mintRequired = nativeDial === BROWSER_NATIVE_DIAL || nativeDial === 'unminted'
+ 
+   if (mint) {
+     const fresh = await mint(profile).catch((error: unknown) => {
+-- 
+2.55.0
+

@@ -1,0 +1,1292 @@
+From 14a77da8224ea958226a04dcf2b771a48e04d220 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 05:57:12 +0000
+Subject: [PATCH] [daveey] retain and reconcile evicted scratch custody safely
+
+Keep host-local path custody separate from synced task ownership. Recover legacy custody only from an exact original admission/session/run-tombstone link; require fresh terminal Board evidence, existing retention, archive guards, and unchanged local task/receipt fence before rename.
+
+Proof: canonical 8-file suite 306 passed; 84 original safety mutants killed plus 36 reliability mutants killed (overlapping reruns). Read-only replay across 10 boards and 10 sync shadows, 8127 admissions: zero current legacy recovery matches, three foreign-tree sessions rejected; no cross-board managed-path overlaps. Worker target provenance verified separately from original local run8815 admission/session cwd and tombstone; deployment and natural timer proof pending.
+---
+ hermes_cli/kanban_scratch_custody.py          | 320 +++++++
+ hermes_cli/kanban_worker_node.py              |   6 +
+ hermes_cli/kanban_worktree_gc.py              |   4 +
+ .../hermes_cli/test_kanban_scratch_custody.py | 896 ++++++++++++++++++
+ 4 files changed, 1226 insertions(+)
+ create mode 100644 hermes_cli/kanban_scratch_custody.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_custody.py
+
+diff --git a/hermes_cli/kanban_scratch_custody.py b/hermes_cli/kanban_scratch_custody.py
+new file mode 100644
+index 00000000000..2ffd4cc47ed
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_custody.py
+@@ -0,0 +1,320 @@
++"""Host-local scratch custody surviving foreign task eviction; never synced.
++
++Custody establishes a path, not deletion authority. Fresh Board terminal evidence
++supplies retention, while local pickup and the receipt are fenced at rename.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++from pathlib import Path
++import shutil
++import sqlite3
++import subprocess
++import time
++
++from hermes_cli import kanban_db_workspace as ws
++
++log = logging.getLogger(__name__)
++_TABLE = "kanban_scratch_custody"
++
++
++def _ensure(conn):
++    conn.execute(f"CREATE TABLE IF NOT EXISTS {_TABLE} ("
++                 "task_id TEXT PRIMARY KEY, workspace_path TEXT NOT NULL, evidence TEXT NOT NULL)")
++
++
++def receipts(conn):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=? AND type='table'", (_TABLE,)).fetchone():
++        return []
++    return [dict(r) for r in conn.execute(f"SELECT * FROM {_TABLE}")]
++
++
++def retain(conn, task_id):
++    """Inside eviction's transaction: only explicit scratch paths, never defaults."""
++    row = conn.execute("SELECT workspace_kind, workspace_path FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
++        return
++    path = Path(row["workspace_path"]).expanduser()
++    # A missing or non-directory path has nothing to retain: skip rather than record it.
++    if not path.is_absolute() or path.is_symlink() or not path.is_dir() or not ws._is_managed_scratch_path(path):
++        return
++    runs = [dict(r) for r in conn.execute(
++        "SELECT id, ended_at FROM task_runs WHERE task_id=? ORDER BY id", (task_id,))]
++    _ensure(conn)
++    conn.execute(f"INSERT OR REPLACE INTO {_TABLE} VALUES (?, ?, ?)",
++                 (task_id, str(path), json.dumps({"kind": "eviction", "runs": runs}, sort_keys=True)))
++
++
++def _state_paths():
++    from hermes_cli import kanban_db as kb
++    root = kb.kanban_home()
++    # The original local stores, never the Board's synced session history.
++    paths = [root / "state.db"]
++    profiles = root / "profiles"
++    if profiles.exists():
++        paths.extend(p / "state.db" for p in profiles.iterdir() if (p / "state.db").exists())
++    return paths
++
++
++@contextlib.contextmanager
++def _state(path):
++    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)
++    conn.row_factory = sqlite3.Row
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _sessions_idle(path):
++    """A live same-tree session, admission or ancestor turn lease vetoes removal."""
++    for db in _state_paths():
++        with _state(db) as state:
++            for session in state.execute("SELECT id, cwd, ended_at FROM sessions WHERE cwd IS NOT NULL"):
++                cwd = Path(session["cwd"]).expanduser().resolve()
++                target = path.resolve()
++                if not cwd.is_relative_to(target):
++                    continue
++                if session["ended_at"] is None:
++                    return False
++                if state.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? "
++                                 "AND status != 'terminal'", (session["id"],)).fetchone():
++                    return False
++                if state.execute(
++                    "WITH RECURSIVE lineage(id) AS (SELECT ? UNION SELECT s.parent_session_id "
++                    "FROM sessions s JOIN lineage l ON s.id=l.id WHERE s.parent_session_id IS NOT NULL) "
++                    "SELECT 1 FROM session_turn_leases WHERE conversation_id IN (SELECT id FROM lineage) "
++                    "AND expires_at > ?", (session["id"], time.time())).fetchone():
++                    return False
++    return True
++
++
++def _legacy_candidates(board):
++    candidates = {}
++    for db in _state_paths():
++        with _state(db) as state:
++            rows = state.execute(
++                "SELECT a.request_id, a.target_session_id, a.status, s.source, s.cwd, s.ended_at "
++                "FROM session_admissions a LEFT JOIN sessions s ON s.id=a.target_session_id "
++                "WHERE a.request_id LIKE 'kanban:%'").fetchall()
++            for row in rows:
++                try:
++                    identity = json.loads(row["request_id"].removeprefix("kanban:"))
++                except ValueError:
++                    continue
++                if (not isinstance(identity, list) or len(identity) != 3 or identity[0] != board
++                        or not isinstance(identity[1], str) or type(identity[2]) is not int):
++                    continue
++                candidates.setdefault(identity[1], []).append((db, dict(row), identity[2]))
++    return candidates
++
++
++def discover_legacy(conn, board):
++    """Recover only exact local request -> ended session -> local run tombstone links."""
++    from hermes_cli.kanban_db_connect import write_txn
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_ended_run_tombstones'").fetchone():
++        return
++    candidates = _legacy_candidates(board)
++    for task_id, matches in candidates.items():
++        # Duplicate admissions/targets are ambiguous, even if one happens to be ended.
++        if len(matches) != 1:
++            continue
++        db, row, run_id = matches[0]
++        if row["source"] != "kanban" or row["status"] != "terminal" or not row["ended_at"] or not row["cwd"]:
++            continue
++        path = Path(row["cwd"])
++        if not path.is_absolute() or path.is_symlink() or not path.is_dir() or not ws._is_managed_scratch_path(path):
++            continue
++        # Only the task's own default tree (<root>/<task_id>): a dir-kind sharer's session runs in
++        # its owner's scratch, and that tree is not this task's to reclaim.
++        if path.name != task_id or ws._is_managed_scratch_path(path.parent):
++            continue
++        if not _sessions_idle(path):
++            continue
++        with write_txn(conn):
++            if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
++                continue
++            ended = conn.execute("SELECT ended_at FROM kanban_ended_run_tombstones "
++                                 "WHERE task_id=? AND run_id=?", (task_id, run_id)).fetchone()
++            if ended is None or not ended[0]:
++                continue
++            _ensure(conn)
++            evidence = {"kind": "legacy", "board": board, "state_db": str(db), "session": row,
++                        "runs": [{"id": run_id, "ended_at": ended[0]}]}
++            conn.execute(f"INSERT OR IGNORE INTO {_TABLE} VALUES (?, ?, ?)",
++                         (task_id, str(path), json.dumps(evidence, sort_keys=True)))
++
++
++def _terminal(hub, board, task_id):
++    evidence = hub.row_evidence(board, "tasks", task_id)
++    row = evidence.get("row")
++    if (evidence.get("table") != "tasks" or evidence.get("uid") != task_id
++            or type(evidence.get("head")) is not int or evidence.get("state") != "live"
++            or not isinstance(row, dict) or row.get("uid") != task_id
++            or row.get("status") not in ("done", "archived")
++            or type(row.get("completed_at")) not in (int, float) or row["completed_at"] <= 0
++            or "lease_holder" not in row or "lease_expires" not in row):
++        return None
++    if row["lease_holder"] is not None and (not row["lease_expires"] or row["lease_expires"] > time.time() * 1000):
++        return None
++    return row
++
++
++def _legacy_unchanged(receipt):
++    evidence = json.loads(receipt["evidence"])
++    if evidence["kind"] != "legacy":
++        return True
++    matches = _legacy_candidates(evidence["board"]).get(receipt["task_id"], [])
++    return matches == [(Path(evidence["state_db"]), evidence["session"], evidence["runs"][0]["id"])]
++
++
++def _safe(conn, receipt, path):
++    tid = receipt["task_id"]
++    current = conn.execute(f"SELECT * FROM {_TABLE} WHERE task_id=?", (tid,)).fetchone()
++    if current is None or dict(current) != receipt or conn.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
++        return False
++    if path.is_symlink() or not path.is_dir() or not ws._is_managed_scratch_path(path):
++        return False
++    if ws._has_active_children(conn, tid):
++        return False
++    if not _legacy_unchanged(receipt):
++        return False
++    for other in receipts(conn):
++        if other["task_id"] == tid:
++            continue
++        other_path = Path(other["workspace_path"]).resolve()
++        if other_path.is_relative_to(path.resolve()) or path.resolve().is_relative_to(other_path):
++            return False
++    # No task-event writes for an evicted owner (including deferred-shared events).
++    if ws._workspace_in_use_by_other(conn, tid, path) is not None:
++        return False
++    from hermes_cli.kanban_workspace_jobs import defer_owned_job_cleanup
++    return _sessions_idle(path) and not defer_owned_job_cleanup(tid, path)
++
++
++class _DetachUncommitted(Exception):
++    """The tree was renamed aside but the receipt DELETE did not cleanly commit: stop the pass."""
++
++
++def _restore_detached(conn, tid, path, trash, exc):
++    """After a failed commit, put the tree back unless something now occupies the path. Never deletes."""
++    try:
++        present = conn.execute(f"SELECT 1 FROM {_TABLE} WHERE task_id=?", (tid,)).fetchone() is not None
++        receipt = "present" if present else "absent"
++    except sqlite3.Error:
++        receipt = "unknown"
++    if os.path.lexists(path):
++        # POSIX rename replaces an empty directory: never clobber a tree recreated after rollback.
++        log.error("Scratch custody detach not committed: task=%s path=%s trash=%s receipt=%s "
++                  "restored=False reason=path_reoccupied (%s)", tid, path, trash, receipt, exc)
++        return
++    try:
++        trash.rename(path)
++    except OSError as restore_exc:
++        log.error("Scratch custody detach not committed: task=%s path=%s trash=%s receipt=%s "
++                  "restored=False reason=restore_failed (%s; %s)", tid, path, trash, receipt, exc, restore_exc)
++        return
++    log.error("Scratch custody detach not committed: task=%s path=%s receipt=%s restored=True (%s)",
++              tid, path, receipt, exc)
++
++
++def _remove(conn, receipt, owner, days, board):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_scratch_archive as sa
++    tid, path = receipt["task_id"], Path(receipt["workspace_path"])
++    eligible_at = owner["completed_at"] + days * 86400
++    log.info("Scratch custody: task=%s path=%s verified_terminal=%s eligible_at=%s",
++             tid, path, owner["status"], eligible_at)
++    if days <= 0 or eligible_at > time.time() or not _safe(conn, receipt, path):
++        return 0
++    before = path.stat()
++    archive = None
++    if not ws._scratch_tree_removable(path):
++        archive = sa.archive_workspace(path, kb.kanban_home() / "archive" / "scratch" / board / tid,
++                                       task_id=tid, completed_at=owner["completed_at"])
++    # Remote resumption does not use this tree. Local pickup does, and shares this lock.
++    trash = path.with_name(f".{path.name}.gc-{os.getpid()}")
++    renamed = False
++    try:
++        with kb.write_txn(conn):
++            if not _safe(conn, receipt, path):
++                return 0
++            after = path.stat()
++            if (before.st_dev, before.st_ino, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_mtime_ns):
++                return 0
++            if trash.exists():
++                return 0
++            # DELETE first: a SQL failure leaves the tree in place; a failed rename rolls the DELETE back.
++            conn.execute(f"DELETE FROM {_TABLE} WHERE task_id=?", (tid,))
++            ws.release_lsp_clients(str(path))
++            path.rename(trash)
++            renamed = True
++    except Exception as exc:  # health: allow BLE001 -- restores a detached tree after any commit failure, then re-raises
++        if not renamed:
++            raise
++        _restore_detached(conn, tid, path, trash, exc)
++        raise _DetachUncommitted(str(exc)) from exc
++    try:
++        shutil.rmtree(trash)
++    except OSError as exc:
++        log.error("Scratch custody detached but not removed: task=%s path=%s trash=%s receipt=consumed (%s)",
++                  tid, path, trash, exc)
++        return 0
++    log.info("Removed custody scratch: task=%s path=%s verified_terminal=%s eligible_at=%s archive=%s",
++             tid, path, owner["status"], eligible_at, archive)
++    return 1
++
++
++def gc_custody(conn, days):
++    """Scheduled scratch GC backstop; authority reads never run in a write transaction."""
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_worktree_gc import _board_slug
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    if conn.in_transaction:
++        return 0
++    board = _board_slug(conn)
++    removed = 0
++    try:
++        discover_legacy(conn, board)
++        rows = receipts(conn)
++        if not rows:
++            return 0
++        hub = client.Hub(client.load_identity())
++        for receipt in rows:
++            try:
++                if not Path(receipt["workspace_path"]).is_dir():
++                    # Nothing to reclaim: skip before any Board call; the receipt stays as evidence.
++                    log.info("Scratch custody skipped: task=%s path=%s reason=path_unavailable",
++                             receipt["task_id"], receipt["workspace_path"])
++                    continue
++                runs = json.loads(receipt["evidence"])["runs"]
++                if not runs or any(not r["ended_at"] for r in runs):
++                    log.warning("Scratch custody preserved: task=%s path=%s reason=run_unverified "
++                                "eligible_at=None", receipt["task_id"], receipt["workspace_path"])
++                    continue
++                try:
++                    owner = _terminal(hub, board, receipt["task_id"])
++                except (OSError, client.SyncUnavailable) as exc:
++                    # Transport failure: every later receipt would wait out its own timeout.
++                    log.warning("Scratch custody preserved: task=%s path=%s reason=board_unavailable "
++                                "eligible_at=None; pass stopped (%s)", receipt["task_id"],
++                                receipt["workspace_path"], exc)
++                    break
++                if owner:
++                    removed += _remove(conn, receipt, owner, days, board)
++                else:
++                    log.warning("Scratch custody preserved: task=%s path=%s reason=terminal_unverified "
++                                "eligible_at=None", receipt["task_id"], receipt["workspace_path"])
++            except _DetachUncommitted:
++                break  # logged with the tree's actual location; fail closed for the rest of the pass
++            except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, client.HubError,
++                    client.SyncUnavailable, ArchiveRefused, subprocess.SubprocessError) as exc:
++                log.warning("Scratch custody preserved: task=%s path=%s reason=cleanup_unavailable "
++                            "eligible_at=None (%s)", receipt["task_id"], receipt["workspace_path"], exc)
++    except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, client.HubError,
++            client.SyncUnavailable, ArchiveRefused, subprocess.SubprocessError) as exc:
++        log.warning("Scratch custody preserved: evidence or cleanup unavailable (%s)", exc)
++    return removed
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 96cc560e6c6..461383509a4 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -282,11 +282,17 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     with write_txn(conn):
+         conn.execute("UPDATE kanban_sync_state SET applying = 1")
+         for (tid,) in rows:
++            if not conn.execute(
++                    "SELECT 1 FROM tasks WHERE id=? AND created_on IS NOT NULL AND created_on != ? "
++                    "AND claim_lock IS NULL AND status != 'running'" + keep, (tid, own)).fetchone():
++                continue
+             if conn.execute(
+                     "SELECT 1 FROM kanban_sync_outbox WHERE state != 'rejected' AND (row_uid = ? OR "
+                     "json_extract(fields, '$.task_id') = ?) LIMIT 1", (tid, tid)).fetchone():
+                 continue
+             from hermes_cli.kanban_run_tombstones import retain_ended_runs
++            from hermes_cli.kanban_scratch_custody import retain
++            retain(conn, tid)
+             retain_ended_runs(conn, tid)
+             for table in present:
+                 conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (tid,))
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index ea1e63d841e..5bc8495253e 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -99,6 +99,8 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+     # Archiving runs git for minutes on big clones: never hold the board's write lock for it.
+     for task_id, path, completed_at in aged:
+         removed += _archive_and_remove_scratch(conn, task_id, path, completed_at)
++    from hermes_cli.kanban_scratch_custody import gc_custody
++    removed += gc_custody(conn, days)
+     return removed
+ 
+ 
+@@ -108,6 +110,8 @@ def _scratch_owner_paths(conn: sqlite3.Connection) -> set[Path]:
+ 
+     root = kb.workspaces_root(board=_board_slug(conn))
+     paths = set()
++    from hermes_cli.kanban_scratch_custody import receipts
++    paths.update(Path(r["workspace_path"]).resolve() for r in receipts(conn))
+     for row in conn.execute("SELECT id, workspace_kind, workspace_path FROM tasks"):
+         if row["workspace_path"]:
+             paths.add(Path(row["workspace_path"]).expanduser().resolve())
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody.py b/tests/hermes_cli/test_kanban_scratch_custody.py
+new file mode 100644
+index 00000000000..849d83bb9b2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_custody.py
+@@ -0,0 +1,896 @@
++"""Moved scratch: real SQLite eviction/GC with an injected authoritative transport.
++
++Session fixtures model only the read-side columns; no live home or Board calls.
++"""
++import json
++import sqlite3
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_scratch_archive as archive
++from hermes_cli import kanban_scratch_custody as custody
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as worker
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++
++remote = helpers.remote
++OLD = int(time.time()) - 10 * 86400
++
++
++@pytest.fixture
++def env(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT"):
++        monkeypatch.delenv(name, raising=False)
++    (home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n")
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, "default", "worker")
++    sync.set_mode(conn, "primary")
++    state = sqlite3.connect(home / "state.db")
++    state.executescript(
++        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT, ended_at INTEGER, parent_session_id TEXT);"
++        "CREATE TABLE session_admissions (request_id TEXT, target_session_id TEXT, status TEXT);"
++        "CREATE TABLE session_turn_leases (conversation_id TEXT, expires_at REAL);")
++    owner = {"uid": "", "status": "done", "completed_at": OLD, "lease_holder": None, "lease_expires": None}
++    e = SimpleNamespace(conn=conn, state=state, home=home, owner=owner, evidence_state="live", calls=0,
++                        evidence_extra={})
++
++    class Hub:
++        def row_evidence(self, board, table, uid):
++            assert not conn.in_transaction
++            assert (board, table) == ("default", "tasks")
++            e.calls += 1
++            return {"table": table, "uid": uid, "head": 1, "state": e.evidence_state, "row": dict(owner),
++                    **e.evidence_extra}
++
++    monkeypatch.setattr(client, "load_identity", lambda: None)
++    monkeypatch.setattr(client, "Hub", lambda identity: Hub())
++    # Keep host process inventory out of synthetic-record tests.
++    from hermes_cli import kanban_workspace_jobs
++    monkeypatch.setattr(kanban_workspace_jobs, "defer_owned_job_cleanup", lambda *_: False)
++    yield e
++    state.close()
++    conn.close()
++
++
++def task(env, *, kind="scratch", path_mode="managed", ended=OLD):
++    tid = kb.create_task(env.conn, title="foreign scratch")
++    path = kb.workspaces_root() / tid
++    path.mkdir(parents=True)
++    (path / "notes").write_text("keep me")
++    stored = {"managed": str(path), "missing": None, "root": str(path.parent),
++              "outside": str(env.home / "source")}[path_mode]
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE kanban_sync_state SET applying=1")
++        env.conn.execute("UPDATE tasks SET created_on='other', status='done', workspace_kind=?, "
++                         "workspace_path=?, completed_at=? WHERE id=?", (kind, stored, OLD, tid))
++        run = env.conn.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at) VALUES (?,'done',?,?)",
++                               (tid, OLD - 1, ended)).lastrowid
++        env.conn.execute("DELETE FROM kanban_sync_outbox")  # fixture: prior work already drained
++        env.conn.execute("UPDATE kanban_sync_state SET applying=0")
++    env.owner["uid"] = tid
++    return tid, path, run
++
++
++def evicted(env, **kwargs):
++    tid, path, run = task(env, **kwargs)
++    assert worker.evict(env.conn) == [tid]
++    assert kb.get_task(env.conn, tid) is None
++    return tid, path, run
++
++
++def session(env, tid, path, run, *, sid="session", request=None, ended: int | None = OLD, source="kanban"):
++    env.state.execute("INSERT INTO sessions VALUES (?,?,?,?,NULL)", (sid, source, str(path), ended))
++    request = request if request is not None else "kanban:" + json.dumps(["default", tid, run])
++    env.state.execute("INSERT INTO session_admissions VALUES (?,?,'terminal')", (request, sid))
++    env.state.commit()
++
++
++def legacy(env, **session_kw):
++    tid, path, run = evicted(env)
++    with kb.write_txn(env.conn):
++        env.conn.execute("DELETE FROM kanban_scratch_custody")  # pre-fix eviction fixture
++    session(env, tid, path, run, **session_kw)
++    return tid, path, run
++
++
++def test_refused_receipt_does_not_starve_later_workspace(env, monkeypatch, caplog):
++    first, first_path, _ = evicted(env)
++    _second, second_path, _ = evicted(env)
++
++    def terminal(_hub, _board, tid):
++        if tid == first:
++            raise archive.ArchiveRefused("preserve this receipt")
++        return dict(env.owner, uid=tid)
++
++    monkeypatch.setattr(custody, "_terminal", terminal)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    assert first_path.exists() and not second_path.exists()
++    assert first in caplog.text and str(first_path) in caplog.text
++    assert "reason=cleanup_unavailable" in caplog.text
++
++
++@pytest.mark.parametrize("ended,status,reason", [(None, "done", "run_unverified"),
++                                               (OLD, "running", "terminal_unverified")])
++def test_unverified_receipt_logs_exact_preserved_path(env, caplog, ended, status, reason):
++    tid, path, _ = evicted(env, ended=ended)
++    env.owner["status"] = status
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++    assert tid in caplog.text and str(path) in caplog.text
++    assert f"reason={reason}" in caplog.text and "eligible_at=None" in caplog.text
++
++
++def test_eviction_receipt_and_rollback_are_local_only(env):
++    tid, path, run = task(env)
++    env.conn.execute("CREATE TEMP TRIGGER refuse_eviction BEFORE DELETE ON tasks "
++                     "BEGIN SELECT RAISE(ABORT, 'rollback'); END")
++    with pytest.raises(sqlite3.IntegrityError, match="rollback"):
++        worker.evict(env.conn)
++    assert kb.get_task(env.conn, tid) is not None
++    assert custody.receipts(env.conn) == []
++    env.conn.execute("DROP TRIGGER refuse_eviction")
++    worker.evict(env.conn)
++    receipt, = custody.receipts(env.conn)
++    assert receipt["workspace_path"] == str(path)
++    assert json.loads(receipt["evidence"])["runs"] == [{"id": run, "ended_at": OLD}]
++    assert not env.conn.execute("SELECT 1 FROM kanban_sync_outbox").fetchone()
++    assert not env.conn.execute("SELECT 1 FROM task_events WHERE task_id=?", (tid,)).fetchone()
++
++
++@pytest.mark.parametrize("kwargs", [{"kind": "dir"}, {"path_mode": "missing"},
++                                    {"path_mode": "root"}, {"path_mode": "outside"}])
++def test_eviction_requires_explicit_managed_scratch(env, kwargs):
++    _, path, _ = evicted(env, **kwargs)
++    assert custody.receipts(env.conn) == []
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("legacy_mode", [False, True])
++def test_old_plain_directory_reclaimed_without_task_events(env, legacy_mode, caplog):
++    tid, path, _ = legacy(env) if legacy_mode else evicted(env)
++    with caplog.at_level("INFO"):
++        assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    assert not path.exists()
++    assert env.calls == 1
++    assert "verified_terminal=done" in caplog.text and "eligible_at=" in caplog.text
++    assert not env.conn.execute("SELECT 1 FROM kanban_sync_outbox").fetchone()
++    assert not env.conn.execute("SELECT 1 FROM task_events WHERE task_id=?", (tid,)).fetchone()
++
++
++@pytest.mark.parametrize("fields,missing,days,state", [
++    ({"completed_at": int(time.time())}, None, 7, "live"),
++    ({}, None, 0, "live"),
++    ({"status": "running"}, None, 7, "live"),
++    ({"lease_holder": "other", "lease_expires": int(time.time() * 1000) + 60000}, None, 7, "live"),
++    ({}, None, 7, "never_existed"),
++    ({"completed_at": None}, None, 7, "live"),
++    ({}, "lease_holder", 7, "live"),
++    ({"uid": "other"}, None, 7, "live"),
++])
++def test_authority_and_retention_controls_keep_plain_directory(env, fields, missing, days, state):
++    _, path, _ = evicted(env)
++    env.owner.update(fields)
++    if missing:
++        del env.owner[missing]
++    env.evidence_state = state
++    assert gc.gc_task_scratch(env.conn, older_than_days=days) == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("control", ["unrelated", "wrong_board", "wrong_run", "live", "source", "ambiguous", "same_cwd_live", "turn", "missing_tombstone"])
++def test_legacy_requires_exact_ended_request_link(env, control):
++    tid, path, run = legacy(env)
++    if control in ("unrelated", "wrong_board", "wrong_run"):
++        request = {"unrelated": "interactive", "wrong_board": "kanban:" + json.dumps(["elsewhere", tid, run]),
++                   "wrong_run": "kanban:" + json.dumps(["default", tid, run + 100])}[control]
++        env.state.execute("UPDATE session_admissions SET request_id=?", (request,))
++    elif control == "missing_tombstone":
++        with kb.write_txn(env.conn):
++            env.conn.execute("DELETE FROM kanban_ended_run_tombstones")
++    else:
++        actions = {
++            "live": lambda: env.state.execute("UPDATE sessions SET ended_at=NULL"),
++            "source": lambda: env.state.execute("UPDATE sessions SET source='cli'"),
++            "ambiguous": lambda: session(env, tid, path, run, sid="duplicate"),
++            "same_cwd_live": lambda: session(env, tid, path, run, sid="live", request="interactive", ended=None, source="cli"),
++            "turn": lambda: env.state.execute("INSERT INTO session_turn_leases VALUES ('session',?)", (time.time() + 60,)),
++        }
++        actions[control]()
++    env.state.commit()
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists() and custody.receipts(env.conn) == []
++
++
++@pytest.mark.parametrize("control", ["state_missing", "state_unreadable", "unfinished_run", "job"])
++def test_local_safety_vetoes(env, monkeypatch, control):
++    _, path, _ = evicted(env, ended=None if control == "unfinished_run" else OLD)
++    if control == "state_missing":
++        (env.home / "state.db").unlink()
++    elif control == "state_unreadable":
++        monkeypatch.setattr(custody, "_state", lambda _: (_ for _ in ()).throw(sqlite3.OperationalError("unreadable")))
++    elif control == "job":
++        from hermes_cli import kanban_workspace_jobs
++        monkeypatch.setattr(kanban_workspace_jobs, "defer_owned_job_cleanup", lambda *_: True)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("control", ["child", "other_board"])
++def test_local_dependents_keep_custody_without_sync_events(env, control):
++    tid, path, _ = evicted(env)
++    if control == "child":
++        child = kb.create_task(env.conn, title="child")
++        with kb.write_txn(env.conn):
++            env.conn.execute("INSERT INTO task_links(parent_id,child_id) VALUES (?,?)", (tid, child))
++    else:
++        other_path = env.home / "kanban" / "boards" / "other" / "kanban.db"
++        other_path.parent.mkdir(parents=True)
++        other = kbc.connect(other_path)
++        try:
++            child = kb.create_task(other, title="sharer")
++            with kb.write_txn(other):
++                other.execute("UPDATE tasks SET workspace_kind='dir',workspace_path=? WHERE id=?", (str(path), child))
++        finally:
++            other.close()
++    before = [tuple(r) for r in env.conn.execute("SELECT * FROM kanban_sync_outbox")]
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++    assert before == [tuple(r) for r in env.conn.execute("SELECT * FROM kanban_sync_outbox")]
++
++
++def test_clone_archives_and_bare_is_preserved(env, remote):
++    tid, path, _ = evicted(env)
++    helpers._run("clone", "-q", str(remote), str(path / "repo"))
++    (path / "repo" / "tracked.txt").write_text("local change\n")
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    dest = env.home / "archive" / "scratch" / "default" / tid / "repo"
++    assert "local change" in (dest / "tracked.diff").read_text()
++    _, path, _ = evicted(env)
++    helpers._run("clone", "-q", "--bare", str(remote), str(path / "bare"))
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("race", ["pickup_null_path", "receipt", "inode", "mtime", "legacy_session_deleted", "legacy_ambiguous"])
++def test_archive_to_rename_fence(env, remote, monkeypatch, race):
++    tid, path, run = legacy(env) if race.startswith("legacy_") else evicted(env)
++    helpers._run("clone", "-q", str(remote), str(path / "repo"))
++    real = archive.archive_workspace
++    raced = []
++
++    def racing(*args, **kwargs):
++        result = real(*args, **kwargs)
++
++        def pickup():
++            # Real foreign import, with no local workspace assigned yet.
++            sync.apply_remote_changes(env.conn, [sync.RemoteChange(
++                1, "tasks", tid, "upsert", {"title": "picked up", "status": "ready", "created_on": "other", "created_at": OLD,
++                                          "workspace_kind": "scratch", "workspace_path": None}, 1, "", "")],
++                new_cursor=1, observers=False)
++            assert kb.get_task(env.conn, tid) is not None
++
++        def change_receipt():
++            with kb.write_txn(env.conn):
++                env.conn.execute("UPDATE kanban_scratch_custody SET evidence=json_set(evidence, '$.changed', 1) WHERE task_id=?", (tid,))
++
++        def replace_tree():
++            path.rename(path.with_name(path.name + "-old"))
++            path.mkdir()
++
++        def delete_session():
++            env.state.execute("DELETE FROM sessions")
++            env.state.commit()
++        actions = {"pickup_null_path": pickup, "receipt": change_receipt, "inode": replace_tree,
++                   "mtime": lambda: (path / "new-work").write_text("new"),
++                   "legacy_session_deleted": delete_session,
++                   "legacy_ambiguous": lambda: session(env, tid, path, run, sid="duplicate")}
++        actions[race]()
++        raced.append(race)
++        return result
++
++    monkeypatch.setattr(archive, "archive_workspace", racing)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert raced == [race]
++    assert path.exists()
++
++
++def test_pickup_after_rename_gets_new_directory(env, monkeypatch):
++    from hermes_cli import kanban_db_workspace as ws
++    tid, path, _ = evicted(env)
++    old_inode = path.stat().st_ino
++    real = custody.shutil.rmtree
++
++    def pickup_then_remove(trash):
++        assert not env.conn.in_transaction
++        assert not path.exists()
++        sync.apply_remote_changes(env.conn, [sync.RemoteChange(
++            1, "tasks", tid, "upsert", {"title": "picked up", "status": "ready", "created_on": "other", "created_at": OLD,
++                                      "workspace_kind": "scratch", "workspace_path": None}, 1, "", "")],
++            new_cursor=1, observers=False)
++        picked = kb.get_task(env.conn, tid)
++        assert picked is not None
++        fresh = ws.resolve_workspace(picked, board="default")
++        assert fresh == path and fresh.stat().st_ino != old_inode
++        (fresh / "new-work").write_text("survives")
++        real(trash)
++
++    monkeypatch.setattr(custody.shutil, "rmtree", pickup_then_remove)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    assert (path / "new-work").read_text() == "survives"
++    assert not (path / "notes").exists()
++
++
++def test_failed_authority_read_keeps_custody(env, monkeypatch):
++    _, path, _ = evicted(env)
++
++    class Unavailable:
++        def row_evidence(self, *args):
++            raise client.SyncUnavailable("offline")
++
++    monkeypatch.setattr(client, "Hub", lambda _: Unavailable())
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++def test_symlink_not_retained_and_overlapping_custody_not_deleted(env):
++    tid, path, _ = task(env)
++    real = path.with_name("real")
++    path.rename(real)
++    path.symlink_to(real, target_is_directory=True)
++    worker.evict(env.conn)
++    assert custody.receipts(env.conn) == []
++    path.unlink()
++    real.rename(path)
++    other, other_path, _ = evicted(env)
++    with kb.write_txn(env.conn):
++        env.conn.execute("INSERT INTO kanban_scratch_custody SELECT ?,workspace_path,evidence "
++                         "FROM kanban_scratch_custody WHERE task_id=?", (tid, other))
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert other_path.exists()
++
++
++def test_existing_receipt_rechecks_ancestor_turn_and_admission(env):
++    tid, path, run = legacy(env)
++    custody.discover_legacy(env.conn, "default")
++    assert custody.receipts(env.conn)
++    env.state.execute("INSERT INTO sessions VALUES ('ancestor','kanban',NULL,?,NULL)", (OLD,))
++    env.state.execute("UPDATE sessions SET parent_session_id='ancestor' WHERE id='session'")
++    env.state.execute("INSERT INTO session_turn_leases VALUES ('ancestor',?)", (time.time() + 60,))
++    env.state.commit()
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++    env.state.execute("DELETE FROM session_turn_leases")
++    session(env, tid, path, run, sid="other", request="interactive")
++    env.state.execute("UPDATE session_admissions SET status='queued' WHERE target_session_id='other'")
++    env.state.commit()
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++# --- Mutation-test survivors (each case below killed a surviving mutant) -------------------------
++
++def reimport(env, tid):
++    sync.apply_remote_changes(env.conn, [sync.RemoteChange(
++        1, "tasks", tid, "upsert", {"title": "picked up", "status": "ready", "created_on": "other", "created_at": OLD,
++                                  "workspace_kind": "scratch", "workspace_path": None}, 1, "", "")],
++        new_cursor=1, observers=False)
++
++
++def test_relative_workspace_path_is_not_retained(env, monkeypatch):
++    tid, path, _ = task(env)
++    monkeypatch.chdir(path.parent)
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE kanban_sync_state SET applying=1")
++        env.conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (tid, tid))
++        env.conn.execute("DELETE FROM kanban_sync_outbox")
++        env.conn.execute("UPDATE kanban_sync_state SET applying=0")
++    worker.evict(env.conn)
++    assert custody.receipts(env.conn) == []
++
++
++def test_reeviction_refreshes_receipt_runs(env):
++    tid, path, _ = evicted(env)
++    reimport(env, tid)
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE kanban_sync_state SET applying=1")
++        env.conn.execute("UPDATE tasks SET workspace_path=?, status='done', completed_at=? WHERE id=?", (str(path), OLD, tid))
++        env.conn.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at) VALUES (?,'running',?,NULL)", (tid, OLD))
++        env.conn.execute("DELETE FROM kanban_sync_outbox")
++        env.conn.execute("UPDATE kanban_sync_state SET applying=0")
++    assert worker.evict(env.conn) == [tid]
++    receipt, = custody.receipts(env.conn)
++    assert [r["ended_at"] for r in json.loads(receipt["evidence"])["runs"]][-1] is None
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("where", ["subdir", "profile"])
++def test_live_session_below_tree_or_in_profile_vetoes(env, where):
++    _, path, _ = evicted(env)
++    if where == "subdir":
++        (path / "sub").mkdir()
++        env.state.execute("INSERT INTO sessions VALUES ('live','cli',?,NULL,NULL)", (str(path / "sub"),))
++        env.state.commit()
++    else:
++        profile = env.home / "profiles" / "worker"
++        profile.mkdir(parents=True)
++        other = sqlite3.connect(profile / "state.db")
++        other.executescript(
++            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT, ended_at INTEGER, parent_session_id TEXT);"
++            "CREATE TABLE session_admissions (request_id TEXT, target_session_id TEXT, status TEXT);"
++            "CREATE TABLE session_turn_leases (conversation_id TEXT, expires_at REAL);")
++        other.execute("INSERT INTO sessions VALUES ('live','cli',?,NULL,NULL)", (str(path),))
++        other.commit()
++        other.close()
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++def test_missing_state_db_is_not_created(env):
++    _, path, _ = evicted(env)
++    (env.home / "state.db").unlink()
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists() and not (env.home / "state.db").exists()
++
++
++@pytest.mark.parametrize("control", ["str_run", "bool_run", "extra_field", "zero_ended", "relative_cwd",
++                                     "symlink_cwd", "missing_cwd", "outside_cwd", "task_local", "zero_tombstone"])
++def test_legacy_rejects_malformed_or_unverified_inputs(env, monkeypatch, control):
++    tid, path, run = legacy(env)
++    assert run == 1  # bool_run relies on True == 1
++    request = {"str_run": [tid, str(run)], "bool_run": [tid, True], "extra_field": [tid, run, "x"]}.get(control)
++    if request:
++        env.state.execute("UPDATE session_admissions SET request_id=?", ("kanban:" + json.dumps(["default", *request]),))
++    elif control == "zero_ended":
++        env.state.execute("UPDATE sessions SET ended_at=0")
++    elif control == "relative_cwd":
++        monkeypatch.chdir(path.parent)
++        env.state.execute("UPDATE sessions SET cwd=?", (path.name,))
++    elif control == "symlink_cwd":
++        moved = path.with_name(path.name + "-moved")
++        path.rename(moved)
++        path.symlink_to(moved, target_is_directory=True)
++    elif control == "missing_cwd":
++        path.rename(path.with_name(path.name + "-moved"))
++    elif control == "outside_cwd":
++        outside = env.home / path.name
++        outside.mkdir()
++        env.state.execute("UPDATE sessions SET cwd=?", (str(outside),))
++    elif control == "task_local":
++        reimport(env, tid)
++    elif control == "zero_tombstone":
++        with kb.write_txn(env.conn):
++            env.conn.execute("UPDATE kanban_ended_run_tombstones SET ended_at=0")
++    env.state.commit()
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    kept = path.with_name(path.name + "-moved") if control in ("symlink_cwd", "missing_cwd") else path
++    assert kept.exists() and custody.receipts(env.conn) == []
++
++
++def test_candidate_identity_requires_string_task(env):
++    _, path, run = legacy(env)
++    env.state.execute("UPDATE session_admissions SET request_id=?",
++                      ("kanban:" + json.dumps(["default", 123, run]),))
++    env.state.commit()
++    assert custody._legacy_candidates("default") == {}
++    assert path.exists()
++
++
++def test_discovery_requires_terminal_admission_before_idle_scan(env, monkeypatch):
++    _, path, _ = legacy(env)
++    env.state.execute("UPDATE session_admissions SET status='queued'")
++    env.state.commit()
++    monkeypatch.setattr(custody, "_sessions_idle", lambda _path: True)
++    custody.discover_legacy(env.conn, "default")
++    assert custody.receipts(env.conn) == []
++    assert path.exists()
++
++
++def test_legacy_link_never_replaces_eviction_receipt(env):
++    tid, path, run = task(env)
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE kanban_sync_state SET applying=1")
++        env.conn.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at) VALUES (?,'running',?,NULL)", (tid, OLD))
++        env.conn.execute("DELETE FROM kanban_sync_outbox")
++        env.conn.execute("UPDATE kanban_sync_state SET applying=0")
++    assert worker.evict(env.conn) == [tid]
++    before = custody.receipts(env.conn)
++    session(env, tid, path, run)  # exact ended legacy link for the ended first run
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists() and custody.receipts(env.conn) == before
++
++
++@pytest.mark.parametrize("evidence,fields,missing", [
++    ({"table": "task_runs"}, {}, None),
++    ({"uid": "other"}, {}, None),
++    ({"head": "1"}, {}, None),
++    ({}, {"status": "blocked"}, None),
++    ({}, {"completed_at": True}, None),
++    ({}, {"completed_at": 0}, None),
++    ({}, {}, "lease_expires"),
++    ({}, {"lease_holder": "other", "lease_expires": None}, None),
++])
++def test_authority_evidence_shape_keeps_plain_directory(env, evidence, fields, missing):
++    _, path, _ = evicted(env)
++    env.evidence_extra.update(evidence)
++    env.owner.update(fields)
++    if missing:
++        del env.owner[missing]
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("race", ["claim", "running", "wake_check"])
++def test_eviction_rechecks_inside_write_txn(env, monkeypatch, race):
++    import contextlib
++    tid, _, _ = task(env)
++    real = kbc.write_txn
++    raced = []
++
++    @contextlib.contextmanager
++    def racing(conn, *args, **kwargs):
++        if not raced:
++            raced.append(race)
++            with real(conn):
++                conn.execute("UPDATE kanban_sync_state SET applying=1")
++                if race == "claim":
++                    conn.execute("UPDATE tasks SET claim_lock='local-worker' WHERE id=?", (tid,))
++                elif race == "running":
++                    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++                else:
++                    conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++                    conn.execute("INSERT INTO task_wake_checks(task_id,cmd,every,next_at) VALUES (?,'true',60,0)", (tid,))
++                conn.execute("UPDATE kanban_sync_state SET applying=0")
++        with real(conn, *args, **kwargs):
++            yield
++
++    monkeypatch.setattr(kbc, "write_txn", racing)
++    assert worker.evict(env.conn) == []
++    assert raced == [race]
++    assert kb.get_task(env.conn, tid) is not None and custody.receipts(env.conn) == []
++
++
++@pytest.mark.parametrize("swap", ["symlink", "file"])
++def test_receipt_path_swapped_for_non_directory_is_kept(env, swap):
++    _, path, _ = evicted(env)
++    target = path.with_name("elsewhere")
++    path.rename(target)
++    if swap == "symlink":
++        path.symlink_to(target, target_is_directory=True)
++    else:
++        path.write_text("not a tree")
++    before = custody.receipts(env.conn)
++    # Assert admission itself: downstream archive/rmtree errors also preserve these
++    # paths, but must not substitute for rejecting them at the safety boundary.
++    assert custody._safe(env.conn, before[0], path) is False
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (path.is_symlink() if swap == "symlink" else path.is_file())
++    assert (target / "notes").read_text() == "keep me" and custody.receipts(env.conn) == before
++
++
++def test_receipt_outside_managed_storage_is_kept(env):
++    tid, _, _ = evicted(env)
++    outside = env.home / "source"
++    outside.mkdir()
++    (outside / "user").write_text("data")
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE kanban_scratch_custody SET workspace_path=? WHERE task_id=?", (str(outside), tid))
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (outside / "user").exists()
++
++
++@pytest.mark.parametrize("relation", ["ancestor", "descendant"])
++def test_nested_custody_receipts_block_each_other(env, relation):
++    tid, path, _ = evicted(env)
++    nested = path / "inner" if relation == "descendant" else path.parent
++    if relation == "descendant":
++        nested.mkdir()
++    with kb.write_txn(env.conn):
++        env.conn.execute("INSERT INTO kanban_scratch_custody SELECT 'x_other',?,evidence "
++                         "FROM kanban_scratch_custody WHERE task_id=?", (str(nested), tid))
++    assert custody.gc_custody(env.conn, 7) == 0
++    assert path.exists()
++
++
++def test_unreadable_sibling_board_keeps_custody(env):
++    _, path, _ = evicted(env)
++    other = env.home / "kanban" / "boards" / "other" / "kanban.db"
++    other.parent.mkdir(parents=True)
++    other.write_bytes(b"not a sqlite database" * 64)
++    assert custody.gc_custody(env.conn, 7) == 0
++    assert path.exists()
++
++
++def test_unsafe_tree_is_not_archived(env, remote, monkeypatch):
++    _, path, _ = evicted(env)
++    helpers._run("clone", "-q", str(remote), str(path / "repo"))
++    from hermes_cli import kanban_workspace_jobs
++    monkeypatch.setattr(kanban_workspace_jobs, "defer_owned_job_cleanup", lambda *_: True)
++    calls = []
++    monkeypatch.setattr(archive, "archive_workspace", lambda *a, **k: calls.append(a))
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert calls == [] and path.exists()
++
++
++def test_replaced_tree_with_restored_mtime_is_kept(env, remote, monkeypatch):
++    import os
++    _, path, _ = evicted(env)
++    helpers._run("clone", "-q", str(remote), str(path / "repo"))
++    real = archive.archive_workspace
++
++    def racing(*args, **kwargs):
++        result = real(*args, **kwargs)
++        st = path.stat()
++        path.rename(path.with_name(path.name + "-old"))
++        path.mkdir()
++        (path / "fresh").write_text("new owner")
++        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
++        return result
++
++    monkeypatch.setattr(archive, "archive_workspace", racing)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (path / "fresh").read_text() == "new owner"
++
++
++def test_existing_empty_trash_directory_preserves_workspace_and_receipt(env):
++    import os
++
++    _, path, _ = evicted(env)
++    trash = path.with_name(f".{path.name}.gc-{os.getpid()}")
++    # An empty destination is replaceable by rename on POSIX; a nonempty one
++    # would mask a missing collision check with an OS-level rename refusal.
++    trash.mkdir()
++    trash_inode = trash.stat().st_ino
++    before = custody.receipts(env.conn)
++
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (path / "notes").read_text() == "keep me"
++    assert trash.is_dir() and trash.stat().st_ino == trash_inode
++    assert list(trash.iterdir()) == []
++    assert custody.receipts(env.conn) == before
++
++
++def test_removal_consumes_receipt(env):
++    _, path, _ = evicted(env)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    assert not path.exists() and custody.receipts(env.conn) == []
++
++
++def test_gc_custody_refuses_inside_caller_transaction(env):
++    _, path, _ = evicted(env)
++    with kb.write_txn(env.conn):
++        assert custody.gc_custody(env.conn, 7) == 0
++    assert path.exists() and env.calls == 0
++
++
++def test_receipt_without_runs_is_unverified(env):
++    tid, path, _ = task(env)
++    with kb.write_txn(env.conn):
++        env.conn.execute("UPDATE kanban_sync_state SET applying=1")
++        env.conn.execute("DELETE FROM task_runs WHERE task_id=?", (tid,))
++        env.conn.execute("DELETE FROM kanban_sync_outbox WHERE 1")
++        env.conn.execute("UPDATE kanban_sync_state SET applying=0")
++    assert worker.evict(env.conn) == [tid]
++    assert json.loads(custody.receipts(env.conn)[0]["evidence"])["runs"] == []
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.exists()
++
++
++def test_custody_path_counts_as_owned_in_inventory(env, caplog):
++    _, path, _ = evicted(env)
++    with caplog.at_level("WARNING"):
++        gc.gc_task_scratch(env.conn, older_than_days=0)
++    assert path.exists() and "owner_unverified" not in caplog.text
++
++
++@pytest.mark.parametrize("cwd", ["foreign_tree", "nested_same_name"])
++def test_legacy_cwd_must_be_the_tasks_own_scratch_tree(env, cwd):
++    """A dir-kind sharer's session runs in its owner's scratch: never custody of that tree."""
++    tid, path, _ = legacy(env)
++    owner = path.parent / "t_owner" if cwd == "foreign_tree" else path / "deeper" / tid
++    owner.mkdir(parents=True)
++    (owner / "owner-work").write_text("not yours")
++    env.state.execute("UPDATE sessions SET cwd=?", (str(owner),))
++    env.state.commit()
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (owner / "owner-work").exists() and custody.receipts(env.conn) == []
++
++
++# --- Reliability: absent paths, Board transport, detach ordering -----------------------------------
++
++def _trash(path):
++    import os
++    return path.with_name(f".{path.name}.gc-{os.getpid()}")
++
++
++def _receipt(env, tid):
++    return env.conn.execute("SELECT * FROM kanban_scratch_custody WHERE task_id=?", (tid,)).fetchone()
++
++
++@pytest.mark.parametrize("shape", ["absent", "file"])
++def test_eviction_skips_missing_or_non_directory_path(env, shape):
++    import shutil
++    tid, path, _ = task(env)
++    shutil.rmtree(path)
++    if shape == "file":
++        path.write_text("not a tree")
++    assert worker.evict(env.conn) == [tid]
++    assert custody.receipts(env.conn) == []
++
++
++@pytest.mark.parametrize("shape", ["absent", "file"])
++def test_gc_skips_unavailable_path_before_board_and_keeps_receipt(env, caplog, shape):
++    import shutil
++    first, first_path, _ = evicted(env)
++    second, second_path, _ = evicted(env)
++    before = dict(_receipt(env, first))
++    shutil.rmtree(first_path)
++    if shape == "file":
++        first_path.write_text("not a tree")
++    with caplog.at_level("INFO"):
++        assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
++    assert env.calls == 1  # only the second receipt reached the Board
++    assert not second_path.exists() and _receipt(env, second) is None
++    assert dict(_receipt(env, first)) == before
++    assert "reason=path_unavailable" in caplog.text and first in caplog.text
++
++
++@pytest.mark.parametrize("error,stops", [
++    (lambda: __import__("urllib.error").error.URLError("connection refused"), True),
++    (lambda: TimeoutError("Board request exceeded its budget"), True),
++    (lambda: client.SyncUnavailable("offline"), True),
++    (lambda: client.HubError(404, "no such row"), False),  # a per-row answer, not transport
++])
++def test_board_transport_failure_stops_pass(env, monkeypatch, caplog, error, stops):
++    first, first_path, _ = evicted(env)
++    second, second_path, _ = evicted(env)
++    calls = []
++
++    class Down:
++        def row_evidence(self, board, table, uid):
++            calls.append(uid)
++            raise error()
++
++    monkeypatch.setattr(client, "Hub", lambda _: Down())
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert calls == ([first] if stops else [first, second])
++    assert first_path.exists() and second_path.exists()
++    assert len(custody.receipts(env.conn)) == 2
++    assert ("reason=board_unavailable" in caplog.text) is stops
++
++
++def test_receipt_delete_failure_leaves_tree_in_place(env):
++    tid, path, _ = evicted(env)
++    before = dict(_receipt(env, tid))
++    env.conn.execute("CREATE TEMP TRIGGER refuse_consume BEFORE DELETE ON kanban_scratch_custody "
++                     "BEGIN SELECT RAISE(ABORT, 'refuse'); END")
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (path / "notes").read_text() == "keep me" and not _trash(path).exists()
++    assert dict(_receipt(env, tid)) == before
++
++
++def test_rename_failure_rolls_back_receipt_delete(env, monkeypatch, caplog):
++    tid, path, _ = evicted(env)
++    before = dict(_receipt(env, tid))
++    real = Path.rename
++
++    def refuse(self, target):
++        if ".gc-" in Path(target).name:
++            raise PermissionError("rename refused")
++        return real(self, target)
++
++    monkeypatch.setattr(Path, "rename", refuse)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (path / "notes").read_text() == "keep me"
++    assert dict(_receipt(env, tid)) == before
++    assert "detach not committed" not in caplog.text
++
++
++@pytest.mark.parametrize("stage", ["commit", "post_commit"])
++def test_commit_failure_after_rename_restores_tree_and_stops(env, monkeypatch, caplog, stage):
++    first, first_path, _ = evicted(env)
++    second, second_path, _ = evicted(env)
++    fired, asked = [], []
++
++    def terminal(_hub, _board, tid):
++        asked.append(tid)
++        return dict(env.owner, uid=tid)
++
++    monkeypatch.setattr(custody, "_terminal", terminal)
++
++    def fail_once(sql=None):
++        if not fired and _trash(first_path).exists() and sql in (None, "COMMIT"):
++            fired.append(stage)
++            raise sqlite3.OperationalError("disk I/O error")
++
++    if stage == "commit":
++        real = kbc._execute_boundary_with_retry
++
++        def boundary(conn, sql):
++            fail_once(sql)
++            return real(conn, sql)
++        monkeypatch.setattr(kbc, "_execute_boundary_with_retry", boundary)
++    else:
++        real = kbc._check_file_length_invariant
++
++        def invariant(conn):
++            real(conn)
++            fail_once()
++        monkeypatch.setattr(kbc, "_check_file_length_invariant", invariant)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert fired == [stage]
++    assert (first_path / "notes").read_text() == "keep me" and not _trash(first_path).exists()
++    # A rolled-back COMMIT keeps the receipt; a landed one is reported absent, never guessed.
++    assert (_receipt(env, first) is not None) is (stage == "commit")
++    receipt = "present" if stage == "commit" else "absent"
++    assert f"receipt={receipt} restored=True" in caplog.text
++    assert asked == [first] and second_path.exists() and _receipt(env, second) is not None
++
++
++def test_commit_failure_never_clobbers_reoccupied_path(env, monkeypatch, caplog):
++    _, path, _ = evicted(env)
++    real = kbc._execute_boundary_with_retry
++    fresh = []
++
++    def boundary(conn, sql):
++        if sql == "COMMIT" and _trash(path).exists() and not fresh:
++            path.mkdir()  # empty: a plain rename would silently replace it
++            fresh.append(path.stat().st_ino)
++            raise sqlite3.OperationalError("disk I/O error")
++        return real(conn, sql)
++
++    monkeypatch.setattr(kbc, "_execute_boundary_with_retry", boundary)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert path.stat().st_ino == fresh[0] and list(path.iterdir()) == []
++    assert (_trash(path) / "notes").read_text() == "keep me"
++    assert "restored=False reason=path_reoccupied" in caplog.text and str(_trash(path)) in caplog.text
++
++
++def test_commit_failure_with_failed_restore_reports_trash(env, monkeypatch, caplog):
++    tid, path, _ = evicted(env)
++    real_boundary, real_rename = kbc._execute_boundary_with_retry, Path.rename
++    fired = []
++
++    def boundary(conn, sql):
++        if sql == "COMMIT" and _trash(path).exists() and not fired:
++            fired.append(1)
++            raise sqlite3.OperationalError("disk I/O error")
++        return real_boundary(conn, sql)
++
++    def rename(self, target):
++        if fired and ".gc-" in self.name:
++            raise PermissionError("restore refused")
++        return real_rename(self, target)
++
++    monkeypatch.setattr(kbc, "_execute_boundary_with_retry", boundary)
++    monkeypatch.setattr(Path, "rename", rename)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert (_trash(path) / "notes").read_text() == "keep me" and _receipt(env, tid) is not None
++    assert "restored=False reason=restore_failed" in caplog.text and str(_trash(path)) in caplog.text
++
++
++def test_post_detach_cleanup_failure_is_reported_accurately(env, monkeypatch, caplog):
++    tid, path, _ = evicted(env)
++
++    def refuse(_trash_path):
++        raise PermissionError("rmtree refused")
++
++    monkeypatch.setattr(custody.shutil, "rmtree", refuse)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert not path.exists() and (_trash(path) / "notes").read_text() == "keep me"
++    assert _receipt(env, tid) is None
++    assert "detached but not removed" in caplog.text and "receipt=consumed" in caplog.text
++    assert str(_trash(path)) in caplog.text and "Scratch custody preserved" not in caplog.text
+-- 
+2.55.0
+

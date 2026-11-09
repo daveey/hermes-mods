@@ -1,0 +1,194 @@
+From f0c1f272ab1bec8e8c31eb766959685602cc30fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 01:59:08 +0000
+Subject: [PATCH] [daveey] Explain preserved scratch without expanding GC
+ authority
+
+---
+ hermes_cli/kanban_worktree_gc.py              |  42 ++++++-
+ .../test_kanban_scratch_preservation.py       | 104 ++++++++++++++++++
+ 2 files changed, 145 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_preservation.py
+
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 11e65458625..df1d1e4651b 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -62,9 +62,11 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+                 "FROM tasks t WHERE t.workspace_kind='scratch' "
+                 f"AND t.status IN {ws._TERMINAL_STATUSES_SQL}"
+             ).fetchall()
++            known_paths = _scratch_owner_paths(conn)
+             for board in ws._sibling_board_db_files(conn):
+                 with _read_board(board) as other:
+-                    other.execute("SELECT workspace_path FROM tasks").fetchall()
++                    known_paths.update(_scratch_owner_paths(other))
++            _report_unowned_scratch(kb.workspaces_root(), known_paths)
+         except (OSError, sqlite3.Error):
+             log.warning("Scratch GC aborted: cannot read all boards; preserving workspaces", exc_info=True)
+             return 0
+@@ -76,6 +78,7 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+                 continue
+             removable = ws._scratch_tree_removable(path)
+             if not removable and not _finished_before(row, days):
++                _report_scratch_retention(row, path, days)
+                 continue
+             if ws._defer_shared_workspace_cleanup(conn, row["id"], path):
+                 continue
+@@ -95,6 +98,43 @@ def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = N
+     return removed
+ 
+ 
++def _scratch_owner_paths(conn: sqlite3.Connection) -> set[Path]:
++    """Read local records only; this inventory never supplies deletion candidates."""
++    from hermes_cli import kanban_db as kb
++
++    root = kb.workspaces_root(board=_board_slug(conn))
++    paths = set()
++    for row in conn.execute("SELECT id, workspace_kind, workspace_path FROM tasks"):
++        if row["workspace_path"]:
++            paths.add(Path(row["workspace_path"]).expanduser().resolve())
++        elif row["workspace_kind"] == "scratch":
++            paths.add((root / row["id"]).resolve())
++    return paths
++
++
++def _report_unowned_scratch(root: Path, known_paths: set[Path]) -> None:
++    """Observe root children without entering them or guessing task IDs from names."""
++    if not root.exists():
++        return
++    for path in root.iterdir():
++        if path.is_symlink() or not path.is_dir():
++            continue
++        if path.resolve() not in known_paths:
++            log.warning("Scratch preserved: reason=owner_unverified path=%s; "
++                        "no local task workspace record; moved or unknown ownership; "
++                        "no deletion deadline", path)
++
++
++def _report_scratch_retention(row: sqlite3.Row, path: Path, days: int) -> None:
++    # Logs, not task events: observing retention must never extend its age.
++    since = row["completed_at"] or row["last_event"] or row["created_at"]
++    reason = "retention_disabled" if days <= 0 else "retention_pending"
++    eligible_at = since + days * 86400 if days > 0 and since else None
++    log.warning("Scratch preserved: reason=%s path=%s task=%s eligible_at=%s; "
++                "deadline is archival eligibility only, all safety guards still apply",
++                reason, path, row["id"], eligible_at)
++
++
+ def _finished_before(row: sqlite3.Row, days: int) -> bool:
+     if days <= 0:
+         return False
+diff --git a/tests/hermes_cli/test_kanban_scratch_preservation.py b/tests/hermes_cli/test_kanban_scratch_preservation.py
+new file mode 100644
+index 00000000000..3dd7c778a85
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_preservation.py
+@@ -0,0 +1,104 @@
++"""Scratch preservation is observable without granting deletion authority."""
++import logging
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++
++board = helpers.board
++remote = helpers.remote
++
++
++def test_moved_owner_absent_locally_is_preserved(board, caplog):
++    path = kb.workspaces_root() / "t_0123456789abcdef"
++    path.mkdir(parents=True)
++    (path / "notes").write_text("keep")
++    # A sync shadow is not a local ownership or deletion authority.
++    shadow = kb.kanban_home() / "kanban" / "sync-shadow" / "default.db"
++    shadow.parent.mkdir(parents=True)
++    with sqlite3.connect(shadow) as conn:
++        conn.execute("CREATE TABLE tasks (id, status, workspace_kind, workspace_path)")
++        conn.execute("INSERT INTO tasks VALUES (?, 'done', 'scratch', NULL)", (path.name,))
++    caplog.set_level(logging.WARNING)
++    assert helpers._gc() == 0
++    assert (path / "notes").read_text() == "keep"
++    assert f"reason=owner_unverified path={path}" in caplog.text
++    with kbc.connect_closing() as conn:
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("days,reason", [(7, "retention_pending"), (0, "retention_disabled")])
++def test_known_clone_reports_stable_retention(board, remote, caplog, days, reason):
++    finished = int(time.time()) - 3600
++    tid, path = helpers._task(remote=remote, completed_at=finished)
++    before = helpers._events(tid)
++    caplog.set_level(logging.WARNING)
++    for _ in range(2):
++        assert helpers._gc(days=days) == 0
++    assert path.exists()
++    assert f"reason={reason} path={path}" in caplog.text
++    if days:
++        assert f"eligible_at={finished + days * 86400}" in caplog.text
++    assert helpers._events(tid) == before
++
++
++def test_actual_nonterminal_owner_is_not_unknown(board, caplog):
++    _, path = helpers._task(status="running")
++    caplog.set_level(logging.WARNING)
++    assert helpers._gc() == 0
++    assert path.exists()
++    assert "owner_unverified" not in caplog.text
++
++
++def test_sibling_record_and_null_path_owner_are_known(board, caplog):
++    tid, path = helpers._task(status="running")
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET workspace_path=NULL WHERE id=?", (tid,))
++    other_path = path.parent / "not-a-task-id"
++    other_path.mkdir()
++    kb.create_board("other")
++    with kbc.connect_closing(board="other") as conn:
++        sibling = kb.create_task(conn, title="sibling owner")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(other_path), sibling))
++    caplog.set_level(logging.WARNING)
++    assert helpers._gc() == 0
++    assert path.exists() and other_path.exists()
++    assert "owner_unverified" not in caplog.text
++
++
++def test_inventory_does_not_follow_symlinks_or_classify_files(board, caplog):
++    root = kb.workspaces_root()
++    root.mkdir(parents=True)
++    (root / "link").symlink_to(board, target_is_directory=True)
++    (root / "file").write_text("not a workspace")
++    caplog.set_level(logging.WARNING)
++    assert helpers._gc() == 0
++    assert "owner_unverified" not in caplog.text
++    assert (root / "link").is_symlink()
++
++
++def test_unreadable_board_aborts_without_unknown_owner_claim(board, caplog):
++    _, path = helpers._task()
++    kb.create_board("broken")
++    kb.board_own_db_path("broken").write_bytes(b"not sqlite")
++    caplog.set_level(logging.WARNING)
++    assert helpers._gc() == 0
++    assert path.exists()
++    assert "cannot read all boards" in caplog.text
++    assert "owner_unverified" not in caplog.text
++
++
++def test_completed_time_wins_over_later_diagnostics(board, remote, caplog):
++    tid, path = helpers._task(remote=remote)
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "commented", {"body": "diagnostic"})
++        assert gc.gc_task_scratch(conn, older_than_days=7) == 1
++    assert not path.exists()
+-- 
+2.55.0
+

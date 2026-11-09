@@ -1,0 +1,1091 @@
+From 438f8a49be0b55551b62e5a32bb55e3e79013306 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:59:37 +0000
+Subject: [PATCH] fix(tui): make idle notification polling commit-driven
+ [daveey]
+
+---
+ tests/tools/test_async_delegation_idle.py     |  80 +++++++++
+ .../test_notification_idle_gates.py           | 160 ++++++++++++++++++
+ .../test_notification_poller_idle.py          | 139 +++++++++++++++
+ tests/tui_gateway/test_notification_wait.py   | 127 ++++++++++++++
+ tools/async_delegation.py                     |   3 +
+ tools/async_delegation_idle.py                |  52 ++++++
+ tools/process_registry_awaiting.py            |   5 +-
+ tools/process_registry_readopt.py             |   7 +
+ tui_gateway/notification_idle.py              |  95 +++++++++++
+ tui_gateway/notification_park.py              |  10 ++
+ tui_gateway/notification_wait.py              |  37 ++++
+ tui_gateway/producer_admission.py             |   5 +-
+ tui_gateway/session_notifications.py          | 120 +++++++++----
+ 13 files changed, 799 insertions(+), 41 deletions(-)
+ create mode 100644 tests/tools/test_async_delegation_idle.py
+ create mode 100644 tests/tui_gateway/test_notification_idle_gates.py
+ create mode 100644 tests/tui_gateway/test_notification_poller_idle.py
+ create mode 100644 tests/tui_gateway/test_notification_wait.py
+ create mode 100644 tools/async_delegation_idle.py
+ create mode 100644 tui_gateway/notification_idle.py
+ create mode 100644 tui_gateway/notification_wait.py
+
+diff --git a/tests/tools/test_async_delegation_idle.py b/tests/tools/test_async_delegation_idle.py
+new file mode 100644
+index 00000000000..eb580731a34
+--- /dev/null
++++ b/tests/tools/test_async_delegation_idle.py
+@@ -0,0 +1,80 @@
++"""An unchanged, terminally settled ledger needs no orphan scan. [daveey]"""
++import queue
++
++
++def test_unchanged_empty_ledger_skips_orphan_scan(monkeypatch):
++    from tools import async_delegation as ad
++    with ad._transaction():
++        pass
++    q = queue.Queue()
++    ad.maybe_sweep_orphaned_completions(q, now=1000000)
++    calls = []
++    def forbidden():
++        calls.append(True)
++        raise AssertionError("unchanged ledger scanned")
++    monkeypatch.setattr(ad, "recover_abandoned_delegations", forbidden)
++    ad.maybe_sweep_orphaned_completions(q, now=1000031)
++    assert calls == []
++
++
++def test_replacement_and_errors_never_reuse_quiet_proof(tmp_path, monkeypatch):
++    import sqlite3
++    from tools import async_delegation_idle as idle
++    path = tmp_path / "ledger.db"
++    replacement = tmp_path / "replacement.db"
++    for p in (path, replacement):
++        with sqlite3.connect(p) as conn:
++            conn.execute("CREATE TABLE async_delegations (state TEXT, delivery_state TEXT)")
++            if p == replacement:
++                conn.execute("INSERT INTO async_delegations VALUES ('running', NULL)")
++    assert idle.ledger_quiet(path)
++    replacement.replace(path)
++    assert not idle.ledger_quiet(path)
++    def failed(conn):
++        raise sqlite3.OperationalError("read failed")
++    monkeypatch.setattr(idle, "_has_work", failed)
++    assert not idle.ledger_quiet(path)
++    path.unlink()
++    assert not idle.ledger_quiet(path)
++
++
++def test_commit_racing_scan_is_rechecked(tmp_path, monkeypatch):
++    import sqlite3
++    from tools import async_delegation_idle as idle
++    path = tmp_path / "ledger.db"
++    with sqlite3.connect(path) as writer:
++        writer.execute("CREATE TABLE async_delegations (state TEXT, delivery_state TEXT)")
++        scan = idle._has_work
++        def racing(conn):
++            result = scan(conn)
++            writer.execute("INSERT INTO async_delegations VALUES ('completed', 'pending')")
++            writer.commit()
++            return result
++        monkeypatch.setattr(idle, "_has_work", racing)
++        assert idle.ledger_quiet(path)
++        monkeypatch.setattr(idle, "_has_work", scan)
++        assert not idle.ledger_quiet(path)
++
++
++def test_commit_invalidates_quiet_proof_and_pending_is_never_cached(tmp_path, monkeypatch):
++    import sqlite3
++    from tools import async_delegation_idle as idle
++    path = tmp_path / "ledger.db"
++    with sqlite3.connect(path) as writer:
++        writer.execute("CREATE TABLE async_delegations (state TEXT, delivery_state TEXT)")
++        writer.commit()
++        assert idle.ledger_quiet(path)
++        scan = idle._has_work
++        monkeypatch.setattr(idle, "_has_work", lambda c: (_ for _ in ()).throw(AssertionError("scan")))
++        assert idle.ledger_quiet(path)
++        monkeypatch.setattr(idle, "_has_work", scan)
++        writer.execute("INSERT INTO async_delegations VALUES ('completed', 'pending')")
++        writer.commit()
++        assert not idle.ledger_quiet(path)
++        assert not idle.ledger_quiet(path)
++        writer.execute("UPDATE async_delegations SET delivery_state='delivered'")
++        writer.commit()
++        assert idle.ledger_quiet(path)
++        writer.execute("INSERT INTO async_delegations VALUES ('running', NULL)")
++        writer.commit()
++        assert not idle.ledger_quiet(path)
+diff --git a/tests/tui_gateway/test_notification_idle_gates.py b/tests/tui_gateway/test_notification_idle_gates.py
+new file mode 100644
+index 00000000000..841b6cdd255
+--- /dev/null
++++ b/tests/tui_gateway/test_notification_idle_gates.py
+@@ -0,0 +1,160 @@
++"""Idle poller proofs: unchanged readers do no application query. [daveey]"""
++import contextlib
++import threading
++
++import pytest
++
++
++@pytest.fixture
++def idle_session(tmp_path, monkeypatch):
++    from hermes_cli import goals
++    from hermes_state import SessionDB
++    from tui_gateway import server
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("idle-proof", "tui")
++    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
++    monkeypatch.setattr(server, "_session_db", lambda session: contextlib.nullcontext(db))
++    session = {"session_key": "idle-proof", "history_lock": threading.RLock(), "running": False}
++    yield server, db, session
++    db.close()
++
++
++@pytest.mark.parametrize("kind", ["loop", "heartbeat"])
++def test_unchanged_schedule_does_not_query(idle_session, monkeypatch, kind):
++    server, db, session = idle_session
++    fire = getattr(server, f"_maybe_fire_tui_{kind}_tick")
++    fire("idle", session)
++    reads = []
++    def forbidden(*args, **kwargs):
++        reads.append(args)
++        raise AssertionError("unchanged schedule queried state_meta")
++    monkeypatch.setattr(db, "get_meta", forbidden)
++    fire("idle", session)
++    assert reads == []
++
++
++@pytest.mark.parametrize("kind", ["loop", "heartbeat"])
++def test_schedule_commit_invalidates_empty_proof(idle_session, monkeypatch, kind):
++    import time
++    from hermes_cli.heartbeat import HeartbeatManager, save_heartbeat
++    from hermes_cli.loops import LoopManager, save_loop
++    server, _db, session = idle_session
++    fire = getattr(server, f"_maybe_fire_tui_{kind}_tick")
++    fire("idle", session)
++    if kind == "loop":
++        mgr = LoopManager(session["session_key"])
++        mgr.set("idle proof wake", interval_seconds=60)
++        assert mgr.state is not None
++        mgr.state.next_due_at = time.time() - 1
++        save_loop(session["session_key"], mgr.state)
++    else:
++        mgr = HeartbeatManager(session["session_key"])
++        state = mgr.set("idle proof wake", 60)
++        state.created_at = time.time() - 3600
++        save_heartbeat(session["session_key"], state)
++    sent = []
++    monkeypatch.setattr(server, "_notif_gateway_owns_heartbeat", lambda *a: False)
++    monkeypatch.setattr(server, "_notif_owner_preflight", lambda *a: True)
++    monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *a: None)
++    monkeypatch.setattr(server, "_emit", lambda *a: None)
++    monkeypatch.setattr(server, "_notif_run_submit", lambda *a, **kw: sent.append(a[3]) or True)
++    fire("idle", session)
++    assert len(sent) == 1
++    assert "idle proof wake" in sent[0]
++
++
++def test_unchanged_empty_producer_does_not_query(idle_session, monkeypatch):
++    from tui_gateway import producer_admission
++    _server, db, session = idle_session
++    assert producer_admission.deliver_pending("idle", session) == "none"
++    reads = []
++    def forbidden(*args, **kwargs):
++        reads.append(args)
++        raise AssertionError("unchanged producer queried sessions")
++    monkeypatch.setattr(db, "get_session", forbidden)
++    producer_admission.deliver_pending("idle", session)
++    assert reads == []
++
++
++def test_producer_commit_invalidates_empty_proof(idle_session, monkeypatch):
++    import hermes_state_producer_admission as pa
++    from tui_gateway import producer_admission
++    server, db, session = idle_session
++    assert producer_admission.deliver_pending("idle", session) == "none"
++    receipt = pa.admit_producer_completion(
++        producer='["user-terminal","idle-proof","final"]', profile_home=db.db_path.parent,
++        stored_session_id=session["session_key"], text="idle proof completion")
++    assert receipt["outcome"] == "admitted"
++    sent = []
++    monkeypatch.setattr(server, "_kb_owner_refusal", lambda *a: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **kw: None)
++    monkeypatch.setattr(server, "_notif_submit", lambda *a, **kw: sent.append(a[3]) or True)
++    assert producer_admission.deliver_pending("idle", session) == "started"
++    assert sent == ["idle proof completion"]
++
++
++def test_empty_kanban_poll_does_not_bind_provider_scope(idle_session, monkeypatch):
++    from hermes_cli import kanban_db_connect
++    server, _db, session = idle_session
++    kanban_db_connect.connect().close()
++    server._notif_poll_kanban("idle", session)
++    calls = []
++    def forbidden(*args, **kwargs):
++        calls.append(args)
++        raise AssertionError("idle poll hydrated provider scope")
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", forbidden)
++    server._notif_poll_kanban("idle", session)
++    assert calls == []
++
++
++def test_board_revision_observes_same_stat_commit(tmp_path, monkeypatch):
++    import os
++    import sqlite3
++    from tui_gateway import server
++    path = tmp_path / "board.db"
++    writer = sqlite3.connect(path)
++    writer.execute("PRAGMA journal_mode=WAL")
++    writer.execute("CREATE TABLE sample(value)")
++    writer.commit()
++    first = server._kb_board_file_sig(path)
++    stat = os.stat
++    frozen = {str(p): stat(p) for p in (path, str(path) + "-wal")}
++    monkeypatch.setattr(os, "stat", lambda p, *a, **kw: frozen.get(str(p)) or stat(p, *a, **kw))
++    writer.execute("INSERT INTO sample VALUES (1)")
++    writer.commit()
++    assert server._kb_board_file_sig(path) != first
++    writer.close()
++
++
++def test_board_quiet_ignores_non_notify_but_not_inflight(tmp_path):
++    import sqlite3
++    from tui_gateway.notification_idle import board_quiet
++    path = tmp_path / "quiet.db"
++    with sqlite3.connect(path) as db:
++        db.executescript("CREATE TABLE kanban_notify_subs(platform, chat_id, task_id, last_event_id, inflight_from);"
++                         "CREATE TABLE task_events(id, task_id, kind);"
++                         "INSERT INTO kanban_notify_subs VALUES('tui','idle','task',0,NULL);"
++                         "INSERT INTO task_events VALUES(1,'task','comment');")
++        assert board_quiet(path, "idle")
++        db.execute("UPDATE kanban_notify_subs SET inflight_from=0")
++        db.commit()
++        assert not board_quiet(path, "idle")
++        db.execute("UPDATE kanban_notify_subs SET inflight_from=NULL")
++        db.execute("INSERT INTO task_events VALUES(2,'task','completed')")
++        db.commit()
++        assert not board_quiet(path, "idle")
++
++
++def test_empty_registry_park_skips_scan(monkeypatch):
++    from tools.process_registry import process_registry
++    from tui_gateway import server
++    calls = []
++    def forbidden(owns):
++        calls.append(True)
++        raise AssertionError("empty registry scanned")
++    monkeypatch.setattr(process_registry, "_parked_events", [])
++    monkeypatch.setattr(process_registry, "take_parked_events", forbidden)
++    assert server._notif_take_parked("idle", {}, process_registry, lambda *a: None) == 0
++    assert calls == []
+diff --git a/tests/tui_gateway/test_notification_poller_idle.py b/tests/tui_gateway/test_notification_poller_idle.py
+new file mode 100644
+index 00000000000..043378a6e3b
+--- /dev/null
++++ b/tests/tui_gateway/test_notification_poller_idle.py
+@@ -0,0 +1,139 @@
++"""Exercise the production poller wait and claim-custody boundaries. [daveey]"""
++import contextlib
++import queue
++import threading
++
++import pytest
++
++
++@pytest.fixture
++def poller(monkeypatch):
++    from tools import async_delegation, process_registry, process_registry_awaiting
++    from tui_gateway import server, producer_admission, notification_park
++    from tui_gateway.notification_wait import PollerStop
++    from types import SimpleNamespace
++
++    q = queue.Queue()
++    registry = SimpleNamespace(completion_queue=q, restore_completions=lambda: None,
++                               has_parked_events=lambda: False)
++    monkeypatch.setattr(process_registry, "process_registry", registry)
++    monkeypatch.setattr(async_delegation, "maybe_sweep_orphaned_completions", lambda q: 0)
++    monkeypatch.setattr(producer_admission, "deliver_pending", lambda *a: "none")
++    def forbidden(owns):
++        raise AssertionError("empty park scanned")
++    real_claim = notification_park.claim
++    monkeypatch.setattr(notification_park, "claim", forbidden)
++    for name in ("_maybe_fire_tui_loop_tick", "_maybe_fire_tui_heartbeat_tick", "_notif_poll_kanban",
++                 "_notif_take_parked", "_kb_release_claims"):
++        monkeypatch.setattr(server, name, lambda *a: None)
++    session = {"session_key": "idle", "history_lock": threading.RLock(), "_test_real_claim": real_claim}
++    stop = PollerStop(q)
++    waiting = threading.Event()
++    delivered = threading.Event()
++    timeouts = []
++    received = []
++    real_take = process_registry_awaiting.take_ready
++
++    def take(q, timeout, **kwargs):
++        if timeout:
++            timeouts.append(timeout)
++            waiting.set()
++        return real_take(q, timeout, **kwargs)
++
++    def handle(sid, session, events, *args):
++        received.extend(events)
++        if events:
++            delivered.set()
++
++    monkeypatch.setattr(process_registry_awaiting, "take_ready", take)
++    monkeypatch.setattr(server, "_notif_handle_ready", handle)
++    thread = threading.Thread(target=server._notification_poller_scoped_loop, args=(stop, "idle", session))
++    thread.start()
++    try:
++        assert waiting.wait(2)
++        yield q, stop, thread, session, timeouts, delivered, received
++    finally:
++        stop.set()
++        thread.join(2)
++        assert not thread.is_alive()
++
++
++def test_idle_production_poller_waits_until_due_and_stops(poller):
++    _q, stop, thread, _session, timeouts, _delivered, _received = poller
++    assert timeouts[0] > 4
++    stop.set()
++    thread.join(1)
++    assert not thread.is_alive()
++
++
++def test_production_poller_queue_put_delivers_within_half_second(poller):
++    q, _stop, _thread, _session, _timeouts, delivered, received = poller
++    event = {"type": "completion", "session_key": "idle"}
++    q.put(event)
++    assert delivered.wait(0.5)
++    assert received == [event]
++
++
++def test_production_poller_park_publication_delivers_within_two_seconds(poller, monkeypatch):
++    from tui_gateway import notification_park, server
++    _q, _stop, _thread, session, _timeouts, delivered, received = poller
++    monkeypatch.setattr(notification_park, "claim", session["_test_real_claim"])
++    monkeypatch.setattr(server, "_session_owns_notification_event", lambda sid, s, event: True)
++    event = {"type": "completion", "session_key": "idle"}
++    try:
++        assert notification_park.park(event)
++        assert delivered.wait(2)
++        assert received == [event]
++    finally:
++        notification_park.clear()
++
++
++def test_self_rehold_does_not_invalidate_wait_generation():
++    from tui_gateway import server
++    from tui_gateway.notification_wait import generation
++    from tools.process_registry_awaiting import release
++    q = queue.Queue()
++    session = {"_notif_held": [], "_notif_poller_ident": threading.get_ident()}
++    before = generation(q)
++    event = {"type": "completion"}
++    try:
++        assert server._notif_hold_for(session, event, q)
++        assert generation(q) == before
++    finally:
++        release(server._notif_take_held(session))
++        server._notif_unhold([event])
++
++
++def test_collected_claims_release_on_provider_binding_failure(monkeypatch):
++    from tui_gateway import server
++    session = {}
++    claims = [("board", "task", 1, 2)]
++    monkeypatch.setattr(server, "_notif_collect_kanban", lambda s: (["notice"], claims))
++    def fail(s):
++        raise RuntimeError("provider binding failed")
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", fail)
++    released = []
++    def release(s):
++        released.extend(s.pop("_kanban_claims"))
++        s.pop("_kanban_pending")
++    monkeypatch.setattr(server, "_kb_release_claims", release)
++    server._notif_poll_kanban("idle", session)
++    assert released == claims
++    assert not session.get("_kanban_claims")
++    assert not session.get("_kanban_pending")
++
++
++def test_finalize_during_provider_binding_releases_prepared_claims(monkeypatch):
++    from tui_gateway import server
++    session = {}
++    claims = [("board", "task", 1, 2)]
++    monkeypatch.setattr(server, "_notif_collect_kanban", lambda s: (["notice"], claims))
++    @contextlib.contextmanager
++    def finalize(s):
++        s["_finalized"] = True
++        yield
++    released = []
++    monkeypatch.setattr(server, "_session_profile_runtime_scope", finalize)
++    monkeypatch.setattr(server, "_kb_release_claims", lambda s: released.extend(s["_kanban_claims"]))
++    server._notif_poll_kanban("idle", session)
++    assert released == claims
+diff --git a/tests/tui_gateway/test_notification_wait.py b/tests/tui_gateway/test_notification_wait.py
+new file mode 100644
+index 00000000000..e24613b8ec5
+--- /dev/null
++++ b/tests/tui_gateway/test_notification_wait.py
+@@ -0,0 +1,127 @@
++"""Notification queue waits are interruptible without a fixed idle timer. [daveey]"""
++import queue
++import threading
++
++
++def test_stop_wakes_waiter_and_pre_wait_stop_is_not_lost():
++    from tui_gateway.notification_wait import PollerStop, generation
++    from tools.process_registry_awaiting import take_ready
++    q = queue.Queue()
++    stop = PollerStop(q)
++    before = generation(q)
++    stop.set()
++    finished = threading.Event()
++    thread = threading.Thread(target=lambda: (take_ready(q, 5, wake_generation=before), finished.set()))
++    thread.start()
++    try:
++        assert finished.wait(0.5)
++    finally:
++        with q.not_empty:
++            q.not_empty.notify_all()
++        thread.join(1)
++
++
++def test_queue_put_wakes_long_wait_and_keeps_custody():
++    from tui_gateway.notification_wait import generation
++    from tools.process_registry_awaiting import take_ready, release
++    q = queue.Queue()
++    before = generation(q)
++    finished = threading.Event()
++    got = []
++    def consume():
++        got.extend(take_ready(q, 5, wake_generation=before))
++        finished.set()
++    thread = threading.Thread(target=consume)
++    thread.start()
++    event = {"type": "completion", "owner_task_id": "idle-wait"}
++    try:
++        q.put(event)
++        assert finished.wait(0.5)
++        assert got == [event]
++    finally:
++        with q.not_empty:
++            q.not_empty.notify_all()
++        thread.join(1)
++        release(got)
++
++
++def test_held_handoff_wakes_all_waiters():
++    from tui_gateway.notification_wait import generation
++    from tools.process_registry_awaiting import take_ready
++    from tui_gateway import server
++    q = queue.Queue()
++    before = generation(q)
++    owner = {"_notif_held": []}
++    assert server._notif_hold_for(owner, {"type": "completion"}, q)
++    finished = threading.Event()
++    thread = threading.Thread(target=lambda: (take_ready(q, 5, wake_generation=before), finished.set()))
++    thread.start()
++    try:
++        assert finished.wait(0.5)
++    finally:
++        with q.not_empty:
++            q.not_empty.notify_all()
++        thread.join(1)
++
++
++def test_wake_releases_multiple_actual_waiters():
++    from tui_gateway.notification_wait import generation, wake
++    from tools.process_registry_awaiting import take_ready
++    q = queue.Queue()
++    before = generation(q)
++    barrier = threading.Barrier(4)
++    finished = [threading.Event() for _ in range(3)]
++    def consume(done):
++        barrier.wait()
++        take_ready(q, 5, wake_generation=before)
++        done.set()
++    threads = [threading.Thread(target=consume, args=(done,)) for done in finished]
++    for thread in threads:
++        thread.start()
++    try:
++        barrier.wait()
++        wake(q)
++        assert all(done.wait(0.5) for done in finished)
++    finally:
++        wake(q)
++        for thread in threads:
++            thread.join(1)
++
++
++def test_held_work_keeps_busy_to_idle_latency_bounded():
++    from tui_gateway.notification_wait import PollerStop, due_timeout
++    stop = PollerStop(queue.Queue())
++    session = {"running": True, "_notif_held": [{"type": "completion"}]}
++    assert due_timeout(10, [15], session, stop) == 0.5
++    session["running"] = False
++    assert due_timeout(10, [15], session, stop) == 0.5
++    session["_notif_held"] = []
++    assert due_timeout(10, [15], session, stop) == 5
++
++
++def test_both_park_producers_publish_a_wake(monkeypatch):
++    from tui_gateway import notification_park
++    from tui_gateway.notification_wait import generation
++    from tools.process_registry import process_registry
++    q = queue.Queue()
++    monkeypatch.setattr(process_registry, "completion_queue", q)
++    monkeypatch.setattr(process_registry, "_parked_events", [])
++    notification_park.clear()
++    event = {"type": "completion", "session_key": "park-proof"}
++    before = generation(q)
++    try:
++        process_registry.park_unowned_event(event)
++        assert generation(q) > before
++        assert process_registry.has_parked_events()
++        assert process_registry.take_parked_events(lambda e: True) == [event]
++        assert not process_registry.has_parked_events()
++        before = generation(q)
++        assert notification_park.park(event)
++        assert generation(q) > before
++        assert notification_park.has_parked()
++        taken = notification_park.claim(lambda e: True)
++        assert taken == [event]
++        notification_park.unhold(taken)
++        assert not notification_park.has_parked()
++    finally:
++        notification_park.clear()
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 01fe04948ad..bdea1caec4c 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -562,6 +562,9 @@ def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = Non
+             return 0
+         _last_orphan_sweep[home] = now
+     try:
++        from tools.async_delegation_idle import ledger_quiet
++        if ledger_quiet(_db_path()):
++            return 0
+         return sweep_orphaned_completions(target_queue)
+     except Exception:
+         logger.debug("Orphaned async delegation sweep failed", exc_info=True)
+diff --git a/tools/async_delegation_idle.py b/tools/async_delegation_idle.py
+new file mode 100644
+index 00000000000..2083a995a87
+--- /dev/null
++++ b/tools/async_delegation_idle.py
+@@ -0,0 +1,52 @@
++"""Commit-keyed empty proofs for the async orphan sweep. [daveey]
++
++Only a ledger with no running/finalizing or pending rows is quiet. Pending rows
++are never cached: owner death, delivery leases and replay age change with time.
++Readers are thread-local, bounded, read-only, and checked for file replacement.
++"""
++import sqlite3
++import threading
++from collections import OrderedDict
++
++_readers = threading.local()
++
++
++def _has_work(conn):
++    return conn.execute(
++        "SELECT 1 FROM async_delegations WHERE state IN ('running','finalizing') "
++        "OR delivery_state='pending' LIMIT 1"
++    ).fetchone() is not None
++
++
++def ledger_quiet(path):
++    """Fail open on missing/unreadable stores; never create or migrate a ledger."""
++    readers = getattr(_readers, "entries", None)
++    if readers is None:
++        readers = _readers.entries = OrderedDict()
++    key = str(path)
++    try:
++        stat = path.stat()
++        identity = (stat.st_dev, stat.st_ino)
++        entry = readers.get(key)
++        if entry is not None and entry[0] != identity:
++            readers.pop(key)[1].close()
++            entry = None
++        if entry is None:
++            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1)
++            entry = [identity, conn, None]
++            readers[key] = entry
++            while len(readers) > 32:
++                readers.popitem(last=False)[1][1].close()
++        readers.move_to_end(key)
++        conn = entry[1]
++        revision = conn.execute("PRAGMA data_version").fetchone()[0]
++        if entry[2] == revision:
++            return True
++        entry[2] = None
++        if not _has_work(conn):
++            entry[2] = revision
++            return True
++    except (OSError, sqlite3.Error):
++        if entry := readers.pop(key, None):
++            entry[1].close()
++    return False
+diff --git a/tools/process_registry_awaiting.py b/tools/process_registry_awaiting.py
+index d79191f4a5a..7d033540e06 100644
+--- a/tools/process_registry_awaiting.py
++++ b/tools/process_registry_awaiting.py
+@@ -64,7 +64,7 @@ def _release_events(events) -> None:
+                     break
+ 
+ 
+-def take_ready(queue, timeout: float) -> list:
++def take_ready(queue, timeout: float, *, wake_generation=None) -> list:
+     """Dequeue everything queued (waiting up to ``timeout`` for the first event) and hold each event's owner in the
+     same critical section, so no reaper check can observe an event as neither queued nor held. Delegation result
+     copies are marked held there too (``async_delegation.mark_copy_held``), so another session's orphan sweep never
+@@ -72,7 +72,8 @@ def take_ready(queue, timeout: float) -> list:
+     returns."""
+     from tools.async_delegation import completion_copy_id, mark_copy_held
+     with queue.not_empty:
+-        if not queue._qsize() and timeout > 0:
++        unchanged = wake_generation is None or wake_generation == getattr(queue, "_notification_generation", 0)
++        if not queue._qsize() and timeout > 0 and unchanged:
+             queue.not_empty.wait(timeout)
+         events = list(queue.queue)
+         queue.queue.clear()
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index 9b0a0d1585c..33a7e1b6a73 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -207,6 +207,13 @@ class ProcessReadoptMixin:
+                 self._parked_events = []
+             self._parked_events.append(event)
+             del self._parked_events[:-_MAX_PARKED_EVENTS]
++        from tui_gateway.notification_wait import wake
++        wake(self.completion_queue)
++
++    def has_parked_events(self) -> bool:
++        """Empty is a lock-protected proof; a producer wakes queue waiters on publication."""
++        with self._lock:
++            return bool(self._parked_events)
+ 
+     def take_parked_events(self, owns: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
+         """Remove and return the parked events *owns* claims. ``owns`` runs outside the lock."""
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+new file mode 100644
+index 00000000000..f086f18855f
+--- /dev/null
++++ b/tui_gateway/notification_idle.py
+@@ -0,0 +1,95 @@
++"""Per-session notification read memos tied to published SQLite commits. [daveey]
++
++Only observational reads are memoized. A key is taken BEFORE reading, so a commit
++racing the read invalidates the next poll. Errors never establish an idle proof.
++"""
++from __future__ import annotations
++
++import contextlib
++import logging
++
++logger = logging.getLogger(__name__)
++
++
++def pending_producers(db, session, target):
++    """Read pending rows unless this owner has an unchanged, proven-empty input."""
++    import hermes_state_producer_admission as pa
++    stamp = state_revision(db)
++    empty_key = (target, stamp)
++    if stamp is not None and session.get("_notif_producer_empty") == empty_key:
++        return []
++    session.pop("_notif_producer_empty", None)
++    if not target or db.get_session(target) is None:
++        return []
++    rows = pa.pending_for_owner(db, pa.owner_of(db, target))
++    if not rows and stamp is not None:
++        session["_notif_producer_empty"] = empty_key
++    return rows
++
++
++@contextlib.contextmanager
++def collection_home(session, launch_home):
++    """Local SQLite collection needs a home, not provider secrets or a terminal policy."""
++    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++    token = set_hermes_home_override(str(session.get("profile_home") or launch_home()))
++    try:
++        yield
++    finally:
++        reset_hermes_home_override(token)
++
++
++def board_quiet(path, session_key):
++    """Only a successful empty read is a proof; foreign in-flight claims need clock/liveness retries."""
++    from pathlib import Path
++    from hermes_cli.kanban_session_activity import cached_ro
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS
++    placeholders = ",".join("?" for _ in _KANBAN_NOTIFY_KINDS)
++    try:
++        with cached_ro(Path(path)) as conn:
++            row = conn.execute(
++                "SELECT 1 FROM kanban_notify_subs AS s WHERE platform = 'tui' AND chat_id = ? "
++                "AND (inflight_from IS NOT NULL OR EXISTS (SELECT 1 FROM task_events AS e "
++                "WHERE e.task_id = s.task_id AND e.id > s.last_event_id "
++                f"AND e.kind IN ({placeholders}))) LIMIT 1",
++                (session_key, *_KANBAN_NOTIFY_KINDS),
++            ).fetchone()
++            return row is None
++    except Exception:
++        logger.debug("Kanban empty proof unavailable", exc_info=True)
++        return False
++
++
++def state_revision(db):
++    """A retained read-only observer sees both this process's and foreign commits."""
++    from tui_gateway.kanban_replica_observer import fingerprint
++
++    path = getattr(db, "db_path", None)
++    writer = getattr(db, "_conn", None)
++    if path is None or (writer is not None and writer.in_transaction):
++        return None
++    return fingerprint(path)
++
++
++def schedule_manager(session, kind, factory):
++    """Reuse only proven absent schedules; active schedules keep their clock driver.
++
++    Do not memoize a manager's swallowed read failure as absence. Prove the raw
++    metadata absent separately; exceptions propagate to the poller's retry path.
++    """
++    from hermes_cli.goals import _get_session_db
++
++    key = session.get("session_key") or ""
++    db = _get_session_db()
++    stamp = state_revision(db) if db is not None else None
++    identity = (key, stamp, factory)
++    cached = session.setdefault("_notif_schedule_memo", {})
++    previous = cached.get(kind)
++    if stamp is not None and previous is not None and previous[0] == identity:
++        return previous[1]
++    absent = db is not None and stamp is not None and db.get_meta(f"{kind}:{key}") is None
++    manager = factory(session_id=key)
++    if absent and manager.state is None:
++        cached[kind] = identity, manager
++    else:
++        cached.pop(kind, None)
++    return manager
+diff --git a/tui_gateway/notification_park.py b/tui_gateway/notification_park.py
+index 24764278369..59130a3cd14 100644
+--- a/tui_gateway/notification_park.py
++++ b/tui_gateway/notification_park.py
+@@ -110,9 +110,19 @@ def park(evt: dict) -> bool:
+     for held in displaced:
+         logger.debug("Dropping parked %s notification to make room for a %s (key=%r)",
+                      held.get("type"), evt.get("type", "completion"), _key(held))
++    if admitted:
++        from tools.process_registry import process_registry
++        from tui_gateway.notification_wait import wake
++        wake(process_registry.completion_queue)
+     return admitted
+ 
+ 
++def has_parked() -> bool:
++    """No scan on the idle path; producers publish a queue wake after adding work."""
++    with _lock:
++        return bool(_parked)
++
++
+ def claim(owns: Callable[[dict], bool]) -> list:
+     """Parked events ``owns`` accepts, in arrival order. ``owns`` may read the lineage store, so it runs on a
+     snapshot outside the lock; an event is handed out only if it is still parked, so exactly one poller takes it.
+diff --git a/tui_gateway/notification_wait.py b/tui_gateway/notification_wait.py
+new file mode 100644
+index 00000000000..af9e8935bac
+--- /dev/null
++++ b/tui_gateway/notification_wait.py
+@@ -0,0 +1,37 @@
++"""Interruptible due-time waits for notification pollers. [daveey]
++
++Queue puts already signal not_empty. Out-of-queue handoffs and stops increment a
++revision under that same mutex; a waiter snapshots it before inspecting sources,
++then checks it atomically with waiting so a signal in between cannot be lost.
++"""
++import threading
++
++
++def generation(queue):
++    with queue.mutex:
++        return getattr(queue, "_notification_generation", 0)
++
++
++def wake(queue):
++    with queue.not_empty:
++        queue._notification_generation = getattr(queue, "_notification_generation", 0) + 1
++        queue.not_empty.notify_all()
++
++
++class PollerStop(threading.Event):
++    def __init__(self, queue):
++        super().__init__()
++        self.queue = queue
++
++    def set(self):
++        super().set()
++        wake(self.queue)
++
++
++def due_timeout(now, deadlines, session, stop):
++    timeout = max(0.0, min(deadlines) - now)
++    # Held work is active work: its turn may finish without a queue put. Keep the
++    # existing idle-boundary latency; do not make every *empty* session pay it.
++    if session.get("_notif_held") or not isinstance(stop, PollerStop):
++        timeout = min(timeout, 0.5)
++    return timeout
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index b1455e4c0e4..a9113b47909 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -75,9 +75,8 @@ def deliver_pending(sid: str, session: dict) -> str:
+             if db is None:
+                 return "none"
+             target = server._submit_row_target_key(session)
+-            if not target or db.get_session(target) is None:
+-                return "none"
+-            rows = pa.pending_for_owner(db, pa.owner_of(db, target))
++            from tui_gateway.notification_idle import pending_producers
++            rows = pending_producers(db, session, target)
+     except Exception:
+         logger.warning("producer admission: pending read failed", exc_info=True)
+         return "error"
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 7a754dcc0fd..023bc5c5511 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -451,7 +451,8 @@ def _maybe_fire_tui_heartbeat_tick(sid: str, session: dict) -> None:
+         return
+     if not (sid_key := session.get("session_key") or ""):
+         return
+-    mgr = HeartbeatManager(session_id=sid_key)
++    from tui_gateway.notification_idle import schedule_manager
++    mgr = schedule_manager(session, "heartbeat", HeartbeatManager)
+     if not mgr.is_active() or not mgr.state.is_due() or _notif_gateway_owns_heartbeat(session, sid_key):
+         return  # not due, or the gateway poller owns the routed conversation — stays due there
+     if not _notif_claim_turn(session):
+@@ -533,7 +534,8 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
+         return
+     if not (sid_key := session.get("session_key") or ""):
+         return
+-    mgr = LoopManager(session_id=sid_key)
++    from tui_gateway.notification_idle import schedule_manager
++    mgr = schedule_manager(session, "loop", LoopManager)
+     if not mgr.is_due() or goal_blocks_loop_tick(sid_key) or _loop_route_is_gateway_chat(mgr.state):
+         return  # not due, or the gateway's wakeup scanner owns the routed chat — stays due there
+     if not _notif_claim_turn(session):
+@@ -652,17 +654,14 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
+ 
+ 
+ def _kb_board_file_sig(db_path) -> tuple | None:
+-    """(mtime_ns, size, inode) of a board's kanban.db and -wal: every commit (a new event, a claim) moves one of them."""
+-    import os
+-    out = []
+-    for path in (str(db_path), f"{db_path}-wal"):
+-        try:
+-            st = os.stat(path)
+-        except OSError:
+-            out.append(None)
+-            continue
+-        out.append((st.st_mtime_ns, st.st_size, st.st_ino))
+-    return tuple(out) if out[0] is not None else None
++    """A commit revision from a guarded retained reader (stat alone misses WAL publication)."""
++    from hermes_cli.kanban_session_activity import cached_ro
++    try:
++        with cached_ro(Path(db_path)) as conn:
++            return conn, conn.execute("PRAGMA data_version").fetchone()[0]
++    except Exception:
++        logger.debug("Kanban revision unavailable", exc_info=True)
++        return None  # unreadable never means unchanged
+ 
+ 
+ def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None, seen: dict | None = None) -> list:
+@@ -674,9 +673,6 @@ def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None,
+     session's last completed poll: no commit means no new event to claim. 21 open chats each probing every board
+     every 5 s, and opening it writable to re-claim nothing, kept the Desktop backend busy. The signature is taken
+     before the poll, so a commit during it is polled again next tick."""
+-    from hermes_cli.kanban_placement import is_placeholder_session
+-    if is_placeholder_session(session_key):
+-        return []
+     from hermes_cli import kanban_db_connect as _kbc
+     from hermes_cli import kanban_db_notify as _kbn
+     db_path = sig = None
+@@ -684,14 +680,20 @@ def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None,
+         with contextlib.suppress(Exception):
+             db_path = str(_kb.kanban_db_path(board=slug))
+             sig = _kb_board_file_sig(db_path)
+-        if sig is not None and seen.get(db_path) == sig:
++        if sig is not None and seen.get(db_path) == (session_key, sig):
+             from hermes_constants import get_hermes_home
+             from tui_gateway.kanban_consumer_health import polled
+             polled(get_hermes_home(), session_key, db_path)
+             return []
++    from hermes_cli.kanban_placement import is_placeholder_session
++    if is_placeholder_session(session_key):
++        return []
+     texts = _kb_poll_board_now(_kb, _kbc, _kbn, slug, session_key, claims)
+-    if sig is not None:
+-        seen[db_path] = sig
++    from tui_gateway.notification_idle import board_quiet
++    if sig is not None and board_quiet(db_path, session_key):
++        seen[db_path] = (session_key, sig)
++    elif seen is not None:
++        seen.pop(db_path, None)
+     return texts
+ 
+ 
+@@ -873,8 +875,33 @@ def _collect_remote_kanban_notifications(session_key: str, claims: list | None)
+ 
+ 
+ def _notif_poll_kanban(sid: str, session: dict) -> None:
+-    with _session_profile_runtime_scope(session):
+-        _notif_poll_kanban_scoped(sid, session)
++    # Collection only reads/claims local SQLite rows. Provider/terminal bindings are
++    # needed for delivery, not for every empty tick. Resolve the home each time:
++    # sessions can move profiles and multiplexing can activate after thread start.
++    from tui_gateway.notification_idle import collection_home
++    with collection_home(session, _launch_home):
++        if session.get("_finalized") or session.get("_closing") or session.get("_lease_taken_over"):
++            prepared = ([], [])
++        else:
++            prepared = _notif_collect_kanban(session)
++        # Track custody before provider binding or a concurrent finalize can fail.
++        session.setdefault("_kanban_pending", []).extend(prepared[0])
++        session.setdefault("_kanban_claims", []).extend(prepared[1])
++    if not any(prepared) and not session.get("_kanban_pending") and not session.get("_kanban_claims"):
++        return
++    with contextlib.ExitStack() as scope:
++        try:
++            scope.enter_context(_session_profile_runtime_scope(session))
++        except Exception as exc:
++            # Nothing has been dispatched. Return custody in the collection home
++            # so a transient binding error retries next tick instead of killing
++            # the poller and stranding claims until their lease expires.
++            with collection_home(session, _launch_home):
++                _kb_release_claims(session)
++            logger.debug("Kanban provider binding failed", exc_info=True)
++            _notif_log_failure("kanban provider binding failed", exc)
++            return
++        _notif_poll_kanban_scoped(sid, session, prepared)
+ 
+ 
+ class _KanbanText(str):
+@@ -1151,7 +1178,19 @@ def _kb_owner_refusal(sid: str, session: dict):
+     return refusal
+ 
+ 
+-def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
++def _notif_collect_kanban(session: dict) -> tuple:
++    claims: list = []
++    texts = []
++    if time.monotonic() >= float(session.get("_kanban_refused_until") or 0):
++        try:
++            texts = _collect_kanban_notifications(session, claims)
++        except Exception as exc:
++            logger.debug("Kanban collection failed", exc_info=True)
++            _notif_log_failure("kanban notification poll failed", exc)
++    return texts, claims
++
++
++def _notif_poll_kanban_scoped(sid: str, session: dict, prepared=None) -> None:
+     """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
+     cursor-claimed, so they wait in the buffer instead of dropping the agent turn; a turn the admission gate
+     refuses hands its claims back (_kb_rewind_refused)."""
+@@ -1161,22 +1200,14 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
+         if session.get("_kanban_claims") or session.get("_kanban_pending"):
+             _kb_release_claims(session)
+         return
+-    claims: list = []
+-    if time.monotonic() < float(session.get("_kanban_refused_until") or 0):
+-        texts = []
+-    else:
+-        try:
+-            texts = _collect_kanban_notifications(session, claims)
+-        except Exception as exc:
+-            _notif_log_failure("kanban notification poll failed", exc)
+-            texts = []
++    texts, claims = prepared if prepared is not None else _notif_collect_kanban(session)
+     for text in texts:
+         from gateway.warning_notifications import DiagnosticText, render_notification
+         render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
+                             platform="tui", diagnostic=isinstance(text, DiagnosticText))
+-    if texts:
++    if texts and prepared is None:
+         session.setdefault("_kanban_pending", []).extend(texts)
+-    if claims:  # a silent claim still waiting for its ack has no text but is tracked too
++    if claims and prepared is None:  # prepared collections already transferred custody
+         session.setdefault("_kanban_claims", []).extend(claims)
+     if not session.get("_kanban_pending") or not _notif_claim_turn(session):
+         return
+@@ -1301,6 +1332,9 @@ def _notif_hold_for(owner: dict, evt: dict, queue) -> bool:
+             return False
+         mark_copy_held(completion_copy_id(evt))
+         held.append(evt)
++    from tui_gateway.notification_wait import wake
++    if owner.get("_notif_poller_ident") != threading.get_ident():
++        wake(queue)  # a self re-hold must still wait (admission/backoff may refuse while not running)
+     return True
+ 
+ 
+@@ -1515,6 +1549,8 @@ def _notif_take_parked(sid, session, registry, handle) -> int:
+     take = getattr(registry, "take_parked_events", None)
+     if take is None:
+         return 0
++    if not getattr(registry, "has_parked_events", lambda: True)():
++        return 0
+     try:
+         events = take(lambda evt: _session_owns_notification_event(sid, session, evt))
+         if events:
+@@ -1712,11 +1748,14 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+     queue = process_registry.completion_queue
+     emitted = session.setdefault("_notification_emitted", set())
+     with _notif_held_lock:
++        session["_notif_poller_ident"] = threading.get_ident()
+         session["_notif_held"] = session.get("_notif_held") or []
+     handle = lambda events, deferred: _notif_handle_ready(
+         sid, session, events, emitted, process_registry, format_process_notification, deferred)
++    from tui_gateway.notification_wait import due_timeout, generation
+     last_kanban_poll = last_loop_poll = last_parked_poll = 0.0
+     while not stop_event.is_set() and not session.get("_finalized"):
++        wake_generation = generation(queue)
+         now = time.monotonic()
+         # Completions whose owner process died after this one started (#97202); throttled per profile home.
+         async_delegation.maybe_sweep_orphaned_completions(queue)
+@@ -1751,10 +1790,17 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+         # owner session stays protected from the reapers (it is in neither the queue nor ``running`` meanwhile).
+         # Addressed events parked while their owner was not live (notification_park): once this session proves it
+         # owns one, it is this session's to deliver, ahead of the shared queue.
+-        parked = notification_park.claim(lambda evt: _session_owns_notification_event(sid, session, evt))
++        parked = (notification_park.claim(lambda evt: _session_owns_notification_event(sid, session, evt))
++                  if notification_park.has_parked() else [])
+         ready = []
+         try:
+-            ready = take_ready(queue, 0 if parked else 0.5)
++            deadlines = [last_loop_poll + _LOOP_POLL_SECONDS, last_kanban_poll + _KANBAN_POLL_SECONDS]
++            has_registry_park = getattr(process_registry, "has_parked_events", lambda: True)
++            if has_registry_park() or notification_park.has_parked():
++                deadlines.append(last_parked_poll + _PARKED_POLL_SECONDS)
++            timeout = due_timeout(time.monotonic(), deadlines, session, stop_event)
++            ready = take_ready(queue, 0 if parked or stop_event.is_set() else timeout,
++                               wake_generation=wake_generation)
+             if not parked and not ready:
+                 continue
+             handle(parked + ready, None)
+@@ -1845,7 +1891,9 @@ _notif_held_lock = threading.Lock()
+ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
+     """Start the background notification poller for a TUI session (thread name is greppable)."""
+     _wire_desktop_sinks()
+-    stop = threading.Event()
++    from tools.process_registry import process_registry
++    from tui_gateway.notification_wait import PollerStop
++    stop = PollerStop(process_registry.completion_queue)
+     t = threading.Thread(target=_notification_poller_loop, args=(stop, sid, session), daemon=True, name=f"tui-notif-poller-{sid}")
+     _notification_pollers[:] = [(s, th) for (s, th) in _notification_pollers if th.is_alive()] + [(stop, t)]
+     from tui_gateway.kanban_consumer_health import register
+-- 
+2.55.0
+

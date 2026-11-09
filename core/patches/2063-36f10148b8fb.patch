@@ -1,0 +1,295 @@
+From 36f10148b8fb219080f546da14c1f3f205b008fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 12:23:52 +0000
+Subject: [PATCH] fix(gateway): launchd plist names its job label so the
+ gateway caps its stop drain [daveey]
+
+launchd stamps XPC_SERVICE_NAME=<label> only on the job's main process. Since
+the signed wrapper and the core-update launcher sit in front of stderr_timestamp,
+every process below the wrapper reads XPC_SERVICE_NAME=0, so the gateway never
+found its label, never read the live 60 s ExitTimeOut, drained a full 60 s and
+launchd restarted into the still-draining gateway (start_refused
+owner_alive=true, defect gateway-cc28b19bca; earlier fix t_01a18a872bab1aac only
+kept the wrapper alive).
+
+- generate_launchd_plist: HERMES_LAUNCHD_LABEL=<label> in EnvironmentVariables,
+  inherited by every descendant.
+- _load_launchd_exit_timeout: a darwin --external-supervisor gateway that still
+  cannot read its budget assumes the gui-domain clamp (60 s, so the drain caps
+  at 50 s) and writes exit-diag row gateway.launchd_budget_missing (warning).
+- Test runs the real job chain (signed wrapper with XPC on the first process,
+  XPC=0 below it, real stderr_timestamp) and asserts the leaf's
+  launchd_job_label().
+---
+ gateway/run_config_loaders.py                 |  44 +++++-
+ hermes_cli/gateway_exit_diag.py               |   5 +-
+ hermes_cli/gateway_launchd.py                 |   7 +
+ .../test_launchd_label_reaches_gateway.py     | 130 ++++++++++++++++++
+ 4 files changed, 178 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_launchd_label_reaches_gateway.py
+
+diff --git a/gateway/run_config_loaders.py b/gateway/run_config_loaders.py
+index 9daa4704d69..f3dc546a52e 100644
+--- a/gateway/run_config_loaders.py
++++ b/gateway/run_config_loaders.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ import json
+ import logging
+ import os
++import sys
+ import time
+ from contextlib import suppress
+ from pathlib import Path
+@@ -19,7 +20,8 @@ from gateway.config import Platform
+ from gateway.restart import (
+     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
+     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+-    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, parse_cron_drain_timeout,
++    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, EXTERNAL_GATEWAY_SUPERVISOR_ENV,
++    LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S, parse_cron_drain_timeout,
+     parse_restart_after_turn_timeout, parse_restart_drain_timeout,
+     launchd_service_label, parse_signal_interrupt_grace_timeout, read_launchd_exit_timeout_s,
+     resolve_launchd_capped_drain,
+@@ -454,7 +456,7 @@ class GatewayConfigLoadersMixin:
+         return value
+ 
+     @staticmethod
+-    def _load_launchd_exit_timeout(drain_timeout: float) -> Optional[float]:
++    def _load_launchd_exit_timeout(drain_timeout: float, *, platform: Optional[str] = None) -> Optional[float]:
+         """Read the live launchd ``ExitTimeOut`` this job runs under, if any.
+ 
+         launchd is the one supervisor the gateway cannot size from config: the per-user (gui)
+@@ -464,13 +466,12 @@ class GatewayConfigLoadersMixin:
+         when ``launchctl print`` is unavailable. Logs a WARNING when the configured drain exceeds
+         the live budget so the misconfiguration is visible at boot, not at the next SIGKILL.
+         """
+-        label = launchd_service_label()
+-        if label is None:
+-            return None
++        platform = sys.platform if platform is None else platform  # data, so both arms test on any host
++        label = launchd_service_label(platform=platform)
+         # read_launchd_exit_timeout_s is already fail-open (returns None on any probe failure).
+-        exit_timeout = read_launchd_exit_timeout_s(label)
++        exit_timeout = read_launchd_exit_timeout_s(label, platform=platform) if label else None
+         if exit_timeout is None:
+-            return None
++            return GatewayConfigLoadersMixin._assumed_launchd_exit_timeout(label, platform)
+         effective = resolve_launchd_capped_drain(drain_timeout, exit_timeout)
+         if effective < drain_timeout:
+             logger.warning(
+@@ -486,6 +487,35 @@ class GatewayConfigLoadersMixin:
+             )
+         return exit_timeout
+ 
++    @staticmethod
++    def _assumed_launchd_exit_timeout(label: Optional[str], platform: str) -> Optional[float]:
++        """[daveey] Budget for a darwin ``--external-supervisor`` gateway that cannot read its live ``ExitTimeOut``.
++
++        Under the generated plist that gateway IS a launchd job, and the gui domain clamps every job to at most
++        ``LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S``. "No limit" there let a SIGTERM drain run its full configured
++        length past launchd's SIGKILL of the job, so launchd restarted into a gateway still tearing down
++        (gateway-cc28b19bca). Assume the clamp instead, and leave a ``gateway.launchd_budget_missing`` exit-diag
++        row so the coach files the lost label as a defect. Any other gateway keeps ``None`` (fail-open).
++        """
++        external = str(os.environ.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}
++        if platform != "darwin" or not external:
++            return None
++        assumed = float(LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S)
++        reason = "probe_failed" if label else "no_label"
++        logger.warning(
++            "launchd_budget_missing: --external-supervisor gateway could not read its launchd exit timeout "
++            "(%s, label %s); assuming the per-user clamp of %.0fs so signal-driven stops end before launchd SIGKILLs",
++            reason, label or "unset", assumed,
++        )
++        try:
++            from hermes_cli.gateway_exit_diag import make_exit_diag
++            make_exit_diag()("gateway.launchd_budget_missing", reason=reason, label=label,
++                             assumed_exit_timeout_s=int(assumed),
++                             xpc_service_name=os.environ.get("XPC_SERVICE_NAME"))
++        except Exception:  # health: allow BLE001 -- the diag row must never break gateway boot
++            logger.debug("launchd_budget_missing diag write failed", exc_info=True)
++        return assumed
++
+     @classmethod
+     def _load_env_or_agent_cfg_timeout(cls, env_var: str, cfg_key: str, parse, default: float) -> float:
+         """Env var (non-empty) else ``agent.<cfg_key>``; warn once when a supplied value fails to parse.
+diff --git a/hermes_cli/gateway_exit_diag.py b/hermes_cli/gateway_exit_diag.py
+index 3daef59efa9..e266518675c 100644
+--- a/hermes_cli/gateway_exit_diag.py
++++ b/hermes_cli/gateway_exit_diag.py
+@@ -17,7 +17,10 @@ from datetime import UTC, datetime
+ # ``gateway.exit_signal`` (info, with signal + parent), a start refused because another gateway owns
+ # this home/host as ``gateway.start_refused`` (info, with reason + owner pid/liveness); a bare
+ # non-zero return is a warning; only an escaped exception or a failing SystemExit is an error.
+-_TAG_LEVELS = {"asyncio.run.exception": "error", "gateway.exit_nonzero": "warning"}
++# [daveey] gateway.launchd_budget_missing: a darwin --external-supervisor gateway could not read launchd's live
++# ExitTimeOut and assumed the gui clamp (gateway-cc28b19bca); the coach files it as a defect.
++_TAG_LEVELS = {"asyncio.run.exception": "error", "gateway.exit_nonzero": "warning",
++               "gateway.launchd_budget_missing": "warning"}
+ 
+ 
+ def _record_level(tag: str, extra: dict[str, object]) -> str:
+diff --git a/hermes_cli/gateway_launchd.py b/hermes_cli/gateway_launchd.py
+index 01e8e986ee8..524e2176c21 100644
+--- a/hermes_cli/gateway_launchd.py
++++ b/hermes_cli/gateway_launchd.py
+@@ -441,6 +441,11 @@ def generate_launchd_plist() -> str:
+     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
+     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
+     # [daveey] With Hermes Python.app installed, the signed bundle owns the job instead (TCC attribution).
++    # [daveey] HERMES_LAUNCHD_LABEL in EnvironmentVariables reaches every process of the job. launchd stamps
++    # XPC_SERVICE_NAME=<label> only on the job's main process (the signed wrapper / osascript); everything
++    # below it, the launcher, stderr_timestamp and the gateway, reads XPC_SERVICE_NAME=0, so stderr_timestamp's
++    # re-export found nothing, the gateway never read the live ExitTimeOut, drained past launchd's 60 s and
++    # launchd restarted into it (start_refused owner_alive=true, defect gateway-cc28b19bca).
+     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
+     command = _timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
+     command = [*gateway_launcher_prefix(hermes_home), *command]
+@@ -488,6 +493,8 @@ def generate_launchd_plist() -> str:
+         <string>{hermes_home}</string>
+         <key>HERMES_SUPERVISED_CHILD</key>
+         <string>1</string>
++        <key>HERMES_LAUNCHD_LABEL</key>
++        <string>{escape(label)}</string>
+     </dict>
+ 
+     <key>LimitLoadToSessionType</key>
+diff --git a/tests/hermes_cli/test_launchd_label_reaches_gateway.py b/tests/hermes_cli/test_launchd_label_reaches_gateway.py
+new file mode 100644
+index 00000000000..7becff54e5b
+--- /dev/null
++++ b/tests/hermes_cli/test_launchd_label_reaches_gateway.py
+@@ -0,0 +1,130 @@
++"""[daveey] The launchd gateway at the END of the real job chain must know its job label (gateway-cc28b19bca).
++
++launchd stamps ``XPC_SERVICE_NAME=<label>`` only on the job's main process. Since the signed-bundle wrapper
++and the core-update launcher went in front of ``stderr_timestamp``, every process below the wrapper reads
++``XPC_SERVICE_NAME=0`` (measured on the MacBook), so ``stderr_timestamp``'s re-export found nothing, the
++gateway's ``launchd_job_label()`` was ``None``, the stop drain was never capped to launchd's 60 s
++``ExitTimeOut`` and launchd restarted into a still-draining gateway (start_refused owner_alive=true).
++The plist now names the label in ``EnvironmentVariables``, which every descendant inherits; a darwin
++``--external-supervisor`` gateway that still finds no label assumes the gui-domain clamp and says so.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import plistlib
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++import hermes_cli.gateway as gateway_cli
++from gateway.restart import (
++    EXTERNAL_GATEWAY_SUPERVISOR_ENV,
++    LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S,
++    LAUNCHD_LABEL_ENV,
++    LAUNCHD_STOP_CLEANUP_RESERVE_S,
++    resolve_launchd_capped_drain,
++)
++from hermes_cli.gateway_launchd import _SIGNED_WRAPPER_SOURCE, launchd_program_arguments
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++
++pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX process chain")
++
++# The gateway stand-in at the leaf: records the label the real reader resolves from its environment.
++_LEAF_PROBE = (
++    "import sys; from gateway.restart import launchd_job_label; "
++    "open(sys.argv[1], 'w').write(str(launchd_job_label()))"
++)
++
++
++def _plist(tmp_path, monkeypatch, label: str = "ai.hermes.gateway") -> dict:
++    profile_dir = tmp_path / ".hermes"
++    profile_dir.mkdir(parents=True, exist_ok=True)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(profile_dir))
++    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
++    monkeypatch.setattr(gateway_cli, "get_python_path", lambda: sys.executable)
++    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: label)
++    return plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
++
++
++@pytest.mark.parametrize("label", ["ai.hermes.gateway", "ai.hermes.gateway-butler"])
++def test_plist_environment_names_the_job_label(tmp_path, monkeypatch, label):
++    env = _plist(tmp_path, monkeypatch, label)["EnvironmentVariables"]
++    assert env[LAUNCHD_LABEL_ENV] == label
++
++
++def test_gateway_at_end_of_real_launchd_chain_resolves_its_label(tmp_path, monkeypatch):
++    """Run the generated job: the plist's EnvironmentVariables, launchd's XPC_SERVICE_NAME on the FIRST
++    process only (the signed wrapper), ``XPC_SERVICE_NAME=0`` from the next process down (the launcher's
++    place in the chain, as macOS stamps it), then the real ``stderr_timestamp`` and a leaf gateway stand-in."""
++    plist = _plist(tmp_path, monkeypatch)
++    out = tmp_path / "leaf-label.txt"
++    leaf = [sys.executable, "-c", _LEAF_PROBE, str(out)]
++    chain = ["/usr/bin/env", "XPC_SERVICE_NAME=0", sys.executable, "-m", "hermes_cli.stderr_timestamp",
++             "--error-log", str(tmp_path / "err.log"), "--", *leaf]
++    program = launchd_program_arguments(chain, tmp_path / "out.log", tmp_path / "err.log",
++                                        responsible=Path(sys.executable))
++    assert program[3] == _SIGNED_WRAPPER_SOURCE  # the real signed wrapper is the job's main process
++    job_env = {
++        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
++        "PYTHONPATH": str(REPO_ROOT),
++        **plist["EnvironmentVariables"],
++        "XPC_SERVICE_NAME": plist["Label"],
++    }
++    proc = subprocess.run(program, env=job_env, cwd=str(REPO_ROOT), timeout=60, check=False)
++    assert proc.returncode == 0, (tmp_path / "err.log").read_text() if (tmp_path / "err.log").exists() else ""
++    assert out.read_text() == "ai.hermes.gateway"
++
++
++def _loader():
++    from gateway.run_config_loaders import GatewayConfigLoadersMixin
++    return GatewayConfigLoadersMixin._load_launchd_exit_timeout
++
++
++def _diag_rows(home: Path) -> list[dict]:
++    log = home / "logs" / "gateway-exit-diag.log"
++    if not log.exists():
++        return []
++    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
++
++
++@pytest.fixture
++def darwin_unlabelled(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
++    monkeypatch.delenv(LAUNCHD_LABEL_ENV, raising=False)
++    monkeypatch.setenv("HERMES_GATEWAY_EXIT_DIAG", "1")
++    return home
++
++
++def test_external_supervisor_without_label_assumes_launchd_clamp_and_records_it(darwin_unlabelled, monkeypatch, caplog):
++    monkeypatch.setenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
++    with caplog.at_level(logging.WARNING, logger="gateway.run"):
++        budget = _loader()(180.0, platform="darwin")
++    assert budget == float(LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S)
++    assert resolve_launchd_capped_drain(180.0, budget) == 60.0 - LAUNCHD_STOP_CLEANUP_RESERVE_S
++    rows = [r for r in _diag_rows(darwin_unlabelled) if r["tag"] == "gateway.launchd_budget_missing"]
++    assert len(rows) == 1 and rows[0]["level"] == "warning"
++    assert rows[0]["assumed_exit_timeout_s"] == 60
++    assert "launchd_budget_missing" in caplog.text
++
++
++def test_foreground_darwin_gateway_without_label_keeps_no_budget(darwin_unlabelled, monkeypatch):
++    """A gateway started from a shell (no --external-supervisor) is not launchd-timed: nothing assumed."""
++    monkeypatch.delenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
++    assert _loader()(180.0, platform="darwin") is None
++    assert _diag_rows(darwin_unlabelled) == []
++
++
++def test_linux_external_supervisor_without_label_keeps_no_budget(darwin_unlabelled, monkeypatch):
++    monkeypatch.setenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
++    assert _loader()(180.0, platform="linux") is None
++    assert _diag_rows(darwin_unlabelled) == []
+-- 
+2.55.0
+

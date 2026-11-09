@@ -1,0 +1,2007 @@
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 965e5c4502c..3efda550523 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -37,6 +37,7 @@ from agent.conversation_compression_deadline import (
+     DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS,
+     resolve_context_compression_timeouts,
+ )
++from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
+ from agent.conversation_compression_telemetry import (
+     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
+     _emit_compression_attempt_telemetry, _record_committed_attempt_effect, _snapshot_compression_effect_input,
+@@ -2154,40 +2155,13 @@ def conversation_history_after_compression(
+     return None
+ 
+ 
+-_SYNTHETIC_USER_PREFIXES = (
+-    "[System: Your previous response was truncated", "[System: The previous response was cut off",
+-    "[System: Your previous tool call", "[Your active task list was preserved across context compression]",
+-    "[IMPORTANT: Background process ",
+-)
+-
+-
+-def _message_text(message: Any) -> str:
+-    content = message.get("content") if isinstance(message, dict) else None
+-    if isinstance(content, str):
+-        return content
+-    if isinstance(content, list):
+-        return "\n".join(
+-            str(part.get("text") or part.get("content") or "") for part in content if isinstance(part, dict)
+-        )
+-    return ""
+-
+-
+-_SYNTHETIC_USER_FLAGS = (
+-    "_todo_snapshot_synthetic", "_empty_recovery_synthetic", "_verification_stop_synthetic", "_pre_verify_synthetic",
+-    "_dropped_toolcall_nudge", "_pre_final_gate_synthetic", "_kanban_stop_synthetic",
+-)
+-
+-
+ def _is_real_user_message(message: Any) -> bool:
+     """Distinguish human intent from user-role runtime scaffolding.
+     A compaction summary flipped to ``role="user"`` for alternation is scaffolding and must not short-circuit
+     anchor restoration."""
+     if not isinstance(message, dict) or message.get("role") != "user":
+         return False
+-    if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
+-        return False
+-    text = _message_text(message).strip()
+-    if not text or text.startswith(_SYNTHETIC_USER_PREFIXES):
++    if is_user_role_scaffolding(message) or not _message_text(message).strip():
+         return False
+     from agent.context_compressor import ContextCompressor
+     return not ContextCompressor._is_synthetic_compression_user_turn(message)
+diff --git a/agent/conversation_compression_scaffolding.py b/agent/conversation_compression_scaffolding.py
+new file mode 100644
+index 00000000000..c11ca6299ec
+--- /dev/null
++++ b/agent/conversation_compression_scaffolding.py
+@@ -0,0 +1,33 @@
++"""Which user-role rows are runtime scaffolding rather than something the person typed."""
++
++from __future__ import annotations
++
++from typing import Any
++
++_SYNTHETIC_USER_PREFIXES = (
++    "[System: Your previous response was truncated", "[System: The previous response was cut off",
++    "[System: Your previous tool call", "[Your active task list was preserved across context compression]",
++    "[IMPORTANT: Background process ",
++)
++
++
++def _message_text(message: Any) -> str:
++    content = message.get("content") if isinstance(message, dict) else None
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "\n".join(
++            str(part.get("text") or part.get("content") or "") for part in content if isinstance(part, dict)
++        )
++    return ""
++
++
++_SYNTHETIC_USER_FLAGS = (
++    "_todo_snapshot_synthetic", "_empty_recovery_synthetic", "_verification_stop_synthetic", "_pre_verify_synthetic",
++    "_dropped_toolcall_nudge", "_pre_final_gate_synthetic", "_kanban_stop_synthetic",
++)
++
++
++def is_user_role_scaffolding(message: dict) -> bool:
++    """A runtime row in the user role, by flag or opening text (nudges, task-list snapshots, background-process completion/watch notices)."""
++    return any(message.get(f) for f in _SYNTHETIC_USER_FLAGS) or _message_text(message).strip().startswith(_SYNTHETIC_USER_PREFIXES)
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index 0f5feceef6a..c32ceca9bd8 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -633,7 +633,13 @@ class MemoryManager:
+     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_turn_start"):
+             return
+-        message = _redact_for_provider(message)
++        # previous_message is earlier user text, so it is scrubbed with the message (one learned-token set). The rest
++        # are identity/runtime values, raw as in sync_all: masking a phone-number author_id merges two senders.
++        if "previous_message" in kwargs:
++            message, previous = _redact_for_provider(message, kwargs["previous_message"])
++            kwargs = {**kwargs, "previous_message": previous}
++        else:
++            message = _redact_for_provider(message)
+ 
+         def _tick(p: MemoryProvider) -> None:
+             # A provider written before the author kwargs declares (turn_number, message) only; it still gets its tick.
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 6e3cd87abf3..7e171fcd116 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -177,9 +177,14 @@ class MemoryProvider(ABC):
+ 
+     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+         """Per-turn tick. kwargs may include remaining_tokens, model, platform, tool_count, author_id, author_name,
+-        author_is_bot. ``model`` is the turn's primary model id at turn start ("" when unset; a preset name
+-        under mixture-of-agents). The author trio names who wrote THIS turn (None, None, False without one): a shared session
+-        carries several participants, so a provider keying durable state on identity must read it per turn."""
++        author_is_bot, previous_message. ``model`` is the turn's primary model id at turn start ("" when unset; a
++        preset name under mixture-of-agents). The author trio names who wrote THIS turn (None, None, False without
++        one): a shared session carries several participants, so a provider keying durable state on identity must read
++        it per turn. ``previous_message`` is the secret-scrubbed text of the person's last message before this turn
++        ("" on a first turn or an image-only one), from the transcript Hermes holds, so a resumed process can redo
++        what a live one queued at the end of that turn. Best-effort: known runtime user-role rows and /steer messages
++        are skipped, but a notice a gateway replays after a restart (cron delivery, process heartbeat, watch-disabled
++        notice) can come through."""
+ 
+     def identity_signature(self) -> dict[str, Any]:
+         """Identity-mapping values that must bust a cached gateway agent when they change (writer identity, alias
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index ed040fe5cb7..0ca1bab66a9 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1037,8 +1037,39 @@ def _memory_query_text(original_user_message: Any) -> str:
+     return ""
+ 
+ 
++def _previous_user_message_text(conversation_history: Optional[list[Any]]) -> str:
++    """Semantic text of the last real user message in the history a turn starts from (``""`` on a first turn).
++
++    Read before the turn appends its own message or turn-start compaction rebinds the history: in-place
++    compaction hands back a list that already ends in this turn's message, and rotation hands back none.
++    Runtime scaffolding in the user role (continue nudges, task-list snapshots, compaction summaries) is
++    skipped, so the value is what the person last asked. A compaction carrier contributes the live ask it
++    wraps, and an image-only turn ends the search with ``""`` rather than falling back to an older ask.
++    The value is the text of that turn's clean persisted ask, as a live process saw it: a gateway timestamp
++    prefix comes off, and a mid-turn /steer row is skipped (gateway replay drops its type, so it is matched by
++    its marker). Best-effort: replay also drops the type of internal-notification rows, so one without a known
++    prefix (a cron delivery, a process heartbeat, a watch-disabled notice) can still be returned."""
++    from agent.context_compressor import user_originated_turn_view
++    from agent.conversation_compression_scaffolding import is_user_role_scaffolding
++    from agent.prompt_builder import STEER_MARKER_OPEN
++    from gateway.message_timestamps import strip_leading_message_timestamps
++
++    for message in reversed(conversation_history or []):
++        if not isinstance(message, dict) or message.get("role") != "user":
++            continue
++        content = message.get("content")
++        if isinstance(content, str) and (clean := strip_leading_message_timestamps(content)[0]) != content:
++            message = {**message, "content": clean}
++        if flatten_message_text(message.get("content")).lstrip().startswith(STEER_MARKER_OPEN):  # text parts only
++            continue
++        # The canonical view cannot see metadata-flagged scaffolding, so screen it out first.
++        if not is_user_role_scaffolding(message) and (live_view := user_originated_turn_view(message)) is not None:
++            return _memory_query_text(live_view.get("content"))
++    return ""
++
++
+ def _memory_turn_start_and_prefetch(
+-    agent: Any, original_user_message: Any, turn_author: Optional[dict[str, Any]] = None,
++    agent: Any, original_user_message: Any, turn_author: Optional[dict[str, Any]], previous_message: str,
+ ) -> str:
+     """Notify memory providers of the new turn, then prefetch external memory once
+     before the tool loop (skipped on trivial prompts with no semantic signal).
+@@ -1054,6 +1085,7 @@ def _memory_turn_start_and_prefetch(
+             model=getattr(agent, "model", "") or "",
+             author_id=_author.get("id") or None, author_name=_author.get("name") or None,
+             author_is_bot=bool(_author.get("is_bot")),
++            previous_message=previous_message,
+         )
+     ext_prefetch_cache = ""
+     with suppress(Exception):
+@@ -1243,6 +1275,9 @@ def build_turn_context(
+         _turn_args.append(_turn_origin)
+     logger.info(_turn_fmt, *_turn_args)
+ 
++    # Before this turn's message is appended and compaction rebinds the history.
++    previous_user_message = _previous_user_message_text(conversation_history) if agent._memory_manager else ""
++
+     # Copy so the caller's list is never mutated.
+     messages = list(conversation_history) if conversation_history else []
+     user_msg, pending_cli_message = _stage_turn_user_message(
+@@ -1339,7 +1374,7 @@ def build_turn_context(
+     _bind_interrupt_scope(agent, ra)
+     # A vetoed prompt never leaves the host: no external-memory prefetch, no titling call.
+     ext_prefetch_cache = "" if plugin_block_message else _memory_turn_start_and_prefetch(
+-        agent, original_user_message, turn_author)
++        agent, original_user_message, turn_author, previous_user_message)
+ 
+     # Title the session now: titling depends only on the user's ask (before any injected
+     # context lands on list content), so it runs concurrently with the turn. Daemon thread,
+diff --git a/apps/desktop/electron/renderer-log.test.ts b/apps/desktop/electron/renderer-log.test.ts
+index f955fc97e9e..d0e799637f9 100644
+--- a/apps/desktop/electron/renderer-log.test.ts
++++ b/apps/desktop/electron/renderer-log.test.ts
+@@ -1,5 +1,10 @@
++import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++
+ import { describe, expect, it, vi } from 'vitest'
+ 
++import { formatDesktopLogLine } from './desktop-log-line'
+ import { attachRendererConsoleCapture, formatRendererBoundaryReport, formatRendererConsoleLine } from './renderer-log'
+ 
+ type ConsoleMessageEvent = {
+@@ -47,6 +52,44 @@ describe('formatRendererConsoleLine', () => {
+ })
+ 
+ describe('attachRendererConsoleCapture', () => {
++  it('writes serialized wake diagnostics to desktop.log without admitting other warnings', () => {
++    const directory = mkdtempSync(join(tmpdir(), 'wake-log-'))
++    const file = join(directory, 'desktop.log')
++    const capture = createWindowHarness()
++
++    const diagnostic = {
++      attempts: 3,
++      phase: 'hydration',
++      profile: 'tom',
++      runtimeBound: false,
++      selectionSettled: true,
++      storedSessionId: 'bot-chat-tom',
++      transcriptPainted: false
++    }
++
++    try {
++      attachRendererConsoleCapture(capture.win, 'session-window', line => {
++        appendFileSync(file, `${formatDesktopLogLine(line)}\n`)
++      })
++      capture.getHandler()?.({
++        level: 'warning',
++        message: `[bot-wake] hydration timed out ${JSON.stringify(diagnostic)}`,
++        sourceId: 'file:///app/index.js',
++        lineNumber: 42
++      })
++      capture.getHandler()?.({ level: 'warning', message: 'unrelated warning', sourceId: 'src', lineNumber: 1 })
++      capture.getHandler()?.({ level: 'info', message: '[bot-wake] quiet', sourceId: 'src', lineNumber: 1 })
++
++      const lines = readFileSync(file, 'utf8').trim().split('\n')
++
++      expect(lines).toHaveLength(1)
++      expect(lines[0]).toContain('[renderer console:session-window] [bot-wake] hydration timed out ')
++      expect(JSON.parse(lines[0]!.split('hydration timed out ')[1]!.split(' (file:')[0]!)).toEqual(diagnostic)
++    } finally {
++      rmSync(directory, { recursive: true, force: true })
++    }
++  })
++
+   it('registers a single-argument listener, logs errors, and skips the rest', () => {
+     const log = vi.fn()
+     const capture = createWindowHarness()
+diff --git a/apps/desktop/electron/renderer-log.ts b/apps/desktop/electron/renderer-log.ts
+index e143c4a981f..53ec311d26f 100644
+--- a/apps/desktop/electron/renderer-log.ts
++++ b/apps/desktop/electron/renderer-log.ts
+@@ -59,20 +59,27 @@ function isConsoleMessageDetails(value: unknown): value is ConsoleMessageDetails
+   )
+ }
+ 
+-/** Format Electron's canonical console-message event object into one line, or
+- *  null for non-error or malformed events. Hermes's pinned Electron line
+- *  puts severity and source metadata on the event object itself; accepting one
++/** Format errors and Bot Chat wake warnings into one line, or null otherwise.
++ *  Hermes's pinned Electron line puts severity and source metadata on the
++ *  event object itself; accepting one
+  *  listener argument also avoids Electron's deprecated positional
+  *  `(event, level, message, line, sourceId)` path. */
+ export function formatRendererConsoleLine(label: string, details: ConsoleMessageEventLike): string | null {
+-  if (!isConsoleMessageDetails(details) || details.level !== 'error') {
++  if (!isConsoleMessageDetails(details)) {
++    return null
++  }
++
++  // Retain the existing quiet console policy outside this support diagnostic.
++  const isWakeWarning = details.level === 'warning' && details.message.startsWith('[bot-wake] ')
++
++  if (details.level !== 'error' && !isWakeWarning) {
+     return null
+   }
+ 
+   return `[renderer console:${label}] ${details.message} (${details.sourceId}:${String(details.lineNumber)})`
+ }
+ 
+-/** Attach the error-level console hook to a renderer window. `log` is the
++/** Attach the diagnostic console hook to a renderer window. `log` is the
+  *  desktop.log sink (rememberLog in main.ts). */
+ export function attachRendererConsoleCapture(win: WindowLike, label: string, log: (line: string) => void): void {
+   win.webContents.on('console-message', event => {
+diff --git a/apps/desktop/src/sdk/bot-wake-log.test.ts b/apps/desktop/src/sdk/bot-wake-log.test.ts
+new file mode 100644
+index 00000000000..85f6b5e03f1
+--- /dev/null
++++ b/apps/desktop/src/sdk/bot-wake-log.test.ts
+@@ -0,0 +1,13 @@
++import { describe, expect, it } from 'vitest'
++
++import { isBotWakeTimeout } from './bot-wake-log'
++
++describe('bot wake timeout classification', () => {
++  it('recognizes hydration timeouts', () => {
++    expect(isBotWakeTimeout(new Error("Timed out loading medicina's session history."))).toBe(true)
++  })
++
++  it.each([null, 'Timed out loading history', { message: 'Timed out loading history' }, new Error('Disconnected'), new Error('Other: Timed out loading history')])('rejects unrelated failures: %s', error => {
++    expect(isBotWakeTimeout(error)).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/sdk/bot-wake-log.ts b/apps/desktop/src/sdk/bot-wake-log.ts
+new file mode 100644
+index 00000000000..5972ffd9c32
+--- /dev/null
++++ b/apps/desktop/src/sdk/bot-wake-log.ts
+@@ -0,0 +1,13 @@
++/** Only hydration timeouts belong to the retry/diagnostic path, not arbitrary wake failures. */
++export function isBotWakeTimeout(error: unknown): error is Error {
++  return error instanceof Error && error.message.startsWith('Timed out loading ')
++}
++
++/** Electron flattens console arguments, so keep wake fields in the message itself.
++ * The renderer console capture persists only this warning namespace to desktop.log. */
++export function logBotWake(
++  message: 'hydration timed out' | 'hydration timed out, retrying',
++  details: Record<string, boolean | number | string>
++): void {
++  console.warn(`[bot-wake] ${message} ${JSON.stringify(details)}`)
++}
+diff --git a/apps/desktop/src/sdk/index.ts b/apps/desktop/src/sdk/index.ts
+index 85ff6b861cd..4996d5b8929 100644
+--- a/apps/desktop/src/sdk/index.ts
++++ b/apps/desktop/src/sdk/index.ts
+@@ -107,6 +107,7 @@ import type { PaginatedSessions, UsageStats } from '@/types/hermes'
+ 
+ import type { SessionMutationSnapshot } from '../../../shared/src/session-http-mutations'
+ 
++import { isBotWakeTimeout, logBotWake } from './bot-wake-log'
+ import { pluginDecisions, profiles, skills, toolsets } from './bridge'
+ import { composerHost } from './composer'
+ import { $gateways, type PluginGateway } from './gateways'
+@@ -1105,8 +1106,7 @@ export const host = {
+             options.awaitHydration &&
+             generation === openSessionGeneration &&
+             attempt < maxAttempts &&
+-            error instanceof Error &&
+-            error.message.startsWith('Timed out loading ')
++            isBotWakeTimeout(error)
+ 
+           if (!retryable) {
+             throw error
+@@ -1121,7 +1121,7 @@ export const host = {
+ 
+           // Logged per attempt so a support bundle shows the retry happened at
+           // all; the terminal failure is reported once by the catch below.
+-          console.warn('[bot-wake] hydration timed out, retrying', {
++          logBotWake('hydration timed out, retrying', {
+             attempt,
+             hydrationWaitMs: Date.now() - profileActiveAt,
+             profile: targetProfile,
+@@ -1133,12 +1133,11 @@ export const host = {
+       if (
+         options.awaitHydration &&
+         openingStillCurrent() &&
+-        error instanceof Error &&
+-        error.message.startsWith('Timed out loading ')
++        isBotWakeTimeout(error)
+       ) {
+         const timedOutAt = Date.now()
+ 
+-        console.warn('[bot-wake] hydration timed out', {
++        logBotWake('hydration timed out', {
+           attempts: wakePhase === 'hydration' ? maxAttempts : 1,
+           hydrationWaitMs: wakePhase === 'hydration' ? timedOutAt - profileActiveAt : 0,
+           phase: wakePhase,
+diff --git a/apps/desktop/src/sdk/profile-routing.test.ts b/apps/desktop/src/sdk/profile-routing.test.ts
+index 7cd9d96a821..fa787056991 100644
+--- a/apps/desktop/src/sdk/profile-routing.test.ts
++++ b/apps/desktop/src/sdk/profile-routing.test.ts
+@@ -193,6 +193,7 @@ const profile = (name: string): ProfileInfo => ({
+ })
+ 
+ afterEach(() => {
++  vi.restoreAllMocks()
+   vi.clearAllMocks()
+   vi.mocked(sessionTileDelegate).mockReturnValue(null)
+   vi.mocked(activeGatewayConnectionId).mockReturnValue('local')
+@@ -344,14 +345,20 @@ describe('connection-aware plugin host APIs', () => {
+       })
+     )
+     expect(hermesApi).toHaveBeenNthCalledWith(2, {
+-      connectionId: 'source-a', path: '/api/sessions/bot-chat/mutation-snapshot?profile=backend-worker'
++      connectionId: 'source-a',
++      path: '/api/sessions/bot-chat/mutation-snapshot?profile=backend-worker'
+     })
+     expect(hermesApi).toHaveBeenNthCalledWith(3, {
+       connectionId: 'source-a',
+       path: '/api/sessions/bot-chat',
+       method: 'PATCH',
+-      body: { hidden: true, profile: 'backend-worker', expected_revision: 31,
+-        expected_generation: 5, request_id: expect.any(String) }
++      body: {
++        hidden: true,
++        profile: 'backend-worker',
++        expected_revision: 31,
++        expected_generation: 5,
++        request_id: expect.any(String)
++      }
+     })
+     expect(vi.mocked(hermesApi).mock.calls.every(([request]) => !('profile' in request))).toBe(true)
+     expect(requestGatewayForAgent).not.toHaveBeenCalled()
+@@ -1027,6 +1034,8 @@ describe('profile-aware plugin session opens', () => {
+   })
+ 
+   it('retries a Bot Chat hydration timeout once without ever arming the Retry surface (#89617)', async () => {
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
++
+     $activeGatewayProfile.set('hyoseob')
+ 
+     // First attempt: leave the surface unhealthy so the hydration wait below
+@@ -1059,9 +1068,12 @@ describe('profile-aware plugin session opens', () => {
+     // call clears it for the currently-routed session.
+     expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+     expect($gatewaySwapTarget.get()).toBeNull()
++    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('[bot-wake] hydration timed out, retrying '))
+   })
+ 
+   it('still arms the Retry surface when a retried Bot Chat hydration times out twice', async () => {
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
++
+     $activeGatewayProfile.set('hyoseob')
+ 
+     await expect(
+@@ -1077,6 +1089,26 @@ describe('profile-aware plugin session opens', () => {
+     expect(openSessionCore).toHaveBeenCalledTimes(2)
+     expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('stranded-bot-chat')
+     expect($gatewaySwapTarget.get()).toBeNull()
++    expect(warn).toHaveBeenCalledTimes(2)
++
++    const [retry, failure] = warn.mock.calls
++
++    expect(retry).toHaveLength(1)
++    expect(failure).toHaveLength(1)
++    expect(JSON.parse(String(retry![0]).split('retrying ')[1]!)).toMatchObject({
++      attempt: 1,
++      profile: 'hyoseob',
++      storedSessionId: 'stranded-bot-chat'
++    })
++    expect(JSON.parse(String(failure![0]).split('timed out ')[1]!)).toMatchObject({
++      attempts: 2,
++      phase: 'hydration',
++      profile: 'hyoseob',
++      runtimeBound: false,
++      selectionSettled: false,
++      storedSessionId: 'stranded-bot-chat',
++      transcriptPainted: false
++    })
+   })
+ 
+   it('lets the latest rapid bot selection win and cancels the older hydration wait', async () => {
+@@ -1190,6 +1222,8 @@ describe('profile-aware plugin session opens', () => {
+   })
+ 
+   it('surfaces a wedged profile activation instead of waiting on it forever (#89556)', async () => {
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
++
+     // The dial the store is waiting on never settles - a backend that accepts
+     // the socket and then never completes the handshake. Before this was
+     // bounded, openSession's await sat here for the life of the window and the
+@@ -1216,6 +1250,18 @@ describe('profile-aware plugin session opens', () => {
+     // retry, not a frozen pane.
+     expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('wedged-chat')
+     expect($gatewaySwapTarget.get()).toBeNull()
++    expect(warn).toHaveBeenCalledTimes(1)
++    expect(warn.mock.calls[0]).toHaveLength(1)
++    expect(JSON.parse(String(warn.mock.calls[0]![0]).split('timed out ')[1]!)).toMatchObject({
++      attempts: 1,
++      hydrationWaitMs: 0,
++      phase: 'activation',
++      profile: 'medicina',
++      runtimeBound: true,
++      selectionSettled: true,
++      storedSessionId: 'wedged-chat',
++      transcriptPainted: true
++    })
+   })
+ 
+   it('gives hydration its own full budget after a slow but successful activation', async () => {
+diff --git a/contributors/emails/paul@letscubo.com b/contributors/emails/paul@letscubo.com
+new file mode 100644
+index 00000000000..1be918ab982
+--- /dev/null
++++ b/contributors/emails/paul@letscubo.com
+@@ -0,0 +1,2 @@
++paulyang-fm
++# PR #107305 salvage (dashboard-auth: foreign-audience JWT is a 401, not 503)
+diff --git a/gateway/session_api.py b/gateway/session_api.py
+index 53e753189c9..08d425af600 100644
+--- a/gateway/session_api.py
++++ b/gateway/session_api.py
+@@ -305,10 +305,12 @@ def restore_api_session(authority, session_id):
+     if saved is None:
+         raise RuntimeStoreError('not_found')
+     receipt = json.loads(saved[0])
+-    if receipt['profile_id'] != authority.profile_id:
+-        raise RuntimeStoreError('profile_mismatch')
+     entry = SessionEntry.from_dict(receipt['entry'])
+     source = entry.origin
++    if receipt['profile_id'] != authority.profile_id and (source is None or source.profile != _served_profile(authority)):
++        # Minted under an older home of this store (it moved with its profile): the stored origin
++        # still places the turn's runtime scope (``bind_api_session``), so it must name this profile.
++        raise RuntimeStoreError('profile_mismatch')
+     _pin_api_identity(authority.runner, source, transport_profile=entry.transport_profile)
+     row = authority.db.get_session(session_id)
+     if (receipt['session_id'] != session_id or entry.session_id != session_id
+diff --git a/gateway/session_history_mount.py b/gateway/session_history_mount.py
+index e50fbed0b86..ddf17ffc988 100644
+--- a/gateway/session_history_mount.py
++++ b/gateway/session_history_mount.py
+@@ -24,7 +24,7 @@ def _reader(authority, actor, sid):
+     with authority.db._read_ctx() as conn:
+         binding = history_binding(conn, sid)
+     if binding is not None:
+-        return binding_names(binding, actor.profile_id, actor.subject)
++        return binding_names(binding, actor.subject)
+     return ('session:operator' in actor.capabilities
+             or getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) == actor)
+ 
+diff --git a/gateway/session_listing.py b/gateway/session_listing.py
+index 22b201fa465..73d97624209 100644
+--- a/gateway/session_listing.py
++++ b/gateway/session_listing.py
+@@ -134,17 +134,18 @@ def _closed_local_session(authority, actor, row, tip):
+ 
+ def _stored_closed(authority, actor, owner):
+     """Boot leaves an ended session unrestored and a listing never restores one (a worker thread): judge
+-    its stored receipt as ``authorize`` and ``closed_and_unviewed`` would after a restore. No viewer."""
+-    from hermes_state_local import local_receipt
++    its stored receipt as ``authorize`` and ``closed_and_unviewed`` would after a restore. No viewer.
++    The stored receipt is judged by the checks a restore runs on it (``restorable_receipt``); the
++    restore's live route check (another session on its route) stays the restore's."""
++    from gateway.session_local_recovery import restorable_receipt
+     from hermes_state_runtime import list_session_admissions
+     if actor.profile_id != authority.profile_id or 'session:read' not in actor.capabilities:
+         return False
+     try:
+-        receipt = local_receipt(authority.db, owner)
+-        row = authority.db.get_session(receipt['entry']['session_id'])
+-    except (RuntimeStoreError, KeyError, TypeError):
++        receipt, entry = restorable_receipt(authority, owner)
++        row = authority.db.get_session(entry.session_id)
++    except (KeyError, TypeError, ValueError, AttributeError):
+         return False
+-    return (receipt.get('profile_id') == authority.profile_id
+-            and (same_owner(receipt.get('principal_id'), actor.subject) or 'session:operator' in actor.capabilities)
++    return ((same_owner(receipt['principal_id'], actor.subject) or 'session:operator' in actor.capabilities)
+             and row is not None and row['ended_at'] is not None
+             and not list_session_admissions(authority.db, session_id=owner))
+diff --git a/gateway/session_local_recovery.py b/gateway/session_local_recovery.py
+index 6310fc8b2a3..ee13a8db2ae 100644
+--- a/gateway/session_local_recovery.py
++++ b/gateway/session_local_recovery.py
+@@ -96,7 +96,7 @@ def _checked_entry(authority, receipt, source, route):
+         raise ValueError('route mismatch')
+     entry = SessionEntry.from_dict(receipt['entry'])
+     # Older local receipts omitted the served profile from the origin. The receipt's
+-    # home and route already matched this authority; fill only that absent field,
++    # route already matched this authority; fill only that absent field,
+     # never accept an explicitly different profile or change the durable route.
+     if 'profile' not in receipt['entry']['origin']:
+         entry.origin.profile = source.profile
+@@ -110,10 +110,13 @@ def _checked_entry(authority, receipt, source, route):
+ 
+ 
+ def owned_receipt(authority, sid):
+-    """*sid*'s stored receipt with its LOCAL source, route and entry, once all are this owner's."""
++    """*sid*'s stored receipt with its LOCAL source, route and entry, once all are this owner's.
++
++    The receipt's ``profile_id`` is the home path that minted it, kept as stored: the session id
++    hashes it (``local_identity``; a legacy-adopted receipt is bound by its route alone), so a
++    store that moved with its profile (another machine, a moved home) still owns its rows. Its
++    owner is this store; the route namespace binds the profile."""
+     receipt = local_receipt(authority.db, sid)
+-    if receipt['profile_id'] != authority.profile_id:
+-        raise RuntimeStoreError('profile_mismatch')
+     chat_id = (receipt['legacy_session_id'] if 'legacy_session_id' in receipt else
+                local_identity(receipt['profile_id'], receipt['principal_id'], receipt['request_id']))
+     if receipt['session_id'] != sid or sid != chat_id:
+@@ -123,6 +126,25 @@ def owned_receipt(authority, sid):
+     return receipt, source, route, _checked_entry(authority, receipt, source, route)
+ 
+ 
++def restorable_receipt(authority, sid):
++    """*sid*'s receipt and entry once ``restore_local_session``'s checks on the stored receipt pass,
++    judged read-only: ``owned_receipt`` plus the stored policy and lineage. A compression catch-up
++    still to adopt is judged as the restore would commit it (``with_adopted_compression``)."""
++    from gateway.session_policy import restore_policy
++    from hermes_state_local_lineage import adoptable_compression, validate_local_lineage, with_adopted_compression
++    receipt, source, route, entry = owned_receipt(authority, sid)
++    if receipt.get('quarantine') is not None:
++        raise _ReceiptRefused('invalid_params', field='policy', detail='stored policy quarantined')
++    restore_policy(receipt['policy'])
++    with authority.db._read_ctx() as conn:
++        adoptable = adoptable_compression(conn, receipt)
++        if adoptable is not None:
++            receipt = with_adopted_compression(receipt, adoptable[0])
++        validate_local_lineage(conn, receipt)
++    # Outside the read: _checked_entry reads the stored row itself (a writer-fallback read holds the lock).
++    return receipt, (entry if adoptable is None else _checked_entry(authority, receipt, source, route))
++
++
+ def unused_session(conn, session_id):
+     """*session_id* holds nothing: no transcript, ledger rows or children (what the SessionStore's
+     stale-route heal, #54878, mints as a route's replacement before any turn runs on it)."""
+diff --git a/hermes_cli/dashboard_auth/base.py b/hermes_cli/dashboard_auth/base.py
+index b8e71461adf..6ddeb91fe8e 100644
+--- a/hermes_cli/dashboard_auth/base.py
++++ b/hermes_cli/dashboard_auth/base.py
+@@ -45,7 +45,8 @@ class ProviderError(Exception):
+ 
+ 
+ class InvalidCodeError(Exception):
+-    """OAuth callback ``code``/``state`` failed validation. Middleware -> HTTP 400."""
++    """A code, state or token failed validation (not an outage): the OAuth callback answers 400,
++    ``verify_session`` returns ``None``."""
+ 
+ 
+ class InvalidCredentialsError(Exception):
+@@ -58,19 +59,25 @@ class RefreshExpiredError(Exception):
+     rejects it."""
+ 
+ 
++# PyJWKClient.get_signing_key's message when the (refetched) JWKS has no key for the token's kid.
++_JWKS_KID_MISS = "Unable to find a signing key that matches"
++
++
+ def classify_jwks_lookup_error(exc: BaseException) -> Exception:
+     """Map a ``PyJWKClient.get_signing_key_from_jwt`` failure to the protocol. Only a genuine
+     transport failure (``PyJWKClientConnectionError``, or an unexpected JWKS shape) is a
+     :class:`ProviderError` (503, never forces logout). A non-JWT bearer (``DecodeError``), a JWKS
+-    with no key for this ``kid`` (``PyJWKSetError``) or any other invalid token is simply not
++    with no usable key or no key for this ``kid``, or any other invalid token is simply not
+     verifiable by this provider -> :class:`InvalidCodeError` (``verify_session`` returns ``None``).
+     Folding "cannot parse" into "cannot reach" once made every opaque bearer a fast 503.
+ 
+     * ``jwt.DecodeError`` — the bearer is not a JWT at all (an opaque peer key, a legacy session token,
+     garbage). #94558: hosted agents answered every non-JWT bearer with a fast 503 ``Auth provider 'nous'
+     unreachable`` even though Portal was healthy, because "cannot parse" and "cannot reach" were folded into
+-    one branch. * ``jwt.PyJWKSetError`` — the JWKS was fetched fine but holds no key for this token's
+-    ``kid`` (rotated/foreign key).
++    one branch. * ``jwt.PyJWKSetError`` — the JWKS was fetched fine but holds no usable keys. * A bare
++    ``PyJWKClientError`` "Unable to find a signing key that matches" — the JWKS was fetched (and
++    refetched) fine but has no key for this token's ``kid`` (rotated/foreign key). PyJWT raises it
++    without a subclass, so the message prefix is the only discriminator.
+     """
+     try:
+         import jwt
+@@ -80,7 +87,8 @@ def classify_jwks_lookup_error(exc: BaseException) -> Exception:
+     # parents.
+     if isinstance(exc, jwt.PyJWKClientConnectionError):
+         return ProviderError(f"JWKS lookup failed: {exc}")
+-    if isinstance(exc, (jwt.DecodeError, jwt.PyJWKSetError)):
++    if isinstance(exc, (jwt.DecodeError, jwt.PyJWKSetError)) or (
++            isinstance(exc, jwt.PyJWKClientError) and str(exc).startswith(_JWKS_KID_MISS)):
+         return InvalidCodeError(f"token not verifiable by this provider: {exc}")
+     if isinstance(exc, jwt.PyJWKClientError):
+         return ProviderError(f"JWKS lookup failed: {exc}")
+diff --git a/hermes_state_local_lineage.py b/hermes_state_local_lineage.py
+index 93fc303d216..d6c26730b27 100644
+--- a/hermes_state_local_lineage.py
++++ b/hermes_state_local_lineage.py
+@@ -135,6 +135,13 @@ def adoptable_compression(conn, receipt):
+     return (children, routed) if routed is not None else None
+ 
+ 
++def with_adopted_compression(receipt, children):
++    """*receipt* as ``adopt_untracked_compression`` commits it: *children* appended to its lineage
++    and its entry moved to the last one. Pure; the caller validates the copy."""
++    return dict(receipt, entry=dict(receipt['entry'], session_id=children[-1]),
++                lineage=[*receipt.get('lineage', [receipt['session_id']]), *children])
++
++
+ def adopt_untracked_compression(db, *, epoch, session_id, expected):
+     """Record, once, compression steps a receipt-unaware build published past the receipt's tip.
+ 
+@@ -157,8 +164,7 @@ def adopt_untracked_compression(db, *, epoch, session_id, expected):
+         if adoptable is None:
+             return
+         children, routed = adoptable
+-        receipt['entry'] = dict(receipt['entry'], session_id=children[-1])
+-        receipt['lineage'] = [*receipt.get('lineage', [session_id]), *children]
++        receipt = with_adopted_compression(receipt, children)
+         validate_local_lineage(conn, receipt)
+         _commit_local_target(conn, receipt, dict(routed, session_id=children[-1]))
+     db._execute_write(write)
+diff --git a/hermes_state_local_migration.py b/hermes_state_local_migration.py
+index 6e6e7c5b843..631eaf513d3 100644
+--- a/hermes_state_local_migration.py
++++ b/hermes_state_local_migration.py
+@@ -110,7 +110,7 @@ def bind_legacy_target(db, conn, receipt):
+     validate_legacy_row(db, dict(row), subject=receipt['principal_id'])
+     from hermes_state_mutation_binding import BINDING_PREFIX, binding_names
+     imported = conn.execute('SELECT value FROM state_meta WHERE key=?', (BINDING_PREFIX + target,)).fetchone()
+-    if imported and not binding_names(imported[0], receipt['profile_id'], receipt['principal_id']):
++    if imported and not binding_names(imported[0], receipt['principal_id']):
+         raise RuntimeStoreError('permission_denied')
+     from hermes_state_compression import _CHAIN_STEP_SQL
+     if conn.execute(_CHAIN_STEP_SQL, (target,)).fetchone() is not None:
+diff --git a/hermes_state_mutation_binding.py b/hermes_state_mutation_binding.py
+index 265c33fe16c..86bd07a4ad7 100644
+--- a/hermes_state_mutation_binding.py
++++ b/hermes_state_mutation_binding.py
+@@ -36,32 +36,34 @@ def _login_label(subject):
+     return None if label.startswith('auth:') else label
+ 
+ 
+-def binding_names(saved, profile_id, subject):
+-    """Whether a stored ``[profile_id, subject]`` binding names *subject* in *profile_id*: same profile,
+-    and the same owner (a binding a Webapp login stored belongs to the machine owner,
+-    gateway.owner_identity.same_owner). Every reader of a binding asks this, never a string compare."""
++def _binding_owner(saved):
++    """The owner half of a stored ``[profile_id, subject]`` binding, or None when unreadable.
++
++    The profile half is the home path that wrote the binding into this profile's own store, so it
++    never names another profile; a store that moved with its profile keeps its bindings."""
+     try:
+-        saved_profile, saved_subject = json.loads(saved)
++        profile, subject = json.loads(saved)
+     except (TypeError, ValueError):
+-        return False
+-    from gateway.owner_identity import same_owner
+-    return saved_profile == profile_id and same_owner(saved_subject, subject)
++        return None
++    return subject if isinstance(profile, str) else None
+ 
+ 
+-def _bound_to(saved, actor):
+-    return binding_names(saved, actor.profile_id, actor.subject)
++def binding_names(saved, subject):
++    """Whether a stored binding names *subject*: the same owner (a binding a Webapp login stored
++    belongs to the machine owner, gateway.owner_identity.same_owner). Every reader of a binding asks
++    this, never a string compare."""
++    from gateway.owner_identity import same_owner
++    owner = _binding_owner(saved)
++    return owner is not None and same_owner(owner, subject)
+ 
+ 
+-def _bindings_agree(first, second):
++def bindings_agree(first, second):
+     """Two stored bindings name the same owner (both absent agrees; one absent does not)."""
+     if first == second or first is None or second is None:
+         return first == second
+-    try:
+-        (first_profile, first_subject), (profile_id, subject) = json.loads(first), json.loads(second)
+-    except (TypeError, ValueError):
+-        return False
+     from gateway.owner_identity import owners_agree
+-    return first_profile == profile_id and owners_agree(first_subject, subject)
++    first_owner, second_owner = _binding_owner(first), _binding_owner(second)
++    return first_owner is not None and second_owner is not None and owners_agree(first_owner, second_owner)
+ 
+ 
+ def import_history_control(conn, actor, session_ids):
+@@ -83,7 +85,7 @@ def authorize_history(conn, actor, session_id, *, claim=False):
+     binding = json.dumps([actor.profile_id, actor.subject], separators=(',', ':'))
+     saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+     if saved is not None:
+-        if not _bound_to(saved[0], actor):
++        if not binding_names(saved[0], actor.subject):
+             raise RuntimeStoreError('permission_denied')
+         return True
+     if not _history_row(row):
+@@ -121,7 +123,7 @@ def same_history_owner(conn, anchor_id, session_id):
+     if row['session_key'] or row['chat_id'] or row['origin_json']:
+         return tuple(row)[1:4] == tuple(anchor)[1:4]
+     binding = history_binding(conn, session_id)
+-    if not _bindings_agree(binding, history_binding(conn, anchor_id)):
++    if not bindings_agree(binding, history_binding(conn, anchor_id)):
+         return False
+     routeless_peer = row['source'] == anchor['source'] and not any(tuple(anchor)[2:5])
+     from gateway.owner_identity import owners_agree
+diff --git a/hermes_state_mutations.py b/hermes_state_mutations.py
+index d4810eadd0b..090fb0ddebb 100644
+--- a/hermes_state_mutations.py
++++ b/hermes_state_mutations.py
+@@ -222,14 +222,14 @@ def _import(db, conn, session_id, payload):
+             parents.append((sid, raw['parent_session_id']))
+         imported.append(sid)
+     # A parent outside this payload is kept only when it is history this importer already
+-    # controls: its import binding equals the child's (written by import_history_control in this
++    # controls: its import binding names the child's owner (written by import_history_control in this
+     # transaction). Linking under any other row would graft the import onto a foreign chain,
+     # which a later chain-aware delete of the import would then remove.
+-    from hermes_state_mutation_binding import history_binding
++    from hermes_state_mutation_binding import bindings_agree, history_binding
+     # Rows imported now, not payload ids: a payload naming an existing foreign id skips that row.
+     fresh = set(imported)
+     foreign = [(sid, parent) for sid, parent in parents if parent not in fresh and (
+-        history_binding(conn, parent) is None or history_binding(conn, parent) != history_binding(conn, sid))]
++        history_binding(conn, parent) is None or not bindings_agree(history_binding(conn, parent), history_binding(conn, sid)))]
+     parents = [link for link in parents if link not in foreign]
+     detached = db._attach_import_parents(conn, parents) + len(foreign)
+     return set(imported), {'ok': True, 'imported': len(imported), 'skipped': len(skipped),
+diff --git a/hermes_state_repair.py b/hermes_state_repair.py
+index 94935458a77..e1ec033394b 100644
+--- a/hermes_state_repair.py
++++ b/hermes_state_repair.py
+@@ -831,7 +831,12 @@ def _retired_cjk_snapshot_health(db_path: Path, conn: sqlite3.Connection) -> Opt
+                     if _is_temporary_file_failure(exc):
+                         return HealthCheckUnavailable(f"the probe copy failed ({exc})")
+                     return str(exc)
+-            reason = _db_opens_cleanly(snapshot)
++            try:
++                reason = _db_opens_cleanly(snapshot)
++            except sqlite3.Error as exc:  # it opens its connection before its own handler
++                if _is_temporary_file_failure(exc):
++                    return HealthCheckUnavailable(f"the probe copy failed ({exc})")
++                raise
+     except OSError as exc:  # the temporary directory or the copy, not the store (includes the copy timeout)
+         return HealthCheckUnavailable(f"could not make the probe copy ({exc})")
+     if reason is not None and _is_temporary_file_failure(reason):
+diff --git a/plugins/dashboard_auth/_shared.py b/plugins/dashboard_auth/_shared.py
+index 116bc17ff4d..ded9cb05bc2 100644
+--- a/plugins/dashboard_auth/_shared.py
++++ b/plugins/dashboard_auth/_shared.py
+@@ -22,6 +22,8 @@ from hermes_cli.dashboard_auth import (
+     DashboardAuthProvider, InvalidCodeError, LoginStart, ProviderError, RefreshExpiredError, Session,
+     classify_jwks_lookup_error)
+ 
++_log = logging.getLogger(__name__)
++
+ # JWKS Cache-Control max-age (nous contract C7); self-hosted mirrors it.
+ JWKS_CACHE_SECONDS = 300
+ TOKEN_ENDPOINT_TIMEOUT_SEC = 10.0
+@@ -229,49 +231,38 @@ def verify_jwt(
+     ``leeway`` is seconds of clock-skew tolerance on the time claims (default
+     60 — the previous zero-leeway made any issuer-ahead skew fail login, #47815).
+ 
+-    Unreachable JWKS → ``ProviderError`` (503); a bearer that is not one of our JWTs
+-    (opaque peer key, foreign kid) → ``InvalidCodeError`` (None / next provider); folding
+-    both into 503 broke peer-key bearers. Expiry and not-yet-valid (``iat``/``nbf`` in
+-    the future beyond the leeway — a *token* failure, not a transport failure) raise
+-    ``InvalidCodeError`` (verify_session maps it to None); any other claim failure raises
+-    ``ProviderError`` with the unverified iss/aud appended so operators can spot config
+-    drift.
++    Only an unreachable (or malformed) JWKS is ``ProviderError`` (503). Every other failure (not a JWT,
++    unknown kid, expired, not yet valid, bad signature, wrong aud/iss, missing claim) is
++    ``InvalidCodeError``: the token is not ours (verify_session -> None -> 401 / next
++    provider). Folding "not ours" into 503 produced #94558 (opaque bearers) and #47815
++    (clock skew), and answered a Portal token minted for another client with "unreachable".
++    A wrong aud/iss is logged with the token's and the configured values, because it is also
++    what config drift (wrong client_id / portal URL) looks like.
+     """
+     import jwt  # lazy — keeps startup fast for the ungated path
+ 
+     try:
+         signing_key = jwks_client.get_signing_key_from_jwt(token)
+     except Exception as exc:
+-        # Unreachable JWKS -> ProviderError (503); a bearer that is not one of our JWTs (opaque peer key,
+-        # foreign kid) -> InvalidCodeError (None / next provider). Folding both into 503 produced #94558.
+         raise classify_jwks_lookup_error(exc) from exc
+     try:
+         return jwt.decode(
+             token, signing_key.key, algorithms=algorithms, audience=audience, issuer=issuer, leeway=leeway,
+             options={"require": ["exp", "iat", "aud", "iss", "sub"]})
+-    except jwt.ExpiredSignatureError as exc:
+-        raise InvalidCodeError(f"{label} expired: {exc}") from exc
+-    except jwt.InvalidSignatureError as exc:
+-        # A forged/tampered bearer is "not my token", never an IDP outage: a 503 here would let a
+-        # remote caller with garbage credentials look like a provider incident (and keep cookies).
+-        raise InvalidCodeError(f"{label} signature invalid: {exc}") from exc
+-    except jwt.ImmatureSignatureError as exc:
+-        # iat/nbf ahead of now beyond the leeway = clock skew or a bad token — the
+-        # provider is *reachable*, so this must NOT surface as ProviderError/503
+-        # (which discarded rotated refresh tokens and forced re-login, #47815).
+-        raise InvalidCodeError(f"{label} not yet valid: {exc}") from exc
++    except (jwt.InvalidAudienceError, jwt.InvalidIssuerError) as exc:
++        # Raised only after the signature verified, so only a real IdP-signed token gets here:
++        # a foreign client's token, or config drift (wrong client_id / portal URL). Log it, since
++        # the caller only sees a 401. The re-decode is for diagnostics only; values are capped.
++        unverified = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
++        message = (
++            f"{label} verification failed: {exc} [token iss={str(unverified.get('iss'))[:128]!r} "
++            f"aud={str(unverified.get('aud'))[:128]!r}; expected iss={issuer!r} aud={audience!r}]")
++        _log.warning("dashboard-auth: %s", message)
++        raise InvalidCodeError(message) from exc
+     except jwt.InvalidTokenError as exc:
+-        # Decoding without verification is safe here: verification already failed and
+-        # these values are surfaced for diagnostics only, never trusted.
+-        details = ""
+-        try:
+-            unverified = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+-            details = (
+-                f" [token iss={unverified.get('iss')!r} aud={unverified.get('aud')!r}; "
+-                f"expected iss={issuer!r} aud={audience!r}]")
+-        except Exception:
+-            pass
+-        raise ProviderError(f"{label} verification failed: {exc}{details}") from exc
++        # Expired, not yet valid, bad signature, wrong alg, malformed payload: not logged, since
++        # the last two need no valid signature and a caller would control the line.
++        raise InvalidCodeError(f"{label} verification failed: {exc}") from exc
+ 
+ 
+ # ---- Shared provider skeletons ----
+@@ -295,7 +286,8 @@ class JwtOAuthProvider(DashboardAuthProvider):
+     """Authorization-code + PKCE provider whose session token is a JWT we verify ourselves
+     (nous: Portal access token; self-hosted: OIDC ID token). Subclasses set ``_client_id`` and
+     implement: ``_jwks_uri() -> str``; ``_claims_for(token) -> claims`` (raises
+-    ``InvalidCodeError`` on expiry/foreign token, ``ProviderError`` otherwise);
++    ``InvalidCodeError`` for a token that is not ours, ``ProviderError`` for an outage or a
++    provider-wide contract failure);
+     ``_grant(data, *, bad_request_exc, headers=None, previous_refresh_token="") -> Session``;
+     ``_refresh_request(refresh_token) -> (form_data, extra_headers)``;
+     ``_session(token, refresh_token, claims) -> Session``."""
+@@ -319,8 +311,14 @@ class JwtOAuthProvider(DashboardAuthProvider):
+         if not refresh_token:
+             raise RefreshExpiredError("no refresh token present in session")
+         data, headers = self._refresh_request(refresh_token)
+-        return self._grant(
+-            data, headers=headers, bad_request_exc=RefreshExpiredError, previous_refresh_token=refresh_token)
++        try:
++            return self._grant(
++                data, headers=headers, bad_request_exc=RefreshExpiredError, previous_refresh_token=refresh_token)
++        except InvalidCodeError as exc:
++            # The grant succeeded but the token it minted does not verify here (foreign aud,
++            # unknown kid): this provider rejects the RT, so the refresh scan moves on instead
++            # of raising.
++            raise RefreshExpiredError(str(exc)) from exc
+ 
+     def verify_session(self, *, access_token: str) -> Optional[Session]:
+         # None on expiry/invalidity (middleware then tries refresh); a ProviderError
+diff --git a/plugins/dashboard_auth/nous/__init__.py b/plugins/dashboard_auth/nous/__init__.py
+index 10a02c0cf3c..cc43f28cdc1 100644
+--- a/plugins/dashboard_auth/nous/__init__.py
++++ b/plugins/dashboard_auth/nous/__init__.py
+@@ -16,7 +16,7 @@ from __future__ import annotations
+ import logging
+ from typing import Any, Callable, Optional
+ 
+-from hermes_cli.dashboard_auth import LoginStart, ProviderError, Session, listener_client
++from hermes_cli.dashboard_auth import InvalidCodeError, LoginStart, ProviderError, Session, listener_client
+ from plugins.dashboard_auth._shared import (
+     DEFAULT_TOKEN_LEEWAY_SECONDS,
+     JwtOAuthProvider,
+@@ -103,11 +103,14 @@ class NousDashboardAuthProvider(JwtOAuthProvider):
+             audience=self._client_id,  # contract C2: bare client_id
+             issuer=self._portal_url, label="access token", leeway=self._token_leeway)
+         # Contract C9: agent_instance_id is "should" not "must" — tolerated when absent
+-        # (the aud check already binds the token to this instance).
++        # (the aud check already binds the token to this instance). A token for another
++        # instance is not ours, like a foreign aud: a rejection, never a 503.
+         token_instance_id = claims.get("agent_instance_id")
+         if token_instance_id is not None and token_instance_id != self._agent_instance_id:
+-            raise ProviderError(
++            raise InvalidCodeError(
+                 f"agent_instance_id mismatch: token={token_instance_id!r} vs configured={self._agent_instance_id!r}")
++        # A contract version this agent does not support stays a 503: every token Portal
++        # mints would fail it, so treating it as "not ours" would only log everyone out.
+         contract_version = claims.get("oauth_contract_version")
+         if contract_version is None:
+             logger.warning(
+diff --git a/tests/agent/test_memory_previous_message_fork_scaffolding.py b/tests/agent/test_memory_previous_message_fork_scaffolding.py
+new file mode 100644
+index 00000000000..375b8f74425
+--- /dev/null
++++ b/tests/agent/test_memory_previous_message_fork_scaffolding.py
+@@ -0,0 +1,26 @@
++"""Fork stop nudges remain scaffolding after the shared predicate extraction."""
++
++import pytest
++
++from agent.conversation_compression import _is_real_user_message
++from agent.conversation_compression_scaffolding import is_user_role_scaffolding
++from agent.turn_context import _previous_user_message_text
++
++
++@pytest.mark.parametrize("flag", ["_pre_final_gate_synthetic", "_kanban_stop_synthetic"])
++@pytest.mark.parametrize("content", ["Finish the required check", [{"type": "text", "text": "Finish the required check"}]])
++def test_fork_stop_nudges_are_not_human_anchors_or_previous_asks(flag, content):
++    ask = {"role": "user", "content": "Ship the verified change"}
++    nudge = {"role": "user", "content": content, flag: True}
++    assert is_user_role_scaffolding(nudge)
++    assert not _is_real_user_message(nudge)
++    assert _previous_user_message_text([ask, nudge]) == ask["content"]
++    assert _previous_user_message_text([nudge]) == ""
++
++
++@pytest.mark.parametrize("flag", ["_pre_final_gate_synthetic", "_kanban_stop_synthetic"])
++def test_false_stop_flag_does_not_hide_a_real_user_ask(flag):
++    ask = {"role": "user", "content": "Finish the required check", flag: False}
++    assert not is_user_role_scaffolding(ask)
++    assert _is_real_user_message(ask)
++    assert _previous_user_message_text([ask]) == ask["content"]
+diff --git a/tests/agent/test_memory_sync_redaction.py b/tests/agent/test_memory_sync_redaction.py
+index 18d6aa7086b..4ad648f3462 100644
+--- a/tests/agent/test_memory_sync_redaction.py
++++ b/tests/agent/test_memory_sync_redaction.py
+@@ -33,7 +33,7 @@ class _Recorder(MemoryProvider):
+     def queue_prefetch(self, query, *, session_id=""): self.seen.append(query)
+     def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None, **kw): self.seen.append((user_content, assistant_content, messages))
+     def handle_tool_call(self, tool_name, args, **kw): self.seen.append(args); return "{}"
+-    def on_turn_start(self, turn_number, message, **kw): self.seen.append(message)
++    def on_turn_start(self, turn_number, message, **kw): self.seen.append((message, kw))
+     def on_session_end(self, messages): self.seen.append(messages)
+     def on_pre_compress(self, messages, **kw): self.seen.append(messages); return ""
+     def on_delegation(self, task, result, **kw): self.seen.append((task, result))
+@@ -53,7 +53,7 @@ FANOUTS = {
+     "prefetch_all": lambda m, t: m.prefetch_all(f"recall {_LEAK}"),
+     "queue_prefetch_all": lambda m, t: m.queue_prefetch_all(f"recall {_LEAK}"),
+     "handle_tool_call": lambda m, t: m.handle_tool_call("rec_tool", {"q": _LEAK, "nested": [_LEAK]}),
+-    "on_turn_start": lambda m, t: m.on_turn_start(1, _LEAK),
++    "on_turn_start": lambda m, t: m.on_turn_start(2, _LEAK, previous_message=_LEAK, author_name="Ada"),
+     "on_session_end": lambda m, t: m.on_session_end(t),
+     "on_pre_compress": lambda m, t: m.on_pre_compress(t, evidence_messages=t),
+     "on_delegation": lambda m, t: m.on_delegation(f"task {_LEAK}", f"result {_LEAK}"),
+@@ -102,3 +102,13 @@ def test_key_detected_in_a_json_tool_result_is_also_masked_where_the_model_repea
+     user, _assistant, messages = provider.seen[0]
+     assert key not in repr(provider.seen)
+     assert user == "show my ov.conf" and json.loads(json.loads(messages[0]["content"])["output"])["model"] == "gemini"
++
++
++def test_on_turn_start_scrubs_user_text_but_hands_identity_through_raw():
++    # A phone-number author id (SMS, Signal) matches the phone pattern; masking it would merge two senders.
++    phone = "+1" + "555" + "0123456"
++    mgr, provider = _manager()
++    mgr.on_turn_start(2, "next ask", previous_message=_LEAK, author_id=phone, author_name=phone, model="test/model")
++    message, kwargs = provider.seen[0]
++    assert message == "next ask" and _SECRET not in kwargs["previous_message"]
++    assert kwargs["author_id"] == phone and kwargs["author_name"] == phone and kwargs["model"] == "test/model"
+diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
+index dd2c94c1547..1dfded09b4c 100644
+--- a/tests/agent/test_turn_context.py
++++ b/tests/agent/test_turn_context.py
+@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ 
++from agent.prompt_builder import steer_user_row
+ from agent.turn_context import (
+     PreflightCompressionTimedOut,
+     TurnContext,
+@@ -278,6 +279,77 @@ def test_turn_author_is_normalized_then_reaches_on_turn_start_and_the_agent_stas
+     assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
+ 
+ 
++_PREVIOUS = "Add the ShapeIndex encoder."
++_PRIOR_TURN = [{"role": "user", "content": _PREVIOUS}, {"role": "assistant", "content": "Done."}]
++
++
++def _carrier(ask: str = "Round-trip the ShapeIndex.") -> str:
++    """A compaction summary flipped into the user role, with the live ask merged after its end marker."""
++    from agent.context_compressor import HISTORICAL_TASK_HEADING, SUMMARY_PREFIX, _SUMMARY_END_MARKER
++
++    return f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n{_SUMMARY_END_MARKER}" + (f"\n\n{ask}" if ask else "")
++
++
++def _compaction_returning_history(history_for):
++    """A turn-start compaction that hands back what ``conversation_history_after_compression`` does."""
++    from agent.turn_context_compaction import CompactionOutcome
++
++    def run(agent, *, messages, active_system_prompt, current_turn_user_idx, **_):
++        return CompactionOutcome(
++            messages=messages, active_system_prompt=active_system_prompt,
++            conversation_history=history_for(messages), current_turn_user_idx=current_turn_user_idx,
++        )
++    return run
++
++
++@pytest.mark.parametrize(
++    "history, compaction, expected",
++    [
++        (_PRIOR_TURN, None, _PREVIOUS),
++        # In place, the flush baseline already ends in this turn's own message.
++        (_PRIOR_TURN, _compaction_returning_history(list), _PREVIOUS),
++        # Rotation hands back no baseline at all.
++        (_PRIOR_TURN, _compaction_returning_history(lambda _messages: None), _PREVIOUS),
++        (None, None, ""),
++        ([{"role": "user", "content": [{"type": "text", "text": _PREVIOUS},
++                                       {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
++          {"role": "assistant", "content": "Done."}], None, _PREVIOUS),
++        (_PRIOR_TURN + [{"role": "user", "content": "[System: Your previous response was truncated. Continue."}],
++         None, _PREVIOUS),
++        (_PRIOR_TURN + [{"role": "user", "content": "1. [ ] encode", "_todo_snapshot_synthetic": True}],
++         None, _PREVIOUS),
++        (_PRIOR_TURN + [{"role": "user", "content": _carrier()}, {"role": "assistant", "content": "Done."}],
++         None, "Round-trip the ShapeIndex."),
++        (_PRIOR_TURN + [{"role": "user", "content": _carrier(ask="")}], None, _PREVIOUS),
++        (_PRIOR_TURN + [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
++                        {"role": "assistant", "content": "Done."}], None, ""),
++        # Gateway replay renders a timestamp prefix and drops the steer row's display_kind.
++        ([{"role": "user", "content": f"[Thu 2026-11-05 10:00:00 IST] {_PREVIOUS}"}, {"role": "assistant", "content": "Done."}],
++         None, _PREVIOUS),
++        (_PRIOR_TURN + [{"role": "user", "content": steer_user_row("use zstd")["content"]}, {"role": "assistant", "content": "Ok."}],
++         None, _PREVIOUS),
++        (_PRIOR_TURN + [{"role": "user", "content": "[Thu 2026-11-05 10:01:00 IST] " + steer_user_row("use zstd")["content"]},
++                        {"role": "assistant", "content": "Ok."}], None, _PREVIOUS),
++        (_PRIOR_TURN + [{"role": "user", "content": [{"type": "text", "text": "\n\n" + steer_user_row("use zstd")["content"]}]},
++                        {"role": "assistant", "content": "Ok."}], None, _PREVIOUS),
++    ],
++    ids=["no-compaction", "in-place-compaction", "rotation", "first-turn", "multimodal", "skips-scaffolding",
++         "skips-flagged-scaffolding", "compaction-carrier-ask", "skips-bare-summary", "image-only-stops-search",
++         "strips-gateway-timestamp", "skips-replayed-steer", "skips-timestamped-steer", "skips-steer-text-part"],
++)
++def test_providers_get_what_the_person_last_asked(history, compaction, expected, monkeypatch):
++    """A resumed process must tell providers what the last turn asked: a live process may have keyed
++    end-of-turn recall on it, and a provider may save no transcript of its own. Turn-start compaction
++    rebinds the history after this turn's message is appended, so the value has to be read before it."""
++    if compaction is not None:
++        monkeypatch.setattr("agent.turn_context_compaction.run_turn_start_compaction", compaction)
++    agent, mm = _agent_with_memory_manager()
++
++    _build(agent, user_message="Now decode it back.", conversation_history=history)
++
++    assert mm.on_turn_start.call_args.kwargs["previous_message"] == expected
++
++
+ def test_turn_without_author_clears_previous_bot_author():
+     agent, mm = _agent_with_memory_manager()
+     _build(agent, user_message="first turn", turn_author={"id": "bot:alpha", "name": "Alpha", "is_bot": True})
+diff --git a/tests/gateway/fixtures/local_lineage_daemon.py b/tests/gateway/fixtures/local_lineage_daemon.py
+index aea436485fe..a58d590ddba 100644
+--- a/tests/gateway/fixtures/local_lineage_daemon.py
++++ b/tests/gateway/fixtures/local_lineage_daemon.py
+@@ -15,7 +15,7 @@ schedule = SessionAuthority._schedule
+ def boundary(self, ref):
+     pending = list_session_admissions(self.db, session_id=ref.session_id)
+     text = pending[-1]['payload'].get('text') if pending else None
+-    if text in {'RECOVER_RESET', 'FOREIGN_QUEUE'}:
++    if text in {'RECOVER_RESET', 'TAMPERED_QUEUE'}:
+         return
+     if text == 'RECOVER_SAFE':
+         for logical_id, live in self.sessions.items():
+diff --git a/tests/gateway/fixtures/local_lineage_probe.py b/tests/gateway/fixtures/local_lineage_probe.py
+index 716f7853228..a6c0d11559c 100644
+--- a/tests/gateway/fixtures/local_lineage_probe.py
++++ b/tests/gateway/fixtures/local_lineage_probe.py
+@@ -39,7 +39,7 @@ def probe(tmp_path):
+                                what=f'{request_id} to settle')
+     async def first(desc, proc):
+         async with websocket(home, desc) as ws:
+-            for name in ('safe', 'reset', 'unknown', 'foreign'):
++            for name in ('safe', 'reset', 'unknown', 'tampered'):
+                 cwd = home / name
+                 cwd.mkdir()
+                 params[name] = dict(request_id=name, source='gui', cwd=str(cwd), model='frozen-' + name, toolsets=[])
+@@ -53,7 +53,7 @@ def probe(tmp_path):
+             assert await asyncio.to_thread(peer.blocked.wait, 20)
+             await rpc(ws, 'prompt.submit', session_id=sessions['unknown'], input_id='follower', text='NEVER_REPLAY')
+             await rpc(ws, 'prompt.submit', session_id=sessions['reset'], input_id='reset', text='RECOVER_RESET')
+-            await rpc(ws, 'prompt.submit', session_id=sessions['foreign'], input_id='foreign', text='FOREIGN_QUEUE')
++            await rpc(ws, 'prompt.submit', session_id=sessions['tampered'], input_id='tampered', text='TAMPERED_QUEUE')
+             await ws.send(json.dumps({'id': 'crash', 'method': 'prompt.submit', 'params': {
+                 'session_id': sessions['safe'], 'input_id': 'safe', 'text': 'RECOVER_SAFE'}}))
+             # Wait for the actual publication, not just admission before the fixture ran.
+@@ -91,7 +91,8 @@ def probe(tmp_path):
+                 assert retry['result']['status'] == 'terminal', retry
+             unknown = await rpc(ws, 'session.resume', session_id=sessions['unknown'])
+             assert [p['status'] for p in unknown['result']['pending']] == ['unknown', 'queued'], unknown
+-            for name, reason in [('foreign', 'profile_mismatch'), ('fork', 'storage_unavailable')]:
++            # A rewritten profile_id no longer hashes to the session id: refused as corrupt.
++            for name, reason in [('tampered', 'storage_unavailable'), ('fork', 'storage_unavailable')]:
+                 refusal = await rpc(ws, 'session.resume', session_id=sessions[name])
+                 assert refusal['error']['message'] == reason, refusal
+     try:
+@@ -104,7 +105,7 @@ def probe(tmp_path):
+                 receipt = json.loads(db.execute('SELECT value FROM state_meta WHERE key=?',
+                                     ('gateway.local_policy.v1:' + sid,)).fetchone()[0])
+                 targets[name] = receipt['entry']['session_id']
+-                if name != 'foreign':
++                if name != 'tampered':
+                     route = json.loads(db.execute("SELECT entry_json FROM gateway_routing WHERE scope='' AND session_key=?",
+                                                   (receipt['route'],)).fetchone()[0])
+                     route_targets[name] = route['session_id']
+@@ -137,7 +138,7 @@ def probe(tmp_path):
+                 pids.append(proc.pid); epochs.append(desc['authority_epoch'])
+                 asyncio.run(recovered(desc))
+                 assert db_rows() == {'warm-safe': 'terminal', 'warm-reset': 'terminal', 'started': 'unknown',
+-                                     'follower': 'queued', 'reset': 'terminal', 'foreign': 'queued', 'fork': 'queued', 'safe': 'terminal'}
++                                     'follower': 'queued', 'reset': 'terminal', 'tampered': 'queued', 'fork': 'queued', 'safe': 'terminal'}
+         assert all(route_targets[name] == targets[name] for name in ('safe', 'reset', 'unknown')), route_targets
+         assert all(targets[name] != sessions[name] for name in ('safe', 'reset', 'unknown')), targets
+         raw_texts = [next((m.get('content') for m in reversed(r['messages']) if m['role'] == 'user'), '') for r in peer.requests]
+@@ -150,7 +151,7 @@ def probe(tmp_path):
+             assert params[name]['cwd'] in json.dumps(request['messages']), request['messages']
+         return {'pids': pids, 'epochs': epochs, 'logical_ids': sessions, 'physical_targets': targets,
+                 'inference_texts': texts, 'raw_inference_texts': raw_texts, 'stable_receipts': True, 'policy_cwd_history_retained': True,
+-                'unknown_not_replayed': True, 'foreign_and_fork_refused': True}
++                'unknown_not_replayed': True, 'tampered_and_fork_refused': True}
+     finally:
+         peer.release.set()
+         peer.shutdown()
+diff --git a/tests/gateway/fixtures/local_recovery_daemon.py b/tests/gateway/fixtures/local_recovery_daemon.py
+index f96fd9f64a6..ab76b141c53 100644
+--- a/tests/gateway/fixtures/local_recovery_daemon.py
++++ b/tests/gateway/fixtures/local_recovery_daemon.py
+@@ -12,7 +12,7 @@ schedule = SessionAuthority._schedule
+ def crash_barrier(self, ref):
+     pending = list_session_admissions(self.db, session_id=ref.session_id)
+     text = pending[-1]['payload'].get('text') if pending else None
+-    if text in {'FOREIGN_QUEUE', 'MISSING_QUEUE', 'CORRUPT_QUEUE'}:
++    if text in {'TAMPERED_QUEUE', 'MISSING_QUEUE', 'CORRUPT_QUEUE'}:
+         return
+     if text == 'RECOVER_QUEUED':
+         os.kill(os.getpid(), signal.SIGSTOP)
+diff --git a/tests/gateway/fixtures/local_recovery_probe.py b/tests/gateway/fixtures/local_recovery_probe.py
+index 731628760e2..a9abb95e710 100644
+--- a/tests/gateway/fixtures/local_recovery_probe.py
++++ b/tests/gateway/fixtures/local_recovery_probe.py
+@@ -152,7 +152,7 @@ def probe(tmp_path):
+             return dict(db.execute('SELECT request_id,status FROM session_admissions'))
+     async def first(desc, proc):
+         async with websocket(home, desc) as ws:
+-            for name in ('safe', 'unknown', 'foreign', 'missing', 'corrupt'):
++            for name in ('safe', 'unknown', 'tampered', 'missing', 'corrupt'):
+                 params[name] = dict(request_id=name, source='gui' if name == 'safe' else 'tui', cwd=str(home), model='frozen-' + name, toolsets=[])
+                 result = await rpc(ws, 'session.create', **params[name])
+                 assert 'result' in result, result
+@@ -163,13 +163,13 @@ def probe(tmp_path):
+             await rpc(ws, 'prompt.submit', session_id=sessions['unknown'], input_id='started', text='BLOCK_STARTED')
+             assert await asyncio.to_thread(peer.blocked.wait, 20)
+             await rpc(ws, 'prompt.submit', session_id=sessions['unknown'], input_id='follower', text='NEVER_REPLAY')
+-            for name in ('foreign', 'missing', 'corrupt'):
++            for name in ('tampered', 'missing', 'corrupt'):
+                 await rpc(ws, 'prompt.submit', session_id=sessions[name], input_id=name, text=name.upper() + '_QUEUE')
+             # The daemon stops itself immediately after this admission commits.
+             await ws.send(json.dumps({'id': 'kill-boundary', 'method': 'prompt.submit', 'params': {
+                 'session_id': sessions['safe'], 'input_id': 'safe', 'text': 'RECOVER_QUEUED'}}))
+             await async_wait_until(lambda: rows().get('safe') == 'queued', timeout=20, what='safe admission queued')
+-            assert rows()['foreign'] == 'queued', rows()
++            assert rows()['tampered'] == 'queued', rows()
+             proc.kill()
+             await asyncio.to_thread(proc.wait, 10)
+     async def second(desc):
+@@ -185,7 +185,8 @@ def probe(tmp_path):
+             assert same['result']['info']['source'] == 'gui' and same['result']['info']['model'] == 'frozen-safe'
+             conflict = await rpc(ws, 'session.create', **{**params['safe'], 'model': 'changed'})
+             assert conflict['error']['message'] == 'invalid_params', conflict
+-            for name, reason in [('foreign', 'profile_mismatch'), ('missing', 'storage_unavailable'), ('corrupt', 'storage_unavailable')]:
++            # A rewritten profile_id no longer hashes to the session id: refused as corrupt.
++            for name, reason in [('tampered', 'storage_unavailable'), ('missing', 'storage_unavailable'), ('corrupt', 'storage_unavailable')]:
+                 rejected = await rpc(ws, 'session.resume', session_id=sessions[name])
+                 assert rejected['error']['message'] == reason, rejected
+             unknown = await rpc(ws, 'session.resume', session_id=sessions['unknown'])
+@@ -198,9 +199,9 @@ def probe(tmp_path):
+         # Negative fixtures corrupt only owned durable policy after the actual crash.
+         with sqlite3.connect(home / 'state.db') as db:
+             prefix = 'gateway.local_policy.v1:'
+-            row = json.loads(db.execute('SELECT value FROM state_meta WHERE key=?', (prefix + sessions['foreign'],)).fetchone()[0])
++            row = json.loads(db.execute('SELECT value FROM state_meta WHERE key=?', (prefix + sessions['tampered'],)).fetchone()[0])
+             row['profile_id'] = str(user)
+-            db.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(row), prefix + sessions['foreign']))
++            db.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(row), prefix + sessions['tampered']))
+             db.execute('DELETE FROM state_meta WHERE key=?', (prefix + sessions['missing'],))
+             db.execute('UPDATE state_meta SET value=? WHERE key=?', ('{}', prefix + sessions['corrupt']))
+         cfg['model']['default'] = 'changed-default'
+@@ -209,18 +210,18 @@ def probe(tmp_path):
+         with daemon(root, home, env, barrier=False) as (proc, desc):
+             pids.append(proc.pid); epochs.append(desc['authority_epoch'])
+             asyncio.run(second(desc))
+-            assert rows() == {'warm': 'terminal', 'started': 'unknown', 'follower': 'queued', 'foreign': 'queued', 'missing': 'queued', 'corrupt': 'queued', 'safe': 'terminal'}, rows()
++            assert rows() == {'warm': 'terminal', 'started': 'unknown', 'follower': 'queued', 'tampered': 'queued', 'missing': 'queued', 'corrupt': 'queued', 'safe': 'terminal'}, rows()
+         with daemon(root, home, env, barrier=False) as (proc, desc):
+             pids.append(proc.pid); epochs.append(desc['authority_epoch'])
+             asyncio.run(second(desc))
+         texts = [next((m.get('content') for m in reversed(r['messages']) if m['role'] == 'user'), '') for r in peer.requests]
+         assert texts.count('BLOCK_STARTED') == 1 and texts.count('RECOVER_QUEUED') == 1, texts
+-        assert not any(t in texts for t in ('NEVER_REPLAY', 'FOREIGN_QUEUE', 'MISSING_QUEUE', 'CORRUPT_QUEUE')), texts
++        assert not any(t in texts for t in ('NEVER_REPLAY', 'TAMPERED_QUEUE', 'MISSING_QUEUE', 'CORRUPT_QUEUE')), texts
+         recovered = next(r for r in peer.requests if any(m.get('content') == 'RECOVER_QUEUED' for m in r['messages']))
+         assert recovered['model'] == 'frozen-safe' and not recovered.get('tools'), recovered
+         assert epochs[1] > epochs[0] and pids[0] != pids[1]
+         return {'pids': pids, 'epochs': epochs, 'sessions': sessions, 'inference_texts': texts,
+-                'queued_recovered': True, 'unknown_paused': True, 'foreign_missing_corrupt_refused': True,
++                'queued_recovered': True, 'unknown_paused': True, 'tampered_missing_corrupt_refused': True,
+                 'history_retained': True, 'frozen_model_toolsets': True}
+     finally:
+         peer.release.set()
+diff --git a/tests/gateway/test_api_moved_store_restore.py b/tests/gateway/test_api_moved_store_restore.py
+new file mode 100644
+index 00000000000..e4c9f5dec7b
+--- /dev/null
++++ b/tests/gateway/test_api_moved_store_restore.py
+@@ -0,0 +1,51 @@
++"""An API session receipt minted under an older home of its store restores, under its own profile only.
++
++A ``state.db`` that moved with its profile (another machine, a moved home) keeps API receipts whose
++``profile_id`` names the old path. Restoring one is that store's own row, but the receipt's stored
++origin still places the turn's runtime scope, so one naming another profile is refused.
++"""
++import json
++
++import pytest
++
++from hermes_state_local import API_BINDING_PREFIX
++from hermes_state_runtime import RuntimeStoreError
++from tests.gateway.test_session_authorities_multiplex import _reserve_homes, _runner
++
++
++def _rehome(authority, session_id, **origin):
++    key = API_BINDING_PREFIX + session_id
++    receipt = json.loads(authority.db.get_meta(key))
++    receipt['profile_id'] = '/departed/host/profiles/alpha'
++    receipt['entry']['origin'].update(origin)
++    authority.db.set_meta(key, json.dumps(receipt))
++
++
++@pytest.mark.asyncio
++async def test_moved_api_receipt_restores_only_under_its_own_profile(tmp_path, monkeypatch):
++    from gateway.run_runtime import initialize_gateway_runtime
++    from gateway.runtime_ownership import process_ownership
++    from gateway.session_api import bind_api_session, restore_api_session
++    root, homes = _reserve_homes(tmp_path, monkeypatch)
++    process_ownership.reserve([home for _, home in homes])
++    runner = None
++    try:
++        runner = _runner(root, homes)
++        await initialize_gateway_runtime(runner)
++        alpha = runner.session_authorities.for_home(homes[1][1])
++        for sid in ('api-moved', 'api-sibling'):
++            alpha.db.create_session(sid, source='api_server')
++            bind_api_session(alpha, sid)
++        _rehome(alpha, 'api-moved')
++        _rehome(alpha, 'api-sibling', profile='beta')
++        alpha.sessions.clear()
++
++        restored = restore_api_session(alpha, 'api-moved')
++        assert alpha.sessions[restored.session_id].source.profile == 'alpha'
++        with pytest.raises(RuntimeStoreError, match='profile_mismatch'):
++            restore_api_session(alpha, 'api-sibling')
++    finally:
++        for authority in list(getattr(runner, 'session_authorities', None) or []):
++            authority.db.close()
++        for _, home in homes:
++            process_ownership.release(home)
+diff --git a/tests/gateway/test_moved_profile_store_receipts.py b/tests/gateway/test_moved_profile_store_receipts.py
+new file mode 100644
+index 00000000000..d6df9ee0287
+--- /dev/null
++++ b/tests/gateway/test_moved_profile_store_receipts.py
+@@ -0,0 +1,147 @@
++"""A profile store that moved with its home keeps its local sessions.
++
++A profile id is the owning home's absolute path and it is stamped into every local creation receipt
++and history binding. A ``state.db`` copied to another machine (a Hermes Cloud migration) or a moved
++home then held rows naming the old path, and ``owned_receipt`` refused each one with
++``profile_mismatch``: the Bot Chat refused every ``hermes peer dm`` / ``peer run`` and none of those
++chats resumed.
++"""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_contract import SessionActor, SessionRef
++from hermes_state_local import POLICY_PREFIX
++from hermes_state_runtime import RuntimeStoreError
++
++_CAPS = frozenset({'session:create', 'session:read', 'session:submit'})
++
++
++@pytest.fixture
++def authority_for(tmp_path, monkeypatch):
++    from gateway import run
++    from gateway.config import GatewayConfig
++    from gateway.session import SessionStore
++    from gateway.session_authority import initialize_session_authority
++    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
++
++    async def build(profile_id, instance_id):
++        store = SessionStore(tmp_path / 'sessions', GatewayConfig())
++        runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
++        return await initialize_session_authority(runner, profile_id=profile_id, instance_id=instance_id)
++    return build
++
++
++def _create(authority, request_id):
++    from gateway.session_local import create_local_session
++    actor = SessionActor('owner', authority.profile_id, _CAPS, 'socket')
++    params = {'request_id': request_id, 'source': 'gui', 'cwd': '/', 'model': 'frozen', 'toolsets': []}
++    return create_local_session(authority, actor, params)
++
++
++@pytest.mark.asyncio
++async def test_local_session_survives_its_home_moving(tmp_path, authority_for):
++    old_home, new_home = str(tmp_path / 'mac' / 'work'), str(tmp_path / 'cloud' / 'work')
++    ref = _create(await authority_for(old_home, 'mac'), 'bot-chat')
++
++    # The same store, now served from another path: the cold boot restores the session.
++    moved = await authority_for(new_home, 'cloud')
++    assert ref.session_id in moved.sessions
++    moved.authorize(SessionActor('owner', new_home, _CAPS, 'peer'), SessionRef(new_home, ref.session_id), 'session:submit')
++
++
++@pytest.mark.asyncio
++async def test_rehomed_receipt_never_restores_under_another_profiles_route(tmp_path, authority_for):
++    """The store owns its rows whatever path stamped them; the route namespace still binds the profile:
++    a receipt whose route names another profile's namespace is refused, as before the move."""
++    from gateway.session_local_recovery import owned_receipt
++    authority = await authority_for(str(tmp_path / 'home'), 'i')
++    ref = _create(authority, 'mine')
++    key = POLICY_PREFIX + ref.session_id
++    receipt = json.loads(authority.db.get_meta(key))
++    authority.db.set_meta(key, json.dumps(dict(receipt, route='agent:sibling:local:dm:' + ref.session_id)))
++    with pytest.raises(ValueError, match='route mismatch'):
++        owned_receipt(authority, ref.session_id)
++
++
++
++@pytest.mark.asyncio
++async def test_picker_offers_an_ended_chat_only_when_resume_would_take_it(tmp_path, authority_for):
++    """The cold picker judges an ended chat by the checks a resume runs: a moved store's chat is
++    offered, one whose route names another profile's namespace is not (resume refuses it)."""
++    from gateway.session_listing import _stored_closed
++    old_home, new_home = str(tmp_path / 'mac' / 'work'), str(tmp_path / 'cloud' / 'work')
++    first = await authority_for(old_home, 'mac')
++    kept, foreign = _create(first, 'kept'), _create(first, 'foreign')
++    for ref in (kept, foreign):
++        receipt = json.loads(first.db.get_meta(POLICY_PREFIX + ref.session_id))
++        first.db.end_session(receipt['entry']['session_id'], 'closed')
++    receipt = json.loads(first.db.get_meta(POLICY_PREFIX + foreign.session_id))
++    first.db.set_meta(POLICY_PREFIX + foreign.session_id,
++                      json.dumps(dict(receipt, route='agent:sibling:local:dm:' + foreign.session_id)))
++
++    moved = await authority_for(new_home, 'cloud')
++    actor = SessionActor('owner', new_home, _CAPS, 'peer')
++    assert _stored_closed(moved, actor, kept.session_id)
++    assert not _stored_closed(moved, actor, foreign.session_id)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('damage', [
++    lambda receipt: receipt['policy'].update(model=''),
++    lambda receipt: receipt.update(lineage=['not-the-root', receipt['entry']['session_id']]),
++    # A policy may decode on this build while its prior quarantine still forbids restore.
++    lambda receipt: receipt.update(quarantine={'reason': 'invalid_policy'}),
++], ids=['policy', 'lineage', 'quarantine'])
++async def test_picker_leaves_out_a_chat_whose_policy_or_lineage_resume_refuses(tmp_path, authority_for, damage):
++    from gateway.session_listing import _stored_closed
++    from gateway.session_local_recovery import restore_local_session
++    authority = await authority_for(str(tmp_path / 'home'), 'i')
++    ref = _create(authority, 'ended')
++    key = POLICY_PREFIX + ref.session_id
++    receipt = json.loads(authority.db.get_meta(key))
++    authority.db.end_session(receipt['entry']['session_id'], 'closed')
++    actor = SessionActor('owner', authority.profile_id, _CAPS, 'peer')
++    assert _stored_closed(authority, actor, ref.session_id)
++    damage(receipt)
++    authority.db.set_meta(key, json.dumps(receipt))
++    authority.sessions.pop(ref.session_id, None)
++    with pytest.raises(RuntimeStoreError):
++        restore_local_session(authority, ref.session_id)
++    assert not _stored_closed(authority, actor, ref.session_id)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('corrupt', [False, True], ids=['valid', 'corrupt-lineage'])
++async def test_picker_judges_a_pending_compression_catch_up_as_restore_would(tmp_path, authority_for, corrupt):
++    """An older writer compacted the chat past its receipt: restore adopts the step, then checks the
++    lineage. The picker judges that same projected receipt, without writing it."""
++    import time
++    from gateway.session_listing import _stored_closed
++    from gateway.session_local_recovery import restorable_receipt
++    authority = await authority_for(str(tmp_path / 'home'), 'i')
++    ref = _create(authority, 'compacted')
++    key = POLICY_PREFIX + ref.session_id
++    receipt = json.loads(authority.db.get_meta(key))
++    tip = receipt['entry']['session_id']
++
++    def compact(conn):
++        parent = conn.execute('SELECT * FROM sessions WHERE id=?', (tip,)).fetchone()
++        conn.execute("UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?", (time.time(), tip))
++        conn.execute("""INSERT INTO sessions(id,source,model,parent_session_id,cwd,profile_name,user_id,session_key,
++            chat_id,chat_type,origin_json,started_at,ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++            ('child', 'gui', parent['model'], tip, parent['cwd'], parent['profile_name'], parent['user_id'],
++             parent['session_key'], parent['chat_id'], parent['chat_type'], parent['origin_json'], time.time(), time.time()))
++    authority.db._execute_write(compact)
++    if corrupt:
++        authority.db.set_meta(key, json.dumps(dict(receipt, lineage=['not-the-root', tip])))
++    authority.sessions.pop(ref.session_id, None)
++    actor = SessionActor('owner', authority.profile_id, _CAPS, 'peer')
++
++    if corrupt:
++        assert not _stored_closed(authority, actor, ref.session_id)
++    else:
++        assert restorable_receipt(authority, ref.session_id)[1].session_id == 'child'
++        assert _stored_closed(authority, actor, ref.session_id)
++    assert json.loads(authority.db.get_meta(key))['entry']['session_id'] == tip, 'the listing wrote the catch-up'
+diff --git a/tests/hermes_state/test_fts_cjk_retirement_concurrency.py b/tests/hermes_state/test_fts_cjk_retirement_concurrency.py
+index 063c8a28010..e062dad4ba9 100644
+--- a/tests/hermes_state/test_fts_cjk_retirement_concurrency.py
++++ b/tests/hermes_state/test_fts_cjk_retirement_concurrency.py
+@@ -241,7 +241,9 @@ def test_a_copy_that_turns_read_only_is_not_reported_as_damage(cjk_db, monkeypat
+ 
+ def test_retirement_succeeds_beside_an_index_whose_tokenizer_is_missing(cjk_db):
+     """Renaming the retired shadows must not re-parse another index's triggers: a build without trigram would fail
+-    there before the open's own tokenizer-unavailable handling runs (seen on SQLite 3.45)."""
++    there before the open's own tokenizer-unavailable handling runs. Discriminates only on SQLite whose modern rename
++    re-parses triggers (3.33.0 and 3.45.1 fail without the fix); 3.53.1 passes either way, so a green run there is
++    not coverage of the fix."""
+     import contextlib
+ 
+     with contextlib.closing(sqlite3.connect(cjk_db, isolation_level=None)) as raw:
+@@ -260,8 +262,9 @@ def test_retirement_succeeds_beside_an_index_whose_tokenizer_is_missing(cjk_db):
+ 
+ @pytest.mark.platforms("posix")
+ @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root writes read-only files")
+-def test_a_copy_failing_its_final_scan_is_not_reported_as_damage(cjk_db, monkeypatch):
+-    """Copy and retirement succeed; the copy then turns read-only, so only the snapshot's own scan fails."""
++@pytest.mark.parametrize("mode", [0o400, 0o000], ids=["read-only", "unopenable"])
++def test_a_copy_failing_its_final_scan_is_not_reported_as_damage(cjk_db, monkeypatch, mode):
++    """Copy and retirement succeed; the copy then turns read-only or unopenable, so only its own scan fails."""
+     import hermes_state_fts
+ 
+     retire = hermes_state_fts.drop_retired_cjk_index
+@@ -272,7 +275,7 @@ def test_a_copy_failing_its_final_scan_is_not_reported_as_damage(cjk_db, monkeyp
+         path = Path(cursor.connection.execute("PRAGMA database_list").fetchone()[2])
+         if path != Path(cjk_db):
+             for item in path.parent.iterdir():
+-                item.chmod(0o400)
++                item.chmod(mode)
+             path.parent.chmod(0o500)
+             frozen.append(path.parent)
+         return removed
+@@ -288,3 +291,21 @@ def test_a_copy_failing_its_final_scan_is_not_reported_as_damage(cjk_db, monkeyp
+                     item.chmod(0o600)
+     assert frozen
+     assert isinstance(reason, repair.HealthCheckUnavailable), reason
++
++
++
++def test_corruption_found_by_the_final_scan_stays_damage(cjk_db, monkeypatch):
++    """A SQLITE_CORRUPT raised by the copy's own scan is the store's damage, not a temporary-file failure."""
++    probe = repair._db_opens_cleanly
++
++    def corrupt_scan(path):
++        if path == cjk_db:
++            return probe(path)
++        error = sqlite3.DatabaseError("database disk image is malformed")
++        error.sqlite_errorcode = 11  # SQLITE_CORRUPT
++        raise error
++
++    monkeypatch.setattr(repair, "_db_opens_cleanly", corrupt_scan)
++    reason = probe(cjk_db)
++    assert reason == "database disk image is malformed"
++    assert not isinstance(reason, repair.HealthCheckUnavailable)
+diff --git a/tests/hermes_state/test_history_binding_moved_store.py b/tests/hermes_state/test_history_binding_moved_store.py
+new file mode 100644
+index 00000000000..721915aa468
+--- /dev/null
++++ b/tests/hermes_state/test_history_binding_moved_store.py
+@@ -0,0 +1,46 @@
++"""A history binding written by an older home of its profile still names that profile.
++
++Imported/claimed history stores ``[profile_id, subject]`` with the owning home's absolute path, so a
++``state.db`` that moved with its profile (another machine, a moved home) refused every bound row:
++pin/archive/rename got ``permission_denied`` and the read-only mount ``not_found``.
++"""
++import json
++
++import hermes_state_runtime as rt
++from hermes_state import SessionDB
++from hermes_state_mutation_binding import BINDING_PREFIX, bindings_agree, binding_names, import_history_control
++
++
++def _bound(profile, subject='owner'):
++    return json.dumps([str(profile), subject])
++
++
++def test_binding_follows_its_store_after_the_home_moved(tmp_path):
++    departed, home = tmp_path / 'mac' / 'home', tmp_path / 'cloud'
++    assert binding_names(_bound(departed), 'owner')
++    assert bindings_agree(_bound(departed), _bound(home))
++
++
++def test_binding_still_names_only_its_owner(tmp_path):
++    departed, home = tmp_path / 'mac' / 'home', tmp_path / 'cloud'
++    assert not binding_names(_bound(departed), 'someone-else')
++    assert not bindings_agree(_bound(departed), _bound(home, 'someone-else'))
++    assert not binding_names('not json', 'owner')
++    assert not binding_names(json.dumps([None, 'owner']), 'owner')
++    assert not bindings_agree(_bound(departed), 'not json')
++
++
++def test_import_links_a_parent_its_owner_imported_before_the_home_moved(tmp_path):
++    from gateway.session_contract import SessionActor
++    with SessionDB(db_path=tmp_path / 'state.db') as db:
++        db.create_session('parent', source='cli')
++        db.set_meta(BINDING_PREFIX + 'parent', _bound(tmp_path / 'mac' / 'home'))
++        actor = SessionActor('owner', str(tmp_path / 'cloud'), frozenset(), 'peer')
++        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
++        result = rt.mutate_runtime_session(
++            db, epoch=epoch, principal_id='owner', session_id='child', request_id='import', expected_revision=0,
++            operation='import', payload={'sessions': [
++                {'id': 'child', 'source': 'cli', 'parent_session_id': 'parent', 'messages': []}]},
++            _authorize_write=lambda conn: import_history_control(conn, actor, ['child']))
++        assert result['detached'] == 0
++        assert db.get_session('child')['parent_session_id'] == 'parent'
+diff --git a/tests/plugins/dashboard_auth/test_nous_provider.py b/tests/plugins/dashboard_auth/test_nous_provider.py
+index ea39cd6e9c9..e45a9047c3d 100644
+--- a/tests/plugins/dashboard_auth/test_nous_provider.py
++++ b/tests/plugins/dashboard_auth/test_nous_provider.py
+@@ -33,6 +33,7 @@ import plugins.dashboard_auth.nous as nous_plugin
+ from hermes_cli.dashboard_auth import (
+     InvalidCodeError,
+     ProviderError,
++    RefreshExpiredError,
+     Session,
+     assert_protocol_compliance,
+ )
+@@ -442,28 +443,31 @@ class TestVerifySession:
+         token = _mint_token(rsa_keypair, ttl_seconds=-600)
+         assert provider.verify_session(access_token=token) is None
+ 
+-    def test_wrong_audience_raises_provider_error(self, provider, rsa_keypair):
++    def test_wrong_audience_returns_none(self, provider, rsa_keypair):
++        # A wrong-audience token is a confirmed denial (the IdP answered, the token
++        # isn't ours): verify_session must return None so middleware refreshes /
++        # re-logins instead of answering the misleading 503 "provider unreachable".
+         token = _mint_token(rsa_keypair, aud="agent:other-instance")
+-        with pytest.raises(ProviderError, match="verification failed"):
+-            provider.verify_session(access_token=token)
++        assert provider.verify_session(access_token=token) is None
+ 
+     def test_verification_failure_message_surfaces_token_claims(
+-        self, provider, rsa_keypair
++        self, provider, rsa_keypair, caplog
+     ):
+         """Operators need to see the actual iss/aud the token carries to debug
+-        config drift between HERMES_DASHBOARD_PORTAL_URL/CLIENT_ID and Portal."""
++        config drift between HERMES_DASHBOARD_PORTAL_URL/CLIENT_ID and Portal: the
++        rejection is a 401, so the warning log is where drift shows up."""
++        import logging
+         token = _mint_token(rsa_keypair, iss="https://evil.example")
+-        with pytest.raises(ProviderError) as excinfo:
+-            provider.verify_session(access_token=token)
+-        msg = str(excinfo.value)
++        with caplog.at_level(logging.WARNING, logger="plugins.dashboard_auth._shared"):
++            assert provider.verify_session(access_token=token) is None
++        msg = caplog.text
+         # Both the observed (token) and expected (configured) values appear.
+         assert "'https://evil.example'" in msg
+         assert "'https://portal.example.com'" in msg  # configured portal URL
+ 
+     def test_agent_instance_id_mismatch_rejected(self, provider, rsa_keypair):
+         token = _mint_token(rsa_keypair, agent_instance_id="some-other-id")
+-        with pytest.raises(ProviderError, match="agent_instance_id mismatch"):
+-            provider.verify_session(access_token=token)
++        assert provider.verify_session(access_token=token) is None
+ 
+     def test_contract_version_missing_warns_but_succeeds(
+         self, provider, rsa_keypair, caplog
+@@ -544,3 +548,18 @@ class TestRefreshAndRevoke:
+         assert kwargs["data"]["client_id"] == "agent:inst123"
+         assert kwargs["data"]["refresh_token"] == "rt_old_value"
+         assert kwargs["headers"]["x-nous-refresh-token"] == "rt_old_value"
++
++    def test_refresh_verify_denial_maps_to_refresh_expired(self, provider, rsa_keypair):
++        """A verify-stage denial inside the refresh grant (exchange OK, but the granted
++        token isn't ours) maps to RefreshExpiredError so the middleware refresh scan
++        rejects this provider instead of crashing on an uncaught InvalidCodeError."""
++        access_token = _mint_token(rsa_keypair, aud="agent:other-instance")
++        mock_resp = self._mock_post(
++            200,
++            {"access_token": access_token, "token_type": "Bearer", "refresh_token": "rt2"},
++        )
++        with patch(
++            "plugins.dashboard_auth._shared.httpx.post", return_value=mock_resp
++        ):
++            with pytest.raises(RefreshExpiredError, match="verification failed"):
++                provider.refresh_session(refresh_token="rt_old")
+diff --git a/tests/plugins/dashboard_auth/test_opaque_bearer_not_unreachable.py b/tests/plugins/dashboard_auth/test_opaque_bearer_not_unreachable.py
+index 5602022bdae..f95af14eb1a 100644
+--- a/tests/plugins/dashboard_auth/test_opaque_bearer_not_unreachable.py
++++ b/tests/plugins/dashboard_auth/test_opaque_bearer_not_unreachable.py
+@@ -8,6 +8,10 @@ a token that is not a JWT at all — into ``ProviderError``. Only a transport
+ failure fetching the JWKS is "unreachable"; anything else means "not my
+ token" (``verify_session`` -> None -> 401 / next provider).
+ 
++The same 503 later came back for well-signed Portal JWTs this instance does not accept: the
++user's Portal CLI token (``aud=hermes-cli:hermes-cli``), another instance's ``aud`` or
++``agent_instance_id``, and a ``kid`` the reachable JWKS does not hold.
++
+ Real ``NousDashboardAuthProvider`` + real ``SelfHostedOIDCProvider`` JWKS path,
+ a real local HTTP JWKS server (reachable case) or a closed port (unreachable),
+ and the real gated web_server app for the HTTP-level assertion.
+@@ -15,11 +19,17 @@ and the real gated web_server app for the HTTP-level assertion.
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import threading
++import time
++from contextlib import contextmanager
+ from http.server import BaseHTTPRequestHandler, HTTPServer
++from unittest.mock import MagicMock, patch
+ 
+ import jwt
+ import pytest
++from cryptography.hazmat.primitives.asymmetric import rsa
++from jwt.algorithms import RSAAlgorithm
+ from starlette.testclient import TestClient
+ 
+ from hermes_cli import web_server
+@@ -30,7 +40,7 @@ from hermes_cli.dashboard_auth import (
+     clear_providers,
+     register_provider,
+ )
+-from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE
++from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE, SESSION_RT_COOKIE
+ import plugins.dashboard_auth.nous as nous_plugin
+ 
+ OPAQUE_PEER_KEY = "hk_live_opaque_peer_key_0123456789abcdef"
+@@ -38,29 +48,60 @@ OPAQUE_PEER_KEY = "hk_live_opaque_peer_key_0123456789abcdef"
+ FOREIGN_KID_JWT = "eyJhbGciOiJSUzI1NiIsImtpZCI6Inp6eiJ9.e30.sig"
+ 
+ 
+-@pytest.fixture(scope="module")
+-def empty_jwks_server():
+-    """A reachable JWKS endpoint that knows no keys."""
++_INSTANCE = "test-instance"
++_KID = "portal-k1"
++
++
++@contextmanager
++def _serve_jwks(keys: list[dict]):
++    """A reachable JWKS endpoint on loopback publishing ``keys``; yields its base URL."""
+ 
+     class _H(BaseHTTPRequestHandler):
+         def do_GET(self):
+             self.send_response(200)
+             self.send_header("content-type", "application/json")
+             self.end_headers()
+-            self.wfile.write(json.dumps({"keys": []}).encode())
++            self.wfile.write(json.dumps({"keys": keys}).encode())
+ 
+         def log_message(self, *a):  # silence
+             pass
+ 
+     srv = HTTPServer(("127.0.0.1", 0), _H)
+-    t = threading.Thread(target=srv.serve_forever, daemon=True)
+-    t.start()
+-    yield f"http://127.0.0.1:{srv.server_address[1]}"
+-    srv.shutdown()
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    try:
++        yield f"http://127.0.0.1:{srv.server_address[1]}"
++    finally:
++        srv.shutdown()
++        srv.server_close()
++
++
++@pytest.fixture(scope="module")
++def empty_jwks_server():
++    """A reachable JWKS endpoint that knows no keys."""
++    with _serve_jwks([]) as url:
++        yield url
++
++
++@pytest.fixture(scope="module")
++def portal():
++    """A reachable Portal JWKS publishing one signing key; yields ``(url, private_key)``."""
++    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    jwk = {**json.loads(RSAAlgorithm.to_jwk(private.public_key())),
++           "kid": _KID, "use": "sig", "alg": "RS256"}
++    with _serve_jwks([jwk]) as url:
++        yield url, private
++
++
++def _mint(portal, *, aud=f"agent:{_INSTANCE}", kid=_KID, **extra) -> str:
++    url, private = portal
++    now = int(time.time())
++    claims = {"iss": url, "aud": aud, "sub": "usr_abc", "iat": now, "exp": now + 900,
++              "oauth_contract_version": 1, **extra}
++    return jwt.encode(claims, private, algorithm="RS256", headers={"kid": kid})
+ 
+ 
+ def _nous(portal_url: str) -> nous_plugin.NousDashboardAuthProvider:
+-    return nous_plugin.NousDashboardAuthProvider(client_id="agent:test-instance", portal_url=portal_url)
++    return nous_plugin.NousDashboardAuthProvider(client_id=f"agent:{_INSTANCE}", portal_url=portal_url)
+ 
+ 
+ # ── classifier ────────────────────────────────────────────────────────────
+@@ -98,6 +139,13 @@ def test_foreign_kid_jwt_with_healthy_portal_is_not_unreachable(empty_jwks_serve
+     assert provider.verify_session(access_token=FOREIGN_KID_JWT) is None
+ 
+ 
++def test_unknown_kid_against_populated_jwks_is_not_unreachable(portal):
++    """The JWKS was fetched fine; it just has no key for this kid (rotated out, or a forged
++    header). That is an unverifiable token, not an unreachable provider."""
++    provider = _nous(portal[0])
++    assert provider.verify_session(access_token=_mint(portal, kid="rotated-out")) is None
++
++
+ def test_real_jwt_with_unreachable_portal_still_raises_provider_error():
+     provider = _nous("http://127.0.0.1:9")  # discard port: connection refused
+     with pytest.raises(ProviderError):
+@@ -128,18 +176,34 @@ def test_self_hosted_provider_shares_the_classification(empty_jwks_server, monke
+ 
+ # ── HTTP level: the gated API answers 401, not 503 ────────────────────────
+ 
+-@pytest.fixture
+-def _gated_nous(empty_jwks_server):
++@contextmanager
++def _gated_app(portal_url: str):
++    """The real gated dashboard app with only the Nous provider, pointed at ``portal_url``."""
+     clear_providers()
+-    prev = {k: getattr(web_server.app.state, k, None) for k in ("bound_host", "bound_port", "auth_required")}
++    keys = ("bound_host", "bound_port", "auth_required")
++    prev = {k: getattr(web_server.app.state, k, None) for k in keys}
+     web_server.app.state.bound_host = "agent.example.test"
+     web_server.app.state.bound_port = 443
+     web_server.app.state.auth_required = True
+-    register_provider(_nous(empty_jwks_server))
+-    yield TestClient(web_server.app, base_url="https://agent.example.test")
+-    clear_providers()
+-    for k, v in prev.items():
+-        setattr(web_server.app.state, k, v)
++    register_provider(_nous(portal_url))
++    try:
++        yield TestClient(web_server.app, base_url="https://agent.example.test")
++    finally:
++        clear_providers()
++        for k, v in prev.items():
++            setattr(web_server.app.state, k, v)
++
++
++@pytest.fixture
++def _gated_nous(empty_jwks_server):
++    with _gated_app(empty_jwks_server) as client:
++        yield client
++
++
++@pytest.fixture
++def gated_portal(portal):
++    with _gated_app(portal[0]) as client:
++        yield client
+ 
+ 
+ def test_gated_api_rejects_opaque_bearer_with_401_not_503(_gated_nous):
+@@ -154,3 +218,64 @@ def test_gated_api_rejects_opaque_cookie_with_401_not_503(_gated_nous):
+     r = _gated_nous.get("/api/auth/me")
+     assert r.status_code != 503, r.text
+     assert "unreachable" not in r.text.lower()
++
++
++def _bearer(client, token):
++    return client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
++
++
++def test_gated_api_accepts_own_portal_token(gated_portal, portal):
++    assert _bearer(gated_portal, _mint(portal)).status_code == 200
++
++
++@pytest.mark.parametrize("token_kwargs", [
++    pytest.param({"aud": "hermes-cli:hermes-cli"}, id="portal-cli-token"),
++    pytest.param({"aud": "agent:other-instance"}, id="other-instance-aud"),
++    pytest.param({"agent_instance_id": "other-instance"}, id="other-instance-claim"),
++    pytest.param({"kid": "rotated-out"}, id="unknown-kid"),
++])
++def test_gated_api_rejects_foreign_portal_jwt_bearer_with_401_not_503(gated_portal, portal, token_kwargs):
++    r = _bearer(gated_portal, _mint(portal, **token_kwargs))
++    assert r.status_code == 401, r.text
++    assert r.json()["reason"] == "invalid_or_expired_session"
++
++
++def test_gated_api_foreign_portal_jwt_cookie_is_401_not_503(gated_portal, portal):
++    """Cookie path: a foreign access-token cookie with no refresh token is a signed-out 401."""
++    gated_portal.cookies.set(f"__Host-{SESSION_AT_COOKIE}", _mint(portal, aud="hermes-cli:hermes-cli"))
++    r = gated_portal.get("/api/auth/me")
++    assert r.status_code == 401, r.text
++    assert r.json()["reason"] == "invalid_or_expired_session"
++
++
++def test_gated_api_refresh_minting_foreign_token_is_401_not_503(gated_portal, portal):
++    """Cookie path with a refresh token: the rotated token Portal hands back does not verify
++    here, so the provider rejects the RT (signed-out 401), never a 503 or an uncaught 500."""
++    foreign = _mint(portal, aud="hermes-cli:hermes-cli")
++    grant = MagicMock(status_code=200, headers={"content-type": "application/json"})
++    grant.json.return_value = {"access_token": foreign, "token_type": "Bearer", "refresh_token": "rt2"}
++    # The __Host- names the server sets over HTTPS (bare names are not read there, #136772).
++    gated_portal.cookies.set(f"__Host-{SESSION_AT_COOKIE}", foreign)
++    gated_portal.cookies.set(f"__Host-{SESSION_RT_COOKIE}", "rt-old")
++    with patch("plugins.dashboard_auth._shared.httpx.post", return_value=grant) as post:
++        r = gated_portal.get("/api/auth/me")
++    assert post.called
++    assert r.status_code == 401, r.text
++    assert r.json()["reason"] == "invalid_or_expired_session"
++
++
++def test_forged_alg_with_published_kid_is_rejected_without_a_drift_warning(portal, caplog):
++    """The drift WARNING is reserved for aud/iss mismatches, which PyJWT reports only after the
++    signature verified. A forged token naming the published kid with another alg is rejected
++    before any signature check: a 401, and no attacker-sized log line."""
++    forged = jwt.encode({"iss": "x" * 4000, "aud": "y"}, "k" * 32, algorithm="HS256", headers={"kid": _KID})
++    provider = _nous(portal[0])
++    with caplog.at_level(logging.WARNING, logger="plugins.dashboard_auth._shared"):
++        assert provider.verify_session(access_token=forged) is None
++    assert "verification failed" not in caplog.text
++
++
++def test_gated_api_unreachable_jwks_is_still_503(portal):
++    """The outage contract is kept: a JWKS that cannot be fetched stays a 503."""
++    with _gated_app("http://127.0.0.1:9") as client:  # discard port: connection refused
++        assert _bearer(client, _mint(portal)).status_code == 503
+diff --git a/tests/plugins/dashboard_auth/test_self_hosted_provider.py b/tests/plugins/dashboard_auth/test_self_hosted_provider.py
+index 19b8601864d..653fa9db903 100644
+--- a/tests/plugins/dashboard_auth/test_self_hosted_provider.py
++++ b/tests/plugins/dashboard_auth/test_self_hosted_provider.py
+@@ -32,6 +32,7 @@ import plugins.dashboard_auth.self_hosted as oidc_plugin
+ from hermes_cli.dashboard_auth import (
+     InvalidCodeError,
+     ProviderError,
++    RefreshExpiredError,
+     Session,
+     assert_protocol_compliance,
+ )
+@@ -686,20 +687,39 @@ class TestVerifySession:
+         token = _mint_id_token(rsa_keypair, ttl_seconds=-600)
+         assert provider.verify_session(access_token=token) is None
+ 
+-    def test_wrong_audience_raises(self, provider, rsa_keypair):
++    def test_wrong_audience_returns_none(self, provider, rsa_keypair):
++        # A wrong-audience token is a confirmed denial: the IdP answered (JWKS fetched,
++        # token parsed) but the token isn't ours. verify_session must return None so the
++        # middleware refreshes / re-logins instead of answering the misleading 503
++        # "provider unreachable" (folding denials into ProviderError produced exactly
++        # that against a desktop reusing one session across same-issuer gateways).
+         token = _mint_id_token(rsa_keypair, aud="some-other-client")
+-        with pytest.raises(ProviderError, match="verification failed"):
+-            provider.verify_session(access_token=token)
+-
++        assert provider.verify_session(access_token=token) is None
+ 
+-    def test_failure_message_surfaces_claims(self, provider, rsa_keypair):
++    def test_failure_message_surfaces_claims(self, provider, rsa_keypair, caplog):
++        import logging
+         token = _mint_id_token(rsa_keypair, iss="https://evil.example")
+-        with pytest.raises(ProviderError) as excinfo:
+-            provider.verify_session(access_token=token)
+-        msg = str(excinfo.value)
++        with caplog.at_level(logging.WARNING, logger="plugins.dashboard_auth._shared"):
++            assert provider.verify_session(access_token=token) is None
++        msg = caplog.text
+         assert "'https://evil.example'" in msg
+         assert f"'{_ISSUER}'" in msg
+ 
++    def test_refresh_verify_denial_maps_to_refresh_expired(self, rsa_keypair):
++        """A verify-stage denial inside the refresh grant maps to RefreshExpiredError so
++        the middleware refresh scan rejects this provider instead of crashing on an
++        uncaught InvalidCodeError."""
++        provider = _make_provider(rsa_keypair)
++        id_token = _mint_id_token(rsa_keypair, aud="some-other-client")
++        mock_resp = _mock_post(
++            200, {"id_token": id_token, "token_type": "Bearer", "refresh_token": "rt2"}
++        )
++        with patch(
++            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
++        ):
++            with pytest.raises(RefreshExpiredError, match="verification failed"):
++                provider.refresh_session(refresh_token="rt_old")
++
+ 
+     def test_jwks_unreachable_raises(self, provider, rsa_keypair):
+         token = _mint_id_token(rsa_keypair)
+@@ -851,7 +871,7 @@ class TestForgedSignature:
+ 
+     Live remote-bind probe: a tampered OIDC bearer on the gated API returned 503
+     ``Auth provider 'self-hosted' unreachable`` (cookies kept, no fall-through), so a forged
+-    token was indistinguishable from an IDP outage. iss/aud drift keeps its 503 (config drift).
++    token was indistinguishable from an IDP outage.
+     """
+ 
+     def test_tampered_signature_is_invalid_token_not_unreachable(self, rsa_keypair):
+diff --git a/website/docs/developer-guide/memory-provider-plugin.md b/website/docs/developer-guide/memory-provider-plugin.md
+index 74cadc7b025..06b603e98ba 100644
+--- a/website/docs/developer-guide/memory-provider-plugin.md
++++ b/website/docs/developer-guide/memory-provider-plugin.md
+@@ -141,6 +141,17 @@ turn start; `""` when unset, a preset name under mixture-of-agents) and the turn
+ `author_id`, `author_name`, `author_is_bot`. Declare only the keywords you need; the manager passes
+ a provider only the ones its signature accepts.
+ 
++It also receives `previous_message`: the text of the person's last message before this turn, taken
++from the transcript Hermes holds (`""` on a first turn, or when that message was image-only). Known
++runtime rows in the user role are skipped (continue nudges, task-list snapshots, single
++background-process completion and watch-match notices, compaction summaries, mid-turn `/steer`
++messages), a gateway timestamp prefix is removed, and the value is secret-scrubbed like `message`. It
++is best-effort: other runtime notices a gateway replays after a restart (a cron delivery, a process
++heartbeat, a watch-disabled or batched-completion notice) can still come through. A process
++that resumed a session (`hermes chat --resume`, a gateway after a restart) never ran the previous
++turn's end, so a provider that prepares recall in `queue_prefetch()` can redo that work from it, even
++when it stores no transcript of its own. Older Hermes omits it: read it with `kwargs.get`.
++
+ Do not assume `os.getcwd()` identifies the conversation's workspace: one Desktop
+ or gateway backend can serve several sessions. If `cwd` is absent and directory
+ routing is needed, `agent.runtime_cwd.resolve_agent_cwd()` honors the session cwd

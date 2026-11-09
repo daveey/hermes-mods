@@ -1,0 +1,309 @@
+From ffe95d069716b1d368e249db525c0b9f1aa8a6ce Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 10:07:39 +0000
+Subject: [PATCH] [daveey] Reuse unchanged remote sweep task projections
+
+---
+ tests/tui_gateway/test_idle_watcher_gates.py  |   8 +-
+ .../test_remote_sweep_projection.py           | 152 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |  12 +-
+ tui_gateway/remote_sweep_projection.py        |  63 ++++++++
+ 4 files changed, 227 insertions(+), 8 deletions(-)
+ create mode 100644 tests/tui_gateway/test_remote_sweep_projection.py
+ create mode 100644 tui_gateway/remote_sweep_projection.py
+
+diff --git a/tests/tui_gateway/test_idle_watcher_gates.py b/tests/tui_gateway/test_idle_watcher_gates.py
+index bc8bbef2b23..88e0e447035 100644
+--- a/tests/tui_gateway/test_idle_watcher_gates.py
++++ b/tests/tui_gateway/test_idle_watcher_gates.py
+@@ -64,9 +64,10 @@ def test_sweep_idle_does_not_read_replica_and_unloaded_chat_is_retried(tmp_path,
+ 
+     poll({CHAT})
+     poll({CHAT})
+-    original = krn._task_rows
++    # Count actual snapshot opens, including the warm seq-only projection path.
++    original = krn._ro
+     reads = []
+-    monkeypatch.setattr(krn, "_task_rows", lambda *a: reads.append(1) or original(*a))
++    monkeypatch.setattr(krn, "_ro", lambda *a: reads.append(1) or original(*a))
+     poll({CHAT})
+     assert reads == []
+     poll(set())
+@@ -77,7 +78,8 @@ def test_sweep_idle_does_not_read_replica_and_unloaded_chat_is_retried(tmp_path,
+ 
+ 
+ def test_sweep_commit_during_read_is_not_cached(tmp_path, monkeypatch):
+-    replica = _replica(tmp_path, [])
++    # Concurrent commits require WAL while the real reader snapshot is held.
++    replica = _replica(tmp_path, [], 'wal')
+     krn._reset_for_tests()
+     original = krn._task_rows
+ 
+diff --git a/tests/tui_gateway/test_remote_sweep_projection.py b/tests/tui_gateway/test_remote_sweep_projection.py
+new file mode 100644
+index 00000000000..9acc97e5842
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_sweep_projection.py
+@@ -0,0 +1,152 @@
++"""Changed replica commits must not re-decode unchanged task projections."""
++import json
++import sqlite3
++
++from tests.tui_gateway.test_kanban_remote_arrival import CHAT, _card
++from tests.tui_gateway.test_kanban_remote_idle_read import NOW, _replica
++from tui_gateway import kanban_remote_notices as remote
++
++
++def test_unrelated_commit_skips_task_projection(tmp_path, monkeypatch):
++    path = _replica(tmp_path, [_card('t_one', CHAT, status='done', at=NOW)], 'wal')
++    remote._reset_for_tests()
++    expected = remote._sweep_snapshot(path, 'macbook')
++    remote._sweep_snapshot(path, 'macbook')
++    calls = []
++    original = remote._sweep_cards
++
++    def track(rows, me):
++        calls.extend(row[1] for row in rows)
++        return original(rows, me)
++
++    monkeypatch.setattr(remote, '_sweep_cards', track)
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE meta SET v='999' WHERE k='head'")
++    assert remote._sweep_snapshot(path, 'macbook') == expected
++    assert calls == []
++
++
++def test_only_changed_task_is_projected(tmp_path, monkeypatch):
++    cards = [_card(t, CHAT, status='done', at=NOW) for t in ('t_one', 't_two')]
++    path = _replica(tmp_path, cards, 'wal')
++    remote._reset_for_tests()
++    remote._sweep_snapshot(path, 'macbook')
++    remote._sweep_snapshot(path, 'macbook')
++    calls = []
++    original = remote._sweep_cards
++
++    def track(rows, me):
++        calls.extend(row[1] for row in rows)
++        return original(rows, me)
++
++    monkeypatch.setattr(remote, '_sweep_cards', track)
++    changed = _card('t_one', CHAT, status='blocked', at=NOW + 1)
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE replica SET data=?,seq=seq+10 WHERE key=?',
++                     (json.dumps(changed['task']), changed['key']))
++    got = remote._sweep_snapshot(path, 'macbook')
++    assert got[1]['hub/' + changed['key']][0] == f'blocked@{int(NOW)+1}'
++    assert calls == [changed['key']]
++
++
++def test_replacement_gateway_and_deletion_invalidate(tmp_path):
++    import os
++
++    card = _card('t_one', CHAT, status='done', at=NOW)
++    path = _replica(tmp_path / 'live', [card])
++    remote._reset_for_tests()
++    assert remote._sweep_snapshot(path, 'macbook')[0]
++    assert remote._sweep_snapshot(path, 'hub') == ([], {})
++    assert remote._sweep_snapshot(path, 'macbook')[0]
++    changed = _card('t_one', CHAT, status='blocked', at=NOW + 1)
++    staged = _replica(tmp_path / 'stage', [changed])
++    os.replace(staged, path)
++    got = remote._sweep_snapshot(path, 'macbook')
++    assert got[1]['hub/' + card['key']][0] == f'blocked@{int(NOW)+1}'
++    with sqlite3.connect(path) as conn:
++        conn.execute('DELETE FROM replica')
++    assert remote._sweep_snapshot(path, 'macbook') == ([], {})
++    from tui_gateway import remote_sweep_projection
++    assert remote_sweep_projection._rows == {}
++
++
++def test_unknown_fingerprint_never_reuses_row_projection(tmp_path, monkeypatch):
++    from tui_gateway import kanban_replica_observer as observer
++
++    card = _card('t_one', CHAT, status='done', at=NOW)
++    path = _replica(tmp_path, [card])
++    remote._reset_for_tests()
++    remote._sweep_snapshot(path, 'macbook')
++    monkeypatch.setattr(observer, 'fingerprint', lambda path: None)
++    changed = _card('t_one', CHAT, status='blocked', at=NOW + 1)
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE replica SET data=?', (json.dumps(changed['task']),))
++    got = remote._sweep_snapshot(path, 'macbook')
++    assert got[1]['hub/' + card['key']][0] == f'blocked@{int(NOW)+1}'
++    assert remote._sweep_memo is None
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE replica SET data=?', (json.dumps(card['task']),))
++    assert remote._sweep_snapshot(path, 'macbook')[1]['hub/' + card['key']][0] == f'done@{int(NOW)}'
++
++
++def test_canonical_row_add_and_remove(tmp_path):
++    card = _card('t_one', CHAT, status='done', at=NOW)
++    legacy = {**card, 'key': 'default/t_one'}
++    path = _replica(tmp_path, [legacy], 'wal')
++    remote._reset_for_tests()
++    assert list(remote._sweep_snapshot(path, 'macbook')[1]) == ['hub/' + legacy['key']]
++    with sqlite3.connect(path) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,2)",
++                     (card['key'], json.dumps(card['task'])))
++    assert list(remote._sweep_snapshot(path, 'macbook')[1]) == ['hub/' + card['key']]
++    with sqlite3.connect(path) as conn:
++        conn.execute('DELETE FROM replica WHERE key=?', (card['key'],))
++    assert list(remote._sweep_snapshot(path, 'macbook')[1]) == ['hub/' + legacy['key']]
++
++
++def test_warm_payload_read_is_one_snapshot(tmp_path, monkeypatch):
++    card = _card('t_one', CHAT, status='done', at=NOW)
++    path = _replica(tmp_path, [card], 'wal')
++    remote._reset_for_tests()
++    remote._sweep_snapshot(path, 'macbook')
++    changed = _card('t_one', CHAT, status='blocked', at=NOW + 1)
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE replica SET data=?,seq=2', (json.dumps(changed['task']),))
++    newer = _card('t_one', CHAT, status='done', at=NOW + 2)
++    original = remote._ro
++    fired = []
++
++    class Reader:
++        def __init__(self, conn):
++            self.conn = conn
++
++        def execute(self, sql, *args):
++            if sql.startswith('SELECT data FROM replica') and not fired:
++                fired.append(True)
++                with sqlite3.connect(path) as writer:
++                    writer.execute('UPDATE replica SET data=?,seq=3', (json.dumps(newer['task']),))
++            return self.conn.execute(sql, *args)
++
++        def close(self):
++            self.conn.close()
++
++    monkeypatch.setattr(remote, '_ro', lambda path: Reader(original(path)))
++    got = remote._sweep_snapshot(path, 'macbook')
++    assert fired
++    assert got[1]['hub/' + card['key']][0] == f'blocked@{int(NOW)+1}'
++    assert remote._sweep_memo is None
++    monkeypatch.setattr(remote, '_ro', original)
++    assert remote._sweep_snapshot(path, 'macbook')[1]['hub/' + card['key']][0] == f'done@{int(NOW)+2}'
++
++
++def test_legacy_no_seq_rereads_payload(tmp_path):
++    card = _card('t_one', CHAT, status='done', at=NOW)
++    path = _replica(tmp_path, [card])
++    with sqlite3.connect(path) as conn:
++        conn.execute('ALTER TABLE replica DROP COLUMN seq')
++    remote._reset_for_tests()
++    assert remote._sweep_snapshot(path, 'macbook')[0]
++    changed = _card('t_one', CHAT, status='blocked', at=NOW + 1)
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE replica SET data=?', (json.dumps(changed['task']),))
++    assert remote._sweep_snapshot(path, 'macbook')[1]['hub/' + card['key']][0] == f'blocked@{int(NOW)+1}'
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 17e117e3736..1ced02137b1 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -688,7 +688,9 @@ def _reset_for_tests() -> None:
+     """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
+     from tui_gateway.kanban_remote_observations import _decoded, _decoded_files, _memo
+     from tui_gateway.kanban_replica_observer import reset as reset_observers
++    from tui_gateway.remote_sweep_projection import reset as reset_projection
+ 
++    reset_projection()
+     global _index_memo, _sweep_memo
+     _sweep_memo = None
+     reset_observers()
+@@ -1038,7 +1040,8 @@ def _sweep_snapshot(path, me: str) -> tuple:
+     One memo bounds retained data; a failed/racing read cannot bless a stale snapshot.
+     """
+     global _sweep_memo
+-    from tui_gateway.kanban_replica_observer import fingerprint
++    from tui_gateway.kanban_replica_observer import file_identity, fingerprint
++    from tui_gateway import remote_sweep_projection
+ 
+     stamp = fingerprint(path)
+     memo = _sweep_memo
+@@ -1046,10 +1049,9 @@ def _sweep_snapshot(path, me: str) -> tuple:
+         return memo[2], memo[3]
+     _sweep_memo = None
+     with contextlib.closing(_ro(Path(path))) as conn:
+-        rows = _canonical(_task_rows(conn, me))
+-    cards = list(_sweep_cards(rows, me))
+-    states = {ref: (state, {"sessions": task.get("sessions")})
+-              for ref, (state, task) in _current_states(rows).items()}
++        conn.execute("BEGIN")
++        cards, states = remote_sweep_projection.snapshot(
++            conn, file_identity(stamp), me)
+     if stamp is not None and fingerprint(path) == stamp:
+         _sweep_memo = (stamp, me, cards, states)
+     return cards, states
+diff --git a/tui_gateway/remote_sweep_projection.py b/tui_gateway/remote_sweep_projection.py
+new file mode 100644
+index 00000000000..00d4f0ae565
+--- /dev/null
++++ b/tui_gateway/remote_sweep_projection.py
+@@ -0,0 +1,63 @@
++"""Retain remote-notice projections across unrelated replica commits.
++
++The replica writer publishes a new seq for each changed row. Read identity rows
++and changed payloads in one transaction; never cache time or claim decisions.
++Only one replica/gateway generation is retained, with deleted rows discarded.
++"""
++from __future__ import annotations
++
++import threading
++
++_lock = threading.Lock()
++_identity = None
++_rows: dict = {}
++
++
++def reset() -> None:
++    global _identity
++    with _lock:
++        _identity = None
++        _rows.clear()
++
++
++def _project(rows, me, remote):
++    cards = list(remote._sweep_cards(rows, me))
++    states = {ref: (state, {"sessions": task.get("sessions")})
++              for ref, (state, task) in remote._current_states(rows).items()}
++    return cards, states
++
++
++def snapshot(conn, identity, me):
++    """Caller owns a snapshot transaction; unknown identities/schemas do not memoize."""
++    from tui_gateway import kanban_remote_notices as remote
++
++    global _identity, _rows
++    with _lock:
++        cols = {row[1] for row in conn.execute("PRAGMA table_info(replica)")}
++        scope = (identity, me)
++        if identity is None or "seq" not in cols:
++            _identity, _rows = None, {}
++            return _project(remote._canonical(remote._task_rows(conn, me)), me, remote)
++        previous = _rows if _identity == scope else {}
++        sql = "SELECT gw, key, seq, NULL FROM replica WHERE coll = 'tasks'"
++        rows = remote._canonical(conn.execute(sql + " AND gw != ?", (me,)).fetchall()
++                                 if me else conn.execute(sql).fetchall())
++        # A cold pass reads payloads in one query, rather than thousands of seeks.
++        cold = {(row[0], row[1]): row for row in remote._canonical(remote._task_rows(conn, me))} if not previous else {}
++        updated = {}
++        cards, states = [], {}
++        for owner, key, seq, _ in rows:
++            hit = previous.get((owner, key))
++            if hit is None or hit[0] != seq:
++                row = cold.get((owner, key))
++                if row is None:
++                    raw = conn.execute("SELECT data FROM replica WHERE coll='tasks' AND gw=? AND key=?",
++                                       (owner, key)).fetchone()
++                    row = (owner, key, seq, raw[0])
++                projection = _project([row], me, remote)
++                hit = (seq, projection)
++            updated[(owner, key)] = hit
++            cards.extend(hit[1][0])
++            states.update(hit[1][1])
++        _identity, _rows = scope, updated
++        return cards, states
+-- 
+2.55.0
+

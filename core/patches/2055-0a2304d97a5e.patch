@@ -1,0 +1,99 @@
+From 0a2304d97a5e486038fbbf10e21d70fe87ac0b63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:52:48 +0000
+Subject: [PATCH] [daveey] Isolate delegate reclaim failures from durable
+ notices
+
+---
+ .../test_kanban_reclaim_error_isolation.py    | 56 +++++++++++++++++++
+ tui_gateway/session_notifications.py          |  4 +-
+ 2 files changed, 58 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_reclaim_error_isolation.py
+
+diff --git a/tests/tui_gateway/test_kanban_reclaim_error_isolation.py b/tests/tui_gateway/test_kanban_reclaim_error_isolation.py
+new file mode 100644
+index 00000000000..5606e106aea
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_reclaim_error_isolation.py
+@@ -0,0 +1,56 @@
++"""A board's reclaim error must not strand durable notices collected on other boards."""
++from unittest.mock import patch
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_state import SessionDB
++from tui_gateway import server
++
++
++def _task(chat_id, board=None):
++    with kbc.connect_closing(board=board) as conn:
++        tid = kb.create_task(conn, title="reclaim isolation", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat_id)
++        kb.complete_task(conn, tid, summary="shipped")
++        return tid
++
++
++@pytest.mark.parametrize("failure", ["corrupt", "archived", "permission"])
++def test_reclaim_error_keeps_other_board_and_remote_notices(tmp_path, failure):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session(session_id="parent", source="desktop")
++        db.create_session(session_id="child", source="subagent", parent_session_id="parent",
++                          model_config={"_delegate_from": "parent"})
++        kb.create_board("zz")
++        own = _task("parent")
++        stray = _task("child", board="zz")
++        real_connect = kbc.connect
++
++        def connect(*args, **kwargs):
++            if kwargs.get("board") == "zz":
++                if failure == "corrupt":
++                    raise kbc.KanbanDbCorruptError(kb.kanban_db_path(board="zz"), None, "test")
++                if failure == "archived":
++                    raise ValueError("board archived")
++                raise PermissionError("board read only")
++            return real_connect(*args, **kwargs)
++
++        session = {"session_key": "parent"}
++        with patch.object(server, "_get_db", lambda: db), \
++                patch.object(server, "_collect_remote_kanban_notifications", return_value=["remote notice"]):
++            with patch.object(kbc, "connect", connect):
++                texts, claims = server._notif_collect_kanban(session)
++            assert any(own in text for text in texts)
++            assert "remote notice" in texts
++            assert any(c["task_id"] == own and c["texts"] for c in claims)
++            assert session["_kanban_stray_keys"] == ("child",)
++            retried, retry_claims = server._notif_collect_kanban(session)
++            assert any(stray in text for text in retried)
++            assert any(c["task_id"] == stray for c in retry_claims)
++            assert session["_kanban_stray_keys"] == ()
++    finally:
++        db.close()
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 7fbd5d9fe64..d6f1956db61 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -725,7 +725,6 @@ def _kb_stray_delegate_keys(session: dict, session_key: str) -> tuple:
+ def _kb_reclaim_stray_subs(_kbn, slug: str, session_key: str, stray: tuple) -> bool:
+     """Re-key ``tui`` subscriptions bound to this session's own subagents back onto it. True when the board is
+     clean afterwards (nothing to move, or moved); False on a DB error so the caller retries next poll."""
+-    import sqlite3
+     from hermes_cli import kanban_db_connect as _kbc
+     try:
+         if not any(_kbn.count_notify_subs(board=slug, platform="tui", chat_id=k) for k in stray):
+@@ -733,7 +732,8 @@ def _kb_reclaim_stray_subs(_kbn, slug: str, session_key: str, stray: tuple) -> b
+         with contextlib.closing(_kbc.connect(board=slug)) as conn:
+             _kbn.retarget_notify_subs(conn, platform="tui", from_chat_ids=stray, to_chat_id=session_key)
+         return True
+-    except sqlite3.Error as exc:  # busy/locked board: the caller retries next poll
++    except Exception as exc:  # corruption, permissions and archival races also retry without dropping other boards
++        logger.debug("Kanban stray-subscription reclaim failed on %s", slug, exc_info=True)
+         _notif_log_failure(f"kanban stray-subscription reclaim failed on {slug}", exc)
+         return False
+ 
+-- 
+2.55.0
+

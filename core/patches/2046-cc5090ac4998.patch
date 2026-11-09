@@ -1,0 +1,366 @@
+From cc5090ac4998bdc0bde7b8a00104d7e618f94c1c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:16:35 +0000
+Subject: [PATCH] fix(profiles): prevent plugin checks resurrecting retired
+ homes [daveey]
+
+---
+ Dockerfile                                    |  2 +
+ hermes_cli/plugins_cadence.py                 | 21 ++++++-
+ hermes_constants.py                           | 11 +++-
+ pm/filesystem.py                              |  5 +-
+ pm/receipt.py                                 | 12 ++--
+ .../test_plugins_cadence_retirement.py        | 61 +++++++++++++++++++
+ tests/pm/test_activation_setup.py             |  2 +-
+ tests/pm/test_bootstrap_import_closure.py     |  5 ++
+ tests/pm/test_cold_runtime_e2e.py             |  2 +-
+ tests/pm/test_receipt_profile_retirement.py   | 32 ++++++++++
+ tests/pm/test_startup_recovery.py             |  2 +-
+ tests/test_named_profile_mkdir_retirement.py  | 30 +++++++++
+ 12 files changed, 171 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_plugins_cadence_retirement.py
+ create mode 100644 tests/pm/test_receipt_profile_retirement.py
+ create mode 100644 tests/test_named_profile_mkdir_retirement.py
+
+diff --git a/Dockerfile b/Dockerfile
+index bfd2d842687..bc236e853c7 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -209,6 +209,8 @@ COPY pm/ pm/
+ # `python3 -m pm.cli install` fails with "No module named
+ # 'hermes_constants'" without it on the path. Copy the module next to pm.
+ COPY hermes_constants.py hermes_constants.py
++# Receipt writers use the profile-safe mkdir and its stdlib-only ACL helper.
++COPY hermes_dir_acl.py hermes_dir_acl.py
+ # PM imports the shared stdlib locking owner before deps exist.
+ COPY hermes_cli/__init__.py hermes_cli/runtime_state.py hermes_cli/
+ COPY scripts/bundles/payload.py scripts/bundles/payload.py
+diff --git a/hermes_cli/plugins_cadence.py b/hermes_cli/plugins_cadence.py
+index c18f7893a69..00c818754d9 100644
+--- a/hermes_cli/plugins_cadence.py
++++ b/hermes_cli/plugins_cadence.py
+@@ -92,8 +92,10 @@ def cached_git_updates(install_metadata: dict) -> dict[str, str]:
+ 
+ def _markers_dir() -> Path:
+     """The markers dir, created on demand — WRITE paths only."""
++    from hermes_constants import mkdir_under_hermes_home
++
+     d = _marker_path().parent
+-    d.mkdir(parents=True, exist_ok=True)
++    mkdir_under_hermes_home(d)
+     return d
+ 
+ 
+@@ -173,6 +175,12 @@ def run_scheduled_check(
+ 
+     if log is None:
+         log = logging.getLogger(__name__)
++    from hermes_constants import assert_named_profile_home_live, get_hermes_home
++
++    try:
++        assert_named_profile_home_live(get_hermes_home())
++    except FileNotFoundError:
++        return None
+     if not check_due(now=now, config_get=config_get):
+         return None
+     if not _tick_lock.acquire(blocking=False):
+@@ -274,6 +282,12 @@ def _run_check_locked(
+     # reviewed sha, tracked git pulls), scan-gated by the update path itself, which also refuses a
+     # widened catalog pin or a too-new requires_hermes without a terminal. Pinned/manual/drift/pip
+     # are never auto-applied (their update_available is False/None or their class excludes it).
++    from hermes_constants import assert_named_profile_home_live, get_hermes_home
++
++    try:
++        assert_named_profile_home_live(get_hermes_home())
++    except FileNotFoundError:
++        return results
+     if apply_updates_fn and updates and auto_apply_enabled(config_get):
+         _auto_apply(updates, checked_installs, apply_updates_fn, log)
+ 
+@@ -313,9 +327,10 @@ def maybe_run_gateway_check(
+     costs one warning and a stamped marker — never an apply.
+     """
+     if plugins_dir is None:
+-        from hermes_cli import plugins_cmd
++        from hermes_constants import get_hermes_home
+ 
+-        plugins_dir = plugins_cmd._plugins_dir()
++        # A read-only background check must not create a home from a stale served-profile list.
++        plugins_dir = get_hermes_home() / "plugins"
+     if run_checks_fn is None:
+         # ONE shared network-default implementation — plugins_updates
+         # owns default_fetch / default_ls_remote / _default_pypi_latest;
+diff --git a/hermes_constants.py b/hermes_constants.py
+index da0aba5d343..445bc78a318 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -470,7 +470,16 @@ def mkdir_under_hermes_home(path: str | Path) -> Path:
+     # closure that creates home dirs, and a missing copy fails loudly instead of silently skipping the
+     # elevated grant (tests/pm/test_bootstrap_import_closure.py).
+     from hermes_dir_acl import make_user_dir
+-    make_user_dir(target, parents=True, exist_ok=True)
++    home = named_profile_home(target)
++    if home is None:
++        make_user_dir(target, parents=True, exist_ok=True)
++    else:
++        # The profile can disappear after the liveness check. Never recursively create its
++        # ancestors: each mkdir below an existing named home must fail if rename/delete won.
++        current = home
++        for part in target.relative_to(home).parts:
++            current = current / part
++            make_user_dir(current, exist_ok=True)
+     return target
+ 
+ 
+diff --git a/pm/filesystem.py b/pm/filesystem.py
+index 4066809a410..d4843f7d6f5 100644
+--- a/pm/filesystem.py
++++ b/pm/filesystem.py
+@@ -166,9 +166,10 @@ def file_digest(path: Path) -> str | None:
+     return hashlib.sha256(data).hexdigest() if data is not None else None
+ 
+ 
+-def durable_write_bytes(path: Path, data: bytes) -> None:
++def durable_write_bytes(path: Path, data: bytes, *, create_parent: bool = True) -> None:
+     """Replace ``path`` atomically and fsync file and directory so a crash keeps old or new bytes."""
+-    path.parent.mkdir(parents=True, exist_ok=True)
++    if create_parent:
++        path.parent.mkdir(parents=True, exist_ok=True)
+     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".publish-")
+     try:
+         with os.fdopen(fd, "wb") as stream:
+diff --git a/pm/receipt.py b/pm/receipt.py
+index 95df41457ac..b5a1f9ed7d7 100644
+--- a/pm/receipt.py
++++ b/pm/receipt.py
+@@ -298,17 +298,19 @@ def _receipt_name(data: dict[str, Any]) -> str:
+ 
+ def _write_rotated(data: dict[str, Any]) -> Path:
+     """Use the same stdlib-only atomic writer as PM's installed facts."""
+-    from pm.filesystem import lock_fd
+-    from pm.lock import _write
++    from hermes_constants import mkdir_under_hermes_home
++    from pm.filesystem import durable_write_bytes, lock_fd
+ 
+     d = _receipt_dir()
+-    d.mkdir(parents=True, exist_ok=True)
++    mkdir_under_hermes_home(d)
+     path = d / _receipt_name(data)
+     # Concurrent completions share latest.json; serialize its replacement.
+     with (d / ".pm-write.lock").open("a+b") as lock:
+         lock_fd(lock.fileno(), wait=True)
+-        _write(path, data)
+-        _write(d / "latest.json", data)
++        payload = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
++        # Retirement can race any write, including the second (latest) publication.
++        durable_write_bytes(path, payload, create_parent=False)
++        durable_write_bytes(d / "latest.json", payload, create_parent=False)
+         _rotate(d)
+     return path
+ 
+diff --git a/tests/hermes_cli/test_plugins_cadence_retirement.py b/tests/hermes_cli/test_plugins_cadence_retirement.py
+new file mode 100644
+index 00000000000..46c04c4bf24
+--- /dev/null
++++ b/tests/hermes_cli/test_plugins_cadence_retirement.py
+@@ -0,0 +1,61 @@
++"""Background plugin checks must not recreate renamed/deleted profile homes."""
++
++import shutil
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import plugins_cadence as cadence
++from hermes_cli.plugins_updates import CheckResult
++from hermes_constants import set_hermes_home_override, reset_hermes_home_override, mark_named_profile_deleted
++from pm import receipt
++
++
++@contextmanager
++def hermes_home_override(home):
++    token = set_hermes_home_override(home)
++    try:
++        yield
++    finally:
++        reset_hermes_home_override(token)
++
++
++@pytest.mark.parametrize("when", ["before", "during", "live"])
++@pytest.mark.parametrize("retirement", ["rename", "delete", "tombstone"])
++def test_gateway_check_respects_profile_retirement(tmp_path, monkeypatch, when, retirement):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    home = tmp_path / "profiles" / "gamma"
++    home.mkdir(parents=True)
++    (home / "config.yaml").write_text("plugins:\n  auto_apply: true\n")
++    calls, applied = [], []
++
++    def retire():
++        if retirement == "rename":
++            home.rename(home.with_name("delta"))
++        elif retirement == "delete":
++            shutil.rmtree(home)
++        else:
++            mark_named_profile_deleted(home)
++
++    def checks(directory):
++        calls.append(directory)
++        if when == "during":
++            retire()
++        return [CheckResult("plug", "git", update_available=True)]
++
++    monkeypatch.setattr(cadence, "_default_config_get", lambda s, k: True if k == "auto_apply" else 24)
++    with hermes_home_override(home):
++        if when == "before":
++            retire()
++        cadence.maybe_run_gateway_check(run_checks_fn=checks, apply_updates_fn=applied.append)
++        if when == "live":
++            saved = receipt.latest()
++            assert saved is not None and saved["outcome"] == "updates-available"
++            assert (home / "plugin-update-checks" / "last-run").is_file()
++            assert (home / "plugin-update-checks" / "results.json").is_file()
++        else:
++            assert calls == ([] if when == "before" else [home / "plugins"])
++            assert not (home / "plugin-update-checks").exists()
++            assert not (home / "logs").exists()
++            assert home.exists() == (retirement == "tombstone")
++        assert applied == (["plug"] if when == "live" else [])
+diff --git a/tests/pm/test_activation_setup.py b/tests/pm/test_activation_setup.py
+index dafdbbe9014..594f122424e 100644
+--- a/tests/pm/test_activation_setup.py
++++ b/tests/pm/test_activation_setup.py
+@@ -61,7 +61,7 @@ def test_activation_real_setup_pm_lifecycle(tmp_path, served):
+         "UV_CACHE_DIR": str(home / ".cache" / "uv"), "UV_PYTHON_DOWNLOADS": "never",
+     }
+     for name in ("activate", "setup-hermes.sh", "hermes_constants.py", "hermes_yaml.py", "utils.py",
+-                 "scripts/_activation.sh"):
++                 "hermes_dir_acl.py", "scripts/_activation.sh"):
+         (core / name).parent.mkdir(parents=True, exist_ok=True)
+         shutil.copy2(REPO / name, core / name)
+     for name in ("pm", "hermes_cli"):
+diff --git a/tests/pm/test_bootstrap_import_closure.py b/tests/pm/test_bootstrap_import_closure.py
+index e2ac0a875c5..154e3d57f03 100644
+--- a/tests/pm/test_bootstrap_import_closure.py
++++ b/tests/pm/test_bootstrap_import_closure.py
+@@ -14,6 +14,7 @@ def test_minimal_bootstrap_closure_reaches_pm_paths_and_locks(tmp_path):
+     stage = tmp_path / "stage"
+     shutil.copytree(repo / "pm", stage / "pm", ignore=shutil.ignore_patterns("__pycache__"))
+     shutil.copy2(repo / "hermes_constants.py", stage / "hermes_constants.py")
++    shutil.copy2(repo / "hermes_dir_acl.py", stage / "hermes_dir_acl.py")
+     (stage / "hermes_cli").mkdir()
+     for name in ("__init__.py", "runtime_state.py"):
+         shutil.copy2(repo / "hermes_cli" / name, stage / "hermes_cli" / name)
+@@ -30,6 +31,10 @@ with Store(root).install_lock():
+     facts = Facts(root / 'facts.json')
+     facts.record_state('probe', 'checked', [])
+ assert facts.path.is_file()
++from pm import receipt
++token = receipt.begin('plugin-check')
++assert receipt.finalize('ok', token=token).is_file()
++assert receipt.latest()['outcome'] == 'ok'
+ print(root)
+ """
+     result = subprocess.run([sys.executable, "-S", "-c", script], cwd=stage, env=env,
+diff --git a/tests/pm/test_cold_runtime_e2e.py b/tests/pm/test_cold_runtime_e2e.py
+index 6d54429edbd..4e05acd8438 100644
+--- a/tests/pm/test_cold_runtime_e2e.py
++++ b/tests/pm/test_cold_runtime_e2e.py
+@@ -102,7 +102,7 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
+         shutil.copytree(source / name, repo / name,
+                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+     for name in ("utils.py", "hermes_constants.py", "hermes_yaml.py",
+-                 "hermes_bootstrap.py"):
++                 "hermes_bootstrap.py", "hermes_dir_acl.py"):
+         shutil.copy2(source / name, repo / name)
+     # No production application lock or metadata enters this source snapshot.
+     recipe = tomllib.loads((repo / "pm" / "pyproject.toml").read_text())
+diff --git a/tests/pm/test_receipt_profile_retirement.py b/tests/pm/test_receipt_profile_retirement.py
+new file mode 100644
+index 00000000000..224a9049614
+--- /dev/null
++++ b/tests/pm/test_receipt_profile_retirement.py
+@@ -0,0 +1,32 @@
++"""Receipt publication never recreates a named home removed between writes."""
++
++import pytest
++
++from pm import receipt
++
++
++@pytest.mark.platforms("posix")  # Windows cannot rename a directory holding this open lock file.
++@pytest.mark.parametrize("publication", [1, 2])
++def test_receipt_profile_rename_during_publication(tmp_path, monkeypatch, publication):
++    from pm import filesystem
++
++    home = tmp_path / "profiles" / "gamma"
++    home.mkdir(parents=True)
++    (home / "config.yaml").write_text("{}")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    original = filesystem.durable_write_bytes
++    writes = []
++
++    def write(path, data, **kwargs):
++        writes.append(path)
++        if len(writes) == publication:
++            home.rename(home.with_name("delta"))
++        return original(path, data, **kwargs)
++
++    monkeypatch.setattr(filesystem, "durable_write_bytes", write)
++    token = receipt.begin("plugin-check")
++    assert receipt.finalize("ok", token=token) is None
++    assert len(writes) == publication
++    assert not home.exists()
++    assert receipt.snapshot() is None
++    assert (home.with_name("delta") / "config.yaml").is_file()
+diff --git a/tests/pm/test_startup_recovery.py b/tests/pm/test_startup_recovery.py
+index 567cea4d31f..be0b1c5816d 100644
+--- a/tests/pm/test_startup_recovery.py
++++ b/tests/pm/test_startup_recovery.py
+@@ -44,7 +44,7 @@ def test_bootstrap_repairs_before_dependency_activation(tmp_path, monkeypatch, m
+     core.mkdir()
+     home = tmp_path / "home"
+     home.mkdir()
+-    for name in ("hermes_bootstrap.py", "hermes_constants.py"):
++    for name in ("hermes_bootstrap.py", "hermes_constants.py", "hermes_dir_acl.py"):
+         shutil.copy2(repo / name, core / name)
+     shutil.copytree(repo / "pm", core / "pm", ignore=shutil.ignore_patterns("__pycache__"))
+     cli = core / "hermes_cli"
+diff --git a/tests/test_named_profile_mkdir_retirement.py b/tests/test_named_profile_mkdir_retirement.py
+new file mode 100644
+index 00000000000..e65a4fd15d8
+--- /dev/null
++++ b/tests/test_named_profile_mkdir_retirement.py
+@@ -0,0 +1,30 @@
++"""A profile disappearing after the liveness check must not be recreated by mkdir."""
++
++import pytest
++
++from hermes_constants import mkdir_under_hermes_home
++
++
++@pytest.mark.parametrize("depth", [1, 2])
++def test_named_home_rename_during_child_mkdir(tmp_path, monkeypatch, depth):
++    import hermes_dir_acl
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    home = tmp_path / "profiles" / "gamma"
++    home.mkdir(parents=True)
++    (home / "config.yaml").write_text("{}")
++    target = home / "logs" / "update_receipts"
++    original = hermes_dir_acl.make_user_dir
++    calls = []
++
++    def mkdir(path, **kwargs):
++        calls.append(path)
++        if len(calls) == depth:
++            home.rename(home.with_name("delta"))
++        return original(path, **kwargs)
++
++    monkeypatch.setattr(hermes_dir_acl, "make_user_dir", mkdir)
++    with pytest.raises(FileNotFoundError):
++        mkdir_under_hermes_home(target)
++    assert not home.exists()
++    assert (home.with_name("delta") / "config.yaml").is_file()
+-- 
+2.55.0
+

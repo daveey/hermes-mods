@@ -1,0 +1,145 @@
+From de81fa41ab7b70362b35066f0ce390964acb575c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 02:07:42 +0000
+Subject: [PATCH] [daveey] Classify the owner seed on worker and gateway
+ session stores
+
+2b74fc45ece moved the reserved child's first-turn merge from
+patch_session_model_config to seed_session_model_config. The agent-loop
+surface scans then found a new SessionDB call that neither adapter
+classified:
+
+- RuntimeSessionStore lacked the method. Seeding fills missing
+  model_config keys, which on a worker's owner-reserved row are owner
+  routing/lineage/policy keys; the worker's only model_config writes are
+  sidecar patches and the constructor set worker_create validates. The
+  seed is now a scope-checked no-op: nothing journaled, no failure
+  latched, another session refused (permission_denied). This keeps the
+  adopted-row probe (_seed_adopted_row_model_config) silent, as before.
+- GatewaySessionStore refused it through __getattr__, so a reserved
+  child on the gateway CLI store would fail _ensure_db_session after the
+  no-op create and retry creation every turn. It is gateway-owned like
+  create_session and patch_session_model_config.
+
+Root (not caught): 2b74fc45ece ran the delegate readiness tests but not
+the adapter surface scans that classify every agent-loop _session_db
+call; both new behavioural tests failed before this change.
+---
+ agent/runtime_session_store.py                |  8 ++++
+ hermes_cli/gateway_session_store.py           |  3 ++
+ ...st_runtime_session_store_surface_parity.py | 39 +++++++++++++++++++
+ .../hermes_cli/test_gateway_session_store.py  | 21 ++++++++++
+ 4 files changed, 71 insertions(+)
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index e94cf914009..b996b899c6e 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -625,6 +625,14 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+             raise WorkerPersistenceError('invalid_params')
+         self._apply('session.sidecars', {'patch': patch})
+ 
++    def seed_session_model_config(self, session_id, defaults):
++        # [daveey] Seeding fills keys the row lacks: on a worker's row, which the owner reserved with
++        # its routing, lineage and policy config, that is an owner write. A worker's model_config writes
++        # are sidecar patches and, for a reserved child, the constructor set ``worker_create`` validates
++        # on ``session.create``; so a seed journals and writes nothing (the agent probes it on adopted
++        # rows, where a refusal would only log), and another session's row is refused as for any write.
++        self._session(session_id)
++
+     def update_session_tool_names(self, session_id, pin):
+         # The tools[] freeze pin ({"version", "tools"[, "delegation_backend"]}; None clears): without it every
+         # fresh worker re-probes check_fns and a config flip between turns silently forks the cached prefix.
+diff --git a/hermes_cli/gateway_session_store.py b/hermes_cli/gateway_session_store.py
+index a783abd3e91..05dad142c9c 100644
+--- a/hermes_cli/gateway_session_store.py
++++ b/hermes_cli/gateway_session_store.py
+@@ -45,6 +45,9 @@ _GATEWAY_OWNED = frozenset({
+     "update_session_model", "patch_session_model_config", "maybe_auto_archive",
+     "maybe_auto_prune_and_vacuum", "set_meta", "update_token_counts", "close",
+     "update_system_prompt",  # [daveey] the gateway builds, persists and refreshes the prompt
++    # [daveey] the gateway's own agent seeds its row; create_session above is a no-op here too, so a
++    # reserved child's first-turn seed must not refuse and leave its row creation retrying.
++    "seed_session_model_config",
+ })
+ # [daveey] Agent-loop SessionDB methods this store refuses on purpose: name -> why. The parity test
+ # requires every ``_session_db`` call in the agent loop to be in one of these sets, so a new call
+diff --git a/tests/agent/test_runtime_session_store_surface_parity.py b/tests/agent/test_runtime_session_store_surface_parity.py
+index 60d81f292a3..f52eece3470 100644
+--- a/tests/agent/test_runtime_session_store_surface_parity.py
++++ b/tests/agent/test_runtime_session_store_surface_parity.py
+@@ -127,3 +127,42 @@ def test_lease_key_answers_only_inside_the_workers_lineage(tmp_path):
+             store.close()
+     finally:
+         db.close()
++
++
++def test_seed_is_an_owner_write_the_worker_never_journals(tmp_path, caplog):
++    """[daveey] ``seed_session_model_config`` fills keys the row lacks, which on a worker's row means
++    owner-reserved routing/lineage config: the store writes nothing, journals nothing, latches no failure,
++    and refuses another session's row. The adopted-row path that probes it stays silent."""
++    import logging
++    import types
++
++    from agent.runtime_session_store import WorkerPersistenceError
++    from agent.turn_facade_lease import _seed_adopted_row_model_config
++
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        db.create_session('s', 'cli', model_config={'model_routing': {'class': 'c'}})
++        db.create_session('other', 'cli')
++        store = _worker_store(db, tmp_path)
++        try:
++            before = json.loads(db.get_session('s')['model_config'])
++            sequence = store.journal['next_sequence']
++            seed = {'max_iterations': 3, '_delegate_from': 'forged', 'model_routing': None}
++            assert store.seed_session_model_config('s', seed) is None
++            agent = types.SimpleNamespace(_persist_disabled=False, _session_row_model_config=lambda: seed)
++            with caplog.at_level(logging.WARNING, logger='agent.turn_facade_lease'):
++                _seed_adopted_row_model_config(agent, store, 's')
++            assert not [r for r in caplog.records if 'adopted session row' in r.getMessage()]
++            assert json.loads(db.get_session('s')['model_config']) == before
++            assert store.journal['next_sequence'] == sequence and store.journal['pending'] == []
++            assert store.failure is None
++            with pytest.raises(WorkerPersistenceError, match='permission_denied'):
++                store.seed_session_model_config('other', {'max_iterations': 3})
++            assert json.loads(db.get_session('other')['model_config'] or '{}') == {}
++            # The store still writes sidecars afterwards: seeding latched nothing.
++            store.patch_session_model_config('s', {'prompt_refresh_epoch': 5})
++            assert json.loads(db.get_session('s')['model_config']) == {**before, 'prompt_refresh_epoch': 5}
++        finally:
++            store.close()
++    finally:
++        db.close()
+diff --git a/tests/hermes_cli/test_gateway_session_store.py b/tests/hermes_cli/test_gateway_session_store.py
+index 4fbe5182d80..13435dc03aa 100644
+--- a/tests/hermes_cli/test_gateway_session_store.py
++++ b/tests/hermes_cli/test_gateway_session_store.py
+@@ -1006,3 +1006,24 @@ def test_every_session_db_call_in_the_agent_loop_is_classified_by_the_store():
+         "Classify these SessionDB calls in hermes_cli/gateway_session_store.py "
+         f"(_READS / _GATEWAY_OWNED / _COUNTED_REPAIRS / _REFUSED_BY_DESIGN): {unclassified}")
+     assert all(isinstance(why, str) and why for why in gss._REFUSED_BY_DESIGN.values())
++
++
++def test_reserved_child_first_turn_seed_is_gateway_owned(store, monkeypatch):
++    """[daveey] A reserved child's first turn seeds its constructor config after ``create_session``;
++    the gateway owns both writes, so the seed is a no-op (no gateway call) and the row counts as
++    created instead of refusing and retrying creation every turn."""
++    import types
++
++    from run_agent import AIAgent
++
++    db, client = store
++    before = len(client.calls)
++    assert db.seed_session_model_config("child", {"max_iterations": 2}) is None
++    agent = types.SimpleNamespace(
++        _persist_disabled=False, _session_db_created=False, _session_db=db, _session_db_reserved=True,
++        platform="cli", session_id="child", model="m", _cached_system_prompt="p", _parent_session_id="parent",
++        _session_row_model_config=lambda: {"_delegate_from": "parent", "max_iterations": 2},
++    )
++    AIAgent._ensure_db_session(agent)
++    assert agent._session_db_created is True
++    assert len(client.calls) == before
+-- 
+2.55.0
+
