@@ -875,10 +875,61 @@ def laptop_job(reply: str) -> Optional[str]:
     return None
 
 
+# ---- skipped_live: the reply admits live state went unchecked while no other live route was tried ---------------------
+# (self-heal agent-8a0b79e7c4: a hub reply asked the user to approve a plan that hinged on live state and said "I didn't
+# check the live state: this machine has no AWS access to the <X> account". True for AWS, but the hub browser was
+# signed in to the product's console, which listed every owner; one plan step turned out moot.) Deterministic, before
+# the judge: an admission outside code/quotes, and no browser, `gh run` log, web fetch or curl call this turn.
+_SL_ADMIT_RE = re.compile(
+    r"\b(?:did(?:n[\u2019']t|\s+not)|could(?:n[\u2019']t|\s+not)|have(?:n[\u2019']t|\s+not)|has(?:n[\u2019']t|\s+not)"
+    r"|was(?:n[\u2019']t|\s+not)\s+able\s+to|can(?:not|[\u2019']t)|unable\s+to)\s+(?:yet\s+|actually\s+)?"
+    r"(?:check(?:ed)?|verif(?:y|ied)|confirm(?:ed)?|read|query|queried|look(?:ed)?\s+at|see(?:n)?)\b[^.\n]{0,60}?"
+    r"\b(?:live|current|production|prod|actual|real)\s+(?:state|status|data|numbers|counts?|config(?:uration)?)\b"
+    # "no access to" only with the agent's own side as subject: "Matt has no access to the repo", "the service has no
+    # access to the account" (a design) and "I changed nothing: ... no access to the boards" are not admissions
+    # (backtest 2026-11-09, 14 days of hub replies).
+    r"|\b(?:I|we|this\s+(?:machine|host|hub|worker|box|gateway|session|sandbox)|the\s+hub(?:\s+worker)?|hub|here)"
+    r"\s+(?:still\s+|also\s+)?(?:has|have|had|got)\s+no\s+(?:AWS\s+|live\s+|read\s+|SSH\s+|console\s+)?access\s+to\b",
+    re.I)
+# A sentence that hands the work to a card, or says the change isn't live yet (nothing to read back), is not a skip.
+_SL_EXCUSED_RE = re.compile(r"\bt_[0-9a-f]{8,}\b|\bhanded\b|\bunmerged\b|\bnot\s+(?:yet\s+)?(?:merged|installed|deployed)\b"
+                            r"|\bisn[\u2019']t\s+(?:yet\s+)?(?:merged|installed|deployed)\b", re.I)
+# A live route this turn: a browser (tool, deferred tool_call or chrome-devtools), a web fetch, `gh run` logs, curl.
+_SL_ROUTE_RE = re.compile(
+    r"^\s*->\s*(?:browser_\w+|mcp__chrome_devtools__\w+|web_extract|tailnet_exec)\("
+    r"|[\"']name[\"']\s*:\s*[\"'](?:browser_\w+|mcp__chrome_devtools__\w+|web_extract|tailnet_exec)[\"']"
+    r"|^\s*->\s*(?:terminal|execute_code)\(.*(?:\bgh\s+run\s+(?:view|list|watch)\b|\bcurl\b|\bwget\b|\bweb_extract\b"
+    r"|\bbrowser_exec\b)", re.I | re.S)
+# The reply already names the routes it tried (the nudge's second exit).
+_SL_TRIED_RE = re.compile(r"\btried\b[^\n]{0,200}?\b(?:browser|console|dashboard|gh\s+run|Actions|web|curl|API|"
+                          r"Chrome|logs?|tailnet)\b", re.I)
+_SL_META_RE = re.compile(r"\bskipped_live\b", re.I)
+SKIPPED_LIVE_NUDGE = (
+    "[coach] skipped_live: your reply says live state went unchecked (\"{evidence}\"), but this turn tried no other "
+    "route to it: no browser, no `gh run view --log`, no web fetch, no tailnet_exec. A missing AWS profile, SSH key or "
+    "account reach is not "
+    "\"no access\". Try the task skill's no-profile routes first (the hub browser is signed in to several consoles; "
+    "deploy/infra job logs hold live numbers) and answer from what they show, especially before asking the user to "
+    "approve a plan that depends on that state. If none works, name each route you tried and what it returned.")
+
+
+def skipped_live(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The admission phrase when the reply says it skipped live state and the turn tried no live route, else None
+    (code spans, quotes, `>` lines and replies naming the routes they tried are ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _SL_META_RE.search(text) or _SL_TRIED_RE.search(text):
+        return None
+    s = next((s for s in _SENTENCE_END.split(text) if _SL_ADMIT_RE.search(s) and not _SL_EXCUSED_RE.search(s)), None)
+    if not s or any(_SL_ROUTE_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return s.strip(" -*\t")
+
+
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-         "laptop_job")
+         "laptop_job", "skipped_live")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-                 "laptop_job")
+                 "laptop_job", "skipped_live")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -2118,6 +2169,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "laptop_job", "p": 1.0, "evidence": phrase, "reason": "laptop_job",
                     "verdict": {"laptop_job": 1.0, "evidence": phrase},
                     "nudge": LAPTOP_JOB_NUDGE.format(evidence=phrase[:160])}
+    if not only or "skipped_live" in only:
+        phrase = skipped_live(reply, tool_log)
+        if phrase:  # deterministic: live state admitted unchecked while no browser/gh-run/web route was tried
+            return {"rule": "skipped_live", "p": 1.0, "evidence": phrase, "reason": "skipped_live",
+                    "verdict": {"skipped_live": 1.0, "evidence": phrase},
+                    "nudge": SKIPPED_LIVE_NUDGE.format(evidence=phrase[:160])}
     if (not only or "report_only" in only) and not scoped:
         closed = card_closed(tool_log)
         tail = CARD_CLOSED_TAIL if closed else ""
@@ -2321,7 +2378,8 @@ def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[
 # `python3 reply_check.py backtest credit_ask --days 14` prints every assistant reply in state.db (and every held draft in
 # <coach>/drafts.jsonl) that the rule would hold, so a regex change is measured against real replies, not hand-picked
 # strings (self-heal agent-ddabb16633: three credit_ask false-positive repairs in 3 days, each fixing one phrase).
-BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job": laptop_job}
+BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job": laptop_job,
+                        "skipped_live": lambda r: skipped_live(r, [])}
 
 
 def backtest(rule: str, days: float, db=None, drafts=None) -> list:
