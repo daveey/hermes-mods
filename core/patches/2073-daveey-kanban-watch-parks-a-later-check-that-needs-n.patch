@@ -1,0 +1,656 @@
+From 081be082652487cb6ab42676880d947c9772826f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:30:51 +0000
+Subject: [PATCH] [daveey] kanban: watch parks, a later check that needs
+ nothing from the chat stops holding it open (self-heal watch-park)
+
+Add watch parks that release chat hold counts while retaining subscriptions.
+
+---
+ hermes_cli/kanban_db_schedule.py              |   5 +-
+ hermes_cli/kanban_session_activity.py         |  65 +-------
+ .../kanban_session_activity_card_details.py   |  59 +++++++
+ hermes_cli/kanban_watch.py                    | 123 +++++++++++++++
+ tests/tools/test_kanban_watch_park.py         | 145 ++++++++++++++++++
+ tools/kanban_tools.py                         |  45 ++----
+ tools/kanban_tools_park_args.py               |  26 ++++
+ tools/kanban_tools_schemas.py                 |   5 +
+ 8 files changed, 386 insertions(+), 87 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity_card_details.py
+ create mode 100644 hermes_cli/kanban_watch.py
+ create mode 100644 tests/tools/test_kanban_watch_park.py
+
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index baa3d67adbb..ad4d8c581c6 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -16,7 +16,7 @@ def schedule_task(
+     check_every: Optional[int] = None, clock_only: bool = False, awaiting: Any = None,
+     clear_blocker: bool = False, comment: Optional[tuple[str, str]] = None,
+     blocker_id: Optional[str] = None, blocker_provider: Optional[str] = None,
+-    blocker_model: Optional[str] = None, blocker_lane: Optional[str] = None,
++    blocker_model: Optional[str] = None, blocker_lane: Optional[str] = None, watch: bool = False,
+ ) -> bool:
+     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
+     (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
+@@ -28,6 +28,7 @@ def schedule_task(
+ 
+     ``comment`` (``(author, body)``) is written in the same txn and only when the park lands
+     (``kanban_reason_comment``); ``human_answer_refusal`` explains the human-answer refusal.
++    ``watch`` stamps the park a watch (``kanban_watch``): it does not hold its chat open while parked.
+     Triage parks reset the dispatcher failure streak without an intermediate dispatchable
+     status; block-loop recurrence evidence is retained, as on unblock."""
+     from hermes_cli.kanban_reason_comment import reason_comment
+@@ -52,6 +53,8 @@ def schedule_task(
+         payload["wake_at"], reason = kdw.apply(record, payload["wake_at"], reason, now=int(_time.time()))
+         reason, check_every = kaw.resource_apply(record, reason, check_every)
+         payload["reason"] = reason
++        if watch:
++            payload["watch"] = True
+         wake_check, check_every = kwc.validate_park(
+             wake_at=payload["wake_at"], wake_check=wake_check,
+             check_every=check_every, clock_only=clock_only)
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index e5bdf70448b..ff9b6164dbe 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -34,10 +34,11 @@ from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbe
+ from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases, _moved_evidence, _retire_moved
+ from hermes_cli.kanban_session_activity_attention import AttentionCache as _AttentionCache
+ from hermes_cli.kanban_session_activity_attention import run_checks as _run_done_checks
++from hermes_cli.kanban_session_activity_card_details import _add_card_details
++from hermes_cli.kanban_watch import not_watch_sql as _not_watch
+ import contextlib
+ import json
+ import logging
+-import re
+ import os
+ import sqlite3
+ import threading
+@@ -140,7 +141,7 @@ def _status_filter(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> tuple
+     parked = "t.status IN ('blocked', 'triage')"
+     if statuses == BLOCKED_STATUSES:
+         return f"({parked} AND {human})", ()
+-    return f"(t.status IN ({ph}) OR ({parked} AND NOT {human}))", statuses
++    return f"((t.status IN ({ph}) OR ({parked} AND NOT {human})) AND {_not_watch(conn)})", statuses  # [daveey]
+ 
+ 
+ def _stored_needs_human(value, kind) -> bool:
+@@ -384,7 +385,7 @@ def _parked_pairs(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+     """(session, task) for every parked card (scheduled/blocked/triage) a session created or shepherds."""
+     if "session_id" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
+         return set()
+-    parked = "t.status IN ('scheduled', 'blocked', 'triage')"
++    parked = f"(t.status IN ('scheduled', 'blocked', 'triage') AND {_not_watch(conn)})"  # watch: kanban_watch
+     pairs: set[tuple[str, str]] = {
+         (str(sid), str(tid)) for sid, tid in conn.execute(
+             f"SELECT session_id, id FROM tasks t WHERE session_id IS NOT NULL AND session_id != '' AND {parked}")}
+@@ -1552,15 +1553,16 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone():
+             run_start = "(SELECT r.started_at FROM task_runs r WHERE r.id = t.current_run_id)"
+         found: dict[str, dict[str, Any]] = {}
++        watch = _not_watch(conn)  # [daveey] a watch park is not the chat's open card (close-out gate)
+         for row in conn.execute(
+                 f"SELECT {select}, {run_start} AS current_run_started_at FROM tasks t "
+-                f"WHERE t.session_id IN ({sid_ph}) AND t.status IN ({st_ph})", (*ids, *statuses)):
++                f"WHERE t.session_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
+             found[row["id"]] = {**dict(row), "via": "created"}
+         try:
+             for row in conn.execute(
+                     f"SELECT {select}, {run_start} AS current_run_started_at FROM kanban_notify_subs s "
+                     f"JOIN tasks t ON t.id = s.task_id WHERE s.platform = 'tui' AND {_counted_sub_clause(conn)} "
+-                    f"AND s.chat_id IN ({sid_ph}) AND t.status IN ({st_ph})", (*ids, *statuses)):
++                    f"AND s.chat_id IN ({sid_ph}) AND t.status IN ({st_ph}) AND {watch}", (*ids, *statuses)):
+                 found.setdefault(row["id"], {**dict(row), "via": "subscribed"})
+         except sqlite3.Error:  # board predates notify subscriptions
+             pass
+@@ -1574,59 +1576,6 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+     return [{**t, "board": board} for t in found.values()]
+ 
+ 
+-_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+-_NOTE_CHARS = 200
+-
+-
+-def _first_line(text: Any) -> str:
+-    line = str(text or "").strip().split("\n", 1)[0].strip()
+-    return line[:_NOTE_CHARS]
+-
+-
+-def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
+-    """Per listed card, what the linked-card rows show: the latest event (``activity_kind``/``activity_at``), a
+-    one-line ``note`` (the newest run summary or comment) and the newest GitHub PR ``pr_url`` found in its
+-    comments, result or run summaries. One query per table for all listed cards; missing tables are skipped."""
+-    if not found:
+-        return
+-    ids = list(found)
+-    ph = ",".join("?" for _ in ids)
+-
+-    def rows(sql: str) -> list[sqlite3.Row]:
+-        try:
+-            return conn.execute(sql, ids).fetchall()
+-        except sqlite3.Error:
+-            return []
+-
+-    for r in rows(f"SELECT task_id, kind, MAX(created_at) AS at FROM task_events WHERE task_id IN ({ph}) GROUP BY task_id"):
+-        found[r["task_id"]].update(activity_kind=r["kind"], activity_at=r["at"])
+-    notes: dict[str, tuple[Any, str]] = {}
+-    prs: dict[str, tuple[Any, str]] = {}
+-
+-    def offer(task_id: str, at: Any, text: Any) -> None:
+-        at = at or 0
+-        line = _first_line(text)
+-        if line and at >= notes.get(task_id, (-1, ""))[0]:
+-            notes[task_id] = (at, line)
+-        for url in _PR_URL_RE.findall(str(text or "")):
+-            if at >= prs.get(task_id, (-1, ""))[0]:
+-                prs[task_id] = (at, url)
+-
+-    for r in rows(f"SELECT task_id, COALESCE(ended_at, started_at) AS at, summary FROM task_runs "
+-                  f"WHERE task_id IN ({ph}) AND summary IS NOT NULL"):
+-        offer(r["task_id"], r["at"], r["summary"])
+-    for r in rows(f"SELECT task_id, created_at AS at, body FROM task_comments WHERE task_id IN ({ph})"):
+-        offer(r["task_id"], r["at"], r["body"])
+-    for r in rows(f"SELECT id AS task_id, completed_at AS at, result FROM tasks WHERE id IN ({ph}) AND result IS NOT NULL"):
+-        for url in _PR_URL_RE.findall(str(r["result"] or "")):
+-            if (r["at"] or 0) >= prs.get(r["task_id"], (-1, ""))[0]:
+-                prs[r["task_id"]] = (r["at"] or 0, url)
+-    for task_id, (_, line) in notes.items():
+-        found[task_id]["note"] = line
+-    for task_id, (_, url) in prs.items():
+-        found[task_id]["pr_url"] = url
+-
+-
+ def _remote_cards(ids: list[str] | None, statuses: tuple[str, ...], stale_ok: bool) -> list[dict[str, Any]]:
+     """Cards on other gateways linked to these chats (``ids`` None = every chat): from the synced chat links in the
+     replicas when ``kanban.sync.links_reader`` is ``replica`` (RFC phase 5), else from the origin-ledger projection.
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+new file mode 100644
+index 00000000000..18b7801cf99
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -0,0 +1,59 @@
++"""Per listed card, what the linked-card rows show (split out of ``kanban_session_activity``). [daveey]"""
++
++from __future__ import annotations
++
++import re
++import sqlite3
++from typing import Any
++
++_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
++_NOTE_CHARS = 200
++
++
++def _first_line(text: Any) -> str:
++    line = str(text or "").strip().split("\n", 1)[0].strip()
++    return line[:_NOTE_CHARS]
++
++
++def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
++    """Per listed card, what the linked-card rows show: the latest event (``activity_kind``/``activity_at``), a
++    one-line ``note`` (the newest run summary or comment) and the newest GitHub PR ``pr_url`` found in its
++    comments, result or run summaries. One query per table for all listed cards; missing tables are skipped."""
++    if not found:
++        return
++    ids = list(found)
++    ph = ",".join("?" for _ in ids)
++
++    def rows(sql: str) -> list[sqlite3.Row]:
++        try:
++            return conn.execute(sql, ids).fetchall()
++        except sqlite3.Error:
++            return []
++
++    for r in rows(f"SELECT task_id, kind, MAX(created_at) AS at FROM task_events WHERE task_id IN ({ph}) GROUP BY task_id"):
++        found[r["task_id"]].update(activity_kind=r["kind"], activity_at=r["at"])
++    notes: dict[str, tuple[Any, str]] = {}
++    prs: dict[str, tuple[Any, str]] = {}
++
++    def offer(task_id: str, at: Any, text: Any) -> None:
++        at = at or 0
++        line = _first_line(text)
++        if line and at >= notes.get(task_id, (-1, ""))[0]:
++            notes[task_id] = (at, line)
++        for url in _PR_URL_RE.findall(str(text or "")):
++            if at >= prs.get(task_id, (-1, ""))[0]:
++                prs[task_id] = (at, url)
++
++    for r in rows(f"SELECT task_id, COALESCE(ended_at, started_at) AS at, summary FROM task_runs "
++                  f"WHERE task_id IN ({ph}) AND summary IS NOT NULL"):
++        offer(r["task_id"], r["at"], r["summary"])
++    for r in rows(f"SELECT task_id, created_at AS at, body FROM task_comments WHERE task_id IN ({ph})"):
++        offer(r["task_id"], r["at"], r["body"])
++    for r in rows(f"SELECT id AS task_id, completed_at AS at, result FROM tasks WHERE id IN ({ph}) AND result IS NOT NULL"):
++        for url in _PR_URL_RE.findall(str(r["result"] or "")):
++            if (r["at"] or 0) >= prs.get(r["task_id"], (-1, ""))[0]:
++                prs[r["task_id"]] = (r["at"] or 0, url)
++    for task_id, (_, line) in notes.items():
++        found[task_id]["note"] = line
++    for task_id, (_, url) in prs.items():
++        found[task_id]["pr_url"] = url
+diff --git a/hermes_cli/kanban_watch.py b/hermes_cli/kanban_watch.py
+new file mode 100644
+index 00000000000..67344a6b675
+--- /dev/null
++++ b/hermes_cli/kanban_watch.py
+@@ -0,0 +1,123 @@
++"""Watch parks: a later check that needs nothing from its chat does not hold the chat open. [daveey]
++
++A card parked ``scheduled`` counts as its chat's open work (``kanban_session_activity.ACTIVE_STATUSES``), so a
++"check this again later" card can keep a chat unfinished although no action is needed (regression
++watch-park). ``kanban_schedule(watch=true)`` stamps the park's ``scheduled`` event ``watch: true``. While the
++card is ``scheduled`` and its newest park event is that watch, the session counts, ``session_tasks`` (the close-out
++gate) and the parked counts leave it out. Nothing else changes: the chat's notify subscription stays, so a later
++block, failure or done still reaches it, and once the card wakes it counts again like any running card.
++
++The flag is sticky: a re-park without ``watch`` keeps the previous park's answer; ``watch=false`` clears it.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from typing import Any, Optional
++
++# A park further out than this, holding an interactive chat, gets the ``chat_hold`` hint.
++HINT_AFTER_S = 24 * 3600
++
++
++def _park_kinds_sql() -> str:
++    from hermes_cli.kanban_wait_info import PARK_EVENT_KINDS
++    return ", ".join(f"'{k}'" for k in PARK_EVENT_KINDS)
++
++
++def watch_park_sql(alias: str = "t") -> str:
++    """SQL predicate: the card (alias ``alias``) is parked ``scheduled`` as a watch."""
++    return (f"({alias}.status = 'scheduled' AND EXISTS (SELECT 1 FROM task_events we WHERE we.id = "
++            f"(SELECT MAX(id) FROM task_events WHERE task_id = {alias}.id AND kind IN ({_park_kinds_sql()})) "
++            f"AND we.kind = 'scheduled' AND CASE WHEN json_valid(we.payload) "
++            f"THEN json_extract(we.payload, '$.watch') ELSE 0 END = 1))")
++
++
++def not_watch_sql(conn: sqlite3.Connection, alias: str = "t") -> str:
++    """``NOT watch_park_sql`` on boards whose ``task_events`` carry park payloads, else ``1`` (no watches)."""
++    try:
++        cols = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++    except sqlite3.Error:
++        cols = set()
++    return f"NOT {watch_park_sql(alias)}" if {"id", "task_id", "kind", "payload"} <= cols else "1"
++
++
++def _last_scheduled(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
++                       "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if not row:
++        return None
++    try:
++        payload = json.loads(row[0]) if row[0] else {}
++    except (TypeError, ValueError):
++        return {}
++    return payload if isinstance(payload, dict) else {}
++
++
++def resolve(conn: sqlite3.Connection, task_id: str, requested: Any) -> bool:
++    """The watch flag for a new park: the explicit ``requested`` bool, else the previous park's."""
++    if requested is not None:
++        return bool(requested)
++    prev = _last_scheduled(conn, task_id)
++    return bool(prev and prev.get("watch") is True)
++
++
++def is_watch(conn: sqlite3.Connection, task_id: str) -> bool:
++    try:
++        return bool(conn.execute(f"SELECT 1 FROM tasks t WHERE t.id = ? AND {watch_park_sql('t')}",
++                                 (task_id,)).fetchone())
++    except sqlite3.Error:
++        return False
++
++
++def held_chats(conn: sqlite3.Connection, task_id: str) -> list[str]:
++    """Interactive chats this card counts as open work for: its creator and its counted ``tui`` subscribers."""
++    from hermes_cli import kanban_db_notify as kbn
++    chats: list[str] = []
++    row = conn.execute("SELECT session_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row and row[0]:
++        chats.append(str(row[0]))
++    try:
++        for (chat, meta) in conn.execute(
++                "SELECT chat_id, delivery_metadata FROM kanban_notify_subs WHERE task_id = ? AND platform = 'tui' "
++                "AND chat_id != ''", (task_id,)):
++            try:
++                reason = (json.loads(meta) or {}).get("reason") if meta else None
++            except (TypeError, ValueError, AttributeError):
++                reason = None
++            if reason != "touch":
++                chats.append(str(chat))
++    except sqlite3.Error:
++        pass
++    chats = [c for c in dict.fromkeys(chats) if not kbn.is_headless_session(c)]
++    if not chats:
++        return []
++    try:
++        from hermes_cli.kanban_origin import gateway_names
++        me = gateway_names()[0]
++        machine = kbn.machine_sessions(me, chats, local_gateway=me) if me else set()
++    except (sqlite3.Error, OSError, ValueError):  # unreadable hub/state db: treat every chat as interactive
++        machine = set()
++    return [c for c in chats if c not in machine and not c.rsplit("/", 1)[-1].startswith("cron_")]
++
++
++def chat_hold_hint(conn: sqlite3.Connection, task_id: str, *, now: Optional[float] = None) -> Optional[str]:
++    """For a non-watch park more than ``HINT_AFTER_S`` out that holds an interactive chat: say which and until when."""
++    payload = _last_scheduled(conn, task_id) or {}
++    if payload.get("watch") is True:
++        return None
++    wake = payload.get("wake_at")
++    now = time.time() if now is None else now
++    if not isinstance(wake, (int, float)) or wake - now <= HINT_AFTER_S:
++        return None
++    chats = held_chats(conn, task_id)
++    if not chats:
++        return None
++    until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(wake))
++    return (f"This keeps chat {', '.join(chats)} unfinished until {until}. If nothing is needed from David "
++            f"before then, re-park it with watch=true.")
++
++
++NOT_RUNNING_TEMPLATE = (
++    "could not complete {tid}: card is {status} with no run; to close it unverified, archive it with a comment; "
++    "to keep the check but free the chat, re-park it with watch=true")
+diff --git a/tests/tools/test_kanban_watch_park.py b/tests/tools/test_kanban_watch_park.py
+new file mode 100644
+index 00000000000..cd72c71afde
+--- /dev/null
++++ b/tests/tools/test_kanban_watch_park.py
+@@ -0,0 +1,145 @@
++"""A ``watch`` park: a later check that needs nothing from the chat does not hold it open. [daveey]
++
++A chat created a card and parked it several days out ("check the example sign-in later") while reporting
++nothing was needed. Scheduled cards count as the chat's open work, so the chat stayed unfinished for days,
++and ``kanban_complete`` on the parked card failed with a vague "stale run" (self-heal watch-park).
++
++``kanban_schedule(watch=true)`` parks the card as a watch: while it waits it is not the chat's open work
++(counts 0, the close-out gate sees no task), and its notify subscription stays, so a later block or done
++still reaches the chat. A long park without ``watch`` says which chat it holds and until when.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++CHAT = "20260101_120000_example"
++HUMAN_REQUEST = {
++    "action": "Sign in to the site again in Chrome. Unblock = re-check; archive = drop the check.",
++    "why_human": "Only the account owner can complete the sign-in.",
++    "interaction": "physical",
++    "scope": "One sign-in",
++    "evidence": "The renewed credential was rejected.",
++}
++
++
++@pytest.fixture
++def board(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_KEY"):
++        monkeypatch.delenv(var, raising=False)
++    from pathlib import Path as _Path
++    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
++    from hermes_cli import kanban_db as kb
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return kb
++
++
++def _chat_card(kb) -> str:
++    """A card the chat created, with the chat's ``tui`` create subscription (what kanban_create writes)."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_notify as kbn
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="check sign-in after expiry", assignee="default", session_id=CHAT)
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT,
++                           delivery_metadata={"reason": "create"})
++    return tid
++
++
++def _wake_iso(hours: float) -> str:
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + hours * 3600))
++
++
++def _schedule(tid: str, hours: float, ref: str = "credential expiry", **extra) -> dict:
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_schedule({
++        "task_id": tid, "reason": f"SCHEDULED_UNTIL={_wake_iso(hours)} verify the credential renewed ({ref})",
++        "clock_only": True, "awaiting": {"kind": "clock", "ref": ref}, **extra}))
++
++
++def _open_for_chat(kb) -> tuple[int, list]:
++    from hermes_cli import kanban_session_activity as ksa
++    path = kb.kanban_db_path()
++    counts = ksa._read_counts(path)
++    tasks = ksa._read_session_tasks(path, [CHAT], ksa.ACTIVE_STATUSES)
++    return counts.get(CHAT, 0), tasks
++
++
++def test_watch_park_frees_the_chat_and_keeps_the_notice(board):
++    tid = _chat_card(board)
++    assert _open_for_chat(board)[0] == 1  # unparked: the chat's own work
++    out = _schedule(tid, 72, watch=True)
++    assert out.get("ok") is not False and not out.get("error"), out
++    assert out["status"] == "scheduled"
++    assert out.get("watch") is True
++    n, tasks = _open_for_chat(board)
++    assert n == 0, "a watch park must not hold the chat open"
++    assert tasks == [], "the close-out gate (session_tasks ACTIVE_STATUSES) must see no open card"
++    from hermes_cli import kanban_session_activity as ksa
++    path = board.kanban_db_path()
++    assert ksa._read_parked(path)[0].get(CHAT, 0) == 0
++    # The subscription stays. When the watch wakes it is the chat's work again, and a block reaches the chat
++    # as an unseen notice.
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_notify as kbn
++    with kbc.connect() as conn:
++        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, tid)] == [CHAT]
++        assert board.unblock_task(conn, tid)
++    assert _open_for_chat(board)[0] == 1
++    with kbc.connect() as conn:
++        assert board.block_task(conn, tid, reason="renewal failed: re-sign in", kind="needs_input",
++                                human_request=HUMAN_REQUEST) is not False
++        assert board.get_task(conn, tid).status == "blocked"
++    assert ksa._read_unseen(path).get(CHAT) == 1  # the block notice reaches the chat
++    assert ksa._read_counts(path, ksa.BLOCKED_STATUSES).get(CHAT) == 1  # and the chat shows the ask
++
++
++def test_watch_is_sticky_across_a_repark_without_it(board):
++    tid = _chat_card(board)
++    _schedule(tid, 72, ref="first expiry", watch=True)
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        assert board.unblock_task(conn, tid)
++    out = _schedule(tid, 48, ref="second expiry")
++    assert out.get("watch") is True, out
++    assert _open_for_chat(board)[0] == 0
++    with kbc.connect() as conn:
++        assert board.unblock_task(conn, tid)
++    out = _schedule(tid, 48, ref="third expiry", watch=False)
++    assert out["status"] == "scheduled" and not out.get("watch"), out
++    assert _open_for_chat(board)[0] == 1
++
++
++def test_long_park_without_watch_names_the_chat_it_holds(board):
++    tid = _chat_card(board)
++    out = _schedule(tid, 72)
++    assert out["status"] == "scheduled", out
++    hint = out.get("chat_hold") or ""
++    assert f"This keeps chat {CHAT} unfinished until" in hint, out
++    assert "watch=true" in hint
++    assert _open_for_chat(board)[0] == 1  # without watch the chat is still held (today's behaviour)
++
++
++def test_short_park_has_no_hint(board):
++    tid = _chat_card(board)
++    out = _schedule(tid, 2)
++    assert "chat_hold" not in out, out
++
++
++def test_complete_on_scheduled_card_says_not_running(board):
++    tid = _chat_card(board)
++    _schedule(tid, 72)
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "verified later"}))
++    assert out.get("error"), out
++    assert out["rejection"] == "not_running"
++    assert out["rejection"] in kt.COMPLETE_REJECTION_CLASSES
++    assert "card is scheduled with no run" in out["error"]
++    assert "archive it with a comment" in out["error"]
++    assert "watch=true" in out["error"]
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 012ce9e436c..0777e320e36 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -24,7 +24,8 @@ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kan
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+                                           _create_session_id, _placement_origin, _placement_refused, _runs_where)
+ from tools.kanban_tools_db_hint import generic_tool_error
+-from tools.kanban_tools_park_args import _blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard
++from tools.kanban_tools_park_args import (_blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard,
++                                          _wake_check_args, _wake_check_echo)
+ from hermes_cli.kanban_ask_resolved import ask_checks, create_ask_check, filing_context
+ from tools import kanban_tools_completion as _kc, kanban_tools_create_args as _ca
+ from tools.kanban_tools_schemas import (
+@@ -155,6 +156,7 @@ COMPLETE_REJECTION_CLASSES = frozenset({
+     "empty",          # no summary/result, or an evidence-free completion
+     "live_claim",     # another live dispatcher worker owns the card
+     "stale_run",      # run superseded, card already terminal, or unknown id
++    "not_running",    # card waits (scheduled/todo/ready) with no run: archive it or re-park it as a watch [daveey]
+     "foreign_card",   # card exists here only as a Board replica copy; its owner gateway must write it [daveey]
+     "pr_acceptance",  # completion contract's PR CI acceptance refused (pr_acceptance event ok=false)
+     "parents",        # unsatisfied parent dependencies
+@@ -957,6 +959,10 @@ def _handle_complete(args: dict, **kw) -> str:
+                 raise _Reject(
+                     f"could not complete {tid}: unsatisfied parent dependencies: "
+                     f"{detail}; complete the parents first (done or archived)", "parents")
++            if task and task.status in ("scheduled", "todo", "ready") and not _kc.pr_acceptance_refused(
++                    conn, tid, event_mark):
++                from hermes_cli.kanban_watch import NOT_RUNNING_TEMPLATE  # [daveey] not a vague "stale run"
++                raise _Reject(NOT_RUNNING_TEMPLATE.format(tid=tid, status=task.status), "not_running")
+             reason = (task.last_failure_error if task else None) or \
+                 f"could not complete {tid} (unknown id, stale run, or already terminal)"
+             _check(False, reason, "pr_acceptance" if _kc.pr_acceptance_refused(conn, tid, event_mark)
+@@ -972,31 +978,6 @@ def _handle_complete(args: dict, **kw) -> str:
+                        for a in kb.list_attachments(conn, tid)])
+ 
+ 
+-def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
+-    """``(wake_check, check_every, clock_only)`` from a park call, validated. [daveey]"""
+-    from hermes_cli import kanban_wake_check as kwc
+-
+-    raw_every = args.get("check_every")
+-    _check(raw_every is None or (isinstance(raw_every, (int, float)) and not isinstance(raw_every, bool)),
+-           "check_every must be an integer number of seconds")
+-    clock_only = args.get("clock_only", False)
+-    _check(isinstance(clock_only, bool), "clock_only must be true or false")
+-    try:
+-        cmd = kwc.normalize_cmd(args.get("wake_check"))
+-        every = kwc.normalize_every(raw_every) if cmd else None
+-        err = kwc.dry_run_error(cmd, blocker_id=args.get("blocker_id"))
+-        if err:
+-            raise ValueError(err)
+-    except ValueError as exc:
+-        _check(False, str(exc), kwc.refusal_code(str(exc)))
+-    return (_redact(cmd) if cmd else None), every, clock_only
+-
+-
+-def _wake_check_echo(wake: tuple) -> dict:
+-    """Result fields echoing the park's probe (none when it has no probe)."""
+-    return {"wake_check": wake[0], "check_every": wake[1]} if wake[0] else {}
+-
+-
+ def _awaiting_arg(args: dict, wake: tuple) -> tuple[Optional[dict], tuple]:
+     """``(awaiting, wake)``: the declared producer (``kanban_awaiting``), and the park's probe
+     with ``hermes kanban wait-check`` filled in for a card wait that brought none. [daveey]"""
+@@ -1190,8 +1171,12 @@ def _handle_schedule(args: dict, **kw) -> str:
+         blocker_id = _blocker_id_arg(args)
+         clear_blocker = _clear_blocker_arg(args, blocker_id)
+         _park_guard(conn, tid, "schedule", wake, reason=reason)
++        from hermes_cli import kanban_watch as kwatch
++        raw_watch = args.get("watch")
++        _check(raw_watch is None or isinstance(raw_watch, bool), "watch must be true or false")
+         ok = kb.schedule_task(
+-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
++            conn, tid, watch=kwatch.resolve(conn, tid, raw_watch), reason=reason,
++            expected_run_id=_worker_run_id(tid),
+             wake_check=wake[0], check_every=wake[1], clock_only=wake[2], awaiting=awaiting,
+             clear_blocker=clear_blocker, blocker_id=blocker_id, **_blocker_scope_args(args))
+         _check(ok, "" if ok else krc.human_answer_refusal(conn, tid, "schedule")
+@@ -1199,7 +1184,11 @@ def _handle_schedule(args: dict, **kw) -> str:
+         escalated = _escalated(kb, conn, tid)
+         if escalated:
+             return escalated
+-        return _ok_landed(kb, conn, tid, "scheduled", reason=reason, **_wake_check_echo(wake))
++        # [daveey] A watch says so; a long non-watch park says which chat it holds open and how to free it.
++        hold = kwatch.chat_hold_hint(conn, tid)
++        return _ok_landed(kb, conn, tid, "scheduled", reason=reason, **_wake_check_echo(wake),
++                          **({"watch": True} if kwatch.is_watch(conn, tid) else {}),
++                          **({"chat_hold": hold} if hold else {}))
+ 
+ 
+ @_kanban_handler("kanban_continue")
+diff --git a/tools/kanban_tools_park_args.py b/tools/kanban_tools_park_args.py
+index 75f095d8166..e52062dd128 100644
+--- a/tools/kanban_tools_park_args.py
++++ b/tools/kanban_tools_park_args.py
+@@ -50,3 +50,29 @@ def _park_guard(conn, tid: str, op: str, wake: tuple, **plan: Any) -> None:
+                                                             if op == "block" else {}))
+     err = kwc.guard_error(wake_at=wake_at, wake_check=wake[0], clock_only=wake[2])
+     _check(err is None, f"kanban_{op} {err}", "invalid_args")
++
++
++def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
++    """``(wake_check, check_every, clock_only)`` from a park call, validated. [daveey]"""
++    from hermes_cli import kanban_wake_check as kwc
++
++    raw_every = args.get("check_every")
++    _check(raw_every is None or (isinstance(raw_every, (int, float)) and not isinstance(raw_every, bool)),
++           "check_every must be an integer number of seconds")
++    clock_only = args.get("clock_only", False)
++    _check(isinstance(clock_only, bool), "clock_only must be true or false")
++    try:
++        cmd = kwc.normalize_cmd(args.get("wake_check"))
++        every = kwc.normalize_every(raw_every) if cmd else None
++        err = kwc.dry_run_error(cmd, blocker_id=args.get("blocker_id"))
++        if err:
++            raise ValueError(err)
++    except ValueError as exc:
++        _check(False, str(exc), kwc.refusal_code(str(exc)))
++    from tools.kanban_tools import _redact  # lazy: kanban_tools imports this module
++    return (_redact(cmd) if cmd else None), every, clock_only
++
++
++def _wake_check_echo(wake: tuple) -> dict:
++    """Result fields echoing the park's probe (none when it has no probe)."""
++    return {"wake_check": wake[0], "check_every": wake[1]} if wake[0] else {}
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index aca91c3225b..de4fa4e041b 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -436,6 +436,11 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+             "the completed run and scheduled event."
+         )),
+         "blocker_id": _prop("string", _BLOCKER_ID_DESC),
++        "watch": _prop("boolean", (
++            "True for a later check that needs nothing from David before it reports (e.g. verify X on "
++            "Friday): the parked card stops holding its chat unfinished; a block, failure or done still "
++            "notifies the chat. Sticky across re-parks; false clears it."
++        )),
+         **_CLEAR_BLOCKER_PROP,
+         **_NEEDS_PROP,
+         **_WAKE_CHECK_PROPS,
+-- 
+2.55.0
+
