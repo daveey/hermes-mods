@@ -64,6 +64,22 @@ test('a running card just under the threshold, or with fresh activity, is not st
   assert.equal(out.active.length, 2)
 })
 
+test('a running card with no known last event is never stuck, however old its first start (kanban-f241d1f60b)', () => {
+  // A hub card claimed 53 s earlier arrived with no event time and no running run; the panel used the first claim a
+  // week earlier and drafted "no progress since Fri 23 23:05". Only a known progress time (last event, else the
+  // current run's start) can make a card Stuck; `since` (first start / creation) is display only.
+  const week = 7 * 86400
+  const out = m.classify([
+    card('t_hub', 'running', { activityAt: 0, since: S - week }),
+    card('t_run', 'running', { activityAt: 0, progressAt: S - 3 * 3600, since: S - week })
+  ], { nowMs: NOW })
+  assert.deepEqual(out.stuck.map(i => i.key), ['kb:t_run'], 'a run 3 h old with no newer event is stuck')
+  assert.deepEqual(out.active.map(i => i.key), ['kb:t_hub'])
+  assert.match(out.active[0].detail, /last event unknown/)
+  assert.equal(out.stuck[0].lastAt, S - 3 * 3600)
+  assert.match(m.nudgeText(out.stuck[0], NOW), /no progress since \d\d:\d\d/)
+})
+
 test('a stale (last-known) card is never stuck or needs-you: its state is unknown, not evidence', () => {
   // closeout-notice-stale-decision: the owner read failed after the user approved a decision card, so session-tasks
   // kept the last-known "running" chip (stale) for hours after the card re-blocked and was archived; the panel

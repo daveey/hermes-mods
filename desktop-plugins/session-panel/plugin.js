@@ -91,7 +91,11 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     if (c.kind === 'kanban-status') { out.waiting.push({ ...item(c), detail: str(c.title) || 'status unknown' }); continue }
     if (c.kind !== 'kanban') continue
     seen(c.activityAt)
-    const last = Math.max(Number(c.activityAt) || 0, Number(c.since) || 0)
+    // Progress = the newest event, else the current run's start (session-tasks `progressAt`); 0 = unknown. Only a
+    // known progress time can make a card Stuck: `since` (first claim / creation) is display only, or a hub card
+    // claimed a minute ago read "no progress since <a week ago>" (kanban-f241d1f60b).
+    const progress = Number(c.activityAt) || Number(c.progressAt) || 0
+    const last = progress || Number(c.since) || 0
     const on = c.waitingOn ? `waiting on ${c.waitingOn}${c.waitingSince ? ` since ${clock(c.waitingSince, nowMs)}` : ''}` : ''
     // A stale chip is session-tasks' last-known copy after a failed read: the card may have been answered,
     // re-blocked or archived since, so it is never stuck (no nudge) or needs-you, only "status unknown".
@@ -103,8 +107,8 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     }
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if (c.state === 'running') {
-      if (last && now - last >= STUCK_CARD_S) out.stuck.push({ ...item(c), reason: 'no-progress', lastAt: last, detail: `running, no progress since ${clock(last, nowMs)} (${ago(last, nowMs)})${c.activity ? ` · last event: ${c.activity}` : ''}` })
-      else out.active.push({ ...item(c), detail: `running${c.assignee ? ` · ${c.assignee}` : ''}${last ? ` · ${ago(last, nowMs)}` : ''}` })
+      if (progress && now - progress >= STUCK_CARD_S) out.stuck.push({ ...item(c), reason: 'no-progress', lastAt: progress, detail: `running, no progress since ${clock(progress, nowMs)} (${ago(progress, nowMs)})${c.activity ? ` · last event: ${c.activity}` : ''}` })
+      else out.active.push({ ...item(c), detail: `running${c.assignee ? ` · ${c.assignee}` : ''}${progress ? ` · ${ago(progress, nowMs)}` : ' · last event unknown'}` })
       continue
     }
     if (c.state === 'review') { out.active.push({ ...item(c), detail: `in review${last ? ` · ${ago(last, nowMs)}` : ''}` }); continue }

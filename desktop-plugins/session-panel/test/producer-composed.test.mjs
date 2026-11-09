@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import { createRequire, register } from 'node:module'
 import { resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { readFileSync } from 'node:fs'
 const require = createRequire(resolve(process.env.HERMES_DESKTOP_DIR || `${homedir()}/.hermes/hermes-agent/apps/desktop`, 'package.json'))
 const React = require('react'), J = require('react/jsx-runtime')
 const { JSDOM } = require('jsdom')
@@ -247,6 +248,24 @@ test('producer: Needs you shows the card human_request (from core TEXT rows), no
     assert.equal(row.querySelector('[data-ask-why]').textContent, 'Why you: Spend needs the owner.')
     assert.equal(row.querySelector('[data-ask-step]').textContent.includes(TITLE), false)
   } finally { dispose() }
+})
+
+test('producer: a real hub-sync session_links row reaches classify with its last event (kanban-f241d1f60b)', () => {
+  // The golden row is asserted against hubview.session_links by plugins/hub-sync/tests/test_session_links_activity.py,
+  // so a field dropped by the producer (hub-sync) or the consumer (session-tasks taskChip) fails one of the two tests.
+  const golden = JSON.parse(readFileSync(new URL('../../../plugins/hub-sync/tests/fixtures/session_links_hub_card.json', import.meta.url), 'utf8'))
+  const [chip] = tasksPlugin.hubLinkChips([golden.row])
+  assert.ok(chip, 'the hub row becomes a chip')
+  assert.equal(chip.activityAt, golden.row.activity_at)
+  const at = sec => (golden.now + sec) * 1000
+  const fresh = panel.classify([chip], { nowMs: at(0) })
+  assert.deepEqual(fresh.stuck, [], 'a card claimed 53 s ago is not stuck, whatever its first start')
+  assert.equal(fresh.active[0]?.key, chip.key)
+  const later = panel.classify([chip], { nowMs: at(3 * 3600) })
+  assert.equal(later.stuck[0]?.lastAt, golden.row.activity_at, 'stuck is measured from the last event')
+  const bare = panel.classify(tasksPlugin.hubLinkChips([{ ...golden.row, activity_at: undefined, activity_kind: undefined }]), { nowMs: at(0) })
+  assert.deepEqual(bare.stuck, [], 'no event and no running run: unknown, not stuck since the first claim')
+  assert.match(bare.active[0]?.detail || '', /last event unknown/)
 })
 
 test('done', () => { root.unmount() })

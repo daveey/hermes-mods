@@ -661,6 +661,9 @@ def session_links(session_ids: List[str], include_closed: bool = False,
                         "session_id": links[0].get("session"), "via": via, "created_at": t.get("created_at"),
                         "started_at": t.get("started_at"),
                         "current_run_started_at": run.get("started_at") if run.get("status") == "running" else None,
+                        # newest event (hermes-hub client >= 1.9.28): the panel's 2 h no-progress rule needs it, and
+                        # without it must say "unknown", never fall back to the first claim (kanban-f241d1f60b)
+                        "activity_at": t.get("activity_at"), "activity_kind": t.get("activity_kind"),
                         "gateway": t["gateway"], "local": t["local"], "stale": t["stale"],
                         "synced_at": t["synced_at"], "version": t["version"], "pending": t["pending"]})
         out.sort(key=lambda x: (x["local"], -(x.get("created_at") or 0)))

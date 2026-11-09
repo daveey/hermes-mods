@@ -192,6 +192,10 @@ function taskChip(t, status) {
     prUrl: /^https:\/\/github\.com\//.test(str(t.pr_url)) ? str(t.pr_url) : null,
     activity: str(t.activity_kind) || null,
     activityAt: Number(t.activity_at) || 0,
+    // When the card last made progress: its newest event, else the current run's start; 0 = unknown. Never the
+    // first claim or creation (`since`, display only): a hub row without events otherwise read as a week-old stall
+    // (kanban-f241d1f60b).
+    progressAt: Number(t.activity_at) || Number(t.current_run_started_at) || 0,
     title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}${waitTitle}`,
     since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
   }

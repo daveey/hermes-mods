@@ -261,6 +261,21 @@ test('hubLinkChips: other gateways only, deduped by gateway+board+id, gateway + 
   assert.match(mini.title, /shepherding/)
 })
 
+test('hubLinkChips: a hub row newest event is the chip progress time, never its first start (kanban-f241d1f60b)', () => {
+  const now = Date.now() / 1000, week = 7 * 86400
+  const [withEvent, runOnly, bare] = m.hubLinkChips([
+    { id: 't_ev', status: 'running', gateway: 'hub', local: false, started_at: now - week, activity_at: now - 53, activity_kind: 'claimed' },
+    { id: 't_run', status: 'running', gateway: 'hub', local: false, started_at: now - week, current_run_started_at: now - 600 },
+    { id: 't_bare', status: 'running', gateway: 'hub', local: false, started_at: now - week, created_at: now - week - 60 }
+  ])
+  assert.equal(withEvent.activityAt, now - 53)
+  assert.equal(withEvent.activity, 'claimed')
+  assert.equal(withEvent.progressAt, now - 53)
+  assert.equal(runOnly.progressAt, now - 600, 'no event: the current run start')
+  assert.equal(bare.progressAt, 0, 'no event and no running run: unknown, not the first claim')
+  assert.equal(bare.since, now - week, 'since stays for display')
+})
+
 test('staleChips keeps last-known remote rows, marked stale (hub down never means no tasks)', () => {
   const out = m.staleChips([{ key: 'kb:mini:default:t1', title: 'x' }])
   assert.equal(out.length, 1)
