@@ -203,7 +203,7 @@ Countermeasures:
 ## Done means
 - [ ] For CPU-starvation reproduction, did you enumerate descendants through every task/thread child list and apply the SIGSTOP/SIGCONT duty cycle to detached canonical test workers as well as their launcher, rather than only the launcher process group?
 - [ ] For a 'forwarder has not reported' card, did you first compare `hosts.json` reach values across hosts and check whether synced `selfheal-config.json` gives several hosts the same reach, causing the hub to probe the wrong machine?
-- [ ] For a cron fingerprint that "came back", did you diff the current stderr against the previous fix card's error and establish whether the cause is the same before calling the earlier fix broken?
+- [ ] For a cron fingerprint that "came back", did you diff the current stderr against the previous fix card's error and establish whether the cause is the same before calling the earlier fix broken? When comparing persisted symptoms with new full details, preserve the producer's truncation boundary: an absent legacy suffix is not a different error. Test identical long errors and canonical suffix-only changes separately.
 - [ ] For SQLite I/O errors or truncated disk-failure signals, is disk-owner adoption scoped to the same host and incident time (bounded local journal evidence is allowed), never cached in an unscoped generic family lane?
 - [ ] Every why cites evidence (log line, test, `file:line`, commit, metric) or is labelled `(hypothesis)`?
 - [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
