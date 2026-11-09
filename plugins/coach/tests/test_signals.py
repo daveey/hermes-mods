@@ -202,6 +202,61 @@ def test_other_session_cron_errors_still_file():
     assert len(sg.parse_errors(tb)) == 1
 
 
+# The real hermes-hub record (errors.log 2026-11-03 13:22:49 UTC, agent-2dc9a44cfa): the gateway re-log of a failed
+# cron script run. The RuntimeError's message is the script's stderr, which quotes the script's own traceback.
+_H = "/home/you/.hermes"
+CRON_SCRIPT_STDERR = [
+    "stderr:",
+    "Traceback (most recent call last):",
+    '  File "<string>", line 16, in <module>',
+    "    exec(code, main.__dict__)",
+    f'  File "{_H}/scripts/askeve_guide_monitor.py", line 45, in get',
+    "    with urllib.request.urlopen(req, timeout=30) as r:",
+    f'  File "{_H}/tools/python/lib/python3.14/urllib/request.py", line 611, in http_error_default',
+    "    raise HTTPError(req.full_url, code, msg, hdrs, fp)",
+    "urllib.error.HTTPError: HTTP Error 502: Bad Gateway",
+    "stdout:",
+    "===== docs/deploy-guide.md",
+]
+
+
+def test_session_cron_rewrap_quoting_the_script_traceback_files_nothing():
+    # A traceback quoted inside the exception message is message text, not a chained exception: the record is still
+    # the gateway's re-raise of the cron run (agent-2dc9a44cfa filed it as "HTTPError in http_error_default").
+    rec = SESSION_CRON_TB + ["RuntimeError: Script exited with code 1"] + CRON_SCRIPT_STDERR
+    assert sg.parse_errors(rec) == []
+
+
+def test_chained_exception_files_the_last_exception_in_the_chain():
+    rec = ["2026-11-03 13:00:00,000 ERROR gateway.run: handler failed",
+           "Traceback (most recent call last):",
+           f'  File "{_H}/hermes-agent/gateway/run.py", line 10, in handle',
+           "    data = load()",
+           "KeyError: 'route'",
+           "",
+           "During handling of the above exception, another exception occurred:",
+           "",
+           "Traceback (most recent call last):",
+           f'  File "{_H}/hermes-agent/gateway/run.py", line 12, in handle',
+           "    recover()",
+           f'  File "{_H}/hermes-agent/gateway/recover.py", line 5, in recover',
+           "    raise ValueError('no fallback route')",
+           "ValueError: no fallback route"]
+    sigs = sg.parse_errors(rec)
+    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("ValueError in recover (recover.py)"), sigs
+
+
+def test_exception_quoting_a_child_traceback_files_as_the_outer_exception():
+    # Not the cron re-raise: our own RuntimeError whose message carries a child's traceback files as ours, at our frame.
+    rec = (["2026-11-03 13:00:00,000 ERROR gateway.run: helper failed",
+            "Traceback (most recent call last):",
+            f'  File "{_H}/hermes-agent/gateway/run.py", line 20, in run_helper',
+            "    raise RuntimeError(err)",
+            "RuntimeError: helper exited 1"] + CRON_SCRIPT_STDERR)
+    sigs = sg.parse_errors(rec)
+    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("RuntimeError in run_helper (run.py)"), sigs
+
+
 # The real hermes-hub pair (errors.log 2026-11-02 02:07:09 UTC): the cron run's own traceback, then the gateway's
 # re-log of the same failure. One incident -> one cron signal, no gateway signal.
 HUB_QUOTA_PAIR = [
@@ -2095,6 +2150,25 @@ def test_worker_exception_line_is_the_one_ending_the_traceback():
              "KeyError: 'route'", "Message: 'later log noise'", "Arguments: ()"]
     got = sg.parse_worker_crashes([f"[pid 51] {l}" for l in lines])
     assert [(c["exc"], c["msg"]) for c in got] == [("KeyError", "'route'")]
+
+
+def test_worker_crash_quoting_a_child_traceback_keeps_the_outer_exception():
+    lines = ["managed worker failed", "Traceback (most recent call last):",
+             f'  File "{_HA}/agent/managed_worker.py", line 464, in main', "    run_child()",
+             "RuntimeError: child exited 1"] + CRON_SCRIPT_STDERR
+    got = sg.parse_worker_crashes([f"[pid 52] {l}" for l in lines])
+    assert [(c["exc"], c["msg"]) for c in got] == [("RuntimeError", "child exited 1")]
+
+
+def test_chained_worker_crash_keeps_the_last_exception():
+    lines = ["managed worker failed", "Traceback (most recent call last):",
+             f'  File "{_HA}/agent/managed_worker.py", line 464, in main', "    execute(frame, channel)",
+             "KeyError: 'route'", "", "During handling of the above exception, another exception occurred:", "",
+             "Traceback (most recent call last):",
+             f'  File "{_HA}/agent/managed_worker.py", line 470, in main', "    report(exc)",
+             "OSError: [Errno 32] Broken pipe"]
+    got = sg.parse_worker_crashes([f"[pid 53] {l}" for l in lines])
+    assert [(c["exc"], c["msg"]) for c in got] == [("OSError", "[Errno 32] Broken pipe")]
 
 
 def test_worker_crash_with_html_5xx_body_is_transient():

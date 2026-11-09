@@ -488,12 +488,15 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue
-        # the last chained exception block
-        start = max(i for i, l in enumerate(r["cont"]) if l.startswith("Traceback (most recent call last)"))
+        # the last exception of the printed chain; a traceback quoted inside a message is message text
+        start = _chain_heads(r["cont"])[-1]
         block = r["cont"][start:]
-        frames = [FRAME_RE.match(l).groups() for l in block if FRAME_RE.match(l)]
-        exc_line = next((l for l in reversed(block) if l and not l[0].isspace() and EXC_RE.match(l)), "")
+        ei = _traceback_end(block, 0)
+        tb = block if ei is None else block[:ei]
+        frames = [FRAME_RE.match(l).groups() for l in tb if FRAME_RE.match(l)]
+        exc_line = block[ei] if ei is not None and EXC_RE.match(block[ei]) else ""
         exc_type = (EXC_RE.match(exc_line).group(1) if exc_line else "") or "Exception"
+        exc_body = ("" if ei is None else "\n".join(block[ei + 1:ei + 1 + EXC_BODY_LINES])[:EXC_BODY_CHARS])
         text = r["msg"] + "\n" + exc_line
         if (RECONNECT_RE.match(r["msg"]) and not OWN_LOGGER_RE.match(r["logger"])
                 and not any(_own_frame(p) for p, _fn in frames)):
@@ -503,12 +506,12 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                                                                    + block))[-1500:]})
             continue
         if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line) or OFFLINE_EXC_RE.fullmatch(exc_line)
-                or provider_5xx(exc_type, exc_line, _exc_body(block, exc_line))):
+                or provider_5xx(exc_type, exc_line, exc_body)):
             continue
-        last = exc_line or next((l for l in reversed(block) if l and not l[0].isspace()), "")  # socket.gaierror
+        last = exc_line or (block[ei] if ei is not None else "")  # socket.gaierror
         if CONNECT_FAIL_RE.match(r["msg"]) and (NETWORK_EXC_RE.match(last) or NETWORK_RE.match(last)):
             continue  # a retried platform connect with no network; a long outage files via NEEDS_ATTENTION
-        if _session_cron_rewrap(block, frames, exc_type):
+        if _session_cron_rewrap(tb, frames, exc_type):
             continue  # the cron run's own failure, re-raised by the gateway: the cron lane files it
         comp, plug = component_of([f[0] for f in frames])
         if r["level"] == "WARNING" and not any(_own_frame(p) for p, _fn in frames):
@@ -754,14 +757,40 @@ def _worker_noise_lines(blk: List[str]) -> set:
     return noise
 
 
-def _traceback_exc_index(blk: List[str], tb: int) -> Optional[int]:
-    """Index of the exception line that ends the traceback starting at `tb`: the first unindented line after the
-    `File ...` frames (source lines and carets are indented), when it reads `Name: text`."""
+def _traceback_end(blk: List[str], tb: int) -> Optional[int]:
+    """Index of the first unindented, non-blank line after the traceback header at `tb`: the exception line that
+    ends its `File ...` frames (source lines and carets are indented). Everything after it is the message."""
     for j in range(tb + 1, len(blk)):
         if blk[j][:1] in (" ", "\t") or not blk[j]:
             continue
-        return j if WORKER_EXC_RE.match(blk[j]) else None
+        return j
     return None
+
+
+def _traceback_exc_index(blk: List[str], tb: int) -> Optional[int]:
+    """Index of the exception line that ends the traceback starting at `tb`, when it reads `Name: text`."""
+    j = _traceback_end(blk, tb)
+    return j if j is not None and WORKER_EXC_RE.match(blk[j]) else None
+
+
+CHAIN_SEP_RE = re.compile(r"^(During handling of the above exception, another exception occurred:"
+                          r"|The above exception was the direct cause of the following exception:)$")
+
+
+def _chain_heads(blk: List[str], skip=()) -> List[int]:
+    """Indexes of the `Traceback (most recent call last)` headers that start an exception of one printed chain:
+    the first header, and each one whose nearest non-blank line above is CPython's chain separator. Any other
+    header sits inside an exception message (a child's stderr quoted by `RuntimeError(stderr)`), so it is message
+    text, not the exception that was raised (agent-2dc9a44cfa: a cron script's HTTPError quoted in the gateway's
+    re-raise defeated _session_cron_rewrap). Headers at indexes in `skip` are ignored."""
+    heads = []
+    for i, l in enumerate(blk):
+        if i in skip or not l.startswith("Traceback (most recent call last)"):
+            continue
+        prev = next((blk[k] for k in range(i - 1, -1, -1) if blk[k].strip()), "")
+        if not heads or CHAIN_SEP_RE.match(prev):
+            heads.append(i)
+    return heads
 
 
 def parse_worker_crashes(lines: List[str]) -> List[dict]:
@@ -784,7 +813,7 @@ def parse_worker_crashes(lines: List[str]) -> List[dict]:
     out = []
     for pid, blk in by_pid.items():
         noise = _worker_noise_lines(blk)
-        tbs = [i for i, l in enumerate(blk) if l.startswith("Traceback (most recent call last)") and i not in noise]
+        tbs = _chain_heads(blk, noise)
         if not tbs:
             continue
         ei = _traceback_exc_index(blk, tbs[-1])
