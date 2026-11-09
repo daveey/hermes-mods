@@ -194,6 +194,11 @@ def test_report_only_scored_logs_owner_probe_live(tmp_path, monkeypatch):
     assert rc.owner_probe_live(DRAFT, [f"   <- BOARD task={OWNER} status=scheduled probe=live(rc=1)"]) == [OWNER]
     # a live probe on a card the reply does not name is not this reply's owner
     assert rc.owner_probe_live("All done.", [f"   <- OK task={OWNER} status=scheduled probe=live(rc=1)"]) == []
+    # live hub probe 2026-11-09: the ask named the card, the reply said only "the card is parked on ..."
+    ok = [f"<- OK task={OWNER} status=scheduled probe=live(rc=1 last=54s every=5m checks=5 since=21m) Task"]
+    assert rc.owner_probe_live("The card is parked on its probe.", ok, f"Is the fix tracked by card {OWNER} live?") \
+        == [OWNER]
+    assert rc.owner_probe_live("t_01a1ffff00000000 owns it.", ok, f"card {OWNER}?") == []
 
 
 # ── 3. both rubrics say how to read a probe fact ───────────────────────────────────────────────────────────────

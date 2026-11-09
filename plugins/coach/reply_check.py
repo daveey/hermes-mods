@@ -271,9 +271,10 @@ FRESH_OWNER_S = 24 * 3600
 _PROBE_LIVE_RE = re.compile(r"task=(?:[\w,]*?)(t_[0-9a-zA-Z_]+)\b[^|]*?\bprobe=live\(")
 
 
-def owner_probe_live(reply: str, tool_log: Optional[list] = None) -> list[str]:
-    """Card ids the reply names whose owner line in `tool_log` shows `probe=live(...)`. Empty when none."""
-    named = set(NAMED_CARD_RE.findall(reply or ""))
+def owner_probe_live(reply: str, tool_log: Optional[list] = None, user_ask: str = "") -> list[str]:
+    """Card ids the reply names (or, when it names none, the user's ask names: "that card ...") whose owner line in
+    `tool_log` shows `probe=live(...)`. Empty when none."""
+    named = set(NAMED_CARD_RE.findall(reply or "")) or set(NAMED_CARD_RE.findall(user_ask or ""))
     out: list[str] = []
     for line in tool_log or []:
         s = (line or "").lstrip()
@@ -2404,7 +2405,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
                    "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
                    "owner_probe_live": bool(owner_probe_live(reply, list(tool_log or []) + list(
-                       named_card_facts(reply, tool_log) or []))),
+                       named_card_facts(reply, tool_log) or []), user_ask)),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
                    **({"elapsed_s": budget_elapsed()} if budget_elapsed() is not None else {}),
