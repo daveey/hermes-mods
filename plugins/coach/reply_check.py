@@ -1022,8 +1022,21 @@ def continued_run(tool_log: Optional[list] = None) -> bool:
 _PARK_LINE = "<- OK park="
 
 
+# Run-ending Kanban lifecycle tools report_only still judges after the run ended, each with why (agent-8a6863884a).
+# Every tool in core's _RUN_LIFECYCLE_TOOLS is either a park (agent_rules.PARK_TOOLS, kanban_continue) or listed here;
+# tests/test_report_only_lifecycle_park.py fails on an unclassified one.
+JUDGED_AFTER_RUN_END = (
+    ("kanban_complete", "completion claims the work is done, so open leftovers are still the worker's to file as a "
+                        "follow-up card before it stops"),
+    ("kanban_move", "an orchestrator or operator status move names no next owner for the work the reply leaves open"),
+)
+# Review handoffs: the card now belongs to the reviewer (request_review) or the implementer (request_changes).
+_HANDOFF_PARKS = ("kanban_request_review", "kanban_request_changes")
+
+
 def lifecycle_park(tool_log: Optional[list] = None) -> bool:
-    """True when this turn's tool log shows a successful human block, kind=time block or kanban_schedule."""
+    """True when this turn's tool log shows a successful human block, kind=time block, kanban_schedule or review
+    handoff (kanban_request_review / kanban_request_changes)."""
     for line in tool_log or []:
         s = (line or "").lstrip()
         if not s.startswith(_PARK_LINE):
@@ -1034,7 +1047,7 @@ def lifecycle_park(tool_log: Optional[list] = None) -> bool:
             continue
         if not isinstance(f, dict):
             continue
-        if f.get("tool") == "kanban_schedule":
+        if f.get("tool") == "kanban_schedule" or f.get("tool") in _HANDOFF_PARKS:
             return True
         if f.get("tool") == "kanban_block":
             if f.get("kind") == "time":

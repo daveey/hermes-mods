@@ -1838,7 +1838,10 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
 # run (a human block or a schedule). The `-> kanban_block(...)` line is cut at 140 chars, which drops `kind` and
 # `human_request` for any real reason text, so after a successful park call one `<- OK park={...}` line keeps the facts
 # reply_check.human_block needs to classify it (no reason text, no card id).
-PARK_TOOLS = ("kanban_block", "kanban_schedule")
+# agent-8a6863884a: the review handoff ends the run too (core's _RUN_LIFECYCLE_TOOLS); kanban_request_review /
+# kanban_request_changes hand the card to its next owner (reviewer / implementer). Every run-ending tool must be here,
+# in reply_check.JUDGED_AFTER_RUN_END, or (kanban_continue) reply_check.continued_run: a test enforces it.
+PARK_TOOLS = ("kanban_block", "kanban_schedule", "kanban_request_review", "kanban_request_changes")
 
 
 def park_result_line(tool: str, args: Any) -> Optional[str]:
