@@ -2247,6 +2247,26 @@ def test_non_retryable_hermes_refusal_files_one_signal_per_message():
     assert len(other) == 1 and other[0]["fp"] != got[0]["fp"]
 
 
+# agent-235b66c443: the lease refusal names no holder; account-usage logs `selection_lease_missing` with the
+# registry holders just before it. The refusal's signal carries that line (same session) as detail, so the hub
+# sees who held the chat without reading the host's log.
+def test_non_retryable_refusal_carries_the_sessions_selection_lease_missing_line():
+    holder = ("selection_lease_missing: session=durable-A runtime=rt-1 lease=abcd1234 pid=77; registry holders: "
+              "['pid=55 lease=stale123 surface=desktop live=rt-old'] -> other owner, refused")
+    lines = ["2026-11-04 12:15:01,100 WARNING [20261022_205332_a60287] hermes_plugins.account_usage.selection: "
+             + holder,
+             "2026-11-04 12:15:01,200 WARNING [other_session] hermes_plugins.account_usage.selection: "
+             "selection_lease_missing: session=x; registry holders: ['pid=9'] -> other owner, refused",
+             "2026-11-04 12:15:02,405 ERROR [20261022_205332_a60287] agent.conversation_loop: "
+             "Non-retryable client error: Chat ownership lease is unavailable"]
+    got = sg.parse_errors(lines)
+    assert len(got) == 1, got
+    assert "pid=55 lease=stale123" in got[0]["details"]
+    assert "pid=9" not in got[0]["details"]  # another session's line is not this turn's holder
+    plain = sg.parse_errors(lines[2:])
+    assert plain[0]["fp"] == got[0]["fp"]  # the detail never splits the fingerprint
+
+
 def test_non_retryable_provider_http_error_is_not_a_hermes_defect():
     lines = ["2026-10-30 21:27:08,405 ERROR agent.conversation_loop: Non-retryable client error: Error code: 403 - "
              "{'error': {'message': 'Key limit exceeded (total limit).'}}",

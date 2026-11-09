@@ -140,6 +140,10 @@ OFFLINE_EXC_RE = re.compile(r"(?:RuntimeError: )+" + re.escape(_OFFLINE_HEAD)
 # HTTP errors and provider stalls ride the same line; the provider/credit lanes own those.
 NONRETRYABLE_RE = re.compile(r"Non-retryable client error: (.+)")
 NONRETRYABLE_PROVIDER_RE = re.compile(r"^(?:Error code: \d{3}\b|Provider has been unresponsive\b)")
+# account-usage's lease-repair diagnostic (names the registry holder). The refusal line above names none, so a
+# non-retryable signal carries its session's latest one as detail (agent-235b66c443: the holder stayed on a
+# sleeping MacBook's log).
+SELECTION_LEASE_RE = re.compile(r"^selection_lease_missing: ")
 PROVIDER_DNS_RE = re.compile(
     r"^provider host does not resolve while network is up: (\S+) "
     r"\(control host (\S+) resolves\) — check the provider base_url$"
@@ -443,8 +447,11 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         elif cur is not None:
             cur["cont"].append(ln)
     held = _cron_held_failures(recs)
+    lease_lines: dict = {}  # session -> its latest selection_lease_missing record (agent-235b66c443)
     out = []
     for i, r in enumerate(recs):
+        if SELECTION_LEASE_RE.match(r["msg"]):
+            lease_lines[r["sid"]] = f"{r['level']} {r['logger']}: {r['msg']}"
         if SKIP_LOGGERS.match(r["logger"]) or i in held:
             continue
         hm = HOOK_RE.match(r["msg"])
@@ -506,9 +513,11 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         if (nr and r["level"] == "ERROR" and OWN_LOGGER_RE.match(r["logger"])
                 and not NONRETRYABLE_PROVIDER_RE.match(nr.group(1))):
             why = nr.group(1).strip()
+            ctx = [lease_lines[r["sid"]]] if r["sid"] and r["sid"] in lease_lines else []
             out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"turn failed on a Hermes refusal: {why[:160]}",
-                        "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"] + r["cont"]))[:1500],
+                        "details": home_tilde("\n".join(ctx + [f"{r['level']} {r['logger']}: {r['msg']}"]
+                                                        + r["cont"]))[:1500],
                         "fp": fp("agent", "non-retryable", re.sub(r"\d+", "N", why[:120]))})
             continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
