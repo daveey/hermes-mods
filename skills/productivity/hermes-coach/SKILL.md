@@ -150,6 +150,12 @@ Undone notices are always plain cards.
 
 ## Pitfalls
 
+- Keep weekly regex candidates separate from adjudicated human corrections. An explicit one-shot reviewer opener,
+  a stamped Subagent relay, or a generated Kanban warning is not a correction; appended `[System: ...]` text must
+  not supply the matching words. Keep ambiguous legacy operator stamps for review. A session-level detection or
+  nearby commit does not prove exact-defect ownership or repair: match the complaint quote, then check the fix's
+  scope and live evidence. Regression coverage: `scripts/test_askgate_weekly_noise.py`.
+
 - xAI `x_search` via the Responses API (outside research scout): send `"tool_choice": "required"` and use
   `grok-4.5`, or the model often answers `[]` from memory without searching (`usage.num_server_side_tools_used: 0`).
   Each call costs ~$0.4–0.7 (`usage.cost_in_usd_ticks` / 1e10 = USD), so log it and cap per day. Citations come back

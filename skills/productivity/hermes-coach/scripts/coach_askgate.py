@@ -46,15 +46,17 @@ SKIP = re.compile(
 GENERATED = re.compile(
     r'^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe)\]|'
     r'\{\s*"item"\s*:|New notes? on your kanban task from another agent session\b|'
-    r'Diagnosis only\. Inspect this runner/host)'  # runners plugin "Repair runner" brief (plugin-4731e7cdc3)
+    r'Diagnosis only\. Inspect this runner/host|⚠\ufe0f?\s+\[[^\]\n]+\]\s+@\S+\s+Kanban\s+t_)'
     r'|\(Roleplay test of our reply checker', re.I)
 # Same marker as plugins/coach/self_heal.py PROBE_RE: a session opener that marks a deliberate detector probe.
 PROBE = re.compile(r"^\s*(?:\[selfheal-probe\]|Live test of a detector\b)", re.I)
 
 # A stamped line of a live card note: "- <author> (<tags>) at HH:MM TZ: <body…>" (core _comment_stamp).
 NOTE_HEADER = re.compile(r"^\s*New notes? on your kanban task from ", re.I)
-NOTE_LINE = re.compile(r"(?m)^- [^\n:]*? at \d{1,2}:\d{2}(?: [A-Za-z0-9+\-]+)?: ")
-AGENT_STAMP = re.compile(r"^- [^\n:(]*\([^)\n]*\bagent chat\b")
+NOTE_LINE = re.compile(r"(?m)^- [^\n]*? at \d{1,2}:\d{2}(?: [A-Za-z0-9+\-]+)?: ")
+AGENT_STAMP = re.compile(r"^- (?:Subagent:|[^\n:(]*\([^)\n]*\bagent chat\b)")
+REVIEW_BRIEF = re.compile(
+    r"^\s*(?:You are (?:an?|the) independent\b[^\n]*\breviewer\b|Review the COMPLETE exact PR\d+\b)", re.I)
 
 
 def drop_agent_notes(text):
@@ -220,7 +222,7 @@ def clean(text):
             text = m.group(1)
     # Desktop appends these machine-owned sections to real user text. Their
     # quoted button labels are not new complaints from the user.
-    text = re.split(r"(?m)^\s*\[(?:user-steps|chat-closeout)\]", text, maxsplit=1)[0]
+    text = re.split(r"(?m)^\s*\[(?:(?:user-steps|chat-closeout)\]|System:)", text, maxsplit=1)[0]
     return drop_agent_notes(text.strip()).strip()
 
 
@@ -314,6 +316,10 @@ def collect(data, since_ts, until_ts, doit=None):
             if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
                 continue
             if u.get("generated"):  # the digest's writer flag: core recorded a plugin wrote this turn (plugin-4731e7cdc3)
+                continue
+            # Launcher-authored review instructions are not human corrections. Do not
+            # suppress ordinary one-shot requests or interactive review requests.
+            if d.get("source") == "oneshot" and i == 0 and REVIEW_BRIEF.match(text):
                 continue
             # Provenance: the digest's `inbox_doit` flag (the Inbox store says Do it sent this prompt; the only proof
             # for a labelled card, whose prompt is not in prev), else the Inbox notice in prev.
@@ -594,6 +600,25 @@ def row_is_doit(row, data=None):
     return False
 
 
+def row_is_review_brief(row, data=None):
+    """Withdraw only a queued quote matched to a proven one-shot review opener."""
+    s, t = row.get("session_id"), row_hit_t(row)
+    q = _ws(str(row.get("quote") or "")).rstrip("…").strip()
+    if not s or t is None or not q:
+        return False
+    for base in coach_data_dirs(data):
+        for f in base.glob(f"*/*/{glob.escape(s)}.json"):
+            d = json.loads(f.read_text())
+            turns = d.get("user_turns") or []
+            if d.get("source") != "oneshot" or not turns:
+                continue
+            u = turns[0]
+            text = clean(u.get("text") or "")
+            if abs((u.get("t") or 0) - t) <= DOIT_NEAR and _ws(text).startswith(q) and REVIEW_BRIEF.match(text):
+                return True
+    return False
+
+
 def still_flags(row, homes=None, data=None):
     """Why the ask-gate monitor no longer stands by a row it queued earlier, else None. The drain re-checks a queued
     row with today's full verdict, in route_hits' order, so any later rule fix retracts the rows it would not have
@@ -604,8 +629,10 @@ def still_flags(row, homes=None, data=None):
     session (selfheal_lane.json). Any error -> None, so the row files as before."""
     try:
         q = row.get("quote") or ""
-        if q and generated(q):
+        if q and (generated(clean(q)) or (NOTE_HEADER.match(q) and not clean(q))):
             return "monitor no longer flags (ask-gate): quote is a generated prompt, not David"
+        if row_is_review_brief(row, data):
+            return "monitor no longer flags (ask-gate): one-shot review brief, not a correction"
         if row_is_doit(row, data):
             return ("monitor no longer flags (ask-gate): the turn was an Inbox Do-it press (the poster's proposal "
                     "pasted as the user's message), not David")
