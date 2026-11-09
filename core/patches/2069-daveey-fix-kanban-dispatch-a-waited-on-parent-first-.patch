@@ -1,0 +1,644 @@
+From e705d05c715054f05c7026c06f5cf559ce056cc1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 14:44:36 +0000
+Subject: [PATCH] [daveey] fix(kanban): dispatch a waited-on parent first and
+ tell its waiting chat when it stays unclaimed
+
+Defect kanban-447c98343f: a rollout card waited 2 h on a p0 parent that sat ready behind 61 older p0 leaves
+(lane order was priority then age only) and the waiting chat heard nothing.
+
+- DISPATCH_ORDER (lane_rows, list_tasks default, worker-node candidates, queue position): effective priority =
+  max(own, waiting todo children), then cards with a waiting child, then age. Stored priority unchanged.
+- kanban_parent_unclaimed: once per wait, a chat-owned todo child whose dependency wait and parent's ready
+  entry are both 30+ min old gets a dependency_parent_unclaimed event (gateway wakes, TUI notice) naming the
+  parent, its queue place and the moves (bump, re-place, do it here). post_notice is reusable.
+- kanban_show adds queue_hint for a card ready and unclaimed 30+ min.
+---
+ gateway/kanban_watchers_notifier.py           |  12 +-
+ hermes_cli/kanban_db.py                       |   8 +-
+ hermes_cli/kanban_db_dispatch.py              |   8 +-
+ hermes_cli/kanban_db_dispatch_queries.py      |  15 +-
+ hermes_cli/kanban_parent_unclaimed.py         | 145 ++++++++++++
+ hermes_cli/kanban_queue_position.py           |  17 +-
+ hermes_cli/kanban_worker_node.py              |   4 +-
+ .../test_kanban_parent_first_dispatch.py      | 217 ++++++++++++++++++
+ tools/kanban_show.py                          |   8 +
+ tui_gateway/session_notifications.py          |   8 +-
+ 10 files changed, 421 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/kanban_parent_unclaimed.py
+ create mode 100644 tests/hermes_cli/test_kanban_parent_first_dispatch.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 002ec899d67..ff9e5fcb2ea 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -47,10 +47,12 @@ def _pin_first():
+ # ``quota_episode_notice`` (third consecutive quota requeue) is a passive notice: it never wakes the origin,
+ # whose own turn would land on the same exhausted provider. ``worker_repin_notice`` (no pool worker can run the
+ # card; hermes_cli.kanban_repin_notice) is passive too: it tells the creator the repin command, never runs it.
+-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice")
++# ``dependency_parent_unclaimed`` (hermes_cli.kanban_parent_unclaimed) wakes the waiting chat: it must act on the
++# parent that cannot start (bump, re-place, do it here), not answer "ready but not started" when asked. [daveey]
++TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed")
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
++_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed")
+ 
+ 
+ def diagnostic_event(ev) -> bool:
+@@ -490,6 +492,11 @@ def _fmt_repin_notice(ev, n) -> tuple:
+     return f"⚠ {n.head}: {notice_text(ev.payload)}", None, None
+ 
+ 
++def _fmt_parent_unclaimed(ev, n) -> tuple:
++    from hermes_cli.kanban_parent_unclaimed import notice_text
++    return f"⏳ {n.head}: {notice_text(ev.payload)}", None, None
++
++
+ def _fmt_timed_out(ev, n) -> tuple:
+     limit = int(_payload(ev, "limit_seconds") or 0)
+     minutes = max(1, round(limit / 60)) if limit else 0
+@@ -516,6 +523,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "block_loop_detected": _fmt_block_loop_detected,
+     "quota_episode_notice": _fmt_quota_episode,
+     "worker_repin_notice": _fmt_repin_notice,
++    "dependency_parent_unclaimed": _fmt_parent_unclaimed,
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index f4e0e11e8a5..8613e65fe39 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -33,6 +33,7 @@ from hermes_cli import kanban_db_sync as _sync
+ from hermes_cli.kanban_worker_placement import validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
++from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_admission import admission_hold_set, claim_transaction, claim_and_open_run, hub_cpu_advisory
+ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+ from toolsets import get_toolset_names
+@@ -1473,12 +1474,11 @@ def list_tasks(
+         if order_by not in VALID_SORT_ORDERS:
+             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
+         query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+-    else:
+-        query += " ORDER BY priority DESC, created_at ASC"
++    else:  # the dispatcher's lane order: a card others wait on first among its effective priority [daveey]
++        query += f" ORDER BY {DISPATCH_ORDER}"
+     if limit:
+         query += f" LIMIT {int(limit)}"
+-    rows = conn.execute(query, params).fetchall()
+-    return [Task.from_row(r) for r in rows]
++    return [Task.from_row(r) for r in conn.execute(query, params).fetchall()]
+ 
+ 
+ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 96e450baecb..f290f7934d7 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -37,7 +37,7 @@ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code
+ from hermes_cli.kanban_db_dispatch_allowlist import _dispatch_profile_allowlist, dispatch_profile_allowlist_summary
+ from hermes_cli import kanban_worker_scope as _worker_scope, kanban_aggregate_scope as _aggregate_scope
+ from hermes_cli import kanban_host_reboot as _host_reboot, kanban_owner_unavailable as _ou  # [daveey]
+-from hermes_cli import kanban_owner_death as _owner_death  # [daveey]
++from hermes_cli import kanban_owner_death as _owner_death, kanban_parent_unclaimed as _parent_unclaimed  # [daveey]
+ from hermes_cli.kanban_db_dispatch_crash_accounting import _account_crashes  # [daveey]
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+ from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
+@@ -2431,6 +2431,7 @@ def _dispatch_once_locked(
+         from hermes_cli.kanban_block_policy import sweep_blocked_cards
+         sweep_blocked_cards(conn, result)
+         _guard_notice.sweep_remote_guard_holds(conn, result)
++        _parent_unclaimed.safe_sweep(conn)  # before the spawn cap: a capped host is when a parent starves [daveey]
+     from hermes_cli.kanban_gateway_drain import dispatch_paused
+     if dispatch_paused():
+         _kb._log.info('kanban dispatcher: scheduling paused — gateway draining or restart requested')
+@@ -2442,9 +2443,8 @@ def _dispatch_once_locked(
+         except Exception:
+             logger = _kb._log
+             logger.warning("kanban worker placement failed; continuing local dispatch", exc_info=True)
+-    may_spawn, spawn_budget = _tick_spawn_budget(
+-        conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+-    )
++    may_spawn, spawn_budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
++                                                 board=board)
+     if not may_spawn:
+         return result
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index 7631767384c..d21d04fc6f2 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -3,12 +3,23 @@ import os
+ import sqlite3
+ 
+ 
++# A card another card waits on (a ``todo`` child) is dispatched first among its effective priority, and that
++# priority is the highest of its own and its waiting children's. Before 11-09 the lane was priority then age only:
++# a p0 parent of a waiting rollout sat ready 2 h behind 61 older p0 leaves (kanban-447c98343f). The stored
++# priority never changes; explicit priority still wins. Rows of ``tasks`` (unaliased) only. [daveey]
++_WAITERS = "FROM task_links wl JOIN tasks w ON w.id = wl.child_id WHERE wl.parent_id = tasks.id AND w.status = 'todo'"
++DISPATCH_ORDER = (
++    f"MAX(COALESCE(tasks.priority, 0), COALESCE((SELECT MAX(COALESCE(w.priority, 0)) {_WAITERS}), 0)) DESC, "
++    f"EXISTS (SELECT 1 {_WAITERS}) DESC, tasks.created_at ASC"
++)
++
++
+ def lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
+-    """Unclaimed rows of one lane in dispatch order."""
++    """Unclaimed rows of one lane in dispatch order (:data:`DISPATCH_ORDER`)."""
+     return conn.execute(
+         "SELECT id, assignee FROM tasks "
+         f"WHERE status = '{status}' AND claim_lock IS NULL "
+-        "ORDER BY priority DESC, created_at ASC"
++        f"ORDER BY {DISPATCH_ORDER}"
+     ).fetchall()
+ 
+ 
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+new file mode 100644
+index 00000000000..5ebf625206e
+--- /dev/null
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -0,0 +1,145 @@
++"""Tell a waiting chat when the parent its card waits on sits ready and unclaimed. [daveey]
++
++Defect kanban-447c98343f (2026-11-02): a rollout card parked at 19:48 on its parent, which sat ready from 19:04 to
++21:04 without a worker; the chat that owned the rollout heard nothing and David asked "what are we waiting for"
++three times. The dispatcher now runs a card others wait on first (``DISPATCH_ORDER``), but a busy or capped host can
++still leave it queued; this module makes that visible to the chat instead of to David.
++
++:func:`sweep` (run by every non-dry dispatcher tick) appends ONE ``dependency_parent_unclaimed`` event per wait to
++a chat-owned ``todo`` child (it has a notify subscription or a ``session_id``) whose latest ``dependency_wait`` is
++at least :data:`THRESHOLD_SECONDS` old while a parent has been ready and unclaimed that long. The gateway and TUI
++notifiers deliver the event to the child's chats with :func:`notice_text`. :func:`ready_hint` is the matching
++``kanban_show`` line for the parent itself.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++
++NOTICE_KIND = "dependency_parent_unclaimed"
++THRESHOLD_SECONDS = 30 * 60
++NO_FIX = "a card that can't start is no fix"
++
++
++def _minutes(seconds: float) -> int:
++    return max(0, int(seconds // 60))
++
++
++def ready_since(conn, task_id: str, created_at: Optional[int] = None) -> int:
++    """When ``task_id`` last entered ``ready`` (the stranded-in-ready diagnostic's floor), else its creation."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_diagnostics import _last_ready_entry_ts
++    since = _last_ready_entry_ts(kb.list_events(conn, task_id))
++    return int(since or created_at or 0)
++
++
++def _place(conn, parent_id: str) -> dict[str, Any]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_queue_position as kqp
++    try:
++        return kqp.position(conn, kb.get_task(conn, parent_id)) or {}
++    except Exception:  # health: allow BLE001 -- a queue place is advisory; the notice still goes out
++        _log.debug("parent-unclaimed: queue position unavailable for %s", parent_id, exc_info=True)
++        return {}
++
++
++def _queue_words(place: dict[str, Any]) -> str:
++    if place.get("lane") == "worker_pool":
++        return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'})"
++    ahead = place.get("ahead")
++    words = f"{ahead} card(s) ahead of it" if ahead is not None else "queue place unknown"
++    if place.get("running") is not None and place.get("limit") is not None:
++        words += f", {place['running']}/{place['limit']} worker slots busy"
++    return words
++
++
++def _options(parent_id: str) -> str:
++    return (f"{NO_FIX}: bump its priority (`hermes kanban edit {parent_id} --priority 10`), re-place it on a "
++            f"gateway with capacity, or do the work here")
++
++
++def notice_text(payload: Any) -> str:
++    """Chat line for the event (gateway and TUI notifiers share it)."""
++    payload = payload if isinstance(payload, dict) else {}
++    parent = str(payload.get("parent") or "<parent>")[:64]
++    title = str(payload.get("parent_title") or "").strip()[:120]
++    named = f"{parent} ({title})" if title else parent
++    return (f"Waiting {payload.get('wait_minutes', '?')} min on parent {named}, which has been ready "
++            f"{payload.get('ready_minutes', '?')} min with no worker ({payload.get('queue') or 'queue place unknown'}). "
++            + _options(parent) + ".")
++
++
++def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
++    """``kanban_show`` hint for a card ready and unclaimed at least :data:`THRESHOLD_SECONDS`; None otherwise."""
++    if task is None or task.status != "ready" or getattr(task, "claim_lock", None):
++        return None
++    now = time.time() if now is None else now
++    waited = now - ready_since(conn, task.id, task.created_at)
++    if waited < THRESHOLD_SECONDS:
++        return None
++    return f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(_place(conn, task.id))}. " + _options(task.id) + "."
++
++
++_CANDIDATES = (
++    "SELECT c.id AS child, p.id AS parent, p.title AS parent_title, p.created_at AS parent_created "
++    "FROM tasks c JOIN task_links l ON l.child_id = c.id JOIN tasks p ON p.id = l.parent_id "
++    "WHERE c.status = 'todo' AND p.status = 'ready' AND p.claim_lock IS NULL "
++    "AND (c.session_id IS NOT NULL OR EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = c.id)) "
++    "ORDER BY c.id, p.id"
++)
++
++
++def sweep(conn, *, now: Optional[float] = None) -> int:
++    """Append the once-per-wait notice for every qualifying (child, parent); returns how many were appended."""
++    from hermes_cli import kanban_db as kb
++    now = time.time() if now is None else now
++    posted = 0
++    for row in conn.execute(_CANDIDATES).fetchall():
++        wait = conn.execute(
++            "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = 'dependency_wait' "
++            "ORDER BY id DESC LIMIT 1", (row["child"],)).fetchone()
++        if wait is None:
++            continue
++        waited = now - (kb._to_epoch(wait["created_at"]) or now)
++        ready_for = now - ready_since(conn, row["parent"], row["parent_created"])
++        if waited < THRESHOLD_SECONDS or ready_for < THRESHOLD_SECONDS:
++            continue
++        if post_notice(conn, row["child"], row["parent"], wait_key=wait["id"], waited_seconds=waited,
++                       ready_seconds=ready_for, parent_title=row["parent_title"]):
++            posted += 1
++    return posted
++
++
++def safe_sweep(conn) -> int:
++    """:func:`sweep` for the dispatcher tick: a notice failure is logged and never stops dispatch."""
++    try:
++        return sweep(conn)
++    except Exception:  # health: allow BLE001 -- a notice failure must never stop dispatch
++        _log.warning("kanban dispatcher: parent-unclaimed notice sweep failed", exc_info=True)
++        return 0
++
++
++def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_seconds: float,
++                ready_seconds: float, parent_title: Optional[str] = None) -> bool:
++    """Append ONE ``dependency_parent_unclaimed`` event to ``task_id`` (its chats receive it through their notify
++    subscriptions) about ``waiting_on``, a card still ready and unclaimed. ``wait_key`` identifies the wait: a
++    second call with the same (waiting_on, wait_key) posts nothing. Reusable for a direct chat wait, where
++    ``waiting_on`` is ``task_id`` itself. Returns True when it posted."""
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        if any(kb._json_dict(p).get("wait_event_id") == wait_key and kb._json_dict(p).get("parent") == waiting_on
++               for (p,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                                        (task_id, NOTICE_KIND))):
++            return False
++        still = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (waiting_on,)).fetchone()
++        if still is None or still["status"] != "ready" or still["claim_lock"]:
++            return False
++        kb._append_event(conn, task_id, NOTICE_KIND, {
++            "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
++            "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
++            "queue": _queue_words(_place(conn, waiting_on)),
++        })
++    return True
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index fc52aa063e2..826a456701a 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -18,14 +18,17 @@ _log = logging.getLogger(__name__)
+ 
+ 
+ def _ahead(conn: sqlite3.Connection, task) -> int:
+-    """Unclaimed ready cards of the same assignee the dispatcher reaches first (higher priority, or the same
+-    priority and created earlier). Worker-first cards wait for the pool, not a local slot, so they are not ahead."""
++    """Unclaimed ready cards of the same assignee the dispatcher reaches first, in its own lane order
++    (``DISPATCH_ORDER``: effective priority, then cards others wait on, then age). Worker-first cards wait for the
++    pool, not a local slot, so they are not ahead."""
++    from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER
+     from hermes_cli.kanban_worker_placement import POLICY
+-    return int(conn.execute(
+-        "SELECT COUNT(*) FROM tasks WHERE status = 'ready' AND claim_lock IS NULL AND id != ? AND assignee IS ? "
+-        "AND placement_policy IS NOT ? AND (priority > ? OR (priority = ? AND created_at < ?))",
+-        (task.id, task.assignee, POLICY, int(task.priority or 0), int(task.priority or 0), int(task.created_at or 0)),
+-    ).fetchone()[0])
++    ids = [r[0] for r in conn.execute(
++        "SELECT id FROM tasks WHERE status = 'ready' AND claim_lock IS NULL AND assignee IS ? "
++        f"AND (placement_policy IS NOT ? OR id = ?) ORDER BY {DISPATCH_ORDER}",
++        (task.assignee, POLICY, task.id),
++    ).fetchall()]
++    return ids.index(task.id) if task.id in ids else len(ids)
+ 
+ 
+ def _running_and_limit(conn: sqlite3.Connection, board: Optional[str]) -> tuple[Optional[int], Optional[int]]:
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 461383509a4..2ad95bbce27 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -32,6 +32,7 @@ import time
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -356,7 +357,8 @@ def candidates(replica: sqlite3.Connection, own: str, *, now_ms: Optional[int] =
+         # parents_not_done by the Board, and that refusal demotes it on every machine. [daveey]
+         "AND NOT EXISTS (SELECT 1 FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
+         "WHERE l.child_id = tasks.id AND COALESCE(p.status, '') NOT IN ('done', 'archived')) "
+-        "ORDER BY status = 'review' DESC, priority DESC, created_at, id",
++        # Same lane order as the hub dispatcher (``DISPATCH_ORDER``): a waited-on parent first. [daveey]
++        f"ORDER BY status = 'review' DESC, {DISPATCH_ORDER}, id",
+         (own, now_ms)).fetchall()
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_parent_first_dispatch.py b/tests/hermes_cli/test_kanban_parent_first_dispatch.py
+new file mode 100644
+index 00000000000..0f475dd4a9b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_parent_first_dispatch.py
+@@ -0,0 +1,217 @@
++"""A ready parent that other cards wait on is dispatched first, and its waiting chat hears when it is not. [daveey]
++
++Defect kanban-447c98343f (2026-11-02): rollout t_01a19400313cfbda parked at 19:48 on its parent t_01a19f3049f432d5,
++which sat ready from 19:04 to 21:04 behind 61 other priority-0 cards, because the dispatcher ordered the ready lane
++by priority then age only. The waiting chat got no notice; David asked three times. These tests pin:
++the dependent-aware lane order (``lane_rows``, ``list_tasks``, the worker-node candidates and the queue position
++agree), one ``dependency_parent_unclaimed`` notice per wait, and the ``kanban_show`` queue hint.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli.kanban_db_dispatch_queries import lane_rows
++
++
++@pytest.fixture
++def conn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    kb.init_db()
++    c = kbc.connect()
++    yield c
++    c.close()
++
++
++def _ready(conn, title, *, priority=0, created_at=None, parents=()):
++    tid = kb.create_task(conn, title=title, assignee="default", priority=priority, parents=parents,
++                         initial_status="running")
++    if created_at is not None:
++        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (created_at, tid))
++        conn.commit()
++    return tid
++
++
++def _ids(rows):
++    return [r["id"] for r in rows]
++
++
++def test_ready_parent_with_waiting_child_dispatches_before_older_leaves(conn):
++    base = int(time.time()) - 3600
++    old1 = _ready(conn, "old leaf 1", created_at=base)
++    old2 = _ready(conn, "old leaf 2", created_at=base + 1)
++    parent = _ready(conn, "newest parent", created_at=base + 2)
++    child = kb.create_task(conn, title="waiting child", assignee="default", parents=[parent])
++    assert kb.get_task(conn, child).status == "todo"
++    order = _ids(lane_rows(conn, "ready"))
++    assert order[0] == parent, order
++    assert order[1:] == [old1, old2]
++
++
++def test_parent_inherits_waiting_childs_priority(conn):
++    base = int(time.time()) - 3600
++    parent = _ready(conn, "p0 parent", priority=0, created_at=base + 5)
++    leaf = _ready(conn, "p5 leaf", priority=5, created_at=base)
++    kb.create_task(conn, title="p10 child", assignee="default", priority=10, parents=[parent])
++    assert _ids(lane_rows(conn, "ready"))[:2] == [parent, leaf]
++    # Stored priority is untouched.
++    assert kb.get_task(conn, parent).priority == 0
++
++
++def test_explicit_priority_still_wins_over_waiting_child(conn):
++    base = int(time.time()) - 3600
++    parent = _ready(conn, "p0 parent", created_at=base)
++    high = _ready(conn, "p5 leaf", priority=5, created_at=base + 1)
++    kb.create_task(conn, title="p0 child", assignee="default", parents=[parent])
++    assert _ids(lane_rows(conn, "ready"))[:2] == [high, parent]
++
++
++def test_list_tasks_default_order_matches_lane(conn):
++    base = int(time.time()) - 3600
++    _ready(conn, "old leaf", created_at=base)
++    parent = _ready(conn, "parent", created_at=base + 1)
++    kb.create_task(conn, title="child", assignee="default", parents=[parent])
++    assert [t.id for t in kb.list_tasks(conn, status="ready")] == _ids(lane_rows(conn, "ready"))
++
++
++def test_queue_position_counts_the_dependent_order(conn):
++    from hermes_cli import kanban_queue_position as kqp
++    base = int(time.time()) - 3600
++    _ready(conn, "old leaf", created_at=base)
++    _ready(conn, "old leaf 2", created_at=base + 1)
++    parent = _ready(conn, "parent", created_at=base + 2)
++    kb.create_task(conn, title="child", assignee="default", parents=[parent])
++    assert kqp._ahead(conn, kb.get_task(conn, parent)) == 0
++
++
++def test_worker_node_candidates_put_waited_on_parent_first(conn):
++    from hermes_cli import kanban_worker_node as wn
++    base = int(time.time()) - 3600
++    leaf = _ready(conn, "old leaf", created_at=base)
++    parent = _ready(conn, "parent", created_at=base + 1)
++    kb.create_task(conn, title="child", assignee="default", parents=[parent])
++    have = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    for col, ddl in (("created_on", "TEXT"), ("lease_holder", "TEXT"), ("lease_expires", "INTEGER")):
++        if col not in have:  # a replica carries the sync columns; a plain test board does not
++            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
++    conn.execute("UPDATE tasks SET created_on='other-gw' WHERE id IN (?, ?)", (leaf, parent))
++    conn.commit()
++    assert [r["id"] for r in wn.candidates(conn, "me")][:2] == [parent, leaf]
++
++
++# --- waiting-chat notice -------------------------------------------------------------------------------------
++
++
++def _subscribe(conn, tid, chat="origin-chat"):
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat, delivery_metadata={"reason": "create"})
++
++
++def _age_wait(conn, child, parent, seconds):
++    """Backdate the child's dependency wait and the parent's ready entry by ``seconds``."""
++    then = int(time.time()) - seconds
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='dependency_wait'", (then, child))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (then, parent))
++    conn.execute("UPDATE tasks SET created_at=? WHERE id IN (?, ?)", (then, child, parent))
++    conn.commit()
++
++
++def _notices(conn, tid):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, pu.NOTICE_KIND))]
++
++
++@pytest.fixture
++def waiting(conn):
++    parent = _ready(conn, "Example sync backport")
++    child = kb.create_task(conn, title="worker-first rollout", assignee="default", parents=[parent])
++    _subscribe(conn, child)
++    _age_wait(conn, child, parent, 31 * 60)
++    return parent, child
++
++
++def test_chat_owned_wait_on_unclaimed_parent_notifies_once(conn, waiting):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    parent, child = waiting
++    assert pu.sweep(conn) == 1
++    notices = _notices(conn, child)
++    assert len(notices) == 1
++    assert notices[0]["parent"] == parent
++    text = pu.notice_text(notices[0])
++    assert parent in text and "bump" in text and "re-place" in text and "here" in text
++    assert pu.sweep(conn) == 0
++    assert len(_notices(conn, child)) == 1
++
++
++def test_claimed_parent_sends_no_notice(conn, waiting):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    parent, child = waiting
++    conn.execute("UPDATE tasks SET claim_lock='hub:1' WHERE id=?", (parent,))
++    conn.commit()
++    assert pu.sweep(conn) == 0
++    assert _notices(conn, child) == []
++
++
++def test_short_wait_sends_no_notice(conn):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    parent = _ready(conn, "parent")
++    child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++    _subscribe(conn, child)
++    _age_wait(conn, child, parent, 10 * 60)
++    assert pu.sweep(conn) == 0
++
++
++def test_child_without_a_chat_sends_no_notice(conn):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    parent = _ready(conn, "parent")
++    child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++    _age_wait(conn, child, parent, 31 * 60)
++    assert pu.sweep(conn) == 0
++
++
++def test_notice_kind_is_delivered_by_both_notifiers():
++    from gateway import kanban_watchers_notifier as gw
++    from hermes_cli import kanban_parent_unclaimed as pu
++    from tui_gateway import session_notifications as sn
++    assert pu.NOTICE_KIND in gw.TERMINAL_KINDS
++    assert pu.NOTICE_KIND in sn._KANBAN_NOTIFY_KINDS
++    assert pu.NOTICE_KIND in sn._KANBAN_EVENT_FORMATTERS
++
++
++def test_dispatch_tick_runs_the_sweep(conn, waiting, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as kbd
++    _parent, child = waiting
++    monkeypatch.setattr(kbd, "_tick_spawn_budget", lambda *a, **k: (False, 0))
++    kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda *a, **k: None)
++    assert len(_notices(conn, child)) == 1
++
++
++# --- kanban_show hint ----------------------------------------------------------------------------------------
++
++
++def test_kanban_show_hints_a_long_ready_card(conn, waiting, monkeypatch):
++    from tools import kanban_show
++    parent, _child = waiting
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    out = json.loads(kanban_show.show({"task_id": parent}))
++    hint = out.get("queue_hint") or ""
++    assert "a card that can't start is no fix" in hint
++    assert "bump" in hint and "re-place" in hint
++
++
++def test_kanban_show_has_no_hint_for_a_fresh_ready_card(conn, monkeypatch):
++    from tools import kanban_show
++    tid = _ready(conn, "fresh")
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    out = json.loads(kanban_show.show({"task_id": tid}))
++    assert not out.get("queue_hint")
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 847e90a2ebc..f22a4d3fd1b 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -19,10 +19,18 @@ def show(args: dict) -> str:
+         task = kt._existing_task(kb, conn, tid)
+         from tools.kanban_tools_capsule import own_card_view
+         worker_context, capsule = own_card_view(task, tid, kb.build_worker_context(conn, tid))
++        # A card ready and unclaimed 30+ min gets its queue place and the moves that start it (kanban-447c98343f):
++        # "ready but has not started" was reported as a status instead of acted on. [daveey]
++        from hermes_cli.kanban_parent_unclaimed import ready_hint
++        try:
++            queue_hint = ready_hint(conn, task)
++        except Exception:  # health: allow BLE001 -- an advisory hint must never fail the read
++            queue_hint = None
+         return json.dumps({
+             "task": kt._fields(task, kt._TASK_FIELDS),
+             **capsule,
+             "queue_reason": kqr.latest(conn, tid),
++            **({"queue_hint": queue_hint} if queue_hint else {}),
+             "parents": kb.parent_ids(conn, tid),
+             "unsatisfied_parents": [
+                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index d6f1956db61..1c7f55db703 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -167,7 +167,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
+ # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+-                        "quota_episode_notice", "worker_repin_notice")
++                        "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -602,6 +602,11 @@ def _kb_repin_notice(payload: dict) -> str:
+     return ": " + notice_text(payload)
+ 
+ 
++def _kb_parent_unclaimed(payload: dict) -> str:
++    from hermes_cli.kanban_parent_unclaimed import notice_text
++    return ": " + notice_text(payload)
++
++
+ def _kb_failure(kind: str, payload: dict, title: str) -> str:
+     """Cause-accurate gave_up/crashed wording; pid/exit/raw output only under ``Details:``. [daveey]"""
+     from hermes_cli.kanban_failure_summary import describe_failure
+@@ -618,6 +623,7 @@ _KANBAN_EVENT_FORMATTERS = {
+     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
+     "quota_episode_notice": ("⏳", lambda t, p, title: _kb_quota_episode(p)),
+     "worker_repin_notice": ("⚠", lambda t, p, title: _kb_repin_notice(p)),
++    "dependency_parent_unclaimed": ("⏳", lambda t, p, title: _kb_parent_unclaimed(p)),
+ }
+ 
+ 
+-- 
+2.55.0
+

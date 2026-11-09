@@ -1,0 +1,299 @@
+From 3282aa2a47b6d1b362631ae824cadf702cf2d68b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 13:56:10 +0000
+Subject: [PATCH] [daveey] kanban: re-add a worktree card's deleted working
+ copy from its branch instead of giving up (self-heal kanban-9101461fb6)
+
+A worktree card t_0000000000000001 (worktree ~/code/sample-dev/task-1175, branch sample-dev/task-1175,
+repo ~/code/sample-dev/myapp) woke after its tree was removed. _resolve_worktree_workspace found no repo
+above the sibling-layout path and raised WorktreeWorkspaceConfigError ('use workspace_path=<repo root>'),
+so the dispatcher sticky-blocked a valid card although its branch still existed.
+
+When a concrete worktree path is gone and the card's branch_name exists in exactly one repo next to it
+(a main checkout or a sibling linked worktree's common dir) or in the board default_workdir, prune and
+re-add it on that branch (never creates a branch) and log a worktree_restored event (path, repo, branch,
+restored_at) so the next deletion can be matched against cleanup logs. If no repo has the branch, the
+error says the working copy was deleted after the card ran, not 'use workspace_path=<repo root>'.
+
+Test: tests/hermes_cli/test_kanban_worktree_restore.py (spawn, delete the tree two ways, spawn again ->
+restored on the same branch and HEAD); red before, green after.
+---
+ hermes_cli/kanban_db_dispatch.py              |   2 +-
+ hermes_cli/kanban_db_workspace.py             |  88 +++++++++++-
+ .../test_kanban_worktree_restore.py           | 134 ++++++++++++++++++
+ 3 files changed, 221 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_worktree_restore.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index d701c785d37..96e450baecb 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2133,7 +2133,7 @@ def _dispatch_lane_task(
+     try:
+         resolved_branch_name = None
+         if claimed.workspace_kind == "worktree":
+-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
++            workspace, resolved_branch_name = _kbw.resolve_worktree_for_dispatch(conn, claimed, board=board)
+         else:
+             workspace = _kbw.resolve_workspace(claimed, board=board)
+     except Exception as exc:
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index b63a05af23d..dba8a6d2e37 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -865,12 +865,60 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
+     return target, branch_name
+ 
+ 
+-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
++_RESTORE_SCAN_LIMIT = 200
++
++
++def _restore_repo_for_missing_worktree(
++    requested: Path, branch_name: str, *, board: Optional[str] = None,
++) -> Optional[Path]:
++    """The one repo that can re-add the deleted worktree *requested* on its existing
++    *branch_name*: the repo of any git checkout next to it (main checkout or a
++    sibling linked worktree, via its common dir) or the board ``default_workdir``.
++    Never guesses: no repo with the branch, or several different ones -> None.
++    [daveey]"""
++    candidates: list[Path] = []
++    board_slug = board if board else _kb.get_current_board()
++    try:
++        default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
++    except (OSError, ValueError, AttributeError):
++        default = ""
++    if default and Path(default).expanduser().is_absolute():
++        candidates.append(Path(default).expanduser())
++    parent = requested.parent
++    try:
++        siblings = sorted(p for p in parent.iterdir() if p.is_dir() and p != requested)
++    except OSError:
++        siblings = []
++    candidates += siblings[:_RESTORE_SCAN_LIMIT]
++    repos: dict[str, Path] = {}
++    for cand in candidates:
++        common = _git_common_dir(cand)
++        if common is None:
++            continue
++        key = _path_key(common)
++        if key in repos:
++            continue
++        root = common.parent if common.name == ".git" else None
++        if root is None or _git_toplevel(root) is None:
++            continue
++        if _git_branch_exists(root, branch_name):
++            repos[key] = root
++    return next(iter(repos.values())) if len(repos) == 1 else None
++
++
++def _resolve_worktree_workspace(
++    task: Task, *, board: Optional[str] = None, restored: Optional[list] = None,
++) -> tuple[Path, str]:
+     """Resolve + materialize a linked git worktree for ``task``. With no
+     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
+     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
+     instead of the dispatcher's incidental CWD (whatever dir the gateway was
+-    launched from); with no anchor configured we fail loudly rather than guess."""
++    launched from); with no anchor configured we fail loudly rather than guess.
++
++    A concrete path that is gone while the card's ``branch_name`` still exists in
++    a repo next to it (or the board ``default_workdir``) is re-added on that
++    branch and reported through *restored* (the dispatcher logs a
++    ``worktree_restored`` event) instead of failing as a config error. [daveey]"""
+     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+     if not task.workspace_path:
+         board_slug = board if board else _kb.get_current_board()
+@@ -928,6 +976,26 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
+         return _anchored_worktree(repo_root, task.id, branch_name)
+ 
+     repo_root = _repo_root_for_worktree_target(requested.parent)
++    if repo_root is None and not requested.exists() and (task.branch_name or "").strip():
++        # A sibling-layout tree (``~/code/sample-dev/task-1175`` of ``~/code/sample-dev/myapp``)
++        # that ran before and was deleted since: re-add it from the card's own branch.
++        repo_root = _restore_repo_for_missing_worktree(requested, branch_name, board=board)
++        if repo_root is None:
++            raise WorktreeWorkspaceConfigError(
++                f"task {task.id} worktree {task.workspace_path!r} was deleted after the card ran (or was created) "
++                f"(on branch {branch_name!r}), and no repo next to it or in the board default_workdir "
++                f"has that branch any more. Re-add it from the repo that has the work: "
++                f"git -C <repo> worktree add {task.workspace_path} <branch>"
++            )
++        _git(repo_root, "worktree", "prune", timeout=60)  # a stale registration blocks the re-add
++        _ensure_git_worktree(repo_root, requested, branch_name)
++        _kb._log.warning(
++            "kanban: restored deleted worktree %s for task %s from %s (branch %s)",
++            requested, task.id, repo_root, branch_name,
++        )
++        if restored is not None:
++            restored.append({"path": str(requested), "repo": str(repo_root), "branch": branch_name})
++        return requested, branch_name
+     if repo_root is None:
+         raise WorktreeWorkspaceConfigError(
+             f"task {task.id} "
+@@ -939,6 +1007,22 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
+     return requested, branch_name
+ 
+ 
++def resolve_worktree_for_dispatch(
++    conn: sqlite3.Connection, task: Task, *, board: Optional[str] = None,
++) -> tuple[Path, str]:
++    """:func:`_resolve_worktree_workspace` for the dispatcher: a working copy deleted
++    after the card ran and re-added from its branch gets a ``worktree_restored``
++    event (path, repo, branch, restored_at), so the next deletion can be matched
++    against GC/cleanup logs. [daveey]"""
++    restored: list = []
++    out = _resolve_worktree_workspace(task, board=board, restored=restored)
++    for info in restored:
++        with _kb.write_txn(conn):
++            _kb._append_event(conn, task.id, "worktree_restored",
++                              dict(info, restored_at=int(time.time())), run_id=task.current_run_id)
++    return out
++
++
+ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+     """Resolve (and create if needed) the workspace for a task.
+ 
+diff --git a/tests/hermes_cli/test_kanban_worktree_restore.py b/tests/hermes_cli/test_kanban_worktree_restore.py
+new file mode 100644
+index 00000000000..6e71a05c4bd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worktree_restore.py
+@@ -0,0 +1,134 @@
++"""A worktree card whose working copy was deleted after it ran is restored from
++its own branch at the next spawn, not given up on as a config error.
++
++Regression (self-heal kanban-9101461fb6): a worktree card
++t_0000000000000001 (workspace_kind=worktree, ~/code/sample-dev/task-1175, branch
++sample-dev/task-1175, repo ~/code/sample-dev/myapp) woke from a CI wait after its tree
++had been removed. ``_resolve_worktree_workspace`` found no repo above the path
++and raised WorktreeWorkspaceConfigError ("use workspace_path=<repo root>"), so
++the dispatcher sticky-blocked a valid card although its branch still existed.
++"""
++
++from __future__ import annotations
++
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    profile = home / "profiles" / "a"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text(
++        "platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n", encoding="utf-8",
++    )
++    kb.init_db()
++    return home
++
++
++def _git(cwd: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-C", str(cwd), "-c", "user.name=T", "-c", "user.email=t@example.com",
++         "-c", "commit.gpgsign=false", *args],
++        check=True, capture_output=True, text=True,
++    ).stdout.strip()
++
++
++@pytest.fixture
++def sample_dev(tmp_path):
++    """``<tmp>/code/sample-dev`` (not a repo) holding repo ``myapp`` and the card's sibling tree ``task-1175``."""
++    root = tmp_path / "code" / "sample-dev"
++    repo = root / "myapp"
++    repo.mkdir(parents=True)
++    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
++    (repo / "README.md").write_text("x\n", encoding="utf-8")
++    _git(repo, "add", "README.md")
++    _git(repo, "commit", "-m", "init")
++    tree = root / "task-1175"
++    _git(repo, "worktree", "add", "-b", "sample-dev/task-1175", str(tree), "HEAD")
++    (tree / "fix.txt").write_text("work\n", encoding="utf-8")
++    _git(tree, "add", "fix.txt")
++    _git(tree, "commit", "-m", "card work")
++    return root
++
++
++def _spawn(conn):
++    from hermes_cli import kanban_db_dispatch as kbd
++    spawned = []
++    kbd.dispatch_once(conn, spawn_fn=lambda task, ws, *a, **k: spawned.append(ws) or 1234, failure_limit=3)
++    return spawned
++
++
++def _requeue(conn, tid):
++    assert kb.reclaim_task(conn, tid, reason="test: next wake", signal_fn=lambda *a, **k: None)
++    assert kb.get_task(conn, tid).status == "ready"
++
++
++@pytest.mark.parametrize("how", ["rm -rf", "git worktree remove"])
++def test_deleted_worktree_is_restored_on_its_branch_at_next_spawn(kanban_home, sample_dev, all_assignees_spawnable, how):
++    tree = sample_dev / "task-1175"
++    head = _git(tree, "rev-parse", "HEAD")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="TASK-1175", assignee="a", workspace_kind="worktree",
++                             workspace_path=str(tree), branch_name="sample-dev/task-1175")
++        assert _spawn(conn) == [str(tree.resolve())]
++        _requeue(conn, tid)
++        if how == "rm -rf":
++            shutil.rmtree(tree)
++        else:
++            _git(sample_dev / "myapp", "worktree", "remove", "--force", str(tree))
++        assert not tree.exists()
++
++        spawned = _spawn(conn)
++        task = kb.get_task(conn, tid)
++        assert spawned == [str(tree)], task.last_failure_error
++        assert task.status == "running"
++        assert _git(tree, "branch", "--show-current") == "sample-dev/task-1175"
++        assert _git(tree, "rev-parse", "HEAD") == head  # same branch, nothing overwritten
++        restored = [e for e in kb.list_events(conn, tid) if e.kind == "worktree_restored"]
++        assert len(restored) == 1
++        p = restored[0].payload
++        assert p["path"] == str(tree)
++        assert p["branch"] == "sample-dev/task-1175"
++        assert Path(p["repo"]).resolve() == (sample_dev / "myapp").resolve()
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
++
++
++def test_deleted_worktree_without_its_branch_names_the_deletion_not_the_config(
++    kanban_home, sample_dev, all_assignees_spawnable,
++):
++    tree = sample_dev / "task-1175"
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="TASK-1175", assignee="a", workspace_kind="worktree",
++                             workspace_path=str(tree), branch_name="sample-dev/task-1175")
++        assert _spawn(conn)
++        _requeue(conn, tid)
++        repo = sample_dev / "myapp"
++        _git(repo, "worktree", "remove", "--force", str(tree))
++        _git(repo, "branch", "-D", "sample-dev/task-1175")
++
++        assert _spawn(conn) == []
++        err = kb.get_task(conn, tid).last_failure_error
++        assert "was deleted after the card ran" in err
++        assert "use workspace_path=" not in err
++
++
++def test_restore_never_creates_a_branch_in_a_guessed_repo(kanban_home, sample_dev, all_assignees_spawnable):
++    """A never-created sibling path with no existing branch stays a config error (create-time rule)."""
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="a", workspace_kind="worktree",
++                             workspace_path=str(sample_dev / "task-9999"))
++        assert _spawn(conn) == []
++        assert not (sample_dev / "task-9999").exists()
++        assert "not inside a git repo" in kb.get_task(conn, tid).last_failure_error
++        assert _git(sample_dev / "myapp", "branch", "--list", f"wt/{tid}") == ""
+-- 
+2.55.0
+

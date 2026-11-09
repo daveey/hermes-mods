@@ -1,0 +1,170 @@
+From 92ac64143d7ab113ff2b1d49780f245ff3d630c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:19:25 +0000
+Subject: [PATCH] [daveey] agent: show a status and log the duration while
+ pre_verify hooks judge a streamed answer (self-heal agent-7aa110cfd7)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The coach's end-of-turn reply check runs after the answer has streamed; a confirm
+pass held a Desktop turn 23 s under a finished-looking answer with a bare spinner.
+_pre_verify_nudge now emits 'Checking the reply before finishing…' via
+agent._emit_status before the hooks run and logs
+'pre_verify done session=<id> seconds=<n> continued=<bool> attempt=<n>' at INFO
+(consumed by hermes-mods plugins/coach/pre_verify_latency_watch.py).
+Fork turns and turns without a pre_verify hook emit nothing; a failing status
+sink never skips the hook.
+---
+ agent/turn_stop_gates.py            | 30 ++++++++---
+ tests/agent/test_turn_stop_gates.py | 83 +++++++++++++++++++++++++++++
+ 2 files changed, 107 insertions(+), 6 deletions(-)
+ create mode 100644 tests/agent/test_turn_stop_gates.py
+
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index cc60c0eb194..7352a70ed21 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -16,6 +16,7 @@ from __future__ import annotations
+ 
+ import logging
+ import os
++import time
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional
+ 
+@@ -24,6 +25,9 @@ from agent.pre_final_gate import UnresolvedFallback
+ 
+ logger = logging.getLogger("agent.conversation_loop")
+ 
++# Shown while ``pre_verify`` hooks judge an answer that has already streamed [daveey].
++PRE_VERIFY_STATUS = "Checking the reply before finishing…"
++
+ 
+ @dataclass
+ class StopGateVerdict:
+@@ -87,12 +91,26 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
+                 from agent.coding_context import is_coding_context
+                 coding = bool(is_coding_context(platform=getattr(agent, "platform", "") or ""))
+                 agent._resolved_is_coding = coding
+-            return get_pre_verify_continue_message(
+-                session_id=getattr(agent, "session_id", None) or "",
+-                platform=getattr(agent, "platform", "") or "",
+-                model=getattr(agent, "model", "") or "", coding=coding, attempt=attempt,
+-                final_response=final_response, changed_paths=_edited,
+-            )
++            # The answer has already streamed; a reply-check hook can take tens of seconds (LLM judges), so
++            # say so instead of leaving a bare spinner under a finished-looking answer (agent-7aa110cfd7).
++            _sid = getattr(agent, "session_id", None) or ""
++            try:
++                agent._emit_status(PRE_VERIFY_STATUS)
++            except Exception:
++                logger.debug("pre_verify status emit failed", exc_info=True)
++            _t0 = time.monotonic()
++            _msg = None
++            try:
++                _msg = get_pre_verify_continue_message(
++                    session_id=_sid,
++                    platform=getattr(agent, "platform", "") or "",
++                    model=getattr(agent, "model", "") or "", coding=coding, attempt=attempt,
++                    final_response=final_response, changed_paths=_edited,
++                )
++                return _msg
++            finally:
++                logger.info("pre_verify done session=%s seconds=%.2f continued=%s attempt=%d",
++                            _sid, time.monotonic() - _t0, bool(_msg), attempt)
+     except Exception:
+         logger.debug("pre_verify hook check failed", exc_info=True)
+     return None
+diff --git a/tests/agent/test_turn_stop_gates.py b/tests/agent/test_turn_stop_gates.py
+new file mode 100644
+index 00000000000..2393ec7ea75
+--- /dev/null
++++ b/tests/agent/test_turn_stop_gates.py
+@@ -0,0 +1,83 @@
++"""turn_stop_gates._pre_verify_nudge: a registered ``pre_verify`` hook runs after the answer has
++streamed, so the user must see a status while it runs and the log must carry its duration
++(self-heal agent-7aa110cfd7: a 23 s silent reply check made a finished answer look stuck)."""
++
++from __future__ import annotations
++
++import logging
++from types import SimpleNamespace
++
++import pytest
++
++from agent import turn_stop_gates, verify_hooks
++
++
++class _Agent(SimpleNamespace):
++    def __init__(self, events, **kw):
++        base = dict(_turn_file_mutation_paths={"a.py"}, session_id="sess-1", platform="tui",
++                    model="m", _resolved_is_coding=False)
++        base.update(kw)
++        super().__init__(**base)
++        self._events = events
++
++    def _emit_status(self, message):
++        self._events.append(("status", message))
++
++
++def _wire(monkeypatch, events, *, hook=True, result="keep going"):
++    from hermes_cli import lifecycle, plugins
++
++    monkeypatch.setattr(lifecycle, "has_hook", lambda name: hook and name == "pre_verify")
++    monkeypatch.setattr(verify_hooks, "pre_verify_every_turn", lambda config=None: True)
++    monkeypatch.setattr(verify_hooks, "max_verify_nudges", lambda config=None: 3)
++
++    def fake(**kw):
++        events.append(("hook", kw["session_id"]))
++        return result
++
++    monkeypatch.setattr(plugins, "get_pre_verify_continue_message", fake)
++
++
++@pytest.mark.parametrize("result,continued", [("keep going", True), (None, False)])
++def test_status_emitted_once_before_hook_and_duration_logged(monkeypatch, caplog, result, continued):
++    events = []
++    _wire(monkeypatch, events, result=result)
++    agent = _Agent(events)
++    with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
++        out = turn_stop_gates._pre_verify_nudge(agent, "Done.", 0)
++    assert out == result
++    assert events == [("status", "Checking the reply before finishing…"), ("hook", "sess-1")]
++    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pre_verify done ")]
++    assert len(lines) == 1, caplog.text
++    assert "session=sess-1" in lines[0] and "seconds=" in lines[0]
++    assert f"continued={continued}" in lines[0]
++
++
++def test_no_hook_no_status(monkeypatch, caplog):
++    events = []
++    _wire(monkeypatch, events, hook=False)
++    with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
++        assert turn_stop_gates._pre_verify_nudge(_Agent(events), "Done.", 0) is None
++    assert events == []
++    assert "pre_verify done" not in caplog.text
++
++
++def test_fork_turn_no_status(monkeypatch):
++    events = []
++    _wire(monkeypatch, events)
++    agent = _Agent(events, _turn_origin="background_review", _persist_disabled=True)
++    assert turn_stop_gates._pre_verify_nudge(agent, "Done.", 0) is None
++    assert events == []
++
++
++def test_status_failure_never_skips_hook(monkeypatch):
++    events = []
++    _wire(monkeypatch, events)
++    agent = _Agent(events)
++
++    def boom(message):
++        raise RuntimeError("no sink")
++
++    agent._emit_status = boom
++    assert turn_stop_gates._pre_verify_nudge(agent, "Done.", 0) == "keep going"
++    assert events == [("hook", "sess-1")]
+-- 
+2.55.0
+
