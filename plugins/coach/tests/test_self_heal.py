@@ -254,6 +254,26 @@ def test_repeat_failure_fingerprint_is_per_tool_and_error():
     assert sh.machine_signal("done", io3)["fingerprint"] != a["fingerprint"]
 
 
+# agent-7f4144a961: a RED/GREEN test cycle (the same test command failed 3x while the agent edited, then passed) was
+# filed as a stuck "repeated terminal error" loop. A loop the identical command later got out of is not a defect.
+RED = ["-> terminal(python3 -m unittest test_listening_metadata_l)",
+       "   <- ERROR test_burst_rollover_is_contiguous (test_listening_metadata_l.T) ... FAIL"]
+
+
+def test_repeat_failure_skips_a_loop_the_same_call_later_passed():
+    assert sh.machine_signal("done", RED * 3 + [RED[0]]) is None  # ends on the passing call (no result line)
+    assert sh.machine_signal("done", RED * 3 + [RED[0], "   <- OK ran 5 tests"]) is None
+    assert sh.machine_signal("done", RED * 3 + [RED[0], "-> read_file(x.py)"]) is None
+
+
+def test_repeat_failure_still_fires_when_a_different_call_passes():
+    hit = sh.machine_signal("done", RED * 3 + ["-> terminal(git status)", "-> read_file(x.py)"])
+    assert hit and hit["kind"] == "repeat_failure"
+    # the identical call passing BEFORE the failures does not excuse them, nor does a pass followed by a 4th failure
+    assert sh.machine_signal("done", [RED[0]] + RED * 3)["kind"] == "repeat_failure"
+    assert sh.machine_signal("done", RED * 3 + [RED[0]] + RED)["kind"] == "repeat_failure"
+
+
 def test_repeat_failure_hit_carries_the_error_line_and_command():
     hit = sh.machine_signal("done", OVERLAP)
     ev = hit["evidence"]

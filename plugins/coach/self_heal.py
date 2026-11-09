@@ -515,15 +515,19 @@ def repeated_tool_error(log) -> Optional[dict]:
     -> {tool, error, count, call, line, evidence, details} or None."""
     seen: dict = {}
     tool, call = "tool", ""
+    calls: list = []  # [call line, errored?] per tool call, in order
     for ln in log or []:
         ln = str(ln)
         m = _TOOL_CALL_RE.match(ln)
         if m:
             tool, call = m.group(1), ln.strip()
+            calls.append([call, False])
             continue
         e = ERR_LINE_RE.search(ln)
         if not e:
             continue
+        if calls:
+            calls[-1][1] = True
         norm = normalize_error(e.group(1)[:200])
         if not norm:
             continue
@@ -531,9 +535,17 @@ def repeated_tool_error(log) -> Optional[dict]:
         rec["count"] += 1
         rec["calls"].append((call, e.group(1).strip()))
         rec["call"], rec["line"] = call, e.group(1).strip()
-    rep = next((r for r in seen.values() if r["count"] >= 3), None)
+        rec["last_idx"] = len(calls) - 1
+
+    # agent-7f4144a961: a RED/GREEN test cycle (the same test command failed 3x while the agent edited, then passed)
+    # is not a stuck loop. Drop a group when the identical call ran again after its last failure and got no error.
+    def _recovered(r) -> bool:
+        return any(c == r["call"] and not err for c, err in calls[r.get("last_idx", len(calls)) + 1:])
+
+    rep = next((r for r in seen.values() if r["count"] >= 3 and not _recovered(r)), None)
     if not rep:
         return None
+    rep.pop("last_idx", None)
     rep["evidence"] = (f"{rep['tool']} failed {rep['count']}x with the same error: {rep['line'][:160]} "
                        f"(last call: {rep['call'][:120]})")
     rep["details"] = "\n".join(f"{c[:200]}\n   <- ERROR {x[:200]}" for c, x in rep.pop("calls")[-4:])
