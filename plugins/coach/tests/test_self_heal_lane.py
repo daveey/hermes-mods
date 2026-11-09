@@ -1760,13 +1760,44 @@ def _commit_case(store, tmp_path, monkeypatch, subject, commit_at, last_reply="F
 
 def test_defect_fixed_by_bare_session_commit_files_nothing_and_records_fixed(store, tmp_path, monkeypatch):
     d, sha, r, out = _commit_case(store, tmp_path, monkeypatch,
-                                  "fix(desktop): show SSH cloud gateways with the cloud glyph", NOW - 3200)
+                                  "fix(desktop): stop sidebar sessions reshuffle on refresh", NOW - 3200)
     assert out["action"] == "skip" and out["adopted"] and out["commit"] == sha
     assert not r.creates()
     assert sh.LaneState(store.root).get(d["fingerprint"] if d.get("fingerprint") else sh.fingerprint("desktop", d["symptom"]))["status"] == "fixed"
     (e,) = ev(store, "selfheal_adopted_owner")
     assert e["via"] == "session_commit" and e["commit"] == sha
     assert sha[:12] in ev(store, "selfheal_fixed")[0]["note"]
+
+
+def test_nearby_component_fix_without_defect_proof_is_not_adopted(store, tmp_path, monkeypatch):
+    """RED before the change: in-window `fix(desktop)` commit about another defect (turn lease) was credited."""
+    d, sha, r, out = _commit_case(store, tmp_path, monkeypatch,
+                                  "fix(desktop): session turn lease wait times out instead of queueing", NOW - 3200)
+    assert out["action"] == "filed" and len(r.creates()) == 1
+    assert not ev(store, "selfheal_adopted_owner") and not ev(store, "selfheal_fixed")
+
+
+def test_named_sha_without_defect_proof_is_not_adopted(store, tmp_path, monkeypatch):
+    """Naming a sha anywhere in the session is not proof the commit fixes this defect."""
+    sha = None
+    d, sha, r, out = _commit_case(store, tmp_path, monkeypatch,
+                                  "fix(desktop): session turn lease wait times out instead of queueing", NOW - 3200,
+                                  last_reply="Landed the turn lease change, see 0123456789ab")
+    p = tmp_path / "data" / "macbook" / "default" / f"{d['session_id']}.json"
+    p.write_text(json.dumps({"id": d["session_id"], "host": "macbook", "user_turns": [], "last_reply": f"see {sha}",
+                             "last_activity_at": NOW - 3000}))
+    assert sh.session_commit_fix(d, NOW - 3600, data=tmp_path / "data", repo=tmp_path / "fork", now=NOW) is None
+    assert out["action"] == "filed"
+
+
+def test_one_session_two_defects_commit_binds_only_the_one_it_names(store, tmp_path, monkeypatch):
+    d1, sha, r, out = _commit_case(store, tmp_path, monkeypatch,
+                                   "fix(desktop): stop sidebar sessions reshuffle on refresh", NOW - 3200)
+    assert out["adopted"] and out["commit"] == sha
+    d2 = defect(at=NOW - 60, host="macbook", component="desktop", complaint_at=NOW - 3600,
+                symptom="cryptic needs you text asks credential", session_id=d1["session_id"])
+    assert sh.session_commit_fix(d2, NOW - 3600, data=tmp_path / "data", repo=tmp_path / "fork", now=NOW) is None
+    assert sh.session_commit_fix(d1, NOW - 3600, data=tmp_path / "data", repo=tmp_path / "fork", now=NOW)["sha"] == sha
 
 
 def test_commit_before_the_complaint_or_other_component_is_not_a_fix(store, tmp_path, monkeypatch):
@@ -2061,3 +2092,13 @@ def test_queued_ask_gate_row_whose_session_the_lane_already_filed_is_withdrawn(s
     sh.retry_deferred(store, now=NOW + 3601, filer=lambda *a, **k: pytest.fail("filed a lane-owned session"))
     (skip,) = [e for e in ev(store, "selfheal_skip") if e["fingerprint"] == row["fingerprint"]]
     assert "already has a filing for session s_lane" in skip["why"]
+
+
+def test_named_sha_that_names_the_defect_is_adopted(store, tmp_path, monkeypatch):
+    d, sha, r, out = _commit_case(store, tmp_path, monkeypatch, "desktop: sidebar sessions reshuffle gone", NOW - 3200)
+    assert out["action"] == "filed"  # not a `fix` subject, so the window path alone does not take it
+    p = tmp_path / "data" / "macbook" / "default" / f"{d['session_id']}.json"
+    p.write_text(json.dumps({"id": d["session_id"], "host": "macbook", "user_turns": [], "last_reply": f"see {sha[:10]}",
+                             "last_activity_at": NOW - 3000}))
+    fix = sh.session_commit_fix(d, NOW - 3600, data=tmp_path / "data", repo=tmp_path / "fork", now=NOW)
+    assert fix["sha"] == sha and fix["via"] == "named"

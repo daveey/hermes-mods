@@ -2669,14 +2669,27 @@ def _traceback_commit_fix(d: dict, since: float, repo: Path, now: float) -> Opti
     return None
 
 
+def _commit_binds_defect(repo: Path, sha: str, subject: str, d: dict) -> bool:
+    """Defect-bound proof that commit `sha` fixes defect `d`, not merely landed nearby: the defect's traceback files
+    are in the diff, or the commit's own subject/body names the fingerprint, the symptom or enough of its
+    distinctive words (card_names_defect rules). Time and component overlap never count (79477b7501f4, a turn-lease
+    fix, was credited to three unrelated needs-you/credential complaints), and neither does a sha the session
+    merely mentions."""
+    tb_files = {os.path.basename(p) for p in re.findall(r'File "([^"]+)"', str(d.get("details") or ""))}
+    if tb_files:
+        return bool(tb_files & {os.path.basename(f) for f in _git_lines(repo, "show", "--name-only", "--format=", sha)})
+    body = "\n".join(_git_lines(repo, "show", "-s", "--format=%b", sha))
+    return card_names_defect({"title": subject, "body": body}, d)
+
+
 def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo: Optional[Path] = None,
                        now: Optional[float] = None) -> Optional[dict]:
     """A fix the origin session shipped as a bare commit (no kanban card): a commit on the fork's origin/main made
-    after `since` that (a) the session's digest names by sha, or (b) landed inside the session's active window
-    (since .. last_activity_at + slack) as a `fix` whose subject names the defect's component, e.g.
-    `fix(desktop): ...` for component=desktop, and (when the defect carries a traceback) whose diff touches a file
-    named in it. Window+component is what catches a digest whose truncated last_reply
-    never names the sha. -> {sha, at, subject} or None."""
+    after `since` that is bound to THIS defect (_commit_binds_defect) and either (a) the session's digest names by
+    sha, or (b) landed inside the session's active window (since .. last_activity_at + slack) as a `fix` whose
+    subject names the defect's component, e.g. `fix(desktop): ...`. Window and component only select candidates;
+    without defect-bound proof the defect stays unresolved (a session can report several defects, and a nearby fix
+    for another one proves nothing). -> {sha, at, subject, via} or None."""
     sid, host, comp = d.get("session_id"), d.get("host"), (d.get("component") or "").lower()
     root = Path(data) if data else Path(os.environ.get("COACH_DATA") or Path.home() / "code" / "hermes-coach-data")
     paths = (sorted(root.glob(f"{host}/*/{sid}.json")) if host else sorted(root.glob(f"*/*/{sid}.json"))) if sid else []
@@ -2701,16 +2714,12 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
                                                             if (t.get("t") or 0) > since for k in ("prev", "text")])
         named = set(_SHA.findall(text))
         for sha, ts, subj in commits:
-            if any(sha.startswith(n) for n in named):
+            if any(sha.startswith(n) for n in named) and _commit_binds_defect(repo, sha, subj, d):
                 return {"sha": sha, "at": ts, "subject": subj, "via": "named"}
-        # A traceback defect names the files it fails in: a window match must touch one of them, or it is just
-        # whatever fix landed nearby (a sessions `--source` change was once adopted as the fix for a lease error).
-        tb_files = {os.path.basename(p) for p in re.findall(r'File "([^"]+)"', str(d.get("details") or ""))}
         for sha, ts, subj in sorted(commits, key=lambda c: c[1]):
             head = subj.lower()
             if ts <= until and head.startswith("fix") and comp and re.search(r"\b%s\b" % re.escape(comp), head):
-                if tb_files and not tb_files & {os.path.basename(f) for f in
-                                                _git_lines(repo, "show", "--name-only", "--format=", sha)}:
+                if not _commit_binds_defect(repo, sha, subj, d):
                     continue
                 return {"sha": sha, "at": ts, "subject": subj, "via": "window"}
     if not has_digest:
