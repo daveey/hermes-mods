@@ -1,7 +1,7 @@
 ---
 name: recurring-job-state
 description: "Use when a cron job or recurring card family needs memory. STATE.md."
-version: 1.0.0
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -54,9 +54,27 @@ Prepend to the prompt: `STATE: first run python3 $S show <job> and follow its Le
 fields above. Edit with `hermes cron edit <id> --prompt "$(cat new.txt)"` on the job's host, then trigger or wait
 for one real run and diff the state file before/after.
 
+## Fleet runs that reach a laptop
+
+When the hub's fleet tick (the family harvest fan-out, or any cron that ssh's into each host) reaches a laptop,
+a sleeping or closed laptop is *unavailable*, never a failed run. Otherwise every overnight sleep turns the cron
+red and files a false defect that looks the same as a real outage. The rule, as in kanban-drift `monitor.py`
+(`presence`, `absent_alert_after`) and the private family-state fleet script:
+- ssh rc=255 with a connect-level error (`connect to host … Connection timed out|No route to host|Network is
+  unreachable|Connection refused`, `Could not resolve hostname`, `Connection timed out during banner exchange`)
+  records `unavailable_since` per host in the job's JSON state and exits 0. Capture stderr to classify it, then
+  pass it through. Auth and host-key errors, the deadline (124) and collector rcs still fail at once.
+- While the host is dark, a presence probe (`tailscale ping -c 1 --timeout 5s <host>`) splits it: if the host is
+  absent, fail after 7 d; if it is up but ssh keeps failing, fail after 6 h. A probe that can't run counts as up,
+  so a broken probe never hides a real failure. A flat 6 h window alone is not enough, because a laptop closed
+  over a weekend trips it.
+- Any real answer, success or a genuine failure, clears `unavailable_since`. Test a sleeping host, a long
+  absence, an up host whose ssh fails, an auth failure, and clearing on success.
+
 ## Done means
 - [ ] The job's prompt (or card body) reads the state file before acting and records to it as the last step?
 - [ ] The state file exists on the host that runs the job and has a Last run line from a real run after the change?
 - [ ] Every new lesson has a `[slug]`, and each PROMOTE line was moved into the job's skill and marked `--promoted`?
 - [ ] `python3 $S prune <job>` exits 0 (file within 150 lines)?
 - [ ] Card family: a fresh card of the family shows the `job-state:` comment, and a finished run appears in Tried?
+- [ ] A fleet run that reaches a laptop exits 0 on a connect-level ssh failure (records `unavailable_since`) and fails only after the absent (7 d) or up-but-failing (6 h) window, with a test for each?
