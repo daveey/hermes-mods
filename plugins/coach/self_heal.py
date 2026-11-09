@@ -1240,6 +1240,8 @@ INVESTIGATION_BUDGET = 8
 FIX_BUDGET = 15
 USD_DAY = 200.0
 MAX_RUNNING = 3
+INVESTIGATION_SLOTS_WHILE_FIXES_WAIT = 1  # fix-first: the rest of MAX_RUNNING goes to waiting fix cards
+FIX_TITLE = "self-heal fix:"
 SNOOZE_DAYS = 14
 NOT_DEFECT_DAYS = 7
 SAME_QUOTE_MIN_CHARS = 120  # a quote this long, shared by other sessions, is one complaint (agent-ea7ff00170)
@@ -1786,6 +1788,10 @@ def budget(board: Optional[str] = None, now: Optional[float] = None,
             raise ValueError("invalid self-heal spend or cap")
         inflight = [c for c in eb.engine_cards(home, b, ("running", "ready", "todo")) if c["lane"] == "selfheal"]
         running = sum(1 for c in inflight if c.get("status", "running") == "running")
+        # A just-created card is `ready` until the dispatcher claims it: counting only `running` let one signals pass
+        # admit 5 investigations in 10 s against a cap of 3 (t_01a1c00ca6bc0945). Admitted = running + ready.
+        busy = [c for c in inflight if c.get("status", "running") in ("running", "ready")]
+        occupied_fix = sum(1 for c in busy if str(c.get("title") or "").startswith(FIX_TITLE))
         reserved = float(new_card_usd)
         for c in inflight:
             cb = eb.card_budget(c, snap) if hasattr(eb, "card_budget") else float(INVESTIGATION_BUDGET)
@@ -1796,7 +1802,8 @@ def budget(board: Optional[str] = None, now: Optional[float] = None,
             why = f"{why} (spend ${usd:.2f} + ${reserved:.2f} reserved for in-flight and the new card)"
         # Commit the observation only after ALL reads succeed. Unknown is not zero spend.
         out.update(usd=usd, cap=cap, running=running, ok_usd=ok, reserved=round(reserved, 2),
-                   ok_running=running < MAX_RUNNING, available=True, why=why)
+                   occupied=len(busy), occupied_fix=occupied_fix,
+                   ok_running=len(busy) < MAX_RUNNING, available=True, why=why)
     except Exception as exc:
         out["why"] = f"budget read failed: {exc}"
     return out
@@ -1819,6 +1826,44 @@ def _admission_denied(b: dict, now: float) -> Optional[dict]:
     if not b["ok_running"]:
         return {"action": "deferred", "retry_at": _iso(now + 3600),
                 "why": "self-heal concurrency limit reached"}
+    return None
+
+
+def fixes_waiting(store, auto: Optional[bool] = None) -> int:
+    """Proposals the lane will turn into fix cards (status proposed, auto-approve on). 0 when approval is manual:
+    those wait on David, not on a slot."""
+    if not (auto_approve() if auto is None else auto):
+        return 0
+    try:
+        return sum(1 for st in LaneState(store.root).read().values() if st.get("status") == "proposed")
+    except Exception:
+        return 0
+
+
+def _fix_first_denied(b: dict, store, now: float) -> Optional[dict]:
+    """Finish before starting: while proposals wait for fix cards, a new investigation may take only the one
+    investigation slot (INVESTIGATION_SLOTS_WHILE_FIXES_WAIT) and must leave FIX_BUDGET of dollar headroom. Without
+    this every freed slot went to the next investigation and 40 approved fixes waited up to 112 h
+    (t_01a1c00ca6bc0945). Budget dicts without `occupied` (injected legacy budget functions) keep the old gate."""
+    if "occupied" not in b:
+        return None
+    waiting = fixes_waiting(store)
+    if not waiting:
+        return None
+    investigations = int(b.get("occupied") or 0) - int(b.get("occupied_fix") or 0)
+    if investigations >= INVESTIGATION_SLOTS_WHILE_FIXES_WAIT:
+        return {"action": "deferred", "retry_at": _iso(now + 3600),
+                "why": f"fix-first: {waiting} proposal(s) wait for fix cards and {investigations} investigation(s) "
+                       f"already hold the investigation slot"}
+    try:
+        need = float(b["usd"]) + float(b["reserved"]) + FIX_BUDGET
+        cap = float(b["cap"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if need >= cap:
+        return {"action": "deferred", "retry_at": _next_utc_midnight(now),
+                "why": f"fix-first: {waiting} proposal(s) wait for fix cards; this investigation would leave less "
+                       f"than ${FIX_BUDGET} for one (${need:.2f} >= ${cap:g} cap)"}
     return None
 
 
@@ -3205,7 +3250,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
         return unavailable
-    denied = _admission_denied(b, now)
+    denied = _admission_denied(b, now) or _fix_first_denied(b, store, now)
     if denied:
         return _defer_investigation(d, denied, store)
     known, gen = known_cards(st), dec["gen"]
@@ -3353,7 +3398,7 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         return {"action": "skip", "why": f"fix card exists: {st['fix_card']}", "card": st["fix_card"]}
     r = route({"component": st.get("component")})
     key = fix_key(fp, generation(st) or 1)
-    args = {"title": f"self-heal fix: {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
+    args = {"title": f"{FIX_TITLE} {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
             "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
