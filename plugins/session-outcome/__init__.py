@@ -186,6 +186,7 @@ SCHEMA = {
         "properties": {
             "kind": {"type": "string", "enum": ["done", "decide", "wait"]},
             "summary": {"type": "string", "description": "done: what was done and the result."},
+            "keep_crons": {"type": "boolean", "description": "done: keep ownership of live cron jobs for a continuing watch. Default false releases ownership without stopping or changing the jobs."},
             "items": {"type": "array", "minItems": 1, "description": "decide: the questions for the user.",
                       "items": {"type": "object", "additionalProperties": False, "required": ["question", "choices"],
                                 "properties": {"question": {"type": "string"},
@@ -241,7 +242,8 @@ def _validate(args: dict) -> dict:
         summary = _text(args.get("summary"))
         if not summary:
             raise ValueError('done needs a non-empty "summary"')
-        return {"kind": "done", "summary": summary[:SUMMARY_MAX]}
+        return {"kind": "done", "summary": summary[:SUMMARY_MAX],
+                **({"keep_crons": True} if args.get("keep_crons") is True else {})}
     if kind == "decide":
         items = args.get("items")
         if not isinstance(items, list) or not items:
@@ -306,7 +308,7 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
         result: dict[str, Any] = {"ok": True}
         added: list[str] = []
         if spec["kind"] == "done":
-            outcome = {"kind": "done", "summary": spec["summary"]}
+            outcome = dict(spec)
         elif spec["kind"] == "wait":
             outcome = {"kind": "waiting", "on": spec["on"]}
         else:
@@ -341,7 +343,9 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
                           + "this Hermes core cannot store outcomes yet; nothing was declared")
             return json.dumps(result)
         try:
-            api.declare_outcome(session_id, outcome)
+            stored = api.declare_outcome(session_id, outcome)
+            if isinstance(stored, dict) and "released_crons" in stored:
+                result["released_crons"] = stored["released_crons"]
         except Exception as exc:
             us = _user_steps() if added else None
             if us is not None:

@@ -122,6 +122,17 @@ def test_done_declares_summary(plugin, fake):
     assert fake.declared == [("S1", {"kind": "done", "summary": "Shipped v2; tests pass."})]
 
 
+def test_done_passes_keep_crons_and_returns_released_jobs(plugin, fake, monkeypatch):
+    receipts = [{"id": "watch", "name": "status-watch"}]
+    def declare(sid, outcome):
+        fake.declared.append((sid, outcome))
+        return {**outcome, "released_crons": receipts}
+    monkeypatch.setattr(fake, "declare_outcome", declare)
+    out = call(plugin, {"kind": "done", "summary": "Installed.", "keep_crons": True})
+    assert fake.declared[0][1]["keep_crons"] is True
+    assert out["released_crons"] == receipts
+
+
 def test_done_without_summary_is_refused(plugin, fake):
     out = call(plugin, {"kind": "done", "summary": "  "})
     assert not out["ok"] and "summary" in out["error"] and fake.declared == []
