@@ -185,7 +185,7 @@ def test_moved_on_batch_clears_no_closeout(incident):
     key = 'chat-closeout:no-closeout:chat:abc'
     tid = plugin.file_card('stuck', 'stuck', key)
     led.flag_once(key, 1)
-    led.write('chat', batch=[], settled_sig='abc')
+    led.write('chat', batch=[], settled_sig='next-batch')
     plugin.watchdog_tick(now=2000, mono=2000, unseen={}, force=True)
     with connect() as conn:
         assert kb.get_task(conn, tid).status == 'done'

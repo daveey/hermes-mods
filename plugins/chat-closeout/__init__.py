@@ -1437,12 +1437,14 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         led.write(sid, covered=set(row.get("covered") or []) | set(new_ids), closing=sorted(row["batch"]),
                   wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1,
                   unlinked=core.briefed(row.get("unlinked"), now))
+        wake_error = None
         try:
             result = wake(sid, prompt, display_kind="kanban_notice",
                           display_metadata={"display_text": core.notice_text(row, cards), "closeout": True,
                                             "task_ids": sorted(row["batch"])},
                           label="chat-closeout")
-        except Exception:
+        except Exception as exc:
+            wake_error = exc
             logger.warning("chat-closeout: wake failed for %s", sid, exc_info=True)
             result = "error"
         if result == "started":
@@ -1453,7 +1455,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
             # busy/refused/error: undo the coverage + count; a later tick (or the owning backend) retries
             led.write(sid, covered=set(row.get("covered") or []), closing=None, wakes=row.get("wakes") or [],
                       wake_count=int(row.get("wake_count") or 0), unlinked=row.get("unlinked") or {})
-            result, backoff = _failure_backoff(sid, result, now)
+            result, backoff = _failure_backoff(sid, result, now, error=wake_error)
             led.release(sid, due, result, now=now, backoff=backoff)
             logger.info("chat-closeout: close-out wake of %s deferred (%s)", sid, result)
         done.append({"session_id": sid, "result": result, "sig": due})
@@ -1554,12 +1556,50 @@ def _quota_wall(sid: str, now: Optional[float] = None) -> Optional[float]:
     return reset if reset > now else None
 
 
-def _failure_backoff(sid: str, result: str, now: float) -> tuple[str, float]:
+def _wake_failure_reset(sid: str, now: float, error: Optional[Exception] = None) -> Optional[float]:
+    """The build exception's clock, including failures on the automation-replay path.
+
+    Core records exception.resets_at in agent_failure before returning an error from
+    _wake_session_turn. A second pool probe can disagree with that actual failure.
+    """
+    import math
+    try:
+        if error is not None:
+            from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
+            reset = getattr(error, "resets_at", None)
+            if (isinstance(error, SubscriptionQuotaUnavailable) and isinstance(reset, (int, float))
+                    and not isinstance(reset, bool) and math.isfinite(reset) and reset > now):
+                return float(reset)
+            return None
+        srv = _server()
+        if srv is None:
+            return None
+        live = srv._find_live_session_by_key(sid)
+        if live is None:
+            tip = _canonical_session(sid)
+            live = srv._find_live_session_by_key(tip) if tip != sid else None
+        session = live[1] if live else {}
+        failure = session.get("agent_failure") or {}
+        reset = failure.get("failure_resets_at") if session.get("agent_error") else None
+        if isinstance(reset, (int, float)) and not isinstance(reset, bool) and math.isfinite(reset) and reset > now:
+            return float(reset)
+    except Exception:
+        logger.debug("chat-closeout: build-failure clock unavailable for %s", sid, exc_info=True)
+    return None
+
+
+def _quota_wait(row: dict, now: float) -> bool:
+    """Persisted quota clocks are authoritative across processes until retry is due."""
+    return row.get("wake_result") == "quota" and (
+        float(row.get("retry_after") or 0) > now or bool(_quota_wall(row["session_id"], now)))
+
+
+def _failure_backoff(sid: str, result: str, now: float, *, error: Optional[Exception] = None) -> tuple[str, float]:
     """(result, backoff) for a failed wake: ``quota`` with an hourly-capped wait to the reset when the chat's exact
     pin is quota-walled, else the plain result with the claim TTL (0 for busy)."""
     if result == "busy":
         return result, 0
-    if result == "error" and (reset := _quota_wall(sid, now)):
+    if result == "error" and (reset := _wake_failure_reset(sid, now, error) or _quota_wall(sid, now)):
         return "quota", max(1.0, min(reset - now, QUOTA_RECHECK_S))
     return result, owner_wake.CLAIM_TTL_S
 
@@ -1586,6 +1626,7 @@ def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Ca
     relayed = {p for p in row.get("relayed") or [] if p.rsplit("@", 1)[0] in batch} | {p for _, p in cands}
     led.write(sid, covered=set(row.get("covered") or []) | set(ids), relayed=relayed, wakes=wakes,
               wake_count=int(row.get("wake_count") or 0) + 1)
+    wake_error = None
     try:
         gateway = _moved_owner(sid)
         prompt = core.ask_relay_prompt(row, cards, ids, now=now)
@@ -1599,7 +1640,8 @@ def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Ca
             result = wake(sid, prompt, display_kind="kanban_notice",
                           display_metadata={"display_text": core.ask_notice_text(cards, ids), "ask_relay": True,
                                             "task_ids": ids}, label="chat-closeout")
-    except Exception:
+    except Exception as exc:
+        wake_error = exc
         logger.warning("chat-closeout: ask relay wake failed for %s", sid, exc_info=True)
         result = "error"
     if result in ("started", "forwarded"):
@@ -1609,7 +1651,7 @@ def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Ca
     else:
         led.write(sid, covered=set(before["covered"] or []), relayed=set(before["relayed"] or []),
                   wakes=before["wakes"] or [], wake_count=int(before["wake_count"] or 0))
-        result, backoff = _failure_backoff(sid, result, now)
+        result, backoff = _failure_backoff(sid, result, now, error=wake_error)
         led.release(sid, key, result, now=now, backoff=backoff)
         logger.info("chat-closeout: ask relay to %s deferred (%s)", sid, result)
     return {"session_id": sid, "result": result, "sig": key, "ask_relay": ids}
@@ -1817,7 +1859,7 @@ _WATCHDOG_KEY = re.compile(r"^chat-closeout:(?:unseen|no-closeout|ask-failed|stu
                            r"|^chat-closeout:handoff:[^:]+$")
 
 
-def _cleared_evidence(key: str, unseen: dict[str, int], led) -> str:
+def _cleared_evidence(key: str, unseen: dict[str, int], led) -> Optional[str]:
     parts = key.split(":")
     if parts[1] in ("unseen", "no-closeout") and _session_gone(parts[2]):
         return f"chat {parts[2]} was deleted (absent from every state.db); nothing can hand it results"
@@ -1825,10 +1867,14 @@ def _cleared_evidence(key: str, unseen: dict[str, int], led) -> str:
         return (f"unseen count 0 for {parts[2]}" if unseen.get(parts[2], 0) == 0
                 else f"unseen episode {parts[3]} ended; a different episode is now observed")
     if parts[1] == "no-closeout":
-        row = led.get(parts[2]) or {}
+        row = led.get(parts[2])
+        if row is None:
+            return f"ledger row absent for {parts[2]}"
         if row.get("done_sig") == parts[3]:
             return f"done_sig matched {parts[3]}; done_at={row.get('done_at')}"
-        return f"batch moved on; settled_sig={row.get('settled_sig')!r}, batch={row.get('batch')!r}"
+        if row.get("settled_sig") != parts[3]:
+            return f"batch moved on; settled_sig={row.get('settled_sig')!r}, batch={row.get('batch')!r}"
+        return None  # unobserved/paused is not proof that this batch cleared
     if parts[1] == "stuck":
         row = led.get(parts[2]) or {}
         if not row.get("batch"):
@@ -1842,11 +1888,13 @@ def _cleared_evidence(key: str, unseen: dict[str, int], led) -> str:
             return f"delivery receipt for {parts[2]}: {row[0]}" if row else f"handoff row {parts[2]} absent"
         finally:
             conn.close()
-    row = led.get(parts[2]) or {}
-    if row.get("wake_result") == "quota":
-        return (f"wakes of {parts[2]} fail only on a known quota wall of its exact-pinned model (a clock wait, "
-                f"retried at most hourly until the reset; next try at Unix {row.get('retry_after')})")
-    return f"ask relay failure_since changed for {parts[2]}"
+    row = led.get(parts[2])
+    if row is None:
+        return f"ask relay ledger row absent for {parts[2]}"
+    since = row.get("failure_since")
+    if since is None or str(int(since)) != parts[3]:
+        return f"ask relay failure_since changed for {parts[2]}"
+    return f"ask relay no longer pending for {parts[2]}"
 
 
 def resolve_card(key: str, resolution: dict) -> bool:
@@ -1955,10 +2003,12 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
             continue  # a failed inventory read cannot prove the incident cleared
         if row.get("closing") is None and core.closeout_key(row, cards) != sig:
             continue  # reported since, or the batch moved on (a woken turn still in flight stays watched)
-        if row.get("wake_result") == "quota" and _quota_wall(row["session_id"], now):
-            continue  # a clock wait on the user's quota-walled exact pin: the core replays at the reset
         if now - float(at) >= core.STALE_S and _session_gone(row["session_id"]):
-            continue  # a deleted chat: wake_tick drops its row; nothing can run its close-out
+            continue  # positive deletion evidence wins even during a quota clock wait
+        if _quota_wait(row, now):
+            seen_mono.setdefault(key, mono)
+            uncertain.add(key)
+            continue  # paused, not cleared: retain the incident and its observation age
         observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - float(at) < core.STALE_S or mono - first < core.STALE_S:
@@ -1975,8 +2025,10 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
         if not sig:
             continue
         key = f"chat-closeout:ask-failed:{row['session_id']}:{int(since)}"
-        if row.get("wake_result") == "quota" and _quota_wall(row["session_id"], now):
-            continue  # a clock wait on the user's quota-walled exact pin, not a broken relay path
+        if _quota_wait(row, now):
+            seen_mono.setdefault(key, mono)
+            uncertain.add(key)
+            continue  # paused, not cleared
         observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - since >= core.STALE_S and mono - first >= core.STALE_S:
@@ -2019,7 +2071,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                            "successful delivery receipt. Inspect the target before retrying; do not resend "
                            "an uncertain send automatically."))
     failures: dict[str, int] = _state.setdefault("post_failures", {})
-    for k in [k for k in seen_mono if k not in observed]:
+    for k in [k for k in seen_mono if k not in observed and k not in uncertain]:
         seen_mono.pop(k, None)
         failures.pop(k, None)
     for key in flagged:
@@ -2029,7 +2081,11 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
             led.reset_resolution(key)
             continue
         try:
-            resolution = led.resolution(key, now, _cleared_evidence(key, unseen, led))
+            evidence = _cleared_evidence(key, unseen, led)
+            if evidence is None:
+                led.reset_resolution(key)  # discard a prior, no-longer-valid positive observation
+                continue
+            resolution = led.resolution(key, now, evidence)
             if resolve_card(key, resolution):
                 led.clear_flag(key)
         except Exception:
