@@ -70,6 +70,38 @@ def test_legacy_duplicate_stale_lane_skips_with_deployed_fix(incident, kind, par
     assert any(r.get("event") == "selfheal_skip" and r.get("why") == "resolved under agent-sibling" for r in rows)
 
 
+@pytest.mark.parametrize("window", [
+    "2026-11-04 00:26:34–00:27:17",  # no explicit timezone
+    "2026-11-04 00:27:17–00:26:34Z",  # reversed
+    "2026-11-04 00:26:34–00:27:17Z; 2026-11-04 01:00:00–01:01:00Z",  # ambiguous
+    "2026-13-04 00:26:34–00:27:17Z",  # invalid date
+])
+def test_ambiguous_legacy_ranges_do_not_suppress(incident, window):
+    store, d, board, _ = incident
+    with sqlite3.connect(board) as db:
+        db.execute("UPDATE task_comments SET body=?", (
+            f"Problem: {window} on example-host, workers died with "
+            "`WorkerPersistenceError: storage_unavailable`.",))
+    result, filed = retry(store, d)
+    assert result == [{"action": "filed"}]
+    assert len(filed) == 1
+
+
+def test_historical_space_separated_utc_range_skips(incident):
+    store, d, board, _ = incident
+    # Preserve the persisted comment's timestamp grammar, scrub host and identifiers.
+    comment = (
+        "Problem: 2026-11-04 00:26:34–00:27:17Z on example-host, "
+        "5 Kanban workers bound to gateway pid 12345 died with "
+        "`WorkerPersistenceError: storage_unavailable` (managed-worker.log)."
+    )
+    with sqlite3.connect(board) as db:
+        db.execute("UPDATE task_comments SET body=?", (comment,))
+    result, filed = retry(store, d)
+    assert result == [{"action": "skip", "why": "resolved under agent-sibling"}]
+    assert not filed
+
+
 @pytest.mark.parametrize("change", ["window", "error", "host", "remote", "no_sha", "unknown_sha", "no_window", "not_signal", "reverted", "refiled", "malformed_lane", "post_resolution"])
 def test_insufficient_or_different_evidence_files(incident, change):
     store, d, board, sha = incident

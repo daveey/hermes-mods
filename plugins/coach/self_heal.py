@@ -2138,12 +2138,17 @@ def _crash_evidence(text: str, host: str) -> Optional[dict]:
     if not window:
         # Investigation comments also use a single explicit range with the end date elided.
         # Multiple ranges are ambiguous: do not combine an outage/deploy window with a crash window.
-        ranges = list(re.finditer(stamp + r"`?\s*(?:\.\.|–|—| - |to)\s*`?"
-                                 r"((?:\d{4}-\d{2}-\d{2}T)?\d{2}:\d{2}:\d{2}Z)", text))
+        # Legacy comments use "YYYY-MM-DD HH:MM:SS–HH:MM:SSZ": the final Z
+        # explicitly scopes the range to UTC. Never infer UTC for an unzoned range.
+        range_start = r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}Z?)"
+        ranges = list(re.finditer(range_start + r"`?\s*(?:\.\.|–|—| - |to)\s*`?"
+                                 r"((?:\d{4}-\d{2}-\d{2}[T ])?\d{2}:\d{2}:\d{2}Z)", text))
         window = ranges[0] if len(ranges) == 1 else None
     if not window:
         return None
-    first, last = window.groups()
+    first, last = (t.replace(" ", "T") for t in window.groups())
+    if not first.endswith("Z"):
+        first += "Z"
     if "T" not in last:
         last = first.split("T")[0] + "T" + last
     try:
