@@ -287,7 +287,9 @@ def check_complete(task_id: str, summary: str, paths: list[Path], title: Optiona
 # "Origin chat: @session:default@macbook/20261025_233046_d48ade", "report ... to origin @session:X",
 # "origin_session=@session:X". The id group is the bare session id (what task_chat_links / notify subs store).
 ORIGIN_SESSION_RE = re.compile(
-    r"\borigin(?:_session)?\b[^\n@]{0,60}@session:(?:[\w.-]+(?:@[\w.-]+)?/)?([A-Za-z0-9][\w-]{5,})", re.I)
+    r"\borigin(?:_session)?\b[^\n@]{0,60}@session:(?:[\w.-]+(?:@[\w.-]+)?/)?([A-Za-z0-9][\w-]{5,})(?![\w-]|/)", re.I)
+# The lookahead stops `@session:default/ (a cron run)` -- a placeholder with no id -- from backtracking into
+# reading the profile name `default` as the session id (cron-b48bd46e2a's fix card could not complete).
 REPORTED_RE = re.compile(r"\bfollow-through:\s*SENT\b", re.I)
 # A "SENT" note that carries the send's failure is not a send (live test: ok:false, "No connected Hermes Desktop").
 FAILED_SEND_RE = re.compile(r"\"?ok\"?\s*:\s*false|\bno connected\b|\b(?:send|delivery) failed\b"
