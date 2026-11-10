@@ -1,0 +1,424 @@
+From 12f2969250695cd0541991e84cb36c28fa47c212 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:38:35 +0000
+Subject: [PATCH] fix(desktop): split transcript-cache bodies from metadata so
+ main-thread reads stop stalling scroll [daveey]
+
+Bodies (up to 8 MB JSON) sat inline before bytes/saved_at/used_at, so every
+metadata read walked the body's overflow chain. At the 256 MB bound each
+prefetch pass (meta() per target) and each write's enforceBounds() scanned the
+whole cache synchronously on Electron's main thread: 0.5-0.85 s input stalls,
+seen as choppy scrolling. Measured on a copy of a real 255 MB cache: freshness
+pass 800 ms -> 2.4 ms, eviction scan 628 ms -> 0.7 ms, stats 55 -> 0.1 ms.
+
+Metadata now lives in 'entries', text in 'bodies' (FK cascade). A legacy
+inline-body file is unlinked on open (instant) and refills via prefetch.
+---
+ .../desktop/electron/transcript-cache.test.ts | 117 ++++++++++++-
+ apps/desktop/electron/transcript-cache.ts     | 154 ++++++++++++------
+ 2 files changed, 217 insertions(+), 54 deletions(-)
+
+diff --git a/apps/desktop/electron/transcript-cache.test.ts b/apps/desktop/electron/transcript-cache.test.ts
+index a9db6649f45..45ba41a929d 100644
+--- a/apps/desktop/electron/transcript-cache.test.ts
++++ b/apps/desktop/electron/transcript-cache.test.ts
+@@ -117,7 +117,7 @@ describe('transcript cache: write and read', () => {
+     store.close()
+ 
+     const raw = new DatabaseSync(file)
+-    raw.prepare("UPDATE transcripts SET body = '{not json'").run()
++    raw.prepare("UPDATE bodies SET body = '{not json'").run()
+     raw.close()
+ 
+     const reopened = new TranscriptCacheStore(file)
+@@ -137,7 +137,12 @@ describe('transcript cache: LRU and size bounds', () => {
+     store.read(key('a')) // a is now the most recently used
+     store.putLatest(key('d'), rows(1, 2))
+ 
+-    expect(store.keys().map(entry => entry.sessionId).sort()).toEqual(['a', 'c', 'd'])
++    expect(
++      store
++        .keys()
++        .map(entry => entry.sessionId)
++        .sort()
++    ).toEqual(['a', 'c', 'd'])
+   })
+ 
+   it('evicts by total bytes', () => {
+@@ -173,3 +178,111 @@ describe('transcript cache: LRU and size bounds', () => {
+     expect(store.read(key('s1'))).toBeNull()
+   })
+ })
++
++const bodyRows = (file: string) => {
++  const raw = new DatabaseSync(file)
++  const n = (raw.prepare('SELECT COUNT(*) AS n FROM bodies').get() as { n: number }).n
++  raw.close()
++
++  return Number(n)
++}
++
++describe('transcript cache: metadata never reads bodies', () => {
++  it('keeps the body out of the metadata table that meta(), stats() and eviction scan', () => {
++    const file = tempFile()
++    new TranscriptCacheStore(file).close()
++
++    const raw = new DatabaseSync(file)
++
++    const columns = (table: string) =>
++      (raw.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(column => column.name)
++
++    expect(columns('entries')).not.toContain('body')
++    expect(columns('entries')).toEqual(
++      expect.arrayContaining(['bytes', 'saved_at', 'used_at', 'activity', 'message_count'])
++    )
++    expect(columns('bodies')).toEqual(['id', 'body'])
++    raw.close()
++  })
++
++  it('answers meta() and stats() for multi-MB entries without decoding their bodies', () => {
++    const file = tempFile()
++    const store = new TranscriptCacheStore(file)
++    const huge = [{ content: 'q'.repeat(4 * 1024 * 1024), id: 1 }]
++
++    store.putLatest(key('big'), huge, { activity: 5, messageCount: 1 })
++    store.close()
++
++    // Corrupt the body in place: a metadata read that decoded it would self-evict the entry.
++    const raw = new DatabaseSync(file)
++    raw.prepare("UPDATE bodies SET body = '{not json'").run()
++    raw.close()
++
++    const reopened = new TranscriptCacheStore(file)
++    expect(reopened.meta(key('big'))).toMatchObject({ activity: 5, messageCount: 1 })
++    expect(reopened.stats().sessions).toBe(1)
++    expect(reopened.stats().bytes).toBeGreaterThan(4 * 1024 * 1024)
++  })
++
++  it('leaves no orphan bodies after drop, dropEverywhere, eviction, re-key over an existing scope and clear', () => {
++    let clock = 0
++    const file = tempFile()
++    const store = new TranscriptCacheStore(file, { limits: { maxSessions: 3 }, now: () => (clock += 1) })
++
++    for (const id of ['a', 'b', 'c', 'd']) {
++      store.putLatest(key(id), rows(1, 2))
++    }
++
++    expect(bodyRows(file)).toBe(3) // 'a' evicted with its body
++
++    store.drop(key('b'))
++    expect(bodyRows(file)).toBe(2)
++
++    store.putLatest(key('c', 'local', 'old'), rows(1, 2))
++    store.putLatest(key('c', 'local', 'new'), rows(5, 6))
++    store.migrateProfile('local', 'old', 'new') // REPLACE deletes the 'new' row it collides with
++    expect(store.read(key('c', 'local', 'new'))?.messages).toEqual(rows(1, 2))
++    expect(bodyRows(file)).toBe(store.stats().sessions)
++
++    store.dropEverywhere('c')
++    expect(bodyRows(file)).toBe(store.stats().sessions)
++
++    store.clear()
++    expect(bodyRows(file)).toBe(0)
++    expect(store.stats().sessions).toBe(0)
++  })
++
++  it('discards a legacy inline-body cache file and starts empty and writable', () => {
++    const file = tempFile()
++    const legacy = new DatabaseSync(file)
++    legacy.exec(`CREATE TABLE transcripts (
++      connection_id TEXT NOT NULL, profile TEXT NOT NULL, session_id TEXT NOT NULL, body TEXT NOT NULL,
++      bytes INTEGER NOT NULL, saved_at REAL NOT NULL, used_at REAL NOT NULL, activity REAL, message_count INTEGER,
++      PRIMARY KEY (connection_id, profile, session_id)) WITHOUT ROWID`)
++    legacy.prepare("INSERT INTO transcripts VALUES ('mac-mini', 'default', 's1', '[]', 2, 1, 1, NULL, NULL)").run()
++    legacy.close()
++
++    const store = new TranscriptCacheStore(file)
++    expect(store.stats().sessions).toBe(0)
++    expect(store.putLatest(key('s1'), rows(1, 2))).toBe(true)
++    expect(store.read(key('s1'))?.messages).toEqual(rows(1, 2))
++    store.close()
++
++    const raw = new DatabaseSync(file)
++    expect(raw.prepare("SELECT 1 FROM sqlite_master WHERE name = 'transcripts'").get()).toBeUndefined()
++    raw.close()
++    expect((fs.statSync(file).mode & 0o777).toString(8)).toBe('600')
++  })
++
++  it('surfaces the real SQLite error when a write fails after SQLite rolled back itself', () => {
++    const file = tempFile()
++    const store = new TranscriptCacheStore(file)
++    const raw = new DatabaseSync(file)
++    const pages = Number((raw.prepare('PRAGMA page_count').get() as { page_count: number }).page_count)
++    raw.close()
++    ;(store as unknown as { db: DatabaseSync }).db.exec(`PRAGMA max_page_count = ${pages + 2}`)
++
++    expect(() => store.putLatest(key('full'), [{ content: 'f'.repeat(1024 * 1024), id: 1 }])).toThrow(/full/i)
++    expect(store.meta(key('full'))).toBeNull()
++  })
++})
+diff --git a/apps/desktop/electron/transcript-cache.ts b/apps/desktop/electron/transcript-cache.ts
+index 2f6885f9f9a..4bed5e6308a 100644
+--- a/apps/desktop/electron/transcript-cache.ts
++++ b/apps/desktop/electron/transcript-cache.ts
+@@ -47,24 +47,40 @@ export interface CachedTranscript {
+ 
+ type Limits = typeof DEFAULT_LIMITS
+ 
++// Metadata and bodies live in separate tables. A body is up to MAX_ENTRY_BYTES of
++// JSON and spills into an overflow-page chain; SQLite reads a row's columns in order,
++// so any column stored after the body (bytes, saved_at, ...) forced a walk of that
++// whole chain. With bodies inline, every freshness check, stats() and LRU scan read
++// the full cache (~256 MB at the bound) synchronously on Electron's main thread and
++// froze input for 0.5-0.85 s per prefetch write: choppy scrolling everywhere.
++// Keep every query that does not need the text on `entries`.
+ const SCHEMA = `
+-CREATE TABLE IF NOT EXISTS transcripts (
++CREATE TABLE IF NOT EXISTS entries (
++  id INTEGER PRIMARY KEY,
+   connection_id TEXT NOT NULL,
+   profile TEXT NOT NULL,
+   session_id TEXT NOT NULL,
+-  body TEXT NOT NULL,
+   bytes INTEGER NOT NULL,
+   saved_at REAL NOT NULL,
+   used_at REAL NOT NULL,
+   activity REAL,
+   message_count INTEGER,
+-  PRIMARY KEY (connection_id, profile, session_id)
+-) WITHOUT ROWID;
+-CREATE INDEX IF NOT EXISTS transcripts_used ON transcripts(used_at);
+-CREATE INDEX IF NOT EXISTS transcripts_session ON transcripts(session_id);
++  UNIQUE (connection_id, profile, session_id)
++);
++CREATE INDEX IF NOT EXISTS entries_used ON entries(used_at);
++CREATE INDEX IF NOT EXISTS entries_session ON entries(session_id);
++CREATE TABLE IF NOT EXISTS bodies (
++  id INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
++  body TEXT NOT NULL
++);
+ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+ `
+ 
++/** Pre-split layout (body inline). A cache: discard the file rather than migrate it. */
++const LEGACY_TABLE = 'transcripts'
++
++const KEY_WHERE = 'connection_id = ? AND profile = ? AND session_id = ?'
++
+ /** Stable identity of one display row: the server row id when present. */
+ export function messageIdentity(message: unknown): string {
+   const row = (message ?? {}) as Record<string, unknown>
+@@ -130,13 +146,10 @@ export class TranscriptCacheStore {
+       fs.mkdirSync(path.dirname(file), { recursive: true })
+     }
+ 
+-    this.db = new DatabaseSync(file)
++    this.db = TranscriptCacheStore.open(file)
+     this.limits = { ...DEFAULT_LIMITS, ...options.limits }
+     this.now = options.now ?? Date.now
+ 
+-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 2000;')
+-    this.db.exec(SCHEMA)
+-
+     if (file !== ':memory:') {
+       try {
+         fs.chmodSync(file, 0o600)
+@@ -146,6 +159,33 @@ export class TranscriptCacheStore {
+     }
+   }
+ 
++  private static open(file: string): DatabaseSync {
++    let db = new DatabaseSync(file)
++
++    if (file !== ':memory:' && TranscriptCacheStore.hasLegacyTable(db)) {
++      // Unlinking is instant; DROP TABLE on a full legacy cache would walk every
++      // overflow page on the main thread, the very stall this layout removes.
++      db.close()
++
++      for (const suffix of ['', '-wal', '-shm']) {
++        fs.rmSync(`${file}${suffix}`, { force: true })
++      }
++
++      db = new DatabaseSync(file)
++    }
++
++    db.exec(
++      'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 2000; PRAGMA foreign_keys = ON;'
++    )
++    db.exec(SCHEMA)
++
++    return db
++  }
++
++  private static hasLegacyTable(db: DatabaseSync): boolean {
++    return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(LEGACY_TABLE))
++  }
++
+   close(): void {
+     this.db.close()
+   }
+@@ -153,11 +193,10 @@ export class TranscriptCacheStore {
+   read(key: TranscriptCacheKey, options: { touch?: boolean } = {}): CachedTranscript | null {
+     const row = this.db
+       .prepare(
+-        'SELECT body, saved_at, activity, message_count FROM transcripts WHERE connection_id = ? AND profile = ? AND session_id = ?'
++        `SELECT b.body, e.saved_at, e.activity, e.message_count FROM entries e JOIN bodies b ON b.id = e.id WHERE ${KEY_WHERE}`
+       )
+       .get(key.connectionId, key.profile, key.sessionId) as
+-      | { activity: null | number; body: string; message_count: null | number; saved_at: number }
+-      | undefined
++      { activity: null | number; body: string; message_count: null | number; saved_at: number } | undefined
+ 
+     if (!row) {
+       return null
+@@ -179,7 +218,7 @@ export class TranscriptCacheStore {
+ 
+     if (options.touch !== false) {
+       this.db
+-        .prepare('UPDATE transcripts SET used_at = ? WHERE connection_id = ? AND profile = ? AND session_id = ?')
++        .prepare(`UPDATE entries SET used_at = ? WHERE ${KEY_WHERE}`)
+         .run(this.now(), key.connectionId, key.profile, key.sessionId)
+     }
+ 
+@@ -189,12 +228,9 @@ export class TranscriptCacheStore {
+   /** Metadata only (prefetch freshness checks): no body parse, no LRU touch. */
+   meta(key: TranscriptCacheKey): { activity: null | number; messageCount: null | number; savedAt: number } | null {
+     const row = this.db
+-      .prepare(
+-        'SELECT saved_at, activity, message_count FROM transcripts WHERE connection_id = ? AND profile = ? AND session_id = ?'
+-      )
++      .prepare(`SELECT saved_at, activity, message_count FROM entries WHERE ${KEY_WHERE}`)
+       .get(key.connectionId, key.profile, key.sessionId) as
+-      | { activity: null | number; message_count: null | number; saved_at: number }
+-      | undefined
++      { activity: null | number; message_count: null | number; saved_at: number } | undefined
+ 
+     return row ? { activity: row.activity, messageCount: row.message_count, savedAt: row.saved_at } : null
+   }
+@@ -225,14 +261,12 @@ export class TranscriptCacheStore {
+   }
+ 
+   drop(key: TranscriptCacheKey): void {
+-    this.db
+-      .prepare('DELETE FROM transcripts WHERE connection_id = ? AND profile = ? AND session_id = ?')
+-      .run(key.connectionId, key.profile, key.sessionId)
++    this.db.prepare(`DELETE FROM entries WHERE ${KEY_WHERE}`).run(key.connectionId, key.profile, key.sessionId)
+   }
+ 
+   /** Every scope's entry for a deleted stored id. */
+   dropEverywhere(sessionId: string): void {
+-    this.db.prepare('DELETE FROM transcripts WHERE session_id = ?').run(sessionId)
++    this.db.prepare('DELETE FROM entries WHERE session_id = ?').run(sessionId)
+   }
+ 
+   /** Profile rename on one connection: re-key its entries. */
+@@ -242,26 +276,26 @@ export class TranscriptCacheStore {
+     }
+ 
+     this.db
+-      .prepare(
+-        'UPDATE OR REPLACE transcripts SET profile = ? WHERE connection_id = ? AND profile = ?'
+-      )
++      .prepare('UPDATE OR REPLACE entries SET profile = ? WHERE connection_id = ? AND profile = ?')
+       .run(to, connectionId, from)
+   }
+ 
+   clear(): void {
+-    this.db.exec('DELETE FROM transcripts')
++    this.db.exec('DELETE FROM bodies; DELETE FROM entries')
+   }
+ 
+   keys(): TranscriptCacheKey[] {
+     return (
+-      this.db
+-        .prepare('SELECT connection_id, profile, session_id FROM transcripts ORDER BY used_at DESC')
+-        .all() as { connection_id: string; profile: string; session_id: string }[]
++      this.db.prepare('SELECT connection_id, profile, session_id FROM entries ORDER BY used_at DESC').all() as {
++        connection_id: string
++        profile: string
++        session_id: string
++      }[]
+     ).map(row => ({ connectionId: row.connection_id, profile: row.profile, sessionId: row.session_id }))
+   }
+ 
+   stats(): { bytes: number; sessions: number } {
+-    const row = this.db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS b FROM transcripts').get() as {
++    const row = this.db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS b FROM entries').get() as {
+       b: number
+       n: number
+     }
+@@ -290,26 +324,42 @@ export class TranscriptCacheStore {
+ 
+     const now = this.now()
+ 
+-    this.db
+-      .prepare(
+-        `INSERT INTO transcripts (connection_id, profile, session_id, body, bytes, saved_at, used_at, activity, message_count)
+-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+-         ON CONFLICT(connection_id, profile, session_id) DO UPDATE SET
+-           body = excluded.body, bytes = excluded.bytes, saved_at = excluded.saved_at, used_at = excluded.used_at,
+-           activity = COALESCE(excluded.activity, transcripts.activity),
+-           message_count = COALESCE(excluded.message_count, transcripts.message_count)`
+-      )
+-      .run(
+-        key.connectionId,
+-        key.profile,
+-        key.sessionId,
+-        fitted.body,
+-        fitted.bytes,
+-        now,
+-        now,
+-        meta.activity ?? null,
+-        meta.messageCount ?? null
+-      )
++    this.db.exec('BEGIN')
++
++    try {
++      const row = this.db
++        .prepare(
++          `INSERT INTO entries (connection_id, profile, session_id, bytes, saved_at, used_at, activity, message_count)
++           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++           ON CONFLICT(connection_id, profile, session_id) DO UPDATE SET
++             bytes = excluded.bytes, saved_at = excluded.saved_at, used_at = excluded.used_at,
++             activity = COALESCE(excluded.activity, entries.activity),
++             message_count = COALESCE(excluded.message_count, entries.message_count)
++           RETURNING id`
++        )
++        .get(
++          key.connectionId,
++          key.profile,
++          key.sessionId,
++          fitted.bytes,
++          now,
++          now,
++          meta.activity ?? null,
++          meta.messageCount ?? null
++        ) as { id: number }
++
++      this.db
++        .prepare('INSERT INTO bodies (id, body) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET body = excluded.body')
++        .run(row.id, fitted.body)
++      this.db.exec('COMMIT')
++    } catch (error) {
++      // SQLITE_FULL/IOERR/NOMEM already rolled back; a second ROLLBACK would mask the real error.
++      if (this.db.isTransaction) {
++        this.db.exec('ROLLBACK')
++      }
++
++      throw error
++    }
+ 
+     this.enforceBounds()
+ 
+@@ -325,7 +375,7 @@ export class TranscriptCacheStore {
+     }
+ 
+     const victims = this.db
+-      .prepare('SELECT connection_id, profile, session_id, bytes FROM transcripts ORDER BY used_at ASC')
++      .prepare('SELECT connection_id, profile, session_id, bytes FROM entries ORDER BY used_at ASC')
+       .all() as { bytes: number; connection_id: string; profile: string; session_id: string }[]
+ 
+     for (const victim of victims) {
+-- 
+2.55.0
+

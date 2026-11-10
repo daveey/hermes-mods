@@ -1,0 +1,164 @@
+From 7807b4ea0eeffd7466a186974da494b4ede9d955 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:57:49 -0800
+Subject: [PATCH] fix(build): retry ENOTEMPTY when removing published product
+ backups [daveey]
+
+---
+ scripts/build/frontend-common.mjs         | 17 +++++--
+ tests-js/frontend-common-publish.test.mjs | 60 ++++++++++++++++++++++-
+ 2 files changed, 71 insertions(+), 6 deletions(-)
+
+diff --git a/scripts/build/frontend-common.mjs b/scripts/build/frontend-common.mjs
+index b9c85e9c620..17b46bc90e8 100644
+--- a/scripts/build/frontend-common.mjs
++++ b/scripts/build/frontend-common.mjs
+@@ -87,17 +87,24 @@ export function productOutput(source, out, inputs) {
+ const heldCodes = new Set(['EPERM', 'EACCES', 'EBUSY'])
+ const heldRetryDelays = [100, 200, 400, 800, 1600]
+ 
+-export function retryHeld(operation) {
++export function retryHeld(operation, codes = heldCodes) {
+   for (const delay of [...heldRetryDelays, undefined]) {
+     try {
+       return operation()
+     } catch (error) {
+-      if (delay === undefined || !heldCodes.has(error?.code)) throw error
++      if (delay === undefined || !codes.has(error?.code)) throw error
+       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay)
+     }
+   }
+ }
+ 
++// Backup deletion can hit ENOTEMPTY just like scratch cleanup on macOS.
++// Keep publication synchronous (including the TUI caller), and fail closed
++// when the bounded retry budget is exhausted or the error is unrelated.
++function removeBackup(dir) {
++  retryHeld(() => rmSync(dir, { recursive: true, force: true }), new Set(['ENOTEMPTY']))
++}
++
+ // Never delete the last successful product before a compiler succeeds. The
+ // backup lives beside out, outside withProduct's scratch tree, so a failed
+ // rollback leaves the previous product somewhere a person can recover it.
+@@ -111,7 +118,7 @@ export function publishDirectory(staged, out, { source } = {}) {
+   try {
+     retryHeld(() => renameSync(out, backup))
+   } catch (error) {
+-    rmSync(backupRoot, { recursive: true, force: true })
++    removeBackup(backupRoot)
+     throw error
+   }
+   try {
+@@ -123,10 +130,10 @@ export function publishDirectory(staged, out, { source } = {}) {
+       error.message += `; rollback failed (${rollbackError.message}); previous product kept at ${backup}`
+       throw error
+     }
+-    rmSync(backupRoot, { recursive: true, force: true })
++    removeBackup(backupRoot)
+     throw error
+   }
+-  rmSync(backupRoot, { recursive: true, force: true })
++  removeBackup(backupRoot)
+ }
+ 
+ export async function withProduct(out, compile, { source } = {}) {
+diff --git a/tests-js/frontend-common-publish.test.mjs b/tests-js/frontend-common-publish.test.mjs
+index 7c00e2cdc93..f8233b10645 100644
+--- a/tests-js/frontend-common-publish.test.mjs
++++ b/tests-js/frontend-common-publish.test.mjs
+@@ -8,11 +8,20 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+ // EPERM until the scan ends (#126914). Fault only the renames a test names;
+ // every other rename reaches the real filesystem.
+ const faults = vi.hoisted(() => [])
++const removals = vi.hoisted(() => [])
+ 
+ vi.mock('node:fs', async importOriginal => {
+   const actual = await importOriginal()
+   return {
+     ...actual,
++    rmSync(dir, options) {
++      const entry = dir.includes('-previous-') ? removals[0] : undefined
++      if (entry) entry.calls++
++      if (entry && entry.calls <= entry.failures) {
++        throw Object.assign(new Error(`${entry.code}: remove '${dir}'`), { code: entry.code })
++      }
++      return actual.rmSync(dir, options)
++    },
+     renameSync(from, to) {
+       const fault = faults.find(entry => entry.match(from))
+       if (fault) fault.calls++
+@@ -24,7 +33,7 @@ vi.mock('node:fs', async importOriginal => {
+   }
+ })
+ 
+-const { withProduct } = await import('../scripts/build/frontend-common.mjs')
++const { publishDirectory, withProduct } = await import('../scripts/build/frontend-common.mjs')
+ 
+ let root
+ 
+@@ -35,6 +44,7 @@ beforeEach(() => {
+ 
+ afterEach(() => {
+   faults.length = 0
++  removals.length = 0
+   vi.restoreAllMocks()
+   rmSync(root, { recursive: true, force: true })
+ })
+@@ -45,6 +55,54 @@ function fault(match, code, failures = Infinity) {
+   return entry
+ }
+ 
++function removal(code = 'ENOTEMPTY', failures = 2) {
++  const entry = { code, failures, calls: 0 }
++  removals.push(entry)
++  return entry
++}
++
++test('backup cleanup retries ENOTEMPTY after publishing the new product', async () => {
++  const out = previousProduct()
++  const entry = removal()
++  await withProduct(out, product => writeFileSync(join(product, 'new.txt'), 'new'))
++  expect(entry.calls).toBe(3)
++  expect(readFileSync(join(out, 'new.txt'), 'utf8')).toBe('new')
++  expect(readdirSync(root)).toEqual(['native-deps'])
++})
++
++test.each(['old', 'staged'])('backup cleanup retries after a failed %s rename without hiding the error', async phase => {
++  const out = previousProduct()
++  const entry = removal()
++  if (phase === 'old') fault(out, 'EINVAL')
++  await expect(withProduct(out, product => {
++    if (phase === 'staged') fault(product, 'EINVAL')
++  })).rejects.toThrow(/EINVAL/)
++  expect(entry.calls).toBe(3)
++  expect(readFileSync(join(out, 'old.txt'), 'utf8')).toBe('old')
++  expect(readdirSync(root)).toEqual(['native-deps'])
++})
++
++test.each([['ENOTEMPTY', 6], ['EINVAL', 1]])('persistent %s cleanup failure is bounded and preserves the new product', async (code, calls) => {
++  const out = previousProduct()
++  const entry = removal(code, Infinity)
++  await expect(withProduct(out, product => writeFileSync(join(product, 'new.txt'), 'new'))).rejects.toThrow(code)
++  expect(entry.calls).toBe(calls)
++  expect(readFileSync(join(out, 'new.txt'), 'utf8')).toBe('new')
++  expect(readdirSync(root).filter(name => name.includes('-previous-'))).toHaveLength(1)
++})
++
++test('direct publication finishes backup cleanup synchronously', () => {
++  const out = previousProduct()
++  const staged = join(root, 'staged')
++  mkdirSync(staged)
++  writeFileSync(join(staged, 'new.txt'), 'new')
++  const entry = removal()
++  expect(publishDirectory(staged, out)).toBeUndefined()
++  expect(entry.calls).toBe(3)
++  expect(readFileSync(join(out, 'new.txt'), 'utf8')).toBe('new')
++  expect(readdirSync(root)).toEqual(['native-deps'])
++})
++
+ function previousProduct() {
+   const out = join(root, 'native-deps')
+   mkdirSync(out)
+-- 
+2.55.0
+

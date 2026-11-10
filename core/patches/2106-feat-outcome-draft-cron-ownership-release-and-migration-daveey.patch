@@ -1,0 +1,197 @@
+From e81d4721b78b950e495db6b29fcb7c00713df687 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 17:59:14 +0000
+Subject: [PATCH] feat(outcome): draft cron ownership release and migration
+ [daveey]
+
+---
+ cron/session_ownership.py                     | 47 ++++++++++++
+ hermes_cli/sessions_cmd_outcome.py            |  5 +-
+ hermes_state_outcome.py                       |  8 +++
+ .../hermes_state/test_outcome_cron_release.py | 71 +++++++++++++++++++
+ 4 files changed, 130 insertions(+), 1 deletion(-)
+ create mode 100644 cron/session_ownership.py
+ create mode 100644 tests/hermes_state/test_outcome_cron_release.py
+
+diff --git a/cron/session_ownership.py b/cron/session_ownership.py
+new file mode 100644
+index 00000000000..4a7ef8eb8cf
+--- /dev/null
++++ b/cron/session_ownership.py
+@@ -0,0 +1,47 @@
++"""Release conversation ownership without changing a job's execution contract."""
++from datetime import UTC, datetime
++
++from cron import jobs
++from hermes_cli.cron_session_activity import _job_is_live
++
++
++def release_session_jobs(session_ids: list[str]) -> list[dict]:
++    """Revalidate owners under the store lock; preserve every scheduling field."""
++    released = []
++    with jobs._jobs_lock():
++        records = jobs.load_jobs()
++        for job in records:
++            owner = job.get("owner_session_id")
++            if owner in session_ids and _job_is_live(job):
++                job["owner_session_id"] = None
++                job["released_from"] = owner
++                job["released_at"] = datetime.now(UTC).isoformat()
++                released.append({"id": job["id"], "name": job.get("name") or job["id"]})
++        if released:
++            jobs.save_jobs(records)
++    return released
++
++
++def release_done_owners(db, *, apply: bool = False) -> list[dict]:
++    """List (or release) live jobs owned by stored-done chats in this store.
++
++    Never derive completion from prose during migration. Explicit keep_crons is
++    durable intent, and missing/unknown owners are left alone.
++    """
++    from hermes_state_outcome import get_outcome
++
++    with jobs._jobs_lock():
++        records = jobs.load_jobs()
++        owners = set()
++        plan = []
++        for job in records:
++            owner = job.get("owner_session_id")
++            if not owner or not _job_is_live(job):
++                continue
++            outcome = get_outcome(owner, db=db) or {}
++            if outcome.get("kind") == "done" and not outcome.get("keep_crons"):
++                owners.add(owner)
++                plan.append({"id": job["id"], "name": job.get("name") or job["id"]})
++        if apply:
++            return release_session_jobs(list(owners))
++        return plan
+diff --git a/hermes_cli/sessions_cmd_outcome.py b/hermes_cli/sessions_cmd_outcome.py
+index 3a929dd195b..0d5a885359d 100644
+--- a/hermes_cli/sessions_cmd_outcome.py
++++ b/hermes_cli/sessions_cmd_outcome.py
+@@ -94,7 +94,7 @@ def sidebar_rows(db, limit: int = AUDIT_DEFAULT_LIMIT) -> list[dict[str, Any]]:
+ 
+ def audit_rows(db, *, refresh: bool = False, limit: int = AUDIT_DEFAULT_LIMIT) -> list[dict[str, Any]]:
+     """``{id, title, kind, reason, age_h, on, items}`` per sidebar row (``age_h`` = hours since last activity)."""
+-    from hermes_state_outcome import refresh_outcome
++    from hermes_state_outcome import _cron_items, _lineage_ids, refresh_outcome
+ 
+     if refresh:
+         ensure_outcome_hooks()
+@@ -102,6 +102,9 @@ def audit_rows(db, *, refresh: bool = False, limit: int = AUDIT_DEFAULT_LIMIT) -
+     for row in sidebar_rows(db, limit):
+         outcome = refresh_outcome(row["id"], "manual", db=db) if refresh else row.get("outcome")
+         outcome = outcome or {}
++        crons = _cron_items(_lineage_ids(db, row["id"])) if outcome.get("kind") == "done" else []
++        if crons:
++            outcome = {**outcome, "reason": "done_owns_cron", "on": crons}
+         last = row.get("last_active") or row.get("started_at") or now
+         out.append({"id": row["id"], "title": row.get("title") or row.get("preview") or "",
+                     "kind": outcome.get("kind"), "reason": outcome.get("reason"),
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 717b0bb42dc..1e926db336b 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -139,6 +139,8 @@ def validate_declaration(outcome: Any) -> dict[str, Any]:
+         if not summary:
+             raise ValueError("a done outcome needs a summary")
+         out["summary"] = summary[:SUMMARY_CHARS]
++        if outcome.get("keep_crons") is True:
++            out["keep_crons"] = True
+     elif kind == "decision":
+         raw_items = outcome.get("items")
+         items = [_decision_item(i) for i in raw_items] if isinstance(raw_items, list) else []
+@@ -628,6 +630,12 @@ def declare_outcome(sid: str, outcome: dict, *, db: Any = None) -> dict[str, Any
+         tip = _tip(handle, sid)
+         if _row(handle, tip) is None:
+             raise ValueError(f"unknown session {sid}")
++        if declared["kind"] == "done" and not declared.get("keep_crons"):
++            from cron.jobs import use_cron_store
++            from cron.session_ownership import release_session_jobs
++
++            with use_cron_store(Path(handle.db_path).parent):
++                declared["released_crons"] = release_session_jobs(_lineage_ids(handle, tip))
+         _write(handle, tip, declared)
+     return declared
+ 
+diff --git a/tests/hermes_state/test_outcome_cron_release.py b/tests/hermes_state/test_outcome_cron_release.py
+new file mode 100644
+index 00000000000..5b98a50e448
+--- /dev/null
++++ b/tests/hermes_state/test_outcome_cron_release.py
+@@ -0,0 +1,71 @@
++"""Declaring done ends ownership, not execution, of standing cron jobs."""
++from cron import jobs
++from hermes_cli import cron_session_activity
++from hermes_state import SessionDB
++import hermes_state_outcome as outcomes
++
++
++def test_done_releases_live_cron_without_changing_execution(tmp_path, monkeypatch):
++    monkeypatch.setattr(cron_session_activity, "_jobs_paths", lambda: [tmp_path / "cron" / "jobs.json"])
++    with jobs.use_cron_store(tmp_path):
++        job = jobs.create_job(prompt="Check status", schedule="every 1h", name="status-watch", owner_session_id="chat")
++        before = jobs.get_job(job["id"])
++        with SessionDB(db_path=tmp_path / "state.db") as db:
++            db.create_session("chat", source="desktop")
++            result = outcomes.declare_outcome("chat", {"kind": "done", "summary": "Installed watch."}, db=db)
++            after = jobs.get_job(job["id"])
++            assert before is not None and after is not None
++            assert not after.get("owner_session_id")
++            assert after["released_from"] == "chat"
++            assert after["released_at"]
++            assert result["released_crons"][0]["id"] == job["id"]
++            assert outcomes._cron_items(["chat"]) == []
++            for key in before:
++                if key != "owner_session_id":
++                    assert after[key] == before[key], key
++
++
++def test_done_can_keep_cron_ownership(tmp_path):
++    with jobs.use_cron_store(tmp_path):
++        job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        before = jobs.get_job(job["id"])
++        with SessionDB(db_path=tmp_path / "state.db") as db:
++            db.create_session("chat", source="desktop")
++            result = outcomes.declare_outcome("chat", {"kind": "done", "summary": "Watching.", "keep_crons": True}, db=db)
++            assert jobs.get_job(job["id"]) == before
++            assert result["keep_crons"] is True
++
++
++def test_audit_flags_stored_done_with_live_cron(tmp_path, monkeypatch):
++    from hermes_cli.sessions_cmd_outcome import audit_rows
++
++    monkeypatch.setattr(cron_session_activity, "_jobs_paths", lambda: [tmp_path / "cron" / "jobs.json"])
++    with jobs.use_cron_store(tmp_path):
++        with SessionDB(db_path=tmp_path / "state.db") as db:
++            db.create_session("chat", source="desktop")
++            outcomes.declare_outcome("chat", {"kind": "done", "summary": "Installed."}, db=db)
++            job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++            row = next(row for row in audit_rows(db) if row["id"] == "chat")
++            assert row["reason"] == "done_owns_cron"
++            assert row["on"][0]["id"] == job["id"]
++
++
++def test_migration_is_dry_by_default_and_preserves_non_done_owners(tmp_path):
++    from cron import session_ownership
++
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        for sid in ("done", "waiting", "watch"):
++            db.create_session(sid, source="desktop")
++        outcomes.declare_outcome("done", {"kind": "done", "summary": "Finished."}, db=db)
++        outcomes.declare_outcome("watch", {"kind": "done", "summary": "Watching.", "keep_crons": True}, db=db)
++        records = [jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id=sid)
++                   for sid in ("done", "waiting", "watch", "missing")]
++        before = jobs.load_jobs()
++        plan = session_ownership.release_done_owners(db)
++        assert [r["id"] for r in plan] == [records[0]["id"]]
++        assert jobs.load_jobs() == before
++        assert session_ownership.release_done_owners(db, apply=True) == plan
++        after = jobs.load_jobs()
++        assert not after[0].get("owner_session_id")
++        assert after[1:] == before[1:]
++        assert session_ownership.release_done_owners(db, apply=True) == []
+-- 
+2.55.0
+

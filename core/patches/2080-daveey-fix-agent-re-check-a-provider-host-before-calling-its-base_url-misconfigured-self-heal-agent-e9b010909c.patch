@@ -1,0 +1,270 @@
+From c0b55a82cd8424f19cb7571e6d2d82c7891b3bdd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 18:07:02 +0000
+Subject: [PATCH] [daveey] fix(agent): re-check a provider host before calling
+ its base_url misconfigured (self-heal agent-e9b010909c)
+
+A DNS blip on a waking/roaming laptop made wait_for_network report chatgpt.com as
+"misconfigured" (ERROR + spent retry) from ONE failed provider lookup next to a good
+control lookup (github.com may answer from cache while a fresh lookup fails).
+
+Now, when the control host resolves:
+- the provider host is re-checked MISCONFIG_RECHECKS=2 times, 5 s of awake time apart;
+  if it resolves -> "online" (retry uncounted), INFO line;
+- "misconfigured" + ERROR only if it still fails AND it never resolved in this process
+  (_RESOLVED_HOSTS, filled by successful lookups) AND it is not a built-in provider host
+  (default base URLs of the provider registry and overlays);
+- otherwise one WARNING "provider host stopped resolving, waiting" and the normal
+  awake-time poll within the existing budget.
+
+Test change: the typo-host test's `sleeps == 0` becomes "at most 2 re-checks" (a real
+bad custom base_url is reported ~10 s later instead of at once).
+---
+ agent/retry_utils.py             | 87 +++++++++++++++++++++++++----
+ tests/agent/test_offline_wait.py | 96 +++++++++++++++++++++++++++++++-
+ 2 files changed, 171 insertions(+), 12 deletions(-)
+
+diff --git a/agent/retry_utils.py b/agent/retry_utils.py
+index 2eaf7144ba1..1e0be8cf1f4 100644
+--- a/agent/retry_utils.py
++++ b/agent/retry_utils.py
+@@ -210,9 +210,40 @@ OFFLINE_POLL_MAX_S = 30.0
+ NETWORK_CONTROL_HOST = "github.com"
+ _RESOLVE_TIMEOUT_S = 5.0
+ _OFFLINE_SLICE_S = 0.2
++# One failed provider lookup next to a good control lookup is not proof of a bad base_url: on a
++# waking or roaming laptop the control name can answer from cache while a fresh lookup fails
++# (self-heal agent-e9b010909c: chatgpt.com reported "misconfigured" while it was reachable). The
++# provider host is re-checked this many times, this many awake seconds apart, before deciding.
++MISCONFIG_RECHECKS = 2
++MISCONFIG_RECHECK_S = 5.0
++# Hosts that resolved in this process: a later failure is an outage, never a typo.
++_RESOLVED_HOSTS: set[str] = set()
++_BUILTIN_PROVIDER_HOSTS: Optional[frozenset] = None
+ _logger = logging.getLogger(__name__)
+ 
+ 
++def builtin_provider_hosts() -> frozenset:
++    """Host names of Hermes' built-in providers' default base URLs (never a user typo)."""
++    global _BUILTIN_PROVIDER_HOSTS
++    if _BUILTIN_PROVIDER_HOSTS is not None:
++        return _BUILTIN_PROVIDER_HOSTS
++    urls: list[Any] = []
++    try:
++        from hermes_cli import auth as _auth
++        from hermes_cli.providers import HERMES_OVERLAYS
++    except ImportError:  # a stripped install: nothing counts as built-in, the typo check still runs
++        _logger.debug("provider registry unavailable for built-in host check", exc_info=True)
++    else:
++        for row in _auth._REGISTRY_ROWS:
++            urls.append(getattr(row, "inference_base_url", None) if not isinstance(row, tuple)
++                        else (row[2] if len(row) > 2 else ""))
++        urls.extend(o.base_url_override for o in HERMES_OVERLAYS.values())
++    hosts = {provider_host(u) for u in urls if isinstance(u, str) and u.startswith("http")}
++    hosts -= {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}
++    _BUILTIN_PROVIDER_HOSTS = frozenset(hosts)
++    return _BUILTIN_PROVIDER_HOSTS
++
++
+ def is_local_network_error(error: Any) -> bool:
+     """True when *error* or anything in its ``__cause__``/``__context__`` chain is a local DNS or
+     network-down failure (``socket.gaierror``, ENETUNREACH, or SDK text naming one). Refused or reset
+@@ -272,7 +303,10 @@ def host_resolves(host: str, timeout: float = _RESOLVE_TIMEOUT_S, *, is_interrup
+         if interrupted() or remaining <= 0:
+             return False
+         done.wait(min(_OFFLINE_SLICE_S, remaining))
+-    return bool(outcome.get("ok"))
++    ok = bool(outcome.get("ok"))
++    if ok:
++        _RESOLVED_HOSTS.add(host)
++    return ok
+ 
+ 
+ def provider_host(base_url: Any) -> str:
+@@ -294,7 +328,9 @@ def wait_for_network(
+     Returns ``(outcome, awake_seconds_spent)``; outcome is ``"online"`` (it resolves again: retry
+     without spending an attempt), ``"already_online"`` (it resolved at once: the failure is not the
+     network's, count the attempt), ``"misconfigured"`` (the control host resolves but the provider's
+-    does not: logs an ERROR and returns at once), ``"interrupted"``, ``"exhausted"`` or ``"disabled"``.
++    still does not after MISCONFIG_RECHECKS re-checks, it never resolved in this process and it is not
++    a built-in provider host: logs an ERROR; a built-in or earlier-resolved host that stopped
++    resolving logs one WARNING and waits instead), ``"interrupted"``, ``"exhausted"`` or ``"disabled"``.
+     Polls every OFFLINE_POLL_MIN_S..OFFLINE_POLL_MAX_S seconds in short slices so *is_interrupted*
+     is honoured promptly; *on_tick(awake_spent_s)* runs about every 30 s of waiting (liveness)."""
+     is_interrupted = is_interrupted or (lambda: False)
+@@ -311,22 +347,51 @@ def wait_for_network(
+         if is_interrupted() or elapsed() >= budget_s:
+             return False
+         if resolve is not None:
+-            return resolve(name)
++            ok = bool(resolve(name))
++            if ok:
++                _RESOLVED_HOSTS.add(name)
++            return ok
+         return host_resolves(name, timeout=min(_RESOLVE_TIMEOUT_S, budget_s - elapsed()),
+                              is_interrupted=is_interrupted)
+ 
++    def sleep_awake(seconds):
++        """Sleep *seconds* of awake time in short slices; False when interrupted."""
++        slice_end = min(budget_s, elapsed() + seconds)
++        while elapsed() < slice_end:
++            if is_interrupted():
++                return False
++            time.sleep(min(_OFFLINE_SLICE_S, slice_end - elapsed()))
++        return not is_interrupted()
++
++    seen_before = host in _RESOLVED_HOSTS
+     if lookup(host):
+         return "already_online", elapsed()
+     if control_host and control_host != host and lookup(control_host):
+-        _logger.error(
+-            "provider host does not resolve while network is up: %s (control host %s resolves) — "
+-            "check the provider base_url", host, control_host,
++        # The control name may answer from cache while a fresh lookup fails (waking/roaming
++        # laptop): re-check the provider host before calling its base_url wrong.
++        for _ in range(MISCONFIG_RECHECKS):
++            if not sleep_awake(MISCONFIG_RECHECK_S):
++                return "interrupted", elapsed()
++            if lookup(host):
++                _logger.info("provider host %s resolves again after %.0fs (transient DNS failure)",
++                             host, elapsed())
++                return "online", elapsed()
++        if not seen_before and host not in builtin_provider_hosts():
++            _logger.error(
++                "provider host does not resolve while network is up: %s (control host %s resolves) — "
++                "check the provider base_url", host, control_host,
++            )
++            return "misconfigured", elapsed()
++        _logger.warning(
++            "provider host stopped resolving, waiting: %s (%s; control host %s resolves); waiting up to "
++            "%.0fs of awake time", host, "resolved earlier" if seen_before else "built-in provider host",
++            control_host, budget_s,
++        )
++    else:
++        _logger.warning(
++            "offline — waiting for network: %s and %s do not resolve; waiting up to %.0fs of awake time",
++            host, control_host, budget_s,
+         )
+-        return "misconfigured", elapsed()
+-    _logger.warning(
+-        "offline — waiting for network: %s and %s do not resolve; waiting up to %.0fs of awake time",
+-        host, control_host, budget_s,
+-    )
+     if on_wait is not None and not is_interrupted():
+         on_wait()
+     spent = elapsed()
+diff --git a/tests/agent/test_offline_wait.py b/tests/agent/test_offline_wait.py
+index a87260bdd40..490483d6df0 100644
+--- a/tests/agent/test_offline_wait.py
++++ b/tests/agent/test_offline_wait.py
+@@ -213,12 +213,106 @@ def test_provider_host_not_resolving_while_network_is_up_logs_error_and_does_not
+     resolve, _calls = _resolver(fail_first=10**9, control_ok=True)
+     with caplog.at_level(logging.WARNING, logger="agent.retry_utils"):
+         outcome, spent = wait_for_network("api.typo-example.com", budget_s=900, resolve=resolve)
+-    assert outcome == "misconfigured" and clock.sleeps == 0 and spent == 0
++    # A typo'd custom host is still reported, after at most MISCONFIG_RECHECKS re-checks of it.
++    import agent.retry_utils as ru
++    assert outcome == "misconfigured"
++    assert _calls["provider"] == 1 + ru.MISCONFIG_RECHECKS
++    assert spent <= ru.MISCONFIG_RECHECKS * ru.MISCONFIG_RECHECK_S + 1
+     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+     assert len(errors) == 1
+     assert errors[0].getMessage().startswith("provider host does not resolve while network is up")
+ 
+ 
++# A DNS blip on a waking/roaming laptop: the control name answers from cache while a fresh lookup of
++# the provider host fails once (self-heal agent-e9b010909c: chatgpt.com reported "misconfigured" 55x
++# while other sessions on the same Mac reached it seconds later).
++
++
++@pytest.fixture(autouse=True)
++def _fresh_resolved_hosts(monkeypatch):
++    import agent.retry_utils as ru
++    if hasattr(ru, "_RESOLVED_HOSTS"):
++        monkeypatch.setattr(ru, "_RESOLVED_HOSTS", set())
++
++
++def _errors(caplog):
++    return [r for r in caplog.records if r.levelno >= logging.ERROR]
++
++
++def test_builtin_provider_host_failing_once_then_resolving_is_online_not_misconfigured(monkeypatch, caplog):
++    from agent.retry_utils import wait_for_network
++    _Clock(awake_per_sleep=1.0, wall_per_sleep=1.0).install(monkeypatch)
++    resolve, calls = _resolver(fail_first=1, control_ok=True)
++    with caplog.at_level(logging.INFO, logger="agent.retry_utils"):
++        outcome, _spent = wait_for_network("chatgpt.com", budget_s=900, resolve=resolve)
++    assert outcome == "online"
++    assert calls["provider"] == 2
++    assert not _errors(caplog)
++
++
++def test_custom_host_failing_once_then_resolving_is_online_not_misconfigured(monkeypatch, caplog):
++    from agent.retry_utils import wait_for_network
++    _Clock(awake_per_sleep=1.0, wall_per_sleep=1.0).install(monkeypatch)
++    resolve, calls = _resolver(fail_first=1, control_ok=True)
++    with caplog.at_level(logging.INFO, logger="agent.retry_utils"):
++        outcome, _spent = wait_for_network("llm.custom-example.com", budget_s=900, resolve=resolve)
++    assert outcome == "online" and calls["provider"] == 2
++    assert not _errors(caplog)
++
++
++def test_builtin_provider_host_that_keeps_failing_waits_without_error(monkeypatch, caplog):
++    from agent.retry_utils import wait_for_network
++    _Clock(awake_per_sleep=1.0, wall_per_sleep=1.0).install(monkeypatch)
++    resolve, _calls = _resolver(fail_first=10**9, control_ok=True)
++    with caplog.at_level(logging.WARNING, logger="agent.retry_utils"):
++        outcome, spent = wait_for_network("chatgpt.com", budget_s=120, resolve=resolve)
++    assert outcome == "exhausted" and spent >= 120
++    assert not _errors(caplog)
++    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
++    assert len(warnings) == 1 and "provider host stopped resolving" in warnings[0]
++
++
++def test_host_that_resolved_earlier_in_this_process_waits_without_error(monkeypatch, caplog):
++    from agent.retry_utils import wait_for_network
++    _Clock(awake_per_sleep=1.0, wall_per_sleep=1.0).install(monkeypatch)
++    host = "llm.custom-example.com"
++    assert wait_for_network(host, budget_s=900, resolve=lambda h: True)[0] == "already_online"
++    resolve, _calls = _resolver(fail_first=10**9, control_ok=True)
++    with caplog.at_level(logging.WARNING, logger="agent.retry_utils"):
++        outcome, _spent = wait_for_network(host, budget_s=120, resolve=resolve)
++    assert outcome == "exhausted"
++    assert not _errors(caplog)
++
++
++def test_host_resolves_records_successful_lookups(monkeypatch):
++    import agent.retry_utils as ru
++    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [("addr",)])
++    assert ru.host_resolves("llm.custom-example.com")
++    assert "llm.custom-example.com" in ru._RESOLVED_HOSTS
++
++
++def test_turn_on_provider_dns_blip_with_network_up_logs_no_misconfiguration(monkeypatch, caplog):
++    """Real turn: the provider host's first lookup fails while github.com resolves, then it resolves.
++    The SAME attempt goes through and no "check the provider base_url" ERROR is filed."""
++    _fast_offline_polls(monkeypatch)
++    import agent.retry_utils as ru
++    monkeypatch.setattr(ru, "MISCONFIG_RECHECK_S", 0.01, raising=False)
++
++    class _Blip(_FlakyDNS):
++        def __call__(self, host, port, *args, **kwargs):
++            if host == "github.com":
++                return self._real("127.0.0.1", port, *args, **kwargs)
++            return super().__call__(host, port, *args, **kwargs)
++
++    dns = _Blip(offline_lookups=2, owned=(_OFFLINE_HOST,))
++    with caplog.at_level(logging.WARNING):
++        result, served = _turn(monkeypatch, dns)
++    assert result.get("completed") and result.get("final_response") == "answered", result
++    assert served == 1 and dns.remaining == 0
++    assert not [r for r in caplog.records
++                if r.getMessage().startswith("provider host does not resolve while network is up")]
++
++
+ def test_both_hosts_failing_logs_one_offline_warning(monkeypatch, caplog):
+     from agent.retry_utils import wait_for_network
+     _Clock(awake_per_sleep=0.2, wall_per_sleep=0.2).install(monkeypatch)
+-- 
+2.55.0
+

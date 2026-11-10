@@ -1,0 +1,307 @@
+From 0fae3261e2c74f6889404f0f00d28a7fd6222dfa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:28:36 +0000
+Subject: [PATCH] fix(kanban): attribute busy fallbacks to sampled lifecycle
+ holders [daveey]
+
+Preserve lock budgets and warning frequency. Record owner and hold time on the shared lifecycle lock, including raw close paths; sample symbolic stack only on timeout. Distinguish native SQLite busy from lifecycle busy and timestamp cached evidence. Historical incident holder remains undetermined.
+---
+ hermes_cli/kanban_generation.py               |  16 ++-
+ hermes_cli/kanban_lifecycle_diagnostics.py    |  70 +++++++++++
+ hermes_cli/kanban_session_activity_busy.py    |   7 +-
+ .../hermes_cli/test_kanban_busy_provenance.py | 119 ++++++++++++++++++
+ 4 files changed, 206 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_lifecycle_diagnostics.py
+ create mode 100644 tests/hermes_cli/test_kanban_busy_provenance.py
+
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index c6ed8c2d6e0..e1c6ecb8191 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -14,6 +14,8 @@ import time
+ import weakref
+ from urllib.parse import unquote
+ 
++from hermes_cli.kanban_lifecycle_diagnostics import LifecycleLock
++
+ _lock = threading.RLock()
+ _connections: weakref.WeakSet = weakref.WeakSet()
+ _reader_caches: list = []
+@@ -30,11 +32,11 @@ def lifecycle_lock(database):
+     """
+     path = _path(database)
+     if path is None:
+-        return threading.RLock()
++        return LifecycleLock()
+     with _lock:
+         lock = _lifecycle_locks.get(path)
+         if lock is None:
+-            lock = threading.RLock()
++            lock = LifecycleLock()
+             _lifecycle_locks[path] = lock
+         return lock
+ 
+@@ -46,10 +48,11 @@ class BoardLifecycleBusy(sqlite3.OperationalError):
+     busy board to its last good answer) treats it as "busy, retry later" rather than a broken board
+     (kanban-359833be53: without the code one busy board marked every sidebar row ``kanban_unknown``)."""
+ 
+-    def __init__(self, message="database is locked: board lifecycle is busy"):
++    def __init__(self, message="database is locked: board lifecycle is busy", *, diagnostic=None):
+         super().__init__(message)
+         self.sqlite_errorcode = sqlite3.SQLITE_BUSY
+         self.sqlite_errorname = "SQLITE_BUSY"
++        self.diagnostic = diagnostic or {}
+ 
+ 
+ def is_busy(exc) -> bool:
+@@ -61,8 +64,13 @@ def is_busy(exc) -> bool:
+ def lifecycle_access(database, timeout):
+     """A reader keeps its own busy budget even behind a long-timeout opener."""
+     lock = lifecycle_lock(database)
++    started = time.monotonic()
+     if not lock.acquire(timeout=max(0.0, float(timeout))):
+-        raise BoardLifecycleBusy()
++        raise BoardLifecycleBusy(diagnostic={
++            "pid": os.getpid(), "sampled_at": time.time(),
++            "wait_ms": round((time.monotonic() - started) * 1000, 3),
++            **lock.snapshot(),
++        })
+     try:
+         yield lock
+     finally:
+diff --git a/hermes_cli/kanban_lifecycle_diagnostics.py b/hermes_cli/kanban_lifecycle_diagnostics.py
+new file mode 100644
+index 00000000000..316fc334a11
+--- /dev/null
++++ b/hermes_cli/kanban_lifecycle_diagnostics.py
+@@ -0,0 +1,70 @@
++"""Cheap lifecycle ownership; sample symbolic stacks only after a timed-out wait.
++
++No logging, file reads or source/locals capture occurs under the board lock.
++Snapshots are best effort: a holder may finish as its waiter times out.
++"""
++from __future__ import annotations
++
++import os
++import sys
++import threading
++import time
++
++
++class LifecycleLock:
++    """The board's reentrant transition lock, including raw connection-close users."""
++
++    def __init__(self):
++        self._lock = threading.RLock()
++        self._owner = None
++        self._depth = 0
++
++    def acquire(self, blocking: bool = True, timeout: float = -1):
++        acquired = self._lock.acquire(blocking, timeout)
++        if acquired:
++            if self._depth == 0:
++                self._owner = (threading.get_ident(), time.monotonic())
++            self._depth += 1
++        return acquired
++
++    def release(self):
++        # Do not corrupt diagnostics if a foreign/unbalanced release is rejected.
++        if self._owner is None or self._owner[0] != threading.get_ident():
++            raise RuntimeError("cannot release un-acquired lock")
++        self._depth -= 1
++        if self._depth == 0:
++            self._owner = None
++        self._lock.release()
++
++    def __enter__(self):
++        self.acquire()
++        return self
++
++    def __exit__(self, *_):
++        self.release()
++
++    def snapshot(self):
++        owner = self._owner
++        if owner is None:
++            return {}
++        ident, started = owner
++        stack = []
++        frame = sys._current_frames().get(ident)
++        try:
++            while frame is not None and len(stack) < 16:
++                code = frame.f_code
++                stack.append(f"{os.path.basename(code.co_filename)}:{frame.f_lineno}:{code.co_name}")
++                frame = frame.f_back
++        finally:
++            del frame
++        # Never attribute a previous owner's stack to a replacement owner.
++        if self._owner is not owner:
++            return {}
++        return {"holder_thread": ident, "held_ms": round((time.monotonic() - started) * 1000, 3),
++                "holder_stack": stack}
++
++
++def busy_details(exc):
++    """No exception message/SQL/locals: only type, code and captured lock metadata."""
++    return (type(exc).__name__, getattr(exc, "sqlite_errorcode", None), os.getpid(),
++            getattr(exc, "diagnostic", {}))
+diff --git a/hermes_cli/kanban_session_activity_busy.py b/hermes_cli/kanban_session_activity_busy.py
+index ac3a7464999..ced19554e77 100644
+--- a/hermes_cli/kanban_session_activity_busy.py
++++ b/hermes_cli/kanban_session_activity_busy.py
+@@ -20,6 +20,7 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from hermes_cli.kanban_generation import is_busy
++from hermes_cli.kanban_lifecycle_diagnostics import busy_details
+ from hermes_cli.kanban_session_activity_revalidate import is_busy_key
+ 
+ _log = logging.getLogger("hermes_cli.kanban_session_activity")
+@@ -63,7 +64,8 @@ def board_reads(path: Path, key: tuple, hit: tuple | None, parked: bool, stalled
+     except sqlite3.OperationalError as exc:
+         if hit is None or not usable or not is_busy(exc):
+             raise
+-        _log.warning("kanban board %s busy; reused last counts", path)
++        _log.warning("kanban board %s busy; reused last counts kind=%s sqlite_code=%s pid=%s holder=%s",
++                     path, *busy_details(exc))
+         reuse_sink.reused = True
+         return hit[1], False, False
+     return reads, complete, True
+@@ -91,7 +93,8 @@ def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
+             with _tasks_lock:
+                 last = _tasks_memo.get(key)
+             if last is not None:
+-                _log.warning("kanban board %s busy; reused last counts", path)
++                _log.warning("kanban board %s busy; reused last counts kind=%s sqlite_code=%s pid=%s holder=%s",
++                             path, *busy_details(exc))
+                 return [{**t, "stale": True} for t in last]
+             now = time.monotonic()
+             if deadline is None or now >= deadline:
+diff --git a/tests/hermes_cli/test_kanban_busy_provenance.py b/tests/hermes_cli/test_kanban_busy_provenance.py
+new file mode 100644
+index 00000000000..e4d073cbff6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_busy_provenance.py
+@@ -0,0 +1,119 @@
++"""Busy diagnostics distinguish native SQLite from a sampled lifecycle holder."""
++import logging
++import os
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_generation as generation
++from hermes_cli import kanban_lockguard
++from hermes_cli import kanban_session_activity_busy as busy
++
++
++@pytest.mark.parametrize("close_path", [False, True])
++def test_timeout_captures_holder_without_waiting_for_release(tmp_path, close_path, caplog):
++    path = tmp_path / "board.db"
++    entered, release = threading.Event(), threading.Event()
++    owner = {}
++
++    class Closing:
++        def close(self):
++            entered.set()
++            assert release.wait(5)
++
++    def holder():
++        owner["thread"] = threading.get_ident()
++        lock = generation.lifecycle_lock(path)
++        if close_path:
++            conn = kanban_lockguard.lifecycle_factory(Closing)()
++            conn._hermes_lifecycle_lock = lock
++            conn.close()
++        else:
++            with generation.lifecycle_access(path, 1):
++                with lock:  # inner release must not clear the outer owner
++                    pass
++                entered.set()
++                assert release.wait(5)
++
++    thread = threading.Thread(target=holder)
++    thread.start()
++    try:
++        assert entered.wait(5)
++        with pytest.raises(generation.BoardLifecycleBusy) as caught:
++            with generation.lifecycle_access(path, .01):
++                pytest.fail("acquired held lock")
++        diagnostic = caught.value.diagnostic
++        assert diagnostic["pid"] == os.getpid()
++        assert diagnostic["holder_thread"] == owner["thread"]
++        assert diagnostic["held_ms"] >= 0
++        assert diagnostic["wait_ms"] >= 0
++        assert any("holder" in frame for frame in diagnostic["holder_stack"])
++        if close_path:
++            assert any("close" in frame for frame in diagnostic["holder_stack"])
++        assert len(diagnostic["holder_stack"]) <= 16
++        assert diagnostic["sampled_at"] > 0
++
++        def fail(*args, **kwargs):
++            raise caught.value
++
++        busy.board_reads(path, (), ((), {}), False, False, fail)
++        assert str(diagnostic) in caplog.records[-1].getMessage()
++        busy.session_tasks(path, ["holder"], (), lambda *a: [])
++        busy.session_tasks(path, ["holder"], (), fail)
++        assert str(diagnostic) in caplog.records[-1].getMessage()
++    finally:
++        release.set()
++        thread.join(5)
++    assert not thread.is_alive()
++    with generation.lifecycle_access(path, 0) as lock:
++        assert lock.snapshot()["holder_thread"] == threading.get_ident()
++    assert lock.snapshot() == {}
++
++
++@pytest.mark.parametrize("entry", ["board_reads", "session_tasks"])
++@pytest.mark.parametrize("lifecycle", [False, True])
++def test_fallback_logs_typed_provenance(tmp_path, caplog, entry, lifecycle):
++    busy.reset()
++    path = tmp_path / "board.db"
++    error = generation.BoardLifecycleBusy() if lifecycle else sqlite3.OperationalError("database is locked")
++    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
++    error.sqlite_errorname = "SQLITE_BUSY"
++
++    def fail(*args, **kwargs):
++        raise error
++
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_session_activity"):
++        if entry == "board_reads":
++            assert busy.board_reads(path, (), ((), {}), False, False, fail) == ({}, False, False)
++        else:
++            busy.session_tasks(path, ["id"], (), lambda *a: [{"id": "id"}])
++            assert busy.session_tasks(path, ["id"], (), fail) == [{"id": "id", "stale": True}]
++    message = caplog.records[-1].getMessage()
++    assert "busy; reused last counts" in message
++    assert f"pid={os.getpid()}" in message
++    assert f"kind={type(error).__name__}" in message
++    assert "sqlite_code=5" in message
++    assert "holder=" in message
++
++
++def test_rejected_release_keeps_owner_and_snapshot_drops_changed_owner(monkeypatch):
++    from hermes_cli import kanban_lifecycle_diagnostics as diagnostics
++
++    lock = diagnostics.LifecycleLock()
++    with pytest.raises(RuntimeError):
++        lock.release()
++    with lock:
++        original = lock._owner
++        with monkeypatch.context() as patcher:
++            patcher.setattr(diagnostics.threading, "get_ident", lambda: -1)
++            with pytest.raises(RuntimeError):
++                lock.release()
++        assert lock._owner is original
++
++        def changed_frames():
++            lock._owner = (original[0], original[1])
++            return {}
++
++        monkeypatch.setattr(diagnostics.sys, "_current_frames", changed_frames)
++        assert lock.snapshot() == {}
+-- 
+2.55.0
+

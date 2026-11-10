@@ -1,0 +1,147 @@
+From 6e266c71e31234bb9bf212b324c9c71c572fed37 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:18:03 +0000
+Subject: [PATCH] fix(cron): report partial ownership migration results
+ [daveey]
+
+---
+ cron/session_ownership.py                     | 78 +++++++++++--------
+ .../hermes_state/test_outcome_cron_release.py | 19 +++++
+ 2 files changed, 63 insertions(+), 34 deletions(-)
+
+diff --git a/cron/session_ownership.py b/cron/session_ownership.py
+index c3da7257cb4..c89d04873c8 100644
+--- a/cron/session_ownership.py
++++ b/cron/session_ownership.py
+@@ -55,43 +55,52 @@ def release_session_jobs(session_ids: list[str]) -> list[dict]:
+     return released
+ 
+ 
+-def release_done_owners(db, *, apply: bool = False) -> list[dict]:
+-    """List (or release) live jobs owned by stored-done chats in this store.
+-
+-    Never derive completion from prose during migration. Explicit keep_crons is
+-    durable intent, and missing/unknown owners are left alone.
+-    """
++def _migrate_store(db, home: Path, apply: bool) -> list[dict]:
+     from hermes_state_outcome import get_outcome
+ 
++    plan = []
++    with jobs.use_cron_store(home), jobs._jobs_lock():
++        if apply:
++            records = jobs.load_jobs()
++        else:
++            data = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8-sig"))
++            records = data.get("jobs", []) if isinstance(data, dict) else data
++            if not isinstance(records, list) or any(not isinstance(j, dict) for j in records):
++                raise ValueError("Invalid cron records; migration will not repair them")
++        for job in records:
++            owner = job.get("owner_session_id")
++            if not owner or not _job_is_live(job) or job.get("owner_retained"):
++                continue
++            outcome = get_outcome(owner, db=db) or {}
++            if outcome.get("kind") != "done" or outcome.get("keep_crons"):
++                continue
++            plan.append({"id": job["id"], "name": job.get("name") or job["id"],
++                         "owner_session_id": owner, "store": str(home / "cron" / "jobs.json")})
++            if apply:
++                job["owner_session_id"] = None
++                job["released_from"] = owner
++                job["released_at"] = datetime.now(UTC).isoformat()
++        if apply and plan:
++            jobs.save_jobs(records)
++    return plan
++
++
++def release_done_owners(db, *, apply: bool = False, errors: list[str] | None = None) -> list[dict]:
++    """Use stored done (declared or derived), never run a new prose judge.
++
++    Explicit keep intent and missing/unknown owners are left alone. With an
++    errors collector, return successful stores even if a later store fails.
++    """
+     plan = []
+     for home in store_homes(db):
+         if not (home / "cron" / "jobs.json").exists():
+             continue
+-        with jobs.use_cron_store(home), jobs._jobs_lock():
+-            if apply:
+-                records = jobs.load_jobs()
+-            else:
+-                data = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8-sig"))
+-                records = data.get("jobs", []) if isinstance(data, dict) else data
+-                if not isinstance(records, list) or any(not isinstance(j, dict) for j in records):
+-                    raise ValueError("Invalid cron records; migration will not repair them")
+-            changed = False
+-            for job in records:
+-                owner = job.get("owner_session_id")
+-                if not owner or not _job_is_live(job) or job.get("owner_retained"):
+-                    continue
+-                outcome = get_outcome(owner, db=db) or {}
+-                if outcome.get("kind") != "done" or outcome.get("keep_crons"):
+-                    continue
+-                plan.append({"id": job["id"], "name": job.get("name") or job["id"],
+-                             "owner_session_id": owner, "store": str(home / "cron" / "jobs.json")})
+-                if apply:
+-                    job["owner_session_id"] = None
+-                    job["released_from"] = owner
+-                    job["released_at"] = datetime.now(UTC).isoformat()
+-                    changed = True
+-            if changed:
+-                jobs.save_jobs(records)
++        try:
++            plan.extend(_migrate_store(db, home, apply))
++        except (OSError, RuntimeError, ValueError) as exc:
++            if errors is None:
++                raise
++            errors.append(f"{home}: {exc}")
+     return plan
+ 
+ 
+@@ -106,10 +115,11 @@ def main(argv=None) -> int:
+     args = parser.parse_args(argv)
+     if not args.db.is_file():
+         parser.error("--db must name an existing session database")
++    errors: list[str] = []
+     with SessionDB(db_path=args.db) as db:
+-        plan = release_done_owners(db, apply=args.apply)
+-    print(json.dumps({"apply": args.apply, "jobs": plan}, indent=2))
+-    return 0
++        plan = release_done_owners(db, apply=args.apply, errors=errors)
++    print(json.dumps({"apply": args.apply, "jobs": plan, "errors": errors}, indent=2))
++    return int(bool(errors))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/hermes_state/test_outcome_cron_release.py b/tests/hermes_state/test_outcome_cron_release.py
+index a881f4cce87..db642eb3b8b 100644
+--- a/tests/hermes_state/test_outcome_cron_release.py
++++ b/tests/hermes_state/test_outcome_cron_release.py
+@@ -195,6 +195,25 @@ def test_keep_does_not_write_unrelated_store(tmp_path, monkeypatch):
+         outcomes.declare_outcome("chat", {"kind": "done", "summary": "Watching.", "keep_crons": True}, db=db)
+ 
+ 
++def test_migration_reports_partial_apply_when_later_store_is_corrupt(tmp_path, capsys):
++    import json
++    from cron import session_ownership
++
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Finished."}, db=db)
++        job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        corrupt = tmp_path / "profiles" / "other" / "cron" / "jobs.json"
++        corrupt.parent.mkdir(parents=True)
++        corrupt.write_text("broken", encoding="utf-8")
++        assert session_ownership.main(["--db", str(tmp_path / "state.db"), "--apply"]) == 1
++        report = json.loads(capsys.readouterr().out)
++        assert report["jobs"][0]["id"] == job["id"]
++        assert report["errors"]
++        assert not jobs.get_job(job["id"])["owner_session_id"]
++        assert corrupt.read_text(encoding="utf-8") == "broken"
++
++
+ def test_migration_is_dry_by_default_and_preserves_non_done_owners(tmp_path):
+     from cron import session_ownership
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,811 @@
+From c70678db89b395e56d151e836d1d4baba6eff8ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:12:57 +0000
+Subject: [PATCH] fix(update): defer busy pre-swap pauses without trapping
+ Desktop [daveey]
+
+---
+ gateway/control_socket.py                     |   5 +-
+ gateway/cron_pause.py                         |  18 +-
+ gateway/run_bootstrap.py                      |   4 +-
+ hermes_cli/update_cmd_pause_gate.py           |   5 +
+ hermes_cli/update_cmd_posix_pause.py          | 100 ++++---
+ hermes_cli/update_pause_record.py             |   8 +
+ tests/gateway/test_update_idle_pause.py       | 163 ++++++++++++
+ tests/hermes_cli/test_update_posix_pause.py   |   8 +-
+ tests/hermes_cli/test_update_preswap_drain.py | 249 ++++++++++++++++++
+ .../hermes_cli/test_update_target_identity.py |   6 +
+ 10 files changed, 513 insertions(+), 53 deletions(-)
+ create mode 100644 tests/gateway/test_update_idle_pause.py
+ create mode 100644 tests/hermes_cli/test_update_preswap_drain.py
+
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index 63ab4ae0066..0284712d880 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -682,14 +682,15 @@ def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) ->
+     return query_gateway_control(home, "identify", timeout=timeout)
+ 
+ 
+-def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
++def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
++                             idle_only: bool = False) -> Optional[dict[str, Any]]:
+     """Ask the gateway serving ``home`` to drain and exit for an update. Returns the ACK ``{"pausing",
+     "already_stopping", "pid", "drain_timeout"}`` or None when no gateway answers (old gateway without
+     the verb, no/dead socket) — the caller then uses the legacy signal/tree-kill pause path.
+ 
+     Step 2 of the socket migration (#92091).
+     """
+-    return query_gateway_control(home, "pause-for-update", timeout=timeout)
++    return query_gateway_control(home, "pause-if-idle-for-update" if idle_only else "pause-for-update", timeout=timeout)
+ 
+ 
+ def rescan_gateway_profiles(home: Path, *, timeout: float = 8.0) -> Optional[dict[str, Any]]:
+diff --git a/gateway/cron_pause.py b/gateway/cron_pause.py
+index de58d33030b..b8ace6daa0c 100644
+--- a/gateway/cron_pause.py
++++ b/gateway/cron_pause.py
+@@ -2,11 +2,13 @@
+ 
+ import os
+ import threading
++import time
+ 
+ 
+-def pause_for_update(runner, loop) -> dict:
++def pause_for_update(runner, loop, *, idle_only: bool = False) -> dict:
+     """Control-socket executor thread: record slots before marshaling the drain onto the loop."""
+-    preserve_cron_slots(runner.config)
++    if not idle_only:
++        preserve_cron_slots(runner.config)
+     try:
+         from hermes_cli.gateway import _get_restart_drain_timeout
+         drain = float(_get_restart_drain_timeout())
+@@ -14,9 +16,18 @@ def pause_for_update(runner, loop) -> dict:
+         drain = 30.0
+     accepted_box: list[bool] = []
+     done = threading.Event()
++    deadline = time.monotonic() + 5.0
++    refused = []
+ 
+     def request() -> None:
+         try:
++            # Check and close admission in one loop callback. A busy pre-swap
++            # update must not start a drain it cannot cancel when it defers.
++            if idle_only:
++                if time.monotonic() >= deadline or runner._active_work_count() > 0:
++                    refused.append(True)
++                    return
++                preserve_cron_slots(runner.config)
+             accepted_box.append(runner.request_restart(detached=False, via_service=True))
+         finally:
+             done.set()
+@@ -24,7 +35,8 @@ def pause_for_update(runner, loop) -> dict:
+     loop.call_soon_threadsafe(request)
+     done.wait(timeout=5.0)
+     accepted = bool(accepted_box and accepted_box[0])
+-    return {"pausing": accepted, "already_stopping": not accepted,
++    return {"pausing": accepted, "already_stopping": bool(accepted_box) and not accepted,
++            "busy": bool(refused),
+             "pid": os.getpid(), "drain_timeout": drain}
+ 
+ 
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 7c568191c50..489e64a1580 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -391,7 +391,9 @@ async def _start_gateway_start_control_socket(runner):
+             return {"multiplex": bool(getattr(runner.config, "multiplex_profiles", False)), **result}
+ 
+         _control_server = GatewayControlServer(
+-            verb_handlers={"pause-for-update": lambda: pause_for_update(runner, _main_loop), "identify": _identify_runtime,
++            verb_handlers={"pause-for-update": lambda: pause_for_update(runner, _main_loop),
++                           "pause-if-idle-for-update": lambda: pause_for_update(runner, _main_loop, idle_only=True),
++                           "identify": _identify_runtime,
+                            "rescan-profiles": _rescan_profiles_handler,
+                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
+                            "unserve-profile": unserve_profile_verb(runner),
+diff --git a/hermes_cli/update_cmd_pause_gate.py b/hermes_cli/update_cmd_pause_gate.py
+index 1f19136047c..e6f2cf2e753 100644
+--- a/hermes_cli/update_cmd_pause_gate.py
++++ b/hermes_cli/update_cmd_pause_gate.py
+@@ -26,6 +26,11 @@ def _checkout_move(token, *targets, paths=(), revert=False):
+     the step found it, or the step reported ``whole`` on the dict this yields (a stash restore that
+     applied cleanly changes the tree by design). A move is judged the moment git returns (see
+     ``_settle_checkout_move``)."""
++    # Stash/discard paths can write tracked code even when HEAD will not move.
++    # Enter only after the local-changes prompt, but before any tree mutation.
++    from hermes_cli import update_cmd_posix_pause as pause
++    if refused := pause.pause_at_commit_point():
++        raise pause.PauseRefused(refused)
+     step: dict = {}
+     targets = sorted({t for t in targets if t})
+     pause_id = (token or {}).get("pause_id")
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index c59b44f6575..da0cc3c3028 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -54,6 +54,10 @@ _REPLAY_ENVS: dict[str, dict] = {}
+ 
+ _STOP_TIMEOUT_S = 120.0
+ _READY_TIMEOUT_S = 30.0
++# Desktop cannot reconnect while the update lock is held, including to answer an
++# approval the draining turn needs. A pre-swap wait must yield, not spend the
++# post-restart after-turn budget behind that fence.
++_PRE_SWAP_DRAIN_WAIT_S = 30.0
+ 
+ 
+ class PauseRefused(RuntimeError):
+@@ -420,9 +424,9 @@ def _wait_gone(pids, timeout: float, born: dict | None = None) -> set[int]:
+     return live
+ 
+ 
+-def _ask_to_drain(entry: dict) -> bool:
+-    """Ask the gateway over its control socket to finish its in-flight turns and exit; True on its
+-    ACK. That is the ``request_restart`` drain the post-update restart uses (SIGUSR1); SIGTERM,
++def _ask_to_drain(entry: dict) -> bool | None:
++    """Ask the gateway to exit only if idle; True on its ACK. Busy/old gateways refuse rather
++    than starting an uncancellable pre-swap drain. SIGTERM,
+     ``systemctl stop`` and ``launchctl bootout`` enter ``stop()`` at once and cut a turn off. No
+     planned-stop marker on this path: the gateway's marker watcher takes that same immediate
+     signal-stop path, and could fire before the request lands. The caller records the request
+@@ -430,12 +434,14 @@ def _ask_to_drain(entry: dict) -> bool:
+     died still leaves the evidence that keeps the drained gateway's restart debt."""
+     from gateway.control_socket import pause_gateway_for_update
+     if not entry.get("home"):
+-        return False
++        return False  # no request was sent
+     try:
+-        ack = pause_gateway_for_update(Path(entry["home"]))
+-    except Exception:  # health: allow BLE001 -- no answer is the pre-verb gateway: the fallback stop handles it
+-        return False
+-    return bool(ack and (ack.get("pausing") or ack.get("already_stopping")))
++        ack = pause_gateway_for_update(Path(entry["home"]), idle_only=True)
++    except Exception:  # health: allow BLE001 -- unknown/busy gateways must not authorize a tree mutation
++        return None
++    if ack and (ack.get("pausing") or ack.get("already_stopping")):
++        return True
++    return False if ack and ack.get("busy") else None  # no answer may have accepted the request
+ 
+ 
+ def _stop_at_once(entry: dict) -> None:
+@@ -458,25 +464,26 @@ def _drain_budget() -> float:
+ 
+ 
+ def _stop_gateways(token: dict, entries: list[dict]) -> None:
+-    """Drain every gateway (bare ones SIGTERMed when they do not answer), then wait for all of them
+-    within one drain budget. A supervised gateway that exited through the drain is stopped through
++    """Request idle-only stops, then wait within one bounded pre-swap budget.
++    A supervised gateway that exited through the drain is stopped through
+     its supervisor at once: its exit 75 asks for a restart, which systemd honours after
+-    ``RestartSec=5`` and launchd immediately, still on the old tree. Past the budget a supervised
+-    survivor gets its supervisor's stop and a bare one SIGKILL, as the restart path escalates."""
++    ``RestartSec=5`` and launchd immediately, still on the old tree. Past the budget the update
++    defers without forcing active work to stop; the checkout must not move."""
+     from hermes_cli import update_pause_record as pause_record
+     from hermes_cli.update_cmd_drain_report import drain_progress_reporter
+-    budget, waiting = _drain_budget(), []
++    budget, waiting = min(_drain_budget(), _PRE_SWAP_DRAIN_WAIT_S), []
+     for entry in entries:
+         pause_record.mark_stop_sent(token, entry["pid"])  # before the request: see _ask_to_drain
+-        if _ask_to_drain(entry):
++        acknowledged = _ask_to_drain(entry)
++        if acknowledged:
+             waiting.append(entry)
+         else:
+-            _stop_at_once(entry)
+-            if not entry.get("kind"):
+-                waiting.append(entry)  # a SIGTERMed bare gateway is waited for like a drained one
++            if acknowledged is False:
++                pause_record.mark_stop_refused(token, entry["pid"])
++            raise PauseRefused(f"{_names([entry])} is busy or cannot acknowledge an idle pause; retry when idle")
+     if not waiting:
+         return
+-    print(f"  ⏳ Waiting up to {budget:.0f}s for in-flight turns on {_names(waiting)} to finish before the update...")
++    print(f"  ⏳ Waiting up to {budget:.0f}s for paused gateways {_names(waiting)} to exit before the update...")
+     ticks = [drain_progress_reporter(Path(e["home"]) if e.get("home") else None, budget_s=budget) for e in waiting]
+     deadline = time.monotonic() + budget
+     while waiting and time.monotonic() < deadline:
+@@ -486,15 +493,8 @@ def _stop_gateways(token: dict, entries: list[dict]) -> None:
+         for tick in ticks if waiting else ():
+             tick()
+         time.sleep(0.2)
+-    for entry in waiting:
+-        if entry.get("kind"):
+-            _stop_at_once(entry)
+-        else:
+-            with suppress(ProcessLookupError, PermissionError):
+-                os.kill(entry["pid"], getattr(signal, "SIGKILL", signal.SIGTERM))
+-    bare = [e for e in waiting if not e.get("kind")]
+-    if left := _wait_gone([e["pid"] for e in bare], 10.0, {e["pid"]: e.get("ct") for e in bare}):
+-        raise PauseRefused("gateway PID(s) " + ", ".join(map(str, sorted(left))) + " did not stop")
++    if waiting:
++        raise PauseRefused(f"{_names(waiting)} still draining after {budget:.0f}s; retry once in-flight turns finish")
+ 
+ 
+ def _disarm(entry: dict) -> None:
+@@ -573,10 +573,8 @@ def _describe(token: dict) -> str:
+ def pause_at_commit_point() -> str | None:
+     """Stop this install's gateways before the first checkout move; once per run.
+ 
+-    Never refuses the update: the pause is protection, not a gate. When it cannot complete
+-    (discovery or the durable record fails, a stop fails), the gateways run through the swap and
+-    the post-commit restart refreshes them, which is how POSIX updated before the pause existed.
+-    Always ``None``; the caller's refusal branch stays for the contract it shares with Windows."""
++    A failed or overlong drain refuses the move. The sticky verdict also fences later
++    commit points in the same update; retrying requires a new run."""
+     token = _RUN
+     if token is None:
+         return None
+@@ -598,8 +596,7 @@ def _pause(token: dict) -> str | None:
+         units, jobs, notices = _left_running(units, jobs)
+         bare, more = _discover_bare({u["pid"] for u in units} | {j["pid"] for j in jobs})
+     except Exception as exc:  # health: allow BLE001 -- a discovery that cannot finish stops nothing
+-        print(f"  ⚠ Could not list the running gateways ({exc}); they keep running and are restarted after the update")
+-        return None
++        return f"could not list running gateways ({exc}); the checkout was not changed"
+     for line in notices + more:
+         print(line)
+     supervised = units + jobs
+@@ -630,23 +627,25 @@ def _pause(token: dict) -> str | None:
+                 pause_record.discharge(token)
+         token.clear()
+         token.update(before)
+-        print(f"  ⚠ Could not record the gateways to pause ({exc}); they keep running and are restarted after the update")
+-        return None
++        return f"could not record gateways to pause ({exc}); the checkout was not changed"
+     # From here a refusal or a crash leaves the set owed: the command's own exit resume (registered
+     # in ``_cmd_update_impl`` for this token), else the next launch's recovery, restarts it.
+     token["posix_stopped"] = True
+     try:
+         _stop_gateways(token, supervised + bare)
+-    except Exception as exc:  # health: allow BLE001 -- roll back: restart the stopped set, update unpaused
+-        print(f"  ⚠ Could not pause every gateway ({exc}); restarting them, the update continues without the pause")
++    except BaseException as exc:  # health: allow BLE001 -- interruption must settle before cmd_update releases its fence
++        from hermes_cli.update_cmd_windows import _resume_windows_gateways_after_update
++        print(f"  ↷ Update deferred: {exc or type(exc).__name__}; the checkout was not changed")
+         try:
+-            resume_paused_set(token)
++            _resume_windows_gateways_after_update(token)
+         except Exception as again:  # health: allow BLE001 -- still owed: completion restarts them after the deps
+-            print(f"  ⚠ {again}; they restart once the dependencies are synced")
++            print(f"  ⚠ {again}; restart debt is retained for the next launch")
+         for restarted in _RESTARTED.values():
+             restarted.clear()  # back on the OLD code: the post-commit fleet restart must refresh them
+         pause_record.sync(token)
+-        return None
++        if not isinstance(exc, Exception):
++            raise
++        return f"gateway pause deferred ({exc}); the checkout was not changed"
+     pause_record.sync(token)
+     print(f"  ⏸ Paused for the update: {_describe(token)} (restarted once the dependencies are synced)")
+     return None
+@@ -682,6 +681,23 @@ def _await_root_locks(name: str, pid: int) -> None:
+ 
+ def resume_paused_set(token: dict) -> None:
+     """Start every paused runtime again; each leaves *token* only on its own verified start."""
++    from hermes_cli import update_pause_record as pause_record
++    # `systemctl start` on a live draining unit succeeds with its OLD PID. That
++    # is not a restart: retain its obligation until the recorded incarnation exits.
++    pause_record.drop_never_stopped(token)
++    draining = pause_record.split_draining(token)
++    try:
++        _resume_exited_set(token)
++    finally:
++        token["posix_units"] = [*token.get("posix_units", []), *draining["posix_units"]]
++        token["unmapped"] = [*token.get("unmapped", []), *draining["unmapped"]]
++        token["unmapped_pids"] = [e["pid"] for e in token["unmapped"]]
++        token["profiles"] = {**token.get("profiles", {}), **draining["profiles"]}
++        token["resume_needed"] = bool(token["posix_units"] or token["unmapped"] or token["profiles"])
++
++
++def _resume_exited_set(token: dict) -> None:
++    """Resume only exited incarnations; the caller keeps live drain debt even on interruption."""
+     failures: list[str] = []
+     restarted: list[str] = []
+     kept_units = []
+@@ -717,13 +733,13 @@ def resume_paused_set(token: dict) -> None:
+             failures.append(str(exc))
+             kept_bare.append(entry)
+     token["unmapped"] = kept_bare
+-    token["unmapped_pids"] = [e["pid"] for e in kept_bare]
++    token["unmapped_pids"] = [e["pid"] for e in token["unmapped"]]
+     token["profiles"] = {}
+     if restarted:
+         print(f"  ▶ Restarted paused gateway(s): {', '.join(restarted)}")
+     if failures:
+         raise RuntimeError("Could not restart every paused gateway: " + "; ".join(failures))
+-    token["resume_needed"] = False
++    token["resume_needed"] = bool(token["posix_units"] or token["unmapped"] or token["profiles"])
+     token["posix_stopped"] = False
+ 
+ 
+diff --git a/hermes_cli/update_pause_record.py b/hermes_cli/update_pause_record.py
+index c5816f887f8..dbe32fc3786 100644
+--- a/hermes_cli/update_pause_record.py
++++ b/hermes_cli/update_pause_record.py
+@@ -487,6 +487,14 @@ def mark_stop_sent(token: dict, pid) -> None:
+         print(f"  ⚠ Could not record the stop request for gateway {pid}: {exc}")
+ 
+ 
++def mark_stop_refused(token: dict, pid) -> None:
++    """A positive idle-pause refusal owes no restart, even if that process later exits normally."""
++    key = str(int(pid))
++    token["stop_sent"] = [p for p in token.get("stop_sent", []) if str(p) != key]
++    _without(token, {key})
++    write(token, owner=identity())
++
++
+ def mark_stop_consumed(path: Path, marker: dict) -> None:
+     """Checkpoint a validated gateway consume BEFORE its marker disappears.
+ 
+diff --git a/tests/gateway/test_update_idle_pause.py b/tests/gateway/test_update_idle_pause.py
+new file mode 100644
+index 00000000000..6151fafc5e1
+--- /dev/null
++++ b/tests/gateway/test_update_idle_pause.py
+@@ -0,0 +1,163 @@
++"""Idle-only update pauses must never start a drain while work is active."""
++
++import asyncio
++import os
++from types import SimpleNamespace
++from unittest.mock import Mock, call
++
++import pytest
++
++from gateway import cron_pause
++from gateway.control_socket import GatewayControlServer, pause_gateway_for_update
++
++
++@pytest.fixture
++def pause_state(monkeypatch):
++    runner = SimpleNamespace(
++        config=object(),
++        _active_work_count=Mock(return_value=0),
++        request_restart=Mock(return_value=True),
++    )
++    preserve = Mock()
++    monkeypatch.setattr(cron_pause, "preserve_cron_slots", preserve)
++    monkeypatch.setattr("hermes_cli.gateway._get_restart_drain_timeout", lambda: 12.5)
++    return runner, preserve
++
++
++def _inline_loop():
++    return SimpleNamespace(call_soon_threadsafe=lambda callback: callback())
++
++
++def test_busy_idle_pause_has_no_restart_or_cron_side_effects(pause_state):
++    runner, preserve = pause_state
++    runner._active_work_count.return_value = 1
++
++    result = cron_pause.pause_for_update(runner, _inline_loop(), idle_only=True)
++
++    assert result == {"pausing": False, "already_stopping": False, "busy": True,
++                      "pid": os.getpid(), "drain_timeout": 12.5}
++    runner._active_work_count.assert_called_once_with()
++    runner.request_restart.assert_not_called()
++    preserve.assert_not_called()
++
++
++def test_idle_pause_preserves_slots_before_requesting_restart(pause_state):
++    runner, preserve = pause_state
++    ordered = Mock()
++    ordered.attach_mock(runner._active_work_count, "active_work")
++    ordered.attach_mock(preserve, "preserve")
++    ordered.attach_mock(runner.request_restart, "restart")
++
++    result = cron_pause.pause_for_update(runner, _inline_loop(), idle_only=True)
++
++    assert result == {"pausing": True, "already_stopping": False, "busy": False,
++                      "pid": os.getpid(), "drain_timeout": 12.5}
++    assert ordered.mock_calls == [call.active_work(), call.preserve(runner.config),
++                                  call.restart(detached=False, via_service=True)]
++
++
++@pytest.mark.parametrize("run_after_return", [False, True], ids=["at-deadline", "after-timeout"])
++def test_expired_scheduled_callback_cannot_start_a_drain(pause_state, monkeypatch, run_after_return):
++    runner, preserve = pause_state
++    queued = []
++    clock = SimpleNamespace(monotonic=Mock(return_value=100.0))
++    event = Mock()
++    monkeypatch.setattr(cron_pause, "time", clock)
++    monkeypatch.setattr(cron_pause, "threading", SimpleNamespace(Event=lambda: event))
++
++    def expire_wait(timeout):
++        assert timeout == 5.0
++        clock.monotonic.return_value = 105.0
++        if not run_after_return:
++            queued.pop()()
++        return False
++
++    event.wait.side_effect = expire_wait
++    loop = SimpleNamespace(call_soon_threadsafe=queued.append)
++    result = cron_pause.pause_for_update(runner, loop, idle_only=True)
++    assert result["pausing"] is False
++    assert result["already_stopping"] is False
++    if run_after_return:
++        queued.pop()()
++    else:
++        assert result["busy"] is True
++    runner.request_restart.assert_not_called()
++    preserve.assert_not_called()
++    event.set.assert_called_once_with()
++
++
++def test_active_count_is_checked_in_scheduled_callback(pause_state, monkeypatch):
++    runner, preserve = pause_state
++
++    def schedule(callback):
++        preserve.assert_not_called()
++        runner._active_work_count.assert_not_called()
++        runner._active_work_count.return_value = 1
++        callback()
++
++    result = cron_pause.pause_for_update(
++        runner, SimpleNamespace(call_soon_threadsafe=schedule), idle_only=True,
++    )
++    assert result["busy"] is True
++    assert result["pausing"] is False
++    preserve.assert_not_called()
++    runner.request_restart.assert_not_called()
++
++
++def test_legacy_pause_still_requests_restart_with_active_work(pause_state):
++    runner, preserve = pause_state
++    runner._active_work_count.return_value = 3
++
++    result = cron_pause.pause_for_update(runner, _inline_loop())
++
++    assert result["pausing"] is True
++    assert result["busy"] is False
++    runner._active_work_count.assert_not_called()
++    preserve.assert_called_once_with(runner.config)
++    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("idle_only,active", [(True, 1), (True, 0), (False, 1)])
++def test_pause_client_routes_over_real_socket(tmp_path, pause_state, idle_only, active):
++    runner, preserve = pause_state
++    runner._active_work_count.return_value = active
++    verbs = []
++
++    async def scenario():
++        loop = asyncio.get_running_loop()
++
++        def idle_handler():
++            verbs.append("pause-if-idle-for-update")
++            return cron_pause.pause_for_update(runner, loop, idle_only=True)
++
++        def legacy_handler():
++            verbs.append("pause-for-update")
++            return cron_pause.pause_for_update(runner, loop)
++
++        server = GatewayControlServer(home=tmp_path, verb_handlers={
++            "pause-if-idle-for-update": idle_handler,
++            "pause-for-update": legacy_handler,
++        })
++        assert await server.start()
++        try:
++            # Omit the flag for the legacy case to test the client's default route.
++            kwargs = {"idle_only": True} if idle_only else {}
++            return await asyncio.to_thread(pause_gateway_for_update, tmp_path, timeout=5.0, **kwargs)
++        finally:
++            await server.stop()
++
++    result = asyncio.run(scenario())
++    assert verbs == ["pause-if-idle-for-update" if idle_only else "pause-for-update"]
++    assert result is not None
++    refused = idle_only and active > 0
++    assert result["busy"] is refused
++    assert result["pausing"] is (not refused)
++    assert result["already_stopping"] is False
++    assert result["drain_timeout"] == 12.5
++    if refused:
++        preserve.assert_not_called()
++        runner.request_restart.assert_not_called()
++    else:
++        preserve.assert_called_once_with(runner.config)
++        runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+diff --git a/tests/hermes_cli/test_update_posix_pause.py b/tests/hermes_cli/test_update_posix_pause.py
+index 5025a484545..42b7b7254d3 100644
+--- a/tests/hermes_cli/test_update_posix_pause.py
++++ b/tests/hermes_cli/test_update_posix_pause.py
+@@ -129,10 +129,8 @@ def test_a_killed_updates_record_owes_only_what_it_stopped(tmp_path, kind, asked
+ @pytest.mark.platforms("posix")
+ @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root writes through a read-only dir")
+ @pytest.mark.parametrize("prior", [{}, {"pause_id": "adopted-1", "resume_needed": True}], ids=["fresh", "adopted"])
+-def test_a_record_that_cannot_be_written_leaves_the_update_unpaused_and_ungated(tmp_path, monkeypatch, prior):
+-    """No durable record, no stop. This attempt must leave nothing that arms the checkout's tree
+-    gate (its required record write would then refuse the update), and an adopted obligation must
+-    survive exactly as it was."""
++def test_a_record_that_cannot_be_written_refuses_without_stopping(tmp_path, monkeypatch, prior):
++    """No durable record, no stop or mutation; an adopted obligation survives unchanged."""
+     from hermes_cli import update_cmd_posix_pause as m
+     gateway = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=subprocess.DEVNULL)
+     home = tmp_path / "home"
+@@ -147,7 +145,7 @@ def test_a_record_that_cannot_be_written_leaves_the_update_unpaused_and_ungated(
+     before = json.loads(json.dumps(token))
+     home.chmod(0o500)
+     try:
+-        assert m._pause(token) is None
++        assert "could not record" in m._pause(token)
+     finally:
+         home.chmod(0o700)
+         gateway.kill()
+diff --git a/tests/hermes_cli/test_update_preswap_drain.py b/tests/hermes_cli/test_update_preswap_drain.py
+new file mode 100644
+index 00000000000..c805370bbae
+--- /dev/null
++++ b/tests/hermes_cli/test_update_preswap_drain.py
+@@ -0,0 +1,249 @@
++"""A busy pre-swap drain must not trap Desktop behind the update fence."""
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import update_cmd_posix_pause as pause
++from hermes_cli import update_pause_record as record
++
++
++@pytest.mark.platforms("posix")
++def test_long_drain_refuses_without_forcing_active_work(monkeypatch):
++    now = [0.0]
++    monkeypatch.setattr(pause, "time", SimpleNamespace(
++        monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds)))
++    monkeypatch.setattr(pause, "_drain_budget", lambda: 1885.0)
++    monkeypatch.setattr(pause, "_ask_to_drain", lambda entry: True)
++    monkeypatch.setattr(pause, "_alive", lambda *args: True)
++    monkeypatch.setattr(record, "mark_stop_sent", lambda *args: None)
++    stop = Mock()
++    monkeypatch.setattr(pause, "_stop_at_once", stop)
++    entry = {"pid": 4242, "kind": "systemd", "unit": "hermes-gateway-test.service"}
++    with pytest.raises(pause.PauseRefused, match="drain"):
++        pause._stop_gateways({}, [entry])
++    assert now[0] <= 31.0
++    stop.assert_not_called()
++
++
++@pytest.mark.platforms("posix")
++def test_resume_retains_live_drain_debt_and_starts_only_exited_units(monkeypatch):
++    live = {"pid": 4242, "kind": "systemd", "scope": "user", "unit": "live.service"}
++    dead = {"pid": 4243, "kind": "systemd", "scope": "user", "unit": "dead.service"}
++    token = {**pause._empty_token(), "resume_needed": True, "posix_stopped": True,
++             "posix_units": [live, dead], "identities": {"4242": "live", "4243": "dead"}}
++    monkeypatch.setattr(record, "identity_is_live", lambda identity: identity["ct"] == "live")
++    monkeypatch.setattr(pause, "_root_first", lambda entries: (entries, None))
++    monkeypatch.setattr(pause, "_RESTARTED", {"units": set(), "labels": set(), "pids": set()})
++    start = Mock(return_value=4244)
++    monkeypatch.setattr(pause, "_start_unit", start)
++    pause.resume_paused_set(token)
++    start.assert_called_once_with(dead)
++    assert token["posix_units"] == [live]
++    assert token["resume_needed"] is True
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("failure", [pause.PauseRefused("still draining"), KeyboardInterrupt()])
++def test_pause_failure_never_arms_a_tree_move_and_settles_under_fence(tmp_path, monkeypatch, failure):
++    from hermes_cli import update_cmd_commit as commit, update_cmd_windows as windows
++    from gateway import status
++
++    token = pause._empty_token()
++    entry = {"pid": 4242, "kind": "systemd", "unit": "test.service", "home": "/fixture"}
++    monkeypatch.setattr(pause, "_RUN", token)
++    monkeypatch.setattr(pause, "_discover_systemd", lambda: [entry])
++    monkeypatch.setattr(pause, "_discover_launchd", list)
++    monkeypatch.setattr(pause, "_left_running", lambda units, jobs: (units, jobs, []))
++    monkeypatch.setattr(pause, "_discover_bare", lambda pids: ([], []))
++    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 1)
++    monkeypatch.setattr(record, "identity", lambda pid=None: {"ct": "ct:1"})
++    monkeypatch.setattr(record, "record_pause", lambda *args: None)
++    monkeypatch.setattr(record, "mark_stop_requested", lambda *args, **kwargs: None)
++    monkeypatch.setattr(record, "sync", lambda token: None)
++    monkeypatch.setattr(pause, "_stop_gateways", Mock(side_effect=failure))
++    resume = Mock()
++    monkeypatch.setattr(windows, "_resume_windows_gateways_after_update", resume)
++    arm = Mock()
++    monkeypatch.setattr(commit, "arm_commit_obligations", arm)
++    if isinstance(failure, KeyboardInterrupt):
++        with pytest.raises(KeyboardInterrupt):
++            commit.arm_commit_point([], tmp_path, "a" * 40)
++    else:
++        assert "drain" in (commit.arm_commit_point([], tmp_path, "a" * 40) or "")
++    arm.assert_not_called()
++    resume.assert_called_once_with(token)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("keep", [True, False])
++def test_busy_pause_precedes_stash_or_discard_but_follows_prompt(tmp_path, monkeypatch, keep):
++    import subprocess
++    from hermes_cli import update_cmd_stash as stash, update_cmd_pause_gate as gate
++
++    def git(*args):
++        return subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True, text=True)
++
++    git("init", "-q")
++    source = tmp_path / "code.py"
++    source.write_text("before = 1\n")
++    git("add", "code.py")
++    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "baseline")
++    before = git("rev-parse", "HEAD").stdout
++    source.write_text("dirty = 2\n")
++    seen = []
++    monkeypatch.setattr(stash, "_ask_keep_local_changes", lambda changes: seen.append("prompt") or keep)
++    monkeypatch.setattr(pause, "pause_at_commit_point", lambda: seen.append("pause") or "gateway busy")
++    with pytest.raises(pause.PauseRefused, match="gateway busy"):
++        stash._stash_local_changes_if_needed(["git"], tmp_path, ask_first=True, checkout_move=gate._moves_for(None))
++    assert seen == ["prompt", "pause"]
++    assert source.read_text() == "dirty = 2\n"
++    assert git("rev-parse", "HEAD").stdout == before
++    assert git("stash", "list").stdout == ""
++
++
++@pytest.mark.platforms("posix")
++def test_unacknowledged_pause_never_forces_a_stop(monkeypatch):
++    monkeypatch.setattr(record, "mark_stop_sent", lambda *args: None)
++    monkeypatch.setattr(record, "mark_stop_refused", lambda *args: None)
++    monkeypatch.setattr(pause, "_ask_to_drain", lambda entry: False)
++    stop = Mock()
++    monkeypatch.setattr(pause, "_stop_at_once", stop)
++    with pytest.raises(pause.PauseRefused, match="busy"):
++        pause._stop_gateways({}, [{"pid": 4242, "kind": "systemd", "unit": "busy.service"}])
++    stop.assert_not_called()
++
++
++def test_discovery_failure_refuses_the_tree_move(monkeypatch):
++    monkeypatch.setattr(pause, "_discover_systemd", Mock(side_effect=OSError("discovery failed")))
++    assert "could not list" in pause._pause(pause._empty_token())
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("mode", ["timeout", "interrupt", "busy"])
++def test_command_releases_desktop_fence_after_preswap_refusal(tmp_path, monkeypatch, mode):
++    import atexit
++    import subprocess
++    import sys
++
++    from gateway import status
++    from hermes_cli import main, update_cmd, update_cmd_windows as windows, update_lock
++    from hermes_cli import update_owning_install
++    from hermes_cli.gateway_connections_ssh_programs import REMOTE_MARKER_GATE_PY
++    from gateway import control_socket, cron_pause
++
++    root = tmp_path / "repo"
++    root.mkdir()
++    subprocess.run(["git", "init", "-q", str(root)], check=True)
++    subprocess.run(["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
++                    "commit", "--allow-empty", "-qm", "baseline"], check=True)
++    monkeypatch.setattr(main, "PROJECT_ROOT", root)
++    monkeypatch.setattr(pause, "_RUN", None)
++    monkeypatch.setattr(record, "install_root", lambda: root)
++    monkeypatch.setattr(update_owning_install, "retarget_to_owning_install", lambda root: None)
++    monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
++    monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
++    monkeypatch.setattr(main, "_finalize_update_output", lambda state: None)
++    monkeypatch.setattr(main, "_finalize_update_receipt", lambda *args: None)
++    # A real live process identity: cleanup must not call systemctl start on it.
++    import os
++    pid = os.getpid()
++    entry = {"pid": pid, "kind": "systemd", "scope": "user", "unit": "fixture.service", "home": str(tmp_path)}
++    exited = {**entry, "pid": 99999999, "unit": "exited.service"}
++    monkeypatch.setattr(pause, "_discover_systemd", lambda: [dict(entry), dict(exited)])
++    monkeypatch.setattr(pause, "_discover_launchd", list)
++    monkeypatch.setattr(pause, "_left_running", lambda units, jobs: (units, jobs, []))
++    monkeypatch.setattr(pause, "_discover_bare", lambda pids: ([], []))
++    if mode != "busy":
++        monkeypatch.setattr(pause, "_ask_to_drain", lambda entry: True)
++    else:
++        runner = SimpleNamespace(config=object(), _active_work_count=lambda: 7, request_restart=Mock())
++        monkeypatch.setattr(cron_pause, "preserve_cron_slots", Mock())
++        def pause_client(home, *, idle_only):
++            assert idle_only
++            assert desktop_gate().startswith("LIVE:")
++            return cron_pause.pause_for_update(
++                runner, SimpleNamespace(call_soon_threadsafe=lambda callback: callback()), idle_only=idle_only)
++        monkeypatch.setattr(control_socket, "pause_gateway_for_update", pause_client)
++    monkeypatch.setattr(pause, "_drain_budget", lambda: 1885.0)
++    monkeypatch.setattr(pause, "_RESTARTED", {"units": set(), "labels": set(), "pids": set()})
++    def start_unit(unit):
++        assert update_lock.holds_checkout_lock(root), "rollback restarted a unit outside the update fence"
++        assert unit["pid"] == exited["pid"]
++        return 99999998
++
++    start = Mock(side_effect=start_unit)
++    stop = Mock()
++    monkeypatch.setattr(pause, "_start_unit", start)
++    monkeypatch.setattr(pause, "_stop_at_once", stop)
++    now = [0.0]
++    monkeypatch.setattr(pause, "_disarm", lambda entry: None)
++    monkeypatch.setattr(pause, "_root_first", lambda entries: (entries, None))
++    marker = update_lock.update_marker_path()
++
++    def desktop_gate():
++        got = subprocess.run([sys.executable, "-c", REMOTE_MARKER_GATE_PY, str(marker), "", str(root)],
++                             capture_output=True, text=True, encoding="utf-8", timeout=10, check=False)
++        return got.stdout.strip().splitlines()[-1]
++
++    def tick(seconds):
++        assert desktop_gate().startswith("LIVE:")  # real subprocess sees the held command fence
++        if mode == "interrupt":
++            raise KeyboardInterrupt
++        now[0] += 31.0
++
++    monkeypatch.setattr(pause, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=tick))
++    token = None
++
++    def impl(args, gateway_mode=False):
++        nonlocal token
++        token = pause.arm_pause(no_gateway_restart=False)
++        atexit.register(windows._resume_windows_gateways_after_update, token)
++        # Real prepare/stash/mutation guard, including a dirty tree at an unchanged HEAD.
++        monkeypatch.setattr(update_cmd, "_apply_parked_branch_guard", lambda *args, **kw: (False, True, None))
++        update_cmd._prepare_checkout_for_update(
++            ["git"], "main", "main", is_fork=True, assume_yes=True, gateway_mode=False,
++            gw_input_fn=None, switch_branch=False, target_ref="HEAD", _windows_gateway_resume=token)
++
++    monkeypatch.setattr(update_cmd, "_cmd_update_impl", impl)
++    source = root / "source.py"
++    source.write_text("before = 1\n")
++    subprocess.run(["git", "-C", str(root), "add", "source.py"], check=True)
++    subprocess.run(["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
++                    "commit", "-qm", "source"], check=True)
++    source.write_text("dirty = 2\n")
++    with pytest.raises(KeyboardInterrupt if mode == "interrupt" else pause.PauseRefused):
++        main.cmd_update(SimpleNamespace(gateway=False))
++    assert desktop_gate() == "CLEAR"
++    assert source.read_text() == "dirty = 2\n"
++    assert not (root / ".git" / "hermes-update-pull").exists()
++    assert token is not None
++    if mode == "busy":
++        runner.request_restart.assert_not_called()
++        cron_pause.preserve_cron_slots.assert_not_called()
++        assert not token["posix_units"]
++        assert not token["resume_needed"]
++        assert not record.orphans()
++        return
++    assert token["resume_needed"]
++    assert [e["pid"] for e in token["posix_units"]] == [pid]
++    assert status.get_process_start_time(pid) is not None
++    start.assert_called_once()
++    stop.assert_not_called()
++    # The updater has exited and the remaining incarnation subsequently exits.
++    # Startup recovery must own its durable debt and hold the checkout fence.
++    record.write(token, owner=record.UNOWNED)
++    monkeypatch.setattr(record, "identity_is_live", lambda identity: False)
++
++    def recover_unit(unit):
++        assert update_lock.holds_checkout_lock(root)
++        assert unit["pid"] == pid
++        return 99999997
++
++    recover_start = Mock(side_effect=recover_unit)
++    monkeypatch.setattr(pause, "_start_unit", recover_start)
++    record.recover(["doctor"])
++    recover_start.assert_called_once()
++    assert not record.orphans()
+diff --git a/tests/hermes_cli/test_update_target_identity.py b/tests/hermes_cli/test_update_target_identity.py
+index cd8c5d4119e..dcebe360568 100644
+--- a/tests/hermes_cli/test_update_target_identity.py
++++ b/tests/hermes_cli/test_update_target_identity.py
+@@ -59,6 +59,12 @@ def update_tree(tmp_path, monkeypatch):
+     monkeypatch.setattr(update_receipt, '_code_identity', lambda **_: {'commit': base})
+     monkeypatch.setattr(cli_main, '_run_pre_update_backup', lambda *_: 'release-snapshot')
+     monkeypatch.setattr(cli_main, '_pause_windows_gateways_for_update', lambda: None)
++    # This fixture models a checkout with no gateways. Fail-closed POSIX pause
++    # must not discover host services through the git-only subprocess sentinel.
++    from hermes_cli import update_cmd_posix_pause as posix_pause
++    monkeypatch.setattr(posix_pause, '_discover_systemd', list)
++    monkeypatch.setattr(posix_pause, '_discover_launchd', list)
++    monkeypatch.setattr(posix_pause, '_discover_bare', lambda pids: ([], []))
+     resumed = []
+     monkeypatch.setattr(cli_main, '_resume_windows_gateways_after_update', lambda state: resumed.append(state))
+     monkeypatch.setattr(cli_main, '_install_hangup_protection', lambda **_: {'installed': False})
+-- 
+2.55.0
+

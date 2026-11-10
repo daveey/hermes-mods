@@ -1,0 +1,85 @@
+From a690a60cd5b3afe4568fa69e6e5323eb8250bbf2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:23:04 +0000
+Subject: [PATCH] fix(web): report unconfirmed corruption as pending across
+ reads [daveey]
+
+---
+ hermes_cli/web_routers/_common.py             |  2 ++
+ hermes_cli/web_routers/sessions.py            |  3 ++
+ .../test_storage_corruption_background.py     | 32 +++++++++++++++++++
+ 3 files changed, 37 insertions(+)
+
+diff --git a/hermes_cli/web_routers/_common.py b/hermes_cli/web_routers/_common.py
+index 2e977db2d54..5740aada3f6 100644
+--- a/hermes_cli/web_routers/_common.py
++++ b/hermes_cli/web_routers/_common.py
+@@ -210,6 +210,8 @@ def corrupt_store_status(db_path, exc) -> HTTPException:
+     """The structured ``state_db_corrupt`` 503 for a malformed store, warning once per store per
+     :data:`_CORRUPT_STORE_WARN_INTERVAL_S` (debug afterwards). Callers ``raise ... from exc``."""
+     from hermes_state_errors import classify_persistence_error
++    if getattr(exc, "hermes_read_corrupt_unconfirmed", False):
++        return HTTPException(status_code=503, detail="Session read failed; background integrity check pending.")
+     key, now = str(db_path), time.monotonic()
+     last = _corrupt_store_warned_at.get(key)
+     detail = _STORE_STATUS_DETAIL_BY_CAUSE.get(classify_persistence_error(exc), CORRUPT_STORE_DETAIL)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index f13ccb87c59..eb58e23c546 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -169,6 +169,9 @@ def _resolve_session_id(db, session_id: str) -> Optional[str]:
+     try:
+         return db.resolve_session_id(session_id)
+     except sqlite3.DatabaseError as exc:
++        if getattr(exc, "hermes_read_corrupt_unconfirmed", False):
++            from hermes_cli.web_routers._common import corrupt_store_status
++            raise corrupt_store_status(db.db_path, exc) from exc
+         if not is_malformed_db_error(exc):
+             raise
+         _log.error("state.db is corrupt while resolving session %s: %s", session_id, exc)
+diff --git a/tests/hermes_state/test_storage_corruption_background.py b/tests/hermes_state/test_storage_corruption_background.py
+index 1a66e2b505e..702f37b6de8 100644
+--- a/tests/hermes_state/test_storage_corruption_background.py
++++ b/tests/hermes_state/test_storage_corruption_background.py
+@@ -101,6 +101,38 @@ def test_web_outer_handlers_do_not_relatch_unconfirmed_read(db, monkeypatch, rou
+         db.append_message(session_id="s1", role="user", content="router did not latch")
+ 
+ 
++@pytest.mark.parametrize("route", ["usage", "models", "resolve", "browse"])
++def test_web_reads_report_unconfirmed_not_repair(db, monkeypatch, caplog, route):
++    import asyncio
++    from fastapi import HTTPException
++    from hermes_cli.web_routers import analytics, sessions
++    from hermes_cli import web_server_sessions
++
++    monkeypatch.setattr(cc, "confirm_corruption", lambda *args: cc.ConfirmResult("timeout", "sessions", 5.0))
++    monkeypatch.setattr(cc, "schedule_background_confirmation", lambda *args: True)
++
++    def fail(*args, **kwargs):
++        return db._read_retrying_ioerr(corrupt_read)
++
++    with pytest.raises(HTTPException) as caught:
++        if route in ("usage", "models"):
++            monkeypatch.setattr(analytics, "_session_db_path_for_profile", lambda *a: db.db_path)
++            monkeypatch.setattr(analytics, f"_get_{route}_analytics", fail)
++            asyncio.run(getattr(analytics, f"get_{route}_analytics")(days=7))
++        elif route == "resolve":
++            monkeypatch.setattr(db, "resolve_session_id", fail)
++            sessions._resolve_session_id(db, "s")
++        else:
++            monkeypatch.setattr("hermes_state.SessionDB", fail)
++            web_server_sessions._open_session_db_at_path(db.db_path, read_only=True)
++    assert caught.value.status_code == 503
++    assert "background integrity check pending" in str(caught.value.detail)
++    assert "doctor" not in str(caught.value.detail)
++    assert "repaired" not in caplog.text
++    assert storage_state(db.db_path) == "ok"
++    db.append_message(session_id="s1", role="user", content="still writable")
++
++
+ def test_distinct_profile_checks_queue_and_errors_do_not_latch(tmp_path, monkeypatch):
+     entered, release = threading.Event(), threading.Event()
+     paths = [tmp_path / "a.db", tmp_path / "b.db"]
+-- 
+2.55.0
+

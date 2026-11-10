@@ -1,0 +1,264 @@
+From f953f662ccd84cbb643d71e113f9a13f939c4a94 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:42:03 -0800
+Subject: [PATCH] fix(usage): retain singleton pool identity in model options
+ [daveey]
+
+---
+ .../components/provider-status-chip.test.tsx  |  21 +++
+ hermes_cli/inventory.py                       |  15 +--
+ .../test_model_options_account_usage.py       |  12 +-
+ .../test_model_options_pool_usage.py          |   6 +-
+ .../test_model_options_single_pool_usage.py   | 121 ++++++++++++++++++
+ 5 files changed, 159 insertions(+), 16 deletions(-)
+ create mode 100644 tests/hermes_cli/test_model_options_single_pool_usage.py
+
+diff --git a/apps/desktop/src/components/provider-status-chip.test.tsx b/apps/desktop/src/components/provider-status-chip.test.tsx
+index 64289654f21..fbc21b1e433 100644
+--- a/apps/desktop/src/components/provider-status-chip.test.tsx
++++ b/apps/desktop/src/components/provider-status-chip.test.tsx
+@@ -76,3 +76,24 @@ it('only presents a pool-wide wall when every account is limited, preserving unk
+   expect(screen.getByText('10 accounts')).toBeTruthy()
+   expect(screen.queryByText(/Limited until|accounts limited/)).toBeNull()
+ })
++
++it('renders a sole unknown Claude account without implying readiness or hiding its identity', async () => {
++  const row: ModelOptionProvider = {
++    slug: 'anthropic',
++    name: 'Anthropic',
++    models: ['claude-opus'],
++    usage: {
++      accounts: [{ id: 'entry:only', label: 'Claude subscription', state: 'unknown', windows: [], resets_at: null }]
++    }
++  }
++
++  render(view(row))
++  const chip = screen.getByText('1 account')
++  expect(screen.queryByText(/left|Limited until/)).toBeNull()
++  fireEvent.pointerMove(chip, { pointerType: 'mouse' })
++  const tip = await screen.findByRole('tooltip')
++  expect(within(tip).getByText('Claude subscription')).toBeTruthy()
++  expect(tip.textContent).toContain('Usage unavailable')
++  expect(tip.querySelector('span[style="width: 0%;"]')).toBeTruthy()
++  expect(tip.textContent).not.toMatch(/ready|100% left/i)
++})
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 01c07b99869..34554cf5443 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -295,8 +295,8 @@ def _apply_usage(rows: list[dict]) -> None:
+     from the cache only, and ask for a background refresh, so the picker never waits on a usage API
+     and a chip can warn before the wall instead of at it.
+ 
+-    Single-account providers keep the legacy gauge (``usage.windows``). A provider with a
+-    MULTI-ENTRY credential pool reports ``usage.accounts`` instead — one row per account, each with
++    Providers without a persisted pool keep the legacy gauge (``usage.windows``). Every
++    nonempty credential pool reports ``usage.accounts`` instead — one row per account, each with
+     its own windows/state/resets_at — because one account's quota says nothing about its siblings;
+     a provider-wide percentage there would be a fabricated average. A snapshot older than the
+     staleness bound renders ``unknown``/``unavailable``, never a confident stale gauge. Nothing here
+@@ -332,16 +332,15 @@ def _apply_usage(rows: list[dict]) -> None:
+ 
+     wanted: list[str] = []
+     entry_requests: list[dict] = []
+-    pooled_sizes = {slug: len(entries) for slug, entries in read_credential_pool().items() if entries}
++    pooled = {slug for slug, entries in read_credential_pool().items() if entries}
+     for row in rows:
+         slug = str(row.get("slug") or "")
+         if not slug or row.get("is_user_defined") or row.get("authenticated") is False:
+             continue
+         supports_usage = has_account_usage(slug)
+-        # A single-entry pool (or no pool) is the single-account case: the legacy gauge stays
+-        # (chip contract unchanged). Only a genuinely multi-entry pool gets per-account rows —
+-        # there, a provider-wide percentage would be a fabricated average across logins.
+-        if pooled_sizes.get(slug, 0) < 2:
++        # Persisted account identity must not disappear with missing telemetry, even for
++        # one entry. Only genuinely non-pooled providers may use ambient legacy credentials.
++        if slug not in pooled:
+             if not supports_usage:
+                 continue
+             wanted.append(slug)
+@@ -350,8 +349,6 @@ def _apply_usage(rows: list[dict]) -> None:
+             if windows and not snapshot_is_stale(snapshot):
+                 row["usage"] = {"windows": windows}
+             continue
+-        if supports_usage:
+-            wanted.append(slug)
+         accounts = _pool_usage_accounts(slug, _wire_windows, _account_resets_at, entry_requests)
+         if accounts is not None:
+             row["usage"] = {"accounts": accounts}
+diff --git a/tests/hermes_cli/test_model_options_account_usage.py b/tests/hermes_cli/test_model_options_account_usage.py
+index 9ade19743ec..3190cf2bb38 100644
+--- a/tests/hermes_cli/test_model_options_account_usage.py
++++ b/tests/hermes_cli/test_model_options_account_usage.py
+@@ -40,14 +40,18 @@ def test_picker_reads_cached_usage_and_refreshes_without_waiting(monkeypatch):
+     # probes such as ``gh auth token``) takes seconds on a loaded runner and is not this contract.
+     first = next(r for r in build_model_options_payload(ctx)["providers"] if r["slug"] == "openrouter")
+     assert not answered.is_set(), "the picker waited on the usage API"
+-    assert "usage" not in first, "nothing cached yet, so nothing to show"
++    (account,) = first["usage"]["accounts"]
++    assert account["state"] == "unknown" and account["windows"] == []
+     assert called.wait(30), "opening the picker must start a background usage refresh"
+ 
+     release.set()
+-    wait_until(lambda: cached_account_usage("openrouter") is not None, timeout=30,
+-               what="the background refresh cached the usage snapshot")
++    wait_until(lambda: cached_account_usage("openrouter", identity_id=account["id"]) is not None, timeout=30,
++               what="the background refresh cached the usage snapshot for this account")
+ 
+     row = next(r for r in build_model_options_payload(ctx)["providers"] if r["slug"] == "openrouter")
+-    (window,) = row["usage"]["windows"]
++    (refreshed,) = row["usage"]["accounts"]
++    assert refreshed["id"] == account["id"]
++    assert refreshed["state"] == "ready"
++    (window,) = refreshed["windows"]
+     assert window["label"] == "Current session" and window["used_percent"] == 92.0
+     assert datetime.fromisoformat(window["resets_at"]) > datetime.now(UTC)
+diff --git a/tests/hermes_cli/test_model_options_pool_usage.py b/tests/hermes_cli/test_model_options_pool_usage.py
+index d4633166faf..71cad00f16f 100644
+--- a/tests/hermes_cli/test_model_options_pool_usage.py
++++ b/tests/hermes_cli/test_model_options_pool_usage.py
+@@ -162,10 +162,10 @@ def test_same_codex_account_two_credentials_counts_one_account(monkeypatch, tmp_
+     assert "codex:acct-2:user-2" in ids
+ 
+ 
+-def test_single_entry_pool_keeps_legacy_gauge(monkeypatch, tmp_path):
+-    """A one-entry pool is the single-account case: the legacy ``usage.windows`` chip contract."""
++def test_no_pool_keeps_legacy_gauge(monkeypatch, tmp_path):
++    """Without persisted account identities the legacy ``usage.windows`` contract stays."""
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "a"))
+-    _write_pool(tmp_path / "a", "openrouter", [_entry("c1", "tok-1")])
++    _write_pool(tmp_path / "a", "openrouter", [])
+     _clear_cache()
+     remember_account_usage("openrouter", _snapshot(50.0))
+ 
+diff --git a/tests/hermes_cli/test_model_options_single_pool_usage.py b/tests/hermes_cli/test_model_options_single_pool_usage.py
+new file mode 100644
+index 00000000000..801e8a7fca2
+--- /dev/null
++++ b/tests/hermes_cli/test_model_options_single_pool_usage.py
+@@ -0,0 +1,121 @@
++"""Persisted account identity, not pool cardinality, owns picker usage."""
++from dataclasses import replace
++from datetime import UTC, datetime, timedelta
++
++import pytest
++
++from agent import account_usage, account_usage_cache as cache
++from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
++from hermes_cli.inventory import _apply_usage
++from tests.hermes_cli import test_model_options_pool_usage as helpers
++
++
++@pytest.fixture
++def pool_home(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    for store in (cache._snapshots, cache._started, cache._last_try, cache._inflight):
++        store.clear()
++    monkeypatch.setattr(cache, "refresh_account_usage_async", lambda providers: [])
++    monkeypatch.setattr(cache, "refresh_account_usage_entries_async", lambda requests: [])
++    return tmp_path
++
++
++def row():
++    return {"slug": "anthropic", "name": "Anthropic", "models": ["claude-opus"], "authenticated": True}
++
++
++@pytest.mark.parametrize("persist_empty", [False, True])
++@pytest.mark.parametrize("telemetry", ["absent", "stale", "fresh"])
++def test_no_accounts_preserves_legacy_gauge(pool_home, persist_empty, telemetry):
++    if persist_empty:
++        helpers._write_pool(pool_home, "anthropic", [])
++    if telemetry != "absent":
++        snapshot = AccountUsageSnapshot(
++            provider="anthropic", source="test",
++            fetched_at=datetime.now(UTC) - timedelta(hours=1 if telemetry == "stale" else 0),
++            windows=(AccountUsageWindow(label="Week", used_percent=12),))
++        cache.remember_account_usage("anthropic", snapshot)
++    provider = row()
++    _apply_usage([provider])
++    if telemetry == "fresh":
++        assert provider["usage"] == {"windows": [{"label": "Week", "used_percent": 12.0,
++                                                  "resets_at": None, "scope": "account"}]}
++    else:
++        assert "usage" not in provider
++
++
++@pytest.mark.parametrize("size", [1, 2])
++@pytest.mark.parametrize("telemetry", ["absent", "stale", "empty", "fresh", "dead"])
++def test_persisted_accounts_remain_visible_without_live_telemetry(pool_home, size, telemetry):
++    entries = [helpers._entry(f"c{i}", f"sk-ant-oat01-test-{i}", auth_type="oauth",
++                              last_status="dead" if telemetry == "dead" else "ok") for i in range(size)]
++    from agent.credential_pool import load_pool
++
++    helpers._write_pool(pool_home, "anthropic", entries)
++    load_pool("anthropic")  # Normalize the persisted fixture before the read-only assertion.
++    before = (pool_home / "auth.json").read_bytes()
++    snapshot = AccountUsageSnapshot(provider="anthropic", source="test", fetched_at=datetime.now(UTC),
++                                    windows=(AccountUsageWindow(label="Week", used_percent=40),))
++    if telemetry == "stale":
++        snapshot = replace(snapshot, fetched_at=datetime.now(UTC) - timedelta(hours=1))
++    if telemetry == "empty":
++        snapshot = replace(snapshot, windows=())
++    if telemetry != "absent":
++        cache.remember_account_usage("anthropic", snapshot, identity_id=helpers._fp(entries[0]["access_token"]))
++    # Ambient/provider-wide data must never impersonate a persisted account.
++    cache.remember_account_usage("anthropic", replace(snapshot, windows=(AccountUsageWindow(label="Other", used_percent=99),)))
++    provider = row()
++    _apply_usage([provider])
++    accounts = provider["usage"]["accounts"]
++    assert len(accounts) == size
++    assert "windows" not in provider["usage"]
++    assert accounts[0]["id"] == helpers._fp(entries[0]["access_token"])
++    assert accounts[0]["label"] == "c0"
++    expected = "unavailable" if telemetry == "dead" else "ready" if telemetry == "fresh" else "unknown"
++    assert accounts[0]["state"] == expected
++    assert accounts[0]["windows"] == ([{"label": "Week", "used_percent": 40.0, "resets_at": None, "scope": "account"}]
++                                       if telemetry == "fresh" else [])
++    assert (pool_home / "auth.json").read_bytes() == before
++
++
++@pytest.mark.parametrize("fails", [False, True])
++def test_single_pool_refresh_uses_exact_row_never_ambient(pool_home, monkeypatch, fails):
++    token = "sk-ant-oat01-pool-test"
++    from agent.credential_pool import load_pool
++
++    helpers._write_pool(pool_home, "anthropic", [helpers._entry("only", token, auth_type="oauth")])
++    load_pool("anthropic")
++    before = (pool_home / "auth.json").read_bytes()
++    calls = []
++    def fail_ambient():
++        pytest.fail("persisted pool refresh consulted ambient singleton")
++    def get_json(url, headers, **kwargs):
++        calls.append(headers["Authorization"])
++        if fails:
++            raise RuntimeError("usage endpoint unavailable")
++        return {"five_hour": None, "seven_day": {"utilization": 100, "resets_at": "2099-01-01T00:00:00Z"}}
++    monkeypatch.setattr(account_usage, "resolve_anthropic_token", fail_ambient)
++    monkeypatch.setattr(account_usage, "_get_json", get_json)
++    # Exercise the actual refresh worker + fetcher, synchronously for deterministic readback.
++    monkeypatch.setattr(cache, "refresh_account_usage_async", lambda providers: [cache._refresh_legacy(p, cache._key(p)) for p in providers])
++    monkeypatch.setattr(cache, "refresh_account_usage_entries_async", cache._refresh_entries)
++    provider = row()
++    _apply_usage([provider])
++    _apply_usage([provider])
++    assert calls == [f"Bearer {token}", f"Bearer {token}"]
++    account = provider["usage"]["accounts"][0]
++    assert account["state"] == ("unknown" if fails else "limited")
++    assert account["windows"] == ([] if fails else [{"label": "Current week", "used_percent": 100.0,
++                                                       "resets_at": "2099-01-01T00:00:00+00:00", "scope": "account"}])
++    assert (pool_home / "auth.json").read_bytes() == before
++
++
++def test_single_pool_model_cooldown_is_not_account_readiness(pool_home):
++    now = datetime.now(UTC).timestamp()
++    helpers._write_pool(pool_home, "anthropic", [helpers._entry("only", "sk-ant-oat01-test", auth_type="oauth",
++        model_cooldowns={"claude-opus": now + 1800})])
++    provider = row()
++    _apply_usage([provider])
++    account = provider["usage"]["accounts"][0]
++    assert account["state"] == "unknown"
++    assert account["model_cooldowns"] == [{"model": "claude-opus", "until": datetime.fromtimestamp(now + 1800, UTC).isoformat()}]
+-- 
+2.55.0
+

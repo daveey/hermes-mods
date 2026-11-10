@@ -1,0 +1,117 @@
+From eb4975426f4b138017d7a3e7bb2390ad4e1ff866 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:24:39 +0000
+Subject: [PATCH] [daveey] Preserve chat outcomes beneath passive human notices
+
+---
+ hermes_state_outcome.py                    |  5 ++
+ tests/tui_gateway/test_notice_guarantee.py | 56 ++++++++++++++++++++++
+ tui_gateway/notice_guarantee.py            |  9 ++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 29f59b4a3da..fb35b7990ea 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -454,6 +454,11 @@ def _completion_note(row: dict) -> Optional[dict]:
+     if isinstance(meta, str):
+         with contextlib.suppress(ValueError, TypeError):
+             meta = json.loads(meta)
++    # The notice guarantee also deliberately suppresses turns for validated human
++    # notices. Card ownership still supplies decision/wait outcomes independently;
++    # an incidental recipient resumes classification of its own preceding turn.
++    if isinstance(meta, dict) and row.get("display_kind") == _NOTICE_KIND and meta.get("outcome_informational") is True:
++        return meta
+     return meta if isinstance(meta, dict) and meta.get("completion_note") else None
+ 
+ 
+diff --git a/tests/tui_gateway/test_notice_guarantee.py b/tests/tui_gateway/test_notice_guarantee.py
+index 7a86ae1d3e0..a724c0b76ff 100644
+--- a/tests/tui_gateway/test_notice_guarantee.py
++++ b/tests/tui_gateway/test_notice_guarantee.py
+@@ -116,6 +116,62 @@ def test_a_blocked_on_human_notice_never_wakes_and_reads_decision(db):
+     assert stored["items"][0]["card_id"] == tid and [c["value"] for c in stored["items"][0]["choices"]] == ["ship", "hold"]
+ 
+ 
++@pytest.mark.parametrize("prior", ["summary", "request", "failed", "notice"])
++def test_touch_only_human_notice_preserves_previous_turn_outcome(db, prior):
++    from hermes_cli import kanban_db_notify as kbn
++
++    if prior == "request":
++        db.append_message(CHAT, "user", "Please do another thing.")
++    elif prior == "failed":
++        db.append_message(CHAT, "assistant", "Request failed.", finish_reason="error")
++    elif prior == "notice":
++        _notice(db, "✔ Kanban t_other done — still needs a summary")
++    before = so.refresh_outcome(CHAT, "manual", db=db)
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="another chat's deploy", assignee="worker", session_id="other-chat",
++                             initial_status="blocked", human_request=HUMAN, lint_blocked=False)
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT,
++                           delivery_metadata={"reason": "touch"})
++    row = _notice(db, f"⏸ Kanban {tid} blocked: needs approval", task_id=tid)
++    ksa._reset_cache_for_tests()
++    assert so._card_items([CHAT]) == ([], [])
++    assert so.refresh_outcome(CHAT, "manual", db=db)["reason"] == (
++        "interrupted" if prior == "request" else "notice_tail")
++
++    out, calls = _run(db)
++
++    assert calls == [] and [o["result"] for o in out] == ["refreshed:human"]
++    after = so.refresh_outcome(CHAT, "manual", db=db)
++    assert (after["kind"], after.get("reason")) == (before["kind"], before.get("reason"))
++    assert db._read_one("SELECT MAX(id) FROM messages WHERE session_id = ?", (CHAT,))[0] == row
++    assert so._card_items([CHAT]) == ([], [])
++
++
++@pytest.mark.parametrize("role,kind,meta,ignored", [
++    ("user", "kanban_notice", {"outcome_informational": True}, True),
++    ("assistant", "kanban_notice", {"outcome_informational": True}, False),
++    ("user", None, {"outcome_informational": True}, False),
++    ("user", "kanban_notice", {"outcome_informational": "true"}, False),
++    ("user", "kanban_notice", {}, False),
++    ("user", "kanban_notice", "invalid-json", False),
++])
++def test_informational_marker_only_applies_to_validated_notice_rows(role, kind, meta, ignored):
++    row = {"role": role, "display_kind": kind, "display_metadata": meta}
++    assert (so._completion_note(row) is not None) is ignored
++
++
++def test_human_notice_stamp_does_not_overwrite_a_concurrent_claim(db):
++    tid = _decision_card()
++    row = _notice(db, f"⏸ Kanban {tid} blocked", task_id=tid)
++    [cand] = ng.candidates(db, time.time())
++    ng._stamp(db, row, "claimed")
++
++    assert ng._refresh_once(db, cand, "human", set()) == "skipped:changed"
++    assert _closeout(db, row) == "claimed"
++    assert db._read_one("SELECT json_extract(display_metadata, '$.outcome_informational') "
++                        "FROM messages WHERE id = ?", (row,))[0] is None
++
++
+ # Remote notices (defect kanban-a9b5d2c7c1): a notice about a card on ANOTHER gateway carries that owner's board
+ # name, which does not exist here. The guarantee must not open a local board for it; it reads the
+ # ``blocked_on_human`` flag the remote writer stored. [daveey]
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 936ce00c4f6..05aeab6c7d0 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -250,6 +250,15 @@ def _refresh_once(db: Any, cand: dict, branch: str, seen: set) -> str:
+     seen.add(key)
+     if key in _refreshed:
+         return "skipped:refreshed"
++    if branch == "human":
++        # This notice intentionally starts no turn. Keep the real card decision in
++        # live-work precedence, but don't strand incidental (touch-only) recipients.
++        meta = {**cand["meta"], "outcome_informational": True}
++        changed = db._write_rowcount(
++            "UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
++            (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"]))
++        if changed != 1:
++            return "skipped:changed"
+     if _refresh(db, cand["sid"]):
+         _refreshed.add(key)
+     return f"refreshed:{branch}"
+-- 
+2.55.0
+

@@ -1,0 +1,209 @@
+From c6955cbe42eab0adc58bfdb06dcd0d0fd92b34d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:08:01 +0000
+Subject: [PATCH] [daveey] Preserve parked native completion custody across
+ orderly exit
+
+---
+ .../tui_gateway/test_shutdown_job_receipts.py | 68 ++++++++++++++++++-
+ tools/process_registry_readopt.py             |  8 ++-
+ tui_gateway/exit_job_receipts.py              |  8 ++-
+ tui_gateway/notification_park.py              |  8 ++-
+ tui_gateway/session_notifications.py          |  7 +-
+ 5 files changed, 92 insertions(+), 7 deletions(-)
+
+diff --git a/tests/tui_gateway/test_shutdown_job_receipts.py b/tests/tui_gateway/test_shutdown_job_receipts.py
+index d5ea9805798..f1d1ce2ee1f 100644
+--- a/tests/tui_gateway/test_shutdown_job_receipts.py
++++ b/tests/tui_gateway/test_shutdown_job_receipts.py
+@@ -293,7 +293,7 @@ def test_sigterm_flush_handler_journals_before_chaining(home, registry, backend,
+     assert marker is not None and [j["session_id"] for j in marker["killed_jobs"]] == ["proc_notify"]
+ 
+ 
+-@pytest.mark.parametrize("pending", ["refused", "held", "queue"])
++@pytest.mark.parametrize("pending", ["refused", "held", "queue", "registry_park", "notification_park"])
+ def test_finished_notice_survives_orderly_restart(home, registry, backend, monkeypatch, pending):
+     from tools.process_registry_notifications import format_process_notification
+     from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit
+@@ -303,7 +303,13 @@ def test_finished_notice_survives_orderly_restart(home, registry, backend, monke
+     job.append_output("CI passed: release verified\n")
+     registry._finish_exited(job, 0)
+     session = backend.sessions["sid"] = _session(home, _notif_held=[])
+-    if pending == "held":
++    if pending == "registry_park":
++        registry.park_unowned_event(registry.completion_queue.get_nowait())
++    elif pending == "notification_park":
++        from tui_gateway import notification_park
++        monkeypatch.setattr(notification_park, "_parked", [])
++        assert notification_park.park(registry.completion_queue.get_nowait())
++    elif pending == "held":
+         session["_notif_held"].append(registry.completion_queue.get_nowait())
+     elif pending == "refused":
+         event = registry.completion_queue.get_nowait()
+@@ -741,6 +747,64 @@ def test_held_events_taken_for_routing_stay_in_custody(home, registry, backend):
+         release(taken)
+ 
+ 
++@pytest.mark.parametrize("park", ["registry", "notification"])
++def test_claimed_parked_notice_keeps_exit_custody(home, registry, backend, monkeypatch, park):
++    from tools.process_registry_awaiting import pending_events, release
++    from tui_gateway import notification_park
++    _, event = _finished_event(registry, exit_code=6)
++    backend.sessions["sid"] = _session(home)
++    monkeypatch.setattr(notification_park, "_parked", [])
++    if park == "registry":
++        registry.park_unowned_event(event)
++        claimed = registry.take_parked_events(lambda evt: True)
++    else:
++        assert notification_park.park(event)
++        claimed = notification_park.claim(lambda evt: True)
++    try:
++        assert claimed == [event]
++        assert event in pending_events(registry.completion_queue)
++        server._shutdown_sessions()
++        marker = read_turn_marker(home, "session-key")
++        assert marker is not None
++        assert [(j["session_id"], j["exit_code"]) for j in marker["killed_jobs"]] == [("proc_done", 6)]
++    finally:
++        release(claimed)
++        if park == "notification":
++            notification_park.unhold(claimed)
++    assert not any(e is event for e in pending_events(registry.completion_queue))
++
++
++def test_registry_park_claim_rechecks_presence(registry):
++    from tools.process_registry_awaiting import release
++    event = {"session_id": "proc_claim", "owner_task_id": "owner"}
++    registry.park_unowned_event(event)
++    inner = []
++
++    def owns(evt):
++        inner.extend(registry.take_parked_events(lambda e: True))
++        return True
++
++    try:
++        assert registry.take_parked_events(owns) == []
++        assert inner == [event]
++    finally:
++        release(inner)
++
++
++def test_registry_park_routing_releases_custody_on_error(home, registry, backend, monkeypatch):
++    from tools.process_registry_awaiting import pending_events
++    _, event = _finished_event(registry)
++    session = backend.sessions["sid"] = _session(home)
++    registry.park_unowned_event(event)
++
++    def handle(events, deferred):
++        assert any(e is event for e in pending_events(registry.completion_queue))
++        raise RuntimeError("routing refused")
++
++    assert server._notif_take_parked("sid", session, registry, handle) == 0
++    assert not any(e is event for e in pending_events(registry.completion_queue))
++
++
+ def test_natural_exit_between_running_snapshot_and_kill_reports_real_result(home, registry, backend, monkeypatch):
+     job = _job("proc_race", owner="turn-1", command="gh run watch 9", notify=True)
+     registry._running[job.id] = job
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index 33a7e1b6a73..5b3354e0a8f 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -216,15 +216,21 @@ class ProcessReadoptMixin:
+             return bool(self._parked_events)
+ 
+     def take_parked_events(self, owns: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
+-        """Remove and return the parked events *owns* claims. ``owns`` runs outside the lock."""
++        """Remove and hold events *owns* claims. Predicate runs outside the lock.
++
++        Caller MUST release the returned in-flight hold after routing.
++        """
+         with self._lock:
+             parked = list(self._parked_events or ())
+         if not parked:
+             return []
+         taken = [evt for evt in parked if _safe_owns(owns, evt)]
+         if taken:
++            from tools.process_registry_awaiting import hold
+             with self._lock:
+                 ids = {id(evt) for evt in taken}
++                taken = [evt for evt in (self._parked_events or ()) if id(evt) in ids]
++                hold(taken)
+                 self._parked_events = [evt for evt in (self._parked_events or ()) if id(evt) not in ids]
+         return taken
+ 
+diff --git a/tui_gateway/exit_job_receipts.py b/tui_gateway/exit_job_receipts.py
+index 6b3870fe1a4..2331101d0c6 100644
+--- a/tui_gateway/exit_job_receipts.py
++++ b/tui_gateway/exit_job_receipts.py
+@@ -116,7 +116,13 @@ def _pending_completions(sid: str, session: dict) -> list[dict]:
+     # queue ↔ in flight ↔ held. The held list is read under its lock together with queue and in-flight, so a
+     # poller moving an event between them (take_ready, _notif_take_held, a requeue) is seen at least once.
+     events = unpublished_completions(process_registry)
+-    with server._notif_held_lock:
++    from tui_gateway import notification_park
++    # Read every off-queue custodian together with queue/in-flight custody. Separate
++    # snapshots can miss a queue-to-park move between reads. Park claims acquire an
++    # in-flight hold before removing their source copy. No callbacks under these locks.
++    with process_registry._lock, notification_park._lock, server._notif_held_lock:
++        events.extend(process_registry._parked_events or ())
++        events.extend(evt for _deadline, evt in notification_park._parked)
+         events.extend(pending_events(process_registry.completion_queue))
+         events.extend(session.get("_notif_held") or ())
+     # Stable after the fence: a notice turn's start marks its notices delivered under ``_sessions_lock``, and
+diff --git a/tui_gateway/notification_park.py b/tui_gateway/notification_park.py
+index 59130a3cd14..a0aaf6e7466 100644
+--- a/tui_gateway/notification_park.py
++++ b/tui_gateway/notification_park.py
+@@ -126,8 +126,10 @@ def has_parked() -> bool:
+ def claim(owns: Callable[[dict], bool]) -> list:
+     """Parked events ``owns`` accepts, in arrival order. ``owns`` may read the lineage store, so it runs on a
+     snapshot outside the lock; an event is handed out only if it is still parked, so exactly one poller takes it.
+-    Each claimed delegation's held-copy mark passes to the caller, who MUST pass the result to ``unhold`` once
+-    routing returns (a re-park in between takes its own mark)."""
++    Each claimed event acquires an in-flight hold; the caller MUST call
++    ``process_registry_awaiting.release`` after routing. Each claimed delegation's
++    original park held-copy mark also passes to the caller, who MUST call ``unhold``
++    after routing (a re-park in between takes its own mark)."""
+     if not _parked:
+         return []
+     with _lock:
+@@ -137,8 +139,10 @@ def claim(owns: Callable[[dict], bool]) -> list:
+     mine = {id(evt) for evt in snapshot if owns(evt)}
+     if not mine:
+         return []
++    from tools.process_registry_awaiting import hold
+     with _lock:
+         claimed = [evt for _deadline, evt in _parked if id(evt) in mine]
++        hold(claimed)
+         _parked[:] = [(deadline, evt) for deadline, evt in _parked if id(evt) not in mine]
+     return claimed
+ 
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index d561c58bed2..a24c713d445 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1612,7 +1612,11 @@ def _notif_take_parked(sid, session, registry, handle) -> int:
+     try:
+         events = take(lambda evt: _session_owns_notification_event(sid, session, evt))
+         if events:
+-            handle(events, None)
++            from tools.process_registry_awaiting import release
++            try:
++                handle(events, None)
++            finally:
++                release(events)
+         return len(events)
+     except Exception as exc:
+         _notif_log_failure("parked notification dispatch failed", exc)
+@@ -1868,6 +1872,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
+             _notif_log_failure("notification dispatch failed", exc)
+         finally:
+             release_in_flight(ready)
++            release_in_flight(parked)
+             notification_park.unhold(parked)
+     # Kanban claims still buffered go back to the board: the process may live on (close, evict). [daveey]
+     try:
+-- 
+2.55.0
+

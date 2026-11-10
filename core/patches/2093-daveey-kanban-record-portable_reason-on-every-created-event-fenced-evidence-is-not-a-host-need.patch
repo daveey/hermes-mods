@@ -1,0 +1,350 @@
+From d1de9c907940ad071f7d9bf8133505730d8cd801 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 07:02:58 +0000
+Subject: [PATCH] [daveey] kanban: record portable_reason on every created
+ event; fenced evidence is not a host need
+
+Self-heal kanban-12ee0e4b65: 13 of 172 hub cards in 3 days were enrolled worker-first and nothing recorded why
+the rest stayed on the hub (the investigation had to replay portable_reason). Every create (CLI and kanban_create)
+now writes {portable_reason: <why> | null} into its created event when a worker pool is configured. Producers can
+fence quoted incident evidence with <!-- placement:evidence --> ... <!-- /placement:evidence --> so a proposal that
+says what happened on the hub no longer pins a repo fix there; only complete pairs are removed and the title is
+never fenced.
+---
+ hermes_cli/kanban.py                          |   3 +-
+ hermes_cli/kanban_db.py                       |   4 +-
+ hermes_cli/kanban_db_creation.py              |   4 +-
+ hermes_cli/kanban_placement.py                |  17 ++-
+ hermes_cli/kanban_worker_placement.py         |  36 ++++-
+ .../test_kanban_portable_reason_audit.py      | 135 ++++++++++++++++++
+ tools/kanban_tools.py                         |   8 ++
+ 7 files changed, 197 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_portable_reason_audit.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index fd5e4757002..8647562aee1 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -505,7 +505,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_ask_resolved import AskFilingRefused, check_create_filing, create_context
+         assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+                     or _cli_default_assignee(args))
+-        from hermes_cli.kanban_worker_placement import cli_policy
++        from hermes_cli.kanban_worker_placement import cli_audit, cli_policy
+         try:
+             # [daveey] A blocked ask's resolved_check runs once first, as the sweep will run it for this assignee
+             # and workspace: already met or broken refuses the create. A key hit returns the card: no probe.
+@@ -538,6 +538,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True, runs_on=getattr(args, "runs_on", None),
+                 placement_policy=cli_policy(args, body, ws_kind, ws_path, board),
++                placement_audit=cli_audit(args, body, ws_kind, ws_path, board),
+                 insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+             )
+         except kanban_overlap.OverlapRefused as exc:  # landed under the write lock after the first check
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 99984ea0c14..4c71ad78240 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1228,7 +1228,7 @@ def create_task(
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
+     placement_policy: Optional[str] = None,
+-    insert_guard: Optional[Callable[[sqlite3.Connection], None]] = None,
++    insert_guard: Optional[Callable[[sqlite3.Connection], None]] = None, placement_audit: Optional[dict] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1396,7 +1396,7 @@ def create_task(
+                     workspace_path=workspace_path, branch_name=branch_name, project_id=project_id,
+                     skills=skills_list, goal_mode=goal_mode, model_override=model_override,
+                     provider_override=provider_override, created_by=created_by, requires=required,
+-                    human_request=human_request,
++                    human_request=human_request, placement_audit=placement_audit,
+                 )
+                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+                 initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin)
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index be5b7cf16f0..8de1c4902b4 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -5,7 +5,7 @@ import json
+ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+                    tenant, workspace_kind, workspace_path, branch_name, project_id,
+                    skills, goal_mode, model_override, provider_override, created_by, requires,
+-                   human_request=None):
++                   human_request=None, placement_audit=None):
+     from hermes_cli import kanban_db as kb
+ 
+     kb._append_event(conn, task_id, "created", {
+@@ -23,6 +23,8 @@ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+         "goal_mode": bool(goal_mode) or None,
+         "model_override": model_override,
+         "provider_override": provider_override,
++        # Why a worker pool can or cannot take it (kanban_worker_placement.creation_audit); absent with no pool.
++        **(placement_audit if isinstance(placement_audit, dict) else {}),
+     })
+     if status == "blocked":
+         # A creation-time human ask is a decision wait: validate_human_request
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 4e0459f9afb..20162dbb22e 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -386,6 +386,21 @@ def without_placement_note(body: str) -> str:
+     return _PLACEMENT_NOTE.sub("", body or "")
+ 
+ 
++# A producer fences quoted evidence (a proposal's "what happened on the hub", a log excerpt) with these markers so
++# the host-need scan reads only the work text. Only complete pairs are removed: an unterminated or stray marker
++# exempts nothing. The title is never fenced. Before this (kanban-12ee0e4b65) 233 of 259 self-heal proposals named
++# the hub, its kanban.db, ssh or cron while describing the incident, so every fix card built from one stayed on
++# the hub although the fix itself was a repo change landed by push. [daveey]
++EVIDENCE_OPEN = "<!-- placement:evidence -->"
++EVIDENCE_CLOSE = "<!-- /placement:evidence -->"
++_EVIDENCE = re.compile(re.escape(EVIDENCE_OPEN) + r".*?" + re.escape(EVIDENCE_CLOSE), re.DOTALL)
++
++
++def without_evidence(body: str) -> str:
++    """``body`` minus every complete fenced evidence block (:data:`EVIDENCE_OPEN` ... :data:`EVIDENCE_CLOSE`)."""
++    return _EVIDENCE.sub("", body or "")
++
++
+ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     """Why a card cannot leave its origin; None means structurally portable, not admitted.
+ 
+@@ -410,7 +425,7 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+         return "gateway-scoped requirement"
+     if any(str(r) not in c.carried_requires() for r in reqs):
+         return "uncarried requirement"
+-    title, body = args.get("title") or "", without_placement_note(args.get("body") or "")
++    title, body = args.get("title") or "", without_evidence(without_placement_note(args.get("body") or ""))
+     if _local_marker(title, body, args.get("skills"), c):
+         return "local marker"
+     full = f"{title}\n{body}"
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index a7c0f782975..24c68d49cee 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -61,6 +61,30 @@ def creation_decision(args, cfg, gateway, pin, origin_intent):
+     return {"where": "local", "placement_policy": POLICY, "why": WAITING}
+ 
+ 
++def creation_audit(args, cfg=None):
++    """``{"portable_reason": <why it cannot leave its origin> | None}`` for the card's ``created`` event, or None when
++    no worker pool is configured (nothing to audit). Records the structural check every create runs, so the share of
++    cards a pool never sees, and why, is a query instead of a replay (kanban-12ee0e4b65). Never raises. [daveey]"""
++    from hermes_cli import kanban_placement as placement
++
++    try:
++        cfg = placement.config() if cfg is None else cfg
++        if not isinstance(cfg, dict) or not cfg.get("worker_pools"):
++            return None
++        return {"portable_reason": placement.portable_reason(args, cfg)}
++    except Exception:  # health: allow BLE001 -- an audit field never blocks a create
++        logger.warning("portable_reason audit failed", exc_info=True)
++        return None
++
++
++def _cli_fields(args, body, workspace_kind, workspace_path, board):
++    fields = {**vars(args), "body": body, "workspace_kind": workspace_kind,
++              "workspace_path": workspace_path, "board": board}
++    if fields.get("initial_status") == "running":
++        fields.pop("initial_status")  # argparse's ordinary create default, not a requested hold
++    return fields
++
++
+ def cli_policy(args, body, workspace_kind, workspace_path, board):
+     """CLI creation uses the same enrollment boundary, without changing legacy routes."""
+     from hermes_cli import kanban_placement as placement
+@@ -69,14 +93,16 @@ def cli_policy(args, body, workspace_kind, workspace_path, board):
+     if not cfg.get("worker_pools"):
+         return None
+     gateway = placement.reg.self_gateway()
+-    fields = {**vars(args), "body": body, "workspace_kind": workspace_kind,
+-              "workspace_path": workspace_path, "board": board}
+-    if fields.get("initial_status") == "running":
+-        fields.pop("initial_status")  # argparse's ordinary create default, not a requested hold
+-    result = creation_decision(fields, cfg, gateway, "auto", None)
++    result = creation_decision(_cli_fields(args, body, workspace_kind, workspace_path, board), cfg, gateway,
++                               "auto", None)
+     return (result or {}).get("placement_policy")
+ 
+ 
++def cli_audit(args, body, workspace_kind, workspace_path, board):
++    """:func:`creation_audit` over the same fields :func:`cli_policy` judged."""
++    return creation_audit(_cli_fields(args, body, workspace_kind, workspace_path, board))
++
++
+ def validate_creation(policy, *, runs_on, workspace_kind, workspace_path, project, origin_intent, board):
+     """Reject contradictory enrollment rather than quietly erasing a caller pin."""
+     if policy is None:
+diff --git a/tests/hermes_cli/test_kanban_portable_reason_audit.py b/tests/hermes_cli/test_kanban_portable_reason_audit.py
+new file mode 100644
+index 00000000000..e5b7e69bb7e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_portable_reason_audit.py
+@@ -0,0 +1,135 @@
++"""Worker-first enrollment audit (self-heal kanban-12ee0e4b65).
++
++Only 13 of 172 hub cards in three days were enrolled worker-first, and nothing recorded why the rest stayed on the
++hub. Two guards: a producer can fence quoted evidence (a proposal's "what happened on the hub") off the host-need
++scan, and every card's ``created`` event carries the ``portable_reason`` the enrollment check returned.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_placement as placement
++
++EVIDENCE = ("Since 11-02 the hub's 7-slot cap fills: `sqlite3 ~/.hermes/kanban.db` shows the cron job and the "
++            "ssh relay on the hub, and hermes-sync logs the same.")
++
++
++# The producer-facing contract is the literal marker text (plugins write it), so the test pins the strings.
++OPEN, CLOSE = "<!-- placement:evidence -->", "<!-- /placement:evidence -->"
++
++
++def fenced(text: str) -> str:
++    return f"{OPEN}\n{text}\n{CLOSE}"
++
++
++def test_marker_constants_match_the_contract():
++    assert (getattr(placement, "EVIDENCE_OPEN", None), getattr(placement, "EVIDENCE_CLOSE", None)) == (OPEN, CLOSE)
++
++
++def test_fenced_evidence_is_not_a_host_need():
++    work = "Fix plugins/coach/self_heal.py in a hermes-mods worktree, add a regression test, push."
++    args = {"title": "self-heal fix: cap", "requires": ["terminal", "file", "git"],
++            "body": f"{work}\n\n{fenced(EVIDENCE)}\n"}
++    assert placement.portable_reason(args, {}) is None
++    result = placement.decide(args, cfg={"worker_pools": {"hub": ["worker-1"]}}, self_gw="hub")
++    assert result["placement_policy"] == "worker-first-v1"
++
++
++def test_unfenced_evidence_still_keeps_the_card_home():
++    args = {"title": "self-heal fix: cap", "requires": ["terminal", "file", "git"], "body": EVIDENCE}
++    assert placement.portable_reason(args, {}) == "home gateway marker"
++
++
++@pytest.mark.parametrize("body", [
++    # a host need in the work text outside the fence still counts
++    "Then run `systemctl restart hermes` yourself.\n" + fenced("quoted"),
++    # an unterminated fence exempts nothing (a producer bug must not open every card)
++    f"{OPEN}\n{EVIDENCE}\n",
++    # a closing marker alone exempts nothing
++    f"{EVIDENCE}\n{CLOSE}",
++])
++def test_fence_never_hides_work_text(body):
++    assert placement.portable_reason({"title": "fix", "body": body}, {}) is not None
++
++
++def test_fenced_mac_words_are_evidence_too():
++    args = {"title": "fix", "body": fenced("The Desktop chat on the MacBook showed it (launchctl list).")}
++    assert placement.portable_reason(args, {}) is None
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    (home / "config.yaml").write_text("kanban:\n  placement:\n    worker_pools:\n      hub: [worker-1]\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def created_payload(task_id):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    with kbc.connect() as conn:
++        return next(e.payload for e in kb.list_events(conn, task_id) if e.kind == "created")
++
++
++@pytest.mark.parametrize("extra, reason", [
++    ("--requires terminal --requires host_repo", "uncarried requirement"),
++    ("--requires terminal --body 'read kanban.db'", "home gateway marker"),
++    ("--requires terminal", None),
++])
++def test_cli_created_event_records_portable_reason(kanban_home, extra, reason):
++    import re
++
++    from hermes_cli import kanban as kc
++
++    out = kc.run_slash(f"create 'audit card' --assignee default {extra}")
++    tid = re.search(r"(t_[0-9a-f]+)", out).group(1)
++    payload = created_payload(tid)
++    assert "portable_reason" in payload, payload
++    assert payload["portable_reason"] == reason
++
++
++@pytest.mark.parametrize("requires, reason", [(["terminal", "host_repo"], "uncarried requirement"),
++                                              (["terminal"], None)])
++def test_tool_created_event_records_portable_reason(kanban_home, monkeypatch, requires, reason):
++    from tools import kanban_tools as kt
++
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    result = json.loads(kt._handle_create({"title": "tool audit card", "assignee": "default",
++                                           "requires": requires}))
++    assert result.get("ok"), result
++    payload = created_payload(result["task_id"])
++    assert "portable_reason" in payload, payload
++    assert payload["portable_reason"] == reason
++
++
++def test_created_event_omits_audit_when_no_pool_is_configured(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    kb.init_db()
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="plain")
++    assert "portable_reason" not in created_payload(tid)
++
++
++def test_create_task_records_a_passed_reason(kanban_home):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="tool card", placement_audit={"portable_reason": "local marker"})
++    assert created_payload(tid)["portable_reason"] == "local marker"
++    assert json.dumps(created_payload(tid))  # stays JSON
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 0777e320e36..23483423dd0 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1554,6 +1554,13 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         return None, None
+ 
+ 
++def _creation_audit(args: dict) -> Optional[dict]:
++    """Worker-pool enrollment audit for the ``created`` event (kanban_worker_placement.creation_audit). [daveey]"""
++    from hermes_cli.kanban_worker_placement import creation_audit
++
++    return creation_audit(args)
++
++
+ @_kanban_handler("kanban_create")
+ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+@@ -1672,6 +1679,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+                 requires=args.get("requires"), runs_on=runs_on, max_retries=max_retries,
+                 placement_policy=(marker_placement or {}).get("placement_policy"),
++                placement_audit=_creation_audit(args),
+                 require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+                 model_override=model_override, provider_override=provider_override,
+                 goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+-- 
+2.55.0
+

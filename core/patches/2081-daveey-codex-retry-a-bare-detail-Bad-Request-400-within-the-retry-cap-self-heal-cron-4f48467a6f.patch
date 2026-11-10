@@ -1,0 +1,240 @@
+From aaf655ac4b479f2ebfdb202dc5c7488ff36dd2f7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 18:41:28 +0000
+Subject: [PATCH] [daveey] codex: retry a bare {"detail": "Bad Request"} 400
+ within the retry cap (self-heal cron-4f48467a6f)
+
+The ChatGPT Codex backend once answered a healthy cron turn's second request with a
+reason-less HTTP 400 {"detail":"Bad Request"}; the classifier called it format_error,
+so the unattended turn ended with no retry (the next fire succeeded on the same calls).
+
+- error_classifier: openai-codex + status 400 + body exactly {"detail": "Bad Request"}
+  (or, with no parsed body, the SDK's exact wrapped message) -> retryable server_error
+  carrying error_context["codex_bare_400"]. Other providers / descriptive details /
+  error objects keep format_error.
+- turn_recovery_autorecover: the marker keeps it off the post-exhaustion auto-recovery
+  ladder, so an always-bare-400 request costs exactly the normal retry cap (3), not
+  5 more 15-60 s cycles of full retry rounds.
+- turn_api_error: one "codex bare-400 retry" warning per bare 400 (attempt n/max) so
+  the error detector can count retries against final failures.
+
+Tests (tests/agent/test_codex_bare_bad_request_400.py): classifier table (retryable + narrow scope) and two loop tests (400 once then
+200 completes in 2 requests; always-400 stops at the retry cap with no ladder cycle).
+---
+ agent/error_classifier.py                     |  22 ++++
+ agent/turn_api_error.py                       |  10 +-
+ agent/turn_recovery_autorecover.py            |   5 +-
+ .../agent/test_codex_bare_bad_request_400.py  | 103 ++++++++++++++++++
+ 4 files changed, 138 insertions(+), 2 deletions(-)
+ create mode 100644 tests/agent/test_codex_bare_bad_request_400.py
+
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index 37608c63e72..7fb46e0b668 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -567,6 +567,8 @@ _V_CONTEXT_OVERFLOW = _v(_R.context_overflow, should_compress=True)
+ _V_PAYLOAD_TOO_LARGE = _v(_R.payload_too_large, should_compress=True)
+ _V_OVERLOADED, _V_SERVER_ERROR, _V_TIMEOUT, _V_UNKNOWN = map(_v, (_R.overloaded, _R.server_error, _R.timeout, _R.unknown))
+ _V_IMAGE_TOO_LARGE, _V_IMAGE_CORRUPT = _v(_R.image_too_large), _v(_R.image_corrupt)
++# ``error_context[CODEX_BARE_400_MARKER]`` = retry within the cap, but never the auto-recovery ladder.
++CODEX_BARE_400_MARKER = "codex_bare_400"
+ _V_MULTIMODAL, _V_INVALID_ENCRYPTED = _v(_R.multimodal_tool_content_unsupported), _v(_R.invalid_encrypted_content)
+ _V_REASONING_MANDATORY = _v(_R.reasoning_mandatory, should_compress=False, should_fallback=False)
+ # Same recovery hints as format_error: consumers without a merge-and-retry step (the main loop
+@@ -1417,6 +1419,12 @@ def _classify_400(c: _Ctx) -> Verdict:
+     # prompt_cache_retention ~20% of the time): transient, retry identical request.
+     if _is_server_injected_param_rejection(msg, c.provider_slug):
+         return _V_SERVER_ERROR
++    # Codex's reason-less ``{"detail": "Bad Request"}``: seen once on a healthy request whose identical
++    # retry succeeded (cron-4f48467a6f). Exact envelope, provider-gated. Retried within the normal
++    # retry cap only: the marker keeps it out of the post-exhaustion auto-recovery ladder, because a
++    # bare 400 that survives every retry is the request, not an outage.
++    if _is_codex_bare_bad_request(c):
++        return _v(_R.server_error, error_context={CODEX_BARE_400_MARKER: True})  # fresh dict per call
+     if any(p in msg for p in _MALFORMED_TOOL_ARGS_PATTERNS):
+         return _V_MALFORMED_TOOL_ARGS
+     if any(p in msg for p in _ROLE_ALTERNATION_PATTERNS):
+@@ -1567,6 +1575,20 @@ def _is_codex_masked_replay_rejection(c: _Ctx) -> bool:
+     )
+ 
+ 
++_CODEX_BARE_BAD_REQUEST_DETAIL = "bad request"
++_CODEX_BARE_BAD_REQUEST_MSG = "error code: 400 - {'detail': 'bad request'}"
++
++
++def _is_codex_bare_bad_request(c: _Ctx) -> bool:
++    """HTTP 400 from ``openai-codex`` whose whole body is ``{"detail": "Bad Request"}`` (or, with no
++    parsed body, the SDK's exact wrapped message for it). Any other key or wording keeps format_error."""
++    if c.provider_slug != "openai-codex" or c.status_code != 400:
++        return False
++    if isinstance(c.body, dict) and c.body:
++        return set(c.body) == {"detail"} and str(c.body.get("detail") or "").strip().lower() == _CODEX_BARE_BAD_REQUEST_DETAIL
++    return c.msg.strip() == _CODEX_BARE_BAD_REQUEST_MSG
++
++
+ def _error_obj(body: Any) -> dict:
+     """``body["error"]`` when it is a dict, else ``{}``."""
+     err = body.get("error") if isinstance(body, dict) else None
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index 4a5768e64a8..b2e2e04213c 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -16,7 +16,7 @@ import time
+ from typing import Any, Dict, Optional
+ 
+ from agent.api_error_summary import is_provider_stream_parse_error
+-from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
++from agent.error_classifier import CODEX_BARE_400_MARKER, RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+ from agent.turn_offline_wait import wait_out_offline
+ from agent.route_verdicts import route_visit
+ from agent.turn_overflow import recover_from_overflow
+@@ -134,6 +134,14 @@ def handle_api_error(
+         base_url=str(getattr(agent, "base_url", "") or ""),
+         api_key=getattr(agent, "api_key", None),
+     )
++    if (classified.error_context or {}).get(CODEX_BARE_400_MARKER):
++        # Detection: one line per bare 400 lets the error detector count retries against the
++        # final "API call failed after N retries" failures (cron-4f48467a6f).
++        logger.warning(
++            "codex bare-400 retry: openai-codex answered HTTP 400 {\"detail\": \"Bad Request\"} with no reason "
++            "(attempt %s/%s) model=%s msgs=%s tokens=~%s",
++            retry_count + 1, max_retries, getattr(agent, "model", ""), len(api_messages or []), approx_tokens,
++        )
+     logger.debug(
+         "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
+         classified.reason.value, classified.status_code,
+diff --git a/agent/turn_recovery_autorecover.py b/agent/turn_recovery_autorecover.py
+index 440f136f31c..132cd5ad2a6 100644
+--- a/agent/turn_recovery_autorecover.py
++++ b/agent/turn_recovery_autorecover.py
+@@ -16,7 +16,7 @@ from __future__ import annotations
+ import logging
+ from typing import Any, Dict, Optional
+ 
+-from agent.error_classifier import TRANSIENT_REASONS
++from agent.error_classifier import CODEX_BARE_400_MARKER, TRANSIENT_REASONS
+ 
+ logger = logging.getLogger("agent.conversation_loop")
+ 
+@@ -57,6 +57,9 @@ def ladder_eligible(agent: Any, classified: Any) -> bool:
+     the user yet (delivered text is never replayed by this path)."""
+     if auto_recovery_cycles(agent) <= 0 or classified.reason not in TRANSIENT_REASONS:
+         return False
++    # Codex's bare 400 earns its normal retries only; surviving them means the request is bad.
++    if (getattr(classified, "error_context", None) or {}).get(CODEX_BARE_400_MARKER):
++        return False
+     streamed = getattr(agent, "_current_streamed_assistant_text", "") or ""
+     return not agent._has_content_after_think_block(streamed)
+ 
+diff --git a/tests/agent/test_codex_bare_bad_request_400.py b/tests/agent/test_codex_bare_bad_request_400.py
+new file mode 100644
+index 00000000000..29322681156
+--- /dev/null
++++ b/tests/agent/test_codex_bare_bad_request_400.py
+@@ -0,0 +1,103 @@
++"""Codex's reason-less ``HTTP 400 {"detail": "Bad Request"}`` (self-heal cron-4f48467a6f).
++
++The ChatGPT Codex backend once answered a healthy cron turn's request this way and the identical next
++request succeeded. It must retry within the normal retry cap (never the post-exhaustion auto-recovery
++ladder), stay provider- and envelope-narrow, and log one ``codex bare-400 retry`` line per attempt.
++"""
++
++import pytest
++
++from agent.error_classifier import FailoverReason, classify_api_error
++from tests.agent.test_error_classifier import MockAPIError
++from tests.agent.test_run_agent_codex_responses import (  # _no_codex_backoff: autouse fixture
++    _build_agent,
++    _codex_message_response,
++    _no_codex_backoff,
++)
++
++
++@pytest.mark.parametrize("body", [
++    {"detail": "Bad Request"},
++    {"detail": " bad request "},
++    None,  # SDK path with only the wrapped message text
++], ids=["dict-body", "normalised-detail", "message-only"])
++def test_codex_bare_bad_request_detail_is_retryable(body):
++    """cron-4f48467a6f: the ChatGPT Codex backend answered a healthy request with a reason-less
++    ``{"detail": "Bad Request"}`` 400 once; the identical next request succeeds. Retry it."""
++    e = MockAPIError("Error code: 400 - {'detail': 'Bad Request'}", status_code=400, body=body)
++    result = classify_api_error(e, provider="openai-codex", model="gpt-6-astra", approx_tokens=28000)
++    assert result.reason == FailoverReason.server_error
++    assert result.retryable is True
++    assert result.error_context.get("codex_bare_400") is True  # keeps it off the auto-recovery ladder
++
++@pytest.mark.parametrize(("provider", "body"), [
++    ("openai", {"detail": "Bad Request"}),  # same envelope, other provider: genuine shape 400
++    ("custom", {"detail": "Bad Request"}),
++    ("openai-codex", {"detail": "Bad Request: input[3].content must be a string"}),  # descriptive detail
++    ("openai-codex", {"error": {"message": "Bad Request", "code": "invalid_value", "param": "input"}}),
++], ids=["openai", "custom", "codex-descriptive", "codex-error-object"])
++def test_codex_bare_bad_request_retry_stays_narrow(provider, body):
++    e = MockAPIError(f"Error code: 400 - {body}", status_code=400, body=body)
++    result = classify_api_error(e, provider=provider, model="gpt-6-astra", approx_tokens=28000)
++    assert result.reason == FailoverReason.format_error
++    assert result.retryable is False
++
++
++def _codex_bare_bad_request():
++    """The reason-less ``HTTP 400 {"detail": "Bad Request"}`` the ChatGPT Codex backend returned (cron-4f48467a6f)."""
++    import httpx
++    import openai
++
++    request = httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")
++    response = httpx.Response(400, request=request, json={"detail": "Bad Request"})
++    return openai.BadRequestError("Error code: 400 - {'detail': 'Bad Request'}", response=response,
++                                  body={"detail": "Bad Request"})
++
++
++def test_run_conversation_codex_bare_bad_request_400_retries_once_then_completes(monkeypatch, caplog):
++    """cron-4f48467a6f: one bare codex 400 used to end an unattended turn; the identical retry succeeds."""
++    agent = _build_agent(monkeypatch)
++    agent.provider = "openai-codex"
++    agent._disable_streaming = True
++    calls = {"count": 0}
++
++    def _flaky_api_call(api_kwargs):
++        calls["count"] += 1
++        if calls["count"] == 1:
++            raise _codex_bare_bad_request()
++        return _codex_message_response("Recovered")
++
++    monkeypatch.setattr(agent, "_interruptible_api_call", _flaky_api_call)
++
++    with caplog.at_level("WARNING"):
++        result = agent.run_conversation("Say hello")
++
++    assert result["completed"] is True
++    assert result["final_response"] == "Recovered"
++    assert calls["count"] == 2
++    assert sum("codex bare-400 retry" in r.getMessage() for r in caplog.records) == 1
++
++
++def test_run_conversation_codex_bare_bad_request_400_stops_at_retry_cap(monkeypatch, caplog):
++    """A codex endpoint that keeps answering the bare 400 is bounded by the normal retry cap."""
++    agent = _build_agent(monkeypatch)
++    agent.provider = "openai-codex"
++    agent._disable_streaming = True
++    calls = {"count": 0}
++
++    def _always_400(api_kwargs):
++        calls["count"] += 1
++        raise _codex_bare_bad_request()
++
++    monkeypatch.setattr(agent, "_interruptible_api_call", _always_400)
++
++    with caplog.at_level("WARNING"):
++        result = agent.run_conversation("Say hello")
++
++    assert result["completed"] is not True
++    # Exactly the normal retry cap: the post-exhaustion auto-recovery ladder (5 more 15-60 s cycles
++    # of full retry rounds) must not engage for a bare 400 that survives every retry.
++    assert agent._api_max_retries >= 2
++    assert calls["count"] == agent._api_max_retries
++    assert not any("auto-recovery cycle" in r.getMessage() for r in caplog.records)
++    assert sum("codex bare-400 retry" in r.getMessage() for r in caplog.records) == calls["count"]
+-- 
+2.55.0
+

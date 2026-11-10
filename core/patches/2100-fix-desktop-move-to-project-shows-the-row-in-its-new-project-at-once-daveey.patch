@@ -1,0 +1,612 @@
+From 05e04c066a5350f85282e509e0ccc7c58b00eb8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:08:24 +0000
+Subject: [PATCH] fix(desktop): move-to-project shows the row in its new
+ project at once [daveey]
+
+Problem: moving a session into another project (row menu, drag, Cmd-Shift-P)
+took several seconds to show the row in the destination.
+
+Why 1: the sidebar files a row by $projectOwnerBySessionId, derived from the
+  cached $projectTree, and the backend owner wins over the row's cwd
+  (workspace-groups.ts liveSessionProjectId / overlayLiveLanes).
+Why 2: moveSessionToProject changed that tree only via refreshProjectTree(),
+  run AFTER the session.workspace.move RPC returned (plus projects.list /
+  mkdir / projects.create round trips for a cross-gateway move).
+Why 3: that refetch is GET /api/profiles/projects/tree, which takes 2-5 s on
+  the hub (loop-watch: "slow request GET /api/profiles/projects/tree
+  ?preview_limit=2000 2.1-5.0s", _read_serial_profile_db).
+Root (happened): the move had no optimistic layer for ownership; only $sessions
+  cwd was patched, and the authoritative-owner rule ignores cwd.
+Root (not caught): move tests asserted the RPC sequence and scope, never what
+  the sidebar shows while the RPC is pending.
+
+Fix: store/projects-move-optimistic.ts reassigns the row in $projectTree (ids,
+previews, lanes, counts) and patches its cwd before any RPC. Each tree payload
+re-applies a pending move until the backend agrees (or 30 s), so a refresh
+that read the backend before the move landed can't snap it back. A failed move
+undoes both and refetches. The follow-suppression helpers moved there too to
+keep projects.ts under its line ratchet.
+
+Tests: projects-move-optimistic.test.ts (row in destination while the RPC is
+pending, survives a stale refresh, rollback on failure, pure reassignment);
+fails with the optimistic call removed. Cross-gateway sequence asserts now
+ignore the rollback's projects.tree read.
+---
+ .../store/projects-cross-gateway-move.test.ts |   4 +-
+ .../store/projects-move-optimistic.test.ts    | 172 +++++++++++++++
+ .../src/store/projects-move-optimistic.ts     | 208 ++++++++++++++++++
+ apps/desktop/src/store/projects.ts            |  95 +++-----
+ 4 files changed, 418 insertions(+), 61 deletions(-)
+ create mode 100644 apps/desktop/src/store/projects-move-optimistic.test.ts
+ create mode 100644 apps/desktop/src/store/projects-move-optimistic.ts
+
+diff --git a/apps/desktop/src/store/projects-cross-gateway-move.test.ts b/apps/desktop/src/store/projects-cross-gateway-move.test.ts
+index f7ce5cb242b..cf452e26e82 100644
+--- a/apps/desktop/src/store/projects-cross-gateway-move.test.ts
++++ b/apps/desktop/src/store/projects-cross-gateway-move.test.ts
+@@ -326,7 +326,7 @@ describe('moveSessionToProject into a lane whose folder this gateway lacks', ()
+     )
+ 
+     await expect(moveSessionToProject('local-s', 'p_docker', 'default')).rejects.toThrow(/Permission denied/)
+-    expect(localCalls.map(([m]) => m)).toEqual(['session.workspace.move', 'projects.list', 'shell.exec'])
++    expect(localCalls.map(([m]) => m).filter(m => m !== 'projects.tree')).toEqual(['session.workspace.move', 'projects.list', 'shell.exec'])
+     expect(localCalls.some(([m]) => m === 'projects.create')).toBe(false)
+   })
+ 
+@@ -343,7 +343,7 @@ describe('moveSessionToProject into a lane whose folder this gateway lacks', ()
+     )
+ 
+     await expect(moveSessionToProject('local-s', 'p_docker', 'default')).rejects.toThrow(/session busy/)
+-    expect(localCalls.map(([m]) => m)).toEqual(['session.workspace.move'])
++    expect(localCalls.map(([m]) => m).filter(m => m !== 'projects.tree')).toEqual(['session.workspace.move'])
+   })
+ })
+ 
+diff --git a/apps/desktop/src/store/projects-move-optimistic.test.ts b/apps/desktop/src/store/projects-move-optimistic.test.ts
+new file mode 100644
+index 00000000000..2a5eb022914
+--- /dev/null
++++ b/apps/desktop/src/store/projects-move-optimistic.test.ts
+@@ -0,0 +1,172 @@
++import { atom } from 'nanostores'
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
++import { activeGateway } from '@/store/gateway'
++import { $activeGatewayProfile, setShowAllProfiles } from '@/store/profile'
++import { $sessions, setSessions } from '@/store/session'
++import type { SessionInfo } from '@/types/hermes'
++
++import { $projectOwnerBySessionId, $projectTree, moveSessionToProject, refreshProjectTree } from './projects'
++import { reassignTreeSession } from './projects-move-optimistic'
++
++vi.mock('@/i18n', () => ({ translateNow: (key: string) => key }))
++vi.mock('@/store/notifications', () => ({ notify: vi.fn() }))
++vi.mock('@/lib/desktop-fs', () => ({
++  desktopDefaultCwd: vi.fn(),
++  isDesktopFsRemoteMode: vi.fn(),
++  selectDesktopPaths: vi.fn(),
++  writeDesktopFileText: vi.fn()
++}))
++vi.mock('@/store/gateway', () => ({
++  $gateway: atom(null),
++  activeGateway: vi.fn(),
++  activeGatewayConnectionId: vi.fn(() => null),
++  isActivePrimary: vi.fn(() => true),
++  ensureActiveGatewayOpen: vi.fn()
++}))
++vi.mock('@/lib/desktop-git', async importOriginal => ({
++  ...((await importOriginal()) as Record<string, unknown>),
++  desktopGit: vi.fn()
++}))
++vi.mock('@/hermes', () => ({
++  getHermesConfig: vi.fn(),
++  getProfiles: vi.fn(),
++  hermesApi: vi.fn(),
++  setApiRequestProfile: vi.fn(),
++  STARTUP_REQUEST_TIMEOUT_MS: 1000
++}))
++
++const row = (id: string, cwd: string): SessionInfo => ({ cwd, id, title: id }) as unknown as SessionInfo
++
++function treeWith(owner: 'p_dest' | 'p_src'): SidebarProjectTree[] {
++  const s1 = row('s1', owner === 'p_src' ? '/repos/src' : '/repos/dest')
++
++  return [
++    {
++      id: 'p_src',
++      label: 'Src',
++      path: '/repos/src',
++      previewSessions: owner === 'p_src' ? [s1] : [],
++      repos: [],
++      sessionCount: owner === 'p_src' ? 1 : 0,
++      sessionIds: owner === 'p_src' ? ['s1'] : []
++    },
++    {
++      id: 'p_dest',
++      label: 'Dest',
++      path: '/repos/dest',
++      previewSessions: owner === 'p_dest' ? [s1] : [],
++      repos: [],
++      sessionCount: owner === 'p_dest' ? 1 : 0,
++      sessionIds: owner === 'p_dest' ? ['s1'] : []
++    }
++  ]
++}
++
++describe('moveSessionToProject shows the row in the destination at once', () => {
++  let releaseMove: () => void
++  let movedOnBackend: boolean
++  let failMove: boolean
++
++  beforeEach(() => {
++    vi.clearAllMocks()
++    setShowAllProfiles(false)
++    $activeGatewayProfile.set('default')
++    movedOnBackend = false
++    failMove = false
++    $projectTree.set(treeWith('p_src'))
++    setSessions(() => [row('s1', '/repos/src')])
++
++    const request = vi.fn(async (method: string) => {
++      if (method === 'projects.tree') {
++        return { active_id: null, projects: treeWith(movedOnBackend ? 'p_dest' : 'p_src'), scoped_session_ids: ['s1'] }
++      }
++
++      if (method === 'session.workspace.move') {
++        await new Promise<void>(resolve => (releaseMove = resolve))
++
++        if (failMove) {
++          throw new Error('boom')
++        }
++
++        movedOnBackend = true
++
++        return { branch: null, cwd: '/repos/dest', git_repo_root: null }
++      }
++
++      return { active_id: null, projects: [] }
++    })
++
++    vi.mocked(activeGateway).mockReturnValue({ connectionState: 'open', request } as never)
++  })
++
++  it('files the row under the destination before the move RPC returns', async () => {
++    const done = moveSessionToProject('s1', 'p_dest')
++
++    expect($projectOwnerBySessionId.get().get('s1')).toBe('p_dest')
++    expect($projectTree.get().find(n => n.id === 'p_dest')?.previewSessions?.map(s => s.id)).toEqual(['s1'])
++    expect($projectTree.get().find(n => n.id === 'p_src')?.previewSessions).toEqual([])
++    expect($sessions.get()[0].cwd).toBe('/repos/dest')
++
++    // A tree refresh that read the backend BEFORE the move landed must not snap it back.
++    await refreshProjectTree()
++    expect($projectOwnerBySessionId.get().get('s1')).toBe('p_dest')
++
++    releaseMove()
++    await done
++    await refreshProjectTree()
++    expect($projectOwnerBySessionId.get().get('s1')).toBe('p_dest')
++  })
++
++  it('puts the row back when the move fails', async () => {
++    failMove = true
++    const done = moveSessionToProject('s1', 'p_dest')
++
++    expect($projectOwnerBySessionId.get().get('s1')).toBe('p_dest')
++    releaseMove()
++    await expect(done).rejects.toThrow('boom')
++    await refreshProjectTree()
++
++    expect($projectOwnerBySessionId.get().get('s1')).toBe('p_src')
++    expect($sessions.get()[0].cwd).toBe('/repos/src')
++  })
++})
++
++describe('reassignTreeSession', () => {
++  const matches = (s: SessionInfo, id: string) => s.id === id
++
++  it('leaves a tree that already agrees untouched (control)', () => {
++    const tree = treeWith('p_dest')
++
++    expect(reassignTreeSession(tree, 's1', 'p_dest', null, matches)).toBe(tree)
++  })
++
++  it('moves ids, previews and lane rows and adjusts counts', () => {
++    const tree = treeWith('p_src')
++    tree[0].repos = [
++      {
++        groups: [{ id: 'g', label: 'main', path: '/repos/src', sessions: [row('s1', '/repos/src')] }],
++        id: 'r',
++        label: 'src',
++        path: '/repos/src',
++        sessionCount: 1
++      }
++    ]
++
++    const next = reassignTreeSession(tree, 's1', 'p_dest', row('s1', '/repos/dest'), matches)
++
++    expect(next[0].sessionIds).toEqual([])
++    expect(next[0].sessionCount).toBe(0)
++    expect(next[0].repos[0].groups[0].sessions).toEqual([])
++    expect(next[1].sessionIds).toEqual(['s1'])
++    expect(next[1].sessionCount).toBe(1)
++    expect(next[1].previewSessions?.[0].cwd).toBe('/repos/dest')
++  })
++
++  it('ignores an unknown destination', () => {
++    const tree = treeWith('p_src')
++
++    expect(reassignTreeSession(tree, 's1', 'p_nope', null, matches)).toBe(tree)
++  })
++})
+diff --git a/apps/desktop/src/store/projects-move-optimistic.ts b/apps/desktop/src/store/projects-move-optimistic.ts
+new file mode 100644
+index 00000000000..a8ee35f150f
+--- /dev/null
++++ b/apps/desktop/src/store/projects-move-optimistic.ts
+@@ -0,0 +1,208 @@
++// [daveey] Instant "Move to project": the sidebar files a row by the project
++// tree's owner map (`$projectOwnerBySessionId`, built from `$projectTree`), and
++// that map used to change only after the move RPC AND a full tree refetch
++// (2-5 s on a busy all-profiles gateway). The move now reassigns the row in
++// the cached tree first; every tree payload that lands while the move is
++// pending re-applies it, so an older in-flight refresh can't snap the row back.
++
++import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
++import { $sessions, sessionMatchesStoredId, setSessions } from '@/store/session'
++import type { SessionInfo } from '@/types/hermes'
++
++import { $projectTree } from './project-tree'
++
++type Matcher = (session: SessionInfo, storedSessionId: string) => boolean
++
++interface PendingMove {
++  at: number
++  projectId: string
++  row: SessionInfo | null
++}
++
++// Long enough for a slow move RPC plus its refetch; afterwards the backend is the
++// only source again even if it disagreed (the move failed server-side).
++const PENDING_MOVE_TTL_MS = 30_000
++const pendingMoves = new Map<string, PendingMove>()
++
++const sessionIdsOf = (row: SessionInfo | null, sessionId: string): Set<string> =>
++  new Set([sessionId, ...(row ? [row.id, row._lineage_root_id ?? '', ...(row._lineage_ids ?? [])] : [])].filter(Boolean))
++
++/**
++ * `tree` with session `sessionId` owned by `targetId` only: dropped from every
++ * other node's ids, previews and lanes, and added to the target's ids and
++ * preview (as `row`, when given). Returns `tree` itself when it already agrees
++ * or the target is not in it.
++ */
++export function reassignTreeSession(
++  tree: SidebarProjectTree[],
++  sessionId: string,
++  targetId: string,
++  row: SessionInfo | null,
++  matches: Matcher
++): SidebarProjectTree[] {
++  if (!tree.some(node => node.id === targetId)) {
++    return tree
++  }
++
++  const ids = sessionIdsOf(row, sessionId)
++  const isMoved = (s: SessionInfo) => ids.has(s.id) || matches(s, sessionId)
++  let changed = false
++
++  const next = tree.map(node => {
++    if (node.id === targetId) {
++      const owned = node.sessionIds?.includes(sessionId) || node.previewSessions?.some(isMoved)
++
++      if (owned && !row) {
++        return node
++      }
++
++      changed = true
++      const previews = (node.previewSessions ?? []).filter(s => !isMoved(s))
++
++      return {
++        ...node,
++        previewSessions: row ? [row, ...previews] : previews,
++        sessionCount: owned ? node.sessionCount : node.sessionCount + 1,
++        sessionIds: [sessionId, ...(node.sessionIds ?? []).filter(id => !ids.has(id))]
++      }
++    }
++
++    const heldIds = node.sessionIds?.some(id => ids.has(id))
++    const heldRows = node.previewSessions?.some(isMoved)
++
++    const heldLanes = node.repos.some(repo => repo.groups.some(group => group.sessions.some(isMoved)))
++
++    if (!heldIds && !heldRows && !heldLanes) {
++      return node
++    }
++
++    changed = true
++
++    const repos = node.repos.map(repo => {
++      const groups = repo.groups.map(group => ({ ...group, sessions: group.sessions.filter(s => !isMoved(s)) }))
++
++      return { ...repo, groups, sessionCount: groups.reduce((n, group) => n + group.sessions.length, 0) }
++    })
++
++    return {
++      ...node,
++      previewSessions: node.previewSessions?.filter(s => !isMoved(s)),
++      repos,
++      sessionCount: Math.max(0, node.sessionCount - 1),
++      sessionIds: node.sessionIds?.filter(id => !ids.has(id))
++    }
++  })
++
++  return changed ? next : tree
++}
++
++/** Start a move: remember it and return the tree with the row already in `projectId`. */
++export function beginPendingMove(
++  tree: SidebarProjectTree[],
++  sessionId: string,
++  projectId: string,
++  row: SessionInfo | null,
++  matches: Matcher
++): SidebarProjectTree[] {
++  pendingMoves.set(sessionId, { at: Date.now(), projectId, row })
++
++  return reassignTreeSession(tree, sessionId, projectId, row, matches)
++}
++
++/** A move that failed: forget it so the next tree payload restores the backend's placement. */
++export function cancelPendingMove(sessionId: string): void {
++  pendingMoves.delete(sessionId)
++}
++
++/** The backend tree already files the session under the target, and nowhere else. */
++function backendAgrees(tree: SidebarProjectTree[], sessionId: string, projectId: string): boolean {
++  return tree.every(node =>
++    node.id === projectId ? Boolean(node.sessionIds?.includes(sessionId)) : !node.sessionIds?.includes(sessionId)
++  )
++}
++
++/**
++ * Re-apply moves still pending to a freshly built tree. A move ends once a
++ * payload agrees with it (the backend has the row there now) or after the TTL.
++ */
++export function applyPendingMoves(tree: SidebarProjectTree[], matches: Matcher): SidebarProjectTree[] {
++  const now = Date.now()
++  let out = tree
++
++  for (const [sessionId, move] of pendingMoves) {
++    if (now - move.at > PENDING_MOVE_TTL_MS || backendAgrees(tree, sessionId, move.projectId)) {
++      pendingMoves.delete(sessionId)
++
++      continue
++    }
++
++    out = reassignTreeSession(out, sessionId, move.projectId, move.row, matches)
++  }
++
++  return out
++}
++
++/** Every session row the cached tree carries (previews and lanes). */
++export function treeSessionRows(): SessionInfo[] {
++  return $projectTree
++    .get()
++    .flatMap(project => [
++      ...(project.previewSessions ?? []),
++      ...(project.repos ?? []).flatMap(repo => repo.groups.flatMap(group => group.sessions))
++    ])
++}
++
++/**
++ * Paint a move before any RPC: the row's owner in the cached tree, and its cwd
++ * in `$sessions` (so the destination's lanes place it). Returns the undo for a
++ * failed move; the caller then refetches the tree to restore the backend's view.
++ */
++export function showMovedAtOnce(sessionId: string, projectId: string, cwd: string): () => void {
++  const before = $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))
++  const row = before ?? treeSessionRows().find(s => sessionMatchesStoredId(s, sessionId)) ?? null
++  const moved = row && cwd ? { ...row, cwd, git_branch: null, git_repo_root: null } : row
++  $projectTree.set(beginPendingMove($projectTree.get(), sessionId, projectId, moved, sessionMatchesStoredId))
++
++  const setCwd = (value: null | string | undefined) =>
++    setSessions(prev => prev.map(s => (sessionMatchesStoredId(s, sessionId) ? { ...s, cwd: value } : s)))
++
++  if (before && moved?.cwd) {
++    setCwd(moved.cwd)
++  }
++
++  return () => {
++    cancelPendingMove(sessionId)
++
++    if (before) {
++      setCwd(before.cwd)
++    }
++  }
++}
++
++// "Move to project" relocates the session's cwd, and the backend echoes that
++// as a session.info cwd change on the selected chat — which would otherwise
++// look like an agent-driven move and yank the sidebar into the destination.
++// A move is filing, not navigation: remember the destination briefly so the
++// follow for that cwd is skipped (local fix: sidebar-move-no-follow).
++const MOVE_FOLLOW_SUPPRESS_MS = 15_000
++const moveFollowSuppressed = new Map<string, number>()
++
++export function suppressMoveFollow(cwd: string): void {
++  const target = cwd.trim()
++
++  if (target) {
++    moveFollowSuppressed.set(target, Date.now() + MOVE_FOLLOW_SUPPRESS_MS)
++  }
++}
++
++export function consumeMoveFollowSuppression(cwd: string): boolean {
++  const until = moveFollowSuppressed.get(cwd)
++
++  if (until === undefined) {
++    return false
++  }
++
++  moveFollowSuppressed.delete(cwd)
++
++  return until >= Date.now()
++}
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index c623c8eaf59..5109cd93b24 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -71,6 +71,13 @@ import { $hiddenGatewayIds } from './gateway-visibility'
+ import { hubGatewayForConnection, hubGatewayProjects, hubRequest, learnHubGatewayName } from './hub-sync'
+ import { type OfflineReplicaRecord, offlineSessionsFromReplica } from './offline-sessions'
+ import { fetchRemoteProjectTree, type ProjectTreePayload } from './project-tree-background'
++import {
++  applyPendingMoves,
++  consumeMoveFollowSuppression,
++  showMovedAtOnce,
++  suppressMoveFollow,
++  treeSessionRows
++} from './projects-move-optimistic'
+ import {
+   DUPLICATE_FOLDER_RE,
+   homeRelativePath,
+@@ -663,19 +670,18 @@ function applyProjectTreePayload(res: ProjectTreePayload, owner: ProjectRowOwner
+   lastLocalTree = { res, owner }
+   const remotes = visibleRemoteTrees(owner)
+   const scoped = new Set([...(res.scoped_session_ids ?? []), ...remoteScopedSessionIds(remotes)])
++
+   // The tree refreshes on every sessions.changed and window focus, and most of
+   // those answers are unchanged. Keep unchanged nodes by reference so the
+   // entered project doesn't refetch and rebuild on a no-op (#77591).
+-  $projectTree.set(
+-    replaceEqualDeep(
+-      $projectTree.get(),
+-      mergeGatewayProjectTrees(
+-        (res.projects ?? []).map(project => tagProjectSessionConnection(project, owner)),
+-        remotes,
+-        projectTreePreviewLimit()
+-      )
+-    )
++  // A move still in flight keeps its row in the destination (store/projects-move-optimistic).
++  const merged = mergeGatewayProjectTrees(
++    (res.projects ?? []).map(project => tagProjectSessionConnection(project, owner)),
++    remotes,
++    projectTreePreviewLimit()
+   )
++
++  $projectTree.set(replaceEqualDeep($projectTree.get(), applyPendingMoves(merged, sessionMatchesStoredId)))
+   $activeProjectId.set(res.active_id ?? null)
+   // [daveey] The next cold start paints this tree before the backend is up.
+   saveBootTree(owner.connectionId, res.active_id ?? null)
+@@ -969,34 +975,6 @@ interface WorkspaceMovePayload {
+   git_repo_root?: null | string
+ }
+ 
+-// "Move to project" relocates the session's cwd, and the backend echoes that
+-// as a session.info cwd change on the selected chat — which would otherwise
+-// look like an agent-driven move and yank the sidebar into the destination.
+-// A move is filing, not navigation: remember the destination briefly so the
+-// follow for that cwd is skipped (local fix: sidebar-move-no-follow).
+-const MOVE_FOLLOW_SUPPRESS_MS = 15_000
+-const moveFollowSuppressed = new Map<string, number>()
+-
+-function suppressMoveFollow(cwd: string): void {
+-  const target = cwd.trim()
+-
+-  if (target) {
+-    moveFollowSuppressed.set(target, Date.now() + MOVE_FOLLOW_SUPPRESS_MS)
+-  }
+-}
+-
+-function consumeMoveFollowSuppression(cwd: string): boolean {
+-  const until = moveFollowSuppressed.get(cwd)
+-
+-  if (until === undefined) {
+-    return false
+-  }
+-
+-  moveFollowSuppressed.delete(cwd)
+-
+-  return until >= Date.now()
+-}
+-
+ // ── Cross-gateway move [daveey] ─────────────────────────────────────────────
+ // The sidebar shows every gateway's sessions and projects, but a move has to
+ // run on the gateway that OWNS the session (asking the active one answers
+@@ -1011,14 +989,6 @@ interface MoveTarget {
+   remote: boolean
+ }
+ 
+-function treeSessionRows(): SessionInfo[] {
+-  return $projectTree
+-    .get()
+-    .flatMap(project => [
+-      ...(project.previewSessions ?? []),
+-      ...(project.repos ?? []).flatMap(repo => repo.groups.flatMap(group => group.sessions))
+-    ])
+-}
+ 
+ function moveTargetGateway(sessionId: string, profile?: null | string, connectionId?: null | string): MoveTarget {
+   const row =
+@@ -1199,6 +1169,7 @@ export async function moveSessionToProject(
+ ): Promise<void> {
+   const node = $projectTree.get().find(n => n.id === projectId)
+   const target = moveTargetGateway(sessionId, profile, connectionId)
++  const undo = showMovedAtOnce(sessionId, projectId, node ? projectRootCwd(node) : '')
+ 
+   // [daveey] The session's OWN gateway does the move, and the destination is
+   // that gateway's copy of the project — created there (folder cloned if
+@@ -1208,27 +1179,33 @@ export async function moveSessionToProject(
+   // lacks, so a refused folder falls through to the create-it-here path.
+   const fast = !target.remote && node && !isRemoteProjectId(node.id) ? projectRootCwd(node) : ''
+ 
+-  if (fast) {
+-    try {
+-      await moveSessionToCwd(target, sessionId, fast)
+-
+-      return
+-    } catch (error) {
+-      if (!MISSING_WORKDIR_RE.test(String((error as Error)?.message ?? error))) {
+-        throw error
++  try {
++    if (fast) {
++      try {
++        return await moveSessionToCwd(target, sessionId, fast)
++      } catch (error) {
++        if (!MISSING_WORKDIR_RE.test(String((error as Error)?.message ?? error))) {
++          throw error
++        }
+       }
+     }
+-  }
+ 
+-  const cwd = await ensureProjectRootOn(target, node, fast)
++    const cwd = await ensureProjectRootOn(target, node, fast)
+ 
+-  if (!cwd) {
+-    throw new Error(translateNow('sidebar.projects.moveNoFolder'))
+-  }
++    if (!cwd) {
++      throw new Error(translateNow('sidebar.projects.moveNoFolder'))
++    }
+ 
+-  await moveSessionToCwd(target, sessionId, cwd)
++    await moveSessionToCwd(target, sessionId, cwd)
++  } catch (error) {
++    undo()
++    void refreshProjectTree()
++
++    throw error
++  }
+ }
+ 
++
+ // [daveey] ⌘⇧P "+ Create project": a new project named `name` with an empty
+ // `~/code/<slug>` folder, on the session's own gateway, then the move into it.
+ // A same-named project already on that gateway is reused instead.
+-- 
+2.55.0
+

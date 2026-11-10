@@ -1,0 +1,431 @@
+From 5ca6b953c9567876a5ae055bac437f4396bdfe0a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 02:39:04 +0000
+Subject: [PATCH] [daveey] kanban: every card read says where a ready card
+ waits (queue + unplaceable), self-heal kanban-7d720d4ab8
+
+Problem: 2026-11-02 rollout card t_01a19400313cfbda sat ready 37 min (hub at 7/7 with priority>=1 cards ahead).
+The chat read kanban_show, saw queue_reason null, called it "still queued despite no remaining dependencies" and
+ran the card's work in a background subagent outside the dispatcher. Separately t_01a1a521638d0a78
+(runs_on ["hermes-hub"], a label no machine carries) has sat ready since 2026-11-04 with nothing on the card.
+Why 1: the dispatcher fills slots by priority then age under max_in_progress (kanban_db_dispatch_queries).
+Why 2: kanban_show returned only queue_reason (worker-pool answers); a hub-slot wait reads null.
+Why 3: b1f608189c0 put kanban_queue_position on the REST read only; e705d05c715 added a prose queue_hint to the
+  tool after 30 min; `hermes kanban show` had neither.
+Why 4: position() never looked at runs_on, so an unplaceable card read as a local slot wait, and the dispatcher's
+  labels_mismatch skip lived only in the tick result.
+Root (happened): the queue answer was per-surface, not one shared read every card surface emits.
+Root (not caught): tests covered REST only; nothing checked surfaces agree.
+
+- kanban_queue_position.placement(): on a synced board with a known registry, runs_on this machine does not
+  satisfy reads {lane: machine, machines} or, when no machine does, {lane: unplaceable, missing, machines}.
+  Unknown/unreachable registry never reads unplaceable.
+- describe(): one line ("waiting for a local slot: ~N ahead, R/L running. queued, not stuck ... do not run its
+  work outside the dispatcher ... raise its priority").
+- kanban_show tool and `hermes kanban show` (--json and text) carry `queue` + `queue_note` for every ready card.
+- Dispatcher eligible_rows writes one skipped_unplaceable event per unchanged condition.
+- tests/tools/test_kanban_show_queue.py: tool, CLI JSON/text, unplaceable/machine/local/unknown-registry, a
+  REST==tool==CLI parity test, and the once-only event. RED 9/10 on d5566cffa9d, GREEN 10/10.
+---
+ hermes_cli/kanban.py                      |   5 +
+ hermes_cli/kanban_db_dispatch_preclaim.py |  24 +++
+ hermes_cli/kanban_queue_position.py       |  98 ++++++++++++
+ tests/tools/test_kanban_show_queue.py     | 187 ++++++++++++++++++++++
+ tools/kanban_show.py                      |   5 +
+ 5 files changed, 319 insertions(+)
+ create mode 100644 tests/tools/test_kanban_show_queue.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 731129b51ce..fd5e4757002 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -766,6 +766,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         wake_check = kwc.get_state(conn, args.task_id)
+         from hermes_cli import kanban_queue_reason as kqr
+         queue_reason = kqr.latest(conn, args.task_id)
++        # Same ``queue`` as kanban_show and the REST read (kanban-7d720d4ab8): a ready card says where it waits. [daveey]
++        from hermes_cli import kanban_queue_position as kqp
++        queue = kqp.read(conn, task, getattr(args, "board", None))
+         if not want_json:
+             graph = kb.task_graph_context(conn, task.id)
+ 
+@@ -777,6 +780,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+             "wake_check": wake_check,
+             "queue_reason": queue_reason,
++            **kqp.fields(queue),
+         })
+         return 0
+ 
+@@ -787,6 +791,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+     field("status", task.status)
+     field("assignee", task.assignee or "-")
+     kqr.print_field(queue_reason, field)
++    kqp.print_field(queue, queue_reason, field)
+     if task.tenant:
+         field("tenant", task.tenant)
+     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
+diff --git a/hermes_cli/kanban_db_dispatch_preclaim.py b/hermes_cli/kanban_db_dispatch_preclaim.py
+index de14eed7aad..9d11d1ff229 100644
+--- a/hermes_cli/kanban_db_dispatch_preclaim.py
++++ b/hermes_cli/kanban_db_dispatch_preclaim.py
+@@ -40,4 +40,28 @@ def eligible_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row], status: str
+                 from hermes_cli.kanban_repin_owner import wait_reason
+                 reason = wait_reason(conn, row["id"])
+             result.skipped_ineligible.append((row["id"], reason))
++            if reason == "labels_mismatch" and getattr(result, "scheduling_admitted", False):
++                note_unplaceable(conn, row["id"])
+     return kept
++
++
++def note_unplaceable(conn: sqlite3.Connection, task_id: str) -> None:
++    """One ``skipped_unplaceable`` event when no known machine satisfies the card's ``runs_on``: the skip was in
++    the tick result only, so t_01a1a521638d0a78 (runs_on ["hermes-hub"]) sat ready for days with nothing on the
++    card saying why. Written again only when the missing labels change or something else happened since. [daveey]"""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_queue_position as kqp
++    try:
++        place = kqp.placement(conn, task_id)
++    except Exception:  # health: allow BLE001 -- the event is advisory; the skip itself already happened
++        kb._log.debug("kanban dispatch: unplaceable check failed for %s", task_id, exc_info=True)
++        return
++    if not place or place.get("lane") != "unplaceable":
++        return
++    payload = {"runs_on": place["runs_on"], "missing": place["missing"], "machines": place["machines"]}
++    with kb.write_txn(conn):
++        last = conn.execute(
++            "SELECT kind, payload FROM task_events WHERE task_id = ? "
++            "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
++        if last is None or last["kind"] != "skipped_unplaceable" or last["payload"] != kb._json_or_null(payload):
++            kb._append_event(conn, task_id, "skipped_unplaceable", payload)
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 826a456701a..f5c96a42d4c 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -47,6 +47,51 @@ def _running_and_limit(conn: sqlite3.Connection, board: Optional[str]) -> tuple[
+     return running, limit
+ 
+ 
++def _runs_on(conn: sqlite3.Connection, task_id: str) -> Optional[list[str]]:
++    try:
++        row = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    except sqlite3.OperationalError:  # an unsynced schema has no runs_on column: no placement labels
++        return None
++    from hermes_cli.kanban_worker_node import _parse
++    return _parse(row[0]) if row is not None else None
++
++
++def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
++    """For a card whose ``runs_on`` this machine does not satisfy, on a synced board with a readable machine
++    registry: ``{"lane": "unplaceable", runs_on, missing, machines}`` when no known machine satisfies it (``missing``
++    = labels no machine carries; empty when each exists but none carries them all), else ``{"lane": "machine",
++    runs_on, machines}`` naming the machines that can lease it. None otherwise (no labels, sync off, registry
++    unknown, or this machine fits): an unknown registry never reads as unplaceable. [daveey] t_01a1a521638d0a78
++    (runs_on ["hermes-hub"], no machine carries it) sat ready for days reading as a local slot wait."""
++    labels = _runs_on(conn, task_id)
++    if not labels:
++        return None
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as kwn
++    db = sync._db_key(conn)
++    if not sync.sync_enabled() or not db or not sync.board_selected(db):
++        return None
++    try:
++        reg = kwn.registry()
++    except Exception:  # health: allow BLE001 -- an unreadable registry is unknown, never "unplaceable"
++        _log.debug("kanban queue position: machine registry unavailable", exc_info=True)
++        return None
++    machines = (reg or {}).get("machines") or {}
++    me = (reg or {}).get("me")
++    if not machines or me not in machines:
++        return None
++    carried = {name: kwn.effective_labels(entry, name) for name, entry in machines.items()}
++    wanted = set(labels)
++    if wanted <= carried[me]:
++        return None
++    fits = sorted(name for name, have in carried.items() if wanted <= have)
++    if fits:
++        return {"lane": "machine", "runs_on": labels, "machines": fits}
++    every = set().union(*carried.values())
++    return {"lane": "unplaceable", "runs_on": labels, "missing": [lb for lb in labels if lb not in every],
++            "machines": sorted(machines)}
++
++
+ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+     """The queue a ``ready`` ``task`` in this gateway's live file waits in; None for any other status."""
+     if task is None or task.status != "ready":
+@@ -59,5 +104,58 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+         except (sqlite3.Error, IndexError):  # an unsynced schema has no lease columns: no stored reason
+             value = None
+         return {"lane": "worker_pool", "reason": (value or {}).get("code")}
++    placed = placement(conn, task.id)
++    if placed is not None:
++        return placed
+     running, limit = _running_and_limit(conn, board)
+     return {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True}
++
++
++_NOT_STUCK = ("queued, not stuck: the dispatcher starts it; do not run its work outside the dispatcher "
++              "(two workers on one card). To start it sooner, raise its priority (`hermes kanban edit <id> "
++              "--priority 10`)")
++
++
++def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
++    """One line for card reads (``kanban_show`` ``queue_note``, ``hermes kanban show``) saying what the card waits
++    for, so "ready, no run" never reads as stuck. [daveey] kanban-7d720d4ab8: a chat saw only a null
++    ``queue_reason`` for a card waiting on a full hub, called it stuck and ran its work in a subagent."""
++    if not place:
++        return None
++    lane = place.get("lane")
++    if lane == "unplaceable":
++        missing = place.get("missing") or []
++        what = (f"label(s) {', '.join(missing)} carried by no machine" if missing
++                else "no machine carries all of " + ", ".join(place.get("runs_on") or []))
++        return (f"unplaceable: no machine can run it ({what}; known: {', '.join(place.get('machines') or [])}). "
++                "Re-place it (`hermes kanban move <id> --runs-on <label> --reason ...`); waiting will not start it")
++    if lane == "machine":
++        return (f"waiting for {', '.join(place.get('machines') or [])} (runs_on "
++                f"{', '.join(place.get('runs_on') or [])}); this machine cannot lease it. " + _NOT_STUCK)
++    if lane == "worker_pool":
++        return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'}). " + _NOT_STUCK
++    ahead = place.get("ahead")
++    words = f"waiting for a local slot: ~{ahead} ahead" if ahead is not None else "waiting for a local slot"
++    if place.get("running") is not None and place.get("limit") is not None:
++        words += f", {place['running']}/{place['limit']} running"
++    return words + ". " + _NOT_STUCK
++
++
++def read(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
++    """:func:`position` for card reads (``kanban_show``, ``hermes kanban show``): advisory, never fails the read."""
++    try:
++        return position(conn, task, board)
++    except Exception:  # health: allow BLE001 -- an advisory queue place must never fail the read
++        _log.debug("kanban queue position: unavailable for %s", getattr(task, "id", None), exc_info=True)
++        return None
++
++
++def fields(place: Optional[dict[str, Any]]) -> dict[str, Any]:
++    """``{"queue", "queue_note"}`` for a card-read payload; empty when the card waits in no queue."""
++    return {"queue": place, "queue_note": describe(place)} if place else {}
++
++
++def print_field(place: Optional[dict[str, Any]], queue_reason: Any, field) -> None:
++    """The text ``queue:`` line, unless the worker-pool ``queue_reason`` line already took it."""
++    if place and not queue_reason:
++        field("queue", describe(place))
+diff --git a/tests/tools/test_kanban_show_queue.py b/tests/tools/test_kanban_show_queue.py
+new file mode 100644
+index 00000000000..4e31788ed93
+--- /dev/null
++++ b/tests/tools/test_kanban_show_queue.py
+@@ -0,0 +1,187 @@
++"""Every card read a chat uses says where a ``ready`` card waits, so a queued card never reads as stuck. [daveey]
++
++Defect kanban-7d720d4ab8 (2026-11-02): rollout card t_01a19400313cfbda sat ready 37 min while the hub was at its
++7-worker cap with higher-priority cards ahead. The chat read ``kanban_show`` (only ``queue_reason``, null for a card
++waiting on a hub slot), called it "still queued despite having no remaining dependencies", and ran the card's work
++in a background subagent outside the dispatcher. b1f608189c0 had added the queue position to the dashboard REST read
++only. Separately t_01a1a521638d0a78 (runs_on ["hermes-hub"], a label no machine carries) sat ready for days with
++nothing on the card saying why.
++
++Pinned here: the ``kanban_show`` tool and ``hermes kanban show`` (JSON and text) carry the same ``queue`` as REST for
++every ready card (no 30-minute wait), a runs_on no known machine satisfies reads ``unplaceable`` with the missing
++labels, and the dispatcher records that once as a ``skipped_unplaceable`` event.
++"""
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_worker_node as kwn
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(var, raising=False)
++    kb.init_db()
++    from hermes_cli import kanban_db_dispatch as kbd
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
++    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 7)
++    yield h
++    kwn.set_registry_fetch(None)
++
++
++def _card(title, *, priority=0, created_at=None, runs_on=None):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title=title, assignee="default", priority=priority)
++        if created_at is not None:
++            conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (created_at, tid))
++        if runs_on is not None:
++            if "runs_on" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++                conn.execute("ALTER TABLE tasks ADD COLUMN runs_on TEXT")  # a synced board's column
++            conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", (json.dumps(runs_on), tid))
++        conn.commit()
++    return tid
++
++
++def _registry(monkeypatch, machines, me="hub"):
++    """A synced board whose Board registry lists ``machines`` ({name: labels})."""
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": True})
++    kwn.set_registry_fetch(lambda: {"me": me, "machines": [{"name": n, "labels": lb} for n, lb in machines.items()]})
++
++
++def _tool(tid):
++    from tools import kanban_show
++    return json.loads(kanban_show.show({"task_id": tid}))
++
++
++def _cli(capsys, *argv):
++    from hermes_cli import kanban as kcli
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    capsys.readouterr()
++    rc = kcli.kanban_command(parser.parse_args(["kanban", *argv]))
++    return rc, capsys.readouterr().out
++
++
++def _rest(tid):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_kanban_show_queue_test", plugin_file)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    app = FastAPI()
++    app.include_router(mod.router, prefix="/api/plugins/kanban")
++    return TestClient(app).get(f"/api/plugins/kanban/tasks/{tid}").json()
++
++
++LOCAL_BEHIND_ONE = {"lane": "local", "ahead": 1, "running": 7, "limit": 7, "approximate": True}
++
++
++def test_tool_shows_queue_for_a_fresh_ready_card_at_the_cap(home):
++    _card("p5 ahead", priority=5, created_at=200)
++    tid = _card("p0 mine", priority=0, created_at=100)
++    out = _tool(tid)
++    assert out.get("queue") == LOCAL_BEHIND_ONE
++    note = out.get("queue_note") or ""
++    assert "1 ahead" in note and "7/7" in note
++    assert "not stuck" in note and "outside the dispatcher" in note
++
++
++def test_cli_json_and_text_show_the_queue(home, capsys):
++    _card("p5 ahead", priority=5, created_at=200)
++    tid = _card("p0 mine", priority=0, created_at=100)
++    rc, out = _cli(capsys, "show", tid, "--json")
++    assert rc == 0 and json.loads(out).get("queue") == LOCAL_BEHIND_ONE
++    rc, out = _cli(capsys, "show", tid)
++    assert rc == 0
++    line = next((ln for ln in out.splitlines() if ln.strip().startswith("queue:")), "")
++    assert "1 ahead" in line and "7/7" in line and "not stuck" in line
++
++
++def test_non_ready_card_has_no_queue(home, capsys):
++    tid = _card("done")
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        conn.commit()
++    assert "queue" not in _tool(tid)
++    rc, out = _cli(capsys, "show", tid, "--json")
++    assert rc == 0 and "queue" not in json.loads(out)
++
++
++def test_runs_on_no_machine_carries_reads_unplaceable(home, monkeypatch, capsys):
++    tid = _card("PR831 land", runs_on=["hermes-hub"])
++    _registry(monkeypatch, {"hub": ["linux"], "worker-1": ["linux"]})
++    want = {"lane": "unplaceable", "runs_on": ["hermes-hub"], "missing": ["hermes-hub"],
++            "machines": ["hub", "worker-1"]}
++    out = _tool(tid)
++    assert out.get("queue") == want
++    assert "no machine" in (out.get("queue_note") or "") and "hermes-hub" in out["queue_note"]
++    rc, text = _cli(capsys, "show", tid)
++    assert rc == 0 and "unplaceable" in text and "hermes-hub" in text
++
++
++def test_runs_on_another_known_machine_reads_that_machine(home, monkeypatch):
++    tid = _card("for worker-1", runs_on=["machine:worker-1"])
++    _registry(monkeypatch, {"hub": ["linux"], "worker-1": ["linux"]})
++    assert _tool(tid).get("queue") == {"lane": "machine", "runs_on": ["machine:worker-1"], "machines": ["worker-1"]}
++
++
++def test_runs_on_this_machine_satisfies_stays_local(home, monkeypatch):
++    tid = _card("for hub", runs_on=["linux"])
++    _registry(monkeypatch, {"hub": ["linux"]})
++    assert _tool(tid).get("queue", {}).get("lane") == "local"
++
++
++def test_unknown_registry_never_claims_unplaceable(home, monkeypatch):
++    tid = _card("PR831 land", runs_on=["hermes-hub"])
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": True})
++
++    def boom():
++        raise OSError("board unreachable")
++    kwn.set_registry_fetch(boom)
++    assert _tool(tid).get("queue", {}).get("lane") == "local"
++
++
++@pytest.mark.parametrize("unplaceable", [False, True])
++def test_rest_tool_and_cli_agree_on_queue(home, monkeypatch, capsys, unplaceable):
++    _card("p5 ahead", priority=5, created_at=200)
++    tid = _card("p0 mine", priority=0, created_at=100, runs_on=["hermes-hub"] if unplaceable else None)
++    if unplaceable:
++        _registry(monkeypatch, {"hub": ["linux"]})
++    rest = _rest(tid).get("queue")
++    tool = _tool(tid).get("queue")
++    rc, out = _cli(capsys, "show", tid, "--json")
++    assert rc == 0 and rest is not None and rest == tool == json.loads(out).get("queue")
++
++
++def test_dispatcher_records_unplaceable_once(home, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli.kanban_db_dispatch_preclaim import eligible_rows
++    from hermes_cli.kanban_db_dispatch_queries import lane_rows
++    tid = _card("PR831 land", runs_on=["hermes-hub"])
++    _registry(monkeypatch, {"hub": ["linux"]})
++    monkeypatch.setattr(kwn, "dispatch_refusals", lambda conn, status: {tid: "labels_mismatch"})
++    with kbc.connect_closing() as conn:
++        for _ in range(3):
++            res = kbd.DispatchResult()
++            res.scheduling_admitted = True
++            assert eligible_rows(conn, lane_rows(conn, "ready"), "ready", res) == []
++            assert res.skipped_ineligible == [(tid, "labels_mismatch")]
++        events = [e for e in kb.list_events(conn, tid) if e.kind == "skipped_unplaceable"]
++    assert len(events) == 1
++    assert events[0].payload["missing"] == ["hermes-hub"]
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index f22a4d3fd1b..cac11fe0958 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -26,10 +26,15 @@ def show(args: dict) -> str:
+             queue_hint = ready_hint(conn, task)
+         except Exception:  # health: allow BLE001 -- an advisory hint must never fail the read
+             queue_hint = None
++        # Every ready card says where it waits, same dict as the REST read (kanban-7d720d4ab8): a null queue_reason
++        # for a card waiting on a full hub read as stuck, and a chat ran its work outside the dispatcher. [daveey]
++        from hermes_cli import kanban_queue_position as kqp
++        queue = kqp.read(conn, task, args.get("board"))
+         return json.dumps({
+             "task": kt._fields(task, kt._TASK_FIELDS),
+             **capsule,
+             "queue_reason": kqr.latest(conn, tid),
++            **kqp.fields(queue),
+             **({"queue_hint": queue_hint} if queue_hint else {}),
+             "parents": kb.parent_ids(conn, tid),
+             "unsatisfied_parents": [
+-- 
+2.55.0
+

@@ -1,0 +1,619 @@
+From 7f29054ff9801714fd1051bd8294c59a2bd12c4a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 10:41:58 +0000
+Subject: [PATCH] [daveey] fix(kanban): a chat's go on a human_request card
+ ranks it, sizes the queue, and the chat hears if it stays unclaimed
+
+Defect agent-70dc07d1a5 (2026-11-02): David said "go" in a live chat, which unblocked t_01a19e4974912dcf and
+promised "a worker will pick it up". The card kept its p0 rank and sat ready for 113 min behind 47 older p0 cards.
+kanban_unblock returned only {"status": "ready"}, and nothing told the chat that the card had no worker.
+
+- kanban_unblock (chat/orchestrator path): when the card carried a human_request, its stored priority rises to
+  at least 10 (never lowered) and a priority_raised event is logged with reason human_go. Worker requeue grants
+  are unchanged.
+- The unblock result carries queue (kanban_queue_position.position), plus queue_hint "bump priority, re-place,
+  or do it in this chat; don't promise a pickup" when ahead >= the host's slots, or when the card is unplaceable.
+- kanban_chat_wait.sweep (every dispatcher tick): a chat-owned card ready and unclaimed for 30 min to 6 h gets ONE
+  chat_wait_unclaimed event per ready episode. The gateway (wakes) and the TUI notifiers deliver it, and it reuses
+  kanban_parent_unclaimed.post_notice, which now takes a kind.
+
+Root (happened): live-chat approvals got no rank, and the unblock result hid the queue.
+Root (not caught): no notice reached a chat waiting directly on an unclaimed card. e705d05c715 covered only
+dependency waits.
+---
+ gateway/kanban_watchers_notifier.py      |  11 +-
+ hermes_cli/kanban_chat_wait.py           | 128 ++++++++++
+ hermes_cli/kanban_parent_unclaimed.py    |  24 +-
+ tests/tools/test_kanban_unblock_queue.py | 291 +++++++++++++++++++++++
+ tools/kanban_tools_self_heal.py          |  21 +-
+ tui_gateway/session_notifications.py     |   9 +-
+ 6 files changed, 469 insertions(+), 15 deletions(-)
+ create mode 100644 hermes_cli/kanban_chat_wait.py
+ create mode 100644 tests/tools/test_kanban_unblock_queue.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index ff9e5fcb2ea..8b8a1db6d25 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -49,10 +49,11 @@ def _pin_first():
+ # card; hermes_cli.kanban_repin_notice) is passive too: it tells the creator the repin command, never runs it.
+ # ``dependency_parent_unclaimed`` (hermes_cli.kanban_parent_unclaimed) wakes the waiting chat: it must act on the
+ # parent that cannot start (bump, re-place, do it here), not answer "ready but not started" when asked. [daveey]
+-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed")
++# ``chat_wait_unclaimed`` (hermes_cli.kanban_chat_wait) does the same for a card the chat waits on directly.
++TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed", "chat_wait_unclaimed")
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed")
++_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed", "chat_wait_unclaimed")
+ 
+ 
+ def diagnostic_event(ev) -> bool:
+@@ -497,6 +498,11 @@ def _fmt_parent_unclaimed(ev, n) -> tuple:
+     return f"⏳ {n.head}: {notice_text(ev.payload)}", None, None
+ 
+ 
++def _fmt_chat_wait(ev, n) -> tuple:
++    from hermes_cli.kanban_chat_wait import notice_text
++    return f"⏳ {n.head}: {notice_text(ev.payload)}", None, None
++
++
+ def _fmt_timed_out(ev, n) -> tuple:
+     limit = int(_payload(ev, "limit_seconds") or 0)
+     minutes = max(1, round(limit / 60)) if limit else 0
+@@ -524,6 +530,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "quota_episode_notice": _fmt_quota_episode,
+     "worker_repin_notice": _fmt_repin_notice,
+     "dependency_parent_unclaimed": _fmt_parent_unclaimed,
++    "chat_wait_unclaimed": _fmt_chat_wait,
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+new file mode 100644
+index 00000000000..7917de1a787
+--- /dev/null
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -0,0 +1,128 @@
++"""A card a chat waits on directly: ranked on David's go, sized in the unblock result, watched once queued. [daveey]
++
++Defect agent-70dc07d1a5 (2026-11-02): David said "go" in a live chat; it unblocked the ``human_request`` card
++t_01a19e4974912dcf and promised "a worker will pick it up". The card stayed p0 and sat ready for 113 min behind 47
++older p0 cards (the hub cap is 7). ``kanban_unblock`` returned only ``{"status": "ready"}``, so the chat could not
++size the wait, and nothing told it that the card had no worker until David asked "what are we waiting for".
++
++- :func:`raise_for_human_go`: a chat's unblock of a card that carried a ``human_request`` raises its stored
++  priority to at least :data:`HUMAN_GO_PRIORITY` (never lowers it) and logs ``priority_raised`` (``human_go``).
++- :func:`unblock_fields`: ``queue`` (``kanban_queue_position.position``) for the unblock result, plus
++  ``queue_hint`` when at least as many cards are ahead as the host has slots.
++- :func:`sweep` (each non-dry dispatcher tick): ONE ``chat_wait_unclaimed`` event per ready episode for a
++  chat-owned card (a notify subscription or ``session_id``) ready and unclaimed for at least
++  ``THRESHOLD_SECONDS``. The gateway and TUI notifiers deliver it to that chat, which wakes. Delivery reuses
++  ``kanban_parent_unclaimed.post_notice``.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any, Optional
++
++from hermes_cli import kanban_parent_unclaimed as pu
++
++_log = logging.getLogger(__name__)
++
++NOTICE_KIND = "chat_wait_unclaimed"
++RAISE_KIND = "priority_raised"
++HUMAN_GO_PRIORITY = 10
++THRESHOLD_SECONDS = pu.THRESHOLD_SECONDS
++# A ready episode older than this when first seen is backlog, not a wait the chat just promised; kanban_show's
++# queue_hint covers it. This also bounds the burst on the first tick after deploy.
++MAX_EPISODE_SECONDS = 6 * 3600
++NO_PROMISE = "bump priority, re-place, or do it in this chat; don't promise a pickup"
++
++
++# --- priority on a chat's human-approval unblock ---------------------------------------------------------------
++
++
++def had_human_request(conn, task_id: str) -> bool:
++    """True when ``task_id`` currently carries a non-empty ``human_request`` (read before the unblock clears it)."""
++    row = conn.execute("SELECT human_request FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    raw = row[0] if row is not None else None
++    return bool(raw) and str(raw).strip() not in ("", "null", "{}")
++
++
++def raise_for_human_go(conn, task_id: str) -> Optional[dict[str, int]]:
++    """Raise ``task_id``'s priority to at least :data:`HUMAN_GO_PRIORITY`; ``{"from", "to"}`` when it changed."""
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is None:
++            return None
++        current = int(row[0] or 0)
++        if current >= HUMAN_GO_PRIORITY:
++            return None
++        conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (HUMAN_GO_PRIORITY, task_id))
++        change = {"from": current, "to": HUMAN_GO_PRIORITY}
++        kb._append_event(conn, task_id, RAISE_KIND, {**change, "reason": "human_go"})
++    kb.notify_task_updated(conn, task_id, ["priority"])
++    return change
++
++
++# --- queue place in the unblock result --------------------------------------------------------------------------
++
++
++def unblock_fields(conn, task, board: Optional[str] = None) -> dict[str, Any]:
++    """``{"queue": ..., ["queue_hint": ...]}`` for an unblock result; empty when the card is not ready."""
++    from hermes_cli import kanban_queue_position as kqp
++    place = kqp.read(conn, task, board)
++    if not place:
++        return {}
++    out: dict[str, Any] = {"queue": place}
++    ahead, limit = place.get("ahead"), place.get("limit")
++    if place.get("lane") == "local" and ahead is not None and limit is not None and ahead >= limit:
++        out["queue_hint"] = f"{ahead} card(s) ahead and {limit} slot(s) on this host: {NO_PROMISE}."
++    elif place.get("lane") == "unplaceable":
++        out["queue_hint"] = f"{kqp.describe(place)}. {NO_PROMISE}."
++    return out
++
++
++# --- direct chat wait notice ------------------------------------------------------------------------------------
++
++
++def notice_text(payload: Any) -> str:
++    """Chat line for ``chat_wait_unclaimed`` (gateway and TUI notifiers share it)."""
++    payload = payload if isinstance(payload, dict) else {}
++    tid = str(payload.get("parent") or "<card>")[:64]
++    title = str(payload.get("parent_title") or "").strip()[:120]
++    named = f"{tid} ({title})" if title else tid
++    return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min with no "
++            f"worker ({payload.get('queue') or 'queue place unknown'}). " + pu._options(tid) + ".")
++
++
++_FLOOR = ", ".join(f"'{k}'" for k in sorted({"created", "promoted", "reclaimed", "unblocked", "claimed",
++                                              "spawned", "continuation_woken", "condition_met", "continued"}))
++_CANDIDATES = (
++    "SELECT t.id, t.title, t.created_at FROM tasks t "
++    "WHERE t.status = 'ready' AND t.claim_lock IS NULL "
++    "AND (t.session_id IS NOT NULL OR EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = t.id)) "
++    f"AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind IN ({_FLOOR})), "
++    "t.created_at) BETWEEN ? AND ? ORDER BY t.id"
++)
++
++
++def sweep(conn, *, now: Optional[float] = None) -> int:
++    """Append the once-per-ready-episode notice for every qualifying card; returns how many were appended."""
++    now = time.time() if now is None else now
++    posted = 0
++    rows = conn.execute(_CANDIDATES, (int(now - MAX_EPISODE_SECONDS), int(now - THRESHOLD_SECONDS))).fetchall()
++    for row in rows:
++        since = pu.ready_since(conn, row["id"], row["created_at"])
++        ready_for = now - since
++        if ready_for < THRESHOLD_SECONDS or ready_for > MAX_EPISODE_SECONDS:
++            continue
++        if pu.post_notice(conn, row["id"], row["id"], wait_key=f"ready@{since}", waited_seconds=ready_for,
++                          ready_seconds=ready_for, parent_title=row["title"], kind=NOTICE_KIND):
++            posted += 1
++    return posted
++
++
++def safe_sweep(conn) -> int:
++    """:func:`sweep` for the dispatcher tick: a notice failure is logged and never stops dispatch."""
++    try:
++        return sweep(conn)
++    except Exception:  # health: allow BLE001 -- a notice failure must never stop dispatch
++        _log.warning("kanban dispatcher: chat-wait notice sweep failed", exc_info=True)
++        return 0
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 5ebf625206e..7e1db8525b7 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -114,30 +114,34 @@ def sweep(conn, *, now: Optional[float] = None) -> int:
+ 
+ 
+ def safe_sweep(conn) -> int:
+-    """:func:`sweep` for the dispatcher tick: a notice failure is logged and never stops dispatch."""
++    """:func:`sweep` for the dispatcher tick, then the direct chat-wait sweep (``kanban_chat_wait``, same
++    cadence; kept here so the dispatcher facade does not grow). A notice failure is logged and never stops
++    dispatch."""
++    from hermes_cli import kanban_chat_wait
+     try:
+-        return sweep(conn)
++        posted = sweep(conn)
+     except Exception:  # health: allow BLE001 -- a notice failure must never stop dispatch
+         _log.warning("kanban dispatcher: parent-unclaimed notice sweep failed", exc_info=True)
+-        return 0
++        posted = 0
++    return posted + kanban_chat_wait.safe_sweep(conn)
+ 
+ 
+ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_seconds: float,
+-                ready_seconds: float, parent_title: Optional[str] = None) -> bool:
+-    """Append ONE ``dependency_parent_unclaimed`` event to ``task_id`` (its chats receive it through their notify
+-    subscriptions) about ``waiting_on``, a card still ready and unclaimed. ``wait_key`` identifies the wait: a
+-    second call with the same (waiting_on, wait_key) posts nothing. Reusable for a direct chat wait, where
+-    ``waiting_on`` is ``task_id`` itself. Returns True when it posted."""
++                ready_seconds: float, parent_title: Optional[str] = None, kind: str = NOTICE_KIND) -> bool:
++    """Append ONE ``kind`` event (default ``dependency_parent_unclaimed``) to ``task_id`` (its chats receive it
++    through their notify subscriptions) about ``waiting_on``, a card still ready and unclaimed. ``wait_key``
++    identifies the wait: a second call with the same (waiting_on, wait_key) posts nothing. Reused for a direct chat
++    wait (``kanban_chat_wait``), where ``waiting_on`` is ``task_id`` itself. Returns True when it posted."""
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
+         if any(kb._json_dict(p).get("wait_event_id") == wait_key and kb._json_dict(p).get("parent") == waiting_on
+                for (p,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+-                                        (task_id, NOTICE_KIND))):
++                                        (task_id, kind))):
+             return False
+         still = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (waiting_on,)).fetchone()
+         if still is None or still["status"] != "ready" or still["claim_lock"]:
+             return False
+-        kb._append_event(conn, task_id, NOTICE_KIND, {
++        kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+             "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
+             "queue": _queue_words(_place(conn, waiting_on)),
+diff --git a/tests/tools/test_kanban_unblock_queue.py b/tests/tools/test_kanban_unblock_queue.py
+new file mode 100644
+index 00000000000..acdb0162120
+--- /dev/null
++++ b/tests/tools/test_kanban_unblock_queue.py
+@@ -0,0 +1,291 @@
++"""A card a chat unblocks on David's live approval is ranked, sized and watched. [daveey]
++
++Defect agent-70dc07d1a5 (2026-11-02): David said "go" in a live chat; it unblocked t_01a19e4974912dcf (a
++``human_request`` card) and told him "a worker will pick it up". The card sat ready and unclaimed for 113 min
++behind 47 older p0 cards: the unblock kept its p0 rank, its result was only ``{"status": "ready"}`` (no queue
++place), and nothing told the chat that the card it waited on directly had no worker. These tests pin:
++priority >= 10 on a chat's human-approval unblock (``priority_raised`` reason ``human_go``), no change for a worker
++or a plain block, ``queue`` plus the don't-promise hint in the result, and ONE ``chat_wait_unclaimed`` notice per
++ready episode for a chat-subscribed card ready and unclaimed 30+ min.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli.kanban_db_dispatch_queries import lane_rows
++
++_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
++        "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT",
++        "HERMES_KANBAN_WORKER_TASK")
++
++
++@pytest.fixture
++def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in _ENV:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++def _connect():
++    return kbc.connect()
++
++
++def _ready(conn, title, *, priority=0, created_at=None):
++    tid = kb.create_task(conn, title=title, assignee="default", priority=priority, initial_status="running")
++    if created_at is not None:
++        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (created_at, tid))
++        conn.commit()
++    return tid
++
++
++def _human_blocked(conn, title="hire: send offer", *, priority=0, with_request=True):
++    tid = kb.create_task(conn, title=title, assignee="default", priority=priority)
++    kb.block_task(conn, tid, reason="needs David's go")
++    if with_request:
++        conn.execute("UPDATE tasks SET human_request=? WHERE id=?",
++                     (json.dumps({"action": "Reply go in this chat. Unblock = send; archive = drop."}), tid))
++        conn.commit()
++    return tid
++
++
++def _unblock(tid):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_unblock({"task_id": tid}))
++
++
++def _behind_eight_older_p0(conn):
++    base = int(time.time()) - 7200
++    return [_ready(conn, f"older p0 {i}", created_at=base + i) for i in range(8)]
++
++
++def _events(conn, tid, kind):
++    return [json.loads(p) if p else {} for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, kind))]
++
++
++# --- priority on a chat's human-approval unblock ----------------------------------------------------------------
++
++
++def test_chat_unblock_of_human_request_card_raises_priority_and_jumps_the_queue(board):
++    conn = _connect()
++    older = _behind_eight_older_p0(conn)
++    tid = _human_blocked(conn)
++    conn.close()
++
++    out = _unblock(tid)
++    assert out["ok"] is True and out["status"] == "ready", out
++
++    conn = _connect()
++    try:
++        assert kb.get_task(conn, tid).priority == 10
++        raised = _events(conn, tid, "priority_raised")
++        assert len(raised) == 1 and raised[0]["reason"] == "human_go"
++        assert raised[0]["from"] == 0 and raised[0]["to"] == 10
++        order = [r["id"] for r in lane_rows(conn, "ready")]
++        assert order[0] == tid and set(order[1:]) == set(older)
++    finally:
++        conn.close()
++
++
++def test_chat_unblock_never_lowers_a_higher_priority(board):
++    conn = _connect()
++    tid = _human_blocked(conn, priority=20)
++    conn.close()
++    _unblock(tid)
++    conn = _connect()
++    try:
++        assert kb.get_task(conn, tid).priority == 20
++        assert _events(conn, tid, "priority_raised") == []
++    finally:
++        conn.close()
++
++
++def test_chat_unblock_without_human_request_keeps_priority(board):
++    conn = _connect()
++    tid = _human_blocked(conn, with_request=False)
++    conn.close()
++    _unblock(tid)
++    conn = _connect()
++    try:
++        assert kb.get_task(conn, tid).priority == 0
++        assert _events(conn, tid, "priority_raised") == []
++    finally:
++        conn.close()
++
++
++def test_worker_unblock_keeps_priority(board, monkeypatch):
++    """A self-heal fix worker requeueing its named card is not David's go: no raise."""
++    conn = _connect()
++    target = _human_blocked(conn)
++    fix = kb.create_task(conn, title=f"self-heal fix: kanban card {target} on hermes-hub/default failed 3x (crashed):",
++                         created_by="self-heal", idempotency_key="selfheal:kanban-50a03854e8:fix",
++                         assignee="default")
++    kb.claim_task(conn, fix)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", fix)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, fix)))
++    conn.close()
++
++    out = _unblock(target)
++    assert out.get("ok") is True and out.get("via") == "self-heal-requeue", out
++    conn = _connect()
++    try:
++        assert kb.get_task(conn, target).priority == 0
++        assert _events(conn, target, "priority_raised") == []
++    finally:
++        conn.close()
++
++
++# --- queue place in the unblock result ------------------------------------------------------------------------
++
++
++def test_unblock_result_carries_queue_and_the_no_promise_hint_when_the_queue_is_full(board, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as kbd
++    monkeypatch.setattr(kbd, "resolve_max_in_progress", lambda *_a, **_k: 2)
++    conn = _connect()
++    base = int(time.time()) - 7200
++    for i in range(3):
++        _ready(conn, f"p50 {i}", priority=50, created_at=base + i)
++    tid = _human_blocked(conn)
++    conn.close()
++
++    out = _unblock(tid)
++    queue = out.get("queue") or {}
++    assert queue.get("lane") == "local", out
++    assert queue.get("ahead") == 3 and queue.get("limit") == 2
++    hint = out.get("queue_hint") or ""
++    assert "don't promise a pickup" in hint
++    assert "bump priority" in hint and "re-place" in hint and "this chat" in hint
++
++
++def test_unblock_result_has_queue_but_no_hint_when_a_slot_is_near(board, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as kbd
++    monkeypatch.setattr(kbd, "resolve_max_in_progress", lambda *_a, **_k: 7)
++    conn = _connect()
++    tid = _human_blocked(conn)
++    conn.close()
++    out = _unblock(tid)
++    assert (out.get("queue") or {}).get("ahead") == 0, out
++    assert "queue_hint" not in out
++
++
++# --- direct chat wait notice -----------------------------------------------------------------------------------
++
++
++def _subscribe(conn, tid, chat="origin-chat"):
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat, delivery_metadata={"reason": "create"})
++
++
++def _age_ready(conn, tid, seconds):
++    then = int(time.time()) - seconds
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (then, tid))
++    conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (then, tid))
++    conn.commit()
++
++
++def _notices(conn, tid):
++    from hermes_cli import kanban_chat_wait as cw
++    return _events(conn, tid, cw.NOTICE_KIND)
++
++
++def test_subscribed_card_ready_31_min_gets_one_notice(board):
++    from hermes_cli import kanban_chat_wait as cw
++    conn = _connect()
++    try:
++        tid = _ready(conn, "hire: send offer")
++        _subscribe(conn, tid)
++        _age_ready(conn, tid, 31 * 60)
++        assert cw.sweep(conn) == 1
++        notices = _notices(conn, tid)
++        assert len(notices) == 1
++        text = cw.notice_text(notices[0])
++        assert tid in text and "bump" in text and "re-place" in text and "here" in text
++        assert cw.sweep(conn) == 0
++        assert len(_notices(conn, tid)) == 1
++    finally:
++        conn.close()
++
++
++def test_claimed_card_sends_no_notice(board):
++    from hermes_cli import kanban_chat_wait as cw
++    conn = _connect()
++    try:
++        tid = _ready(conn, "claimed")
++        _subscribe(conn, tid)
++        _age_ready(conn, tid, 31 * 60)
++        conn.execute("UPDATE tasks SET claim_lock='hub:1' WHERE id=?", (tid,))
++        conn.commit()
++        assert cw.sweep(conn) == 0
++        assert _notices(conn, tid) == []
++    finally:
++        conn.close()
++
++
++def test_short_wait_or_no_chat_sends_no_notice(board):
++    from hermes_cli import kanban_chat_wait as cw
++    conn = _connect()
++    try:
++        fresh = _ready(conn, "fresh")
++        _subscribe(conn, fresh)
++        _age_ready(conn, fresh, 10 * 60)
++        orphan = _ready(conn, "no chat")
++        _age_ready(conn, orphan, 31 * 60)
++        assert cw.sweep(conn) == 0
++    finally:
++        conn.close()
++
++
++def test_a_new_ready_episode_notifies_again(board):
++    from hermes_cli import kanban_chat_wait as cw
++    conn = _connect()
++    try:
++        tid = _ready(conn, "re-queued")
++        _subscribe(conn, tid)
++        _age_ready(conn, tid, 3 * 3600)
++        assert cw.sweep(conn) == 1
++        kb.block_task(conn, tid, reason="again")
++        kb.unblock_task(conn, tid)
++        then = int(time.time()) - 31 * 60
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind IN ('blocked','unblocked')",
++                     (then, tid))
++        conn.commit()
++        assert cw.sweep(conn) == 1
++        assert len(_notices(conn, tid)) == 2
++    finally:
++        conn.close()
++
++
++def test_notice_kind_is_delivered_and_wakes_the_chat():
++    from gateway import kanban_watchers_notifier as gw
++    from hermes_cli import kanban_chat_wait as cw
++    from tui_gateway import session_notifications as sn
++    assert cw.NOTICE_KIND in gw.TERMINAL_KINDS and cw.NOTICE_KIND in gw._WAKE_KINDS
++    assert cw.NOTICE_KIND in gw._EVENT_FORMATTERS
++    assert cw.NOTICE_KIND in sn._KANBAN_NOTIFY_KINDS and cw.NOTICE_KIND in sn._KANBAN_EVENT_FORMATTERS
++
++
++def test_dispatch_tick_runs_the_chat_wait_sweep(board, monkeypatch):
++    from hermes_cli import kanban_db_dispatch as kbd
++    conn = _connect()
++    try:
++        tid = _ready(conn, "waited on by a chat")
++        _subscribe(conn, tid)
++        _age_ready(conn, tid, 31 * 60)
++        monkeypatch.setattr(kbd, "_tick_spawn_budget", lambda *a, **k: (False, 0))
++        kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda *a, **k: None)
++        assert len(_notices(conn, tid)) == 1
++    finally:
++        conn.close()
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+index 2fe79fde219..75c3f06904e 100644
+--- a/tools/kanban_tools_self_heal.py
++++ b/tools/kanban_tools_self_heal.py
+@@ -131,7 +131,24 @@ def handle_unblock(args: dict, **kw) -> str:
+     kt._require_orchestrator_tool("kanban_unblock")
+     kt._enforce_worker_task_ownership(tid)
+     with kt._board(args.get("board")) as (kb, conn):
+-        kt._check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
++        # [daveey] agent-70dc07d1a5: a chat's unblock of a human_request card is David's go. It used to keep its
++        # p0 rank and return only the status, so the chat promised a pickup 47 older cards stood in front of.
++        from hermes_cli import kanban_chat_wait as cw
++        asked: dict = {}
++
++        def note_request(current) -> None:
++            asked["human"] = cw.had_human_request(current, tid)  # unblock_task clears human_request
++
++        kt._check(kb.unblock_task(conn, tid, precondition=note_request),
++                  f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
++        try:
++            raised = cw.raise_for_human_go(conn, tid) if asked.get("human") else None
++        except Exception:  # health: allow BLE001 -- the unblock already committed; the raise is advisory
++            kt.logger.warning("kanban_unblock: human_go priority raise failed for %s", tid, exc_info=True)
++            raised = None
+         subscribed = kt._maybe_subscribe_on_touch(conn, tid)
+-        return kt._ok(task_id=tid, **kt._fields(kb.get_task(conn, tid), ("status",)),
++        task = kb.get_task(conn, tid)
++        return kt._ok(task_id=tid, **kt._fields(task, ("status",)),
++                      **({"priority_raised": raised} if raised else {}),
++                      **cw.unblock_fields(conn, task, args.get("board")),
+                       **({"subscribed": True} if subscribed else {}))
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 1c7f55db703..d561c58bed2 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -167,7 +167,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds (archived/unblocked) too so the cursor advances
+ # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+-                        "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed")
++                        "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed",
++                        "chat_wait_unclaimed")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -607,6 +608,11 @@ def _kb_parent_unclaimed(payload: dict) -> str:
+     return ": " + notice_text(payload)
+ 
+ 
++def _kb_chat_wait(payload: dict) -> str:
++    from hermes_cli.kanban_chat_wait import notice_text
++    return ": " + notice_text(payload)
++
++
+ def _kb_failure(kind: str, payload: dict, title: str) -> str:
+     """Cause-accurate gave_up/crashed wording; pid/exit/raw output only under ``Details:``. [daveey]"""
+     from hermes_cli.kanban_failure_summary import describe_failure
+@@ -624,6 +630,7 @@ _KANBAN_EVENT_FORMATTERS = {
+     "quota_episode_notice": ("⏳", lambda t, p, title: _kb_quota_episode(p)),
+     "worker_repin_notice": ("⚠", lambda t, p, title: _kb_repin_notice(p)),
+     "dependency_parent_unclaimed": ("⏳", lambda t, p, title: _kb_parent_unclaimed(p)),
++    "chat_wait_unclaimed": ("⏳", lambda t, p, title: _kb_chat_wait(p)),
+ }
+ 
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,325 @@
+From cb9d579b37776a9469e614ba71925b4a49956b8d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 16:43:22 +0000
+Subject: [PATCH] [daveey] sessions: a busy parent gets its killed-subagent
+ notice once its turn ends (self-heal desktop-ac1b365935)
+
+The startup orphan reap tells a parent chat when a restart killed its subagent mid-work, inline and once. A parent
+mid-turn refuses the row (SessionTurnLeaseLostError); reap_notices logged a WARNING with a traceback and dropped the
+notice for good, and nothing looked at the closed child again.
+
+- reap_notices: a busy parent (turn lease, or compression closing its tip) is one INFO line 'parent busy, will
+  retry', no traceback. Unexpected errors keep WARNING + traceback.
+- retry_pending_killed_notices(db): re-offers the notice for each child closed by startup_orphan_reap in the last
+  24 h (last active role tool/user) whose parent lineage lacks subagent-killed:<child>. notice_id dedup makes repeats
+  a read-only no-op. Runs every kanban-unloaded sweeper pass, before guarantee_pass so the same tick can wake the
+  parent. A parent still busy 30 min after the reap logs ONE WARNING per child (the real-failure line).
+
+Why: each notice writer handled 'chat busy' itself; the kanban writers retry (kanban-e5babca565), this one did not.
+Not caught: the restart test covered only an idle parent.
+
+Proof: tests/tui_gateway/test_session_outcome_restarts.py 3 new tests red before (WARNING at reap_notices.py:58,
+no retry), 8/8 green after; 9/9 mutants of the new conditions killed; 188 tests across restarts, kanban_unloaded,
+kanban_remote_wake, notice_guarantee, session_outcome, split_module_imports pass. Retry scan: ~10 ms on the hub's
+19k-row sessions table.
+---
+ .../test_session_outcome_restarts.py          | 128 ++++++++++++++++++
+ tui_gateway/kanban_unloaded.py                |   5 +
+ tui_gateway/reap_notices.py                   | 103 ++++++++++++--
+ 3 files changed, 223 insertions(+), 13 deletions(-)
+
+diff --git a/tests/tui_gateway/test_session_outcome_restarts.py b/tests/tui_gateway/test_session_outcome_restarts.py
+index 1738f43a2f1..66ac9e44d13 100644
+--- a/tests/tui_gateway/test_session_outcome_restarts.py
++++ b/tests/tui_gateway/test_session_outcome_restarts.py
+@@ -91,3 +91,131 @@ def test_a_reaped_subagent_mid_work_tells_its_parent(monkeypatch, db, last_role,
+     assert "subagent repo auditor was stopped by a restart before finishing" in notice["content"]
+     stored = so.get_outcome("parent", db=db)
+     assert (stored["kind"], stored["reason"]) == ("unresolved", "subagent_killed")
++
++
++def _killed_child_of(db, parent="parent", child="child"):
++    """A parent chat whose delegate child a restart killed mid-tool, aged past the reap TTL."""
++    db.create_session(parent, source="desktop")
++    db.append_message(parent, role="user", content="audit the three repos")
++    db.append_message(parent, role="assistant", content="Delegated the audit to a subagent.")
++    db.create_session(child, source="subagent", parent_session_id=parent)
++    db._conn.execute("UPDATE sessions SET title = ? WHERE id = ?", ("repo auditor" if child == "child" else f"repo auditor {child}", child))
++    db._conn.commit()
++    db.append_message(child, role="user", content="audit repo A")
++    db.append_message(child, role="assistant", content="", tool_calls=[
++        {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}])
++    db.append_message(child, role="tool", content="ok", tool_call_id="c1", tool_name="terminal")
++    _age(db, child, 8 * 3600)
++
++
++def _notices(db, sid="parent"):
++    return [m for m in db.get_messages(sid) if m.get("display_kind") == "kanban_notice"]
++
++
++def test_a_busy_parent_gets_the_killed_subagent_notice_once_its_turn_ends(monkeypatch, db, caplog):
++    """desktop-ac1b365935: a parent mid-turn refused the reap's notice; it was logged as a warning with a
++    traceback and dropped for good. Now the refusal is a quiet "parent busy, will retry" and the sweeper's retry
++    delivers it once the turn ends, exactly once."""
++    import logging
++    from tui_gateway import reap_notices as rn
++    _killed_child_of(db)
++    holder = f"pid={__import__('os').getpid()}:turn-in-progress"
++    assert db.try_acquire_session_turn_lease("parent", holder)  # the parent chat is mid-turn
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_SESSION_TTL_S", 6 * 3600)
++
++    with caplog.at_level(logging.INFO, logger="tui_gateway.reap_notices"):
++        assert "child" in server._sweep_orphaned_session_rows()
++    assert _notices(db) == []
++    reap_lines = [r for r in caplog.records if r.name == "tui_gateway.reap_notices"]
++    assert not [r for r in reap_lines if r.levelno >= logging.WARNING], "an expected busy parent is not a failure"
++    assert any("parent busy, will retry" in r.getMessage() and r.exc_info is None for r in reap_lines)
++
++    with caplog.at_level(logging.INFO, logger="tui_gateway.reap_notices"):
++        assert rn.retry_pending_killed_notices(db) == []  # still busy: skipped quietly, nothing written
++    assert _notices(db) == []
++    assert not [r for r in caplog.records if r.name == "tui_gateway.reap_notices" and r.levelno >= logging.WARNING]
++
++    db.release_session_turn_lease("parent", holder)
++    assert rn.retry_pending_killed_notices(db) == ["parent"]
++    [notice] = _notices(db)
++    assert "subagent repo auditor was stopped by a restart before finishing" in notice["content"]
++    stored = so.get_outcome("parent", db=db)
++    assert (stored["kind"], stored["reason"]) == ("unresolved", "subagent_killed")
++    assert rn.retry_pending_killed_notices(db) == []  # delivered: a second pass writes nothing
++    assert len(_notices(db)) == 1
++
++
++def test_a_parent_busy_past_the_overdue_window_logs_one_warning(monkeypatch, db, caplog):
++    import logging
++    from tui_gateway import reap_notices as rn
++    rn._reset_for_tests()
++    _killed_child_of(db)
++    holder = f"pid={__import__('os').getpid()}:turn-in-progress"
++    assert db.try_acquire_session_turn_lease("parent", holder)
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_SESSION_TTL_S", 6 * 3600)
++    assert "child" in server._sweep_orphaned_session_rows()
++    db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 'child'", (time.time() - rn.OVERDUE_S - 5,))
++    db._conn.commit()
++
++    with caplog.at_level(logging.INFO, logger="tui_gateway.reap_notices"):
++        rn.retry_pending_killed_notices(db)
++        rn.retry_pending_killed_notices(db)
++    warnings = [r for r in caplog.records if r.name == "tui_gateway.reap_notices" and r.levelno >= logging.WARNING]
++    assert len(warnings) == 1 and "overdue" in warnings[0].getMessage() and "child" in warnings[0].getMessage()
++
++
++def test_an_unexpected_notice_failure_still_warns_with_a_traceback(monkeypatch, db, caplog):
++    import logging
++    from tui_gateway import reap_notices as rn
++    _killed_child_of(db)
++
++    def boom(*_a, **_k):
++        raise RuntimeError("disk on fire")
++
++    monkeypatch.setattr(db, "append_kanban_notice", boom)
++    monkeypatch.setattr(db, "record_kanban_notice", boom)
++    with caplog.at_level(logging.INFO, logger="tui_gateway.reap_notices"):
++        assert rn.notify_parents_of_killed_subagents(db, ["child"]) == []
++    [warning] = [r for r in caplog.records if r.name == "tui_gateway.reap_notices" and r.levelno >= logging.WARNING]
++    assert warning.exc_info is not None and "could not tell parent" in warning.getMessage()
++
++
++def test_the_retry_ignores_old_reaps_and_children_that_finished(db, caplog):
++    import logging
++    from tui_gateway import reap_notices as rn
++    with caplog.at_level(logging.INFO, logger="tui_gateway.reap_notices"):
++        assert rn.retry_pending_killed_notices(None) == []  # no state.db in this process: nothing to do, no noise
++    assert not caplog.records
++    _killed_child_of(db)
++    db._conn.execute("UPDATE sessions SET ended_at = ?, end_reason = 'startup_orphan_reap' WHERE id = 'child'",
++                     (time.time() - 25 * 3600,))  # reaped more than a day ago: out of the retry window
++    _killed_child_of(db, parent="p2", child="c2")
++    db._conn.execute("UPDATE sessions SET ended_at = ?, end_reason = 'agent_close' WHERE id = 'c2'", (time.time(),))
++    db._conn.commit()
++    assert rn.retry_pending_killed_notices(db) == []
++    assert _notices(db) == [] and _notices(db, "p2") == []
++
++
++def test_the_kanban_unloaded_sweeper_pass_runs_the_retry_before_the_guarantee(monkeypatch, db):
++    import threading
++    from tui_gateway import kanban_unloaded as ku
++    from tui_gateway import notice_fanout, notice_guarantee
++    _killed_child_of(db)
++    db._conn.execute("UPDATE sessions SET ended_at = ?, end_reason = 'startup_orphan_reap' WHERE id = 'child'",
++                     (time.time() - 60,))  # reaped a minute ago; its inline notice was refused
++    db._conn.commit()
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    stop = threading.Event()
++    seen_at_guarantee = []
++    for name in ("HERMES_KANBAN_UNLOADED_FIRST_S", "HERMES_KANBAN_UNLOADED_SWEEP_S"):
++        monkeypatch.setenv(name, "0" if name.endswith("FIRST_S") else "1")
++    monkeypatch.setattr(ku, "sweep_remote_once", lambda *a, **k: [])
++    monkeypatch.setattr(ku, "sweep_once", lambda *a, **k: [])
++    monkeypatch.setattr(ku, "live_session_ids", lambda: set())
++    monkeypatch.setattr(notice_fanout, "card_change_pass", lambda: None)
++    monkeypatch.setattr(notice_guarantee, "guarantee_pass",
++                        lambda: seen_at_guarantee.append(len(_notices(db))) or stop.set())
++    ku._loop(stop)
++    assert seen_at_guarantee == [1]
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 87f1825eadc..e2b39203e72 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -595,6 +595,11 @@ def _loop(stop: threading.Event) -> None:
+         from tui_gateway.notice_fanout import card_change_pass
+         from tui_gateway.notice_guarantee import guarantee_pass
+         card_change_pass()
++        # [daveey] A parent that was mid-turn when the orphan reap killed its subagent refused that notice: re-offer
++        # it before the guarantee pass, so the same tick can wake the parent on it (desktop-ac1b365935).
++        from tui_gateway import server
++        from tui_gateway.reap_notices import retry_pending_killed_notices
++        retry_pending_killed_notices(server._get_db())
+         guarantee_pass()
+         stop.wait(interval)
+ 
+diff --git a/tui_gateway/reap_notices.py b/tui_gateway/reap_notices.py
+index 4c1dee83102..71899bbd059 100644
+--- a/tui_gateway/reap_notices.py
++++ b/tui_gateway/reap_notices.py
+@@ -5,15 +5,39 @@ A delegate child row that a backend restart killed while it was mid-tool or wait
+ children in 14 days on the MacBook, session-state audit 2026-10-29). For each one the reap appends ONE notice to
+ the parent's live tip ("subagent <title> was stopped by a restart before finishing") and refreshes the parent's
+ outcome, which then reads ``unresolved{subagent_killed}`` until a turn answers it (the notice guarantee wakes it).
++
++A parent mid-turn refuses the row (``SessionTurnLeaseLostError``; a compression rotating its tip refuses with
++``CompressionSessionClosedError``): that is "busy, try later", logged once at INFO with no traceback. The kanban
++unloaded sweeper then calls :func:`retry_pending_killed_notices` every pass, which re-offers each child reaped in
++the last day whose parent lineage has no ``subagent-killed:<child>`` notice yet (``notice_id`` makes repeats a
++no-op). A notice still undelivered ``OVERDUE_S`` after the reap logs ONE warning per child: that is the
++real-failure line (desktop-ac1b365935: the inline write was refused by a busy parent and dropped for good).
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+-from typing import Any, Iterable
++import threading
++import time
++from typing import Any, Iterable, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
++RETRY_WINDOW_S = 24 * 3600.0  # children reaped longer ago than this are not re-offered
++OVERDUE_S = 1800.0  # a notice still undelivered this long after the reap warns once
++_overdue_lock = threading.Lock()
++_overdue_warned: set[str] = set()  # child ids already warned about (this process)
++
++_REAPED_SQL = """
++SELECT id, ended_at FROM sessions
++ WHERE parent_session_id IS NOT NULL AND end_reason = 'startup_orphan_reap' AND ended_at >= ?
++"""
++
++
++def _reset_for_tests() -> None:
++    with _overdue_lock:
++        _overdue_warned.clear()
++
+ _CHILDREN_SQL = """
+ SELECT s.id, s.title, s.parent_session_id,
+        (SELECT role FROM messages WHERE session_id = s.id AND active = 1 AND role IN ('user', 'assistant', 'tool')
+@@ -36,9 +60,30 @@ def killed_subagents(db: Any, swept: Iterable[str]) -> list[dict]:
+             for r in db._read_all(sql, tuple(ids)) if r["last_role"] in ("tool", "user")]
+ 
+ 
++def _deliver(db: Any, child: dict) -> tuple[str, Optional[str]]:
++    """Write one child's notice to its parent's live tip. ``("written"|"present"|"busy"|"error", tip)``; never
++    raises. ``busy`` = the parent refused because a turn (or a compression) owns it right now."""
++    from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
++    tip = child["parent"]
++    try:
++        tip = db.get_compression_tip(child["parent"]) or child["parent"]
++        text = (f"⚠ subagent {child['title']} was stopped by a restart before finishing (child session "
++                f"{child['id']}); its result never came back. Check what it got done and redo or re-delegate the rest.")
++        metadata = {"notice_id": f"subagent-killed:{child['id']}", "display_text": text,
++                    "subagent_killed": child["id"]}
++        _row, inserted = db.record_kanban_notice(tip, text, metadata)
++    except (SessionTurnLeaseLostError, CompressionSessionClosedError):
++        return "busy", tip
++    except Exception:
++        logger.warning("could not tell parent %s that subagent %s was reaped", tip, child["id"], exc_info=True)
++        return "error", tip
++    return ("written" if inserted else "present"), tip
++
++
+ def notify_parents_of_killed_subagents(db: Any, swept: Iterable[str]) -> list[str]:
+     """Append one notice per killed child to its parent's tip and refresh that parent. Returns the parents
+-    notified. Never raises (a parent mid-turn refuses the row; that is logged and skipped)."""
++    notified. Never raises. A parent mid-turn refuses the row: one INFO line, and the sweeper's
++    :func:`retry_pending_killed_notices` delivers it once the turn ends."""
+     from hermes_state_outcome import refresh_outcomes_quietly
+     notified: list[str] = []
+     try:
+@@ -47,19 +92,51 @@ def notify_parents_of_killed_subagents(db: Any, swept: Iterable[str]) -> list[st
+         logger.warning("killed-subagent lookup after the orphan reap failed", exc_info=True)
+         return notified
+     for child in children:
+-        tip = db.get_compression_tip(child["parent"]) or child["parent"]
+-        text = (f"⚠ subagent {child['title']} was stopped by a restart before finishing (child session "
+-                f"{child['id']}); its result never came back. Check what it got done and redo or re-delegate the rest.")
+-        metadata = {"notice_id": f"subagent-killed:{child['id']}", "display_text": text,
+-                    "subagent_killed": child["id"]}
+-        try:
+-            db.append_kanban_notice(tip, text, metadata)
+-        except Exception:
+-            logger.warning("could not tell parent %s that subagent %s was reaped", tip, child["id"], exc_info=True)
+-            continue
+-        notified.append(tip)
++        result, tip = _deliver(db, child)
++        if result == "busy":
++            logger.info("could not tell parent %s yet that subagent %s was reaped: parent busy, will retry",
++                        tip, child["id"])
++        elif result == "written":
++            notified.append(tip)
+     refresh_outcomes_quietly(notified, "reap", db=db)
+     if notified:
+         logger.info("orphan reap: told %d parent chat(s) their subagent was stopped mid-work: %s",
+                     len(notified), ", ".join(notified))
+     return notified
++
++
++def retry_pending_killed_notices(db: Any, *, now: Optional[float] = None) -> list[str]:
++    """Re-offer the notice for every child the orphan reap closed in the last ``RETRY_WINDOW_S`` whose parent
++    lineage does not have it yet (the inline write found the parent busy). Returns the parents newly told. A
++    still-busy parent is skipped quietly; ``OVERDUE_S`` after the reap it logs one WARNING per child. Already
++    delivered children cost one lineage read (no write lock). Never raises."""
++    from hermes_state_outcome import refresh_outcomes_quietly
++    if db is None:
++        return []
++    now = time.time() if now is None else now
++    try:
++        reaped = {str(r["id"]): r for r in db._read_all(
++            _REAPED_SQL, (now - RETRY_WINDOW_S,))}
++        children = killed_subagents(db, list(reaped))
++    except Exception:
++        logger.warning("killed-subagent notice retry: lookup failed", exc_info=True)
++        return []
++    notified: list[str] = []
++    for child in children:
++        result, tip = _deliver(db, child)
++        if result == "written":
++            notified.append(tip)
++            logger.info("orphan reap retry: told parent %s that subagent %s was stopped mid-work", tip, child["id"])
++        if result in ("written", "present"):
++            with _overdue_lock:
++                _overdue_warned.discard(child["id"])
++            continue
++        age = now - float(reaped[child["id"]]["ended_at"] or now)
++        with _overdue_lock:
++            if age < OVERDUE_S or child["id"] in _overdue_warned:
++                continue
++            _overdue_warned.add(child["id"])
++        logger.warning("killed-subagent notice for child %s to parent %s overdue %dm: %s", child["id"], tip,
++                       age // 60, "parent busy (a turn is running in it)" if result == "busy" else "write failed")
++    refresh_outcomes_quietly(notified, "reap", db=db)
++    return notified
+-- 
+2.55.0
+
