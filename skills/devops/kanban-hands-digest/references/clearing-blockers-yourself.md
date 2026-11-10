@@ -21,7 +21,16 @@ Classify each blocked card by the event that stopped it (`select kind,payload fr
 
 After fixing one misrouted card, sweep for its siblings before they block: `select id,status,title from tasks where assignee in (<narrow/sandboxed profiles>) and status not in ('done','archived')`. Worker-created follow-ups inherit the same wrong assignee, and each one that blocks turns the session red again.
 
-Unblock in one call (`hermes kanban unblock <ids…> --reason …`). After about 3 minutes, read back status, `consecutive_failures` and the model override. Queued `ready` cards behind the concurrency limit are fine.
+Unblock in one call (`hermes kanban unblock <ids…> --reason …`). Read back status, `consecutive_failures`, model override and actual claim. When a card this chat depends on stays ready behind a full pool, inspect its current priority before raising it; a fixed numeric priority can accidentally lower it. If the queue still prevents progress, execute a bounded slice in this chat or a direct subagent. Re-read ownership before edits: if the dispatcher starts the original worker, hand it the branch, tests and review artifacts rather than race publication. A queued card is not an executing fix.
+
+## Reconciling a delivered Board-owned landing tracker
+
+Use this only when delivery is already verified and the local mutation tool reports a foreign replica. A replica is evidence, not the writable owner. Delegated children must return the receipt to the parent operator, not bypass their mutation fence.
+
+1. Read the authoritative row with the installed Board client: `from hermes_cli.kanban_sync_client import Hub, load_identity`; `hub = Hub(load_identity())`; `hub.row_evidence(board, 'tasks', task_id)`. Confirm the parent is done and the tracker has no live lease/run. Scan reverse dependency edges and cross-gateway references before closure.
+2. Verify actual landed revisions and installed bytes. If an inaccessible handoff patch was rebuilt and independently reviewed, record the replacement commit explicitly rather than claiming the original SHA landed.
+3. For an authorized parent operator, inspect the current semantic API before using `hub.ops(board, [op])`. The verified completion shape is `{'client_op_id': stable_id, 'op': 'complete', 'task': task_id, 'result': evidence_summary, 'summary': short_summary, 'metadata': evidence_metadata}`. Use it only for fulfilled acceptance; do not use it to evade a completion refusal or mark missing proof successful. Keep server parent/lease checks intact.
+4. Require an `applied` receipt, then independently call `row_evidence` again and verify `status='done'` plus the exact result. Do not repeat publication or deployment merely to clear bookkeeping.
 
 ## Fleet inventory and session mapping
 

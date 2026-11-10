@@ -55,7 +55,7 @@ leaf yourself (re-submit, bump priority, do the step), not just report it. Also 
 
 Before presenting an unblock request:
 1. Read the latest task events; delayed crash notices do not establish current state. Distinguish worker failure from an explicit human ask—never substitute the task body's opening sentence.
-2. Report cause → current retry/paused state → recovery owner. For a genuine ask, name the action, device, reason and observable completion condition. Otherwise say no user action is identified; do not repeatedly requeue a refusal or switch providers to evade it.
+2. Report cause → current execution state → next verified step. Read a completion notice's full result: implementation may be done while publication/deployment is handed off. Advance that existing landing owner before calling the fix delivered. For genuine asks, name the action, device and completion condition; never repeatedly requeue a refusal or switch providers to evade it.
 3. `hermes kanban stats` "Waiting on you: N" and diag `waiting_behind_user` are not a list of asks: they include quota-wall holds (`blocker_auth`) and asks that went stale. Check each premise live (`gh workflow list`, device state, `kanban_show` events) before it goes on his list; clear or archive the false ones yourself.
 4. When the user calls the messaging useless, fix its producer and rendered surface, not just the explanation. Keep operational pauses visible as agent issues without Done buttons. Test failure → nonhuman pause → genuine human ask, including rendered buttons/counts; helper tests alone miss misleading controls.
 
