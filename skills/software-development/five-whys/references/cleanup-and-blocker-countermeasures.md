@@ -14,6 +14,8 @@ existing tests for assertions that enshrine the faulty default; passing them alo
 
 For synced Kanban workspace cleanup, inspect sync-shadow replicas before calling a directory orphaned: gateway-local primary boards can evict remote-owned cards while their scratch directories remain. Protect any active copy across primary/profile/replica boards, use the latest finished activity, and abort retention on unreadable ownership sources. Test replica-only completion and active-copy veto; absence from the primary is not proof of abandonment.
 
+For PID-owned temporary-home cleanup, exercise the real process scanner under the reaper's service UID as well as fixtures. Same-user non-dumpable processes can make an unprivileged `/proc` scan fail closed permanently; preserve that safety behavior and verify a privileged scheduled fallback instead of ignoring permission errors. Cover both configured scratch and the OS temp root, and test a killed creator whose child still holds a descendant file.
+
 For cleanup incidents, distinguish a creator's lifecycle reaper from a generic age-based GC backstop. Trace
 creator ownership from markers, task records or creation commands; directory names alone are not attribution.
 Before exempting a creator from burst monitoring, verify its reaper is discovered and enabled in the actual
