@@ -1413,7 +1413,7 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
     root = Path(root) if root is not None else coach_root()
     now = time.time() if now is None else now
     since = now - days * 86400
-    nudges, outcomes, delivered = [], [], {}  # delivered: nudge_id -> ts of its first delivery record
+    nudges, outcomes, dropped, delivered = [], [], [], {}  # delivered: nudge_id -> ts of first delivery
     try:
         with (root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
             for ln in f:
@@ -1428,10 +1428,15 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
                 if r.get("event") in DELIVERY_EVENTS and r.get("nudge_id"):
                     delivered.setdefault(r["nudge_id"], float(r.get("ts") or 0))
                 (nudges if r.get("event") == "reply_nudge" else
-                 outcomes if r.get("event") == "reply_nudge_outcome" else []).append(r)
+                 outcomes if r.get("event") == "reply_nudge_outcome" else
+                 dropped if r.get("event") == "reply_nudge_answer_dropped" else []).append(r)
     except OSError:
         pass
     out: dict = {}
+    for d in dropped:  # agent-e868df5c84: the revision lost the draft's direct answer (shown only when it happened)
+        c = out.setdefault(d["rule"], {"nudges": 0, "resolved": 0, "still_failing": 0, "no_outcome": 0, "waiting": 0,
+                                       "untracked": 0, "unconfirmed": 0, "filed": 0})
+        c["answer_dropped"] = c.get("answer_dropped", 0) + 1
     for n in nudges:
         rule = n["rule"]
         c = out.setdefault(rule, {"nudges": 0, "resolved": 0, "still_failing": 0, "no_outcome": 0, "waiting": 0,

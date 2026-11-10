@@ -1888,6 +1888,23 @@ def close_open_nudges(home: Path, opened: dict, now: float) -> None:
         del opened[nid]
 
 
+def answer_dropped_signal(r: dict, at: float) -> dict:
+    """agent-e868df5c84: a coach nudge made the agent drop the direct answer its held draft opened with (the user
+    asked "are you done", the draft said "No. ...", the revision opened on owner proof and never said yes or no). The
+    nudge's own rule may call that revision resolved, so this is a coach regression on its own: one card per rule
+    (later drops comment on it while it is open)."""
+    rule = str(r.get("rule") or "?")
+    return {"kind": "coach", "component": "plugin", "at": at, "session_id": r.get("session_id") or "",
+            "symptom": f"coach {rule} nudge dropped the reply's direct answer",
+            "details": (f"A coach {rule} nudge (nudge {r.get('nudge_id') or '?'}, draft {r.get('draft_id') or '?'}) "
+                        f"held a draft that opened with a direct answer, \"{str(r.get('lead') or '')[:160]}\", and "
+                        f"the revised reply no longer opens with one: \"{str(r.get('reply') or '')[:300]}\". The "
+                        f"nudge text must keep the answer (reply_check.keep_answer) for every nudge path, and the "
+                        f"revision should lead with it.")[:1500],
+            "fp": fp("plugin", "nudge-answer-dropped", rule),
+            "comment_open_card": True}
+
+
 def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
     agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
@@ -1933,7 +1950,9 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
         if nid and r.get("event") in NUDGE_OUTCOME and r.get("event") != "reply_nudge_outcome":
             # the backend closed it without a revision (dead/ended turn): not an agent that ignored the nudge
             pending = [n for n in pending if n.get("nudge_id") != nid]
-        if r.get("event") == "fixloop_card":
+        if r.get("event") == "reply_nudge_answer_dropped":
+            out.append(answer_dropped_signal(r, at))
+        elif r.get("event") == "fixloop_card":
             issue = str(r.get("issue") or "a fix that keeps failing")
             out.append({"kind": "coach", "component": "agent", "at": at, "session_id": r.get("session_id") or "",
                         "symptom": f"claimed fix failed {r.get('n') or 2}x: {issue[:120]}",

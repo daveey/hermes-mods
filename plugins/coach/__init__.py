@@ -975,6 +975,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           # (agent-b04f510c13); counted so such nudges are measured, not just felt
                           **({"nudge_after_run_end": _run_end} if (_run_end := rc.run_end_tool(log_lines)) else {}),
                           **({"outcome": True} if tracked else {})}
+            lead = rc.direct_lead(final_response)  # agent-e868df5c84: the draft's direct answer, kept in the nudge
+            if lead:
+                out["rec"]["lead"] = lead
+                hit["nudge"] = rc.keep_answer(hit["nudge"], final_response)
             if tracked:  # judged again on attempt 1 (any rule): self-heal files the outcome, not the nudge
                 st = coach.loop_state(session_id)
                 old = st.get("outcome_nudge")
@@ -984,7 +988,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     "turn": coach.turn_number(session_id), "rule": hit["rule"], "ask": ask, "nudge_id": nid,
                     "at": time.time(), "sig": _sig(final_response),
                     "log": list(log_lines)[-25:], "kanban_down": kanban_down,
-                    "threshold": cfg["threshold"], "thresholds": thresholds, "platform": platform, **draft_ref()}
+                    "threshold": cfg["threshold"], "thresholds": thresholds, "platform": platform, **draft_ref(),
+                    **({"lead": lead} if lead else {})}
             return {"action": "continue", "message": hit["nudge"]}
         except Exception as exc:
             log.debug("coach pre_verify: %s", exc)
@@ -1050,6 +1055,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                          **({"src": res["src"]} if "src" in res else {}),
                          **({"unconfirmed": True} if res.get("unconfirmed") else {}),
                          **({} if attempt else {"via": "recheck"}))
+            if n.get("lead") and rc.answer_dropped(n["lead"], final_response):
+                # agent-e868df5c84: the nudge took the draft's direct answer out of the reply the user sees
+                store.log({"event": "reply_nudge_answer_dropped", "session_id": session_id, "rule": rule,
+                           **_ids(n), "lead": n["lead"], "reply": (final_response or "")[:300],
+                           **({"platform": plat} if plat else {})})
             n = None
         except Exception as exc:
             log.debug("coach nudge outcome: %s", exc)

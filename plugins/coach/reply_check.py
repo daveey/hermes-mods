@@ -461,7 +461,9 @@ def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = 
 PROGRESS_ASK_EXTRA = (
     r"|\bwhat(?:'s|’s|s| is) the deal\b|\bhow(?:'s|’s|s| is)? (?:it |things |this |that |everything )?go(?:es|ing)\b"
     r"|\bcan we (?:un-?block|fix\b|get\b[^.?!\n]{0,40}\b(?:working|done|unblocked|fixed|moving|going))"
-    r"|\b(?:what(?:'s|’s|s| is| are)?|where)\b[^.?!\n]{0,40}\bblocked on\b")
+    r"|\b(?:what(?:'s|’s|s| is| are)?|where)\b[^.?!\n]{0,40}\bblocked on\b"
+    # agent-e868df5c84: "are you done" (the ask whose direct "No." a nudge removed)
+    r"|\bare (?:you|we) (?:done|finished)\b|\bis (?:it|this|that) (?:done|finished)\b|\bdone yet\b")
 # The question half of the progress ask (status_plain reads only this: "still not working" or "finish it" is a fix
 # report or an order, not a request for a status).
 _STATUS_QUESTION = (
@@ -2130,8 +2132,52 @@ REPORT_ONLY_KANBAN_PARKS = (
     "evidence}). A dependency park behind a stalled card is not an ending.")
 
 
+# agent-e868df5c84: David asked "are you done"; the held draft opened "**No. Three-day retention is not yet deployed
+# ...**", the report_only nudge said only "fix it, card it or prove the owner", and the revision swapped the "No." for
+# owner proof, so he had to ask again. A draft that opens with a direct answer keeps it: every nudge asks for that, and
+# the outcome logs reply_nudge_answer_dropped when the revision no longer opens with one.
+_DIRECT_LEAD_RE = re.compile(r"^(?:yes|yep|yeah|no|nope|not yet|not quite|done|partly|partially)\b", re.I)
+_LEAD_STRIP_RE = re.compile(r"^(?:[#>*_`\s-]|\d+[.)]\s)+")
+KEEP_ANSWER = (" Keep your direct answer to the user's question as the first line of the reply ('{lead}'). Put the "
+               "fix or card after it.")
+
+
+def direct_lead(text: str) -> str:
+    """The opening sentence of `text` when it starts with a direct answer (yes/no/not yet/done/partly...; markdown
+    bold or a heading allowed), else "". A bare "No." is extended with the sentence after it, so the lead quotes
+    what the answer says. Capped at 160 chars."""
+    line = next((ln for ln in (text or "").splitlines() if ln.strip()), "")
+    line = _LEAD_STRIP_RE.sub("", line).replace("**", "").replace("__", "").strip()
+    if not _DIRECT_LEAD_RE.match(line):
+        return ""
+    ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", line)]
+    end = next((e for e in ends if e >= 12), len(line))
+    lead = line[:end].strip()
+    return lead if len(lead) <= 160 else lead[:157].rstrip() + "..."
+
+
+def keep_answer(nudge: str, draft: str) -> str:
+    """`nudge` plus the keep-answer clause when the held draft opens with a direct answer (idempotent)."""
+    lead = direct_lead(draft)
+    if not lead or "Keep your direct answer to the user's question" in (nudge or ""):
+        return nudge
+    return (nudge or "") + KEEP_ANSWER.format(lead=lead.replace("'", "’"))
+
+
+def answer_dropped(lead: str, reply: str) -> bool:
+    """True when the held draft had a direct answer (`lead`) and the non-empty revised `reply` no longer opens with
+    one."""
+    return bool(lead) and bool((reply or "").strip()) and not direct_lead(reply)
+
+
 def nudge_for(rule: str, evidence: str, kanban_down: bool = False, card_closed: bool = False,
-              platform: str = "") -> str:
+              platform: str = "", draft: str = "") -> str:
+    return keep_answer(_nudge_text(rule, evidence, kanban_down=kanban_down, card_closed=card_closed,
+                                   platform=platform), draft)
+
+
+def _nudge_text(rule: str, evidence: str, kanban_down: bool = False, card_closed: bool = False,
+                platform: str = "") -> str:
     parks = ""
     if rule == "report_only" and kanban_down:
         tmpl = REPORT_ONLY_KANBAN_DOWN
@@ -2530,7 +2576,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     closed = best == "report_only" and card_closed(tool_log)
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
             **({"variant": "card_closed"} if closed and not down else {}),
-            "nudge": nudge_for(best, v["evidence"], kanban_down=down, card_closed=closed, platform=platform)}
+            "nudge": nudge_for(best, v["evidence"], kanban_down=down, card_closed=closed, platform=platform,
+                               draft=reply)}
 
 
 # ───────────────────────────── block-time handoff check (agent-19492bff76) ─────────────────────────────
