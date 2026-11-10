@@ -149,6 +149,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
   shard counts vs timeouts) and known failure classes (JS fixture socket paths, Hermes E2E daemon leaks, Docker
   gha cache export, gitleaks on self-hosted runners): `references/ci-authoring-and-failure-fixes.md`.
 
+- On hermes-hub, bare `gh` is unauthenticated: a background `wait_for_ci.py` dies with `gh kept failing` ("gh auth login"). Wrap the whole script: `token-broker exec --scope user/github --reason '...' -- python3 -B $S <sha> ...`, and check it with `--once` first.
 - When `gh` is only reachable through a broker wrapper (`token-broker exec ... -- gh`), never put a `gh -> wrapper` symlink first on PATH for `wait_for_ci.py`: the wrapper's inner `gh` resolves to the symlink again and recurses (dozens of `github_quota.py` guards, ledger `database is locked`, every call exits 75 `TimeoutExpired`). Use a shim script that removes its own dir from PATH before exec'ing the wrapper.
 - In a fork checkout with an `upstream` remote, a bare `gh run`/`gh pr` reads the upstream repo's runs, so a
   hand-run one needs `-R OWNER/NAME` (the script passes it from `origin`; override with `--gh-repo`).
