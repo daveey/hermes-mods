@@ -1114,6 +1114,11 @@ def validate_human_request(value: Any) -> dict[str, str]:
     return request
 
 
+# A bounded antecedent describes a condition to investigate, not a present human
+# obligation. Only ready-card prose uses this; explicit blocks remain conservative.
+_READY_ANTECEDENT = re.compile(r"(?:^|(?<=[;:.!?\n]))\s*(?:if|unless)\b[^,;.!?\n]{0,80},", re.I)
+
+
 def needs_checked(tool_name: str, args: dict, is_worker: bool) -> tuple[bool, str]:
     """(does this tool call wait on David / need the Checked gate, the text to scan)."""
     if not isinstance(args, dict):
@@ -1130,12 +1135,15 @@ def needs_checked(tool_name: str, args: dict, is_worker: bool) -> tuple[bool, st
         full = str(args.get("body") or "")
         if args.get("initial_status") == "blocked":
             body = f"{title}\n{full}"
+            scan = body
         else:
             # Ready/todo cards only state a goal up front; later paragraphs are
             # spec, quotes or code that may merely mention a blocked card.
             first = re.split(r"\n\s*\n", full.strip(), maxsplit=1)[0] if full.strip() else ""
             body = f"{title}\n{first}"
-        if says_david_must_act(body):
+            # Keep the title and consequent: a real ask elsewhere still gates.
+            scan = f"{title}\n{_READY_ANTECEDENT.sub(' X,', first)}"
+        if says_david_must_act(scan):
             return True, body
     return False, ""
 

@@ -27,6 +27,17 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 5. Root: correctness of an ask depended on the model's discipline, not on a mechanism. Fix: put the check in the runtime,
    where it runs whether or not the model remembers (this plugin), and give it the facts the model lacks (live state, ledger, capabilities).
 
+## Ready-card conditional evidence
+
+For a non-blocked `kanban_create` without `human_request`, the legacy Checked-line classifier
+scans the title and first paragraph. A short, comma-terminated `if`/`unless` antecedent in the
+body is a condition, not a present human obligation: `if only David can submit, investigate`
+does not turn agent investigation into a human ask. The consequent, title, and surrounding
+text still gate (`if ready, David must approve`); malformed/unbounded conditions remain conservative.
+Explicit blocked cards, `kanban_block`, and structured `human_request` validation are unchanged.
+Coverage: `tests/test_ready_card_quotes.py` tests the classifier and `pre_tool_call`, including
+positive obligations and unchanged blocked-card handling. This classification grants no execution authority.
+
 ## What it does
 
 | Layer | Hook | Behavior |

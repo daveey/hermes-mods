@@ -1034,7 +1034,7 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
         gated, text = core.needs_checked(tool_name, args, _is_worker())
         if not gated or "Filed automatically by the `open-asks` plugin" in text:
             return None
-        what = "blocked card" if tool_name == "kanban_create" else "block"
+        what = ("blocked card" if args.get("initial_status") == "blocked" else "card") if tool_name == "kanban_create" else "block"
         tools = _tools_now(session_id)
         claim = core.checked_line(text)
         if not claim:
