@@ -41,7 +41,9 @@ query each board: `select id,status,block_kind,title from tasks where status not
 (session_id='<id>' or id in (select task_id from task_chat_links where chat_session='<id>' and coalesce(released,0)=0))`.
 "Nothing running, all waiting" means: walk each card's open parents and its scheduled `wake_check` target down to
 the leaf that nothing will move (a decision card, a `ready` card whose events are only `skipped_nonspawnable`,
-a throttled queue), and report that leaf; the cards above it only poll. Also report two states that wait silently:
+a throttled queue, a PR wait whose PR is no longer queued: check its labels/timeline and the waiter's exit,
+not the card's "waiting on merge train" text), and report that leaf; the cards above it only poll. Then move that
+leaf yourself (re-submit, bump priority, do the step), not just report it. Also report two states that wait silently:
 - `triage` with a human `block_kind` (`needs_input`/`capability`): block-loop detection moved a repeatedly
   re-blocked card there. It still waits on the user, and the latest `block_loop_detected` event holds the ask.
   Filtering on `status='blocked'` alone (as the digest script does) misses these.
