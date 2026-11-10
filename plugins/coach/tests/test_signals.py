@@ -1042,6 +1042,81 @@ def test_a_reach_shared_by_two_hosts_never_marks_a_silent_host_awake(tmp_path):
                                                                             ["mini"])]
 
 
+def _hosts(hub):
+    return json.loads((hub / "coach" / "signals" / "hosts.json").read_text())
+
+
+def test_a_silent_alias_of_a_fresh_forwarder_is_dropped_not_filed(tmp_path):
+    # plugin-31f1beac2c (2026-11-05): one manual `signals.py forward` on the mini (no --host) beat as its nodename
+    # "daveey-mini"; the launchd feed beats as "mini". Same machine, two names: the hub filed the never-refreshed
+    # one as a silent forwarder. A heartbeat carries its machine's nodename; a silent entry whose node matches a
+    # fresh entry's node is the same forwarder under a stale label: log it, drop it, file nothing.
+    hub = tmp_path / "hub"
+    reach = "you@mini.example.com"
+    sg.ingest(hub, json.dumps({"kind": "heartbeat", "host": "daveey-mini", "n": 0, "reach": reach,
+                               "node": "daveey-mini"}) + "\n", now=NOW)
+    t0 = NOW + 10 * 3600
+    sg.ingest(hub, json.dumps({"kind": "heartbeat", "host": "mini", "n": 0, "reach": reach,
+                               "node": "daveey-mini"}) + "\n", now=t0 - 600)
+    probed = []
+    got = sg.silent_forwarders(hub, now=t0, prober=lambda r: probed.append(r) or UP(r))
+    assert got == [] and probed == []
+    alias = _log_events(hub, "forwarder_silent_alias")
+    assert [(a["host"], a["alias_of"], a["node"], a["age_h"]) for a in alias] == [("daveey-mini", "mini",
+                                                                                   "daveey-mini", 10.0)]
+    assert set(_hosts(hub)) == {"mini"}
+    filed = []
+    sg.sweep(hub, "hermes-hub", filer=lambda d: filed.append(d) or {"action": "would_file"}, now=t0, prober=UP)
+    assert filed == []
+
+
+def test_a_silent_host_on_another_node_is_still_filed(tmp_path):
+    # Two real machines (different nodes) never mask each other, even when a stale beat shares a reach.
+    hub = tmp_path / "hub"
+    sg.ingest(hub, json.dumps({"kind": "heartbeat", "host": "macbook", "n": 0, "reach": "you@mac.example.com",
+                               "node": "mac-1"}) + "\n", now=NOW)
+    t0 = NOW + 7 * 86400 + 3600
+    sg.ingest(hub, json.dumps({"kind": "heartbeat", "host": "mini", "n": 0, "reach": "you@mac.example.com",
+                               "node": "mini-1"}) + "\n", now=t0 - 600)
+    got = sg.silent_forwarders(hub, now=t0, prober=UP)
+    assert [s["host"] for s in got] == ["macbook"]
+    assert _log_events(hub, "forwarder_silent_alias") == []
+    assert set(_hosts(hub)) == {"macbook", "mini"}
+
+
+def test_heartbeat_carries_the_nodename(home, monkeypatch):
+    monkeypatch.setattr(sg, "short_host", lambda: "daveey-mini")
+    sent = []
+    sg.forward(home, "mini", "you@hub.example.com", now=NOW, cfg={},
+               runner=lambda argv, stdin: sent.append(stdin) or SimpleNamespace(returncode=0, stdout="{}", stderr=""))
+    assert json.loads(sent[0].splitlines()[0])["node"] == "daveey-mini"
+
+
+def _cli_forward(home, monkeypatch, argv, cfg=None):
+    (home / "coach" / "selfheal-config.json").write_text(json.dumps(cfg or {"hub_ssh": "you@hub.example.com"}))
+    monkeypatch.setattr(sg, "short_host", lambda: "daveey-mini")
+    seen = []
+    monkeypatch.setattr(sg, "forward", lambda h, host, hub, **kw: seen.append(host) or {"ok": True, "sent": 0})
+    assert sg.main(["--home", str(home)] + argv) == 0
+    return seen[-1]
+
+
+def test_forward_without_host_reuses_the_feeds_label(home, monkeypatch):
+    # The launchd feed passes --host mini; a manual `forward` with no --host must report under the same name.
+    assert _cli_forward(home, monkeypatch, ["--host", "mini", "forward"]) == "mini"
+    assert _cli_forward(home, monkeypatch, ["forward"]) == "mini"
+    # the remembered label is per host and never in the synced selfheal-config.json
+    assert "mini" not in (home / "coach" / "selfheal-config.json").read_text()
+
+
+def test_forward_without_host_falls_back_to_host_sync_labels_then_nodename(home, monkeypatch):
+    cfg = {"hub_ssh": "you@hub.example.com", "host_sync_labels": {"macbook": "Laptop-A", "mini": "daveey-mini"}}
+    assert _cli_forward(home, monkeypatch, ["forward"], cfg=cfg) == "mini"
+    (home / "coach" / "signals").mkdir(parents=True, exist_ok=True)
+    (home / "coach" / "signals" / "host-label").unlink(missing_ok=True)
+    assert _cli_forward(home, monkeypatch, ["forward"], cfg={"hub_ssh": "you@hub.example.com"}) == "daveey-mini"
+
+
 def test_probe_counts_an_answering_sshd_as_awake():
     # The hub has no plain login key for the mini: "Permission denied" still proves the host is up.
     run = lambda rc, err: (lambda argv, stdin=None: SimpleNamespace(returncode=rc, stdout="", stderr=err))  # noqa

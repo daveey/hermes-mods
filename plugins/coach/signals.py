@@ -2122,6 +2122,35 @@ def short_host() -> str:
     return os.uname().nodename.split(".")[0]
 
 
+def resolve_host(home: Path, given: Optional[str], remember: bool = False) -> str:
+    """The forwarder's host label (plugin-31f1beac2c: a manual `forward` without --host beat as the nodename while
+    the launchd feed passes --host, so one machine reported under two names). --host wins and, for `forward`, is
+    remembered in <coach>/signals/host-label (per host: selfheal-config.json is synced to every host, so it can't
+    hold one host's label). Without --host: that file, else the `host_sync_labels` key whose value is this
+    nodename, else the nodename."""
+    lp = coach_dir(home) / "signals" / "host-label"
+    if given:
+        if remember:
+            try:
+                if not lp.exists() or lp.read_text().strip() != given:
+                    lp.parent.mkdir(parents=True, exist_ok=True)
+                    lp.write_text(given + "\n")
+            except OSError:
+                pass
+        return given
+    try:
+        saved = lp.read_text().strip()
+    except OSError:
+        saved = ""
+    if saved:
+        return saved[:40]
+    node = short_host()
+    for label, sync in sorted(((config(home).get("host_sync_labels") or {}).items())):
+        if str(sync).lower() == node.lower():
+            return str(label)
+    return node
+
+
 def _self_heal():
     import importlib.util
     spec = importlib.util.spec_from_file_location("_coach_self_heal_signals", SELF_DIR / "self_heal.py")
@@ -2197,7 +2226,7 @@ def forward(home: Path, host: str, hub: str, runner: Optional[Callable] = None, 
     sigs = collect(home, cur, host, now)
     cfg = cfg if cfg is not None else config(home)
     beat = {"kind": "heartbeat", "host": host, "at": now or time.time(), "n": len(sigs),
-            "reach": reach_target(cfg, host, home)}
+            "reach": reach_target(cfg, host, home), "node": short_host()}
     payload = "".join(json.dumps(s) + "\n" for s in [beat] + sigs)
     run = runner or (lambda argv, stdin: subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=90))
     try:
@@ -2293,7 +2322,8 @@ def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
                 continue
             if isinstance(s, dict) and s.get("kind") == "heartbeat" and s.get("host"):
                 beats[str(s["host"])[:40]] = {"at": now, "n": s.get("n"),
-                                              **({"reach": str(s["reach"])[:120]} if s.get("reach") else {})}
+                                              **({"reach": str(s["reach"])[:120]} if s.get("reach") else {}),
+                                              **({"node": str(s["node"])[:80]} if s.get("node") else {})}
                 continue
             if not isinstance(s, dict) or not s.get("fp") or s.get("kind") not in KINDS + ("collector",):
                 continue
@@ -2311,6 +2341,24 @@ def ingest(home: Path, text: str, now: Optional[float] = None) -> int:
         tmp.write_text(json.dumps(hosts, indent=1))
         tmp.replace(hp)
     return n
+
+
+def _drop_stale_hosts(hp: Path, names: List[str], now: float) -> None:
+    """Remove alias entries from hosts.json, re-reading first so a heartbeat ingested meanwhile is kept (an entry
+    that beat again since the sweep read it is no longer stale and stays)."""
+    try:
+        hosts = json.loads(hp.read_text())
+    except Exception:
+        return
+    kept = {h: v for h, v in hosts.items()
+            if not (h in names and now - float((v or {}).get("at") or 0) > SILENT_S)}
+    if kept != hosts:
+        try:
+            tmp = hp.with_suffix(".tmp")
+            tmp.write_text(json.dumps(kept, indent=1))
+            tmp.replace(hp)
+        except OSError:
+            pass
 
 
 def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[Callable] = None) -> List[dict]:
@@ -2339,10 +2387,24 @@ def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[
     for h, v in hosts.items():
         if isinstance(v, dict) and v.get("reach"):
             by_reach.setdefault(str(v["reach"]), []).append(h)
+    # plugin-31f1beac2c: one machine beating under two labels (a manual `forward` with no --host used the nodename,
+    # the feed passes --host). A heartbeat's `node` is its machine's nodename, so a silent entry whose node a fresh
+    # entry also carries is the same forwarder under a stale label: log it, drop it, file nothing.
+    fresh_by_node: Dict[str, str] = {}
+    for h, v in sorted(hosts.items()):
+        if isinstance(v, dict) and v.get("node") and now - float(v.get("at") or 0) <= SILENT_S:
+            fresh_by_node.setdefault(str(v["node"]), h)
+    aliases = []
     for h, v in sorted(hosts.items()):
         last = float(v.get("at") or 0)
         age = now - last
         if age <= SILENT_S:
+            continue
+        alias_of = fresh_by_node.get(str(v.get("node") or "")) if v.get("node") else None
+        if alias_of and alias_of != h:
+            _coach_log(home, {"event": "forwarder_silent_alias", "ts": now, "host": h, "alias_of": alias_of,
+                              "node": v.get("node"), "reach": v.get("reach"), "age_h": round(age / 3600, 1)})
+            aliases.append(h)
             continue
         reach = v.get("reach")
         last_s = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(last))
@@ -2387,6 +2449,8 @@ def silent_forwarders(home: Path, now: Optional[float] = None, prober: Optional[
                     "details": f"last heartbeat {last_s}{note}; the forwarder rides on that host's launchd coach "
                                f"feed (coach_feed.py, every 30 min) and ssh to the hub",
                     "fp": fp("plugin", "forwarder-silent", h)})
+    if aliases:
+        _drop_stale_hosts(sig_dir / "hosts.json", aliases, now)
     if new_state != state:
         try:
             tmp = sp.with_suffix(".tmp")
@@ -2493,7 +2557,7 @@ def main(argv=None) -> int:
     sub.add_parser("route-monitor")
     a = ap.parse_args(argv)
     home = Path(a.home).expanduser()
-    host = a.host or short_host()
+    host = resolve_host(home, a.host, a.cmd == "forward")
     if a.cmd == "sweep":
         res = sweep(home, host, m=a.mode)
         for ln in _summ(res) if not a.verbose else [json.dumps(r)[:400] for r in res]:
