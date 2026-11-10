@@ -72,7 +72,11 @@ STILL_BROKEN_RE = re.compile(
     r"|(didn'?t|did not|doesn'?t|does not|still can'?t) (work|fix|help|change|load|show)\w*|not working|isn'?t working"
     r"|no change|nothing changed|broken again|again (broken|failing)|keeps? (failing|crashing|breaking))")
 # Hermes-written user-role messages: "[IMPORTANT: ...", "[System note: ...", "[ASYNC DELEGATION ...", turn-cap notices.
-SYNTHETIC_RE = re.compile(r"^\s*(\[[A-Z][A-Za-z -]{2,40}(:|\]| —)|You've reached the maximum number of tool-calling)")
+# Also core's held-draft notice (agent/pre_final_gate.HELD_NOTICE, which held_nudge() puts before every held nudge)
+# and the coach's own lowercase "[coach]" nudge rows (agent-71a1e1fdca); tests/test_selfheal_synthetic_tags.py
+# builds the row from core's held_nudge() so a reworded notice goes red.
+SYNTHETIC_RE = re.compile(r"^\s*(\[[A-Z][A-Za-z -]{2,40}(:|\]| —)|You've reached the maximum number of tool-calling"
+                          r"|\[runtime\] Your draft above was NOT shown|(?i:\[coach\]))")
 OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
 
 

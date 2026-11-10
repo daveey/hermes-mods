@@ -164,3 +164,80 @@ def test_core_notice_tags_are_synthetic():
     """Hermes core (not in this repo) writes [kanban] notifier notices and [runtime] pre-final-gate notices."""
     for tag in ("kanban", "runtime", "owner-wake", "coach", "chat-closeout"):
         assert sh.SYNTHETIC_RE.match(f"[{tag}] notice"), tag
+
+
+# ── agent-71a1e1fdca: a held-draft notice row filed BEFORE the classifier fix must not become a fix card ──
+# Hub message 935839 (session 20261031_064316_d54356): core's held_nudge() row, "[runtime] ... NOT shown" + the
+# coach nudge, was filed as David's complaint on 11-09 (before f8d40bd5 taught SYNTHETIC_RE the [runtime] tag), then
+# proposed, then auto-approved 17 h later: pending/file re-checks withdrew its siblings, but fix admission never did.
+HELD_ROW = ("[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its full "
+            "content; don't refer to it as 'above'.\n\n[coach] Your message ends on a problem you could fix (offline "
+            "placeholder rendering still needs the existing client acceptance checks.)")
+# Pinned copy of core's agent/pre_final_gate.HELD_NOTICE; test_held_notice_contract compares it when core is present.
+PINNED_HELD_NOTICE = ("[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its "
+                      "full content; don't refer to it as 'above'.")
+
+
+def _core_held_nudge():
+    try:
+        from agent.pre_final_gate import HELD_NOTICE, held_nudge  # type: ignore
+    except Exception:
+        return None, None
+    return HELD_NOTICE, held_nudge
+
+
+def test_held_notice_contract():
+    """Built from core's real held_nudge() output (or the pinned notice when core is absent): every coach classifier
+    treats the row as Hermes-written. Core rewording the notice turns the pinned comparison red."""
+    notice, held_nudge = _core_held_nudge()
+    if notice is not None:
+        assert notice == PINNED_HELD_NOTICE, "core HELD_NOTICE changed: update PINNED_HELD_NOTICE and re-check"
+        row = held_nudge("[coach] The reply is still not fixed; rerun the acceptance check.", shown=False)
+    else:
+        row = f"{PINNED_HELD_NOTICE}\n\n[coach] The reply is still not fixed; rerun the acceptance check."
+    assert sh.prefilter(row) is False
+    assert sh.synthetic_user_row({"source": "backstop", "quote": row}) is True
+    # core.py: the still-broken counter and the curriculum must skip it too (core.py:75 had only capitalised tags).
+    assert core.is_still_broken(row) is False
+    assert core.SYNTHETIC_RE.match(row)
+
+
+def test_core_skips_coach_nudge_rows_but_not_user_text():
+    assert core.is_still_broken("[coach] still not working: rerun it") is False
+    assert core.is_still_broken("[ui] the button is still broken") is True
+    assert core.is_still_broken("it is still broken") is True
+    assert sh.prefilter("[ui] the button is broken") is True
+
+
+def test_fix_admission_withdraws_a_proposed_synthetic_row(tmp_path):
+    """A defect whose detection quote is Hermes-written (by today's classifier) never gets a fix card."""
+    store = core.Store(tmp_path / "coach")
+    fp = "agent-71a1e1fdca"
+    store.log({"event": "selfheal_detect", "mode": "live", "session_id": "20261031_064316_d54356",
+               "source": "backstop", "fingerprint": fp, "evidence": HELD_ROW})
+    sh.LaneState(store.root).update(fp, status="proposed", component="agent", card="t_inv",
+                                    symptom="Left actionable acceptance checks without follow-up")
+    calls = []
+
+    def runner(argv, **kw):
+        calls.append(argv)
+        raise AssertionError(f"no command may run: {argv[:4]}")
+
+    ok = lambda board=None, now=None: {"usd": 1.0, "cap": 25.0, "running": 0, "ok_usd": True,
+                                         "ok_running": True, "why": ""}
+    res = sh.file_fix(fp, store=store, runner=runner, now=1000.0, budget_fn=ok, trigger="auto")
+    assert res["action"] == "skip" and res["why"] == "synthetic_tag", res
+    assert not calls
+    assert sh.LaneState(store.root).get(fp)["status"] == "not_defect"
+    rows = [json.loads(ln) for ln in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert any(r.get("event") == "selfheal_withdrawn" and r.get("fingerprint") == fp
+               and r.get("stage") == "fix" for r in rows)
+
+
+def test_fix_admission_keeps_a_real_complaint(tmp_path):
+    store = core.Store(tmp_path / "coach")
+    fp = "agent-realcompl1"
+    store.log({"event": "selfheal_detect", "source": "backstop", "fingerprint": fp,
+               "evidence": "it is still broken after your fix"})
+    sh.LaneState(store.root).update(fp, status="proposed", component="agent", card="t_inv", symptom="x")
+    assert sh._synthetic_fix_row(store, fp) is False

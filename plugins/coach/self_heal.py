@@ -3919,6 +3919,16 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         return {"action": "error", "why": f"not a fingerprint: {fp!r}"}
     if st.get("fix_card") and st.get("status") in ("approved", "fixed"):
         return {"action": "skip", "why": f"fix card exists: {st['fix_card']}", "card": st["fix_card"]}
+    if _synthetic_fix_row(store, fp):
+        # Filed before the classifier knew the quote's tag (agent-71a1e1fdca: a "[runtime] ... NOT shown" row filed
+        # 11-09 06:21, f8d40bd5 at 13:48, auto-approved 17 h later): the pending/file passes withdraw such rows, but
+        # one already proposed reached here. Withdraw it now; a fix card would only re-diagnose Hermes's own text.
+        rec = _detect_record(store, fp)
+        lane.update(fp, status="not_defect", closed_at=now)
+        store.log({"event": "selfheal_withdrawn", "mode": "live", "fingerprint": fp, "why": "synthetic_tag",
+                   "stage": "fix", "source": rec.get("source"), "session_id": rec.get("session_id"),
+                   "quote": str(rec.get("evidence") or rec.get("quote") or "")[:200]})
+        return {"action": "skip", "why": "synthetic_tag"}
     r = route({"component": st.get("component")})
     key = fix_key(fp, generation(st) or 1)
     args = {"title": f"{FIX_TITLE} {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
@@ -4169,6 +4179,12 @@ def _detect_record(store, fp: str) -> dict:
     except OSError:
         pass
     return best
+
+
+def _synthetic_fix_row(store, fp: str) -> bool:
+    """The defect's detection quote (newest selfheal_detect/filed row) is Hermes-written by today's classifier."""
+    rec = _detect_record(store, fp)
+    return synthetic_user_row({"source": rec.get("source"), "quote": rec.get("evidence") or rec.get("quote") or ""})
 
 
 def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optional[float] = None,
