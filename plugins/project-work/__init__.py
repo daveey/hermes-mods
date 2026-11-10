@@ -389,6 +389,35 @@ def _check_tool_mount(volume, tool_dir):
         raise refuse
 
 
+def in_profile_scope(home, fn):
+    """Call ``fn`` with ``home`` bound as the Hermes home and its terminal policy freshly read.
+
+    Uses core's per-profile seams (``hermes_constants.set_hermes_home_override`` and
+    ``tools.terminal_scope.build_profile_terminal_scope``/``set_terminal_scope``), the same pair
+    ``gateway.run._profile_runtime_scope`` installs for a turn, minus the secret scope the gate
+    never reads. Fails closed: a core without them, or a policy that cannot be read, refuses.
+    """
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.terminal_scope import build_profile_terminal_scope, reset_terminal_scope, set_terminal_scope
+    except ImportError as exc:
+        raise PermissionError('Project work cannot bind its profile scope on this Hermes core') from exc
+    home_token = set_hermes_home_override(str(home))
+    try:
+        try:
+            # Under the home override: the managed-scope overlay is read for the current home.
+            policy = build_profile_terminal_scope(Path(home))
+        except Exception as exc:
+            raise PermissionError('Project work cannot read its profile terminal policy') from exc
+        scope_token = set_terminal_scope(policy)
+        try:
+            return fn()
+        finally:
+            reset_terminal_scope(scope_token)
+    finally:
+        reset_hermes_home_override(home_token)
+
+
 def register(ctx):
     from hermes_constants import get_hermes_home
     home = Path(get_hermes_home())
@@ -400,7 +429,11 @@ def register(ctx):
     # gateway has bound this profile before authorizing each individual turn.
     client = Client(endpoint)
     queue = DurableIngressQueue(endpoint.parent / 'ingress.sqlite3', client)
-    ingress = Ingress(policy, client, queue, gate=require_sandbox)
+    # Tool calls run inside core's per-turn profile scope, rebuilt for every turn. The native Slack
+    # middleware does not: it only inherits the ContextVars the Socket Mode task was created with
+    # at connect(), a snapshot that never sees later config edits. Re-read THIS profile's policy.
+    ingress = Ingress(policy, client, queue, gate=require_sandbox,
+                      ingress_gate=lambda: in_profile_scope(home, require_sandbox))
     def wire(native, adapter):
         native.use(ingress.middleware)
     ctx.register_platform_handler('slack', wire)

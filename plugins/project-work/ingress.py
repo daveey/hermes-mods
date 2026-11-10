@@ -26,12 +26,17 @@ NOTICES = {
 
 
 class Ingress:
-    def __init__(self, policy, client, queue=None, gate=None):
+    def __init__(self, policy, client, queue=None, gate=None, ingress_gate=None):
         self.policy, self.client = policy, client
         self.queue = queue
         # Re-run at every tool call: a skill or mount that appears after register() (a git pull, a
         # hub install) would otherwise go unaudited for the gateway's lifetime.
         self.gate = gate
+        # Re-run at every native Slack event, before anything is observed, queued or answered: the
+        # same drift (e.g. a docker_forward_env added after register()) must close ingress too, not
+        # only the tools. register() binds it to the registered profile's freshly read policy,
+        # because the Bolt middleware runs in whatever context the Socket Mode task inherited.
+        self.ingress_gate = ingress_gate if ingress_gate is not None else gate
         self.events = OrderedDict()
         self.lock = threading.Lock()
 
@@ -150,8 +155,24 @@ class Ingress:
                 '(type=%s subtype=%s bot=%s)', ev.get('ts'), ev.get('type'),
                 ev.get('subtype'), bool(ev.get('bot_id')))
 
+    def admit(self):
+        """Run the sandbox gate for one native event. False = refused (one WARNING, no side effect)."""
+        if self.ingress_gate is None:
+            return True
+        try:
+            self.ingress_gate()
+        except Exception as exc:
+            # Reason class only: gate messages can name host paths, and the event body is untrusted.
+            log.warning('Project ingress refused: sandbox gate failed (%s); event not observed, '
+                        'queued or answered', type(exc).__name__)
+            return False
+        return True
+
     def enqueue(self, body):
         """Queue an authenticated command. Returns a thread notice to send, or None."""
+        # Gate FIRST: a refusal must leave no observe entry, queue row or notice behind.
+        if not self.admit():
+            return None
         ctx = self.observe(body) if isinstance(body, dict) else None
         if ctx is None:
             self.log_ignored(body)
