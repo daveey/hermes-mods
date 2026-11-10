@@ -1324,7 +1324,13 @@ OWNER_READ_SHELL_FORMS = {
     "kanban_cli": re.compile(r"\bhermes\s+kanban\b[^\n;|&]*\b(?:show|list|ls|tail|log|runs)\b"),
     "board_sql": re.compile(r"\bsqlite3\b[^\n]*kanban[\w./-]*\.db|kanban[\w./-]*\.db[^\n]*\bsqlite3\b", re.I),
     "worker_ps": re.compile(r"\bps\b[^\n|;]*\s-[\w]*p\b|\bpgrep\b|/proc/\$?\{?\w+\}?/(?:stat|status|cmdline)\b"),
+    # agent-a8184f8541: another gateway's cards, read on the hub (its replica of every board) or through the
+    # dispatcher's own probe. Read-only by construction (neither command writes a card).
+    "hub_tasks": re.compile(r"\bhermes-hub\s+tasks\b|\bhermes\s+kanban\s+wait-check\s+task\b"),
 }
+# A `hermes-hub tasks ... > <file>` read names no card; a later call that filters <file> by card id completes it.
+_SAVED_READ_RE = re.compile(r"\bhermes-hub\s+tasks\b[^\n;|&]*?>\s*['\"]?([\w./~-]+)")
+_WAIT_CHECK_RE = re.compile(r"\bhermes\s+kanban\s+wait-check\s+task\s+(t_[0-9a-f]{6,})\b")
 _CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{6,}\b")
 _ANY_SQL_WRITE_RE = re.compile(r"\b(?:UPDATE\s+\w+\s+SET|INSERT\s+(?:OR\s+\w+\s+)?INTO|DELETE\s+FROM|REPLACE\s+INTO|"
                                r"DROP\s+TABLE|ALTER\s+TABLE|VACUUM)\b", re.I)
@@ -1336,9 +1342,27 @@ def _shell_text(name: str, a: dict) -> str:
     return str(a.get("command") or "") if name == "terminal" else str(a.get("code") or "")
 
 
-def owner_read_forms(tool: str, args: Any) -> list:
+def saved_read_files(tool: str, args: Any) -> list:
+    """File names a `hermes-hub tasks ... > <file>` call saved its card list to (agent-a8184f8541)."""
+    name = (tool or "").rsplit("__", 1)[-1]
+    if name != "terminal":
+        return []
+    return [Path(m.group(1)).name for m in _SAVED_READ_RE.finditer(_shell_text(name, args or {}))]
+
+
+def wait_check_not_yet(tool: str, args: Any, result: Any) -> bool:
+    """`hermes kanban wait-check task <id>` exits 1 for "not yet" and prints `<id> <status>`: a read, not a failure."""
+    name = (tool or "").rsplit("__", 1)[-1]
+    m = _WAIT_CHECK_RE.search(_shell_text(name, args or {})) if name == "terminal" else None
+    d = _as_dict(result) if m else None
+    return bool(m and d and d.get("exit_code") == 1 and re.match(
+        re.escape(m.group(1)) + r"\s+[a-z_-]+\s*$", str(d.get("output") or "").strip()))
+
+
+def owner_read_forms(tool: str, args: Any, saved: Any = ()) -> list:
     """Names of OWNER_READ_SHELL_FORMS a terminal/execute_code call uses to read a card's state ([] when it is not a
-    read-only look at a named card or board)."""
+    read-only look at a named card or board). `saved`: files an earlier hub_tasks read saved this session; a call
+    that names a card and reads one of them is a hub_tasks read too (agent-a8184f8541)."""
     name = (tool or "").rsplit("__", 1)[-1]
     a = args if isinstance(args, dict) else {}
     if name not in ("terminal", "execute_code"):
@@ -1352,10 +1376,13 @@ def owner_read_forms(tool: str, args: Any) -> list:
     forms = [k for k, rx in OWNER_READ_SHELL_FORMS.items() if rx.search(text)]
     if name == "execute_code" and not forms and KANBAN_DB_RE.search(text) and re.search(r"\bsqlite3\b", text):
         forms = ["board_sql"]
+    if not forms and _CARD_ID_RE.search(text) and any(
+            f and re.search(r"(?<![\w.-])" + re.escape(f) + r"(?![\w-])", text) for f in saved or ()):
+        forms = ["hub_tasks"]
     return forms
 
 
-def owner_read_call(tool: str, args: Any) -> bool:
+def owner_read_call(tool: str, args: Any, saved: Any = ()) -> bool:
     name = (tool or "").rsplit("__", 1)[-1]
     a = args if isinstance(args, dict) else {}
     if name in OWNER_READ_TOOLS:
@@ -1365,7 +1392,7 @@ def owner_read_call(tool: str, args: Any) -> bool:
     if name == "terminal" and (_OWNER_READ_CLI.search(str(a.get("command") or ""))
                                or _LIST_READ_CLI.search(str(a.get("command") or ""))):
         return True
-    return bool(owner_read_forms(name, a))
+    return bool(owner_read_forms(name, a, saved))
 
 
 _BOARD_STATUS_RE = re.compile(r"(?<![\w-])(running|ready|todo|blocked|done|archived|triage|scheduled|review)(?![\w-])")
@@ -1467,6 +1494,9 @@ def _tasks_in(obj: Any, depth: int = 0) -> list:
         return []
     if isinstance(obj, str):
         s = obj.strip()
+        if s[:1] not in "{[":  # a short text head before the JSON (agent-a8184f8541: a filter printing `list`)
+            m = re.search(r"^[\[{]", s[:200], re.M)
+            s = s[m.start():] if m else ""
         if s[:1] in "{[":
             try:
                 return _tasks_in(json.loads(s), depth + 1)
@@ -1535,7 +1565,8 @@ def _first_ts(d: dict, keys: tuple) -> Optional[float]:
 
 def _task_summary(task: dict, runs: list, events: list, now: float) -> str:
     parts = [f"task={task.get('id')}" if task.get("id") else "", f"status={task.get('status')}"]
-    runs = [r for r in runs if isinstance(r, dict)]
+    # `hermes-hub tasks` records carry one `run` dict, no runs/events list (agent-a8184f8541)
+    runs = [r for r in runs if isinstance(r, dict)] or ([task["run"]] if isinstance(task.get("run"), dict) else [])
     state = None
     if runs:
         # newest by time when runs carry one, else by id (cross_task lists them oldest first, untimed)
@@ -1549,6 +1580,13 @@ def _task_summary(task: dict, runs: list, events: list, now: float) -> str:
     if evs:
         at, _, e = max(evs, key=lambda tie: tie[:2])  # same-second events: the later-listed one is newer
         parts.append(f"last={e.get('kind')} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(at))} ({_ago(now - at)} ago)")
+    elif task.get("_gw") or task.get("gw"):  # a `hermes-hub tasks` record: its newest lifecycle stamp
+        stamps = [(t, k) for k in ("created", "started", "completed") for t in [_ts(task.get(f"{k}_at"))]
+                  if t and t <= now + 120]
+        if stamps:
+            at, kind = max(stamps)
+            parts.append(f"last={kind} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(at))} ({_ago(now - at)} ago)")
+        parts.append(f"gw={task.get('_gw') or task.get('gw')}")
     if str(task.get("status")) == "scheduled" and task.get("id"):
         parts.append(_card_probe_text(str(task["id"]), now))  # agent-61b50f34ae: is its wake probe still running?
     return " ".join(p for p in parts if p)
@@ -1670,6 +1708,31 @@ def board_dbs() -> list:
     return [str(p) for p in paths if p.is_file()]
 
 
+def shadow_dbs() -> list:
+    """This host's replicas of other gateways' boards (agent-a8184f8541): the hub keeps one per board under
+    <kanban home>/kanban/sync-shadow/<board>.db (created_on names the card's home gateway). COACH_SHADOW_DBS
+    (os.pathsep list) overrides; a COACH_BOARD_DBS override without it reads none, so tests and replays never see
+    this host's real replicas."""
+    env = os.environ.get("COACH_SHADOW_DBS")
+    if env is not None:
+        return [p for p in env.split(os.pathsep) if p and Path(p).is_file()]
+    if os.environ.get("COACH_BOARD_DBS") is not None:
+        return []
+    root = None
+    if os.environ.get("HERMES_KANBAN_HOME"):
+        root = Path(os.environ["HERMES_KANBAN_HOME"])
+    else:
+        try:
+            from hermes_cli import kanban_db  # type: ignore
+            root = Path(kanban_db.kanban_home())
+        except Exception:
+            root = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    try:
+        return [str(p) for p in sorted((root / "kanban" / "sync-shadow").glob("*.db")) if p.is_file()]
+    except OSError:
+        return []
+
+
 def _board_connect(path: str):
     import sqlite3
     try:
@@ -1684,10 +1747,24 @@ def _board_connect(path: str):
 
 def board_card_facts(card_id: str, now: Optional[float] = None, dbs: Optional[list] = None) -> Optional[dict]:
     """A card's state on this host's boards as of `now` (events after `now` are ignored, for replays):
-    {id, status, created_at, claimed_at, last_kind, last_at, run, run_failed, waits_on: [(id, status, age_s)]}.
-    None when no board has the card or every read fails."""
+    {id, status, created_at, claimed_at, last_kind, last_at, run, run_failed, waits_on: [(id, status, age_s)],
+    replica, home}. With `dbs` None, a card on no local board is looked up in this host's replicas of other
+    gateways' boards (shadow_dbs; replica=True, home=<created_on>). None when no board has the card or every
+    read fails."""
     now = time.time() if now is None else now
-    for path in (board_dbs() if dbs is None else dbs):
+    if dbs is not None:
+        return _card_facts_in(card_id, now, dbs, replica=False)
+    facts = _card_facts_in(card_id, now, board_dbs(), replica=False)
+    if facts is None:
+        try:
+            facts = _card_facts_in(card_id, now, shadow_dbs(), replica=True)
+        except Exception:
+            facts = None
+    return facts
+
+
+def _card_facts_in(card_id: str, now: float, paths: list, replica: bool) -> Optional[dict]:
+    for path in paths:
         try:
             conn = _board_connect(path)
         except Exception:
@@ -1721,11 +1798,19 @@ def board_card_facts(card_id: str, now: Optional[float] = None, dbs: Optional[li
             waits.sort(key=lambda w: (rank.get(w[1], len(rank)), w[2] if w[2] is not None else 1e18))
             run_state = str(run[0]) if run and run[0] else None
             probe = _wake_probe(conn, card_id, now) if str(row[0]) == "scheduled" else None
+            home = None
+            if replica:
+                try:
+                    h = conn.execute("select created_on from tasks where id=?", (card_id,)).fetchone()
+                    home = str(h[0]) if h and h[0] else None
+                except Exception:
+                    home = None
             return {"id": card_id, "status": str(row[0]), "created_at": _ts(row[1]),
                     "claimed_at": _ts(cl[0]) if cl and cl[0] else None,
                     "last_kind": str(ev[0]) if ev else None, "last_at": _ts(ev[1]) if ev else None,
                     "run": run_state, "run_failed": bool(run_state and _FAILED_RUN_RE.search(run_state)),
-                    "waits_on": waits[:BOARD_MAX_PARENTS], "probe": probe, "db": str(path)}
+                    "waits_on": waits[:BOARD_MAX_PARENTS], "probe": probe, "db": str(path),
+                    "replica": replica, "home": home}
         except Exception:
             continue
         finally:
@@ -1815,6 +1900,8 @@ def board_fact_line(facts: dict, now: Optional[float] = None) -> str:
     if pr:
         parts.append(pr)
     w = _waits_text(facts)
+    if facts.get("replica"):  # agent-a8184f8541: read from this host's replica of the card's home board
+        w = (w + " " if w else "") + f"home={facts.get('home') or '?'} (replica)"
     return (f"{BOARD_LINE_PREFIX} " + " ".join(parts) + (f" {w}" if w else ""))[:OK_LINE_MAX]
 
 
@@ -1894,8 +1981,10 @@ def session_result_line(tool: str, args: Any, result: Any, now: Optional[float] 
 
 
 
-def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None) -> Optional[str]:
-    """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls."""
+def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None,
+                      saved: Any = ()) -> Optional[str]:
+    """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls. `saved`: files an
+    earlier `hermes-hub tasks ... > <file>` call of this session wrote (owner_read_forms)."""
     session = session_result_line(tool, args, result, now)
     if session:
         return session
@@ -1909,7 +1998,7 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
             return subagent_steer_line(args, result)
         except Exception:
             return None
-    if not owner_read_call(tool, args):
+    if not owner_read_call(tool, args, saved):
         return None
     now = time.time() if now is None else now
     if list_read_call(tool, args):
@@ -1929,7 +2018,7 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
             m = re.search(r"^\s*status:\s+(\S+)", text, re.M)
             name = (tool or "").rsplit("__", 1)[-1]
             a = args if isinstance(args, dict) else {}
-            if not m and owner_read_forms(name, a):
+            if not m and owner_read_forms(name, a, saved):
                 cards = list(dict.fromkeys(_CARD_ID_RE.findall(_shell_text(name, a))))
                 body = _with_board_facts(_raw_owner_body(text, cards, now), cards, now)
             else:
@@ -2225,13 +2314,17 @@ class AgentCoach:
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
         if tool == "terminal" and "commit" in arg and "git" in arg:
             s.setdefault("turn_commits", deque(maxlen=20)).append(f"-> terminal({arg[:8000]})")
-        if failed(tool, result, status):
+        if failed(tool, result, status) and not wait_check_not_yet(tool, args, result):
             s["turn_log"].append(f"   <- ERROR {str(result)[:120]}")
         else:
-            ok = owner_result_line(tool, args, result)
+            ok = owner_result_line(tool, args, result, saved=s.get("owner_read_files") or ())
             if ok:  # what a successful owner check found, for the report_only judges (agent-9516de5af8)
                 s["turn_log"].append(ok)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(ok)
+            files = saved_read_files(tool, args)
+            if files:  # a hub card list saved for a later filter by card id (agent-a8184f8541)
+                kept = s.setdefault("owner_read_files", deque(maxlen=8))
+                kept.extend([f for f in files if f not in kept])
             linked = linked_parents(tool, args)
             if linked:  # parents a dependency park this turn waits on (agent-b04f510c13)
                 s.setdefault("turn_linked", []).extend(p for p in linked if p not in s.get("turn_linked", []))

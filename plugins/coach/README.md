@@ -334,6 +334,21 @@ writes and unrelated reads get no line); detection guard
 `test_every_owner_read_shell_form_has_a_real_format_fixture` (every form in `OWNER_READ_SHELL_FORMS` needs a fixture).
 Replay of the incident through the real second-opinion judge: 0.9/0.1 → 0.1 (3/3).
 
+**Owners on another gateway's board (self-heal agent-a8184f8541, 2026-11-06).** A hub worker handed the rest of its
+card to a comment-only card it had just filed on the MacBook board (ready, 12 min old) and read it with
+`hermes-hub tasks --gw macbook --all --json > macbook-tasks.json` plus a python filter of that file by card id
+(cross_task was down). Neither call was a known owner read, and the coach's own board read covered only this host's
+boards, so both judges held the true hand-off (0.9). Now: `OWNER_READ_SHELL_FORMS` has `hub_tasks` (`hermes-hub tasks`,
+`hermes kanban wait-check task <id>`; a wait-check "not yet" exit 1 still writes the OK line); a `hermes-hub tasks …
+> <file>` call that names no card is remembered, and a later call naming a card that reads `<file>` counts as the read.
+Its OK line takes the record's single `run`, the newest created/started/completed stamp as `last=` and `gw=<gateway>`.
+`board_card_facts` (with no explicit `dbs`) falls back to this host's replicas of other gateways' boards,
+`<kanban home>/kanban/sync-shadow/*.db` (`agent_rules.shadow_dbs`; `COACH_SHADOW_DBS` overrides, and a
+`COACH_BOARD_DBS` override without it reads none), and the `<- BOARD` line ends `home=<created_on> (replica)`, which
+`BOARD_OWNER` counts like a local line. `report_only_scored` gains `owner_source` (`ok`|`board`|`replica`|`none`).
+Tests: `tests/test_report_only_cross_gateway_owner.py`. Replay of the real turn (hub state.db msgs 969739–969847)
+through the second opinion: 0.9 → 0.1.
+
 **Board list reads show the open cards (agent-5f2ca3a822).** After an "M3 done" notice the agent ran
 `kanban_list(board=…)`, saw M4 running with its review and deploy cards queued, and said so; the outcome judge held the
 rewrite at 0.88 ("kanban_list has no result"): list reads wrote no `<- OK` line. A successful list read

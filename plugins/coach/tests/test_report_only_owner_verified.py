@@ -252,6 +252,9 @@ OWNER_READ_SHELL_FIXTURES = {
     "kanban_cli": ("terminal", {"command": f"hermes kanban --board runners list | grep {CARD}"},
                    # a list read gets the `<- OK list: <id>=<status>` form (agent-5f2ca3a822)
                    lambda now: f"{CARD}  running  default  fix the collapsed arm", (f"{CARD}=running",)),
+    # agent-a8184f8541: another gateway's card, through the dispatcher's own probe (`<id> <status>`)
+    "hub_tasks": ("terminal", {"command": f"hermes kanban wait-check task {CARD} --gateway macbook"},
+                  lambda now: f"{CARD} running\n", ("status=running",)),
 }
 OWNER_READ_EXEC_FIXTURE = (
     "execute_code", {"code": f"import sqlite3\nc = sqlite3.connect('/h/.hermes/kanban.db')\n"

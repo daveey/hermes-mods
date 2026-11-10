@@ -392,7 +392,8 @@ def closed_owner(reply: str, card_status: Optional[Callable[[str], Optional[str]
 # agent's own reads, so a true "that card is running now" with no read this turn failed (p 0.9) and a false one got no
 # counter-evidence. For up to NAMED_CARD_MAX cards the reply's ending names that no `<- OK` line read, the coach reads
 # this host's boards itself and both judge prompts get one `<- BOARD ...` line per card (agent_rules.board_fact_line).
-# Cards on another gateway's board are not found and add nothing (the old behaviour).
+# agent-a8184f8541: a card on no local board is read from this host's replica of its home gateway's board
+# (kanban/sync-shadow/*.db on the hub); its line ends `home=<gw> (replica)`. Cards on no board add nothing.
 NAMED_CARD_MAX = 4
 NAMED_CARD_RE = re.compile(r"\bt_[0-9a-f]{8,}\b")
 _DQUOTES = "\"“”"
@@ -443,13 +444,30 @@ def named_card_facts(reply: str, tool_log: Optional[list] = None, now: Optional[
         return []
 
 
+def owner_source(reply: str, tool_log: Optional[list] = None, board: Optional[list] = None) -> str:
+    """Where report_only's owner evidence for the cards the reply names came from (telemetry, agent-a8184f8541):
+    `ok` (an `<- OK` line of the turn's own read), `board` / `replica` (the coach's own read of this host's board /
+    of its replica of another gateway's board), or `none`."""
+    named = list(dict.fromkeys(NAMED_CARD_RE.findall((reply or "")[-1500:])))
+    if not named:
+        return "none"
+    if any(_read_this_turn(cid, [l for l in tool_log or [] if (l or "").lstrip().startswith("<- OK")])
+           for cid in named):
+        return "ok"
+    lines = named_card_facts(reply, tool_log) if board is None else list(board)
+    if any("(replica)" in l for l in lines):
+        return "replica"
+    return "board" if lines else "none"
+
+
 def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = None) -> str:
     """The prompt section with the coach's own board read ("" when it has no lines). `board=None` reads now."""
     lines = named_card_facts(reply, tool_log) if board is None else list(board)
     if not lines:
         return ""
-    return ("COACH'S OWN BOARD READ (this host's Kanban boards, read just now for cards the final message names "
-            "that the tool log did not read; counts as a check of these cards this turn):\n"
+    return ("COACH'S OWN BOARD READ (this host's Kanban boards and its replicas of other gateways' boards, read just "
+            "now for cards the final message names that the tool log did not read; counts as a check of these cards "
+            "this turn):\n"
             + "\n".join(lines) + "\n\n")
 
 
@@ -1493,7 +1511,9 @@ STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible r
 # dependency-gated owners.
 BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the coach's own read of a card the message "
                "names, made from this host's boards when judging: count it as a check of that card this turn, the "
-               "same as an `<- OK` line. It shows status=, created= (card age), claimed= (newest claim, or never), "
+               "same as an `<- OK` line. A line ending `home=<gateway> (replica)` was read from this host's synced "
+               "copy of that gateway's board (the card lives there): it counts the same as a local one. It shows "
+               "status=, created= (card age), claimed= (newest claim, or never), "
                "run= (newest run state) and last=<age>(<event>). The named card is a started owner when it is "
                "running or claimed with its last event under 24 h; or ready or todo, created under 24 h ago, with "
                "no failed, crashed or timed_out run; or todo, scheduled or blocked on a dependency with `waits_on=` "
@@ -2551,13 +2571,15 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                   and v["report_only"] >= th_ro)
     if audit is not None and "report_only" in cands:
         try:
+            named_board = named_card_facts(reply, tool_log) or []
             audit({"event": "report_only_scored", "screen_p": screen_p,
                    "confirm_attempted": confirm_attempted, "floor": confirm_floor,
                    "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
                    "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
                    "owner_probe_live": bool(owner_probe_live(reply, list(tool_log or []) + list(
-                       named_card_facts(reply, tool_log) or []), user_ask)),
+                       named_board), user_ask)),
+                   "owner_source": owner_source(reply, tool_log, board=named_board),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
                    **({"elapsed_s": budget_elapsed()} if budget_elapsed() is not None else {}),
