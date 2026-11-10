@@ -153,8 +153,7 @@ uv run --with pytest python -m pytest -q -p no:cacheprovider skills/devops/kanba
 
 ## Pitfalls
 
-- A lettered menu ("Reply A, B, C or D") relayed into chat used to become four bare letter buttons in For you. user-steps now resolves each code from the reply or the named card's human_request/block reason (`explained_choices` in core.py) and drops codes it can't define. When you write a `human_request.choices` or `action_request` choice, put the meaning in the label and one plain `explain` line, and set `recommended` on your pick; never a bare code.
-
+- Never write a bare code ("A", "Option 2") as a `human_request.choices`/`action_request`/`clarify` label: put the meaning in the label, add one plain `explain` line and set `recommended` on your pick. The For you tile shows only the labels, and the letters' definitions sit in a message he can't see.
 - A `mode=ro` sqlite open can fail transiently while a writer truncates the WAL; the reader retries,
   then falls back to `query_only`.
 - Checks that read a remote DB must not `.backup` a big live database per call (tens of seconds); open
