@@ -105,6 +105,8 @@ def _price_reply(e, prefix):
 
 
 class AnthropicBackend:
+    resolved_model = None
+
     def __init__(self, client, prefix, provider, base_url, get_price):
         self.client, self.prefix, self.provider, self.base_url, self.get_price = client, prefix, provider, base_url, get_price
         self.no_think_alias = {}
@@ -201,6 +203,8 @@ def _item_texts(item):
 
 
 class CodexBackend:
+    resolved_model = None
+
     """Codex Responses wire: ONE streaming responses.create per call, instructions = system, no tools, store=False,
     no retries. `client` is an openai.OpenAI built with max_retries=0 (tests inject a fake)."""
     CHARS_PER_TOKEN = 4  # client-side output cap where the endpoint takes no max_output_tokens
@@ -327,6 +331,7 @@ def build_backend(provider, model=None):
         client = aa.build_anthropic_client(key, base, timeout=300).with_options(max_retries=0)
         oauth = bool(anthropic_route_is_oauth(base, key, provider=rt.get("provider")))
         be = AnthropicBackend(client, aa._CLAUDE_CODE_SYSTEM_PREFIX if oauth else "", rt.get("provider"), base, get_price)
+        be.resolved_model = rt.get("model") or model
         return be, {"provider": rt.get("provider"), "oauth": oauth}
     if mode == "codex_responses":
         from openai import OpenAI
@@ -335,7 +340,9 @@ def build_backend(provider, model=None):
             from agent.codex_headers import codex_cloudflare_headers
             headers = codex_cloudflare_headers(key, base_url=base)
         client = OpenAI(api_key=key, base_url=base, timeout=300, max_retries=0, default_headers=headers or None)
-        return CodexBackend(client, rt.get("provider"), base, get_price), {"provider": rt.get("provider"), "oauth": False}
+        be = CodexBackend(client, rt.get("provider"), base, get_price)
+        be.resolved_model = rt.get("model") or model
+        return be, {"provider": rt.get("provider"), "oauth": False}
     raise ValueError(f"provider {provider} uses {mode}; only anthropic_messages and codex_responses are supported")
 
 
@@ -345,11 +352,16 @@ def serve(default_provider, backends, build=build_backend, lines=None):
         try:
             req = json.loads(line)
             prov = req.get("provider") or default_provider
-            if prov not in backends:
-                backends[prov] = build(prov, req.get("model"))[0]
-            be = backends[prov]
+            key = (prov, req.get("model"))
+            if key not in backends:
+                backends[key] = backends.get(prov) or build(prov, req.get("model"))[0]
+            be = backends[key]
+            req = dict(req, model=getattr(be, "resolved_model", None) or req.get("model"))
             if req.get("op") == "price":
-                _reply(be.price(req["model"]))
+                price = be.price(req["model"])
+                if "error" not in price and getattr(be, "resolved_model", None):
+                    price = dict(price, model=req["model"], provider=be.provider)
+                _reply(price)
             elif req.get("op") == "call":
                 _reply(be.call(req))
             else:
@@ -360,14 +372,20 @@ def serve(default_provider, backends, build=build_backend, lines=None):
 
 
 def main():
-    provider = os.environ.get("COACH_EVAL_PROVIDER") or "anthropic"
-    try:
-        be, info = build_backend(provider, os.environ.get("COACH_WORKER_MODEL"))
-    except Exception as exc:
-        _reply({"fatal": str(exc)})
-        return 2
+    model = os.environ.get("COACH_WORKER_MODEL")
+    provider = os.environ.get("COACH_EVAL_PROVIDER") or ("auto" if str(model).startswith("class:") else "anthropic")
+    backends, info = {}, {}
+    # No model yet: do not pin the configured default to an unrelated provider.
+    # Explicit startup models retain eager validation and visible errors.
+    if model:
+        try:
+            be, info = build_backend(provider, model)
+            backends[(provider, model)] = be
+        except Exception as exc:
+            _reply({"fatal": str(exc)})
+            return 2
     _reply(dict(info, ready=True))
-    return serve(provider, {provider: be})
+    return serve(provider, backends)
 
 
 if __name__ == "__main__":

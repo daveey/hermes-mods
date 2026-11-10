@@ -920,16 +920,24 @@ class DirectRunner:
     def provider_for(self, model, judge):
         """Replays use COACH_EVAL_PROVIDER. The judge uses COACH_JUDGE_PROVIDER, else anthropic for a claude judge
         (so a codex-wire model is graded by the same fixed judge as every other model), else the replay provider."""
+        explicit = os.environ.get("COACH_JUDGE_PROVIDER" if judge else "COACH_EVAL_PROVIDER")
+        if explicit:
+            return explicit
+        if str(model).startswith("class:"):
+            return "auto"
         if not judge:
             return self.provider
-        return os.environ.get("COACH_JUDGE_PROVIDER") or ("anthropic" if str(model).startswith("claude") else self.provider)
+        return "anthropic" if str(model).startswith("claude") else self.provider
 
     def prepare(self, prompt, home=None, cwd=None, model=None, toolsets=None, ignore_rules=False):
         from decimal import Decimal
         r = DirectRequest()
         r.provider = self.provider_for(model, ignore_rules)
         p = self.price(model, r.provider)
-        r.model, r.user, r.price = model, prompt, p
+        # Freeze the route priced before reservation: another pooled worker must
+        # not resolve a selector to a differently priced model during dispatch.
+        r.model, r.user, r.price = p.get("model") or model, prompt, p
+        r.provider = p.get("provider") or r.provider
         r.system = JUDGE_SYSTEM if ignore_rules else compose_system(home, cwd, self.preload)
         r.max_tokens = self.judge_max_tokens if ignore_rules else self.max_tokens
         r.thinking = {"type": "disabled"} if ignore_rules else None  # the judge needs its whole budget for the JSON
