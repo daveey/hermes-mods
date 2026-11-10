@@ -13,6 +13,19 @@ Coverage: `tests/test_stranded_sqlite_retired.py` checks missing/tombstoned/live
 `tests/test_stranded_sqlite_watch.py` retains real child-process deleted-sidecar detection and mock-only filing.
 
 
+## Nonblocking profiler attachment
+
+`pre_tool_call` refuses attached `py-spy record`/`top` commands without `--nonblocking`.
+A sampling duration does not bound stop-the-world pauses when ptrace falls behind.
+Use bounded nonblocking sampling for live services; launch an isolated fixture under
+py-spy when consistent blocking snapshots are necessary. One-shot `dump` is unchanged.
+The accidental-command guard covers terminal commands, common sudo/env/nice wrappers,
+quoted SSH/shell payloads, and literal `terminal(...)` calls inside `execute_code`.
+It ignores redirection filenames and command-looking data. Dynamic Python commands,
+script contents and general shell evaluation are not covered; this is not a sandbox.
+`tests/test_profiler_safety.py` exercises both tool entry paths and the registered hook,
+with safe/non-executing controls and redirection/wrapper regressions.
+
 ## Traceback attribution
 
 Bug detection decodes JSON tool envelopes before inspecting frame paths and exception tails.

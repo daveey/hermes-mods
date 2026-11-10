@@ -381,6 +381,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     envelope_gate.assess_before_holds = True
 
     def pre_tool_call(tool_name="", args=None, session_id="", **_):
+        profiler = _load("profiler_safety")
+        if profiler.blocked(tool_name, args):
+            store.log({"event": "agent_block", "rule": "profiler_safety", "tool": tool_name})
+            return {"action": "block", "message": profiler.MESSAGE}
         if tool_name in ("kanban_block", "kanban_create", "tool_call"):
             try:
                 ce = _load("compute_envelope")
