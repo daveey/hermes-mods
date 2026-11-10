@@ -35,3 +35,18 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
 Most of the remaining space is usually live work: research artifacts, open-card workspaces, models and containers.
 When cleanups keep landing above ~80% used, the lasting fix is capacity (a David-only spend ask), not another
 deletion pass.
+
+## Growing the hub root volume (once David approves)
+
+This can be done online, with no reboot.
+
+1. The instance role `hermes-hub` cannot call `ec2:ModifyVolume`. Run the resize with the auto-tier scope, pinned
+   to the one volume:
+   `token-broker exec --scope aws.write.hermes --reason "..." --resource arn:aws:ec2:<region>:<acct>:volume/<vol> -- aws ec2 modify-volume --region <region> --volume-id <vol> --size <GiB>`.
+2. Don't poll `describe-volumes-modifications`. The instance role is denied that call too. `lsblk -no SIZE /dev/nvme0n1`
+   shows the new size within seconds.
+3. `sudo parted -s /dev/nvme0n1 unit s print`: the root partition must be the last one on the disk (on the hub it is
+   p1, after p14–p16). Then run `sudo growpart /dev/nvme0n1 1 && sudo resize2fs /dev/nvme0n1p1` (ext4; check it
+   with `findmnt -no FSTYPE /`).
+4. Post the `df -h /` before/after on the capacity card. Then archive that card: unblocking it would dispatch a
+   worker to repeat the resize.
