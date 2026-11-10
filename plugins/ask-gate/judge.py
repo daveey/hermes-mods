@@ -132,6 +132,25 @@ IRREVERSIBLE_REASON = "irreversible: David's decision"
 PROFILE_CAP = 2000
 
 
+# A choice between options is David's (SYSTEM: "choices between options" are ALWAYS ok). The model can still return
+# already_answered citing a general profile rule ("low-stakes decisions made without asking"; 11-01, agent-bcd395b957,
+# its own reason saying the A/B/C choice was still open), so code keeps an option choice whose repeat evidence is the
+# profile alone. A recorded answer (ledger, messages) still holds it. The ask itself names options, or it asks for his
+# call/pick/decision while the draft lists two or more lettered/numbered options.
+OPTION_ASK = re.compile(
+    r"\b(?:option|choice|plan)\s+(?:[A-D]|[1-9])\b|\bpick (?:one|between|which)\b|\bwhich (?:one|option)\b"
+    r"|\b(?-i:[A-D])\s*(?:/|,|or)\s*(?-i:[A-D])\b", re.I)
+_DECISION_ASK = re.compile(r"\byour (?:call|pick|choice|decision)\b|\b(?:decide|choose|pick)\b|\bwhich\b", re.I)
+_LISTED_OPTION = re.compile(r"^\s*(?:[-*]\s*)?\**\(?(?:option\s+)?([A-D]|[1-9])[).:]\**\s+\S", re.I | re.M)
+CHOICE_REASON = "option choice: David's decision (profile-only repeat evidence)"
+
+
+def is_option_choice(ask: str, reply: str = "") -> bool:
+    if OPTION_ASK.search(ask or ""):
+        return True
+    return bool(_DECISION_ASK.search(ask or "")) and len({m.upper() for m in _LISTED_OPTION.findall(reply or "")}) >= 2
+
+
 def _home() -> Path:
     try:
         from hermes_constants import get_hermes_home  # type: ignore
@@ -309,6 +328,12 @@ def _repeat_recheck(raw: str, system: str, user: str, llm: Callable, *, strict: 
                      and not (isinstance(basis.get(item["i"]), str)
                               and _label_mismatch(basis[item["i"]], quote, request))
                      and isinstance(evidence.get("explanation"), str) and bool(evidence["explanation"].strip()))
+        if (valid and item["verdict"] == "already_answered" and evidence.get("source") == "profile"
+                and is_option_choice(asks.get(item["i"], ""), (context or {}).get("reply", ""))):
+            _log("choice_kept", ask=asks.get(item["i"], "")[:240], reason=str(item.get("reason", ""))[:240])
+            item.update(verdict="ok", reason=CHOICE_REASON, how="")
+            item.pop("equivalence", None)
+            continue
         if not valid:
             item.update(verdict="unverified" if strict else "ok",
                         reason="repeat/completion lacks grounded subject/action equivalence",
@@ -508,7 +533,7 @@ def judge(asks: list[str], *, tools_text: str, user_msgs: list[str], card_status
                 continue
             sub = [asks[i] for i in idx]
             profile = standing_decisions()
-            context = {"requests": sub,
+            context = {"requests": sub, "reply": reply,
                        "label_basis": [label_basis[i] for i in idx] if label_basis is not None else None,
                        "sources": {
                 "tools": tools_text, "ledger": ledger_text,
