@@ -794,6 +794,43 @@ def test_backstop_passes_the_confirm_model(tmp_path, monkeypatch):
     assert len(cyes) == 1 and len(filed) == 1 and filed[0]["stages"] == [0.8, 0.8, 0.9]
 
 
+def test_backstop_tells_the_judge_how_many_tool_calls_followed_the_last_text():
+    """agent-b6540f8eef: the digest judge saw "TOOL LOG ... (no tool calls)" for every backstop turn (it has no log),
+    so a reply ending "Reading the card first:" plus "what's going on with this?" filed as "promised verification but
+    made no tool calls" whether or not tools ran. The context now carries digest `prev_tools`, or says it is unknown."""
+    turns = [{"t": 1, "text": "verify the card", "prev": ""},
+             {"t": 2, "text": "what's going on with this?", "prev": "Reading the card first:", "prev_tools": 4}]
+    dg = {"title": "Verify", "last_reply": ""}
+    ctx = sh.backstop_context(dg, turns, turns[1])
+    assert "Tool calls after the agent's last text: 4" in ctx
+    p = sh.complaint_prompt(turns[1]["prev"], turns[1]["text"], context=ctx)
+    assert "(no tool calls)" not in p  # the digest has no tool log: never state that none ran
+    legacy = dict(turns[1]); legacy.pop("prev_tools")
+    lctx = sh.backstop_context(dg, [turns[0], legacy], legacy)
+    assert "Tool calls after the agent's last text: unknown" in lctx
+    assert "never claim" in sh.COMPLAINT_SYS.lower() and "no tool calls" in sh.COMPLAINT_SYS
+
+
+@pytest.mark.parametrize("prev_tools, filed_n", [(3, 0), (0, 1)])
+def test_backstop_drops_a_no_tool_stall_claim_when_tools_ran(tmp_path, prev_tools, filed_n):
+    import time as _t
+    now = _t.time()
+    p = tmp_path / "data" / "hub" / "default" / "s1.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"id": "s1", "host": "hub", "profile": "default", "source": "desktop", "title": "x",
+                             "user_turns": [{"t": now - 60, "text": "what's going on with this?",
+                                             "prev": "Reading the card first, together with the PR:",
+                                             "prev_tools": prev_tools}]}))
+    store = core.Store(tmp_path / "coach")
+    llm, _ = judge(0.95, component="agent", symptom="promised verification but made no tool calls", kind="agent_fault")
+    filed = []
+    sh.backstop(tmp_path / "data", store=store, judge=llm, now=now, m="shadow", confirm=None,
+                filer=lambda d, store=None, m=None: filed.append(d) or d)
+    assert len(filed) == filed_n
+    if not filed_n:
+        assert any(e.get("why") == "tools_ran" for e in events(tmp_path, "selfheal_skip"))
+
+
 def test_handoff_nudge_counts_show_resolved_versus_filed(tmp_path):
     """Detection for agent-e278947864: `self_heal.py status` reports how many handoff nudges the revised reply
     resolved versus how many still file, so a judge that never resolves (or always does) stays visible."""

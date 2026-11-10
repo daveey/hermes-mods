@@ -306,7 +306,8 @@ to do something it should have known to do, so a self-correcting system should r
 - a bare nudge ("resume", "what's going on", "are you stuck", "status?") when the previous turn did not end in a real
   answer: it was interrupted, errored, stopped mid-work, went silent after many tool calls, or promised work that never
   came. A nudge after a complete answer is low. A previous message that merely looks cut off may have been clipped
-  for length before you saw it; that alone is not a defect.
+  for length before you saw it; that alone is not a defect. A digest has no tool log: never claim "no tool calls" (or
+  that the agent did not act) unless "Tool calls after the agent's last text" says 0; when it is unknown, say so.
 Do NOT count (low, <0.3): brand-new requests or feature asks with no failure; design taste or wording preferences the
 agent could not have predicted; answers to the agent's legitimate questions; approvals; status questions with no sign
 of a problem; problems in third-party services or the outside world that Hermes neither caused nor should have
@@ -341,7 +342,8 @@ to do something it should have known to do, so a self-correcting system should r
 - requests to fix or root-cause the agent's or Hermes's own behavior,
 {strict_extra}- a bare nudge ("resume", "what's going on", "are you stuck", "status?") when the previous turn did not end in a real
   answer: it was interrupted, errored, stopped mid-work, went silent after many tool calls, or promised work that never
-  came. A nudge after a complete answer is low.
+  came. A nudge after a complete answer is low. A digest has no tool log: never claim "no tool calls" (or that the
+  agent did not act) unless "Tool calls after the agent's last text" says 0; when it is unknown, say so.
 Do NOT count (low, <0.3): brand-new requests or feature asks; design taste or wording preferences the agent could not
 have predicted; answers to the agent's legitimate questions; approvals; status questions with no sign of a problem;
 bugs in his products or the outside world that he reports as a NEW issue with no sign the agent's or Hermes's own work
@@ -911,8 +913,12 @@ def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "
     reply is unknown. Without it a context-free report (\"why didnt this work [screenshot]\") reads as a new issue."""
     ctx = f"SESSION CONTEXT (from a digest):\n{context[:2200]}\n\n" if context else ""
     prev = prev_reply or ("(not available)" if context else "(none: first turn)")
+    # A digest carries no tool log: "(no tool calls)" there was a fabricated fact the judge then repeated as
+    # "made no tool calls" (agent-b6540f8eef). The count, when known, is in the session context.
+    log = (_log_text(tool_log) if tool_log or not context
+           else "(not available from a digest; see \"Tool calls after the agent's last text\" above)")
     return (f"{ctx}AGENT'S PREVIOUS FINAL MESSAGE:\n{prev[-3000:]}\n\n"
-            f"TOOL LOG OF THE AGENT'S PREVIOUS TURN:\n{_log_text(tool_log)}\n\n"
+            f"TOOL LOG OF THE AGENT'S PREVIOUS TURN:\n{log}\n\n"
             f"USER'S NEW MESSAGE:\n{clean_user(user_text)[:2000]}")
 
 
@@ -4588,7 +4594,18 @@ def backstop_context(dg: dict, turns: list, t: dict, n: int = 3, chars: int = 30
     if reply.strip() and reply != (t.get("prev") or ""):
         lines.append("The agent's reply to this message (written after it; use it only to learn what the message and "
                      "any screenshot were about, not as proof of a defect): " + reply[:reply_chars].replace("\n", " "))
+    # The digest keeps text only, so a reply ending "Reading the card first:" reads the same whether tools ran after it
+    # or the agent stalled (agent-b6540f8eef). Digest v8 counts them; older digests say nothing, so say unknown.
+    if (t.get("prev") or "").strip():
+        n_tools = t.get("prev_tools")
+        lines.append("Tool calls after the agent's last text: "
+                     + (str(n_tools) if isinstance(n_tools, int) else "unknown"))
     return "\n".join(lines)
+
+
+# A judge symptom claiming the agent did not act. With digest `prev_tools` > 0 that claim is false by measurement.
+NO_TOOL_CLAIM_RE = re.compile(r"\b(?:no|zero|without|never made any|made no|didn'?t make any)\s+tool[- ]?calls?\b"
+                              r"|\bno tools? (?:ran|run|used)\b", re.I)
 
 
 _UNSET = object()
@@ -4690,6 +4707,13 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
                 n += 1
                 hit = detect_complaint(t.get("prev") or "", text, llm=judge, threshold=threshold(),
                                        context=backstop_context(dg, turns, t), confirm=confirm)
+                if (hit and isinstance(t.get("prev_tools"), int) and t["prev_tools"] > 0
+                        and NO_TOOL_CLAIM_RE.search(f"{hit.get('symptom') or ''} {hit.get('component') or ''}")):
+                    # The judge's "no tool calls" is contradicted by the digest's own count (agent-b6540f8eef).
+                    store.log({"event": "selfheal_skip", "why": "tools_ran", "session_id": dg.get("id") or f.stem,
+                               "at": t["t"], "prev_tools": t["prev_tools"], "symptom": hit.get("symptom"),
+                               "p": hit.get("p_defect")})
+                    continue
             if not hit:
                 continue
             sid = dg.get("id") or f.stem
