@@ -45,7 +45,7 @@ def _suite(tmp_path):
     root = tmp_path / 'root'
     tests = root / 'plugins' / 'coach' / 'tests'
     tests.mkdir(parents=True)
-    for name in ('conftest.py', 'gateway_reaper.py', 'home_guard.py'):
+    for name in ('conftest.py', 'gateway_reaper.py', 'home_guard.py', 'collection_home.py'):
         shutil.copyfile(Path(__file__).with_name(name), tests / name)
     (root / 'plugins' / 'waker').mkdir()
     (root / 'plugins' / 'waker' / '__init__.py').write_text(_WAKER)

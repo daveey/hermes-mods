@@ -13,7 +13,7 @@ import pytest
 def test_late_swallowed_violation_fails_pytest(tmp_path, workers, leak):
     suite = tmp_path / 'repo/plugins/coach/tests'
     suite.mkdir(parents=True)
-    for name in ('conftest.py', 'home_guard.py', 'gateway_reaper.py'):
+    for name in ('conftest.py', 'home_guard.py', 'gateway_reaper.py', 'collection_home.py'):
         shutil.copyfile(Path(__file__).with_name(name), suite / name)
     if leak:
         with (suite / 'conftest.py').open('a') as out:

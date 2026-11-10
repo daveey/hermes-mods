@@ -9,10 +9,11 @@ import threading
 import pytest
 
 from home_guard import HomeGuard
+from collection_home import create as create_collection_home
 
 # Collection is isolated too: imported modules may capture home paths before fixtures.
 _LIVE_HOME = Path.home() / '.hermes'
-_COLLECTION_HOME = tempfile.TemporaryDirectory(prefix='coach-collection-')
+_COLLECTION_HOME = create_collection_home()
 # tempfile users (including pytest fd capture) must stay inside our owned root.
 tempfile.tempdir = _COLLECTION_HOME.name
 _ROOT = Path(__file__).resolve().parents[3]

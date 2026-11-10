@@ -28,7 +28,7 @@ def _alive(pid):
 def test_session_stops_gateway_homed_at_pytest_root(tmp_path):
     suite = tmp_path / 'suite'
     suite.mkdir()
-    for name in ('conftest.py', 'gateway_reaper.py', 'home_guard.py'):
+    for name in ('conftest.py', 'gateway_reaper.py', 'home_guard.py', 'collection_home.py'):
         shutil.copyfile(Path(__file__).with_name(name), suite / name)
     pidfile = tmp_path / 'pid'
     stopped = tmp_path / 'stopped'
@@ -82,7 +82,7 @@ def test_spawn(tmp_path_factory):
 def test_core_writer_finishes_before_test_home_restore(tmp_path):
     suite = tmp_path / 'suite'
     suite.mkdir()
-    for name in ('conftest.py', 'gateway_reaper.py', 'home_guard.py'):
+    for name in ('conftest.py', 'gateway_reaper.py', 'home_guard.py', 'collection_home.py'):
         shutil.copyfile(Path(__file__).with_name(name), suite / name)
     (suite / 'test_probe.py').write_text('''
 import threading
@@ -119,7 +119,7 @@ def test_02_drained():
 def test_collection_writer_is_joined_before_home_cleanup(tmp_path, name):
     suite = tmp_path / 'suite'
     suite.mkdir()
-    for filename in ('conftest.py', 'gateway_reaper.py', 'home_guard.py'):
+    for filename in ('conftest.py', 'gateway_reaper.py', 'home_guard.py', 'collection_home.py'):
         shutil.copyfile(Path(__file__).with_name(filename), suite / filename)
     receipt = tmp_path / 'receipt'
     homefile = tmp_path / 'home'
