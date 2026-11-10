@@ -23,7 +23,8 @@ def test_whole_turn_steering_compaction(agent, tmp_path, monkeypatch, compact, f
     agent._session_db = db
     agent._ensure_db_session()
     db.set_session_title(agent.session_id, "Steering retention test")
-    monkeypatch.setattr("agent.conversation_compression._refresh_agent_tool_definitions", lambda _: False)
+    # Stub the external MCP boundary, not the movable compaction wrapper.
+    monkeypatch.setattr("tools.mcp_tool_agent.refresh_agent_mcp_tools", lambda *a, **kw: [])
     original_sid = agent.session_id
     events, evidence, compressions = [], [], []
     gate = gd.build_gate(SimpleNamespace(log=events.append))
@@ -136,7 +137,8 @@ def test_native_post_tool_compaction_cannot_invent_scope(agent, tmp_path, monkey
     agent._session_db = db
     agent._ensure_db_session()
     db.set_session_title(agent.session_id, "Steering retention test")
-    monkeypatch.setattr("agent.conversation_compression._refresh_agent_tool_definitions", lambda _: False)
+    # Stub the external MCP boundary, not the movable compaction wrapper.
+    monkeypatch.setattr("tools.mcp_tool_agent.refresh_agent_mcp_tools", lambda *a, **kw: [])
     original_sid = agent.session_id
     events, evidence, compressions = [], [], []
     gate = gd.build_gate(SimpleNamespace(log=events.append))
