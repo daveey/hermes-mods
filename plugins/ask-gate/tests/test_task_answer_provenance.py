@@ -6,6 +6,7 @@ judges against the same answer, so the verdict cannot depend on which chat files
 card binding stay in the recording chat's compression lineage (no global sharing), cards named only in
 evidence/why_human are not the ask's task, and runtime/agent-written text never becomes a user answer.
 """
+import json
 import sqlite3
 
 import pytest
@@ -227,3 +228,65 @@ def test_chat_reply_judge_reads_card_named_in_ask_not_elsewhere(bound):
     reply = f"Status: {CARD} is shipped.\n\nCould you choose the color for the new icon?"
     assert ANSWER not in prompt_after(bound, lambda: bound.pre_final_gate(
         session_id="sibling", platform="tui", final_response=reply, attempt=0))
+
+
+@pytest.mark.parametrize("platform,binds", [("desktop", True), ("slack", False), ("api_server", False)])
+def test_only_local_single_user_surfaces_bind_answers(gate, platform, binds):
+    """A turn typed on a shared or relayed surface (Slack, API server) may not be the user's own words for the
+    whole board: it stays chat-local. Only local single-user surfaces bind it to the ask's card."""
+    sessions(gate)
+    gate.ledger().set_open_asks("origin", [ASK])
+    gate.pre_llm_call(session_id="origin", user_message="The step was completed.", platform=platform)
+    assert [r["card_id"] for r in gate.ledger().relevant("origin")] == [CARD if binds else ""]
+    assert bool(gate.ledger().relevant("sibling", cards=[CARD])) is binds
+
+
+def test_worker_block_without_task_id_is_about_its_own_card(bound, monkeypatch):
+    """kanban_block defaults task_id to the worker's own card, so that card is the ask's task."""
+    def go(own):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", own)
+        bound.LOG.add("sibling", "terminal", "load check", "0.27")
+        return bound.pre_tool_call(tool_name="kanban_block", session_id="sibling", args={
+            "kind": "needs_input", "reason": "acceptance decision", "human_request": human(scope="This incident only.")})
+    assert ANSWER in prompt_after(bound, lambda: go(CARD))
+    assert ANSWER not in prompt_after(bound, lambda: go(OTHER))
+
+
+def test_card_scope_admits_only_whole_card_ids(gate):
+    """A malformed bound id (a prefix, or an id with trailing text) never widens a read beyond the lineage."""
+    sessions(gate)
+    for bad in ("t_", "t_zz", CARD + " extra"):
+        gate.ledger().add(f"Ask about {bad}", ANSWER, session="origin", card_id=bad)
+        assert gate.ledger().relevant("sibling", cards=[bad]) == [], bad
+    assert gate.ledger().relevant("sibling", cards=["t_", CARD + " extra"]) == []
+
+
+def test_incident_same_wait_or_close_ask_agrees_across_chats_and_paths(gate, monkeypatch):
+    """Incident regression (t_01a1c757f061c042): the user answered the wait-or-close ask about one card in the
+    origin chat. kanban_block from origin and kanban_create from a sibling chat, both about that card, are judged
+    on the same answer, so the judge returns the same verdict; a create about another card is not held by it."""
+    sessions(gate)
+    gate.ledger().set_open_asks("origin", [ASK])
+    monkeypatch.setattr(gate.judge_mod, "classify_answer",
+                        lambda msg, asks, llm: [{"i": 0, "topic": "wait or close", "answer": msg}])
+    said = "No, keep waiting for the live check on it; do not close it on offline proof."
+    gate.pre_llm_call(session_id="origin", user_message=said, platform="desktop")
+
+    def verdict(fn):
+        prompts = []
+
+        def llm(system, user):
+            prompts.append(user)
+            v = "already_answered" if said in user else "ok"
+            return json.dumps({"asks": [{"i": 0, "verdict": v, "reason": "the user answered this" if v != "ok"
+                                         else "new decision", "how": ""}]})
+        gate.LLM = llm
+        r = fn()
+        assert prompts, "the judge was never asked"
+        return (r or {}).get("action") == "block", any(said in p for p in prompts), (r or {}).get("message")
+
+    origin_block = verdict(lambda: block(gate, "origin"))
+    sibling_create = verdict(lambda: create(gate, "sibling"))
+    assert origin_block[:2] == (True, True)
+    assert sibling_create == origin_block
+    assert verdict(lambda: create(gate, "sibling", hr=human(scope=f"Incident {OTHER} only."))) == (False, False, None)

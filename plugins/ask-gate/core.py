@@ -239,6 +239,11 @@ def card_ids(text: str) -> list[str]:
     return sorted(set(_CARD_ID.findall(text or "")))
 
 
+def is_card_id(value: Any) -> bool:
+    """True only for a whole card id (``t_`` + 8 or 16 hex), never a prefix or an id embedded in other text."""
+    return isinstance(value, str) and bool(_CARD_ID.fullmatch(value))
+
+
 def bound_card(ask: str) -> str:
     """The one card an answered ask names, else "". Two or more ids, or a heading unit joining several items
     with " | " (the answer may be to an item that names no card), are ambiguous: the answer stays unbound."""
@@ -760,7 +765,7 @@ class Ledger:
                       ((sid,) for sid in answer_lineage(session)))
         c.execute("create temp table answer_cards (id text primary key)")
         c.executemany("insert or ignore into answer_cards values (?)",
-                      ((x,) for x in cards if isinstance(x, str) and x.startswith("t_")))
+                      ((x,) for x in cards if is_card_id(x)))
         # Rows a pre-fix process recorded from a runtime notice stay invisible to every read.
         c.create_function("runtime_notice", 1, lambda text: int(runtime_notice(text)), deterministic=True)
 

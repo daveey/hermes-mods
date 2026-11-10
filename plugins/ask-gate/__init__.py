@@ -43,6 +43,10 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     replan = _sib("replan")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
+# Surfaces where the typed turn is the single local user's own words. Only an answer typed there may be bound to a
+# card and read from sibling chats; Slack, IRC, Telegram, API-server and other shared or relayed surfaces keep their
+# answers chat-local (lineage only), since another person or a bot may have typed them.
+TASK_BINDING_PLATFORMS = frozenset({"", "cli", "tui", "local", "desktop"})
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
 _SUBAGENTS: set[str] = set()                  # sessions seen with a parent_session_id (delegate_task children)
 MAX_NUDGES = 2
@@ -56,6 +60,16 @@ def _off() -> bool:
 
 def _is_worker() -> bool:
     return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
+def _block_card(tool_name: str, args: dict) -> list[str]:
+    """The card a kanban_block is about: its ``task_id`` (a whole card id), or, when omitted, the worker's own card
+    (the tool's default). Other tools, and ids that are not whole card ids, name none."""
+    if tool_name != "kanban_block":
+        return []
+    raw = args.get("task_id")
+    tid = str(raw).strip() if raw else str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    return [tid] if core.is_card_id(tid) else []
 
 
 def _chat_eligible(session_id: str, platform: str = "") -> bool:
@@ -377,7 +391,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", conversation_hist
         directive = ledger().record_workflow_directive(session_id, user_message or "")
         if not directive and not runtime:
             _record_answers(session_id, _human_text(user_message or ""), conversation_history or [],
-                            raw_message=user_message or "")
+                            raw_message=user_message or "", platform=platform)
         block = core.l1_block(session_id, ledger())
         return {"context": block} if block else None
     except Exception as e:  # never break a chat
@@ -393,10 +407,16 @@ def _last_assistant_text(history: list) -> str:
 
 
 def _record_answers(session_id: str, msg: str | None, history: list,
-                    raw_message: str | None = None) -> None:
+                    raw_message: str | None = None, *, platform: str) -> None:
     if not msg:
         return
     led = ledger()
+    # Task binding only for the local user's own typed turn (TASK_BINDING_PLATFORMS; "" is core's unset platform,
+    # i.e. local); elsewhere rows stay unbound. ``platform`` is required so no caller binds by omission.
+    bindable = (platform or "").lower() in TASK_BINDING_PLATFORMS
+
+    def bind(ask: str) -> str:
+        return core.bound_card(ask) if bindable else ""
     snapshot = led.pending_snapshot(session_id)
     open_asks = snapshot or []
     strong = core.is_strong_dismissal(msg)
@@ -413,7 +433,7 @@ def _record_answers(session_id: str, msg: str | None, history: list,
     if len(open_asks) == 1 and direct_terminal and direct_input:
         # A single pending question has an unambiguous target. Persist the actual
         # user's words, never a classifier-generated terminal assertion.
-        led.add(open_asks[0], msg, session=session_id, card_id=core.bound_card(open_asks[0]))
+        led.add(open_asks[0], msg, session=session_id, card_id=bind(open_asks[0]))
         led.set_open_asks(session_id, [])
         return
     if not open_asks and not strong:
@@ -432,7 +452,7 @@ def _record_answers(session_id: str, msg: str | None, history: list,
         # Bind to a card only through the shown ask the user answered (never the classifier's topic, never a
         # general dismissal): only then may another chat asking about that same card read this answer.
         i = a.get("i")
-        card = core.bound_card(open_asks[i]) if type(i) is int and 0 <= i < len(open_asks) else ""
+        card = bind(open_asks[i]) if type(i) is int and 0 <= i < len(open_asks) else ""
         led.add(a["topic"], msg, session=session_id, retire=False, card_id=card)
     if answered:
         answered_indices = {a.get("i") for a in answered if type(a.get("i")) is int and a["i"] >= 0}
@@ -909,8 +929,7 @@ def _explicit_cards(tool_name: str, args: dict, request: dict) -> list[str]:
     """The task(s) a human_request is about: the card being blocked, plus cards its action or scope names.
     Evidence and why_human cite other cards as context (often to say they do NOT cover this), so not the task."""
     ids = set(core.card_ids(str(request.get("action") or "") + " " + str(request.get("scope") or "")))
-    if tool_name == "kanban_block" and str(args.get("task_id") or "").startswith("t_"):
-        ids.add(str(args["task_id"]))
+    ids.update(_block_card(tool_name, args))
     return sorted(ids)
 
 
@@ -1049,7 +1068,7 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             if replanned is not None:
                 return replanned
         # The card being blocked is the ask's task even when the prose reason does not repeat its id.
-        own = [str(args["task_id"])] if tool_name == "kanban_block" and str(args.get("task_id") or "").startswith("t_") else []
+        own = _block_card(tool_name, args)
         reconciled = _retired_block(session_id, found, sorted(set(core.card_ids(" ".join(found)) + own)))
         if reconciled is not None:
             return reconciled
@@ -1162,7 +1181,7 @@ def _source_ref_cards(req: dict) -> list[str]:
     """An ActionRequest's explicit tasks: card ids in its scope.sourceRefs only. Plan markdown, limits and choices
     cite cards as context, which must not import answers bound to those cards from other chats."""
     refs = _typed(_typed(req, "scope", dict), "sourceRefs", list)
-    return sorted({str(x.get("id")) for x in refs if isinstance(x, dict) and str(x.get("id") or "").startswith("t_")})
+    return sorted({str(x.get("id")) for x in refs if isinstance(x, dict) and core.is_card_id(str(x.get("id") or ""))})
 
 
 def _action_request_gate(session_id: str, args: dict) -> dict | None:
