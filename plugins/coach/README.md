@@ -1246,6 +1246,19 @@ on the coach, never an Inbox post. `--dry-run` prints the window's stats and fil
 `tests/test_pre_verify_latency_watch.py` (anchored line match, one card after a slow day, fast day files nothing,
 rotation/no double count, dry-run) and `tests/test_reply_check_elapsed.py`.
 
+### Worker share (`worker_share_watch.py`, no agent, no LLM)
+
+The hub's dispatcher only offers worker-first cards (`placement_policy`) to its worker pool; every other ready card
+waits for one of the hub's own `max_card_runs` slots (kanban-12ee0e4b65: the hub sat at its cap for most of a day
+while worker-1 ran 3 cards). A hermes cron job on hermes-hub (no-agent, every 10 min, "worker-share watch (hub)")
+runs it with the hermes-agent venv: each run samples the worker registry and the board, and when the hub is at its
+cap, a fresh unpinned pool worker has room and unmarked ready cards wait, for 3 samples in a row, it files ONE card
+per day (`--idempotency-key worker-share-watch:<date>`) listing core's `portable_reason` for each waiting card.
+Every `created` event also carries `portable_reason` (core), so the marked share is a query. Self-heal splits a
+default-board fix into a portable FIX card (`FIX_REQUIRES`, proposal inside the placement evidence fence) and a
+`self-heal verify:` child that keeps `host_repo` for the live check and the lane `event`. Tests:
+`tests/test_worker_share_watch.py`, `tests/test_self_heal_fix_placement.py`.
+
 ### Bare ask-gate notices (`withheld_notice_watch.py`, no agent, no LLM)
 
 ask-gate used to swap a whole reply for "I withheld a request ..." (17 in 7 sessions, Oct 27-29). It now holds

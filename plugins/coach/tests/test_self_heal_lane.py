@@ -1013,18 +1013,22 @@ def test_do_it_creates_the_fix_card_with_red_green_acceptance(store, monkeypatch
     fp = proposed(store, r)
     monkeypatch.setattr(sh, "coach_root", lambda: Path(store.root))
     out = sh.file_fix(fp, store=store, runner=r, now=NOW + 200, budget_fn=OPEN)
-    argv = r.creates()[-1]
+    argv, verify = r.creates()[-2:]  # a default-board fix is a portable FIX card plus its hub VERIFY child
     assert out["action"] == "filed" and opt(argv, "--idempotency-key") == f"selfheal:{fp}:fix"
-    assert opt(argv, "--model") == "claude-opus-5-5"
-    assert opt(argv, "--provider") == "anthropic"
+    assert opt(verify, "--idempotency-key") == f"selfheal:{fp}:verify" and opt(verify, "--parent") == out["card"]
+    for a in (argv, verify):
+        assert opt(a, "--model") == "claude-opus-5-5"
+        assert opt(a, "--provider") == "anthropic"
     body = opt(argv, "--body")
-    for part in ("add test_sort_stable", "FAILING", "PASSING", "Verify live", "event fixed", "--result result.md"):
+    for part in ("add test_sort_stable", "FAILING", "PASSING", "fix_shas"):
         assert part in body, part
+    for part in ("Verify live", "event fixed", "--result result.md"):
+        assert part in opt(verify, "--body"), part
     (a,) = ev(store, "selfheal_approved")
     assert a["card"] == out["card"] and a["trigger"] == "do_it"
     # idempotent: a second Do it (or the sync backstop) does not file a second fix card
     assert sh.file_fix(fp, store=store, runner=r, now=NOW + 300, budget_fn=OPEN)["action"] == "skip"
-    assert len(r.creates()) == 2
+    assert len(r.creates()) == 3
 
 
 def test_inbox_type_do_it_is_a_resolve_the_hub_cron_acts_on():
@@ -1098,7 +1102,7 @@ def test_auto_approve_files_the_fix_with_no_inbox_decision(store, monkeypatch):
                         fixer=lambda fp, **kw: sh.file_fix(fp, budget_fn=OPEN, **kw)))
     assert done[fp].startswith("auto -> t_")
     st = sh.LaneState(store.root).get(fp)
-    assert st["status"] == "approved" and opt(r.creates()[-1], "--idempotency-key") == f"selfheal:{fp}:fix"
+    assert st["status"] == "approved" and opt(r.creates()[-2], "--idempotency-key") == f"selfheal:{fp}:fix"
     (a,) = ev(store, "selfheal_approved")
     assert a["trigger"] == "auto"
     assert not [c for c, _ in r.calls if c[:3] == ["hermes", "inbox", "act"]]  # nothing open to resolve
@@ -1125,7 +1129,7 @@ def test_auto_approve_ignores_an_earlier_generations_decision(store):
     b.outcomes = {f"selfheal:{fp}": {"state": "resolved", "outcome": "not_now", "at": NOW + 600}}  # gen 1's card
     done = dict(sh.sync(store, runner=b, now=NOW + 30 * 86400, auto=True,
                         fixer=lambda fp, **kw: sh.file_fix(fp, budget_fn=OPEN, **kw)))
-    assert done[fp].startswith("auto -> t_") and len(b.creates()) == 3
+    assert done[fp].startswith("auto -> t_") and len(b.creates()) == 4  # 2 investigations, fix, verify
 
 
 def test_auto_approve_config_and_env(monkeypatch):
@@ -1252,9 +1256,10 @@ def test_refile_after_a_reverted_fix_gets_a_new_fix_card_on_do_it(store):
     from `selfheal:<fp>:fix`, log selfheal_approved, and run no fix."""
     b = Board()
     fp, ids = lifecycle(store, b, ["file", "proposed", "fix", "reverted", "file", "proposed", "fix"])
-    assert len(set(ids)) == 4 and len(b.creates()) == 4, ids
+    assert len(set(ids)) == 4 and len(b.creates()) == 6, ids
     keys = [opt(a, "--idempotency-key") for a in b.creates()]
-    assert keys == [f"selfheal:{fp}", f"selfheal:{fp}:fix", f"selfheal:{fp}:r2", f"selfheal:{fp}:r2:fix"]
+    assert keys == [f"selfheal:{fp}", f"selfheal:{fp}:fix", f"selfheal:{fp}:verify",
+                    f"selfheal:{fp}:r2", f"selfheal:{fp}:r2:fix", f"selfheal:{fp}:r2:verify"]
     assert sh.LaneState(store.root).get(fp)["fix_card"] == ids[-1]
 
 

@@ -367,6 +367,7 @@ class SelfHealLane(unittest.TestCase):
     def test_fingerprint_of_keys(self):
         self.assertEqual(coach_weekly.selfheal_fp("selfheal:abc"), "abc")
         self.assertEqual(coach_weekly.selfheal_fp("selfheal:abc:fix"), "abc")
+        self.assertEqual(coach_weekly.selfheal_fp("selfheal:abc:r2:verify"), "abc")  # a split fix's hub child
         self.assertEqual(coach_weekly.selfheal_fp("selfheal-fix:abc"), "abc")
 
 

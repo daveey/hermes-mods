@@ -405,7 +405,8 @@ DEFECT_FP_RX = re.compile(r"-[0-9a-f]{8,}$")
 def selfheal_fp(key):
     """Fingerprint of a `selfheal:` idempotency key (investigation and fix cards share it)."""
     k = re.sub(r"^selfheal(?:-fix)?:", "", key or "")
-    return re.sub(r"(?::r\d+)?(?::fix)?$", "", k)  # `:r<n>` = a recurrence's investigation (self_heal.file_defect)
+    # `:r<n>` = a recurrence's investigation (self_heal.file_defect); `:verify` = a split fix's hub child
+    return re.sub(r"(?::r\d+)?(?::fix|:verify)?$", "", k)
 
 
 def selfheal_homes(homes=None):
@@ -468,7 +469,7 @@ def selfheal_cards(homes, cost=True):
                         usd = 0.0
                 out.append({"id": tid, "key": key, "fingerprint": selfheal_fp(key), "board": board, "status": status,
                             "created_at": c_at, "completed_at": done_at,
-                            "fix": key.endswith(":fix") or key.startswith("selfheal-fix:"),
+                            "fix": key.endswith((":fix", ":verify")) or key.startswith("selfheal-fix:"),
                             "not_defect": bool(NOT_DEFECT_RX.search(result or "")), "cost_usd": usd})
     return out
 

@@ -1323,6 +1323,16 @@ FIX_SKILLS = ("five-whys", "hermes-mods-repo", "systematic-debugging")
 # Every self-heal card declares what its worker needs: core refuses an agent-run create that omits it
 # (requires_declaration_missing under kanban.require_capability_declaration), which silently dropped investigations.
 SELFHEAL_REQUIRES = ("terminal", "file", "git", "host_repo")
+# A default-board fix is split in two (kanban-12ee0e4b65): the FIX card is repo work landed by push, so it declares
+# no host_repo and fences the proposal as evidence, and the hub's worker pool can run it; its VERIFY child stays on
+# this host (host_repo) for the live check and the lane `event` (both read this host's coach store and logs).
+# Before, every fix card stamped host_repo and quoted the hub-words proposal, so none left the hub's 7 slots.
+FIX_REQUIRES = ("terminal", "file", "git")
+VERIFY_TITLE = "self-heal verify:"
+VERIFY_RUNTIME = 3600
+VERIFY_SKILLS = ("five-whys", "hermes-mods-repo")
+# Same strings as core's kanban_placement.EVIDENCE_OPEN/CLOSE: the placement scan skips a complete fenced block.
+EVIDENCE_OPEN, EVIDENCE_CLOSE = "<!-- placement:evidence -->", "<!-- /placement:evidence -->"
 STUCK_PROPOSAL_S = 2 * 3600  # proposed, budget open, no fix card for this long = the lane is not filing
 PULL_FAIL_CARD_AFTER = 3     # consecutive coach-data pull failures before the lane files its own card
 CREATED_BY = "self-heal"
@@ -1711,12 +1721,90 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
 """
 
 
-def fix_brief(fp: str, st: dict) -> str:
+def _proposal_text(fp: str, st: dict) -> str:
     proposal = coach_root() / "selfheal" / fp / "proposal.md"
     try:
-        text = proposal.read_text()[:6000]
+        return proposal.read_text()[:6000]
     except Exception:
-        text = f"(proposal file {proposal} missing: read the investigation card {st.get('card') or '?'} comments)"
+        return f"(proposal file {proposal} missing: read the investigation card {st.get('card') or '?'} comments)"
+
+
+def fenced_evidence(text: str) -> str:
+    """``text`` inside the placement evidence fence (markers in it are dropped: they would end the fence early)."""
+    inner = (text or "").replace(EVIDENCE_OPEN, "").replace(EVIDENCE_CLOSE, "")
+    return f"{EVIDENCE_OPEN}\n{inner}\n{EVIDENCE_CLOSE}"
+
+
+def split_fix(st: dict, board: Optional[str]) -> bool:
+    """Default-board, non-bb fixes run as a portable FIX card plus a VERIFY child here; bb keeps one card."""
+    return st.get("component") != "bb" and (not board or board == "default")
+
+
+def portable_fix_brief(fp: str, st: dict) -> str:
+    """The FIX card: repo work only (reproduce, red test, fix, push). No host paths or lane commands in the work
+    text, and the proposal (incident evidence) is fenced, so the hub's worker pool may run it. Its handoff is read
+    by the VERIFY child, which runs here."""
+    return f"""Self-heal FIX for defect `{fp}`. The proposal below is approved (David's standing self-heal approval;
+the lane auto-approves every proposal). Post nothing to the Inbox. Investigation card: {st.get('card') or '?'}.
+Budget for this card <= ${FIX_BUDGET}.
+
+This card may run on a worker node. It does the repo part: reproduce, red test, fix, push. A child VERIFY card on
+the gateway that filed it does the live check and records the result, from your completion handoff. So never run
+the lane's `self_heal.py event` command here, and don't read the gateway's own state files: the proposal below is
+the evidence you get (it describes where it happened, not where you work).
+
+## Approved proposal (evidence)
+{fenced_evidence(_proposal_text(fp, st))}
+
+## Acceptance (all of it, in order)
+1. Re-check the defect still reproduces on the current code of the repo(s) it names (fresh clone or worktree on
+   origin). Already fixed? Complete the card with a summary starting `not a defect: already fixed by <sha>` and
+   metadata `{{"not_defect": "already fixed by <sha>"}}`; the verify card records it.
+2. Write the regression test FIRST and show it FAILING on the current code (paste the failing output in a card
+   comment).
+3. Make the fix from the plan (root level, not just the symptom) and the detection guard. Show the same test
+   PASSING, plus the module's existing tests.
+4. Ship it under David's standing merge/deploy approval: hermes-mods commit + push (pre-commit hook, never
+   --no-verify), core changes through a hermes-core-wt worktree + ship, settings through shared-config.json
+   (hermes-mods-repo skill).
+5. If part of the plan can only be done on the gateway host itself (its local settings, scheduled jobs or
+   databases), do the repo part and list the rest, exact commands included, in metadata `host_steps`; the verify
+   card runs them. Don't block for it.
+6. Complete the card with metadata `{{"fix_shas": ["<every commit sha, core and hermes-mods>"], "red": "<failing
+   test output>", "green": "<passing output>", "live_check": "<what the verify card must check, and where>",
+   "host_steps": [...], "undo": "<revert command>"}}`. If something irreversible or external blocks the fix,
+   kanban_block with the exact ask instead.
+"""
+
+
+def verify_brief(fp: str, st: dict, fix_card: str) -> str:
+    """The VERIFY child (host_repo, stays here): host steps, live check, and the lane event, from the fix's handoff."""
+    return f"""Self-heal VERIFY for defect `{fp}`: fix card {fix_card} (its parent here) did the repo work. You run
+on the host that filed it, because the live check and the lane record need this host's coach store and logs.
+Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
+
+1. Read the fix card's handoff: `kanban_show(task_id="{fix_card}")` (summary, metadata `fix_shas`, `red`, `green`,
+   `live_check`, `host_steps`, `undo`, or `not_defect`).
+2. `not_defect` set? Confirm the cited sha is on the deployed checkout, run
+   `{SELF_EVENT} not_defect {fp} --card {fix_card} --note "<its not_defect text>"` and complete. Stop.
+3. Confirm each fix sha is deployed here (`git -C <checkout> merge-base --is-ancestor <sha> HEAD` for the live
+   checkout that runs it; a hermes-mods change deploys within 10 min, core through hermes-sync). Not yet deployed
+   after 30 min? kanban_schedule a re-check; don't record fixed on undeployed code.
+4. Run every `host_steps` entry. Verify live on the real path (the surface/command/session type where it
+   happened) as `live_check` says, and capture the proof. A live probe that makes a detector fire on purpose starts
+   its first prompt with `[selfheal-probe]` (e.g. `hermes chat -q '[selfheal-probe] ...'`): the lane then logs
+   `selfheal_skip why=probe` and files nothing. Check that log line; never delete selfheal_pending rows by hand.
+   The live check fails? Comment the evidence, then kanban_block naming what still fails; do not record fixed.
+5. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post`. Write `result.md`
+   (what changed with commits, the red/green test output from the handoff, your live proof, the undo command) and
+   run `{SELF_EVENT} fixed {fp} --card {fix_card} --note "<every fix sha, space-separated>" --result result.md`.
+   That stores it under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed.
+6. Complete the card with the live proof in the summary.
+"""
+
+
+def fix_brief(fp: str, st: dict) -> str:
+    text = _proposal_text(fp, st)
     bb = st.get("component") == "bb"
     ship = ("Ship it through the bb-self-fix procedure (PR, merge, deploy) under David's standing approval."
             if bb else
@@ -2337,6 +2425,10 @@ def fix_key(fp: str, gen: int) -> str:
     return f"selfheal:{fp}:fix" if gen <= 1 else f"selfheal:{fp}:r{gen}:fix"
 
 
+def verify_key(fp: str, gen: int) -> str:
+    return f"selfheal:{fp}:verify" if gen <= 1 else f"selfheal:{fp}:r{gen}:verify"
+
+
 def known_cards(st: dict) -> set:
     return {c for c in (st.get("cards") or []) + [st.get("card"), st.get("fix_card")] if c}
 
@@ -2638,6 +2730,8 @@ def kanban_argv(args: dict, hermes: str = "hermes") -> list:
         argv += ["--skill", s]
     req = args.get("requires", SELFHEAL_REQUIRES)
     argv += [x for c in req for x in ("--requires", c)] if req else ["--no-requires"]
+    for parent in args.get("parents") or []:
+        argv += ["--parent", parent]
     return argv
 
 
@@ -3918,6 +4012,10 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     if not FP_RE.match(fp or ""):
         return {"action": "error", "why": f"not a fingerprint: {fp!r}"}
     if st.get("fix_card") and st.get("status") in ("approved", "fixed"):
+        r = route({"component": st.get("component")})
+        if split_fix(st, r["board"]) and st.get("status") == "approved" and not st.get("verify_card"):
+            # The verify child failed to file with its fix card: retry it (idempotent key), never a second fix.
+            _file_verify(fp, st, st["fix_card"], r, store, runner, now)
         return {"action": "skip", "why": f"fix card exists: {st['fix_card']}", "card": st["fix_card"]}
     if _synthetic_fix_row(store, fp):
         # Filed before the classifier knew the quote's tag (agent-71a1e1fdca: a "[runtime] ... NOT shown" row filed
@@ -3930,11 +4028,14 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
                    "quote": str(rec.get("evidence") or rec.get("quote") or "")[:200]})
         return {"action": "skip", "why": "synthetic_tag"}
     r = route({"component": st.get("component")})
+    split = split_fix(st, r["board"])
     key = fix_key(fp, generation(st) or 1)
-    args = {"title": f"{FIX_TITLE} {(st.get('symptom') or fp)[:90]}", "body": fix_brief(fp, st),
+    args = {"title": f"{FIX_TITLE} {(st.get('symptom') or fp)[:90]}",
+            "body": portable_fix_brief(fp, st) if split else fix_brief(fp, st),
             "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
+            "assignee": "default", "created_by": CREATED_BY,
+            "requires": list(FIX_REQUIRES if split else SELFHEAL_REQUIRES)}
     if args.get("board") and not board_present(args["board"]):
         why = f"kanban board {args['board']!r} does not exist"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args["board"]})
@@ -3966,10 +4067,32 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
         return {"action": "error", "why": why}
     sched = None
-    lane.update(fp, status="approved", fix_card=tid, approved_at=now, cards=sorted(known_cards(st) | {tid}))
+    lane.update(fp, status="approved", fix_card=tid, approved_at=now, cards=sorted(known_cards(st) | {tid}),
+                verify_card=None)
     store.log({"event": "selfheal_approved", "fingerprint": fp, "card": tid, "component": st.get("component"),
-               "trigger": trigger, "scheduled": sched})
-    return {"action": "filed", "card": tid, "key": key, "scheduled": sched}
+               "trigger": trigger, "scheduled": sched, "split": split})
+    verify = _file_verify(fp, lane.get(fp), tid, r, store, runner, now) if split else None
+    return {"action": "filed", "card": tid, "key": key, "scheduled": sched, "verify_card": verify}
+
+
+def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: float) -> Optional[str]:
+    """File the VERIFY child of ``fix_card`` (stays on this host: host_repo). -> its id, or None (logged)."""
+    lane = LaneState(store.root)
+    args = {"title": f"{VERIFY_TITLE} {(st.get('symptom') or fp)[:90]}", "body": verify_brief(fp, st, fix_card),
+            "idempotency_key": verify_key(fp, generation(st) or 1), "model": MODEL, "provider": PROVIDER,
+            "max_runtime": VERIFY_RUNTIME, "skills": list(VERIFY_SKILLS), "board": r["board"],
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
+            "parents": [fix_card]}
+    rc, out, err = _run(kanban_argv(args), runner)
+    vid = _task_id(out) if rc == 0 else None
+    if not vid or vid == fix_card:
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "stage": "verify", "card": fix_card,
+                   "error": (err or out).strip()[-300:] or f"kanban create exited {rc} with no task id"})
+        return None
+    e = lane.get(fp)
+    lane.update(fp, verify_card=vid, cards=sorted(known_cards(e) | {vid}))
+    store.log({"event": "selfheal_verify_filed", "fingerprint": fp, "card": vid, "fix_card": fix_card})
+    return vid
 
 
 _CRON_SYMPTOM = re.compile(r"^cron job '(?P<name>.+?)' failed on (?P<host>[^:\s]+):")
@@ -4299,6 +4422,10 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
         if not card:
             continue
         ks = card_status(card, st.get("board"), runner)
+        if ks == "done" and status == "approved" and st.get("verify_card"):
+            # A split fix ends at its VERIFY child (it records fixed): judge that card, not the finished fix card.
+            card = st["verify_card"]
+            ks = card_status(card, st.get("board"), runner)
         if ks not in ENDED:
             continue
         proposal = Path(store.root) / "selfheal" / fp / "proposal.md"

@@ -75,7 +75,9 @@ def test_fix_and_investigation_argv_declare_requires(store):
     b = Board()
     r = sh.file_fix("cron-0123456789", store=store, runner=b, now=NOW, budget_fn=OPEN)
     assert r["action"] == "filed"
-    assert requires_of(b.creates()[0]) == ["terminal", "file", "git", "host_repo"]
+    # a default-board fix card is repo work the worker pool can run; its verify child keeps host_repo
+    assert requires_of(b.creates()[0]) == ["terminal", "file", "git"]
+    assert requires_of(b.creates()[1]) == ["terminal", "file", "git", "host_repo"]
 
 
 def test_argv_without_requires_key_still_declares_and_empty_list_says_no_requires():
