@@ -72,8 +72,9 @@ def waiting_unmarked(db: Path) -> list:
     con = _ro_connect(db)
     con.row_factory = sqlite3.Row
     try:
-        rows = con.execute("SELECT id, title, body, assignee, requires, skills, runs_on, workspace_kind,"
-                           " workspace_path FROM tasks WHERE status = 'ready' AND placement_policy IS NULL"
+        rows = con.execute("SELECT t.*, (SELECT e.payload FROM task_events e"
+                           " WHERE e.task_id=t.id AND e.kind='created' ORDER BY e.id LIMIT 1) AS creation_payload"
+                           " FROM tasks t WHERE status = 'ready' AND placement_policy IS NULL"
                            " ORDER BY created_at").fetchall()
     finally:
         con.close()
@@ -82,13 +83,33 @@ def waiting_unmarked(db: Path) -> list:
         if (r["runs_on"] or "").strip() not in ("", "[]", "null"):
             continue
         d = dict(r)
-        for k in ("requires", "skills"):
+        try:
+            audit = json.loads(d.pop("creation_payload") or "{}")
+        except (ValueError, TypeError):
+            audit = {}
+        d["reason_source"] = "current replay (creation audit unavailable)"
+        if (isinstance(audit, dict) and "portable_reason" in audit
+                and (audit["portable_reason"] is None or isinstance(audit["portable_reason"], str))):
+            d["creation_reason"] = audit["portable_reason"]
+            d["reason_source"] = "created event"
+        # Scratch paths are allocated on first dispatch, not requested at creation.
+        # Never erase a custom path or a dir/worktree binding when replaying old cards.
+        generated = db.parent / "kanban" / "workspaces" / d["id"]
+        if ((d.get("workspace_kind") or "scratch") == "scratch"
+                and d.get("workspace_path") == str(generated)):
+            d["workspace_path"] = None
+        for k in ("requires", "skills", "human_request"):
             try:
-                d[k] = json.loads(d[k]) if d[k] else None
+                d[k] = json.loads(d[k]) if d.get(k) else None
             except ValueError:
                 d[k] = None
         out.append(d)
     return out
+
+
+def card_reason(card: dict, reason_fn: Callable[[dict], Optional[str]]) -> str:
+    value = card["creation_reason"] if "creation_reason" in card else reason_fn(card)
+    return value or "portable (not re-enrolled)"
 
 
 def sample(registry: dict, waiting: list, now_ms: int, reason_fn: Callable[[dict], Optional[str]]) -> dict:
@@ -109,7 +130,7 @@ def sample(registry: dict, waiting: list, now_ms: int, reason_fn: Callable[[dict
     reasons = collections.Counter()
     for card in waiting:
         try:
-            reasons[reason_fn(card) or "portable (not re-enrolled)"] += 1
+            reasons[card_reason(card, reason_fn)] += 1
         except Exception as exc:  # one odd card never hides the rest
             reasons[f"check failed: {type(exc).__name__}"] += 1
     return {"at": now_ms, "hub": me, "hub_runs": hub_runs, "hub_cap": hub_cap, "hub_full": hub_full,
@@ -139,6 +160,7 @@ def save_state(home: Path, st: dict) -> None:
 def card_body(s: dict, streak: int, examples: list) -> str:
     reasons = "\n".join(f"- `{k}`: {v}" for k, v in s["reasons"].items())
     cards = "\n".join(f"- {c['id']} ({c.get('assignee') or '-'}): {(c.get('title') or '')[:90]} -> `{c['reason']}`"
+                      f" ({c.get('reason_source', 'current replay')})"
                       for c in examples[:MAX_LISTED])
     room = ", ".join(f"{k} ({v} free)" for k, v in s["room"].items())
     return f"""The hub ran {s['hub_runs']}/{s['hub_cap']} cards for {streak} samples in a row (10 min apart) while
@@ -146,7 +168,7 @@ def card_body(s: dict, streak: int, examples: list) -> str:
 (`placement_policy`) to the pool, so these wait for a hub slot. Found by {AUTHOR} (hermes-mods
 plugins/coach/worker_share_watch.py, kanban-12ee0e4b65).
 
-## Why the waiting cards stayed on the hub (core `portable_reason`)
+## Placement evidence (created `portable_reason`; legacy rows replay current rules)
 {reasons}
 
 ## Examples
@@ -198,11 +220,10 @@ def run(home: Path, *, registry_fn: Callable[[], object], reason_fn: Callable[[d
         examples = []
         for c in waiting:
             try:
-                reason = reason_fn(c)
+                reason = card_reason(c, reason_fn)
             except Exception:
                 reason = "check failed"
-            if reason:
-                examples.append({**c, "reason": reason})
+            examples.append({**c, "reason": reason})
         out["filed"] = file_card(s, streak, examples, runner=runner, day=day)
         st["filed_day"], st["filed_card"] = day, out["filed"]
     st.update({"streak": streak, "last": {k: s[k] for k in ("at", "hub_runs", "hub_cap", "room", "waiting")}})

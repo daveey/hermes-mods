@@ -41,6 +41,7 @@ def home(tmp_path):
             ("t_e1", "running", "z", "default", None, None, None, "running", None, 6)]
     con.executemany("INSERT INTO tasks (id,title,body,assignee,requires,skills,runs_on,status,placement_policy,"
                     "created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    con.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
     con.commit()
     con.close()
     return tmp_path
@@ -164,6 +165,50 @@ def test_dry_run_saves_and_files_nothing(home):
     for i in range(4):
         out = go(home, r, registry(), i, dry_run=True)
     assert out["streak"] == 1 and r.calls == [] and not w.state_path(home).exists()
+
+
+@pytest.mark.parametrize("audit", [None, "home gateway marker", "uncarried requirement"])
+def test_created_audit_wins_over_allocated_scratch_path(home, audit):
+    con = sqlite3.connect(home / "kanban.db")
+    con.execute("UPDATE tasks SET workspace_kind='scratch',workspace_path=? WHERE id='t_a1'",
+                (str(home / 'kanban' / 'workspaces' / 't_a1'),))
+    con.execute("INSERT INTO task_events(task_id,kind,payload) VALUES ('t_a1','created',?)",
+                (json.dumps({'portable_reason': audit}),))
+    con.commit()
+    con.close()
+    cards = w.waiting_unmarked(home / 'kanban.db')
+    s = w.sample(registry(), cards[:1], NOW_MS, lambda c: 'uncarried option')
+    assert s['reasons'] == {audit or 'portable (not re-enrolled)': 1}
+    assert cards[0]['reason_source'] == 'created event'
+
+
+@pytest.mark.parametrize('custom', [False, True])
+def test_legacy_replay_only_removes_generated_scratch_path(home, custom):
+    con = sqlite3.connect(home / 'kanban.db')
+    path = str(home / ('custom' if custom else 'kanban/workspaces/t_a1'))
+    con.execute("UPDATE tasks SET workspace_kind='scratch',workspace_path=? WHERE id='t_a1'", (path,))
+    con.commit()
+    con.close()
+    card = w.waiting_unmarked(home / 'kanban.db')[0]
+    assert bool(card.get('workspace_path')) is custom
+    assert card['reason_source'] == 'current replay (creation audit unavailable)'
+
+
+def test_portable_examples_are_not_dropped(home):
+    r = Runner()
+    w.run(home, registry_fn=registry, reason_fn=lambda c: None, now_ms=NOW_MS,
+          streak_needed=1, runner=r)
+    body = r.calls[0][r.calls[0].index('--body') + 1]
+    assert 't_a1' in body and 'portable (not re-enrolled)' in body
+
+
+def test_replay_preserves_uncarried_options(home):
+    con = sqlite3.connect(home / 'kanban.db')
+    con.execute('ALTER TABLE tasks ADD COLUMN tenant TEXT')
+    con.execute("UPDATE tasks SET tenant='tenant-a' WHERE id='t_a1'")
+    con.commit()
+    con.close()
+    assert w.waiting_unmarked(home / 'kanban.db')[0]['tenant'] == 'tenant-a'
 
 
 def test_a_failing_reason_check_is_counted_not_fatal(home):
