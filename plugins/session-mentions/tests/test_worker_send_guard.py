@@ -143,7 +143,15 @@ def _api(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()
     _sessions(home / "state.db", {"desk": "desktop", "worker-sess": "kanban", "cli-chat": "cli"})
-    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: home))
+    # Patch the real module when core is importable: a one-attribute stub in sys.modules made the
+    # dashboard's first `hermes_cli.kanban_db` import fail mid-way, caching a half-built
+    # kanban_db_connect (no `_kb`) that broke test_worker_send_subscribe later in the same run.
+    try:
+        import hermes_constants
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: home))
+    else:
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
     monkeypatch.delitem(sys.modules, "_session_mentions_relay_files", raising=False)
     spec = importlib.util.spec_from_file_location("sm_guard_api", _ROOT / "dashboard" / "plugin_api.py")
     api = importlib.util.module_from_spec(spec)
