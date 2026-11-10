@@ -15,7 +15,7 @@ metadata:
 
 **Look first:** the exact sha from `git`/`gh` output, the repo's AGENTS.md (it may name its own wait wrapper), and `--once`.
 
-For ordinary commit/release waits, use containment rather than "the newest run" (`gh run list -L 1`) or a single-run watch: branch concurrency can replace pending runs with a later run containing your commit. For input-specific experiments (native enabled versus skipped, RED/GREEN controls), containment alone is insufficient: bind evidence to the exact head, dispatch inputs, job and executed tests. A successful same-head run with the target job skipped cannot satisfy that experiment. See the acceptance recipe in `references/ci-authoring-and-failure-fixes.md`. Tag-mode success establishes containment only, not that CI passed
+For ordinary commit/release waits, use containment rather than "the newest run" (`gh run list -L 1`) or a single-run watch: branch concurrency can replace pending runs with a later run containing your commit. For input-specific experiments (native enabled versus skipped, RED/GREEN controls), containment alone is insufficient: bind evidence to the exact head, dispatch inputs, job and executed tests. A successful same-head run with the target job skipped cannot satisfy that experiment. See the acceptance recipe in `references/ci-authoring-and-failure-fixes.md`. For dispatched or experiment runs, record each run id from the dispatch output and wait with `wait_for_ci.py --run-id ID --expect ID:JOB=CONCLUSION` (below), never a hand-written waiter: one that filtered `gh run list` by a guessed `createdAt` matched none of five queued runs and exited 0 printing `{}`. Tag-mode success establishes containment only, not that CI passed
 or release assets were published; verify the workflow and required release artifacts separately.
 
 When a branch uses ONE serialized concurrency group (in-flight always finishes, only the newest pending waits), a
@@ -49,7 +49,15 @@ python3 -B $S <sha>                                   # every workflow that ran 
 python3 -B $S <sha> --workflow ci.yml                 # just this workflow (repeatable)
 python3 -B $S <sha> --workflow release.yml --tag-glob 'v*'   # released: a v* tag contains <sha>
 python3 -B $S <sha> --once                            # one check: exit 0 done, 1 finished red, 2 not yet
+python3 -B $S --run-id 41967431576 --expect 41967436628:native-guard=failure   # exact dispatched runs (below)
 ```
+
+Exact-run mode (`--run-id ID`, `--expect ID:JOB=CONCLUSION`, both repeatable; ids in `--expect` join the list;
+CONCLUSION is success|failure|skipped|cancelled): exit 0 only when every listed run completed and every expected job
+ended with exactly that conclusion (a skipped job matches only an expected skip); a run with no `--expect` must end
+`success`. Exit 1 at once with `no runs to wait on` for an empty manifest (also a blank `--run-id "$IDS"`), for a run id
+gh can't find, a job that ended otherwise, or an expected job missing from a completed run. `--once` gives 2 while
+anything is queued or running. Pass `--gh-repo OWNER/NAME` (dispatches often target helper branches of another repo).
 
 Exit codes: 0 done (prints the run URLs or tags; a run that built a later commit containing yours is marked
 `(ran on <sha>, a later commit containing it)`, so cite it as CI on that commit, not on yours. When a workflow's

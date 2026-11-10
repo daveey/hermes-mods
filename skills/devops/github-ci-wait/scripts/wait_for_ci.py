@@ -31,6 +31,16 @@ Every gh/git call is bounded by CALL_TIMEOUT_S, so a hung call can't outlive the
 --dispatch: on a stall, `gh workflow run` each --workflow (at most twice) and
 keep waiting instead of exiting 1.
 
+Exact-run mode, for dispatched runs and experiments (RED/GREEN controls, helper branches):
+
+    wait_for_ci.py --run-id ID [--run-id ID ...] [--expect ID:JOB=CONCLUSION ...] [--once] [--gh-repo O/R]
+
+  waits on exactly these run ids (from the dispatch output; ids named in --expect join the list). Done (0) when
+  every run completed and every expected job ended with exactly its CONCLUSION (success|failure|skipped|cancelled:
+  a skipped job matches only an expected skip); a run with no --expect must end `success`. Exit 1 at once for an
+  empty manifest ("no runs to wait on"), an unknown run id, a job that ended otherwise, or an expected job absent
+  from a completed run; 2 while anything is queued/running under --once, or on timeout.
+
 Run it from inside the repo checkout (needs `git` and an authenticated `gh`). From any other directory,
 --gh-repo OWNER/NAME uses that repo's ~/code/<name> checkout; without one it exits 1 at once.
 Start it as a background process with completion notification and end the turn:
@@ -328,9 +338,153 @@ def resolve_repo(repo: Path, slug: str | None = None) -> Path:
                      "--repo <checkout path>.")
 
 
+EXPECTABLE = ("success", "failure", "skipped", "cancelled")
+EXPECT_RE = re.compile(r"^(\d+):(.+)=(success|failure|skipped|cancelled)$")
+NOT_FOUND_RE = re.compile(r"could not find|not found|HTTP 404", re.I)
+
+
+class RunMissing(RuntimeError):
+    """gh says the run id does not exist (in this repo): final, never retried."""
+
+
+def view_run(repo: Path, slug: str | None, run_id: str) -> dict:
+    """One run with its jobs (latest attempt), bounded like every other call."""
+    fields = "databaseId,status,conclusion,headSha,headBranch,workflowName,url,event,jobs"
+    cmd = gh_cmd(slug, "run", "view", run_id, "--json", fields)
+    try:
+        out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=CALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"gh run view {run_id}: timed out after {CALL_TIMEOUT_S}s") from None
+    if out.returncode != 0:
+        err = out.stderr.strip()
+        if NOT_FOUND_RE.search(err):
+            raise RunMissing(f"run {run_id} not found{' in ' + slug if slug else ''}: {err}")
+        raise RuntimeError(f"gh run view {run_id}: {err}")
+    return json.loads(out.stdout or "{}")
+
+
+def parse_manifest(run_ids: list[str], expects: list[str]) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """(run ids in order, {run id: {job name: expected conclusion}}). Raises ValueError on a malformed entry.
+
+    Ids named only in --expect join the manifest. Blank entries (an unset shell variable: `--run-id "$IDS"`) are
+    dropped, so they leave the manifest empty instead of matching anything."""
+    ids: list[str] = []
+    exp: dict[str, dict[str, str]] = {}
+    for raw in run_ids:
+        for rid in raw.replace(",", " ").split():
+            if not rid.isdigit():
+                raise ValueError(f"--run-id {rid!r}: not a numeric run id")
+            if rid not in ids:
+                ids.append(rid)
+    for raw in expects:
+        m = EXPECT_RE.match(raw.strip())
+        if not m:
+            raise ValueError(f"--expect {raw!r}: want RUN_ID:JOB=CONCLUSION, CONCLUSION one of {'|'.join(EXPECTABLE)}")
+        rid, jobname, concl = m.group(1), m.group(2).strip(), m.group(3)
+        if rid not in ids:
+            ids.append(rid)
+        exp.setdefault(rid, {})[jobname] = concl
+    return ids, exp
+
+
+def judge_run(run: dict, expected: dict[str, str]) -> tuple[str, str]:
+    """('ok'|'wait'|'fail', detail) for one run against its expected jobs.
+
+    No expectations: the run must complete `success`. With expectations: each named job must complete with exactly
+    that conclusion (a skip matches only an expected skip), and the run must complete; the run's own conclusion is
+    then free, so an expected-red control can pass. A job that completed with the wrong conclusion is final at once,
+    even while siblings are queued. A job absent from a completed run is final (it never ran)."""
+    rid = str(run.get("databaseId") or "?")
+    status = run.get("status") or ""
+    head = (run.get("headSha") or "")[:10]
+    where = f"run {rid} ({run.get('workflowName') or '?'} on {run.get('headBranch') or '?'}@{head}) {run.get('url') or ''}".rstrip()
+    jobs = {j.get("name"): j for j in run.get("jobs") or []}
+    seen = []
+    for name, want in expected.items():
+        j = jobs.get(name)
+        if j is None:
+            if status == "completed":
+                have = ", ".join(sorted(n for n in jobs if n)) or "none"
+                return "fail", f"{where}: no job {name!r} (jobs: {have})"
+            return "wait", f"{where}: job {name!r} not started yet"
+        if j.get("status") != "completed":
+            return "wait", f"{where}: job {name!r} {j.get('status')}"
+        got = j.get("conclusion")
+        if got != want:
+            return "fail", f"{where}: job {name!r} ended {got}, expected {want}{' ' + j['url'] if j.get('url') else ''}"
+        seen.append(f"{name}={got}")
+    if status != "completed":
+        return "wait", f"{where}: {status or 'unknown status'}"
+    if not expected and run.get("conclusion") != "success":
+        return "fail", f"{where}: ended {run.get('conclusion')}"
+    return "ok", f"{where} {run.get('conclusion')}" + (f" [{', '.join(seen)}]" if seen else "")
+
+
+def wait_runs(a, run_ids: list[str], expects: dict[str, dict[str, str]]) -> int:
+    """Exact-run mode: wait on these run ids (from the dispatch output), never on a listing filter."""
+    if a.gh_repo:
+        repo = a.repo if a.repo.is_dir() else Path.cwd()
+        slug = a.gh_repo
+    else:
+        repo = resolve_repo(a.repo, None)
+        slug = gh_repo(repo)
+    deadline = time.monotonic() + a.timeout_min * 60
+    last, errors = "", 0
+    while True:
+        verdicts: dict[str, tuple[str, str]] = {}
+        err = None
+        for rid in run_ids:
+            try:
+                verdicts[rid] = judge_run(view_run(repo, slug, rid), expects.get(rid, {}))
+            except RunMissing as e:
+                print(f"stalled: {e}")
+                return 1
+            except (RuntimeError, ValueError) as e:
+                err = e
+                break
+        if err is not None:
+            errors += 1
+            if a.once:
+                print(f"not yet: {err}")
+                return 2
+            if errors >= MAX_CALL_ERRORS:
+                print(f"gh kept failing ({errors} times in a row): {err}")
+                return 1
+            if time.monotonic() >= deadline:
+                print(f"timed out after {a.timeout_min:g} min; last gh error: {err}")
+                return 2
+            print(f"{err}; retrying", flush=True)
+            time.sleep(a.interval)
+            continue
+        errors = 0
+        bad = [d for v, d in verdicts.values() if v == "fail"]
+        if bad:
+            print("stalled: " + "; ".join(bad))
+            return 1
+        pend = [d for v, d in verdicts.values() if v == "wait"]
+        if not pend:
+            print(f"passed {len(run_ids)} run(s): " + "; ".join(d for _, d in verdicts.values()))
+            return 0
+        note = f"waiting for {len(pend)}/{len(run_ids)} run(s): " + "; ".join(pend)
+        if a.once:
+            print(f"not yet: {note}")
+            return 2
+        if note != last:
+            print(note, flush=True)
+            last = note
+        if time.monotonic() >= deadline:
+            print(f"timed out after {a.timeout_min:g} min; still {note}")
+            return 2
+        time.sleep(a.interval)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("shas", nargs="+")
+    p.add_argument("shas", nargs="*")
+    p.add_argument("--run-id", action="append", default=[],
+                   help="exact-run mode: a run id from the dispatch output (repeatable; blank entries are dropped)")
+    p.add_argument("--expect", action="append", default=[], metavar="ID:JOB=CONCLUSION",
+                   help=f"exact-run mode: job JOB of run ID must end CONCLUSION ({'|'.join(EXPECTABLE)}; repeatable)")
     p.add_argument("--repo", type=Path, default=Path.cwd())
     p.add_argument("--branch", default="main")
     p.add_argument("--workflow", action="append", default=[], help="workflow file or name (repeatable)")
@@ -341,6 +495,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dispatch", action="store_true")
     p.add_argument("--gh-repo", help="OWNER/NAME for gh (default: the checkout's origin remote)")
     a = p.parse_args(argv)
+    if a.run_id or a.expect or not a.shas:
+        if a.shas:
+            print("pass either shas (containment wait) or --run-id/--expect (exact runs), not both")
+            return 1
+        try:
+            run_ids, expects = parse_manifest(a.run_id, a.expect)
+        except ValueError as e:
+            print(e)
+            return 1
+        if not run_ids:
+            # An empty manifest must never read as "all done" (agent-829ab754ac: a createdAt filter matched none
+            # of 5 queued runs and the hand-written waiter exited 0 printing `{}`).
+            print("no runs to wait on: pass a sha, or --run-id/--expect with the run ids from the dispatch output")
+            return 1
+        return wait_runs(a, run_ids, expects)
     repo = resolve_repo(a.repo, a.gh_repo)
     slug = a.gh_repo or gh_repo(repo)
 
