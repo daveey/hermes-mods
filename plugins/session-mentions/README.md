@@ -57,6 +57,18 @@ owner-naming message verbatim, never "not found". Tests: `tests/task-refs.test.m
 foreign_card comment, `foreignCardRefusal`). The core side is daveey/hermes `plugins/kanban/dashboard/plugin_api.py`
 (card t_01a1a015ef0013bd); against an older core no task has `source`, and reads behave as before.
 
+## `cross_task` comments are recorded as an agent's
+
+The courier posts a `task_comment` with `writer_kind: "agent"` and the sender's `writer_session` (from the
+outbox request's `sender`, never from the model's args, which the agent plugin allowlists anyway). The core
+endpoint records it on the `commented` event, so the running worker's live note says "from another agent
+session" instead of "from the operator" (comment 179201 was stamped human). The endpoint accepts only `agent`
+from a client: an explicit `human`, an unknown kind or a session without a kind is a 400; GUI comments send
+neither and stay human. This is provenance, not authentication: any holder of the gateway's dashboard token
+that omits `writer_kind` is still recorded human, and `writer_session` is the courier's unverified claim. A core
+older than daveey/hermes card t_01a1c78af452ff15 ignores the fields (records
+human, as before). Tests: `tests/task-refs.test.mjs` (posted body; args cannot pick provenance).
+
 ## Tests
 
 From the repo root with pytest installed:

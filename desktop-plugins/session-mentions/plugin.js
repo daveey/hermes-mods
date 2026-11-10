@@ -1071,10 +1071,15 @@ async function performTaskRequest(req, origin, conns) {
     if (!body) return { ok: false, error: 'message is required for comment' }
     const sender = req.sender || {}
     const author = String(sender.title || sender.session_id || 'cross-gateway agent').slice(0, 80)
+    // An agent wrote this (cross_task), not a person in the GUI: say so, or the endpoint records it as
+    // human and the worker reads it as the operator's words. Set here, never from args. Cores that
+    // predate the field ignore it (and keep recording human).
+    const writerSession = String(sender.session_id || '').slice(0, 200)
+    const post = { body, author, writer_kind: 'agent', ...(writerSession ? { writer_session: writerSession } : {}) }
     try {
       await api(target.connectionId, `/api/plugins/kanban/tasks/${enc(target.taskId)}/comments${target.board ? `?board=${enc(target.board)}` : ''}`, {
         method: 'POST',
-        body: { body, author },
+        body: post,
         timeoutMs: 15_000
       })
     } catch (e) {

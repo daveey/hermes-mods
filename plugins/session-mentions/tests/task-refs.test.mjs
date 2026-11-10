@@ -108,15 +108,28 @@ test('courier task_read resolves a qualified ref on its gateway, a bare id on an
 test('courier task_comment posts to the task gateway as the sender; task_list filters by status', async () => {
   const calls = []
   const m = await load({ state, connections: async () => conns }, fakeApi(calls))
-  const res = await m.performRequest({ action: 'task_comment', args: { target: '@task:bb@mac-mini/t_bbbb2222', message: 'ping' }, sender: { title: 'Planner' } }, 'local', conns)
+  const res = await m.performRequest({ action: 'task_comment', args: { target: '@task:bb@mac-mini/t_bbbb2222', message: 'ping' }, sender: { title: 'Planner', session_id: 'sess-planner' } }, 'local', conns)
   assert.equal(res.ok, true)
   const post = calls.find(c => c.method === 'POST')
   assert.equal(post.connectionId, 'mac-mini')
   assert.equal(post.path, '/api/plugins/kanban/tasks/t_bbbb2222/comments?board=bb')
-  assert.deepEqual(post.body, { body: 'ping', author: 'Planner' })
+  // An agent's cross_task comment is recorded as an agent's, never as David typing in the GUI.
+  assert.deepEqual(post.body, { body: 'ping', author: 'Planner', writer_kind: 'agent', writer_session: 'sess-planner' })
 
   const list = await m.performRequest({ action: 'task_list', args: { status: 'running,blocked' } }, 'local', conns)
   assert.deepEqual(list.tasks.map(t => t.ref).sort(), ['@task:bb@mac-mini/t_bbbb2222', '@task:default/t_aaaa1111'])
+})
+
+test('courier task_comment: the agent cannot pick its own provenance; no sender is still agent', async () => {
+  const calls = []
+  const m = await load({ state, connections: async () => conns }, fakeApi(calls))
+  const res = await m.performRequest({
+    action: 'task_comment',
+    args: { target: '@task:bb@mac-mini/t_bbbb2222', message: 'ping', writer_kind: 'human', writer_session: 'forged', author: 'desktop' }
+  }, 'local', conns)
+  assert.equal(res.ok, true)
+  const post = calls.find(c => c.method === 'POST')
+  assert.deepEqual(post.body, { body: 'ping', author: 'cross-gateway agent', writer_kind: 'agent' })
 })
 
 test('courier task_read: a gateway that errors (503 draining) is reported unreachable+retryable, never "not found"', async () => {
