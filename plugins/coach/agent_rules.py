@@ -69,6 +69,10 @@ HINTS = {
     "plan_first": ("Plan Before You Build: this is a new build request and the user has not seen a plan yet. Stop "
                    "editing, post the plan (approach, files, how it gets tested) as your reply and end the turn for "
                    "the user's go. Someone else's approval (a reviewer, a cut PR) does not replace it."),
+    "empty_wait": ("`{cmd}` exited 0 and printed nothing ({shown}). A wait that printed nothing may have matched "
+                   "nothing; check it watched the runs you expect before calling it done. For dispatched GitHub "
+                   "runs use github-ci-wait's `wait_for_ci.py --run-id ID --expect ID:JOB=CONCLUSION`, which exits 1 "
+                   "on an empty manifest instead of passing."),
     "widget_send": ("{path} is a chat widget that calls hermes.send but {issue}. Widget rules: hermes.send takes at "
                     "most 500 characters and one per second, and returns a Promise of {{ok:true}} or "
                     "{{ok:false,error,retryAfterMs}}: await it, retry after retryAfterMs when throttled, show the "
@@ -486,6 +490,39 @@ def command_key(tool: str, args: dict) -> str:
     except Exception:
         blob = str(args)[:400]
     return f"{tool}:{blob}"
+
+
+EMPTY_WAIT_CMD = re.compile(r"wait", re.I)
+EMPTY_OUTPUTS = {"", "{}", "[]", "None", "null"}
+
+
+def empty_wait(tool: str, args: dict, result: Any) -> Optional[tuple[str, str, str]]:
+    """(key, command, shown output) when a finished wait job exited 0 with empty output, else None.
+
+    A hand-written CI waiter that matched zero runs exited 0 at once printing `{}` (process_manage wait result,
+    agent-829ab754ac); exit 0 read as acceptance. Only commands containing "wait" count, so ordinary quiet
+    commands (`ls`, `make`) stay silent. terminal: the call's own command; process_manage: the job's command."""
+    d = _as_dict(result)
+    if not d or d.get("exit_code") != 0:
+        return None
+    if tool == "terminal":
+        cmd = str(args.get("command") or "")
+        if args.get("background"):  # the start notice, not the job's end
+            return None
+        key = "terminal:" + _norm_cmd(cmd)[:200]
+    elif tool == "process_manage":
+        if d.get("status") not in ("exited", "completed", "done", None) or "command" not in d:
+            return None
+        cmd = str(d.get("command") or "")
+        key = "proc:" + str(args.get("session_id") or d.get("session_id") or cmd[:200])
+    else:
+        return None
+    if not EMPTY_WAIT_CMD.search(cmd):
+        return None
+    out = str(d.get("output") if d.get("output") is not None else "").strip()
+    if out not in EMPTY_OUTPUTS:
+        return None
+    return key, cmd, (f"output `{out}`" if out else "empty output")
 
 
 def is_poll(tool: str, args: dict) -> bool:
@@ -2076,6 +2113,17 @@ class AgentCoach:
         if hit:
             self._fire(self._s(sid), sid, "live_checkout", "session", path=hit.replace(str(Path.home()), "~", 1))
 
+    def check_empty_wait(self, sid: str, tool: str, args: Any, result: Any) -> None:
+        """empty_wait rule (once per job): a wait that exited 0 with empty output. Also run from
+        transform_tool_result so the hint lands on the result that showed the empty output."""
+        if not sid:
+            return
+        hit = empty_wait(tool, args if isinstance(args, dict) else {}, result)
+        if hit:
+            key, cmd, shown = hit
+            short = cmd if len(cmd) <= 100 else cmd[:97] + "..."
+            self._fire(self._s(sid), sid, "empty_wait", key, cmd=short, shown=shown)
+
     def check_kanban_db_write(self, sid: str, tool: str, args: Any) -> None:
         """kanban_db_write rule (once per session): a hand-written SQL write to the board's task tables.
         Also run from transform_tool_result so the hint lands on this very call."""
@@ -2155,6 +2203,7 @@ class AgentCoach:
         self.check_live(sid, tool, args)
         self.check_kanban_db_write(sid, tool, args)
         self.check_widget_send(sid, tool, args)
+        self.check_empty_wait(sid, tool, args, result)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":
             d = _as_dict(result) or {}

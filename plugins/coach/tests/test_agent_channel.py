@@ -830,3 +830,48 @@ def test_widget_send_hint_covers_patch_and_observe(tmp_path):
     c = coach(tmp_path)
     c.observe("s1", "patch", {"path": "/tmp/w.htm", "old_string": "a", "new_string": _WIDGET_UNCHECKED}, OK)
     assert "never reads" in (c.take("s1") or "")
+
+
+# ── empty_wait: a wait that exited 0 and printed nothing may have watched nothing (agent-829ab754ac) ──
+# The incident's process_manage result (msg 890972): a hand-written CI waiter matched zero runs and exited 0 at once.
+EMPTY_WAIT = json.dumps({"status": "exited", "command": "python3 /home/u/.hermes/cache/scratch/x/w12/wait.py",
+                         "exit_code": 0, "completion_reason": "exited", "termination_source": "",
+                         "output": "{}\n", "timeout_note": "Requested wait of 1500s was clamped to configured limit of 180s"})
+
+
+def test_empty_wait_fires_on_the_incident_process_result(tmp_path):
+    c = coach(tmp_path)
+    c.observe("s1", "process_manage", {"action": "wait", "session_id": "proc_fd4623e21355"}, EMPTY_WAIT)
+    hint = c.take("s1")
+    assert hint and "printed nothing" in hint and "may have matched nothing" in hint
+    assert "--run-id" in hint  # points at the tool that refuses an empty manifest
+
+
+def test_empty_wait_fires_on_terminal_and_on_each_empty_shape(tmp_path):
+    for out in ("", "  \n", "{}", "[]", "None", "null"):
+        c = coach(tmp_path)
+        term(c, "python3 wait_runs.py --ids 1 2", json.dumps({"output": out, "exit_code": 0}))
+        assert c.take("s1"), repr(out)
+
+
+def test_empty_wait_quiet_otherwise(tmp_path):
+    c = coach(tmp_path)
+    term(c, "python3 wait.py", json.dumps({"output": "passed: 5 runs", "exit_code": 0}))  # printed evidence
+    term(c, "python3 wait.py", json.dumps({"output": "{}", "exit_code": 1}))  # failed: repeat_failure's job
+    term(c, "ls /tmp", json.dumps({"output": "", "exit_code": 0}))  # not a wait
+    c.observe("s1", "process_manage", {"action": "wait", "session_id": "p2"},
+              json.dumps({"status": "exited", "command": "make build", "exit_code": 0, "output": ""}))
+    c.observe("s1", "process_manage", {"action": "wait", "session_id": "p3"},
+              json.dumps({"status": "running", "command": "python3 wait.py", "output": ""}))  # still running
+    assert c.take("s1") is None
+
+
+def test_empty_wait_hint_lands_on_the_call_that_caused_it(tmp_path):
+    _, hooks = plugin.build(store=core.Store(tmp_path / "coach"))
+    args = {"action": "wait", "session_id": "proc_fd4623e21355"}
+    out = hooks["transform_tool_result"](tool_name="process_manage", args=args, result=EMPTY_WAIT, session_id="s1")
+    assert out and "may have matched nothing" in out
+    hooks["post_tool_call"](tool_name="process_manage", args=args, result=EMPTY_WAIT, session_id="s1")
+    # once per job: observe() after transform must not queue it again for the next result
+    nxt = hooks["transform_tool_result"](tool_name="terminal", args={"command": "ls"}, result=OK, session_id="s1")
+    assert nxt is None
