@@ -6,15 +6,27 @@ patch. This module is the decision logic for the Hermes hooks in ``__init__.py``
 
 - Any ``git stash`` (push, pop, apply, list, no-arg, ...) inside a repo with more than one
   worktree gets a warning. ``list`` is included so a read-only command can prove the guard.
-- ``git stash pop`` / ``apply`` is refused when that repo has more than one worktree and the
-  stash's branch (parsed from ``WIP on <branch>:`` / ``On <branch>:``) is not the current
-  branch. A missing or unparseable subject fails closed. Same-branch pop is allowed (the
-  warning still fires). A single-worktree repo is left alone: stash is the normal undo there.
+- In a shared (more than one worktree) or unresolved/unreadable repo, every ``refs/stash``
+  mutation is refused, whatever branch made the entry: ``git stash`` push/save/store (and
+  no-arg push), pop, branch, drop, clear and import. Branch names cannot prove ownership of
+  a repository-wide stack: a same-branch pop or drop can consume another worker's entry.
+- Explicit raw writes to ``refs/stash`` are refused in the same repos: ``update-ref`` naming
+  it (all ``--stdin`` is conservatively refused), ``reflog delete``/``expire``/``drop`` of a stash entry (and
+  ``reflog expire --all`` with an explicit ``--expire``), a ``fetch``/``push`` refspec whose
+  destination is ``refs/stash``, and ``symbolic-ref`` setting or deleting it.
+- ``git stash apply`` (which leaves the stack unchanged) is still allowed when the stash's
+  branch (parsed from ``WIP on <branch>:`` / ``On <branch>:``) is the current branch; a
+  different, missing or unparseable subject fails closed. Read-only ``list``/``show`` and
+  ``create`` stay allowed. A known single-worktree repo is left alone: stash is the normal
+  undo there.
 
 Commands are parsed by a bounded static analyzer (see ``_Analyzer``); nothing is executed.
 Unsupported state is unknown, and unknown never infers a safe repo. Uncertain fragments
 (unsupported wrapper argv, unknown command names, ANSI-C text) are re-analyzed with an
-unknown repo, so adding uncertainty can only add refusals.
+unknown repo, so adding uncertainty can only add refusals. It is not a sandbox: argv that
+Python computes at run time, direct filesystem writes to ``.git/refs/stash`` or
+``logs/refs/stash``, implicit autostash (``rebase``/``merge``/``pull --autostash``) and
+``gc``/default reflog pruning are not covered.
 
 ``STASH_WORKTREE_GUARD=off`` in the command, or ``STASH_WORKTREE_GUARD_DISABLE=1`` in the
 environment, skips both paths.
@@ -1211,7 +1223,7 @@ def _ansi_c_decode(body: str) -> str:
     return _ANSI_ESC.sub(one, body)
 
 
-def _restore_evidence(text: str) -> list[str]:
+def _restore_evidence(text: str, ops=None) -> list[str]:
     """Restore ops (``pop``/``apply``) for which ``text`` holds any ``stash`` + op evidence.
 
     Order-independent: scalar assignments may name the op before the subcommand. Variants
@@ -1242,7 +1254,7 @@ def _restore_evidence(text: str) -> list[str]:
         for flat in {re.sub(r"[\"'\\]", "", t), re.sub(r"[\"']", "", re.sub(r"\\[a-z]", " ", t))}:
             # (a printf/echo -e escape like `pop\n` ends the word: `\n` is not part of it)
             if re.search(r"\bstash\b", flat):
-                found |= {op for op in REFUSE_OPS if re.search(rf"\b{op}\b", flat)}
+                found |= {op for op in (REFUSE_OPS if ops is None else ops) if re.search(rf"\b{op}\b", flat)}
             # Values the text does not hold (printf -v, read, $(...), {a,b}) are unknown, as
             # in ordinary analysis: an unknown stash op or git subcommand may be a restore.
             if _DYNAMIC_OP.search(flat) or _DYNAMIC_SUB.search(flat):
@@ -1334,6 +1346,22 @@ class _Analyzer:
             self.unanalyzed += 1
         for op in _restore_evidence(text or ""):
             self.record(None, "stash", [op])
+        # Mutation evidence is separate from restore/alias diagnostics. This is
+        # used only when parsing failed, never to reinterpret ordinary inventory.
+        if git_words:
+            return  # git() resolves which argument was unknown, e.g. a push message.
+        for op in _restore_evidence(text or "", {"push", "save", "drop", "clear"}):
+            self.record(None, "stash", [op])
+        flat = re.sub(r"[\"'\\]", "", text or "")
+        for op in re.findall(r"\bstash\s+(store|import|branch)\b", flat):
+            self.record(None, "stash", [op])
+        if re.search(r"\bstash\s*(?:-[qm]|--message|--\s|$|[;|&])", flat):
+            self.record(None, "stash", ["push"])
+        if ("refs/stash" in flat and re.search(r"\b(?:update-ref|symbolic-ref|fetch|push)\b", flat)
+                or re.search(r"\breflog\s+(?:delete|expire|drop)\b", flat)
+                and (re.search(r"\b(?:refs/)?stash\b", flat)
+                     or "--all" in flat and "--expire" in flat)):
+            self.record(None, "stash", ["drop"])
 
     def run_text(self, text: str, states: list, depth: int) -> list:
         if "\\\n" in text and not self.joining:
@@ -2330,7 +2358,7 @@ def _git_calls_noted(cmd: str, cwd: Optional[str], depth: int = 0):
     except Exception:  # budget, recursion, or an analyzer defect: never fail open
         analyzer.fail_closed(cmd or "")
     if analyzer.uncertain:  # a fragment failed: its text may not be all that went unanalyzed
-        analyzer.fail_closed(cmd or "")
+        analyzer.fail_closed(cmd or "", git_words=not analyzer.unanalyzed)
     yield from analyzer.calls
 
 
@@ -2338,12 +2366,11 @@ def stash_op(args: list[str]) -> Optional[str]:
     """``push`` for no-arg / ``git stash -q``, the subcommand name, or None for ``--help``."""
     if "-h" in args or "--help" in args:
         return None
-    positional = [a for a in args if not a.startswith("-")]
-    if not positional:
+    # With no explicit subcommand Git defaults to push, including -m MESSAGE
+    # and -- PATHSPEC. Option values are not subcommands.
+    if not args or args[0].startswith("-"):
         return "push"
-    if positional[0] in STASH_SUBS:
-        return positional[0]
-    return None
+    return args[0] if args[0] in STASH_SUBS else None
 
 
 def stash_ref(args: list[str]) -> str:
@@ -2395,12 +2422,66 @@ def warning_for(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def _raw_stash_mutation(sub: str, args: list[str], text: str) -> bool:
+    """Recognize explicit ref/reflog writes, not ordinary ref inventory."""
+    if sub in {"update-ref", "symbolic-ref", "fetch", "push"} and None in args:
+        return True  # an unresolved target may name refs/stash
+    if sub == "reflog" and args and args[0] in {"delete", "expire", "drop"} and None in args:
+        return True
+    def stash(word):
+        return word in {"stash", "refs/stash"} or word.startswith(("stash@{", "refs/stash@{"))
+
+    if sub == "update-ref":
+        return "refs/stash" in args or "--stdin" in args
+    if sub == "symbolic-ref":
+        positional = []
+        words = iter(args)
+        for word in words:
+            if word == "-m":
+                next(words, None)
+            elif not word.startswith("-"):
+                positional.append(word)
+        return bool(positional and positional[0] == "refs/stash" and
+                    (len(positional) > 1 or "--delete" in args or "-d" in args))
+    if sub == "reflog" and args and args[0] in {"delete", "expire", "drop"}:
+        return any(stash(a) for a in args[1:]) or (
+            args[0] == "expire" and "--all" in args and
+            any(a.startswith("--expire") for a in args))
+    if sub in {"fetch", "push"}:
+        return any(":" in a and a.rsplit(":", 1)[1] == "refs/stash" for a in args)
+    return False
+
+
 def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
-    """Why ``pop``/``apply`` must be blocked, or None to let it run."""
+    """Why a shared mutation or unsafe restore must be blocked, or None."""
     if _bypassed(cmd):
         return None
     seen = set()
+    base = _resolve(os.path.expanduser(cwd or os.getcwd()), os.getcwd())
+    for repo, sub, args, _note in _git_calls_noted(cmd, base):
+        if _raw_stash_mutation(sub, args, cmd) and (repo is None or worktree_count(repo) != 1):
+            return (
+                f"STASH WORKTREE GUARD: blocked `git {sub}` mutation of shared refs/stash "
+                "(or unresolved repository). Use the archive-verified "
+                "live-checkout-guard/reconcile.py retirement helper. " + _safe_recipe()
+            )
     calls = list(_stash_invocations(cmd, cwd))
+    # Branch names cannot establish ownership of a repository-wide stack. Even
+    # a same-branch pop/drop can consume another worker's newly pushed entry.
+    for repo, op, _args, _note in calls:
+        if _note:  # Preserve the actionable unknown-word/alias diagnostic below.
+            continue
+        if op not in PUSH_OPS | {"pop", "branch", "drop", "clear", "import"}:
+            continue
+        if repo is None or worktree_count(repo) != 1:
+            return (
+                f"STASH WORKTREE GUARD: blocked `git stash {op}`: shared refs/stash "
+                "mutation is not permitted in a multi-worktree or unresolved repository. "
+                "Use a detached baseline for tests; for removal use the archive-verified "
+                "live-checkout-guard/reconcile.py stash retirement helper. "
+                "Read-only stash list/show and non-mutating create remain available. "
+                + _safe_recipe()
+            )
     # Every unresolved-repo restore comes only from an unknown word, with no stash text.
     notes = [note for repo, op, _a, note in calls if repo is None and op in REFUSE_OPS]
     alias_note = next((note for note in notes if isinstance(note, _AliasUncertainty)), None)
@@ -2470,7 +2551,7 @@ def check_python(code: str, cwd: Optional[str] = None) -> Optional[str]:
     """Refuse path for shell strings and git argv lists inside Python (execute_code)."""
     if _bypassed(code):
         return None
-    for lit in re.findall(r"""(?:"([^"\n]*\bgit\b[^"\n]*stash[^"\n]*)"|'([^'\n]*\bgit\b[^'\n]*stash[^'\n]*)')""", code or ""):
+    for lit in re.findall(r"""(?:"([^"\n]*\bgit\b[^"\n]*)"|'([^'\n]*\bgit\b[^'\n]*)')""", code or ""):
         why = refuse_reason(lit[0] or lit[1], cwd)
         if why:
             return why

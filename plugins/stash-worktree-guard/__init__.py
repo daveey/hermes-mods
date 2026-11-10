@@ -1,7 +1,10 @@
 """stash-worktree-guard: ``refs/stash`` is shared by every worktree of a repo.
 
-- ``pre_tool_call`` blocks ``git stash pop`` / ``apply`` when the repo has more than one worktree
-  and the stash's branch is not the current branch (terminal, process, execute_code, nested tool_call).
+- ``pre_tool_call`` (terminal, process, execute_code, nested tool_call) blocks, in a repo with more
+  than one worktree or one it cannot resolve, every ``refs/stash`` mutation (stash
+  push/save/store/pop/branch/drop/clear/import and explicit raw ``update-ref``/``reflog``/
+  ``fetch``/``push``/``symbolic-ref`` writes), and ``apply`` unless the stash's branch is the current
+  branch. Known single-worktree repos are left alone. Bounded static analysis, not a sandbox.
 - ``transform_terminal_output`` appends a warning after any ``git stash`` in such a repo, including
   ``git stash list``, so the agent sees the shared-ref rule on the command that just ran.
 """

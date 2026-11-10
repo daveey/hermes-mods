@@ -169,7 +169,7 @@ def test_slash_named_function_controls(multi):
     main, wt = multi
     for cmd in (
         f"/usr/bin/python3() {{ git -C {wt} stash list; }}; /usr/bin/python3",
-        f"/usr/bin/python3() {{ git -C {main} stash pop; }}; /usr/bin/python3",
+        f"/usr/bin/python3() {{ git -C {main} stash apply; }}; /usr/bin/python3",
         f"/usr/bin/python3() {{ git -C {wt} stash pop; }}; command /usr/bin/python3 -c pass",
         f"/usr/bin/python3() {{ git -C {wt} stash pop; }}; unset -f /usr/bin/python3; "
         "/usr/bin/python3 -c pass",
@@ -388,7 +388,7 @@ def test_nested_runner_inherited_taint_refusal(multi, command):
     "git -c alias.x='stash pop' difftool -x 'true'; git x",
     "git -c alias.x='stash pop' rebase -x 'git stash list'; git x",
     "git for-each-repo --config=r.repo -- -c alias.x='stash pop' status; git x",
-    "git bisect run sh -c 'cd /missing'; git stash pop",
+    "git bisect run sh -c 'cd /missing'; git stash apply",
 ])
 def test_nested_runner_isolated_taint_allow(multi, command):
     assert guard.refuse_reason(command, str(multi[0])) is None
@@ -587,16 +587,26 @@ def test_no_warning_for_a_single_worktree_or_unrelated_git(single, multi):
 
 def test_refuses_pop_and_apply_when_stash_branch_differs(multi):
     main, wt = multi
+    # apply keeps the branch check: the refusal names both branches.
+    for cmd in (
+        f"git -C {wt} stash apply",
+        f"cd {wt} && git stash apply",
+        f"timeout 60 git -C {wt} stash apply",
+        f"bash -c 'git -C {wt} stash apply'",
+    ):
+        got = block("terminal", command=cmd)
+        assert got and got["action"] == "block", cmd
+        assert "other" in got["message"] and "main" in got["message"]
+        assert "refs/stash" in got["message"]
+    # pop mutates the shared ref: refused in a multi-worktree repo whatever the branch.
     for cmd in (
         f"git -C {wt} stash pop",
-        f"git -C {wt} stash apply",
         f"cd {wt} && git stash pop",
         f"timeout 60 git -C {wt} stash pop",
         f"bash -c 'git -C {wt} stash pop'",
     ):
         got = block("terminal", command=cmd)
         assert got and got["action"] == "block", cmd
-        assert "other" in got["message"] and "main" in got["message"]
         assert "refs/stash" in got["message"]
     got = block("terminal", command="git stash pop", workdir=str(wt))
     assert got and got["action"] == "block"
@@ -608,13 +618,16 @@ def test_refuses_pop_and_apply_when_stash_branch_differs(multi):
     assert got and got["action"] == "block"
 
 
-def test_allows_pop_when_the_stash_branch_matches_or_the_repo_has_one_worktree(multi, single):
+def test_allows_apply_when_the_stash_branch_matches_or_pop_when_the_repo_has_one_worktree(multi, single):
     main, _wt = multi
-    assert block("terminal", command=f"git -C {main} stash pop") is None
-    assert block("terminal", command=f"git -C {main} stash push") is None
+    assert block("terminal", command=f"git -C {main} stash apply") is None
     assert block("terminal", command=f"git -C {main} stash list") is None
-    # Same-branch pop still warns: the ref is shared even when the names match.
-    warned = plugin.transform_terminal_output(command=f"git -C {main} stash pop", output="ok")
+    # Branch names cannot establish ownership of the shared stack: same-branch pop/push refuse.
+    for op in ("pop", "push"):
+        got = block("terminal", command=f"git -C {main} stash {op}")
+        assert got and got["action"] == "block", op
+    # Same-branch apply still warns: the ref is shared even when the names match.
+    warned = plugin.transform_terminal_output(command=f"git -C {main} stash apply", output="ok")
     assert warned and guard.MARK in warned
     # One worktree: pop across branches is the ordinary stash workflow.
     assert block("terminal", command=f"git -C {single} stash pop") is None
@@ -631,7 +644,7 @@ def test_off_switch_skips_both_paths(multi):
 def test_unparseable_stash_subject_fails_closed(multi, monkeypatch):
     _main, wt = multi
     monkeypatch.setattr(guard, "stash_subject", lambda repo, ref="stash@{0}": "custom message with no branch")
-    got = block("terminal", command=f"git -C {wt} stash pop")
+    got = block("terminal", command=f"git -C {wt} stash apply")
     assert got and got["action"] == "block"
     assert "does not name a branch" in got["message"]
 
@@ -643,21 +656,26 @@ def test_assignment_cd_push_pop_is_checked_before_background_promotion(multi, mo
     command = 'WT=$TMPDIR/wt; cd $WT; git stash -q -- f.txt; git status; git stash pop -q'
     got = block("terminal", command=command, timeout=900)
     assert got and got["action"] == "block"
+    assert "refs/stash" in got["message"]
+    # The assigned cwd resolves to the detached worktree: apply's branch check names both.
+    command = 'WT=$TMPDIR/wt; cd $WT; git status; git stash apply -q'
+    got = block("terminal", command=command, timeout=900)
+    assert got and got["action"] == "block"
     assert "main" in got["message"] and "HEAD" in got["message"]
 
 
 @pytest.mark.parametrize("target", ['$UNKNOWN_STASH_REPO', '"$(mktemp -d)"', '`mktemp -d`'])
-@pytest.mark.parametrize("op", ["pop", "apply"])
-def test_unknown_target_fails_closed(multi, target, op, monkeypatch):
-    main, _wt = multi
+@pytest.mark.parametrize("op", ["pop", "apply", "push"])
+def test_unknown_target_fails_closed(single, target, op, monkeypatch):
+    # The fallback cwd (cd failed) is a one-worktree repo, so only the unknown target refuses.
     monkeypatch.delenv("UNKNOWN_STASH_REPO", raising=False)
-    got = block("terminal", command=f'cd {target}; git stash {op}', workdir=str(main))
+    got = block("terminal", command=f'cd {target}; git stash {op}', workdir=str(single))
     assert got and got["action"] == "block"
     assert "resolve" in got["message"]
     assert "Save a patch instead" in got["message"]
 
 
-@pytest.mark.parametrize("op", ["list", "push", "show"])
+@pytest.mark.parametrize("op", ["list", "create", "show"])
 def test_unknown_target_nonrestoring_stash_is_allowed(multi, op):
     main, _wt = multi
     assert block("terminal", command=f'cd "$(mktemp -d)"; git stash {op}', workdir=str(main)) is None
@@ -671,15 +689,15 @@ def test_assigned_git_C_and_safe_expansions(multi, single, monkeypatch):
         got = block("terminal", command=f'M={target}; git -C "$M" stash apply')
         assert got and got["action"] == "block"
         assert "other" in got["message"] and "main" in got["message"]
-    for repo in (main, single):
-        assert block("terminal", command=f'M="{repo}"; git -C "$M" stash pop') is None
+    for repo, op in ((main, "apply"), (single, "pop")):
+        assert block("terminal", command=f'M="{repo}"; git -C "$M" stash {op}') is None
 
 
 def test_unknown_cwd_cannot_fall_back_to_guard_cwd(multi):
     main, _wt = multi
     assert block("terminal", command='cd "$MISSING"; cd relative; git stash pop', workdir=str(main))
-    # An absolute -C restores a known target; a same-branch pop remains permitted.
-    assert block("terminal", command=f'cd "$MISSING"; git -C "{main}" stash pop') is None
+    # An absolute -C restores a known target; a same-branch apply remains permitted.
+    assert block("terminal", command=f'cd "$MISSING"; git -C "{main}" stash apply') is None
 
 
 def test_assignment_scope_and_tracked_pwd(multi, single, monkeypatch):
@@ -713,7 +731,9 @@ def test_quoted_literal_variable_is_not_expanded(multi, single):
 def test_missing_stash_is_not_a_block(multi):
     main, wt = multi
     git("stash", "clear", cwd=main)
-    assert block("terminal", command=f"git -C {wt} stash pop") is None
+    assert block("terminal", command=f"git -C {wt} stash apply") is None
+    # An empty stack is no ownership proof: another worktree may push before the pop runs.
+    assert block("terminal", command=f"git -C {wt} stash pop")
 
 
 # --- A restore after a push in the same command ---
@@ -744,16 +764,16 @@ def test_restore_after_same_command_push_refuses(multi, template, where, clear):
     cmd = template.format(main=main, wt=wt)
     got = block("terminal", command=cmd, workdir=str({"main": main, "wt": wt}[where]))
     assert got and got["action"] == "block", cmd
-    assert "pushes a stash" in got["message"], got["message"]
+    assert "refs/stash" in got["message"], got["message"]
 
 
 PUSH_THEN_RESTORE_ALLOWED = [
     # One worktree: nobody else shares refs/stash.
     ("git stash -q; true; git stash pop -q", "single"),
     # No push in the command: the top stash is main's own.
-    ("git stash list; git stash show; git stash pop", "main"),
+    ("git stash list; git stash show; git stash apply", "main"),
     # A push into another repository leaves this one's refs/stash alone.
-    ("git -C {single} stash -q; git -C {main} stash pop", "wt"),
+    ("git -C {single} stash -q; git -C {main} stash apply", "wt"),
 ]
 
 
@@ -784,15 +804,17 @@ STASH_BRANCH_CASES = [
     ("git stash branch newb", "wt", True),
     ("git -C {wt} stash branch newb stash@{{0}}", "main", True),
     ("git stash push -q -m x; git stash branch newb", "main", True),
-    # The stash is main's own: restoring it in main is fine.
-    ("git stash branch newb", "main", False),
+    # `stash branch` drops the entry: refused in a multi-worktree repo even on its own branch.
+    ("git stash branch newb", "main", True),
+    # One worktree: nobody else shares refs/stash.
+    ("git -C {single} stash branch newb", "wt", False),
 ]
 
 
 @pytest.mark.parametrize("template,where,expected", STASH_BRANCH_CASES)
-def test_stash_branch_is_checked_like_pop(multi, template, where, expected):
+def test_stash_branch_is_checked_like_pop(multi, single, template, where, expected):
     main, wt = multi
-    cmd = template.format(main=main, wt=wt)
+    cmd = template.format(main=main, wt=wt, single=single)
     assert _blocked(cmd, {"main": main, "wt": wt}[where]) is expected, cmd
 
 
@@ -822,8 +844,8 @@ EXPORTED_FUNCTION_CASES = [
     ("f() {{ git -C {wt} stash pop; }}; export -f f; bash -c 'bash -c f'", "main", True),
     # Controls: an unexported function is not visible in the child.
     ("f() {{ git -C {wt} stash pop; }}; bash -c f", "main", False),
-    # The exported function restores this worktree's own stash.
-    ("f() {{ git stash pop; }}; export -f f; bash -c f", "main", False),
+    # The exported function applies this worktree's own stash.
+    ("f() {{ git stash apply; }}; export -f f; bash -c f", "main", False),
 ]
 
 
@@ -855,7 +877,7 @@ SHELL_STATE_CASES = [
     # Grouping: a subshell's cd scopes its own commands, never the parent.
     ("(cd {wt} && git stash pop)", "main", True),
     ("(cd {wt}; git stash apply)", "main", True),
-    ("(cd {main} && git stash pop)", "wt", False),
+    ("(cd {main} && git stash apply)", "wt", False),
     ("(cd {single} && git stash pop)", "wt", False),
     ("(cd {main}); git stash pop", "wt", True),
     ("{{ cd {wt}; git stash pop; }}", "main", True),
@@ -866,7 +888,7 @@ SHELL_STATE_CASES = [
     ("cd {single} |& cat; git stash pop", "wt", True),
     ("git -C {wt} stash list |& git -C {wt} stash pop", "main", True),
     # Redirections are not control separators.
-    ("git -C {main} stash pop 2>&1 | tail -3", "wt", False),
+    ("git -C {main} stash apply 2>&1 | tail -3", "wt", False),
     ("git -C {wt} stash pop 2>&1 | tail -3", "main", True),
     ("cd {single} >/dev/null 2>&1; git stash pop", "wt", False),
     ("cd {single} &>/dev/null; git stash pop", "wt", False),
@@ -927,12 +949,12 @@ def test_nested_shell_exhaustion_fails_closed(multi):
     assert _blocked(f"f() {{ git -C {main} stash pop; f; }}; f", wt)
     assert _blocked("f() { f; }; f; git stash pop", main)
     # A shallow same-branch nesting keeps working.
-    assert not _blocked("bash -c " + shlex.quote(f"git -C {main} stash pop"), wt)
+    assert not _blocked("bash -c " + shlex.quote(f"git -C {main} stash apply"), wt)
 
 
 @pytest.mark.parametrize("template,where,expected", [
     ("bash <<EOF\ncd {wt}\ngit stash pop\nEOF", "main", True),
-    ("cat <<'EOF'\ngit stash pop\nEOF\ngit -C {main} stash pop", "wt", False),
+    ("cat <<'EOF'\ngit stash pop\nEOF\ngit -C {main} stash apply", "wt", False),
     ("G=git; $G stash pop", "wt", True),
     ("$(echo git) stash pop", "main", True),
     ("trap 'git stash pop' EXIT", "main", True),
@@ -951,7 +973,7 @@ def test_execute_code_shell_state(multi, single, monkeypatch):
     monkeypatch.setenv("TERMINAL_CWD", str(main))
     got = block("execute_code", code=f'terminal("(cd {wt} && git stash pop)")')
     assert got and got["action"] == "block"
-    assert block("execute_code", code=f'terminal("cd {single} & git stash pop")') is None
+    assert block("execute_code", code=f'terminal("cd {single} & git stash apply")') is None
     monkeypatch.setenv("TERMINAL_CWD", str(wt))
     got = block("execute_code", code='terminal(\'x="$(git stash pop)"\')')
     assert got and got["action"] == "block"
@@ -1022,7 +1044,8 @@ def test_expanded_restore_argv(multi, template):
 def test_scalar_argv_allow_controls(multi, single, where):
     main, wt = multi
     repo = {"main": main, "single": single}[where]
-    cmd = f'G=git; S=stash; OP=pop; $G -C {repo} "$S" "$OP" 2>&1'
+    op = "apply" if where == "main" else "pop"  # a same-branch pop mutates the shared ref
+    cmd = f'G=git; S=stash; OP={op}; $G -C {repo} "$S" "$OP" 2>&1'
     assert not _blocked(cmd, wt)
 
 
@@ -1183,7 +1206,7 @@ def test_cdpath_relative_target_is_unknown(multi, single):
     (wt.parent / 'target').symlink_to(wt, target_is_directory=True)
     cmd = f'CDPATH={wt.parent}; cd target; git stash pop'
     assert _blocked(cmd, single)
-    assert not _blocked(f'CDPATH={wt.parent}; cd {main}; git stash pop', wt)
+    assert not _blocked(f'CDPATH={wt.parent}; cd {main}; git stash apply', wt)
 
 
 def test_expansion_globbing_is_not_a_scalar(multi):
@@ -1262,9 +1285,9 @@ def test_function_precedence_allow_controls(multi, single):
     subprocess.run([BASH, "-c", cmd], cwd=main, capture_output=True, env=GIT_ENV, check=True)
     assert _stash_count(main) == 1
     # Same-branch and single-worktree restores through a shadowing function stay allowed.
-    assert not _blocked(f'timeout() {{ git -C {main} stash pop; }}; timeout 5 true', wt)
+    assert not _blocked(f'timeout() {{ git -C {main} stash apply; }}; timeout 5 true', wt)
     assert not _blocked(f'env() {{ git -C {single} stash pop; }}; env true', wt)
-    assert not _blocked(f'git() {{ :; }}; command git -C {main} stash pop', wt)
+    assert not _blocked(f'git() {{ :; }}; command git -C {main} stash apply', wt)
     # Non-restoring function bodies are not refused.
     assert not _blocked(f'env() {{ git -C {wt} stash list; }}; env true', main)
 
@@ -1285,7 +1308,7 @@ def test_cli_alternate_selection_is_sticky_across_C(multi, template):
 def test_alternate_selection_controls(multi, single):
     main, wt = multi
     # Plain absolute -C stays trusted; redirection and non-restoring ops are unaffected.
-    assert not _blocked(f"git -C {main} stash pop 2>&1 >/dev/null", wt)
+    assert not _blocked(f"git -C {main} stash apply 2>&1 >/dev/null", wt)
     assert not _blocked(f"git -C {single} stash pop", wt)
     assert not _blocked(f"git --git-dir={_gitdir(wt)} --work-tree={wt} -C {main} stash list", main)
 
@@ -1405,16 +1428,16 @@ def test_round3_allow_controls(multi, single):
     main, wt = multi
     for cmd in (
         # same-branch / single-worktree restores through the newly modeled forms
-        f"timeout 10 git -C {main} stash pop",
-        f"timeout --foreground -k 5 10 git -C {main} stash pop",
-        f"builtin cd {main}; git stash pop",
+        f"timeout 10 git -C {main} stash apply",
+        f"timeout --foreground -k 5 10 git -C {main} stash apply",
+        f"builtin cd {main}; git stash apply",
         f"builtin cd {single}; git stash pop",
-        f"git --namespace foo -C {main} stash pop",
-        f"git --no-pager -C {main} stash pop 2>&1 >/dev/null",
-        f"git -C {main} stash pop stash@{{0}}",
-        f"git -c core.editor=true -C {main} stash pop",
+        f"git --namespace foo -C {main} stash apply",
+        f"git --no-pager -C {main} stash apply 2>&1 >/dev/null",
+        f"git -C {main} stash apply stash@{{0}}",
+        f"git -c core.editor=true -C {main} stash apply",
         f"pushd {single} >/dev/null; git stash pop",
-        f"cd {main}/../repo; git stash pop",
+        f"cd {main}/../repo; git stash apply",
     ):
         assert not _blocked(cmd, wt), cmd
     for cmd in (
@@ -1429,9 +1452,10 @@ def test_round3_allow_controls(multi, single):
         f"git -c alias.p='stash pop' -C {main} log -1",
         'git log --format="%H" -1 "$X"',
         'git commit -m "$MSG"',
-        f'git -C {wt} stash -m "$MSG"',
-        f"echo $'x'; git -C {wt} stash push -m \"$MSG\"",
-        f"echo $'x'; git -C {wt} stash -m \"$MSG\"",
+        # A push is a shared-ref mutation in main/wt; -m "$MSG" parsing is checked in single.
+        f'git -C {single} stash -m "$MSG"',
+        f"echo $'x'; git -C {single} stash create",
+        f"echo $'x'; git -C {single} stash list",
     ):
         assert not _blocked(cmd, main), cmd
 
@@ -1440,11 +1464,11 @@ def test_logical_cd_allow_controls(multi):
     main, wt = multi
     _symlink_into_main(main, wt)
     # Physical cd lands in main (same branch); a symlink without `..` is unambiguous.
-    assert not _blocked(f"cd -P {wt}/l/..; git stash pop", wt)
-    assert not _blocked(f"cd {wt}/l; cd {main}; git stash pop", wt)
+    assert not _blocked(f"cd -P {wt}/l/..; git stash apply", wt)
+    assert not _blocked(f"cd {wt}/l; cd {main}; git stash apply", wt)
     assert not _blocked(f"cd {wt}/l; git stash list", main)
     # The tracked logical cwd is still exact: wt/l is inside main's checkout.
-    assert not _blocked(f"cd {wt}/l; git stash pop", wt)
+    assert not _blocked(f"cd {wt}/l; git stash apply", wt)
 
 
 # --- Bounds: state cap, step budget, unexpected analyzer exception ---
@@ -1601,7 +1625,7 @@ def test_state_cap_collapses_to_unknown(multi, single, monkeypatch):
 
 def test_step_budget_fails_closed(multi):
     main, wt = multi
-    same_branch = f"git -C {main} stash pop"
+    same_branch = f"git -C {main} stash apply"
     assert not _blocked("true; " * 10 + same_branch, wt)
     assert _blocked("true; " * guard.MAX_STEPS + same_branch, wt)
     assert not _blocked("true; " * guard.MAX_STEPS + f"git -C {main} stash list", wt)
@@ -1609,7 +1633,7 @@ def test_step_budget_fails_closed(multi):
 
 def test_unexpected_analyzer_exception_fails_closed(multi, monkeypatch):
     main, wt = multi
-    same_branch = f"git -C {main} stash pop"
+    same_branch = f"git -C {main} stash apply"
     assert not _blocked(same_branch, wt)
 
     def boom(*_a, **_k):
@@ -1681,16 +1705,16 @@ def test_round4_restores_are_refused(multi, template):
 def test_round4_allow_controls(multi, single):
     main, wt = multi
     for cmd in (
-        f"bash -ec 'git -C {main} stash pop'",
+        f"bash -ec 'git -C {main} stash apply'",
         f"bash -lc 'cd {single} && git stash pop'",
-        f"sh -c -- 'git -C {main} stash pop'",
-        f"IFS=x; A=stash; git -C {main} $A pop",
-        f"git -C {main} sta\\\nsh pop",
-        f"set -a; X=1; git -C {main} stash pop",
-        f"cd {main} && /usr/lib/git-core/git-stash pop",
+        f"sh -c -- 'git -C {main} stash apply'",
+        f"IFS=x; A=stash; git -C {main} $A apply",
+        f"git -C {main} sta\\\nsh apply",
+        f"set -a; X=1; git -C {main} stash apply",
+        f"cd {main} && /usr/lib/git-core/git-stash apply",
         f"git -c include.path=/dev/null -C {main} log -1",
-        f"git -c include.path=/dev/null -C {main} stash pop",
-        f"echo hi # comment \\\ngit -C {main} stash pop",
+        f"git -c include.path=/dev/null -C {main} stash apply",
+        f"echo hi # comment \\\ngit -C {main} stash apply",
     ):
         assert not _blocked(cmd, wt), cmd
     for cmd in (
@@ -1787,20 +1811,20 @@ def test_round5_restores_are_refused(multi, template):
 def test_round5_allow_controls(multi):
     main, wt = multi
     for cmd in (
-        f"hash -p /bin/echo e; git -C {main} stash pop",
-        f"set -a; D={main}; bash -c 'git -C \"$D\" stash pop'",
-        f"shopt -so allexport; X=1; git -C {main} stash pop",
-        f"set -k; git -C {main} stash pop",
-        f"python3 -m pytest -q && git -C {main} stash pop",
-        f"python3 -c 'print(1)' && git -C {main} stash pop",
-        f"make \"$TARGET\" && git -C {main} stash pop",
-        f"declare -n ref=arr; git -C {main} stash pop",
+        f"hash -p /bin/echo e; git -C {main} stash apply",
+        f"set -a; D={main}; bash -c 'git -C \"$D\" stash apply'",
+        f"shopt -so allexport; X=1; git -C {main} stash apply",
+        f"set -k; git -C {main} stash apply",
+        f"python3 -m pytest -q && git -C {main} stash apply",
+        f"python3 -c 'print(1)' && git -C {main} stash apply",
+        f"make \"$TARGET\" && git -C {main} stash apply",
+        f"declare -n ref=arr; git -C {main} stash apply",
         f"git config alias.st status && git -C {main} st",
         f"echo pop | bash -c cat",
         f"printf 'hello\\n' | bash; git -C {main} stash list",
-        f"git config user.name x && git -C {main} stash pop",
-        f"git -c core.editor=true -c core.pager=cat -C {main} stash pop",
-        f"x=\"$(git -C {main} stash list)\"; PS4='+ '; git -C {main} stash pop",
+        f"git config user.name x && git -C {main} stash apply",
+        f"git -c core.editor=true -c core.pager=cat -C {main} stash apply",
+        f"x=\"$(git -C {main} stash list)\"; PS4='+ '; git -C {main} stash apply",
         f'gh pr create --title x --body "then run git -C {wt} stash pop"',
         f"sed -i 's|old|git -C {wt} stash pop|' notes.md",
     ):
@@ -2198,9 +2222,9 @@ def test_state_cap_exported_repository_selectors(multi):
     assert not subprocess.check_output(["git", "stash", "list"], cwd=main, env=GIT_ENV).strip()
 
 
-def test_for_loop_over_same_branch_checkout_allows_pop(multi):
+def test_for_loop_over_same_branch_checkout_allows_apply(multi):
     main, _wt = multi
-    cmd = f"for w in {main}; do git -C $w stash pop; done"
+    cmd = f"for w in {main}; do git -C $w stash apply; done"
     assert guard.refuse_reason(cmd, str(main)) is None, cmd
 
 
@@ -2283,7 +2307,7 @@ LOOP_ACCUMULATOR_ALLOWED = [
     'A=""; for i in a b c; do A="$A x$i"; done; ~/bin/tool run --help',
     'A=""; for i in a b; do A="$A/$i"; done; git -C ~/x status',
     'n=0; while [ $n -lt 3 ]; do n=$((n+1)); done; ~/bin/tool --help',
-    'A=; for i in a b; do A="$A$i"; done; cd {main} && git stash pop',
+    'A=; for i in a b; do A="$A$i"; done; cd {main} && git stash apply',
 ]
 
 

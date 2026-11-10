@@ -8,14 +8,42 @@ claims below apply to the forms it recognizes; **an allowed command is not proof
 it cannot restore another branch's stash**. See [explicit out-of-scope compositions](#explicit-out-of-scope-compositions)
 for known bypasses, including commands that create their own scripts or config.
 
-This plugin:
+## Policy
+
+In a **shared** repo (more than one worktree) or an **unresolved** one (the analyzer cannot
+resolve or read it), the guard blocks every mutation of `refs/stash` before execution,
+regardless of which branch made the entry:
+
+- `git stash push`, `save`, `store` (and no-arg `git stash`, including `-m MSG`/`-- PATHSPEC`),
+  `pop`, `branch`, `drop`, `clear` and `import`. Branch names cannot establish ownership of a
+  repository-wide stack: even a same-branch `pop` or `drop` can consume an entry another
+  worker pushed a moment earlier;
+- explicit raw writes to `refs/stash`: `git update-ref` naming it (all `--stdin` input is
+  conservatively refused), `git reflog delete`/`expire`/`drop` of a `stash`/`stash@{n}` entry, `git reflog
+  expire --all` with an explicit `--expire…` value, a `git fetch` or `git push` refspec whose destination
+  is `refs/stash`, and `git symbolic-ref refs/stash` that sets or deletes it.
+
+Still allowed: `git stash apply` when the stash's branch equals the current branch (under
+the existing branch checks below), read-only `list`/`show`, and `create` (prints a commit,
+writes no ref). A known single-worktree repo is left alone: every stash mutation runs
+there. To remove entries from a shared stash, use the archive-verified retirement helper
+in [live-checkout-guard](../live-checkout-guard/) (`reconcile.py`); for tests, use a
+detached baseline worktree instead of stash.
+
+Not covered (bounded analyzer, not a sandbox): Git argv that Python computes at run time
+(only literal strings and argv lists in `execute_code` are checked), direct filesystem
+writes to `.git/refs/stash`, `.git/logs/refs/stash` or `packed-refs`, implicit autostash
+(`rebase`/`merge`/`pull --autostash`, `rebase.autoStash`), and `git gc`/default reflog
+pruning (`reflog expire` without an explicit expiry).
+
+This plugin also:
 
 - appends a `[stash-worktree-guard]` warning to terminal output for `git stash`
   (including `list`) in a repo with more than one worktree;
-- blocks `git stash pop` and `git stash apply` before execution when the stash's branch
-  (`WIP on <branch>:` / `On <branch>:`) differs from the current branch, or its subject
-  does not name a branch. `git stash branch` (which applies and then drops the stash) gets
-  the same check on resolved argv; the textual fallback covers only pop and apply;
+- blocks `git stash apply` (and any restore whose op the textual fallback cannot rule out)
+  when the stash's branch (`WIP on <branch>:` / `On <branch>:`) differs from the current
+  branch, or its subject does not name a branch. Restore fallback covers pop and apply;
+  separate mutation evidence also covers shared-stack writes on analysis failure;
 - blocks a restore that follows a push (`git stash`, `push`, `save`, `store`) into the same
   repository earlier in the same command, whatever refs/stash holds when it is checked: the
   restore takes whichever stash is newest when it runs, which can be another worker's;
@@ -42,7 +70,7 @@ This plugin:
   unknown repo;
 - fails closed for restoring operations when the repo cannot be resolved or read.
   Unknown variables, command substitution, and unsupported expansions are not executed
-  to discover the path. Read-only stash commands and pushes are not refused on that basis.
+  to discover the path. Read-only stash commands remain allowed; pushes are refused.
   A parse failure, the nesting limit (8 levels of `bash -c`/substitution/eval/function
   call), the state cap (16), the step budget, or an analyzer exception turns textual
   `stash` plus `pop`/`apply` evidence anywhere in the whole original command, in either
@@ -171,8 +199,8 @@ This plugin:
   define an alias, so a non-builtin subcommand is unknown; so does an earlier
   `git config alias.*`/`include.*` in the same command.
 
-Known scalar same-branch restores and known single-worktree repos retain their previous
-behavior. Unsupported forms intentionally may refuse safe restores (for example
+Known single-worktree repos retain their previous behavior; in shared repos only a known
+same-branch `apply` is still allowed (see [Policy](#policy)). Unsupported forms intentionally may refuse safe restores (for example
 `git -C $UNQUOTED stash list`, `git "$SUB" log`, `timeout 1e3 git … stash pop`, a
 restore behind `xargs`/`flock`/`prlimit`/`nix develop -c` even in a same-branch repo,
 any textual `stash … pop` in a command that also runs `bash x.sh`, `… | sh` or `source`,
@@ -249,6 +277,15 @@ that every unsupported form is refused.
 ## Tests
 
 From the repository root: `scripts/test-all -k stash-worktree-guard`.
+
+`test_shared_mutations.py` exercises pre-tool refusal for terminal, execute_code shell
+strings and literal argv, and chains, checking unchanged synthetic stash refs and files.
+It also proves real push/drop affect the shared stack, single-worktree mutation allows,
+read-only allows on both entry paths, and the supported retirement-helper invocation.
+`test_ref_mutations.py` covers raw writes, symbolic-ref message options, unresolved argv,
+opaque update-ref stdin, and analysis-budget/exception fallback through terminal and
+execute_code. Raw read-only inventory is checked through both shell-string and argv
+paths. The live-checkout-guard suite independently exercises real archive retirement.
 
 `test_read_only_allow_corpus` collects real read-only false positives (awk diff filters,
 SQLite loops, literal for-loop variables, bracket tests, sed reads and builtin plumbing
@@ -378,6 +415,19 @@ unsupported wrappers and ANSI-C, split scalars, quoted and escaped spellings),
 non-restoring shapes allowed.
 
 ## Failure analysis
+
+Shared push/drop executed despite the output warning because the pre-tool policy
+explicitly skipped push and non-restore operations; the warning was emitted only after
+execution. Root (happened): branch-restore protection was mistaken for shared-stack
+ownership protection. Root (not caught): tests required shared push and same-branch pop
+to pass, with no independent push/drop refusal acceptance. Recurrence: the earlier
+push-then-restore fix below protected restores but left standalone stack mutation
+advisory. The new mutation tests fail on that policy and pass with the pre-execution
+shared/unresolved mutation check. Existing parser allow controls now use non-mutating
+apply, retaining single-worktree pop allows. Review additionally reproduced raw unknown
+argv raising outside the analyzer (the hook catches exceptions), and symbolic-ref's
+message value being mistaken for its target. Explicit unknown handling and option-value
+parsing close these paths; terminal/execute_code regressions failed before those fixes.
 
 A function exported to a child Bash (`export -f f; timeout 5 bash -c f`) was listed above as
 an out-of-scope composition until 2026-11-01. It isn't obfuscation: `timeout` can't run a
