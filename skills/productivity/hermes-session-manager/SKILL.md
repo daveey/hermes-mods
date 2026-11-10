@@ -118,12 +118,14 @@ say what's running, never what needs the user.
 - When a worker blocks on a conflict between the approval's literal limits and live facts, settle it yourself:
   pick the reading that satisfies both the intent and the letter, and leave anything outside the approved scope
   untouched as a named follow-up. Then `kanban_comment` the ruling and unblock, rather than asking the user again.
-- "Still red" / "why is it red" is about the Desktop sidebar stripe, not the stored outcome. The app can paint a row
+- "Still red" / "no green bar" is about the Desktop sidebar stripe, not the stored outcome. The app can paint a row
   red on its own (a queue card a restart lost, an open prompt, a turn gone quiet) while `outcome --refresh` reads
-  `waiting` or `done`. Never tell David a chat isn't red from `outcome` alone: ask what the stripe's tooltip says
+  `waiting` or `done`. Never tell David a chat is green or isn't red from `outcome` alone: ask what the stripe's tooltip says
   (a restart-lost queue card reads "A message queued before a restart may not have run: Send again or Discard";
-  Discard or Send again on that card clears it), or check the row on the machine he sees it on. Since the
-  desktop-d94ca254ae fix, Desktop settles such a card by itself once the stored transcript shows its message ran to a reply.
+  Discard or Send again clears it), or check the row on the machine he sees it on. A `done` outcome with a non-empty
+  `crons` list (the chat is `owner_session_id` of a live job in `cron/jobs.json`) draws a green loop glyph, never
+  the bar, so check `crons` in `outcome --refresh --json` before promising green. That owner field only feeds the
+  sidebar; releasing it doesn't change how the job runs.
 - Verify completion with `hermes sessions outcome <id> --refresh --json`, then read it back; without
   `--refresh` the command only reads stored state. Live card links can restore `waiting` after a done declaration. Trace remote links to the
   owner's `kanban notify-list <task> --json` and the card's named canonical origin. Remove only a demonstrably
