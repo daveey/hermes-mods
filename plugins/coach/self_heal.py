@@ -1650,7 +1650,7 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
 ## Evidence (from the detector)
 - Symptom: {d.get('symptom') or '?'}
 - Component: {comp} · detector: {d.get('source') or '?'} ({d.get('kind') or '?'}, p={d.get('p_defect', '?')})
-- When: {when} · host: {d.get('host') or '?'} · session: @session:{d.get('profile') or 'default'}/{sid}
+- When: {when} · host: {d.get('host') or '?'} · session: {('@session:' + (d.get('profile') or 'default') + '/' + sid) if sid else 'none (no chat, e.g. a cron run)'}
 - Quote: "{(d.get('quote') or '').strip()[:500]}"
 {('- Extra: ' + str(d.get('details'))[:1500]) if d.get('details') else ''}
 {('- Stop evidence (captured on ' + str(d.get('stop_host') or d.get('host') or '?') + '): cause ' +
