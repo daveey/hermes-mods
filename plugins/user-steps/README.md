@@ -548,6 +548,17 @@ turn-end hook). Tests: `tests/test_clarify_early.py`.
 
 ## Tests
 
+`tests/test_desktop_contract.py` runs in `scripts/test-all -k user-steps` and feeds
+real `ActionStore.views()` output to the Desktop plugin's exported `validRequest`
+and `projectRequests` in Node. It covers all four request kinds, omitted/true/false
+permission flags, persisted legacy strings, and open/withdrawn lifecycle views.
+New requests go through `ActionStore.create()` and its validator; only legacy
+string revisions are seeded directly in the temporary database, since new writes
+correctly reject that historical format. No production data is read or changed.
+Node >= 18.19 is required (missing Node fails rather than silently skipping the
+contract); React/Desktop installation is not required. The runner stubs only UI
+imports and loads the actual renderer module, not a copy of its validator.
+
 Verify standalone CI separately from the core-enabled suite: local auto-discovery can
 otherwise hide accidental core dependencies. From `plugins/user-steps`, run this
 with both `--python 3.11` and `--python 3.14`:
