@@ -71,6 +71,31 @@ class DigestDedupe(unittest.TestCase):
 
 
 class DigestFeatures(unittest.TestCase):
+    def test_prev_tools_counts_tool_calls_after_the_agents_last_text(self):
+        """Defect agent-b6540f8eef: a reply ending "Reading the card first:" looked the same whether tools ran after
+        it or the agent stalled, because `prev` keeps only text. `prev_tools` is the count of tool calls since it."""
+        t = time.time() - 100
+        call = lambda name: {"type": "function", "function": {"name": name, "arguments": "{}"}}
+        rows = [("user", "verify the card", t, 1, 0, None, None, "u1"),
+                ("assistant", "Reading the card first:", t + 1, 1, 0, None, None, "a1"),
+                ("assistant", "", t + 2, 1, 0, None, None, "a2"),
+                ("user", "what's going on with this?", t + 3, 1, 0, None, None, "u2"),
+                ("assistant", "Checking the PR now:", t + 4, 1, 0, None, None, "a3"),
+                ("user", "and?", t + 5, 1, 0, None, None, "u3")]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            con = sqlite3.connect(db)
+            con.execute("update messages set tool_calls=? where message_uid='a1'", (json.dumps([call("kanban_show")]),))
+            con.execute("update messages set tool_calls=? where message_uid='a2'", (json.dumps([call("terminal")]),))
+            con.commit(); con.close()
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        turns = dg["user_turns"]
+        self.assertNotIn("prev_tools", turns[0])  # nothing before the first message
+        self.assertEqual(turns[1]["prev"], "Reading the card first:")
+        self.assertEqual(turns[1]["prev_tools"], 2)  # text, then 2 tool calls, then the user
+        self.assertEqual(turns[2]["prev_tools"], 0)  # text, then the user: a real no-tool stall
+
     def test_feature_counts_from_tool_args_and_tool_call_wrapper(self):
         t = time.time() - 100
         call = lambda name, args: {"type": "function", "function": {"name": name, "arguments": json.dumps(args)}}

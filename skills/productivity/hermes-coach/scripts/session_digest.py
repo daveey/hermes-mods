@@ -21,7 +21,8 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, fnmatch, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 7            # v7: bounded user-turn head/tail + explicit clipping metadata
+DIGEST_V = 8            # v8: user turns carry prev_tools (tool calls after the agent's last text)
+                        # v7: bounded user-turn head/tail + explicit clipping metadata
                         # v6: each user turn carries `prev`, the agent reply before it (head+tail clip), for the
                         #     self-heal backstop judge (without it \"why didnt this work\" reads as a new issue)
                         # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
@@ -401,6 +402,7 @@ def digest_db(profile, db, host, since, prev=None, have=None, keys=None, stats=N
         sig = collections.Counter()
         feats = collections.Counter()
         last_reply, n_real = "", 0
+        tools_after_text = 0
         last_interrupt = None
         for m in msgs:
             role, content = m["role"], m["content"] or ""
@@ -430,18 +432,25 @@ def digest_db(profile, db, host, since, prev=None, have=None, keys=None, stats=N
                     turn["text_original_chars"] = len(text)
                 if last_reply.strip():
                     turn["prev"] = clip_ends(redact(_home_rel(last_reply) or ""))
+                if last_reply.strip() or tools_after_text:
+                    # Tool calls after the agent's last text: a reply ending "Reading the card first:" is a stall at 0
+                    # and a working turn at N > 0; `prev` alone can't tell them apart (agent-b6540f8eef).
+                    turn["prev_tools"] = tools_after_text
                 if last_interrupt:
                     turn["prev_interrupt"] = last_interrupt
                 users.append(turn)
+                tools_after_text = 0
             elif role == "assistant":
                 if content.strip():
                     last_reply = content
+                    tools_after_text = 0
                     # Why the model wait before this reply was cut short (core display_metadata.interrupt:
                     # reason/waited_s/prompt_tokens), or None once a real reply follows it.
                     last_interrupt = _interrupt_meta(m["meta"])
                 for tc, targs, inner in _tool_calls(m["tool_calls"], with_args=True):
                     if not inner:
                         tools[tc] += 1
+                        tools_after_text += 1
                     feats.update(call_features(tc, targs))
             elif role == "tool":
                 if m["tool_name"] and TOOL_ERR.search(content[:4000]):
