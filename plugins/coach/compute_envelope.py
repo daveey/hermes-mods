@@ -6,8 +6,9 @@ spend or genuine requests for approval as a new spending commitment.
 
 The standing rule (~/AGENTS.md, rent-machine skill): once the user has said go on a job that needs a GPU, an agent
 may rent ONE single-GPU machine up to $25 total without asking (cheapest by $ per finished run, hard cap,
-auto-teardown, linked to the chat) and states the choice in one line. It asks only above $25 or for multi-GPU /
-multi-node machines. Running on a shared host outside its scheduler is not the fallback; renting is.
+auto-teardown, linked to the chat) and states the choice in one line. Incremental single-GPU spend under $20
+needs no ask, even across the original cap; increments of $20 or more and multi-GPU / multi-node still need
+approval. Running on a shared host outside its scheduler is not the fallback; renting is.
 
 Defect agent-962f3f10ff: with no default budget written down, agents turned a ~$5-10 rental into three
 `kanban_block`s and an "approve $20 / use metta1 directly" menu, and the experiment sat blocked for 5 days.
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import Decimal
 from typing import Any, Optional
 
 DEFAULT_ENVELOPE_USD = 25.0
@@ -179,6 +181,44 @@ def cap_amounts(sent: str) -> list[float]:
     return out
 
 
+# The standing top-up rule is strict: $19.99 is pre-approved; $20 is not.
+TOPUP_USD = 20.0
+INCREMENT_BEFORE_RE = re.compile(
+    r"(?:\b(?:additional|another|extra|incremental|add)\s+|"
+    r"\b(?:top[- ]?up|increment|increase|extend)(?:\s+(?:by|of|for))?\s*[:=]?\s*|\+\s*)$", re.I)
+INCREMENT_AFTER_RE = re.compile(r"\s*(?:top[- ]?up|extra|more|additional|increment)\b", re.I)
+
+
+def increments(text: str) -> list[float]:
+    """Explicit top-up amounts, not totals or hourly rates. Bind cues to the figure."""
+    s = _money_text(unquoted(text)).replace('*', '').replace('`', '')
+    return [_usd(m) for m in MONEY_RE.finditer(s) if not m.group(4) and (
+        INCREMENT_BEFORE_RE.search(s[:m.start()]) or INCREMENT_AFTER_RE.match(s[m.end():]))]
+
+
+def _baseline(text: str, default: float) -> float:
+    """Named previous/current spend or budget, used only alongside an explicit top-up.
+
+    This is context for the small increment, never authority for a new cap.
+    """
+    s = _money_text(unquoted(text)).replace('*', '').replace('`', '')
+    values = [default]
+    for m in MONEY_RE.finditer(s):
+        if m.group(4):
+            continue
+        if (re.search(r"\b(?:spent|spent so far|current budget|previous budget|last budget|current cap|previous cap)"
+                      r"\s*(?:is|was|of|:)?\s*$", s[:m.start()], re.I)
+                or re.match(r"\s*(?:spent|already spent|spent so far)\b", s[m.end():], re.I)):
+            values.append(_usd(m))
+    return max(values)
+
+
+def _small_topup(text: str, amounts, baseline: float) -> bool:
+    inc = increments(text)
+    return bool(inc) and all(0 < v < TOPUP_USD for v in inc) and (
+        not amounts or Decimal(str(max(amounts))) <= Decimal(str(baseline)) + Decimal(str(max(inc))))
+
+
 def classify(text: str, envelope: Optional[float] = None) -> Optional[dict]:
     """The asking sentence when `text` asks a human to approve compute/spend inside the envelope, else None."""
     text = str(text or "")
@@ -186,7 +226,10 @@ def classify(text: str, envelope: Optional[float] = None) -> Optional[dict]:
         return None
     cap = envelope_usd() if envelope is None else envelope
     money = totals(text)
-    if any(v > cap for v in money):
+    inc = increments(text)
+    if any(v >= TOPUP_USD for v in inc):
+        return None
+    if any(v > cap for v in money) and not _small_topup(text, money, _baseline(text, cap)):
         return None
     if MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", text)):
         return None
@@ -360,6 +403,10 @@ def _authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
              for part in re.split(r"(?<=[.?!;])\s+|\n+", t)
              if not DENY_RE.search(part) and not re.search(r"\?|\b(?:why|whether)\b", part, re.I)]
     approved = [v for user in users for v in totals(user)] + [float(v) for v in asked or ()]
+    topup_grants = [v for user in users if re.search(r"\b(?:approv\w*|authorize|allow|budget)\b", user, re.I)
+                   and not PAST_RE.search(user) for v in totals(user)] + [float(v) for v in asked or ()]
+    fixed_limit = any(re.search(r"\bonly\b|\bnever go above\b|\bdo not exceed\b", u, re.I)
+                      for u in user_texts if typed_text(u))
     multi_approved = any(AUTH_MULTI_RE.search(u) and re.search(
         r"\b(?:approve|allow|go ahead|you may|rent|use)\b", u, re.I) for u in users)
     # A cap label followed by its value on the next line is one declaration.
@@ -378,10 +425,20 @@ def _authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
         multi = bool(AUTH_MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", count_text)))
         # The task's approved policy accepts either matching dollars or explicit
         # multi-GPU permission. Never let a smaller dollar figure grant a larger cap.
-        dollar_ok = bool(approved and amounts) and max(approved) >= max(amounts)
+        inc = increments(sent)
+        # Explicit increments at/above the threshold need a matching number too,
+        # even when they are smaller than the initial rental envelope.
+        required = [*amounts, *[v for v in inc if v >= TOPUP_USD]]
+        dollar_ok = bool(approved and required) and max(approved) >= max(required)
         if multi_approved or dollar_ok:
             continue
-        if (amounts and max(amounts) > envelope_usd()) or multi:
+        baseline = topup_grants[-1] if topup_grants else envelope_usd()
+        delta_ok = bool(topup_grants and amounts) and (
+            0 < Decimal(str(max(amounts))) - Decimal(str(baseline)) < Decimal(str(TOPUP_USD)))
+        topup_ok = _small_topup(text, totals(text), _baseline(text, baseline))
+        if not multi and not fixed_limit and not any(v >= TOPUP_USD for v in inc) and (delta_ok or topup_ok):
+            continue
+        if (amounts and max(amounts) > envelope_usd()) or multi or any(v >= TOPUP_USD for v in inc):
             return {"sentence": sent[:300], "usd": max(amounts) if amounts else None,
                     "cap": envelope_usd(), "rule": "compute_authority"}
     return None
@@ -390,7 +447,8 @@ def _authority(text: str, user_texts=(), asked=()) -> Optional[dict]:
 def authority_note(hit: dict) -> str:
     return ('[coach] Compute authority: the agent-set GPU cap has no matching user approval. '
             'AGENTS.md: "Once I\'ve said go on a job that needs a GPU, you may rent ONE single-GPU '
-            'machine up to $25 total without asking"; "Ask only above $25 total or for multi-GPU / multi-node." '
+            'machine up to $25 total without asking". Incremental single-GPU spend under $20 is also pre-approved. '
+            'An increment of $20 or more, or multi-GPU / multi-node, still needs a user number. '
             'Calibrate inside that envelope first, then ask for an explicit number with a blocked card. '
             'Do not treat your own reply or a dispatched card body as spend authority.')
 
@@ -473,5 +531,6 @@ def note(hit: dict, where: str) -> str:
             f"Lambda; rent-machine skill), hard cap, results copied off, auto-teardown with a verified destroy, "
             f"linked to the chat. State the choice in one line and carry on. {act}, and don't run on a shared host "
             f"outside its scheduler instead. An agent-written 'no paid rentals' line on a card does not revoke the "
-            f"envelope; only David's own words do. Ask only above ${cap} total or for multi-GPU / multi-node. If "
+            f"envelope; only David's own words do. Incremental single-GPU spend under $20 needs no ask, even "
+            f"when it takes the total past ${cap}. Ask for increments of $20 or more or multi-GPU / multi-node. If "
             f"the job itself has not been approved yet, ask about the job, not the spend.")

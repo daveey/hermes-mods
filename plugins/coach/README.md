@@ -94,8 +94,16 @@ source; for `write_file`/`patch`, in the process env. Tests: `tests/test_live_ch
 machine up to $25 total without asking. A deterministic classifier (no model call) catches a `kanban_block`
 (direct or through `tool_call`) or a final reply with a sentence that asks for a decision (approve, may I, want me
 to, reply "…") about compute or money (GPU, rent, Vast/RunPod, outside Slurm, budget, $N), in a text about compute.
-It stays silent when any total is above the envelope (hourly rates don't count), the machine is multi-GPU /
-multi-node, or the sentence is about a credential (token-broker grant, SSH key, password, 2FA, sudo). The first hit
+It stays silent when any total is above the envelope without a bounded small top-up (hourly rates don't count),
+the machine is multi-GPU / multi-node, or the sentence is about a credential (token-broker grant, SSH key, password,
+2FA, sudo). Incremental single-GPU spend strictly under $20 is pre-approved even across the original $25 cap.
+Explicit additional/extra/top-up amounts are bound to their numbers, with named prior spend/current budgets
+used only to check the resulting total; a small unrelated figure cannot excuse a much larger cap. Authority also
+accepts a total less than $20 above a user-approved budget (including persisted answered asks), but not a user
+historical-spend mention or an explicit fixed limit. Plain new caps without incremental context retain the original
+$25 check. An explicit increment of $20 or more and multi-GPU/multi-node keep their approval check.
+`tests/test_compute_topups.py` covers reply/block/create, $19.99/$20 boundaries, later top-ups, arithmetic, and provenance.
+The first hit
 per session and surface holds the block / the turn once with a note to rent within budget and carry on (logged
 `agent_hint` / `reply_nudge`, rule `compute_envelope`); a repeat goes through and is logged as `agent_fault`.
 Origin: defect agent-962f3f10ff, where three blocks and an "approve $20 / use metta1 directly" menu left a ~$5-10
