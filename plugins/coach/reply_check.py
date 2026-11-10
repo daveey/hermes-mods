@@ -293,9 +293,11 @@ _ITEM_ID_RE = re.compile(r"\bt_[0-9a-f]{8,}\b|(?<![\w&])#\d{2,6}\b|\b(?=[0-9a-f]
 _ITEM_WORD_RE = re.compile(r"[a-z0-9]{3,}")
 
 
-def evidence_ids(reply: str, evidence: str) -> list[str]:
+def evidence_ids(reply: str, evidence: str, user_ask: str = "") -> list[str]:
     """Card / PR / commit ids (commits cut to 7 hex) in the paragraph of `reply` sharing the most words with
-    `evidence` (the evidence's own ids first). [] when no paragraph shares a word."""
+    `evidence` (the evidence's own ids first). [] when no paragraph shares a word.
+    agent-b22d5f6bb5: when that paragraph and the evidence name no id, the cards `user_ask` names (a notice's
+    "Existing delivery card t_..."): the draft called it "the existing task", the revision named it."""
     def ids(text):
         out = []
         for m in _ITEM_ID_RE.finditer(text or ""):
@@ -310,7 +312,10 @@ def evidence_ids(reply: str, evidence: str) -> list[str]:
         n = len(words & set(_ITEM_WORD_RE.findall(para.lower())))
         if n > score:
             best, score = para, n
-    return list(dict.fromkeys(ids(evidence) + ids(best)))[:12]
+    out = list(dict.fromkeys(ids(evidence) + ids(best)))[:12]
+    if not out and user_ask:
+        out = list(dict.fromkeys(NAMED_CARD_RE.findall(user_ask)))[:NAMED_CARD_MAX]
+    return out
 
 
 def fresh_ready_owner(reply: str, tool_log: Optional[list] = None) -> list[str]:
@@ -416,12 +421,22 @@ def _read_this_turn(cid: str, tool_log: Optional[list]) -> bool:
     return False
 
 
+def _named_or_ask_text(reply: str, user_ask: str = "") -> str:
+    """The reply's ending; when it names no card id, the user's ask (agent-b22d5f6bb5: a draft saying "the existing
+    task will resume when the Mac reconnects" about the card its notice named; owner_probe_live's same fallback)."""
+    tail = (reply or "")[-1500:]
+    if NAMED_CARD_RE.search(tail) or not user_ask:
+        return tail
+    return user_ask[:ASK_HEAD]
+
+
 def named_card_facts(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None,
-                     dbs: Optional[list] = None) -> list[str]:
+                     dbs: Optional[list] = None, user_ask: str = "") -> list[str]:
     """`<- BOARD task=...` lines for cards the reply's ending names (unquoted) that this turn's tool log never read
-    with a status; [] when there are none, no board has them, or a read fails (fail-open)."""
+    with a status; [] when there are none, no board has them, or a read fails (fail-open). A reply naming no card
+    reads the cards `user_ask` names instead."""
     try:
-        tail = (reply or "")[-1500:]
+        tail = _named_or_ask_text(reply, user_ask)
         ids: list[str] = []
         for m in NAMED_CARD_RE.finditer(tail):
             cid = m.group(0)
@@ -444,17 +459,18 @@ def named_card_facts(reply: str, tool_log: Optional[list] = None, now: Optional[
         return []
 
 
-def owner_source(reply: str, tool_log: Optional[list] = None, board: Optional[list] = None) -> str:
+def owner_source(reply: str, tool_log: Optional[list] = None, board: Optional[list] = None,
+                 user_ask: str = "") -> str:
     """Where report_only's owner evidence for the cards the reply names came from (telemetry, agent-a8184f8541):
     `ok` (an `<- OK` line of the turn's own read), `board` / `replica` (the coach's own read of this host's board /
     of its replica of another gateway's board), or `none`."""
-    named = list(dict.fromkeys(NAMED_CARD_RE.findall((reply or "")[-1500:])))
+    named = list(dict.fromkeys(NAMED_CARD_RE.findall(_named_or_ask_text(reply, user_ask))))
     if not named:
         return "none"
     if any(_read_this_turn(cid, [l for l in tool_log or [] if (l or "").lstrip().startswith("<- OK")])
            for cid in named):
         return "ok"
-    lines = named_card_facts(reply, tool_log) if board is None else list(board)
+    lines = named_card_facts(reply, tool_log, user_ask=user_ask) if board is None else list(board)
     if any("(replica)" in l for l in lines):
         return "replica"
     return "board" if lines else "none"
@@ -591,14 +607,14 @@ def stall_telemetry(reply: str, tool_log: Optional[list] = None, now: Optional[f
     return {"owner_ready_for_s": f["ready_for_s"], "owner_stall_notes": int(f.get("stall_notes") or 0)}
 
 
-def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = None) -> str:
+def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = None, user_ask: str = "") -> str:
     """The prompt section with the coach's own board read ("" when it has no lines). `board=None` reads now."""
-    lines = named_card_facts(reply, tool_log) if board is None else list(board)
+    lines = named_card_facts(reply, tool_log, user_ask=user_ask) if board is None else list(board)
     if not lines:
         return ""
     return ("COACH'S OWN BOARD READ (this host's Kanban boards and its replicas of other gateways' boards, read just "
-            "now for cards the final message names that the tool log did not read; counts as a check of these cards "
-            "this turn):\n"
+            "now for cards the final message names (when it names none, the cards the user's request names) that the "
+            "tool log did not read; counts as a check of these cards this turn):\n"
             + "\n".join(lines) + "\n\n")
 
 
@@ -2118,7 +2134,7 @@ def confirm_prompt(user_ask: str, rich_log: list[str], reply: str, prev_turn: Op
     request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else request_excerpt(ask)
     context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
     return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
-            f"truncated):\n{log}\n\n{board_section(reply, rich_log, board)}{prev_turn_section(prev_turn, rich_log)}"
+            f"truncated):\n{log}\n\n{board_section(reply, rich_log, board, user_ask)}{prev_turn_section(prev_turn, rich_log)}"
             f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
@@ -2336,7 +2352,7 @@ def judge_prompt(user_ask: str, tool_log: list[str], reply: str, prev_turn: Opti
                  board: Optional[list] = None) -> str:
     log = render_tool_log(tool_log, 5000)
     return (f"USER'S REQUEST (latest):\n{request_excerpt(user_ask)}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
-            f"{log}\n\n{board_section(reply, tool_log, board)}{prev_turn_section(prev_turn, tool_log)}"
+            f"{log}\n\n{board_section(reply, tool_log, board, user_ask)}{prev_turn_section(prev_turn, tool_log)}"
             f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
@@ -2851,7 +2867,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                   and v["report_only"] >= th_ro)
     if audit is not None and "report_only" in cands:
         try:
-            named_board = named_card_facts(reply, tool_log) or []
+            named_board = named_card_facts(reply, tool_log, user_ask=user_ask) or []
             audit({"event": "report_only_scored", "screen_p": screen_p,
                    "confirm_attempted": confirm_attempted, "floor": confirm_floor,
                    "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
@@ -2859,7 +2875,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
                    "owner_probe_live": bool(owner_probe_live(reply, list(tool_log or []) + list(
                        named_board), user_ask)),
-                   "owner_source": owner_source(reply, tool_log, board=named_board),
+                   "owner_source": owner_source(reply, tool_log, board=named_board, user_ask=user_ask),
                    **stall_telemetry(reply, tool_log, now=now),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
