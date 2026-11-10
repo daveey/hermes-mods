@@ -146,8 +146,14 @@ older, idle) and stale cron/loop ticks.
 
 `hermes sessions archive` matches by filters, not by id, so archive one session safely:
 1. `hermes sessions archive --title "<exact title>" --newer-than <age> --dry-run` and check it
-   matches exactly the session you mean (narrow with `--source`, `--cwd`, `--after`).
-2. Re-run with `--yes`. It soft-hides (no deletion).
+   matches exactly the session you mean (narrow with `--source`, `--cwd`, `--after`). It matches only
+   ended sessions by default. A Desktop chat is usually still open, and the dry run reports it as
+   "skipped", so add `--include-open` for that one session.
+2. Re-run with `--yes`. It soft-hides (no deletion). Read back `archived=1` in `sessions`.
+
+If the user's sidebar archive "keeps failing", grep `agent.log` for `session.mutate storage failure` before
+retrying. A `structural corruption` reason there is the state.db latch, which refuses every write:
+follow patching-local-hermes-runtime, then archive through the CLI.
 
 Never archive pinned sessions, anything with an open PR or open card, or anything ambiguous: list
 those for the user instead. Done cards: `hermes kanban archive <id>` only after reporting them.
