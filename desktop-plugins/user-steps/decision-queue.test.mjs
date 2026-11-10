@@ -51,6 +51,24 @@ test('missing scope disables approve; exact limits and long scope stay inline; r
  assert.ok(el().querySelector('a'))
 })
 
+test('boolean permissionRequired (the backend contract since 4affdc54) is valid and never empties the queue', async () => {
+ // Hub 20261110_182947_f0f6a3: one withdrawn request with permissionRequired: true made refreshRequests throw
+ // "Invalid action request owner or schema", so the chat's open ask had no buttons while its row stayed red.
+ const flagged = freshRequest({ state: 'withdrawn', limits: [{ key: 'size', value: '400 → 600 GiB', permissionRequired: true }, { key: 'cost', value: '+$16/month', permissionRequired: false }] })
+ const open = freshRequest({ title: 'Grow the disk further?' })
+ assert.equal(m.validRequest(flagged), true)
+ for (const bad of [{ permissionRequired: '' }, { permissionRequired: 1 }, { permissionRequired: null }]) assert.equal(m.validRequest(freshRequest({ limits: [{ key: 'k', value: 'v', ...bad }] })), false, JSON.stringify(bad))
+ window.hermesDesktop = { api: async () => ({ requests: [flagged, open] }) }
+ await show(React.createElement(m.ActionQueue, { key: 'bool-permission' }))
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ assert.doesNotMatch(el().textContent, /Action queue unavailable/)
+ assert.match(el().textContent, /Grow the disk further\?/)
+ await show(React.createElement(m.DecisionRow, { request: freshRequest({ limits: [{ key: 'size', value: '600 GiB', permissionRequired: true }, { key: 'cost', value: '+$16', permissionRequired: false }] }), route, call: async () => ({}) }))
+ const items = [...el().querySelectorAll('[data-action-limits] li')].map(li => li.textContent)
+ assert.deepEqual(items, ['size: 600 GiB — needs separate permission', 'cost: +$16'])
+ await show(null); delete window.hermesDesktop
+})
+
 test('revise focuses inline, validates, Escape restores focus; keyboard submits durable revision', async () => {
  const calls = []; let op = null; const r = freshRequest()
  const call = async (path, opts = {}) => { calls.push([path,opts]); if (opts.method === 'POST') { op = { operationId: 'op-revise', state: 'pending' }; return { operation: op, request: r } } return { operation: op, request: r } }

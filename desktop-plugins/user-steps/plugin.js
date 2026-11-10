@@ -630,6 +630,11 @@ export const requestKey = r => r?.owner?.gatewayId && r?.owner?.profile && r?.re
   ? JSON.stringify([r.owner.gatewayId, r.owner.profile, r.requestId]) : null
 export const sourceKey = r => r?.gatewayId && r?.profile && r?.id && ['message', 'user_step', 'kanban'].includes(r.type) && (r.type !== 'kanban' || r.board)
   ? JSON.stringify([r.gatewayId, r.profile, r.type, r.type === 'kanban' ? r.board : '', r.id]) : null
+// A limit's permissionRequired is a boolean flag (backend core.py validates it as one since 4affdc54); requests stored
+// before that carry a non-empty string naming the permission. Both are valid: a stale contract here rejected the
+// whole queue ("Invalid action request owner or schema") for one flagged row, hiding every ask in that chat.
+const validPermission = p => p === undefined || typeof p === 'boolean' || (typeof p === 'string' && !!p.trim())
+const permissionNote = p => p === true ? ' — needs separate permission' : typeof p === 'string' && p.trim() ? ` — separately requires ${p}` : ''
 export function validRequest(r) {
   const text = s => typeof s === 'string' && !!s.trim()
   return !!requestKey(r) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r.requestId) &&
@@ -639,7 +644,7 @@ export function validRequest(r) {
     typeof r.scope?.markdown === 'string' && typeof r.scope.complete === 'boolean' &&
     Array.isArray(r.scope.sourceRefs) && r.scope.sourceRefs.every(sourceKey) &&
     Array.isArray(r.aliases) && r.aliases.every(sourceKey) &&
-    Array.isArray(r.limits) && r.limits.every(l => text(l?.key) && text(l.value) && (l.permissionRequired === undefined || text(l.permissionRequired))) &&
+    Array.isArray(r.limits) && r.limits.every(l => text(l?.key) && text(l.value) && validPermission(l.permissionRequired)) &&
     Array.isArray(r.exclusions) && r.exclusions.every(text) &&
     (text(r.outcomes?.revise) || (['choice','input','external_step'].includes(r.kind) && text(r.outcomes?.answer))) &&
     Array.isArray(r.choices) && r.choices.length > 0 && new Set(r.choices.map(c => c?.id)).size === r.choices.length &&
@@ -1011,7 +1016,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   const choiceDisabled = c => unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open'))
   const kindLabel = { approval: 'Approval', choice: 'Question', input: 'Question', external_step: 'Your step' }[r.kind] || 'Ask'
   const scopeView = jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) })
-  const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] })
+  const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${permissionNote(l.permissionRequired)}` }, i)) })] })
   const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
   const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
   return jsxs('article', { ref: article, 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
