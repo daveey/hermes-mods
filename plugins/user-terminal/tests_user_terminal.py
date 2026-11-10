@@ -1794,3 +1794,138 @@ def test_identity_recorded_by_pre_fix_runner_still_verifies(tmp_path, monkeypatc
     assert old and old != ut._proc_start(victim.pid)
     assert ut._same_process(victim.pid, old)
     assert not ut._same_process(victim.pid, "Mon Jan  1 00:00:00 2001")
+
+
+# ---------------------------------------------------------------- yield: a chat message hands control back
+# Core's yield contract (tools/interrupt.py request_yield/consume_yield): a mid-turn user message asks the
+# running tool thread to return so the message is delivered. Stop (is_interrupted) is a different signal.
+
+
+@pytest.fixture
+def interrupt_api(monkeypatch):
+    """Core's tools.interrupt when importable, else a stand-in with the same request/consume semantics."""
+    import types
+    try:
+        from tools import interrupt as real  # type: ignore
+        return real
+    except Exception:
+        pass
+    lock, yields, stops = threading.Lock(), set(), set()
+    fake = types.ModuleType("tools.interrupt")
+
+    def request_yield(tid):
+        with lock:
+            yields.add(tid)
+
+    def consume_yield(tid):
+        with lock:
+            if tid in yields:
+                yields.discard(tid)
+                return True
+            return False
+
+    def set_interrupt(active, thread_id=None, **_kw):
+        tid = thread_id if thread_id is not None else threading.current_thread().ident
+        with lock:
+            (stops.add if active else stops.discard)(tid)
+            if not active:
+                yields.discard(tid)
+
+    fake.request_yield, fake.consume_yield, fake.set_interrupt = request_yield, consume_yield, set_interrupt
+    fake.is_interrupted = lambda: threading.current_thread().ident in stops
+    pkg = types.ModuleType("tools")
+    pkg.interrupt = fake
+    monkeypatch.setitem(sys.modules, "tools", pkg)
+    monkeypatch.setitem(sys.modules, "tools.interrupt", fake)
+    return fake
+
+
+def _signal_after(api, tid_box, delay, kind="yield"):
+    def go():
+        time.sleep(delay)
+        if kind == "yield":
+            api.request_yield(tid_box[0])
+        else:
+            api.set_interrupt(True, tid_box[0])
+    threading.Thread(target=go, daemon=True).start()
+
+
+def _job_files(job: Path) -> dict:
+    return {p.name: p.read_bytes() for p in job.iterdir() if p.is_file()}
+
+
+def test_yield_returns_a_pending_local_job_at_once_and_leaves_it_running(tmp_path, monkeypatch, interrupt_api):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("read -r x", "", str(tmp_path))
+    before = _job_files(job)
+    tid = [threading.current_thread().ident]
+    _signal_after(interrupt_api, tid, 1.0)
+    t0 = time.time()
+    out = json.loads(ut.handle({"job_id": job.name, "wait_s": 8}))
+    took = time.time() - t0
+    try:
+        assert took < 2.5, f"yield ignored: waited {took:.1f}s of 8"
+        assert out["ok"] and out.get("yielded") is True and out["job_id"] == job.name
+        assert out["status"] not in ut.FINAL and "job_id" in out["note"] and "message" in out["note"]
+        assert _job_files(job) == before and not (job / "final.lock").exists()  # never withdrawn or killed
+    finally:
+        interrupt_api.set_interrupt(False, tid[0])
+
+
+def test_yield_during_a_new_local_request_keeps_the_window(tmp_path, monkeypatch, interrupt_api):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    tid = [threading.current_thread().ident]
+    _signal_after(interrupt_api, tid, 1.0)
+    t0 = time.time()
+    out = json.loads(ut.handle({"command": "read -r x", "cwd": str(tmp_path), "wait_s": 8}))
+    try:
+        assert time.time() - t0 < 2.5 and out.get("yielded") is True and out["terminal"] == "fake", out
+        assert ut.read_status(ut.jobs_dir() / out["job_id"])["status"] not in ut.FINAL
+    finally:
+        interrupt_api.set_interrupt(False, tid[0])
+
+
+def test_yield_returns_a_relayed_job_at_once(remote, monkeypatch, tmp_path, interrupt_api):
+    base, _ = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 4)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    tid = [threading.current_thread().ident]
+    try:
+        first = json.loads(ut.handle_remote({"command": "read -r x", "cwd": str(tmp_path), "wait_s": 1}))
+        assert first["ok"] and first["status"] == "pending", first
+        job = ut.jobs_dir() / first["job_id"]
+        _signal_after(interrupt_api, tid, 1.0)
+        t0 = time.time()
+        out = json.loads(ut.handle_remote({"job_id": first["job_id"], "wait_s": 10}))
+        took = time.time() - t0
+    finally:
+        c.stop.set()
+        interrupt_api.set_interrupt(False, tid[0])
+    assert took < 2.5, f"yield ignored on the relay path: waited {took:.1f}s of 10"
+    assert out["ok"] and out.get("yielded") is True and out["job_id"] == first["job_id"], out
+    assert out["device"] == "macbook" and "job_id" in out["note"]
+    assert ut.read_status(job)["status"] not in ut.FINAL and not (job / "final.lock").exists()
+
+
+def test_stop_still_interrupts_and_is_not_a_yield(tmp_path, monkeypatch, interrupt_api):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    job = ut.create_job("read -r x", "", str(tmp_path))
+    tid = [threading.current_thread().ident]
+    _signal_after(interrupt_api, tid, 1.0, kind="stop")
+    t0 = time.time()
+    try:
+        out = json.loads(ut.handle({"job_id": job.name, "wait_s": 8}))
+    finally:
+        interrupt_api.set_interrupt(False, tid[0])
+    assert time.time() - t0 < 2.5 and not out.get("yielded")
+    assert out["status"] not in ut.FINAL and not (job / "final.lock").exists()
+
+
+def test_no_yield_without_core(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tools.interrupt", None)  # import fails -> never a yield, never a crash
+    assert ut._yield_requested() is False

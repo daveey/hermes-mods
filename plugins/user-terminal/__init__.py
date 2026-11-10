@@ -771,6 +771,28 @@ def _interrupted() -> bool:
         return False
 
 
+def _yield_requested() -> bool:
+    """Core's yield contract (tools.interrupt.request_yield): the user sent a chat message while this tool
+    waits, so hand control back now. Unlike Stop the job is never killed or withdrawn; the agent answers
+    and resumes with job_id. Consumes the request (one message = one early return)."""
+    try:
+        import threading
+
+        from tools import interrupt as _ti  # type: ignore
+
+        tids = {threading.current_thread().ident}
+        acting = getattr(_ti, "acting_for_tid", None)
+        if acting is not None:
+            tids.add(acting.get())
+        return any(_ti.consume_yield(t) for t in tids if t is not None)
+    except Exception:
+        return False
+
+
+YIELD_NOTE = ("The user sent a message while this was waiting. Read it and answer; the window is still open, so "
+              "call run_in_user_terminal with this job_id to keep waiting.")
+
+
 FINAL = ("ran", "declined", "failed", "withdrawn", "abandoned")
 
 
@@ -2284,7 +2306,11 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
         _reconcile(job)
     next_check = time.time() + WATCH_INTERVAL_S
     st = read_status(job)
+    yielded = False
     while st.get("status") not in FINAL and time.time() < deadline and not _interrupted():
+        if _yield_requested():
+            yielded = True
+            break
         time.sleep(0.5)
         if reconcile and time.time() >= next_check:
             _reconcile(job)
@@ -2315,6 +2341,9 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
         result["note"] = ("Still waiting (user hasn't answered, or the command is still running). Call "
                           "run_in_user_terminal with this job_id to keep waiting. If it is no longer needed, "
                           "withdraw it immediately (action=withdraw, this job_id, a reason).")
+        if yielded:
+            result["yielded"] = True
+            result["note"] = YIELD_NOTE
         card_note = _card_note(job)
         if card_note:
             result["note"] += " " + card_note
@@ -2613,8 +2642,11 @@ def _sender(session_id: str | None) -> dict:
     return info
 
 
-def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: float) -> dict:
-    """One request to the Mac's courier. Errors (never a hang) when nobody claims it within PICKUP_S."""
+def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: float,
+               yieldable: bool = False) -> dict:
+    """One request to the Mac's courier. Errors (never a hang) when nobody claims it within PICKUP_S.
+    yieldable (status polls only, never the start request whose answer carries the new job_id): a chat
+    message returns {"ok": True, "status": "pending", "yielded": True} at once."""
     rid = uuid.uuid4().hex
     outbox, result = base / "outbox" / f"{rid}.json", base / "results" / f"{rid}.json"
     req = {"id": rid, "action": "user_terminal", "route": device, "args": args, "sender": sender,
@@ -2640,6 +2672,10 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
                                            f"Tell the owner; do not hand them the command.")}
         if _interrupted():
             return {"ok": False, "error": "interrupted"}
+        if yieldable and _yield_requested():  # a chat message: hand control back; the Mac's job keeps waiting
+            if outbox.exists():
+                outbox.unlink(missing_ok=True)  # unclaimed status poll: nobody needs its answer now
+            return {"ok": True, "status": "pending", "yielded": True}
         time.sleep(0.3)
     return {"ok": False, "error": f"`{device}` claimed the request but sent no answer in time"}
 
@@ -2672,18 +2708,26 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
         else:
             terminal = None
         res: dict = {}
+        yielded = False
         while True:
             left = deadline - time.time()
             res = relay_once(base, device, {"job_id": job_id, "wait_s": int(max(0, min(POLL_S, left)))}, sender,
-                             POLL_S + 30)
-            if not res.get("ok") or res.get("status") in FINAL or time.time() >= deadline:
+                             POLL_S + 30, yieldable=True)
+            yielded = bool(res.pop("yielded", False))
+            if yielded or not res.get("ok") or res.get("status") in FINAL or time.time() >= deadline:
                 break
             if _interrupted():
+                break
+            if _yield_requested():
+                yielded = True
                 break
         res = {**res, "job_id": job_id, "device": device}
         if terminal:
             res["terminal"] = terminal
-        if res.get("ok") and res.get("status") not in FINAL:
+        if yielded and res.get("ok") and res.get("status") not in FINAL:
+            res["yielded"] = True
+            res["note"] = YIELD_NOTE + f" (The window is on `{device}`.)"
+        elif res.get("ok") and res.get("status") not in FINAL:
             res["note"] = (f"Still waiting on `{device}` (the owner hasn't answered, or the command is still "
                            f"running). Call run_in_user_terminal with this job_id to keep waiting.")
         return json.dumps(res)
