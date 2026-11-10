@@ -21,7 +21,7 @@ const root = createRoot(document.getElementById('root'))
 const el = () => document.getElementById('root')
 const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
-const click = async label => React.act(async () => { const b = [...el().querySelectorAll('button')].find(b => b.textContent === label); assert.ok(b, label); b.click(); await flush() })
+const click = async label => React.act(async () => { const b = [...el().querySelectorAll('button')].find(b => (b.querySelector('[data-option-label]')?.textContent ?? b.textContent) === label); assert.ok(b, label); b.click(); await flush() })
 const owner = { gatewayId: 'G1', profile: 'default', storedSessionId: 'S1' }
 const alias = { gatewayId: 'G1', profile: 'default', type: 'kanban', board: 'ops', id: 'same' }
 const request = extra => ({ schemaVersion: 2, owner, requestId: '00000000-0000-4000-8000-000000000001', revision: 1, kind: 'approval', title: 'Stage A', scope: { complete: true, markdown: 'Exact adapter files, correctness tests and deliverables.\n' + 'Full inline plan. '.repeat(300), sourceRefs: [] }, limits: [{ key: 'CPU', value: '≤4 CPU core-hours' }, { key: 'RAM', value: '≤4 GiB RAM' }, { key: 'GPU', value: '≤2 existing GPU-hours', permissionRequired: 'owner permission' }], exclusions: ['No rentals or new spend', 'Full training needs separate budget approval'], outcomes: { approve: 'Stage A only', revise: 'Work remains blocked', decline: 'No execution' }, choices: [{ id: 'yes', label: 'Approve Stage A', effect: 'approve' }, { id: 'edit', label: 'Revise', effect: 'revise' }, { id: 'no', label: 'Decline', effect: 'decline' }], aliases: [alias], state: 'open', ...extra })
@@ -432,10 +432,10 @@ test('run-timing question marks its go options as approving (self-heal agent-aa8
  const r=freshRequest({kind:'choice',title:'When should I run the migration?',scope:{complete:true,markdown:'When should I run the Mac mini launcher migration: now, when idle, or later?',sourceRefs:[]},outcomes:{answer:'Send this answer to the agent. Options marked ✓ approve running exactly the scope above; any other answer (and free text) grants no execution permission.'},choices:[{id:'answer-0',label:'now',effect:'answer',authorizes:true},{id:'answer-1',label:'later',effect:'answer'},{id:'answer-text',label:'Answer in your own words',effect:'answer'}]})
  assert.equal(m.validRequest(r),true)
  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>({})}))
- const labels=[...el().querySelectorAll('button[data-decision-effect]')].map(b=>b.textContent)
+ const labels=[...el().querySelectorAll('button[data-decision-effect]')].map(b=>b.querySelector('[data-option-label]')?.textContent ?? b.textContent)
  assert.deepEqual(labels,['✓ now','later','Answer in your own words'])
- // the go option says it approves; the others carry no such line (no per-option disclaimer either)
- assert.equal(el().querySelector('[data-decision-option="answer-0"]').textContent,'✓ nowApproves running exactly the plan above.')
+ // the go option says it approves, inside its own button; the others carry no such line (no per-option disclaimer either)
+ assert.equal(el().querySelector('button[data-decision-option="answer-0"]').textContent,'✓ nowApproves running exactly the plan above.')
  assert.equal(el().querySelector('[data-decision-option="answer-1"]'),null)
  assert.doesNotMatch(el().textContent,/grants no execution permission/)
 })
@@ -766,6 +766,26 @@ test('explained options: one line each, the recommended one first and primary, p
  assert.equal(fold.open, false, 'folded until opened')
  assert.doesNotMatch(el().textContent, /Revision 1|Read this|Your decision/)
  assert.equal(el().querySelector('[data-action-kind]').textContent, 'Approval')
+})
+
+test('a lettered question shows each option as one button with its meaning, the recommended one first and marked', async () => {
+ const sent = []
+ const r = freshRequest({ kind: 'choice', title: 'How should the build lock treat the six macOS services?', limits: [], exclusions: [], scope: { complete: true, markdown: 'Reply A, B, C or D on the card.', sourceRefs: [] }, outcomes: { answer: 'Send this answer to the agent. This does not grant execution permission.' }, choices: [
+  { id: 'answer-0', label: 'A \u2014 root launchd attribution', effect: 'answer', explain: 'Allow a narrow root-owned read-only helper; keeps the exclusion.', recommended: true },
+  { id: 'answer-1', label: 'B \u2014 disclosed Apple-service class', effect: 'answer', explain: 'Exempt exact Apple binaries; weaker.' },
+  { id: 'answer-text', label: 'Answer in your own words', effect: 'answer' }] })
+ assert.equal(m.validRequest(r), true)
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async (path, init) => { if (init?.method === 'POST') sent.push(JSON.parse(init.body)); return {} } }))
+ const rows = [...el().querySelectorAll('[data-decision-options] > button')]
+ assert.deepEqual(rows.map(b => b.getAttribute('data-decision-option')), ['answer-0', 'answer-1'])
+ assert.equal(rows[0].querySelector('[data-option-label]').textContent, 'A \u2014 root launchd attribution')
+ assert.equal(rows[0].querySelector('[data-recommended]').textContent, 'Recommended')
+ assert.equal(rows[1].querySelector('[data-recommended]'), null)
+ assert.match(rows[0].querySelector('[data-option-explain]').textContent, /narrow root-owned/)
+ assert.match(rows[0].getAttribute('aria-label'), /^A \u2014 root launchd attribution \(recommended\): Allow/)
+ // no separate bare button repeats an explained option; free text stays in the bottom row
+ const bottom = [...el().querySelectorAll('button[data-decision-effect]')].filter(b => !b.hasAttribute('data-decision-option')).map(b => b.textContent)
+ assert.deepEqual(bottom, ['Answer in your own words'])
 })
 
 test('a legacy question without explanations keeps its question inline and adds no option lines', async () => {

@@ -2759,6 +2759,127 @@ def literal_options(step: dict) -> list[str]:
 
 ANSWER_TEXT = {'id': 'answer-text', 'label': 'Answer in your own words', 'effect': 'answer'}
 
+# Lettered/numbered menus ("Reply A, B, C or D"): a bare code is meaningless as a button. Look up what each code
+# means where the agent defined it ("A) ...", "**B:** ...", a card's human_request choice labels / block reason)
+# and which one it recommended. A code nobody defined is dropped; free text still answers.
+_OPTION_CODE = re.compile(r"\s*(?:option\s+)?\(?([A-Za-z]|\d{1,2})\)?[.:]?\s*", re.I)
+_OPTION_HEAD_CUT = re.compile(r"\s+\(|;\s|\.\s|\s[\u2014\u2013]\s|\s-\s|,\s+(?:so|but|which|then)\b")
+OPTION_LABEL_MAX = 70
+OPTION_EXPLAIN_MAX = 400
+
+
+def option_code(label) -> Optional[str]:
+    m = _OPTION_CODE.fullmatch(str(label or ''))
+    return m.group(1).upper() if m else None
+
+
+def _option_def_re(code: str) -> re.Pattern:
+    c = re.escape(code)
+    return re.compile(rf"^\s*(?:[-*\u2022]\s+)?(?:\*\*|__)?(?:[Oo]ption\s+)?\(?{c}(?:\*\*|__)?\s*[).:\u2014\u2013-]"
+                      rf"(?:\*\*|__)?\s+(.+?)\s*$", re.M)
+
+
+def _unmarked(s: str) -> str:
+    return _ws(re.sub(r"\*\*|__|`", "", s))
+
+
+def _option_head(definition: str) -> str:
+    head = _OPTION_HEAD_CUT.split(definition, 1)[0].rstrip(' .:')
+    if len(head) > OPTION_LABEL_MAX:
+        head = head[:OPTION_LABEL_MAX].rsplit(' ', 1)[0].rstrip(' ,;:') + '\u2026'
+    return head
+
+
+def option_meanings(codes: list[str], texts: list[str]) -> dict:
+    """{code: {'label': 'A \u2014 short meaning', 'explain': full definition, 'recommended': bool}} for each code a
+    text defines. ``texts`` in priority order: the first text that defines a code names its button, the longest
+    definition explains it. The recommendation is the code a 'recommend...' sentence names (first one wins)."""
+    out = {}
+    for code in codes:
+        defs = [_unmarked(m.group(1)) for t in texts if t for m in [_option_def_re(code).search(t)] if m]
+        defs = [d for d in defs if len(d.split()) >= 2]
+        if not defs:
+            continue
+        explain = max(defs, key=len)
+        if len(explain) > OPTION_EXPLAIN_MAX:
+            explain = explain[:OPTION_EXPLAIN_MAX].rsplit(' ', 1)[0] + '\u2026'
+        out[code] = {'label': f'{code} \u2014 {_option_head(defs[0])}', 'explain': explain}
+    alts = '|'.join(re.escape(c) for c in out)
+    if alts:
+        rec = re.compile(rf"(?i:\brecommend\w*)\b[^.\n]{{0,40}}?\b(?:[Oo]ption\s+)?({alts})\b")
+        for t in texts:
+            m = t and rec.search(_unmarked(t))
+            if m:
+                out[m.group(1)]['recommended'] = True
+                break
+    return out
+
+
+def card_option_texts(*texts, boards=None) -> list[str]:
+    """Definition sources on the cards a relay names (``t_...``): each blocked card's human_request choice labels
+    and its latest ``blocked`` reason. Unreadable boards contribute nothing."""
+    ids = sorted({i for t in texts for i in _CARD_ID.findall(t or '')})
+    out: list[str] = []
+    if not ids:
+        return out
+    for _slug, path in (boards if boards is not None else kanban_boards()):
+        try:
+            c = _ro_connect(path, timeout=2)
+        except sqlite3.Error:
+            continue
+        try:
+            for tid in ids:
+                row = c.execute('SELECT human_request FROM tasks WHERE id=?', (tid,)).fetchone()
+                if not row:
+                    continue
+                try:
+                    hr = json.loads(row[0]) if row[0] else {}
+                except ValueError:
+                    hr = {}
+                labels = [str(ch.get('label')) for ch in (hr or {}).get('choices') or []
+                          if isinstance(ch, dict) and ch.get('label')]
+                if labels:
+                    out.append('\n'.join(labels))
+                ev = c.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+                               "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                try:
+                    reason = (json.loads(ev[0]) or {}).get('reason') if ev and ev[0] else None
+                except ValueError:
+                    reason = None
+                if isinstance(reason, str) and reason.strip():
+                    out.append(reason)
+        except sqlite3.Error:
+            continue
+        finally:
+            c.close()
+    return out
+
+
+def explained_choices(labels: list[str], step: dict, *, boards=None) -> list[dict]:
+    """Answer choices for ``labels``: ordinary labels pass through; bare codes become 'A \u2014 meaning' with an
+    explain line and the recommendation, or are dropped when no source defines them."""
+    codes = [option_code(label) for label in labels]
+    meanings = {}
+    if any(codes):
+        own = [step.get('paragraph') or '', step.get('reply') or '', step.get('verbatim_span') or '']
+        meanings = option_meanings([c for c in codes if c], own)
+        if any(c and c not in meanings for c in codes):
+            more = option_meanings([c for c in codes if c and c not in meanings],
+                                   card_option_texts(step.get('text'), *own, boards=boards))
+            if any(m.get('recommended') for m in meanings.values()):
+                for m in more.values():
+                    m.pop('recommended', None)
+            meanings.update(more)
+    out = []
+    for i, (label, code) in enumerate(zip(labels, codes)):
+        if code is None:
+            out.append({'id': f'answer-{i}', 'label': label, 'effect': 'answer'})
+        elif code in meanings:
+            m = meanings[code]
+            out.append({'id': f'answer-{i}', 'label': m['label'], 'effect': 'answer', 'explain': m['explain'],
+                        **({'recommended': True} if m.get('recommended') else {})})
+    return out
+
 # A question about WHEN or WHETHER to run/do something (not "which colour"): its go options authorize.
 _RUN_Q = re.compile(r"\b(?:when|whether|should\s+I|shall\s+I|ok(?:ay)?\s+to|go\s+ahead|want\s+me\s+to|can\s+I)\b", re.I)
 _RUN_VERB = re.compile(r"\b(?:run|start|do|restart|migrate|migration|ship|deploy|merge|apply|proceed|execute|kick\s+off|"
@@ -2797,8 +2918,7 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
     no_grant = 'This does not grant execution permission.'
     if kind in ('choice', 'input'):
         # Completeness here describes the QUESTION, never executable scope.
-        r['choices'] = [{'id': f'answer-{i}', 'label': label, 'effect': 'answer'}
-                        for i, label in enumerate(literal_options(step))] + [dict(ANSWER_TEXT)]
+        r['choices'] = explained_choices(literal_options(step), step) + [dict(ANSWER_TEXT)]
         go = run_question(markdown, step.get('text')) and [c for c in r['choices'] if go_option(c['label'])]
         for c in go or []:
             c['authorizes'] = True

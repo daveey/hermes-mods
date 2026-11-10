@@ -776,6 +776,13 @@ const choiceStyle = effect => ({ ...actionStyle, fontSize: 12.5, fontWeight: eff
   background: effect === 'approve' ? `color-mix(in srgb, ${SUCCESS} 22%, var(--card))` : 'transparent',
   color: effect === 'decline' ? DANGER : 'var(--foreground)' })
 const primaryStyle = { ...actionStyle, fontSize: 12.5, fontWeight: 600, borderColor: 'transparent', color: 'var(--primary-foreground, #fff)', background: 'var(--primary, #3b82f6)' }
+// A full-width option row: label + why. The agent's pick is outlined in the accent and marked Recommended;
+// approve/decline keep their success/danger edge so a risky pick still reads as one.
+const optionStyle = c => ({ ...actionStyle, display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 2, width: '100%', boxSizing: 'border-box',
+  textAlign: 'left', padding: '8px 12px', borderRadius: 8, fontWeight: 400, color: 'var(--foreground)', cursor: 'pointer',
+  borderColor: c.recommended === true ? 'var(--primary, var(--accent))' : c.effect === 'approve' ? SUCCESS : c.effect === 'decline' ? DANGER : 'var(--border)',
+  background: c.recommended === true ? 'color-mix(in srgb, var(--primary, var(--accent)) 10%, transparent)' : 'transparent' })
+const recommendedPill = { padding: '1px 7px', borderRadius: 999, fontSize: 11, fontWeight: 600, color: 'var(--primary-foreground, #fff)', background: 'var(--primary, var(--accent))' }
 const needsText = c => c.effect === 'revise' || (c.effect === 'answer' && c.id === 'answer-text')
 // Missing plan/step = agent work. It never counts as something "for you".
 export const agentPending = r => !['choice','input'].includes(r.kind) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !(r.choices || []).some(c => c.effect === 'approve')))
@@ -999,6 +1006,9 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   const ordered = recommended ? [recommended, ...shown.filter(c => c !== recommended)] : shown
   const explained = ordered.filter(c => !needsText(c) && explainOf(c))
   const primary = c => recommended ? c === recommended : c.effect === 'approve' || c.authorizes === true
+  // Questions: each explained option is its own full-width button. Approvals keep their Approve/Decline row.
+  const optionButtons = question
+  const choiceDisabled = c => unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open'))
   const kindLabel = { approval: 'Approval', choice: 'Question', input: 'Question', external_step: 'Your step' }[r.kind] || 'Ask'
   const scopeView = jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) })
   const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] })
@@ -1013,7 +1023,15 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     !locked && (explained.length
       ? fold(r.kind === 'approval' ? 'Full plan and limits' : 'Full question', [scopeView, limitsView, exclusionsView])
       : jsxs('div', { style: { display: 'contents' }, children: [scopeView, (limitsView || exclusionsView) && fold('Limits and exclusions', [limitsView, exclusionsView])] })),
-    !locked && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
+    // Explained options ARE the buttons: what it is, what happens, and the agent's pick, in one target.
+    !locked && optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', role: 'group', 'aria-label': 'Options', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('button', { type: 'button', 'data-decision-option': c.id, 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, 'aria-label': `${choiceLabel(c, choices, r.kind)}${c.recommended === true ? ' (recommended)' : ''}: ${explainOf(c)}`, style: optionStyle(c), disabled: choiceDisabled(c), onClick: () => void send(c), children: [
+      jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 8, rowGap: 2 }, children: [
+        jsx('span', { 'data-option-label': '', style: { fontWeight: 600, fontSize: 13.5 }, children: choiceLabel(c, choices, r.kind) }),
+        c.recommended === true && jsx('span', { 'data-recommended': '', style: recommendedPill, children: 'Recommended' })
+      ] }),
+      jsx('span', { 'data-option-explain': '', style: { display: 'block', color: 'var(--muted-foreground)', fontSize: 12.5, fontWeight: 400, lineHeight: 1.45 }, children: explainOf(c) })
+    ] }, c.id)) }),
+    !locked && !optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
       jsx('strong', { style: { fontWeight: 600 }, children: choiceLabel(c, choices, r.kind) }),
       c.recommended === true && jsx('span', { 'data-recommended': '', style: { marginLeft: 6, fontSize: 11, color: 'var(--primary, var(--accent))' }, children: 'recommended' }),
       jsx('div', { style: { color: 'var(--muted-foreground)', fontSize: 12.5 }, children: jsx(MessageTextContent, { media: false, text: explainOf(c) }) })
@@ -1023,7 +1041,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : explainOf(selected)}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [
-      ...ordered.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, title: explainOf(c) || c.label, style: needsText(c) ? { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' } : primary(c) ? primaryStyle : choiceStyle(c.effect === 'approve' ? 'neutral' : c.effect), disabled: unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id)),
+      ...ordered.filter(c => !optionButtons || !explained.includes(c)).map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, title: explainOf(c) || c.label, style: needsText(c) ? { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' } : primary(c) ? primaryStyle : choiceStyle(c.effect === 'approve' ? 'neutral' : c.effect), disabled: choiceDisabled(c), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: c.recommended === true && !needsText(c) && !explained.includes(c) ? `${choiceLabel(c, choices, r.kind)} · Recommended` : choiceLabel(c, choices, r.kind) }, c.id)),
       ...(approvalPending ? [
         jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),
         // An owner without the withdraw route (older backend) can only hide it on this device.
