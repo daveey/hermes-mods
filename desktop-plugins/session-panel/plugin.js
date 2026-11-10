@@ -2,8 +2,8 @@
  * Session Panel — one panel above the composer that answers, for the focused chat:
  *   is work moving, how much is left, what is waiting on me, and what is stuck.
  *
- *   header       agent replying in this chat / idle since …, a progress bar over the chat's kanban cards:
- *                done · running · needs you · stuck · waiting · queued
+ *   header       agent replying in this chat / idle since …, then one small box per kanban card and the counts:
+ *                needs you · stuck · running · waiting · not started · done
  *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks; a card
  *                no ask covers shows its own human_request as "Do this / Why you / Next" (askView), never its
  *                agent-written title or block reason; without a request it says so and offers Ask agent
@@ -29,7 +29,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v1'
+const VERSION = 'session-panel-v2'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -284,15 +284,26 @@ const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const heading = color => ({ margin: '12px 0 6px', fontSize: 12, fontWeight: 600, color })
 const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12.5, cursor: 'pointer' }
 
-function Bar({ n }) {
-  const total = Object.values(n).reduce((a, b) => a + b, 0)
-  if (!total) return null
-  const order = ['done', 'running', 'needsYou', 'stuck', 'waiting', 'queued']
-  return jsxs('div', { children: [
-    jsx('div', { 'data-progress-bar': '', role: 'img', 'aria-label': order.filter(k => n[k]).map(k => `${n[k]} ${LABEL[k]}`).join(', '), style: { display: 'flex', height: 6, borderRadius: 3, overflow: 'hidden', margin: '8px 0 6px', background: 'color-mix(in srgb, var(--border) 60%, transparent)' },
-      children: order.filter(k => n[k]).map(k => jsx('div', { 'data-segment': k, style: { flex: n[k], background: C[k] } }, k)) }),
-    jsx('div', { 'data-progress-legend': '', style: { display: 'flex', flexWrap: 'wrap', columnGap: 12, rowGap: 2, ...muted }, children: order.filter(k => n[k]).map(k =>
-      jsxs('span', { 'data-count': k, children: [jsx('span', { 'aria-hidden': true, style: { color: C[k] }, children: '● ' }), `${n[k]} ${LABEL[k]}`] }, k)) })
+// One small box per card, in the header beside the status: a full-width bar spent a whole row to say "1 waiting".
+// Shape carries state as well as colour: open work is filled, waiting is an outline, not started is dashed.
+const PIP_ORDER = ['needsYou', 'stuck', 'running', 'waiting', 'queued', 'done']
+export const PIPS_MAX = 24 // boxes drawn before the rest fold into "+N"
+const pipStyle = k => {
+  const base = { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none' }
+  if (k === 'waiting') return { ...base, border: `1.5px solid ${C.waiting}` }
+  if (k === 'queued') return { ...base, border: `1.5px dashed ${C.waiting}`, opacity: 0.7 }
+  return { ...base, background: C[k] }
+}
+
+export function Pips({ n }) {
+  const order = PIP_ORDER.filter(k => n[k])
+  if (!order.length) return null
+  const all = order.flatMap(k => Array.from({ length: n[k] }, () => k))
+  const shown = all.slice(0, PIPS_MAX), more = all.length - shown.length
+  const words = order.map(k => `${n[k]} ${LABEL[k]}`)
+  return jsxs('span', { 'data-progress-pips': '', role: 'img', 'aria-label': words.join(', '), title: words.join('\n'), style: { display: 'inline-flex', alignItems: 'center', gap: 3, flex: 'none' }, children: [
+    ...shown.map((k, idx) => jsx('span', { 'data-pip': k, 'aria-hidden': true, style: pipStyle(k) }, idx)),
+    more > 0 && jsx('span', { 'data-pip-more': '', 'aria-hidden': true, style: { ...muted, marginLeft: 2 }, children: `+${more}` })
   ] })
 }
 
@@ -397,15 +408,15 @@ export function Panel() {
     ...sorted.unasked.map(i => jsx(AskRow, { i, session: route.session }, i.key)),
     legacy
   ].filter(Boolean)
-  const summary = Object.keys(LABEL).filter(k => n[k]).map(k => `${n[k]} ${LABEL[k]}`).join(' · ')
+  const summary = PIP_ORDER.filter(k => n[k]).map(k => `${n[k]} ${LABEL[k]}`).join(' · ')
   return jsxs('section', { 'data-session-panel': '', 'aria-label': 'Session status', style: { width: '100%', minWidth: 0, boxSizing: 'border-box', padding: '10px 12px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
     jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
       jsx('h2', { style: { margin: 0, fontSize: 13.5, fontWeight: 600, flex: 'none' }, children: 'This session' }),
       jsxs('span', { 'data-session-status': '', style: { ...muted, display: 'flex', alignItems: 'center', gap: 5, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [busy && jsx('span', { 'aria-hidden': true, style: { color: C.running }, children: '●' }), status] }),
-      collapsed && summary && jsx('span', { 'data-collapsed-summary': '', style: { ...muted, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `· ${summary}` }),
+      jsx(Pips, { n }),
+      summary && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), style: { ...muted, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: summary }),
       jsx('button', { type: 'button', 'data-panel-toggle': '', 'aria-expanded': !collapsed, 'aria-label': collapsed ? 'Expand session status' : 'Collapse session status', title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: toggle, style: { ...btn, marginLeft: 'auto', flex: 'none', minHeight: 28, minWidth: 28, padding: '2px 6px' }, children: jsx('i', { 'aria-hidden': true, className: `codicon ${collapsed ? 'codicon-chevron-up' : 'codicon-chevron-down'}` }) })
     ] }),
-    !collapsed && jsx(Bar, { n }),
     // Collapse folds progress, never an ask: a muted "1 needs you" behind a chevron reads as nothing needing you.
     collapsed && waitLines.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { ...muted, marginTop: 4, minWidth: 0 }, children: [
       ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.detail}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `${i.label} · ${i.detail || 'waiting'}` }, i.key)),

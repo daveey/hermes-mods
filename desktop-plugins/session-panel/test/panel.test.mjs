@@ -168,7 +168,11 @@ test('panel: status line, progress bar, needs you, stuck with steps, in progress
   assert.equal(b.calls[0].path, '/api/plugins/user-steps/session-cards?ids=S1%2CS0')
   assert.deepEqual([b.calls[0].connectionId, b.calls[0].profile], ['C1', 'default'])
   assert.equal(el().querySelector('[data-session-status]').textContent, 'Idle · last activity 2 min ago')
-  assert.deepEqual([...el().querySelectorAll('[data-count]')].map(x => x.textContent.replace('● ', '')), ['2 done', '1 running', '1 needs you', '1 stuck', '1 not started'])
+  assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 needs you', '1 stuck', '1 running', '1 not started', '2 done'])
+  // one box per counted item, in the header, no full-width bar
+  assert.deepEqual([...el().querySelectorAll('[data-pip]')].map(x => x.dataset.pip), ['needsYou', 'stuck', 'running', 'queued', 'done', 'done'])
+  assert.equal(el().querySelector('[data-progress-bar]'), null)
+  assert.equal(el().querySelector('[data-progress-pips]').getAttribute('aria-label'), '1 needs you, 1 stuck, 1 running, 1 not started, 2 done')
   assert.deepEqual([...el().querySelectorAll('[data-section]')].map(x => x.textContent), ['Needs you · 1', 'Stuck · 1', 'In progress · 1'])
   assert.equal(el().querySelector('[data-fake-queue]').getAttribute('data-fake-queue'), 'embedded')
   const stuck = el().querySelector('[data-stuck="kb:t_old"]')
@@ -189,7 +193,7 @@ test('panel: an unmarked session-cards answer leaves done unknown instead of zer
   window.hermesDesktop = { api: async () => ({ tasks: [{ id: 't_x', status: 'done' }] }) } // older owner / other route
   await show(React.createElement(m.Panel, { key: 'unmarked' }))
   await React.act(async () => { await m.refreshDone(); await flush() })
-  assert.deepEqual([...el().querySelectorAll('[data-count]')].map(x => x.textContent.replace('● ', '')), ['1 running'])
+  assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running'])
   assert.equal(el().querySelector('[data-fold^="Done"]'), null)
   void b
 })
@@ -374,6 +378,6 @@ test('panel: a chat whose cards are all done shows no panel; new open work bring
     assert.equal(el().textContent, '')
     await React.act(async () => { b.push([card('t_done', 'done'), card('t_run', 'running', { activityAt: s - 30 })]); await flush() })
     assert.ok(el().querySelector('[data-session-status]'), 'open work shows the panel')
-    assert.deepEqual([...el().querySelectorAll('[data-count]')].map(x => x.textContent.replace('● ', '')), ['1 done', '1 running'])
+    assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running', '1 done'])
   } finally { await show(null) }
 })
