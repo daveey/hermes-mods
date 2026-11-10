@@ -4,7 +4,9 @@ Call enumerate(scope) once per scope, not per runner. Transport is a callable
 GET client (see base.py). Clock returns epoch seconds; jitter returns [0,1].
 Backoff is nonblocking: errors schedule the next eligible call, never sleep or
 retry within a poll. Keep one adapter per collector to retain credential budgets.
-No Link/redirect/API-returned URL is followed. Enterprise is GitHub.com only.
+No Link or arbitrary returned URL is followed. A single repository inventory
+301 may select GitHub's numeric repository route, with the exact same query.
+Enterprise is GitHub.com only.
 Job results are advisory and separate from registration health; incomplete job
 coverage must never imply stuck/idle/offline. The caller supplies the explicit
 repository allowlist and recent runner IDs; neither is discovered or widened.
@@ -154,9 +156,9 @@ class GitHubActions:
                 delay = max(delay, seconds)
         budget.until = max(budget.until, now + delay)
 
-    def _get(self, credential, path):
+    def _get(self, credential, path, *, metadata=False):
         try:
-            result = self._request(credential, path)
+            result = self._request(credential, path, metadata=metadata)
         except BudgetPersistenceError:
             raise
         except Exception:
@@ -165,8 +167,8 @@ class GitHubActions:
         self._persist()
         return result
 
-    def _request(self, credential, path):
-        # Paths are generated internally only. Returned links are never used.
+    def _request(self, credential, path, *, redirect=True, metadata=False):
+        # All routes are generated locally, including the one-hop numeric alias.
         now = self.clock()
         if self._cycle_remaining is not None:
             if self._cycle_remaining <= 0:
@@ -174,8 +176,11 @@ class GitHubActions:
             self._cycle_remaining -= 1
         budget = self._budgets.setdefault(credential.key, _Budget())
         # Permissions are resource-local; quota belongs to the credential.
-        prefix, action = path.split('/actions/', 1)
-        resource = prefix + '/actions/' + action.split('?', 1)[0].split('/', 1)[0]
+        if '/actions/' in path:
+            prefix, action = path.split('/actions/', 1)
+            resource = prefix + '/actions/' + action.split('?', 1)[0].split('/', 1)[0]
+        else:
+            resource = path.split('?', 1)[0]
         permission_key = 'scope:' + hashlib.sha256((credential.key + '\0' + resource).encode()).hexdigest()
         permission = self._budgets.get(permission_key)
         if permission and now < permission.until:
@@ -223,6 +228,26 @@ class GitHubActions:
         if self.pace_requests and budget.remaining is not None and budget.remaining > 0:
             budget.next_at = max(now, budget.next_at) + max(0, budget.reset-now)/budget.remaining
         status = response.status
+        if metadata and status == 301:
+            return response  # canonical.py validates the only admissible next path
+        if status == 301 and redirect and re.fullmatch(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runners\?per_page=100&page=[1-9][0-9]*', path):
+            url = response.body.get('url') if type(response.body) is dict else None
+            suffix = path[path.index('/actions/'):]
+            match = re.fullmatch(re.escape(self.ENDPOINT) + r'/repositories/([1-9][0-9]*)' + re.escape(suffix), url) if type(url) is str else None
+            if match:
+                # GitHub supplied an immutable ID, not an arbitrary new scope.
+                # Budget, quota, timeouts and persistence still apply per GET;
+                # redirect=False prevents chains. Never used for jobs/mutations.
+                numeric = '/repositories/' + match[1] + '/actions/runners'
+                try:
+                    return self._request(credential, '/repositories/' + match[1] + suffix, redirect=False)
+                except _Failure:
+                    numeric_key = 'scope:' + hashlib.sha256((credential.key + '\0' + numeric).encode()).hexdigest()
+                    if numeric_key in self._budgets:
+                        # Fence the original alias too: don't spend one request
+                        # per tick rediscovering an already-cooled-down target.
+                        self._budgets[permission_key] = deepcopy(self._budgets[numeric_key])
+                    raise
         if status not in (200, 304):
             # 3xx: the scope's repo/org was renamed or transferred (redirects are never
             # followed). 410: gone. Both describe one resource, like 403/404, so they
@@ -273,7 +298,7 @@ class GitHubActions:
         budget.cause = None
         budget.failures = 0
         budget.until = 0
-        return body
+        return HTTPResponse(200, {}, body) if metadata else body
 
     @staticmethod
     def _page(body, key):

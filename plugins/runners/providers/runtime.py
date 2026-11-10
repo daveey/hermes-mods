@@ -134,6 +134,8 @@ class GitHubHTTPTransport:
 
     def __call__(self, method, url, *, headers, timeout, allow_redirects):
         conn = None
+        response = None
+        response_headers = {}
         try:
             if (method != 'GET' or allow_redirects is not False
                     or not _bounded_number(timeout, 300) or type(url) is not str
@@ -162,8 +164,9 @@ class GitHubHTTPTransport:
             conn.request('GET', (target.path or '/') + ('?' + target.query if target.query else ''), headers=safe_headers)
             response = conn.getresponse()
             response_headers = {k.lower(): v for k, v in response.getheaders()}
-            # Error and redirect payloads can echo credentials. Never retain them.
-            if response.status != 200:
+            # Error bodies can echo credentials. For a 301 retain only the
+            # strictly validated numeric repository route below, never messages.
+            if response.status not in (200, 301):
                 return HTTPResponse(response.status, response_headers)
             if response_headers.get('content-encoding', 'identity').lower() != 'identity':
                 raise ValueError()
@@ -185,8 +188,17 @@ class GitHubHTTPTransport:
                     raise ValueError()
             if length is not None and len(body) != int(length):
                 raise ValueError()
-            return HTTPResponse(response.status, response_headers, json.loads(body))
+            parsed = json.loads(body)
+            if response.status == 301:
+                url = parsed.get('url') if type(parsed) is dict else None
+                allowed = r'https://api\.github\.com/repositories/[1-9][0-9]*(?:/actions/runners\?per_page=100&page=[1-9][0-9]*)?'
+                parsed = {'url': url} if type(url) is str and re.fullmatch(allowed, url) else {}
+            return HTTPResponse(response.status, response_headers, parsed)
         except Exception:
+            if response is not None and response.status == 301:
+                # A malformed moved resource must not poison its credential's
+                # other scopes. Preserve the known status, discard all payload.
+                return HTTPResponse(301, response_headers, {})
             raise RuntimeBoundaryError('http_transport_failed') from None
         finally:
             if conn is not None:

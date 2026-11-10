@@ -8,6 +8,39 @@ default-off gate: enable only after live owner-routed duplicate-click acceptance
 
 ## Collector and API deployment
 
+The manifest declares the collector's systemd/launchd service and
+`service_restart_safe: true`: it is observe-only, with no request listener to
+quiesce. A compatible `hermes-sync` restarts an already-running collector after
+changes under `plugins/runners/` arrive, logging `mods-reload: service ... restarted`.
+It never starts an uninstalled/stopped collector. Unrelated plugin changes do not
+restart it; failed restarts retry on the next sync pass.
+
+## Canonical scope generation and maintenance
+
+Generate names from current GitHub repository metadata, not a saved inventory's
+`full_name`. Stop the collector, then run `scripts/reconcile_scopes.py --config
+/path/runners.yaml --runtime /path/runtime.json --state-dir /path/runners` to
+dry-run canonical regeneration; add `--apply` for a CAS update. Restart the collector
+when finished (including after a failed run). The generator shares its lifetime
+lock and persisted provider quota/backoff/crash fences, so it cannot run concurrently.
+It resolves repository metadata 301s through exactly
+`https://api.github.com/repositories/<numeric-id>`, verifies the returned ID, and
+preserves scope IDs, bindings and permissions. Unknown/deleted/inaccessible scopes
+are reported, not silently dropped. Job/workflow-referenced scopes are reported
+for coordinated allowlist updates, not automatically renamed. The JSON report
+contains names/IDs and sanitized failures, never credentials. Requests are serial,
+paced, bounded per scope, and stop on quota/backoff. Recheck fresh coverage after a
+full cycle. This replaces one-shot generation from historical inventory exports.
+
+To tolerate future renames without waiting for regeneration, inventory GETs accept
+one GitHub numeric repository-ID 301 with the exact original pagination query.
+The client never enables HTTP redirects; other hosts, paths, queries, chains,
+job reads and mutations cannot use this exception. Every hop consumes the existing
+persisted request budget. Transport retains only the validated numeric URL from
+301 bodies, never error messages. Tests: `tests/test_canonical*.py`, `tests/test_github.py`.
+
+## Installation
+
 For repair reconciliation, prefer `scripts/install_service.py --install
 --hermes-launcher /absolute/hermes --core-root /path/to/hermes-core` (plus the
 owner/config arguments below). The installer discovers the interpreter through
