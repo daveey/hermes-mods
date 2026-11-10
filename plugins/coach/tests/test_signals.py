@@ -2491,3 +2491,45 @@ def test_coach_skips_core_connection_phrases():
     for p in phrases:
         for t in ("anthropic.APIStatusError", "openai.APIError", "anthropic.ServiceUnavailableError"):
             assert sg.parse_errors(_stream_fail(f"{t}: {p}")) == [], (t, p)
+
+
+# ── a Hermes resume preamble in front of a real request is not a fixed prompt (agent-6b76c58161) ─────────────
+# The MacBook filed "report_only held 3 replies whose user turn has the same opening text \"[System note: Your
+# previous turn was int\" in 3 chats": core wraps the interrupted request in a recovery note when it resumes a
+# crashed/paused turn, so 3 unrelated asks shared the note's first 40 chars.
+
+RESUME_HEAD = "[System note: Your previous turn was int"
+
+
+def test_resume_preamble_heads_in_three_chats_file_nothing(tmp_path):
+    rows = [{**_tpl_nudge(i, f"s{i}", head=RESUME_HEAD, rule="report_only"), "ask_len": 700 + i,
+             "ask_fp": f"fp{i:08d}"} for i in range(3)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW)) == []
+
+
+def test_resume_preamble_heads_already_in_the_window_do_not_refile(tmp_path):
+    """Old passes stored raw preamble heads in cur['coach_template']; a later pass must not group them."""
+    ev = [{"at": NOW - 3600 * (i + 1), "rule": "report_only", "head": RESUME_HEAD, "sid": f"s{i}", "fp": f"fp{i}"}
+          for i in range(3)]
+    cur = {"coach_template": {"ev": ev, "filed": {}}}
+    assert _templates(sg.collect_coach(_coach_home(tmp_path, [NUDGE]), cur, NOW)) == []
+
+
+def test_jobs_stopped_notice_heads_still_group_for_rules_that_skip_notices(tmp_path):
+    """The preamble skip is only for resume notes: core's jobs-stopped notice opens with a note too, and a rule
+    that should not judge notices holding it in 3 chats is still a template."""
+    head = "[System note: background job results fro"
+    rows = [{**_tpl_nudge(i, f"s{i}", head=head, rule="handoff"), "ask_len": 300 + i, "ask_fp": f"jp{i:08d}"}
+            for i in range(3)]
+    assert len(_templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW))) == 1
+
+
+def test_wrapped_asks_group_on_the_real_request_after_the_preamble(tmp_path):
+    """Control: the same real request behind the preamble in 3 chats is still a template (rows log the stripped
+    head); 3 identical human asks with no preamble still file too."""
+    rows = [{**_tpl_nudge(i, f"s{i}", head="[cron] nightly digest run for the team", rule="report_only"),
+             "ask_wrapped": True, "ask_len": 700 + i, "ask_fp": f"fp{i:08d}"} for i in range(3)]
+    assert len(_templates(sg.collect_coach(_coach_home(tmp_path / "a", rows), {}, NOW))) == 1
+    human = [{**_tpl_nudge(i, f"s{i}", head="please check the deploy status now", rule="report_only"),
+              "ask_len": 40 + i, "ask_fp": f"hp{i:08d}"} for i in range(3)]
+    assert len(_templates(sg.collect_coach(_coach_home(tmp_path / "b", human), {}, NOW))) == 1

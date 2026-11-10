@@ -143,6 +143,38 @@ def test_pre_verify_hook_nudges_the_real_turn_once(tmp_path, monkeypatch):
     assert hooks["pre_verify"](session_id=sid, platform="desktop", attempt=1, final_response=REAL[1][1]) is None
 
 
+def test_pre_verify_logs_the_request_behind_a_resume_preamble(tmp_path, monkeypatch):
+    """agent-6b76c58161: a resumed turn's ask is core's recovery note + the user's words. The row's ask_head is the
+    user's words (the template detector groups on it) and ask_wrapped marks the strip; ask_fp still hashes it all."""
+    spec = importlib.util.spec_from_file_location("coach_init_so_wrap", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcm = mod._load("reply_check")
+    monkeypatch.setattr(rcm, "aux_judge", lambda s, p: json.dumps({k: 0 for k in rcm.RULES}))
+    monkeypatch.setenv("COACH_SYSTEM_ONE", "off")
+    monkeypatch.setenv("COACH_STALLED_GOAL", "0")
+    monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
+    root = tmp_path / "coach"
+    _, hooks = mod.build(store=core.Store(root=root), checkout=None)
+    sid = "20261101_000000_cccccc"
+    ask = ("[System note: Your previous turn was interrupted mid-run — the app or its backend process stopped before "
+           "the turn could finish. Some of the work may already be complete; check the current state before redoing "
+           "anything, then finish the task. The interrupted request was:]\n\nwhya re we waiting for 8h?")
+    hooks["pre_llm_call"](session_id=sid, user_message=ask, platform="desktop")
+    hooks["post_tool_call"](tool_name="kanban_show", args={"task_id": "t_82f0fe15"}, result="{}", session_id=sid)
+    hooks["post_tool_call"](tool_name="terminal", args={"command": "hermes kanban unblock t_ae11c0bc"},
+                            result="{}", session_id=sid)
+    hooks["post_tool_call"](tool_name="kanban_comment", args={"task_id": "t_ae11c0bc", "body": "x"}, result="{}",
+                            session_id=sid)
+    out = hooks["pre_verify"](session_id=sid, platform="desktop", attempt=0, final_response=REAL[1][1])
+    assert out and out["action"] == "continue"
+    rows = [json.loads(l) for l in (root / "log.jsonl").read_text().splitlines()]
+    nudges = [r for r in rows if r.get("event") == "reply_nudge"]
+    assert [(r.get("ask_head"), r.get("ask_wrapped")) for r in nudges] == [("whya re we waiting for 8h?", True)]
+    assert nudges[0]["ask_fp"] == hashlib.sha1(ask.encode()).hexdigest()[:10]
+
+
 def test_status_only_is_a_default_rule_and_can_be_turned_off(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
     assert "status_only" in rc.settings()["rules"]

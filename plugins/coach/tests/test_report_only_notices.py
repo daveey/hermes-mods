@@ -326,3 +326,59 @@ def test_every_core_synthetic_user_prefix_is_classified():
         else:
             unclassified.append(p)
     assert not unclassified, f'classify in reply_check.NOTICE_RE (+ a sample) or NOT_NOTICES: {unclassified}'
+
+
+# ── resume preambles (agent-6b76c58161) ──────────────────────────────────────────────────────────────────────
+# Core wraps a resumed turn's real request in a "[System note: …]" preamble. The coach's template detector keys on
+# the ask's opening, so it must see the request, not the preamble. Built from core's own builders: a new or reworded
+# core preamble fails here before it reaches live data.
+
+def _core_preambles(prompt):
+    import subprocess
+    import sys
+    root = _core_root()
+    code = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+p = sys.argv[2]
+import tui_gateway.server as server  # session_auto_continue's bodies run rebound onto server's globals
+_auto_continue_note = server._auto_continue_note
+from tui_gateway.update_pause import pause_note
+from gateway.run import build_resume_recovery_note
+from tui_gateway.exit_job_receipts import jobs_stopped_note
+out = {"jobs_stopped_report": jobs_stopped_note([{"session_id": "proc_1a2b", "command": "sleep 9", "started_at": 0,
+                                                  "kill_state": "killed"}]),"auto_continue": _auto_continue_note(p), "pause": pause_note(p),
+       "gateway_restart": build_resume_recovery_note("restart_timeout", p),
+       "gateway_noninteractive": build_resume_recovery_note("shutdown_timeout", p, interactive=False)}
+open(sys.argv[3], "w").write(json.dumps(out))  # not stdout: core's server import takes stdout for JSON-RPC
+'''
+    import os
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix='coach-preamble-'))
+    env = {**os.environ, 'HERMES_HOME': str(tmp / 'home'), 'HERMES_DISABLE_LAZY_INSTALLS': '1'}
+    r = subprocess.run([sys.executable, '-c', code, str(root), prompt, str(tmp / 'out.json')], capture_output=True,
+                       text=True, timeout=120, env=env)
+    if r.returncode:
+        pytest.skip(f'core preamble builders not importable with {sys.executable}: {r.stderr.strip()[-300:]}')
+    return json.loads((tmp / 'out.json').read_text())
+
+
+def test_core_resume_preambles_strip_to_the_real_request():
+    notes = _core_preambles('fix X')
+    receipt = notes.pop('jobs_stopped_report')
+    assert set(notes) == {'auto_continue', 'pause', 'gateway_restart', 'gateway_noninteractive'}
+    # core's jobs-stopped notice also opens with a note, then Hermes's job report: a notice, never stripped
+    assert '\n\n' in receipt and rc.notice_turn(receipt) and rc.strip_preamble(receipt) == receipt
+    for name, note in notes.items():
+        assert note.startswith('[System note:'), name
+        assert rc.strip_preamble(note) == 'fix X', (name, note[:120])
+        assert not rc.automation_prompt(note), f'{name}: a resumed human request must stay judged'
+
+
+def test_stacked_preambles_strip_and_bare_preambles_stay():
+    inner = _core_preambles('fix X')['auto_continue']
+    assert rc.strip_preamble(_core_preambles(inner)['pause']) == 'fix X'
+    bare = '[System note: The previous turn was interrupted by a gateway restart.]'
+    assert rc.strip_preamble(bare) == bare  # nothing real follows: unchanged
+    for ask in ('fix X', '', 'What does [System note: x] mean?', '[System note: unterminated'):
+        assert rc.strip_preamble(ask) == ask

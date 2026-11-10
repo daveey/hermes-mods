@@ -1722,20 +1722,29 @@ def _prompt_id(r: dict, sid: str, at: float) -> str:
     return f"{sid}:{at}"
 
 
+def _preamble_head(head: str) -> bool:
+    """A head that is core's resume preamble ("[System note: Your previous turn was int…"), not the request behind it:
+    rows logged before reply_check.strip_preamble (agent-6b76c58161). Unrelated asks share it, so it never groups.
+    A notice that opens with a note (core's jobs-stopped receipt) is a real template and still groups."""
+    return head.startswith("[System note:") and not _notice_head(head)
+
+
 def _ask_head(r: dict) -> str:
     """The first TEMPLATE_HEAD chars of the held turn's user text: the row's ask_head, else (rows from an older
-    plugin) the status_only evidence quote. '' when unknown."""
+    plugin) the status_only evidence quote. '' when unknown or when it is only a resume preamble."""
     head = r.get("ask_head")
     if not head:
         m = _ASKED_RE.match(str(r.get("evidence") or ""))
         head = m.group(1) if m else ""
-    return " ".join(str(head).split())[:TEMPLATE_HEAD]
+    head = " ".join(str(head).split())[:TEMPLATE_HEAD]
+    return "" if _preamble_head(head) else head
 
 
 def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") -> List[dict]:
     """nudges: this pass's reply_nudge rows. Keeps a 7-day window in cur["coach_template"] across passes."""
     st = cur.get("coach_template") or {}
-    evs = [e for e in st.get("ev") or [] if e.get("at", 0) > now - TEMPLATE_HOLD_S]
+    evs = [e for e in st.get("ev") or [] if e.get("at", 0) > now - TEMPLATE_HOLD_S
+           and not _preamble_head(str(e.get("head") or ""))]  # stored by passes before agent-6b76c58161
     filed = {k: v for k, v in (st.get("filed") or {}).items() if v > now - TEMPLATE_HOLD_S}
     for r in nudges:
         head = _ask_head(r)

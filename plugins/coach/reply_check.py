@@ -1682,6 +1682,34 @@ def automation_prompt(user_ask: str) -> bool:
     return notice_turn(user_ask) or bool(KANBAN_PROMPT_RE.match(user_ask or ""))
 
 
+PREAMBLE_OPEN = "[System note:"
+
+
+def strip_preamble(ask: str) -> str:
+    """The user's request behind core's leading "[System note: …]" resume preamble(s) (crash auto-continue, update
+    pause, gateway restart recovery; agent-6b76c58161). Unchanged when the ask has no preamble, the note never
+    closes, or nothing real follows it. The ask stays a human request (not automation_prompt): only the logged
+    opening the template detector groups on uses this. A notice that opens with a note (core's jobs-stopped
+    receipt) is left whole: what follows it is Hermes's job report, not a request."""
+    text = ask or ""
+    if notice_turn(text):
+        return ask
+    for _ in range(4):  # a resumed turn that is interrupted again stacks a second note
+        if not text.startswith(PREAMBLE_OPEN):
+            break
+        depth, end = 0, -1
+        for i, ch in enumerate(text):
+            depth += (ch == "[") - (ch == "]")
+            if depth == 0:
+                end = i
+                break
+        rest = text[end + 1:].lstrip() if end > 0 else ""
+        if not rest:
+            return ask
+        text = rest
+    return text
+
+
 NOTICE_CONTEXT = """AUTOMATED NOTICE, not a human request for a read-only status update. The notice supplies a worker's
 handoff; it does not establish that this agent acted on each unresolved item. Evaluate each unresolved agent-fixable
 leftover independently: finishing the main repair does not excuse a separate verification or deployment gap.
