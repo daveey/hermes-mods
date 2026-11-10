@@ -293,13 +293,16 @@ def _session_user_msgs(session_id: str, query: str, keep: int = 30, recent: int 
 
 def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "", *, structured: bool = False,
               llm=None, users: list[str] | None = None, whole_request: bool = False,
-              label_basis: list[str] | None = None) -> list[dict]:
+              label_basis: list[str] | None = None, cards: list[str] | None = None) -> list[dict]:
     """``whole_request``: each ask is a complete structured request (action_request), not an ask sentence, so
-    sentence-level screens (soft-instruction routing, "I can't" short-circuit) do not apply to its plan text."""
+    sentence-level screens (soft-instruction routing, "I can't" short-circuit) do not apply to its plan text.
+    ``cards``: the ask's explicit task cards (default: ids in the ask text itself, never the surrounding reply);
+    answers bound to those cards are read from any chat, so sibling chats asking about one task agree."""
     ids = core.card_ids(" ".join(asks) + " " + reply)
     statuses = core.card_status(ids)
-    led = ledger().relevant(session_id, limit=20)
-    retired = core.retired_matches(asks, ledger().retired_for(session_id, asks))
+    cards = core.card_ids(" ".join(asks)) if cards is None else cards
+    led = ledger().relevant(session_id, limit=20, cards=cards)
+    retired = core.retired_matches(asks, ledger().retired_for(session_id, asks, cards=cards))
     remaining = [i for i in range(len(asks)) if i not in retired]
     if not remaining:
         return [retired[i] for i in range(len(asks))]
@@ -410,7 +413,7 @@ def _record_answers(session_id: str, msg: str | None, history: list,
     if len(open_asks) == 1 and direct_terminal and direct_input:
         # A single pending question has an unambiguous target. Persist the actual
         # user's words, never a classifier-generated terminal assertion.
-        led.add(open_asks[0], msg, session=session_id)
+        led.add(open_asks[0], msg, session=session_id, card_id=core.bound_card(open_asks[0]))
         led.set_open_asks(session_id, [])
         return
     if not open_asks and not strong:
@@ -426,7 +429,11 @@ def _record_answers(session_id: str, msg: str | None, history: list,
         topic = (open_asks[0] if open_asks else _last_assistant_text(history)[:160]) or "asks in general"
         answered = [{"i": -1, "topic": topic, "answer": msg[:160]}]
     for a in answered:
-        led.add(a["topic"], msg, session=session_id, retire=False)
+        # Bind to a card only through the shown ask the user answered (never the classifier's topic, never a
+        # general dismissal): only then may another chat asking about that same card read this answer.
+        i = a.get("i")
+        card = core.bound_card(open_asks[i]) if type(i) is int and 0 <= i < len(open_asks) else ""
+        led.add(a["topic"], msg, session=session_id, retire=False, card_id=card)
     if answered:
         answered_indices = {a.get("i") for a in answered if type(a.get("i")) is int and a["i"] >= 0}
         # A general dismissal (-1) is not proof that every distinct question was
@@ -572,7 +579,8 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             return _refuse(session_id, "workflow_stopped", final_response, retirement_candidates,
                            "David stopped this workflow, so asking him to act on it is not allowed until he "
                            "resumes it himself.", attempt, budget, howto=howto)
-        retired = core.retired_matches(retirement_candidates, ledger().retired_for(session_id, retirement_candidates))
+        retired = core.retired_matches(retirement_candidates, ledger().retired_for(
+            session_id, retirement_candidates, cards=core.card_ids(" ".join(retirement_candidates))))
         if retired:
             rejected = True
             refused = [retirement_candidates[i] for i in sorted(retired) if i < len(retirement_candidates)]
@@ -747,13 +755,14 @@ UNKNOWN_RETIREMENT_MSG = ("ask-gate: retirement state is unavailable, so this as
                           "asking the user and retry once the ledger is readable.")
 
 
-def _retired_block(session_id: str, asks: list[str]) -> dict | None:
+def _retired_block(session_id: str, asks: list[str], cards: list[str] | None = None) -> dict | None:
     """Durable terminal answers precede judgment on structured ask surfaces; unknown state fails closed."""
     asks = [a for a in asks if isinstance(a, str) and a.strip()]
     if not asks or not session_id:
         return None
     try:
-        retired = core.retired_matches(asks, ledger().retired_for(session_id, asks))
+        cards = core.card_ids(" ".join(asks)) if cards is None else cards
+        retired = core.retired_matches(asks, ledger().retired_for(session_id, asks, cards=cards))
     except Exception as e:
         core.log_event("retirement_unknown", session=session_id, error=repr(e))
         return {"action": "block", "message": UNKNOWN_RETIREMENT_MSG}
@@ -896,6 +905,15 @@ def _replan_reply_hold(session_id: str, asks: list[str], attempt: int, budget: i
             "(replan_hold). ") + " Do not relay a worker's 'end it or expand scope' question: replan on its card."}
 
 
+def _explicit_cards(tool_name: str, args: dict, request: dict) -> list[str]:
+    """The task(s) a human_request is about: the card being blocked, plus cards its action or scope names.
+    Evidence and why_human cite other cards as context (often to say they do NOT cover this), so not the task."""
+    ids = set(core.card_ids(str(request.get("action") or "") + " " + str(request.get("scope") or "")))
+    if tool_name == "kanban_block" and str(args.get("task_id") or "").startswith("t_"):
+        ids.add(str(args["task_id"]))
+    return sorted(ids)
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -919,7 +937,8 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         reconciled = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
         if reconciled is not None:
             return reconciled
-        retired = _retired_block(session_id, [request["action"]])
+        cards = _explicit_cards(tool_name, args, request)
+        retired = _retired_block(session_id, [request["action"]], cards)
         if retired is not None:
             return retired
         tools = _tools_now(session_id)
@@ -930,7 +949,7 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         # Keep the complete contract in the ask itself: prose detectors and their sentence/length
         # caps must not select an unrelated sentence or drop a late field from this explicit ask.
         text = json.dumps(request, ensure_ascii=False)
-        verdicts = _judge_explicit(session_id, tool_name, text, tools)
+        verdicts = _judge_explicit(session_id, tool_name, text, tools, cards)
         if verdicts is None:
             # Every reachable judge failed: no verdict exists. The deterministic checks above (schema,
             # evidence matching a tool call this turn, reconciliation, retirement) passed, so the ask goes
@@ -954,17 +973,18 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
                 "same call once. Do not park the card without it."}
 
 
-def _judge_explicit(session_id: str, tool_name: str, text: str, tools: list[dict]) -> list[dict] | None:
+def _judge_explicit(session_id: str, tool_name: str, text: str, tools: list[dict],
+                    cards: list[str] | None = None) -> list[dict] | None:
     """Verdicts from the configured judge, else from the class fallbacks (fast, standard, deep; subscription
     only). None when no judge was reachable. A verdict, good or bad, is final: it never falls back."""
     errors = []
     try:
-        return run_judge(session_id, [text], tools, text, structured=True)
+        return run_judge(session_id, [text], tools, text, structured=True, cards=cards)
     except judge_mod.JudgeUnavailable as e:
         errors.append(("configured", str(e)))
     for name, llm in FALLBACKS():
         try:
-            verdicts = run_judge(session_id, [text], tools, text, structured=True, llm=llm)
+            verdicts = run_judge(session_id, [text], tools, text, structured=True, llm=llm, cards=cards)
         except judge_mod.JudgeUnavailable as e:
             errors.append((name, str(e)))
             continue
@@ -1028,7 +1048,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             replanned = _replan_hold(session_id, tool_name, candidate)
             if replanned is not None:
                 return replanned
-        reconciled = _retired_block(session_id, found)
+        # The card being blocked is the ask's task even when the prose reason does not repeat its id.
+        own = [str(args["task_id"])] if tool_name == "kanban_block" and str(args.get("task_id") or "").startswith("t_") else []
+        reconciled = _retired_block(session_id, found, sorted(set(core.card_ids(" ".join(found)) + own)))
         if reconciled is not None:
             return reconciled
         gated, text = core.needs_checked(tool_name, args, _is_worker())
@@ -1044,7 +1066,8 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
                 what=what, extra=f"(Your Checked line \"{claim[:100]}\" matches no tool call made this turn.)")}
         sents = core.find_leftovers(text) + [a for a in core.find_asks(text) if a not in core.find_leftovers(text)]
         sents = sents or [str(args.get("title") or text)[:200]]
-        verdicts = run_judge(session_id, sents[:6], tools, text)
+        verdicts = run_judge(session_id, sents[:6], tools, text,
+                             cards=sorted(set(core.card_ids(" ".join(sents[:6])) + own)))
         core.log_event("l3_verdict", tool=tool_name, session=session_id,
                        verdicts=[(v["verdict"], v.get("reason", "")) for v in verdicts])
         if judge_mod.bad(verdicts):
@@ -1135,6 +1158,13 @@ def _action_identity(args: dict, req: dict) -> tuple[str, bool]:
     return head, cut
 
 
+def _source_ref_cards(req: dict) -> list[str]:
+    """An ActionRequest's explicit tasks: card ids in its scope.sourceRefs only. Plan markdown, limits and choices
+    cite cards as context, which must not import answers bound to those cards from other chats."""
+    refs = _typed(_typed(req, "scope", dict), "sourceRefs", list)
+    return sorted({str(x.get("id")) for x in refs if isinstance(x, dict) and str(x.get("id") or "").startswith("t_")})
+
+
 def _action_request_gate(session_id: str, args: dict) -> dict | None:
     """Judge an action_request approval/choice against David's words from the whole chat (agent-ebedadaefd).
     Withdrawals, other kinds and an unreachable judge pass; only already_answered/agent_can_do block."""
@@ -1161,7 +1191,7 @@ def _action_request_gate(session_id: str, args: dict) -> dict | None:
         try:
             verdicts = run_judge(session_id, [ask], tools, "(the ask above is the complete ActionRequest)",
                                  llm=llm, users=users, whole_request=True,
-                                 label_basis=[title + "\n" + plan])
+                                 label_basis=[title + "\n" + plan], cards=_source_ref_cards(req))
             break
         except judge_mod.JudgeUnavailable as e:
             errors.append((name, str(e)))

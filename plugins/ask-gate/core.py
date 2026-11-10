@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 try:
     from zoneinfo import ZoneInfo
@@ -237,6 +237,13 @@ def find_leftovers(text: str) -> list[str]:
 
 def card_ids(text: str) -> list[str]:
     return sorted(set(_CARD_ID.findall(text or "")))
+
+
+def bound_card(ask: str) -> str:
+    """The one card an answered ask names, else "". Two or more ids, or a heading unit joining several items
+    with " | " (the answer may be to an item that names no card), are ambiguous: the answer stays unbound."""
+    ids = card_ids(ask)
+    return ids[0] if len(ids) == 1 and " | " not in (ask or "") else ""
 
 
 def says_david_must_act(text: str) -> bool:
@@ -738,13 +745,22 @@ class Ledger:
             return []
         return [{"ts": r[0], "session": r[1], "topic": r[2], "answer": r[3], "card_id": r[4]} for r in rows]
 
+    # An answer row is visible to a read when it was recorded in this chat's compression lineage, or when it is
+    # bound to a card (card_id, set only from a user answer to an ask naming exactly that one card) that the
+    # current ask explicitly names. Unbound rows never leave their lineage: no global sharing of chat answers.
+    _VISIBLE = ("(a.session in (select session from answer_scope) "
+                "or (coalesce(a.card_id, '')<>'' and a.card_id in (select id from answer_cards)))")
+
     @staticmethod
-    def _scope(c: sqlite3.Connection, session: str) -> None:
+    def _scope(c: sqlite3.Connection, session: str, cards: Iterable[str] = ()) -> None:
         # Connection-local scope avoids SQLite's bound-parameter ceiling for long
         # compression chains. It never changes durable state or sibling sessions.
         c.execute("create temp table answer_scope (session text primary key)")
         c.executemany("insert or ignore into answer_scope values (?)",
                       ((sid,) for sid in answer_lineage(session)))
+        c.execute("create temp table answer_cards (id text primary key)")
+        c.executemany("insert or ignore into answer_cards values (?)",
+                      ((x,) for x in cards if isinstance(x, str) and x.startswith("t_")))
         # Rows a pre-fix process recorded from a runtime notice stay invisible to every read.
         c.create_function("runtime_notice", 1, lambda text: int(runtime_notice(text)), deterministic=True)
 
@@ -754,20 +770,22 @@ class Ledger:
                  "card_id": card, "retired": retired is not None}
                 for ts, sid, topic, answer, card, retired in rows]
 
-    def relevant(self, session: str, window_s: float = 14 * 86400, limit: int = 20) -> list[dict]:
+    def relevant(self, session: str, window_s: float = 14 * 86400, limit: int = 20,
+                 cards: Iterable[str] = ()) -> list[dict]:
         """Bounded context: at most limit terminal and limit ordinary records.
 
         Terminal context has no TTL and cannot be crowded out by ordinary chatter.
         Enforcement MUST use retired_for, not this lossy context sample.
+        ``cards``: the current ask's explicit cards; their bound answers count from any chat.
         """
         if limit <= 0:
             return []
         c = self._conn()
         try:
-            self._scope(c, session)
+            self._scope(c, session, cards)
             base = ("select a.ts, a.session, a.topic, a.answer, a.card_id, r.answer_id "
-                    "from answered a join answer_scope s on s.session=a.session "
-                    "left join retired_answers r on r.answer_id=a.id where not runtime_notice(a.answer) and ")
+                    "from answered a left join retired_answers r on r.answer_id=a.id "
+                    f"where {self._VISIBLE} and not runtime_notice(a.answer) and ")
             terminal = c.execute(base + "r.answer_id is not null "
                                  "order by a.ts desc, a.id desc limit ?", (limit,)).fetchall()
             ordinary = c.execute(base + "r.answer_id is null and a.ts>=? "
@@ -777,7 +795,7 @@ class Ledger:
         finally:
             c.close()
 
-    def retired_for(self, session: str, asks: list[str]) -> list[dict]:
+    def retired_for(self, session: str, asks: list[str], cards: Iterable[str] = ()) -> list[dict]:
         """Candidate-specific durable facts; bounded by unique candidate count.
 
         Whitespace normalization matches retired_matches. Punctuation and case
@@ -787,14 +805,14 @@ class Ledger:
             return []
         c = self._conn()
         try:
-            self._scope(c, session)
+            self._scope(c, session, cards)
             c.create_function("action_key", 1, lambda text: " ".join(text.split()))
             rows = []
             for key in dict.fromkeys(" ".join(a.split()) for a in asks):
                 row = c.execute(
                     "select a.ts, a.session, a.topic, a.answer, a.card_id, r.answer_id "
-                    "from answered a join answer_scope s on s.session=a.session "
-                    "join retired_answers r on r.answer_id=a.id where action_key(a.topic)=? "
+                    "from answered a join retired_answers r on r.answer_id=a.id "
+                    f"where {self._VISIBLE} and action_key(a.topic)=? "
                     "and not runtime_notice(a.answer) "
                     "order by a.ts desc, a.id desc limit 1", (key,)).fetchone()
                 if row is not None:
