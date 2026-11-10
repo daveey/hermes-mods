@@ -350,3 +350,30 @@ test('panel: unasked rows show the step for local and remote cards; missing data
   assert.equal(bare.querySelector('[data-ask-card]').getAttribute('title'), 'Gate retained; architecture settled', 'title only as hover context')
   } finally { await show(null) } // unmount: stops the panel's done poll so the file exits
 })
+
+test('hasOpenWork: finished cards alone are not open work; anything unfinished is', () => {
+  const empty = { active: [], stuck: [], waiting: [], queued: [], unasked: [] }
+  assert.equal(m.hasOpenWork(empty), false)
+  assert.equal(m.hasOpenWork({ ...empty, waiting: [{ kind: 'kanban', chip: { state: 'done' } }, { kind: 'kanban', chip: { state: 'archived' } }] }), false)
+  assert.equal(m.hasOpenWork(empty, { steps: [{ id: 's1', status: 'done' }] }), false)
+  assert.equal(m.hasOpenWork({ ...empty, waiting: [{ kind: 'kanban', chip: { state: 'blocked' } }] }), true)
+  assert.equal(m.hasOpenWork({ ...empty, active: [{ kind: 'sub', chip: {} }] }), true)
+  assert.equal(m.hasOpenWork(empty, { asks: 1 }), true)
+  assert.equal(m.hasOpenWork(empty, { steps: [{ id: 's1' }] }), true)
+  assert.equal(m.hasOpenWork(empty, { issues: [{ id: 'i' }] }), true)
+})
+
+test('panel: a chat whose cards are all done shows no panel; new open work brings it back', async () => {
+  window.localStorage.clear()
+  const s = Date.now() / 1000
+  const b = bridges({ chips: [card('t_done', 'done')], cards: [{ id: 't_done', status: 'done', title: 'Shipped', activity_at: s - 60 }] })
+  try {
+    await show(React.createElement(m.Panel, { key: 'all-green' }))
+    await React.act(async () => { await m.refreshDone(); await flush() })
+    assert.equal(el().querySelector('[data-session-status]'), null, 'all green: no panel')
+    assert.equal(el().textContent, '')
+    await React.act(async () => { b.push([card('t_done', 'done'), card('t_run', 'running', { activityAt: s - 30 })]); await flush() })
+    assert.ok(el().querySelector('[data-session-status]'), 'open work shows the panel')
+    assert.deepEqual([...el().querySelectorAll('[data-count]')].map(x => x.textContent.replace('● ', '')), ['1 done', '1 running'])
+  } finally { await show(null) }
+})

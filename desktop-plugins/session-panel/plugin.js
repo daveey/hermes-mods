@@ -16,6 +16,8 @@
  *   Waiting      parked cards and what they wait on
  *   footer       finished and not-yet-started cards, folded
  *   collapsed    header, Needs you, and one line per waiting card (up to 3) saying what it waits on
+ *   hidden       when nothing is open (no ask, open card, sub-agent, process, step or issue): finished cards alone
+ *                never show the panel
  *
  * Data: session-tasks' snapshot (window.__sessionTasks: cards, sub-agents, processes, machines; it keeps polling),
  * user-steps' asks (window.__userSteps), and finished cards from user-steps' /session-cards (every 30 s; core's
@@ -107,6 +109,8 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       if (!TERMINAL.has(str(c.state)) && !isAsked(c)) out.unasked.push({ ...item(c), detail: on || 'needs you' })
       continue
     }
+    // Finished cards come from the Done list (/session-cards); a terminal chip here is not waiting on anything.
+    if (TERMINAL.has(str(c.state))) continue
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if (c.state === 'running') {
       if (progress && now - progress >= STUCK_CARD_S) out.stuck.push({ ...item(c), reason: 'no-progress', lastAt: progress, detail: `running, no progress since ${clock(progress, nowMs)} (${ago(progress, nowMs)})${c.activity ? ` · last event: ${c.activity}` : ''}` })
@@ -118,6 +122,14 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     out.waiting.push({ ...item(c), detail: on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state) })
   }
   return out
+}
+
+/** True when the chat has anything not finished: an ask, a card/sub-agent/process that is open, an open ledger
+ *  step or an agent issue. Done/archived cards (and a done list) never count: all green = no panel. */
+export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) {
+  const open = list => (list || []).some(i => !(i.kind === 'kanban' && TERMINAL.has(str(i.chip?.state))))
+  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.queued) ||
+    (Array.isArray(steps) && steps.some(s => s?.id && (s.status || 'open') === 'open')) || (Array.isArray(issues) && issues.length))
 }
 
 function item(c) {
@@ -368,8 +380,8 @@ export function Panel() {
   // A legacy card listed above as an unasked row is the same exact qualified card the strip's "Earlier asks"
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
-  const anything = asks || sorted.unasked.length || chips.length || finished?.length || US?.snapshot?.ledger?.steps?.length || US?.snapshot?.issues?.length
-  if (!anything) return null
+  // Finished cards alone are no reason to take space above the composer: an all-green chat shows nothing.
+  if (!hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) return null
   const attention = attentionKeys(asks, sorted)
   const collapsed = !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
   const toggle = () => { const next = collapsed ? null : attention; writeCollapsed(next); setCollapsedState(next) }
