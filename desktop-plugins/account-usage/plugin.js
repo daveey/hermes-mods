@@ -12,6 +12,8 @@
  * stay unselectable; an older backend without limit_kind stays red (never masked as green).
  * Read-only: the call serves cached snapshots and kicks a background refresh,
  * so polling it never blocks a turn or rotates a credential.
+ * Disable/Enable (row details) = `hermes auth disable|enable` for every pooled row of that account
+ * (REST /disabled); a disabled account is grey, never counted ready and never selectable.
  */
 
 import { atom, cn, host, Popover, PopoverContent, PopoverTrigger, STATUSBAR_AREAS, useValue } from '@hermes/plugin-sdk'
@@ -62,7 +64,10 @@ const PROVIDERS = [
   { slug: 'gemini', name: 'Gemini', title: 'Gemini (AI Studio key)', statusOnly: true, statusOk: 'API key valid · no usage windows (AI Studio has no usage API)', statusBad: 'key rejected', statusBadHint: 'key rejected · check the key at aistudio.google.com/apikey' }
 ]
 
-const COLORS = { ready: '#3fb950', warn: '#d29922', cooldown: '#e3b341', limited: '#f85149', unknown: 'var(--ui-text-tertiary, #888)', unavailable: 'var(--ui-text-tertiary, #888)' }
+const COLORS = { ready: '#3fb950', warn: '#d29922', cooldown: '#e3b341', limited: '#f85149', unknown: 'var(--ui-text-tertiary, #888)', unavailable: 'var(--ui-text-tertiary, #888)', disabled: 'var(--ui-text-tertiary, #888)' }
+
+// Pooled providers whose accounts can be switched off (backend DISABLE_PROVIDERS).
+const DISABLE_SLUGS = new Set(['anthropic', 'openai-codex', 'xai-oauth'])
 
 const REASONS = { quota_window: 'quota used up', billing: 'billing / credits', usage_limit: 'usage limit reached', rate_limit: 'rate limited', auth: 'auth error', cooldown: 'cooling down' }
 
@@ -77,6 +82,7 @@ export function pickWindow(windows, kind) {
 }
 
 export function tone(account) {
+  if (account.disabled) return 'disabled'
   // Only an explicit backend 'cooldown' verdict turns a limited account amber.
   if (account.state === 'limited') return account.limit_kind === 'cooldown' ? 'cooldown' : 'limited'
   if (account.state !== 'ready') return account.state === 'unavailable' ? 'unavailable' : 'unknown'
@@ -101,6 +107,7 @@ export function fmtReset(iso, now = Date.now()) {
 // One line on why an account is not ready, from sanitized fields only (codes + timestamps).
 export function describe(account, now = Date.now()) {
   if (!account) return ''
+  if (account.disabled) return 'disabled · not used until you enable it'
   const parts = []
   if (account.state === 'limited' && account.status_bad) {
     parts.push(account.status_bad)
@@ -139,7 +146,7 @@ export function statusLabel(g, a) {
 
 // Whether a row has anything behind its disclosure chevron. Ready rows with nothing to say have none.
 export function hasDetails(g, a) {
-  return !!g.statusOnly || !!describe(a) || needsReconnect(a)
+  return !!g.statusOnly || !!g.canDisable || !!describe(a) || needsReconnect(a)
 }
 
 export function statusHint(g, a) {
@@ -149,8 +156,10 @@ export function statusHint(g, a) {
   return 'not checked yet · rechecks in a few seconds'
 }
 
-export function summarize(payload, last = {}, now = Date.now()) {
+// `disabled` = the /disabled reply {supported, accounts: {provider: [account_id]}}; absent = unsupported.
+export function summarize(payload, last = {}, now = Date.now(), disabled = null) {
   const rows = (payload && payload.providers) || []
+  const off = (disabled && disabled.supported && disabled.accounts) || {}
   return PROVIDERS.map(p => {
     const row = rows.find(r => r && r.slug === p.slug)
     let accounts = row && row.usage && Array.isArray(row.usage.accounts) ? row.usage.accounts : null
@@ -164,11 +173,15 @@ export function summarize(payload, last = {}, now = Date.now()) {
     if (!accounts || !accounts.length) return null
     // Status-only providers with their own wording (Gemini): a rejected key is not "out of quota".
     if (p.statusBad) accounts = accounts.map(a => (a.state === 'limited' ? { ...a, reason: 'auth', status_bad: p.statusBad } : a))
-    const ready = accounts.filter(a => a.state === 'ready').length
+    const offIds = new Set(Array.isArray(off[p.slug]) ? off[p.slug] : [])
+    if (offIds.size) accounts = accounts.map(a => (offIds.has(a.id) ? { ...a, disabled: true } : a))
+    const canDisable = !!(disabled && disabled.supported) && DISABLE_SLUGS.has(p.slug)
+    const ready = accounts.filter(a => a.state === 'ready' && !a.disabled).length
+    const off_ = accounts.filter(a => a.disabled).length
     const cooling = accounts.filter(a => tone(a) === 'cooldown').length
     const limited = accounts.filter(a => tone(a) === 'limited').length
     const nextBack = accounts
-      .filter(a => a.state === 'limited' && a.resets_at)
+      .filter(a => a.state === 'limited' && !a.disabled && a.resets_at)
       .map(a => a.resets_at)
       .sort()[0] || null
     const rec = last && last[p.slug]
@@ -181,7 +194,7 @@ export function summarize(payload, last = {}, now = Date.now()) {
         mark = now - rec.at * 1000 < ACTIVE_MS ? 'active' : 'last'
       }
     }
-    return { ...p, accounts, ready, cooling, limited, total: accounts.length, nextBack, markId, mark, markAt: rec ? rec.at * 1000 : null }
+    return { ...p, accounts, ready, cooling, limited, disabled: off_, canDisable, total: accounts.length, nextBack, markId, mark, markAt: rec ? rec.at * 1000 : null }
   }).filter(Boolean)
 }
 
@@ -196,6 +209,11 @@ export function needsReconnect(account) {
 // back to a fixed local file: that would leak the default profile onto remotes.
 async function readLast(ctx) {
   try { return await ctx.rest('/last') || {} } catch { return {} }
+}
+
+// Older plugin backends / cores have no /disabled: treat as unsupported (no toggle shown).
+async function readDisabled(ctx) {
+  try { return await ctx.rest('/disabled') || null } catch { return null }
 }
 
 export function createStore(ctx) {
@@ -218,8 +236,8 @@ export function createStore(ctx) {
     const e = epoch
     const current = () => { sync(); return !disposed && epoch === e }
     $state.set({ ...$state.get(), loading: true })
-    inflight = Promise.all([host.request('model.options', {}, 30_000), readLast(ctx)])
-      .then(([payload, last]) => { if (current()) $state.set({ groups: summarize(payload, last || {}), fetchedAt: Date.now(), loading: false, error: null }) })
+    inflight = Promise.all([host.request('model.options', {}, 30_000), readLast(ctx), readDisabled(ctx)])
+      .then(([payload, last, disabled]) => { if (current()) $state.set({ groups: summarize(payload, last || {}, Date.now(), disabled), fetchedAt: Date.now(), loading: false, error: null }) })
       .catch(err => { if (current()) $state.set({ ...$state.get(), loading: false, error: String(err?.message || err) }) })
       .finally(() => { if (current()) inflight = null })
     return inflight
@@ -287,6 +305,7 @@ export function createSelectionStore(ctx) {
     const row = $state.get().selection
     if (!row || $state.get().loading) { refuse('Selection is loading; refresh before trying again.'); return }
     if (account && provider !== row.provider) { refuse(`This chat uses ${row.provider}; selecting another provider would change its route.`); return }
+    if (account && account.disabled) { refuse('Account is disabled; enable it first.'); return }
     if (account && (account.state !== 'ready' || !account.id || account.selectable === false)) {
       const why = describe(account)
       refuse(`Account unavailable (${account.state || 'unknown'}${why ? `: ${why}` : ''}). Cooldowns are not reset.`); return
@@ -341,6 +360,29 @@ export function createReconnectStore(ctx, onDone = () => {}) {
   return { $state, key, reconnect }
 }
 
+// Disable / Enable one account (every pooled row of it). onDone refreshes the usage store.
+export function createDisableStore(ctx, onDone = () => {}) {
+  const $state = atom({})
+  const key = (provider, id) => `${provider}\u0000${id}`
+  const put = (k, v) => $state.set({ ...$state.get(), [k]: v })
+  const toggle = async (provider, account) => {
+    const k = key(provider, account.id)
+    if ($state.get()[k]?.busy) return
+    const want = !account.disabled
+    put(k, { busy: true })
+    try {
+      const r = await ctx.rest('/disabled', { method: 'POST', body: { provider, account_id: account.id, disabled: want } })
+      put(k, r && r.ok
+        ? { message: want ? 'Disabled · not used until enabled' : 'Enabled' }
+        : { error: true, message: want ? 'Not disabled; refresh and retry' : 'Still disabled by the main Hermes home (run hermes auth enable there)' })
+      await onDone()
+    } catch (err) {
+      put(k, { error: true, message: `${want ? 'Disable' : 'Enable'} failed: ${String(err?.message || err)}` })
+    }
+  }
+  return { $state, key, toggle }
+}
+
 // ── UI ────────────────────────────────────────────────────────────────────
 
 function Dot({ t, size = 7, mark = null }) {
@@ -381,6 +423,18 @@ function Meter({ win }) {
 const GRID = { display: 'grid', gridTemplateColumns: '10px minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr)', gap: 8, alignItems: 'center' }
 const PANEL_STYLE = { width: 'min(460px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)', maxHeight: 'min(80vh, 680px)', overflowY: 'auto', overflowX: 'hidden' }
 
+function DisableLine({ g, a, disableStore, disableState }) {
+  if (!g.canDisable || !disableStore) return null
+  const st = disableState[disableStore.key(g.slug, a.id)] || {}
+  const name = a.label || a.id
+  return jsxs('div', { className: 'hermes-au-fix', children: [
+    jsx('button', { type: 'button', 'aria-label': `${a.disabled ? 'Enable' : 'Disable'} ${name}`, disabled: !!st.busy,
+      title: a.disabled ? 'Let Hermes use this account again' : 'Stop Hermes from using this account (it stays signed in)',
+      onClick: () => disableStore.toggle(g.slug, a), children: st.busy ? 'Saving…' : a.disabled ? 'Enable account' : 'Disable account' }),
+    st.message ? jsx('span', { style: { color: st.error ? COLORS.limited : undefined, opacity: st.error ? 1 : 0.8 }, children: st.message }) : null
+  ] })
+}
+
 function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   const st = reconnectState[reconnectStore.key(g.slug, a.id)] || {}
   if (!needsReconnect(a) && !st.message) return null
@@ -399,16 +453,16 @@ function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
 
 // The table shows only visual cues (dot colour, bars, dimmed rows, a tinted chevron). Why an
 // account is limited, status hints and the Reconnect action sit behind the row's chevron.
-export function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reconnectStore, reconnectState }) {
+export function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reconnectStore, reconnectState, disableStore = null, disableState = {} }) {
   const t = tone(a)
   const name = a.label || a.id
   const why = describe(a)
   // Backend says manual choice is refused (managed model routing); keep the row as a read-only status line.
-  const refused = typeof selectionState.selection?.unavailable === 'string' ? selectionState.selection.unavailable : ''
+  const refused = a.disabled ? 'disabled' : typeof selectionState.selection?.unavailable === 'string' ? selectionState.selection.unavailable : ''
   const fix = reconnectState[reconnectStore.key(g.slug, a.id)] || {}
   const details = hasDetails(g, a)
   // A Reconnect outcome stays visible after the click even if the row is collapsed again.
-  const shown = details && (open || !!fix.message)
+  const shown = details && (open || !!fix.message || !!(disableStore && disableState[disableStore.key(g.slug, a.id)]?.message))
   const cue = t === 'ready' || t === 'unknown' ? undefined : COLORS[t]
   return jsxs('div', { children: [
     jsxs('div', { className: 'hermes-au-line', children: [
@@ -416,7 +470,7 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
         'aria-label': refused ? `${name}: ${refused}` : `Try ${name} next`, disabled: selectionState.busy || selectionState.loading || !!refused,
         'aria-disabled': refused ? 'true' : undefined, 'data-unavailable': refused ? 'true' : undefined,
         onClick: refused ? undefined : () => selectionStore.select(g.slug, a),
-        style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.6, ...(refused ? { cursor: 'not-allowed' } : {}) },
+        style: { ...GRID, opacity: a.disabled ? 0.45 : a.state === 'ready' || a.id === g.markId ? 1 : 0.6, ...(refused ? { cursor: 'not-allowed' } : {}) },
         title: refused ? `${name} · ${why || a.state} · ${refused}` : `${name} · ${why || a.state} · Next request in the focused chat only`, children: [
         jsx(Dot, { t, mark: a.id === g.markId ? g.mark : null }),
         jsxs('span', { style: { display: 'flex', alignItems: 'center', minWidth: 0, fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
@@ -435,17 +489,19 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
     shown ? jsxs('div', { className: 'hermes-au-details', 'data-account': name, style: { '--au-c': cue }, children: [
       why ? jsx('span', { className: 'hermes-au-why', 'data-tone': t, style: { color: cue }, children: why }) : null,
       g.statusOnly ? jsx('span', { style: { opacity: 0.8 }, children: statusHint(g, a) }) : null,
-      jsx(ReconnectLine, { g, a, reconnectStore, reconnectState })
+      a.disabled ? null : jsx(ReconnectLine, { g, a, reconnectStore, reconnectState }),
+      jsx(DisableLine, { g, a, disableStore, disableState })
     ] }) : null
   ] })
 }
 
-function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconnectState }) {
+function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconnectState, disableStore, disableState }) {
   const [open, setOpen] = useState(() => new Set())
   const toggle = id => setOpen(prev => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next })
   const limited = g.limited, cooling = g.cooling
-  const unknown = g.total - g.ready - limited - cooling
-  const parts = [`${g.ready} ready`, limited && `${limited} ${g.statusBad || 'out of quota'}`, cooling && `${cooling} cooling down`, unknown && `${unknown} unknown`].filter(Boolean)
+  const off = g.disabled || 0
+  const unknown = g.total - g.ready - limited - cooling - off
+  const parts = [`${g.ready} ready`, limited && `${limited} ${g.statusBad || 'out of quota'}`, cooling && `${cooling} cooling down`, off && `${off} disabled`, unknown && `${unknown} unknown`].filter(Boolean)
   return jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 }, children: [
     jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }, children: [
       jsx('b', { style: { fontSize: 12 }, children: g.title }),
@@ -455,7 +511,7 @@ function GroupPanel({ g, selectionStore, selectionState, reconnectStore, reconne
       jsxs('div', { style: { ...GRID, flex: 1, padding: '0 3px' }, children: [jsx('span', {}), jsx('span', { children: 'Account' }), jsx('span', { children: '5-hour' }), jsx('span', { children: 'Weekly' })] }),
       jsx('span', { className: 'hermes-au-gap' })
     ] }),
-    ...g.accounts.map(a => jsx(AccountRow, { key: a.id, g, a, open: open.has(a.id), onToggle: () => toggle(a.id), selectionStore, selectionState, reconnectStore, reconnectState }))
+    ...g.accounts.map(a => jsx(AccountRow, { key: a.id, g, a, open: open.has(a.id), onToggle: () => toggle(a.id), selectionStore, selectionState, reconnectStore, reconnectState, disableStore, disableState }))
   ] })
 }
 
@@ -465,9 +521,10 @@ function ago(ts) {
   return s < 60 ? `${s}s ago` : `${Math.round(s / 60)}m ago`
 }
 
-function UsageBar({ store, selectionStore, reconnectStore }) {
+function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
   const { groups, fetchedAt, loading, error } = useValue(store.$state)
   const reconnectState = useValue(reconnectStore.$state)
+  const disableState = useValue(disableStore.$state)
   const selectionState = useValue(selectionStore.$state)
   // Subscriptions invalidate immediately; effect hydrates the newly focused route.
   const focused = useValue(host.state.focusedSessionId)
@@ -485,7 +542,7 @@ function UsageBar({ store, selectionStore, reconnectStore }) {
   return jsxs(Popover, { open, onOpenChange: v => { setOpen(v); if (v) store.refresh() }, children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage', children:
       groups.map(g => jsxs('span', { key: g.slug, style: { display: 'inline-flex', alignItems: 'center', gap: 5, marginRight: 6 },
-        title: `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
+        title: `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
           jsx('b', { style: { fontWeight: 600 }, children: g.name }),
           jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
           jsx('span', { style: { color: countColor(g) }, children: `${g.ready}/${g.total}` })
@@ -500,7 +557,7 @@ function UsageBar({ store, selectionStore, reconnectStore }) {
           jsx('button', { type: 'button', disabled: selectionState.busy || selectionState.loading, onClick: () => selectionStore.refresh(), style: { marginLeft: 8, textDecoration: 'underline' }, children: 'Refresh selection' })
         ] }),
         selectionState.error ? jsx('div', { role: 'alert', style: { color: 'var(--ui-text-primary)', border: '1px solid var(--ui-stroke-secondary)', padding: 7, overflowWrap: 'anywhere' }, children: selectionState.error }) : null,
-        ...groups.flatMap((g, i) => [i ? jsx('div', { key: `sep-${g.slug}`, style: { borderTop: '1px solid var(--border)' } }) : null, jsx(GroupPanel, { key: g.slug, g, selectionStore, selectionState, reconnectStore, reconnectState })]).filter(Boolean),
+        ...groups.flatMap((g, i) => [i ? jsx('div', { key: `sep-${g.slug}`, style: { borderTop: '1px solid var(--border)' } }) : null, jsx(GroupPanel, { key: g.slug, g, selectionStore, selectionState, reconnectStore, reconnectState, disableStore, disableState })]).filter(Boolean),
         jsx('div', { style: { borderTop: '1px solid var(--border)' } }),
         jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10.5, opacity: 0.7 }, children: [
           jsx('span', { children: error ? `Refresh failed: ${error}` : `Updated ${ago(fetchedAt)} · auto every 30s` }),
@@ -523,10 +580,12 @@ export default {
     const store = createStore(ctx)
     const selectionStore = createSelectionStore(ctx)
     const reconnectStore = createReconnectStore(ctx, () => store.refresh())
+    // Twice: a poll already in flight resolves with the pre-toggle state; the second read is fresh.
+    const disableStore = createDisableStore(ctx, async () => { await store.refresh(); await store.refresh() })
     store.refresh()
     // Second read shortly after: the first call kicks background usage fetches.
     ctx.setTimeout(() => store.refresh(), 8_000)
     ctx.setInterval(() => { store.refresh(); selectionStore.refresh() }, POLL_MS)
-    ctx.register({ id: 'chips', area: STATUSBAR_AREAS.right, order: 5, render: () => jsx(UsageBar, { store, selectionStore, reconnectStore }) })
+    ctx.register({ id: 'chips', area: STATUSBAR_AREAS.right, order: 5, render: () => jsx(UsageBar, { store, selectionStore, reconnectStore, disableStore }) })
   }
 }
