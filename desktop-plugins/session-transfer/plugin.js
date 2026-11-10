@@ -21,16 +21,10 @@ import {
   Button,
   Codicon,
   cn,
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
   host,
   PALETTE_AREA,
   queryClient,
   ROUTES_AREA,
-  SESSION_ROW_AREAS,
   SIDEBAR_NAV_AREA,
   useQuery
 } from '@hermes/plugin-sdk'
@@ -281,60 +275,6 @@ async function runTransfer({ from, to, toLabel, sessionId, title, move }) {
   }
 }
 
-// ── Sidebar row action ──────────────────────────────────────────────────────
-
-function RowTransferMenu({ sessionId }) {
-  const connections = useConnections()
-  const [busy, setBusy] = useState(false)
-  const from = activeConnection()
-  const targets = (connections.data ?? []).filter(c => c.id !== from)
-
-  if (!sessionId || !targets.length) {
-    return null
-  }
-
-  const go = (target, move) => {
-    if (busy) {
-      return
-    }
-
-    setBusy(true)
-    runTransfer({ from, to: target.id, toLabel: target.label, sessionId, move })
-      .catch(() => {})
-      .finally(() => setBusy(false))
-  }
-
-  return jsxs(DropdownMenu, {
-    children: [
-      jsx(DropdownMenuTrigger, {
-        asChild: true,
-        children: jsx('button', {
-          'aria-label': 'Copy or move to another gateway',
-          className: cn(
-            'inline-flex size-5 items-center justify-center rounded-[3px] text-(--ui-text-tertiary)',
-            'hover:bg-(--chrome-action-hover) hover:text-foreground',
-            busy ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100'
-          ),
-          onClick: e => e.stopPropagation(),
-          onPointerDown: e => e.stopPropagation(),
-          title: 'Copy or move to another gateway',
-          type: 'button',
-          children: jsx(Codicon, { name: busy ? 'loading' : 'arrow-swap', spinning: busy, size: '12px' })
-        })
-      }),
-      jsx(DropdownMenuContent, {
-        align: 'end',
-        onClick: e => e.stopPropagation(),
-        children: targets.flatMap((t, i) => [
-          i > 0 ? jsx(DropdownMenuSeparator, {}, `sep-${t.id}`) : null,
-          jsx(DropdownMenuItem, { onSelect: () => go(t, false), children: `Copy to ${t.label}` }, `copy-${t.id}`),
-          jsx(DropdownMenuItem, { onSelect: () => go(t, true), children: `Move to ${t.label}` }, `move-${t.id}`)
-        ])
-      })
-    ]
-  })
-}
-
 // ── Page: browse any gateway, copy/move in either direction ─────────────────
 
 function ConnSelect({ value, onChange, options, label }) {
@@ -469,12 +409,6 @@ export default {
   id: ID,
   name: 'Session Transfer',
   register(ctx) {
-    ctx.register({
-      id: 'row-action',
-      area: SESSION_ROW_AREAS.trailing,
-      data: { render: ({ sessionId }) => jsx(RowTransferMenu, { sessionId }) }
-    })
-
     ctx.register({
       id: 'page',
       area: ROUTES_AREA,
