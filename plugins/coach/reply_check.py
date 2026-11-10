@@ -1206,6 +1206,45 @@ def skipped_live(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     return s.strip(" -*\t")
 
 
+# ---- consent_relay: a macOS permission click paired with a second "unblock / reply done" step ------------------------
+# (self-heal agent-2469206a31: the password window's osascript hung on "Hermes Python wants access to control
+# Terminal"; the reply asked David to click OK AND to unblock a card / reply "done" so an agent re-ran the installer.
+# The click is his; the re-run is not: run_in_user_terminal now keeps that job awaiting_consent and opens the window by
+# itself after OK.) Deterministic handoff hit, before the judge (whose rubric scores permission grants low).
+_CR_GRANT_RE = re.compile(r"\b(?:click|press|tap|hit|choose)\s+(?:on\s+)?[*_\"“']*(?:OK|Allow)\b", re.I)
+_CR_PROMPT_RE = re.compile(r"\bwants\s+access\s+to\s+control\b|\b(?:privacy|permission|consent|Automation|TCC)\b"
+                           r"[^.\n]{0,40}\b(?:prompt|dialog|pop-?up|permission|grant)\b|\bprompt\b", re.I)
+_CR_EXTRA_RE = re.compile(
+    # an instruction (step start, sentence start, or "then/and/please ..."), not a report ("it told you to unblock")
+    r"(?:^|(?<=[\n.;:!?])|(?<=\d[.)])|(?<=[-*] )|\b(?:then|and|please|so|just)\b)[\s*_]*"
+    r"(?:unblock(?:ing)?\s+(?:the|this|that|my|your|its|card|t_[0-9a-f]+)\b|reply\s+(?:with\s+)?[*_\"“']*done\b"
+    r"|say\s+[*_\"“']*done\b|(?:tell|let)\s+me\s+(?:know\s+)?(?:when|once)\b)"
+    r"|\bwhen\s+you\s+reply\b"
+    r"|\bonce\s+you(?:'ve|\s+have)?\s+(?:clicked|approved|allowed)\b[^.\n]{0,80}\b(?:I'll|I\s+will|re-?run|retry)\b",
+    re.I | re.M)
+# Only long quotations are dropped (a postmortem quoting the old ask); a short one is the ask itself: Reply "done".
+_CR_LONG_QUOTE_RE = re.compile(r'"[^"\n]{30,}"|\u201c[^\u201d\n]{30,}\u201d')
+CONSENT_RELAY_NUDGE = (
+    "[coach] consent_relay: your message asks the user to click OK on a macOS permission prompt AND to do a second "
+    "step so you retry (\"{evidence}\"). The click is the only human step. run_in_user_terminal keeps a job whose "
+    "window is held by an Automation prompt in status `awaiting_consent` and opens the password window by itself after "
+    "OK (it retries every 15 s until max wait). Tell the user one step: click OK, then type the password in the window "
+    "that opens. Keep waiting with run_in_user_terminal job_id (a Kanban worker parks with that job_id in the reason); "
+    "if the earlier job already failed, start a new run_in_user_terminal call now. Do not ask them to unblock a card "
+    "or reply \"done\".")
+
+
+def consent_relay(reply: str) -> Optional[str]:
+    """The extra-step phrase when the reply pairs a macOS permission click with an unblock / reply-done re-trigger,
+    else None (code spans, quotes and `>` lines ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _CR_LONG_QUOTE_RE.sub(" ", text)
+    if not (_CR_GRANT_RE.search(text) and _CR_PROMPT_RE.search(text)):
+        return None
+    m = _CR_EXTRA_RE.search(text)
+    return " ".join(text[max(0, m.start() - 40):m.end() + 40].split()) if m else None
+
+
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
          "laptop_job", "skipped_live")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
@@ -1806,7 +1845,9 @@ probabilities (0-1):
   restart an app, plug something in...) that the agent could plausibly have done itself with shell, browser
   automation, saved credentials, a password vault, a token broker, ssh, or background desktop control. Physical
   actions (plugging hardware, being at a device), the user's own judgment/taste, money/legal decisions, secrets
-  only the user knows, and macOS privacy permission grants are NOT handoffs (score low).
+  only the user knows, and macOS privacy permission grants are NOT handoffs (score low). A step ADDED after such a
+  grant so the agent retries (unblock a card, reply "done", tell me when) IS a handoff (score high):
+  run_in_user_terminal waits `awaiting_consent` and opens its window by itself once the user clicks OK.
   A CONDITIONAL ask ("if X isn't set up, you'll need to...", "may still need you if...") counts as a handoff when
   the agent could have checked X itself (membership, login state, a config value) and didn't: score it high.
   Asking the user to type, send or relay a message into a Hermes chat/session is a handoff (score high): an agent
@@ -2567,7 +2608,11 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
     """After a handoff nudge: does the REVISED final reply still hand the user a step? Same judge and threshold as
     the nudge. Returns {"p", "resolved", "evidence", "judged"}; resolved=None when the judge gave no usable verdict
     (the self-heal collector then files, as it would without an outcome). A reply the prefilter no longer flags is
-    resolved without a judge call, the same way check() never judges a reply with no candidate."""
+    resolved without a judge call, the same way check() never judges a reply with no candidate. A reply that still
+    pairs a permission click with an unblock / reply-done step (consent_relay) is unresolved without a judge call."""
+    phrase = consent_relay(reply)
+    if phrase:
+        return {"p": 1.0, "resolved": False, "evidence": phrase, "judged": False, "src": "consent_relay"}
     if "handoff" not in prefilter(reply):
         return {"p": 0.0, "resolved": True, "evidence": "no handoff language left", "judged": False}
     try:
@@ -2738,6 +2783,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                     "asks": [str(a.get("id") or "") for a in asks],
                     "verdict": {"denied_ask": 1.0, "evidence": phrase},
                     "nudge": DENIED_ASK_NUDGE.format(evidence=phrase[:120], n=len(asks), asks=listed[:900])}
+    if not only or "handoff" in only:
+        phrase = consent_relay(reply)
+        if phrase:  # deterministic: a permission click plus an "unblock / reply done" re-trigger (agent-2469206a31)
+            return {"rule": "handoff", "p": 1.0, "evidence": phrase, "reason": "consent_relay",
+                    "verdict": {"handoff": 1.0, "handoff_src": "consent_relay", "evidence": phrase},
+                    "nudge": CONSENT_RELAY_NUDGE.format(evidence=phrase[:160])}
     if not only or "credit_ask" in only:
         phrase = credit_ask(reply, tool_log)
         if phrase:  # deterministic: asking the user for money while the account pool sat unused
@@ -2966,7 +3017,12 @@ def human_block(tool_name: str, args: Any, default_card: str = "") -> Optional[t
 def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
                   threshold: float = 0.7, thresholds: Optional[dict] = None) -> Optional[dict]:
     """Judge a Kanban ask to the user with the reply judge's handoff rule. {"p", "evidence", "nudge"} on a hit,
-    else None (also when the judge fails: fail-open)."""
+    else None (also when the judge fails: fail-open). A permission click paired with an unblock / reply-done step
+    (consent_relay) is a hit without the judge."""
+    phrase = consent_relay(text)
+    if phrase:
+        return {"p": 1.0, "evidence": phrase[:200], "src": "consent_relay",
+                "nudge": CONSENT_RELAY_NUDGE.format(evidence=phrase[:160])}
     msg = ("[The agent is about to block its Kanban card on the user with this ask; nothing else will reach the "
            "user this turn.]\n" + (text or ""))
     try:

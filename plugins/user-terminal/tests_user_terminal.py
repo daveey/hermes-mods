@@ -737,16 +737,23 @@ def test_osascript_timeout_responsible_unknown_is_labelled(tmp_path, monkeypatch
     assert "iterm: osascript timed out" in msg and "TCC responsible process: unknown" in msg
 
 
-def test_osascript_timeout_persists_diagnosis_in_failed_status(tmp_path, monkeypatch):
+def test_osascript_timeout_persists_diagnosis_while_awaiting_consent(tmp_path, monkeypatch):
+    """A timeout is a pending consent prompt, not a failure (defect agent-2469206a31): the job waits
+    awaiting_consent with the diagnosis on disk; tests/test_awaiting_consent.py covers retry, expiry and errors."""
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path / "jobs"))
     _osa_timeout(monkeypatch)
     monkeypatch.setattr(ut, "_responsible_pid", lambda pid: 4242)
     monkeypatch.setattr(ut, "_proc_info", lambda pid: (1, "/x/Example Host") if pid == 4242 else None)
     monkeypatch.setattr(ut, "terminal_order", lambda: ["terminal"])
+    monkeypatch.setattr(ut, "spawn_watchdog", lambda job: None)
     out = json.loads(ut.handle({"command": "true", "cwd": str(tmp_path), "wait_s": 3}))
-    st = _assert_failed_status(_only_job(tmp_path / "jobs"), "osascript timed out")
-    assert out["status"] == "failed" and st["diagnosis"]["responsible_process"]["name"] == "Example Host"
-    assert st["diagnosis"]["responsible_process"]["source"] == "responsibility_get_pid_responsible_for_pid"
+    job = _only_job(tmp_path / "jobs")
+    rec = ut.read_consent(job)
+    assert out["status"] == "awaiting_consent" and "osascript timed out" in out["consent_error"], out
+    assert ut.read_status(job)["status"] == "waiting_for_user" and not (job / "start.lock").exists()
+    assert rec["diagnosis"]["responsible_process"]["name"] == "Example Host"
+    assert rec["diagnosis"]["responsible_process"]["source"] == "responsibility_get_pid_responsible_for_pid"
+    ut.withdraw_job(job, "test over")
 
 
 def test_osascript_error_includes_stderr(tmp_path, monkeypatch):

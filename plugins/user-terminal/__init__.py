@@ -20,6 +20,11 @@ Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
               and any osascript diagnosis). It is written only by fail_job() after it wins start.lock, so "nothing
               ran" is proven, never assumed. A job with no window after LAUNCH_GRACE_S (openers long done) is fenced
               (start.lock owner "fence <pid>") and then "abandoned"; so is one whose window died.
+  awaiting_consent.json  {"since", "last_try", "attempts", "error", "diagnosis", "opened_at"?}: an opener's
+              osascript timed out (a pending macOS Automation consent prompt). status.json stays waiting_for_user;
+              results report status "awaiting_consent" with `next` (the one human step). The watchdog retries the
+              open every CONSENT_RETRY_S (flock consent.lock, one at a time) until it opens (opened_at), max wait
+              expires (failed) or the job is withdrawn. A non-zero osascript exit still fails at once.
   opened      one line per runner that started (a window exists); the opener stops trying other apps once
               it sees this, even if its osascript call then errored (e.g. timed out centring the window)
   start.lock  the single-start gate (atomic mkdir; owner file says who). runner.sh takes it right before it
@@ -434,13 +439,19 @@ class OpenFailed(RuntimeError):
         self.diagnosis = diagnosis
 
 
+class OpenTimedOut(OpenFailed):
+    """osascript hung past OSA_TIMEOUT: most often macOS is showing an Automation consent prompt ("X wants access
+    to control Terminal"). Not final: the job waits ``awaiting_consent`` and its watchdog retries the open (see
+    retry_consent_open). An osascript that exits non-zero (denied, app error) stays a plain OpenFailed."""
+
+
 def _osascript(script: str) -> None:
     try:
         subprocess.run(["osascript", "-e", script], check=True, capture_output=True, text=True,
                        timeout=OSA_TIMEOUT, env=launch_env())
     except subprocess.TimeoutExpired:
         d = osa_diagnosis()
-        raise OpenFailed(f"osascript timed out after {OSA_TIMEOUT}s. {_diagnosis_text(d)}", d) from None
+        raise OpenTimedOut(f"osascript timed out after {OSA_TIMEOUT}s. {_diagnosis_text(d)}", d) from None
     except subprocess.CalledProcessError as e:
         err = str(e.stderr or e.output or "").strip()
         raise OpenFailed(f"osascript exited {e.returncode}: {err or 'no stderr'}") from None
@@ -522,7 +533,8 @@ def _open_via_launchd(job: Path, python: Path, caller: dict) -> str:
                 data = json.loads(result.read_text())
                 if data.get("ok"):
                     return data["terminal"]
-                raise OpenFailed(data.get("error") or "signed opener failed", data.get("diagnosis") or caller)
+                cls = OpenTimedOut if data.get("consent_pending") else OpenFailed
+                raise cls(data.get("error") or "signed opener failed", data.get("diagnosis") or caller)
             if window_started(job):
                 return "signed app (runner started)"
             time.sleep(0.1)
@@ -564,7 +576,8 @@ def opener_main(job: Path) -> int:
             raise OpenFailed("launchd opener did not acquire signed-app responsibility", diagnosis)
         result = {"ok": True, "terminal": _open_window_direct(job), "diagnosis": diagnosis}
     except Exception as e:
-        result = {"ok": False, "error": str(e), "diagnosis": getattr(e, "diagnosis", None) or diagnosis}
+        result = {"ok": False, "error": str(e), "diagnosis": getattr(e, "diagnosis", None) or diagnosis,
+                  "consent_pending": isinstance(e, OpenTimedOut)}
     tmp = job / "opener-result.tmp"
     tmp.write_text(json.dumps(result))
     tmp.replace(job / "opener-result.json")
@@ -577,7 +590,7 @@ def _open_window_direct(job: Path) -> str:
     osascript errors get a bounded OPEN_GRACE_S watch for a late window; other errors are checked once."""
     run_cmd = f"/bin/bash {shlex.quote(str(job / 'runner.sh'))} {shlex.quote(str(job))}"
     shell_cmd = _unset_prefix() + run_cmd + "; exit"  # typed into an interactive shell (Terminal.app, cmux)
-    errors, diagnosis = [], None
+    errors, diagnosis, timed_out = [], None, False
     names = {"cmux": "cmux", "iterm": "iTerm", "terminal": "Terminal"}
     for k in terminal_order():
         try:
@@ -590,13 +603,98 @@ def _open_window_direct(job: Path) -> str:
         except Exception as e:  # fall through to the next terminal, unless this one's window started anyway
             errors.append(f"{k}: {e}")
             diagnosis = getattr(e, "diagnosis", None) or diagnosis
+            timed_out = timed_out or isinstance(e, OpenTimedOut)
             if _await_window(job, OPEN_GRACE_S if isinstance(e, OpenFailed) else 0):
                 try:
                     (job / "open_warning.txt").write_text("; ".join(errors))
                 except OSError:
                     pass
                 return names.get(k, k)
-    raise OpenFailed("; ".join(errors) or "no terminal available", diagnosis)
+    # One opener hung (a consent prompt pending for that app) is enough to wait: the user's click makes it work.
+    raise (OpenTimedOut if timed_out else OpenFailed)("; ".join(errors) or "no terminal available", diagnosis)
+
+
+# ---------------------------------------------------------------- awaiting macOS consent
+# osascript hangs while macOS asks "<app> wants access to control Terminal". The job then waits awaiting_consent
+# (JOB/awaiting_consent.json; status.json stays waiting_for_user, so the runner's gates are unchanged) and its
+# watchdog retries the open every CONSENT_RETRY_S, one osascript at a time, until the window opens, max wait
+# expires (failed, as before) or the job is withdrawn. A real osascript error (denied, -1743) fails at once.
+
+CONSENT_RETRY_S = 15.0
+CONSENT_FILE = "awaiting_consent.json"
+CONSENT_NEXT = ("macOS is showing a permission prompt (\"... wants access to control Terminal/iTerm\") on the user's "
+                "screen. Ask the user to click OK on the prompt; the password window then opens by itself (Hermes "
+                "retries every 15 s until user_terminal.max_wait_minutes). Do not ask them to unblock or reply. "
+                "Call run_in_user_terminal with this job_id to keep waiting for the result.")
+
+
+def read_consent(job: Path) -> dict | None:
+    try:
+        d = json.loads((job / CONSENT_FILE).read_text())
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_consent(job: Path, d: dict) -> None:
+    tmp = job / f".consent.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps(d))
+    os.replace(tmp, job / CONSENT_FILE)
+
+
+def awaiting_consent(job: Path) -> dict | None:
+    """The consent record while the job still waits on it: no window yet, not final, no successful open yet."""
+    d = read_consent(job)
+    if not d or d.get("opened_at") or window_started(job) or read_status(job).get("status") in FINAL:
+        return None
+    return d
+
+
+def mark_awaiting_consent(job: Path, e: Exception) -> dict:
+    prev = read_consent(job) or {}
+    now = time.time()
+    d = {"since": prev.get("since") or now, "last_try": now, "attempts": int(prev.get("attempts") or 0) + 1,
+         "error": str(e), "diagnosis": getattr(e, "diagnosis", None) or prev.get("diagnosis")}
+    _write_consent(job, d)
+    return d
+
+
+def retry_consent_open(job: Path) -> str | None:
+    """One retry of an open that hung on a consent prompt: at most every CONSENT_RETRY_S, one at a time (flock on
+    JOB/consent.lock). Returns "opened", "waiting", "failed", or None when there was nothing to do."""
+    import fcntl
+
+    d = awaiting_consent(job)
+    if d is None or (job / "withdraw").exists():
+        return None
+    if time.time() - float(d.get("last_try") or 0) < CONSENT_RETRY_S:
+        return None
+    try:
+        lf = open(job / "consent.lock", "a")
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None  # another retry is in flight
+        if awaiting_consent(job) is None or (job / "withdraw").exists():
+            return None
+        try:
+            where = open_window(job)
+        except OpenTimedOut as e:
+            if window_started(job):
+                return "opened"
+            mark_awaiting_consent(job, e)
+            return "waiting"
+        except Exception as e:  # denied (-1743) or another real error: final, as before this wait existed
+            fail_job(job, f"could not open a terminal window: {e}", getattr(e, "diagnosis", None))
+            return "failed"
+        _write_consent(job, {**(read_consent(job) or {}), "opened_at": time.time(), "terminal": where})
+        log.info("user_terminal: %s opened after macOS consent (%s)", job.name, where)
+        return "opened"
+    finally:
+        lf.close()
 
 
 # ---------------------------------------------------------------- jobs
@@ -1840,9 +1938,18 @@ def _watch_once(job: Path, seen: dict) -> dict | None:
     created = float(meta.get("created") or time.time())
     age = time.time() - created
     legacy = is_legacy_job(job)
+    consent = read_consent(job)
+    limit = _valid_minutes(meta.get("max_wait_minutes")) or max_wait_minutes()
+    if consent and not consent.get("opened_at") and not window_started(job) and age > limit * 60:
+        # the consent prompt was never answered: fail as an open failure always did (a late window refuses)
+        return fail_job(job, f"could not open a terminal window: {consent.get('error')} (no window after "
+                             f"{limit:g} min awaiting macOS consent)", consent.get("diagnosis"))
     # No window ever announced itself within the launch grace (the openers are long done: fail_job reports their
-    # real errors). Fence the start gate, then abandoned: nothing ran, and a late window refuses.
-    if (age > LAUNCH_GRACE_S and st.get("status") == "waiting_for_user" and not (job / "opened").exists()
+    # real errors). Fence the start gate, then abandoned: nothing ran, and a late window refuses. While macOS
+    # consent is pending there is no grace yet; it starts when the retried open succeeds.
+    launched = float(consent.get("opened_at") or 0) if consent else created
+    if (launched and time.time() - launched > LAUNCH_GRACE_S and st.get("status") == "waiting_for_user"
+            and not (job / "opened").exists()
             and not (job / "start.lock").exists() and not (legacy and legacy_runner_live(job))):
         r = _fence_abandon(job, f"no terminal window started within {LAUNCH_GRACE_S:g} s; nothing ran")
         if r is not None:
@@ -1861,7 +1968,6 @@ def _watch_once(job: Path, seen: dict) -> dict | None:
                 return withdraw_job(job, why)
         finally:
             _attach_unlock(job)
-    limit = _valid_minutes(meta.get("max_wait_minutes")) or max_wait_minutes()
     if age > limit * 60:
         return withdraw_job(job, expiry_reason(limit))
     return None
@@ -2192,6 +2298,8 @@ def watchdog(job: Path, interval: float = WATCH_INTERVAL_S, max_s: float | None 
             if r and r.get("status") in FINAL + ("gone",):
                 _retry_reconcile(job, r, seen)
                 return r
+            if r is None and retry_consent_open(job) == "failed":
+                continue  # the next pass reconciles the failure
             time.sleep(max(0.05, min(interval, WATCH_INTERVAL_S)))
         r = watch_once(job, seen) or read_status(job)
         _retry_reconcile(job, r, seen)
@@ -2262,6 +2370,15 @@ def _open_or_fail(job: Path, prefix: str) -> tuple[str | None, dict | None]:
     while the openers were failing, fail_job leaves it alone and this reports the window as opened."""
     try:
         return open_window(job), None
+    except OpenTimedOut as e:
+        if not window_started(job):
+            mark_awaiting_consent(job, e)  # the job's watchdog retries; the user's click is the only step
+            return "pending macOS consent", None
+        try:
+            (job / "open_warning.txt").write_text(str(e))
+        except OSError:
+            pass
+        return "unknown (a window started although its opener reported an error)", None
     except Exception as e:
         st = fail_job(job, f"{prefix}: {e}", getattr(e, "diagnosis", None))
         if st.get("status") != "failed":
@@ -2336,6 +2453,16 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
         result["ok"] = False
         result["note"] = ("The terminal window went away before the command finished (abandoned). Nothing more "
                           "will happen for this job_id; start a new request if it is still needed.")
+    elif st.get("status") not in ("ran", "declined") and awaiting_consent(job):
+        consent = awaiting_consent(job) or {}
+        result.update({"status": "awaiting_consent", "next": CONSENT_NEXT, "note": CONSENT_NEXT,
+                       "consent_error": consent.get("error"), "consent_attempts": consent.get("attempts")})
+        if yielded:
+            result["yielded"] = True
+            result["note"] = YIELD_NOTE + " " + CONSENT_NEXT
+        card_note = _card_note(job)
+        if card_note:
+            result["note"] += " " + card_note
     elif st.get("status") not in ("ran", "declined"):
         result["status"] = "pending" if st.get("status") != "running" else "running"
         result["note"] = ("Still waiting (user hasn't answered, or the command is still running). Call "
@@ -2474,6 +2601,8 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
     if res.get("status") in ("running", "ran", "declined"):
         out.update({k: v for k, v in res.items() if k not in ("note",)})
         out["terminal"] = where
+    elif res.get("status") == "awaiting_consent":
+        out.update({k: res[k] for k in ("status", "next", "consent_error", "consent_attempts") if k in res})
     if res.get("opener_warning"):
         out["opener_warning"] = res["opener_warning"]
     return out
@@ -2727,6 +2856,9 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
         if yielded and res.get("ok") and res.get("status") not in FINAL:
             res["yielded"] = True
             res["note"] = YIELD_NOTE + f" (The window is on `{device}`.)"
+        elif res.get("ok") and res.get("status") == "awaiting_consent":
+            res["next"] = res.get("next") or CONSENT_NEXT
+            res["note"] = res["next"] + f" (The prompt and the window are on `{device}`.)"
         elif res.get("ok") and res.get("status") not in FINAL:
             res["note"] = (f"Still waiting on `{device}` (the owner hasn't answered, or the command is still "
                            f"running). Call run_in_user_terminal with this job_id to keep waiting.")

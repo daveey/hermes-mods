@@ -71,6 +71,10 @@ Hand it over only when it can't.
   or the client lacks a VNC handler, say so and explain the right remote-desktop fallback.
 - Commands still go through `run_in_user_terminal`. Screen Share is for GUI interaction, not a substitute for the
   command approval flow.
+- A macOS Automation prompt ("... wants access to control Terminal") in front of a `run_in_user_terminal` window is
+  ONE human step: "click OK, then type the password in the window that opens". The job waits `awaiting_consent` and
+  opens the window by itself after the click (retries every 15 s until max wait). Keep waiting with its `job_id`;
+  never add "unblock the card" or "reply done" so an agent retries (coach `consent_relay` holds that reply).
 
 ## Inbox posts
 
