@@ -6,13 +6,14 @@ run. An edit there mid-run makes its "OK" match no revision (self-heal agent-101
 
 - lists THIS task's running background processes from the Hermes process registry and keeps the
   test-like ones (pytest, unittest, nose2, tox/nox, ``t.sh``, any word starting ``test``/``tests``);
-- maps each to its busy trees: the git top-level of its cwd and of every existing absolute or
-  ``$PWD/``-relative path in its command (interpreter paths under a venv are ignored);
+- maps each to its busy trees: the git top-level at each command's effective cwd (following
+  ``cd``) and of existing absolute or ``$PWD/``-relative arguments (venv interpreters ignored);
 - extracts the paths an edit would touch: ``patch``/``write_file`` (``path``, V4A ``*** ... File:``
   headers), and shell commands that change files (``sed -i``/``perl -i``, ``>``/``>>``/``tee``,
   ``rm``/``mv``/``cp``/``touch``/``truncate``, mutating git subcommands, following ``cd DIR``).
 
-An edit whose path lies inside a busy tree is refused. Kill switch: ``BUSY_TREE_GUARD=0``.
+An edit whose path lies inside a busy tree is refused. Kill switch: set ``BUSY_TREE_GUARD=0``
+in the agent environment before starting Hermes, not inline in a terminal command.
 Not covered: ``execute_code`` file writes, edits by other tasks/sessions, foreground runs.
 """
 
@@ -110,10 +111,21 @@ def busy_trees(proc: dict) -> List[str]:
     cwd = str(proc.get("cwd") or "")
     command = str(proc.get("command") or "")
     trees: List[str] = []
-    for cand in ([cwd] if cwd else []) + list(_command_paths(command, cwd or "/")):
-        top = git_toplevel(cand)
-        if top and top not in trees:
-            trees.append(top)
+    # Registry cwd is the shell's launch directory, not necessarily the test's.
+    # Follow cd before assigning a command to a tree; never union in the launch
+    # tree unconditionally (it may be a completely unrelated worktree).
+    cwd = cwd or "/"
+    for argv, _ in _segments(_tokens(command)):
+        argv = _strip_wrappers(argv)
+        if not argv:
+            continue
+        if argv[0] == "cd" and len(argv) > 1:
+            cwd = _abs(argv[1], cwd)
+            continue
+        for cand in [cwd] + list(_command_paths(shlex.join(argv), cwd)):
+            top = git_toplevel(cand)
+            if top and top not in trees:
+                trees.append(top)
     return trees
 
 
@@ -203,6 +215,10 @@ def shell_targets(command: str, cwd: str, depth: int = 0) -> List[str]:
     out: List[str] = []
     for argv, redirs in _segments(_tokens(command)):
         for op, target in redirs:
+            # >&N duplicates, >&- closes, >&N- moves a descriptor. Bash's
+            # >&file remains a file write, as do >1 and &>file.
+            if op in {">&", "<&"} and re.fullmatch(r"(?:\d+-?|-)", target):
+                continue
             if ">" in op and target and not target.startswith("&") and target != "/dev/null":
                 out.append(_abs(target, cwd))
         argv = _strip_wrappers(argv)
@@ -294,7 +310,9 @@ def message(target: str, tree: str, proc: dict) -> str:
             f"is still reading: `{str(proc.get('command'))[:200]}`. An edit now makes its result match "
             "no revision. Ways out: make the edit in another worktree (`git worktree add --detach "
             "<dir> HEAD`), wait for the run to finish (process wait), or kill it "
-            "(process kill) and rerun after the edit. Operator override: BUSY_TREE_GUARD=0.")
+            "(process kill) and rerun after the edit. Operator override: set BUSY_TREE_GUARD=0 "
+            "in the agent process environment before starting Hermes (e.g. BUSY_TREE_GUARD=0 hermes). "
+            "An inline assignment in a terminal command does not change the running agent's environment.")
 
 
 def record(tool: str, target: str, tree: str, proc: dict) -> None:

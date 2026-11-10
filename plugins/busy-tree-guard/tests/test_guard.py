@@ -164,6 +164,50 @@ def test_interpreter_path_does_not_make_its_repo_busy(env):
     assert env["hook"](tool_name="patch", args=_patch(env["fix2"] / "retention_policy.py"), task_id=TASK)
 
 
+@pytest.mark.parametrize("redirect", ["2>&1", "1>&2", "2>&-", "2>&1-"])
+def test_fd_redirections_are_not_file_writes(env, redirect):
+    env["reg"].add("python -m pytest", env["fix2"])
+    assert env["hook"](tool_name="terminal", args={
+        "workdir": str(env["fix2"]),
+        "command": f"timeout 400 python -m pytest -q -p no:cacheprovider {redirect} | tail -3",
+    }, task_id=TASK) is None
+
+
+def test_explicit_cd_does_not_mark_launch_tree_busy(env):
+    env["reg"].add(f"cd {env['fix2']} && python -m pytest", env["other"])
+    assert env["hook"](tool_name="patch", args=_patch(env["other"] / "retention_policy.py"), task_id=TASK) is None
+    assert env["hook"](tool_name="patch", args=_patch(env["fix2"] / "retention_policy.py"), task_id=TASK)
+
+
+@pytest.mark.parametrize("redirect", [">1", "2>errors", ">&errors", "&>errors", ">>errors", ">errors 2>&1"])
+def test_real_file_redirections_still_block(env, redirect):
+    env["reg"].add("python -m pytest", env["fix2"])
+    assert env["hook"](tool_name="terminal", args={
+        "workdir": str(env["fix2"]), "command": f"python -m pytest {redirect}"
+    }, task_id=TASK)
+
+
+def test_cd_resolves_pwd_test_argument(env):
+    child = _repo(env["other"] / "nested")
+    env["reg"].add(f"cd {env['other']} && bash t.sh $PWD/nested", env["fix2"])
+    assert env["hook"](tool_name="patch", args=_patch(child / "retention_policy.py"), task_id=TASK)
+    assert env["hook"](tool_name="patch", args=_patch(env["fix2"] / "retention_policy.py"), task_id=TASK) is None
+
+
+def test_sibling_path_containment(env):
+    guard = env["mod"].guard
+    assert not guard._inside(str(env["fix2"]) + "-sibling/file", str(env["fix2"]))
+
+
+def test_override_message_explains_parent_environment(env):
+    env["reg"].add("python -m pytest", env["fix2"])
+    result = env["hook"](tool_name="terminal", args={
+        "command": "BUSY_TREE_GUARD=0 touch retention_policy.py", "workdir": str(env["fix2"])
+    }, task_id=TASK)
+    assert result and "before starting Hermes" in result["message"]
+    assert "inline" in result["message"]
+
+
 CORE = Path(os.environ.get("HERMES_CORE", Path.home() / ".hermes" / "hermes-agent"))
 
 
