@@ -53,11 +53,22 @@ def moved_owner(sid: str, db_path: Path | None = None) -> str | None:
                 hub = kanban_sync_client.Hub(kanban_sync_client.load_identity())
                 rec = (hub.sessions(board, {'action': 'get', 'session_ids': [root]}).get('owners') or {}).get(root)
                 _fallback_cache[root] = (time.monotonic(), rec)
-        except Exception:
+        except Exception as exc:
             rec = hit[1] if hit else None
             # Match core admission's fail-open when there is no known move. A
             # known owner from session_owner's stale cache never takes this path.
-            logging.getLogger('chat_closeout').warning('chat-closeout: Board owner fallback unavailable', exc_info=True)
+            # Remember the failure for the same 30 s window, so one offline pass
+            # asks the Board (and logs) once, keeping any known moved owner.
+            _fallback_cache[root] = (time.monotonic(), rec)
+            unreachable = (OSError, TimeoutError, getattr(kanban_sync_client, 'SyncUnavailable', OSError))
+            log = logging.getLogger('chat_closeout')
+            if isinstance(exc, unreachable):
+                # No network / no enrollment is expected on a laptop: one line, no
+                # traceback (the errors detector files tracebacks with our frames).
+                reason = getattr(exc, 'reason', None) or exc
+                log.warning('chat-closeout: Board owner fallback unavailable (Board unreachable: %s)', reason)
+            else:
+                log.warning('chat-closeout: Board owner fallback unavailable', exc_info=True)
     return str(rec['gateway']) if rec and rec.get('gateway') and rec['gateway'] != me else None
 
 

@@ -86,3 +86,55 @@ def test_named_profile_is_resolved_and_passed_by_plugin(tmp_path, monkeypatch):
     assert seen == [('tip', named)]
     assert plugin._handoff_ask(None, 'tip', 'remote', 'key', 'prompt', 1000) == 'forwarded'
     assert seen[-1] == {'profile': 'work'}
+
+
+def _fallback_warnings(caplog):
+    return [r for r in caplog.records if 'Board owner fallback unavailable' in r.getMessage()]
+
+
+def test_unreachable_board_logs_one_line_and_is_cached(owner_env, monkeypatch, caplog):
+    """A laptop with no network (DNS failure) is expected: no traceback, no retry storm."""
+    import socket
+    import urllib.error
+    _, _, calls, set_record = owner_env
+    clock = [1.0]
+    monkeypatch.setattr(routing.time, 'monotonic', lambda: clock[0])
+    set_record(urllib.error.URLError(socket.gaierror(8, 'nodename nor servname provided, or not known')))
+    caplog.set_level('WARNING', logger='chat_closeout')
+    assert routing.moved_owner('tip') is None
+    clock[0] = 5.0
+    assert routing.moved_owner('tip') is None
+    assert len(calls) == 1  # the failure is remembered for the 30 s window
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is None  # no traceback: the errors detector must not file it
+    assert 'Board unreachable' in warnings[0].getMessage()
+    assert 'nodename nor servname' in warnings[0].getMessage()
+    clock[0] = 40.0
+    assert routing.moved_owner('tip') is None
+    assert len(calls) == 2  # retried once the window has passed
+
+
+def test_unreachable_board_keeps_known_moved_owner(owner_env, monkeypatch, caplog):
+    import urllib.error
+    _, _, calls, set_record = owner_env
+    clock = [1.0]
+    monkeypatch.setattr(routing.time, 'monotonic', lambda: clock[0])
+    assert routing.moved_owner('tip') == 'remote'
+    clock[0] = 100.0
+    set_record(urllib.error.URLError(TimeoutError('timed out')))
+    assert routing.moved_owner('tip') == 'remote'
+    clock[0] = 110.0
+    assert routing.moved_owner('tip') == 'remote'  # cached failure still returns the known owner
+    assert len(calls) == 2
+
+
+def test_unexpected_error_keeps_traceback(owner_env, caplog):
+    """A real bug in the lookup still logs exc_info so the errors detector files it."""
+    _, _, calls, set_record = owner_env
+    set_record(KeyError('owners'))
+    caplog.set_level('WARNING', logger='chat_closeout')
+    assert routing.moved_owner('tip') is None
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is not None
