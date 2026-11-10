@@ -1313,7 +1313,11 @@ ASK_HEAD = 2000
 # A Kanban worker's request (core kanban_db_context): "# Kanban task <id>: <title>", header lines, "## Body", then board
 # sections the card's author didn't write (other cards' summaries, shared blockers, comments). A limit such as
 # "Diagnosis only." usually ends the body, past ~2 KB of header (self-heal agent-668442d68f).
-KANBAN_PROMPT_RE = re.compile(r"\A\s*# Kanban task \S+:")
+# Core's restart resume (gateway/session_kanban_resume.py RESUME_NOTE) puts a one-paragraph note BEFORE the header;
+# it is still the dispatcher's prompt, and the note is core's text, not the author's (agent-105768f616).
+RESUME_HEAD = "## Resumed after gateway restart"
+_RESUME_NOTE_RE = re.compile(r"\A\s*" + re.escape(RESUME_HEAD) + r"\n[^\n]*\n\s*(?=# Kanban task \S+:)")
+KANBAN_PROMPT_RE = re.compile(r"\A\s*(?:" + re.escape(RESUME_HEAD) + r"\n[^\n]*\n\s*)?# Kanban task \S+:")
 _CARD_SECTION_RE = re.compile(
     r"^## (Body|Standing instructions\b[^\n]*|Attachments|Prior attempts on this task|Parent task results|"
     r"Recent work by @[^\n]*|Comment thread|Open shared blockers on this board|Continuation checkpoint\b[^\n]*|"
@@ -1327,6 +1331,7 @@ def scope_text(user_ask: str) -> str:
     ask = user_ask or ""
     if not KANBAN_PROMPT_RE.match(ask):
         return ask
+    ask = _RESUME_NOTE_RE.sub("", ask, count=1)
     marks = list(_CARD_SECTION_RE.finditer(ask))
     parts = [ask[:marks[0].start()] if marks else ask]
     for i, m in enumerate(marks):
@@ -2148,8 +2153,11 @@ def notice_turn(user_ask: str) -> bool:
 
 def automation_prompt(user_ask: str) -> bool:
     """A Hermes-written prompt, not a human asking now: a notice envelope or the dispatcher's Kanban worker prompt
-    (anchored header only; agent-e80aa5e107). Rules that read the ask as the user's live question skip these."""
-    return notice_turn(user_ask) or bool(KANBAN_PROMPT_RE.match(user_ask or ""))
+    (anchored header only; agent-e80aa5e107), also behind core's leading restart-resume note. The note's own opening
+    counts too, so the 40-char ask_head signals.template_holds reads is recognised (agent-105768f616). Rules that read
+    the ask as the user's live question skip these."""
+    ask = user_ask or ""
+    return notice_turn(ask) or bool(KANBAN_PROMPT_RE.match(ask)) or ask.lstrip().startswith(RESUME_HEAD)
 
 
 PREAMBLE_OPEN = "[System note:"

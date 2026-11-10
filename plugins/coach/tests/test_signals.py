@@ -2207,6 +2207,26 @@ def test_status_only_distinct_closeout_prompts_still_file_one_card(tmp_path):
     assert len(got) == 1 and "3 holds" in got[0]["details"] and "2 chats" in got[0]["details"]
 
 
+# ── resumed Kanban worker prompt (agent-105768f616) ───────────────────────────────────────────────────────────
+# Core's restart resume (gateway/session_kanban_resume.py RESUME_NOTE) puts "## Resumed after gateway restart" BEFORE
+# the "# Kanban task <id>:" header. report_only held 7 such worker turns in 7 chats on the hub and the template
+# detector filed it as a misfire, because the 40-char head was not recognised as a worker prompt.
+
+RESUMED_HEAD = "## Resumed after gateway restart The pre"
+
+
+def test_report_only_holds_on_the_resumed_worker_prompt_file_nothing(tmp_path):
+    rows = [{**_tpl_nudge(i, f"s{i}", head=RESUMED_HEAD, rule="report_only"), "ask_len": 14000 + i,
+             "ask_fp": f"fp{i:08d}"} for i in range(7)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW)) == []
+
+
+def test_status_only_holds_on_the_resumed_worker_prompt_still_file(tmp_path):
+    rows = [{**_tpl_nudge(i, f"s{i}", head=RESUMED_HEAD), "ask_len": 14000 + i, "ask_fp": f"fp{i:08d}"}
+            for i in range(3)]
+    assert len(_templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW))) == 1
+
+
 # ── provider 5xx whose body is a proxy/CDN HTML page (agent-ee16fb8bb9) ─────────────────────────────────────
 
 def _html_502_record():
