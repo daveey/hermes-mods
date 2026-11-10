@@ -1972,16 +1972,18 @@ def linked_parents(tool: str, args: Any) -> list:
     return [pid] if _PARK_CARD_RE.fullmatch(pid) else []
 
 
-def park_result_line(tool: str, args: Any, linked: Optional[list] = None) -> Optional[str]:
+def park_result_line(tool: str, args: Any, linked: Optional[list] = None, result: Any = None) -> Optional[str]:
     """The `   <- OK park={...}` line for a park call (direct or via tool_call), else None. Callers skip failed calls.
     A dependency block also records the parent cards it waits on: ids its reason names plus `linked` (parents this
-    turn's successful kanban_link calls linked), for reply_check.lifecycle_park (agent-b04f510c13)."""
+    turn's successful kanban_link calls linked), for reply_check.lifecycle_park (agent-b04f510c13). A block also
+    records `landed`, the block_kind its result reports: an assignment handoff counts only when the kernel landed it
+    as one (agent-081fb3bbc3). A local tool_call carries one entry and returns that tool's own result."""
     name = (tool or "").rsplit("__", 1)[-1]
     a = args if isinstance(args, dict) else {}
     if name == "tool_call":
         for c in a.get("calls") or []:
             if isinstance(c, dict):
-                got = park_result_line(str(c.get("name") or ""), c.get("arguments"), linked)
+                got = park_result_line(str(c.get("name") or ""), c.get("arguments"), linked, result)
                 if got:
                     return got
         return None
@@ -1992,6 +1994,9 @@ def park_result_line(tool: str, args: Any, linked: Optional[list] = None) -> Opt
         facts.update(kind=str(a.get("kind") or ""), human_request=bool(isinstance(a.get("human_request"), dict)
                                                                        and a.get("human_request")),
                      needs=bool(a.get("needs")))
+        landed = (_as_dict(result) or {}).get("block_kind")
+        if isinstance(landed, str) and landed:
+            facts["landed"] = landed
         if facts["kind"] == "dependency":
             parents = list(dict.fromkeys(_PARK_CARD_RE.findall(str(a.get("reason") or "")) + list(linked or [])))
             if parents:
@@ -2230,7 +2235,7 @@ class AgentCoach:
             linked = linked_parents(tool, args)
             if linked:  # parents a dependency park this turn waits on (agent-b04f510c13)
                 s.setdefault("turn_linked", []).extend(p for p in linked if p not in s.get("turn_linked", []))
-            park = park_result_line(tool, args, s.get("turn_linked"))
+            park = park_result_line(tool, args, s.get("turn_linked"), result)
             if park:  # this turn parked its run: reply_check.lifecycle_park (agent-9f966b0682)
                 s["turn_log"].append(park)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(park)

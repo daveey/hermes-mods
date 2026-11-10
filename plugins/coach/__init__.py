@@ -951,7 +951,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response), "ask_len": len(ask or ""),
                            **({"elapsed_s": _el} if _el is not None else {}),
-                           **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {})})
+                           **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {}),
+                           **({"park": _park} if guard == "lifecycle_park" and (_park := rc.run_end_tool(log_lines))
+                              else {})})
                 return None
             tracked = hit["rule"] in rc.RULES
             nid = _new_nudge_id()

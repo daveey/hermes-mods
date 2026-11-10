@@ -5,8 +5,8 @@ kanban_block(kind="needs_input", human_request=...) (the coach's block-time chec
 blocked, not complete, on the remaining scope decision". report_only nudged that reply as a diagnosis left unowned.
 A block ends the run, so the revision turn had no run to act in: its kanban_schedule was refused and its revised reply
 failed again. A successful human block or kanban_schedule this turn is the protocol's park, already judged at block
-time by block_handoff; report_only must not judge the same turn again. Dependency/transient/assignment blocks ask
-nobody and stay judged.
+time by block_handoff; report_only must not judge the same turn again. Transient/capability blocks ask nobody and
+stay judged; dependency and assignment blocks count only on a live parent / a landed reassignment (below).
 """
 import importlib.util
 import json
@@ -384,3 +384,73 @@ def test_nudge_after_a_run_ending_park_is_counted(tmp_path, monkeypatch):
     hooks2["pre_verify"](session_id="w5", platform="kanban", attempt=0, final_response=DEP_DRAFT)
     n2 = [json.loads(l) for l in logf2.read_text().splitlines() if '"reply_nudge"' in l]
     assert n2 and "nudge_after_run_end" not in n2[0]
+
+
+# agent-081fb3bbc3: the same class again, for the assignment handoff. A hub worker could not get the named native test
+# results its card required and handed the SAME card (same acceptance) to its creator profile with
+# kanban_block(kind="assignment"). The kernel reassigned it and returned run_ended=true ("This run is over ... write
+# your final reply"); bb-tuner ran the card a minute later. report_only nudged the reply ("Acceptance remains open");
+# every exit its Kanban nudge offers is refused after the run ended, so the revision could only reword and failed
+# again. A block the kernel landed as an assignment (result block_kind == "assignment") names the next owner: a park.
+AS_ASK = ("work kanban task t_0000000000000009\n\nRetention fixture: land the voice_eval fixture fix and prove the 11 "
+          "voice-eval and 59 guard tests pass by name on the native macOS lane.")
+AS_DRAFT = ("PR #2939 remains landed with exact-head CI green. The macOS run reports 9,897 executed tests but does not "
+            "name the required 11 voice-eval and 59 guard outcomes. I reassigned this card to bb-tuner for native-proof "
+            "coordination. Acceptance remains open: completion still requires named native outcomes.")
+AS_ARGS = {"kind": "assignment",
+           "reason": "Route this card to creator bb-tuner for final-owner native test coordination; named 11+59 "
+                     "outcomes unmet, do not weaken acceptance."}
+AS_OK = json.dumps({"ok": True, "task_id": "t_0000000000000009", "run_id": 160681, "status": "todo",
+                    "block_kind": "assignment", "run_ended": True,
+                    "next": "This run is over; the card is todo. Don't call kanban lifecycle tools "
+                            "(block/schedule/continue/complete/request_review) or kanban_link/kanban_unlink on it "
+                            "again; write your final reply."})
+AS_REFUSED = json.dumps({"error": "no_capable_supervisor: task t_0000000000000009 requires a different profile with "
+                                  "its original capabilities and kanban tools.", "rejection": "invalid_args"})
+
+
+def _as_check(log):
+    return rc.check(AS_DRAFT, AS_ASK, log, _judge(0.95), threshold=0.7, thresholds=rc.settings()["thresholds"],
+                    confirm=CONFIRMED, confirm_floor=rc.CONFIRM_FLOOR)
+
+
+def test_assignment_handoff_direct_is_a_lifecycle_park():
+    log = _log(BEFORE + [("kanban_block", AS_ARGS, AS_OK)])
+    assert rc.lifecycle_park(log), log
+    assert rc.report_only_guard(AS_ASK, AS_DRAFT, log) == "lifecycle_park"
+    assert _as_check(log) is None  # the replayed incident turn: no report_only nudge after the handoff
+
+
+def test_assignment_handoff_deferred_is_a_lifecycle_park():
+    log = _log(BEFORE + [_deferred("kanban_block", AS_ARGS) + (AS_OK,)])
+    assert rc.lifecycle_park(log), log
+    assert rc.report_only_guard(AS_ASK, AS_DRAFT, log) == "lifecycle_park"
+    assert _as_check(log) is None
+
+
+def test_refused_or_unlanded_assignment_stays_judged():
+    """A refused handoff (no_capable_supervisor), or a block whose result doesn't show it landed as an assignment
+    (re-kinded, or an older result without block_kind), reassigned nobody: still judged."""
+    rekinded = json.dumps({"ok": True, "task_id": "t_0000000000000009", "status": "blocked", "block_kind": "needs_input"})
+    for call in (("kanban_block", AS_ARGS, AS_REFUSED), _deferred("kanban_block", AS_ARGS) + (AS_REFUSED,),
+                 ("kanban_block", AS_ARGS, rekinded), ("kanban_block", AS_ARGS, OK)):
+        log = _log(BEFORE + [call])
+        assert not rc.lifecycle_park(log), (call, log)
+        assert rc.report_only_guard(AS_ASK, AS_DRAFT, log) is None
+        hit = _as_check(log)
+        assert hit and hit["rule"] == "report_only", call
+
+
+def test_pre_verify_logs_guard_and_park_kind_after_an_assignment_handoff(tmp_path, monkeypatch):
+    """Detection: the reply_checked record carries guard=lifecycle_park and park=kanban_block:assignment, so
+    assignment skips can be counted."""
+    hooks, logf = _hooks(tmp_path, monkeypatch)
+    sid = "w9"
+    hooks["pre_llm_call"](session_id=sid, user_message=AS_ASK, platform="kanban")
+    hooks["post_tool_call"](tool_name="kanban_block", session_id=sid, args=AS_ARGS, result=AS_OK)
+    assert hooks["pre_verify"](session_id=sid, platform="kanban", attempt=0, final_response=AS_DRAFT) is None
+    logged = [json.loads(l) for l in logf.read_text().splitlines()]
+    checked = [r for r in logged if r["event"] == "reply_checked"]
+    assert checked and checked[-1].get("guard") == "lifecycle_park", logged
+    assert checked[-1].get("park") == "kanban_block:assignment", checked
+    assert not any(r["event"] == "reply_nudge" for r in logged)

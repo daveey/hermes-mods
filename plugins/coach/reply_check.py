@@ -1182,9 +1182,13 @@ def continued_run(tool_log: Optional[list] = None) -> bool:
 # closed with "H5 is blocked, not complete, on the remaining scope decision". report_only nudged it; the block had
 # ended the run, so the revision turn's kanban_schedule was refused and no revised reply could pass. A turn that
 # parked its run the protocol's way (a block that asks a human per human_block, a goal-mode kind=time block, or a
-# kanban_schedule) is not a diagnosis left unowned. Transient/assignment blocks and capability+needs blocks ask nobody
-# and stay judged. A dependency block is a park only when a parent it waits on (named in its reason, or linked by this
-# turn's kanban_link) is open on this host's board and moved within 24 h (agent-b04f510c13: a worker linked under the
+# kanban_schedule) is not a diagnosis left unowned. An assignment block the kernel landed as one (its result reports
+# block_kind "assignment") is a park too: the same card, same acceptance, now belongs to another profile and the run
+# is over (agent-081fb3bbc3: a hub worker handed its card to bb-tuner, which ran it a minute later; the nudged
+# revision could only reword). A refused (no_capable_supervisor) or re-kinded handoff stays judged.
+# Transient blocks and capability+needs blocks ask nobody and stay judged. A dependency block is a park only when a
+# parent it waits on (named in its reason, or linked by this turn's kanban_link) is open on this host's board and
+# moved within 24 h (agent-b04f510c13: a worker linked under the
 # live landing card and parked, the protocol's "a wait on another card is a parent link", and got nudged after its run
 # ended). A bare dependency block, or one on a done/archived/idle/unknown parent, stays judged. Reads the
 # `<- OK park={...}` facts line agent_rules.observe writes after a successful
@@ -1289,6 +1293,8 @@ def lifecycle_park(tool_log: Optional[list] = None, now: Optional[float] = None,
         if f.get("tool") == "kanban_block":
             if f.get("kind") == "time":
                 return True
+            if f.get("kind") == "assignment" and f.get("landed") == "assignment":
+                return True  # the kernel reassigned the same card to another profile (agent-081fb3bbc3)
             args = {"kind": f.get("kind") or "", "reason": "park",
                     **({"human_request": {"ask": True}} if f.get("human_request") else {}),
                     **({"needs": ["x"]} if f.get("needs") else {})}
