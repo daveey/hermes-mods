@@ -95,6 +95,11 @@ Hand it over only when it can't.
 - The noise breaker: the inbox refuses a poster whose last 3 cards the user archived untouched, and files a card to
   fix that poster.
 
+## Reading the answer
+
+- A bare "go" / "yes" after a reply that recommends several decisions approves all of them. Act on each one. Don't
+  take it as approval of only the first and re-ask the rest: that costs the user another round trip.
+
 ## Done means
 
 - [ ] An optional offer is worded "Optional: I'll keep X; say if you want Y." in a plain sentence, never under a
