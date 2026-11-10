@@ -36,7 +36,12 @@ restate the ask; the panel already shows it. He calls an answer of "nothing" giv
 shows asks a lie.
 
 The card set for the session-scoped question: Find them from this session's own `kanban_create` results /
-task strip, then `kanban_show` each and report the blocked ones. Also report two states that wait silently:
+task strip, then `kanban_show` each and report the blocked ones. For a session he links (`@session:<profile>/<id>`),
+query each board: `select id,status,block_kind,title from tasks where status not in ('done','archived') and
+(session_id='<id>' or id in (select task_id from task_chat_links where chat_session='<id>' and coalesce(released,0)=0))`.
+"Nothing running, all waiting" means: walk each card's open parents and its scheduled `wake_check` target down to
+the leaf that nothing will move (a decision card, a `ready` card whose events are only `skipped_nonspawnable`,
+a throttled queue), and report that leaf; the cards above it only poll. Also report two states that wait silently:
 - `triage` with a human `block_kind` (`needs_input`/`capability`): block-loop detection moved a repeatedly
   re-blocked card there. It still waits on the user, and the latest `block_loop_detected` event holds the ask.
   Filtering on `status='blocked'` alone (as the digest script does) misses these.
@@ -58,6 +63,10 @@ Treat a complaint about recurring stalls as recovery work, not a sequence of aud
 1. Sweep blocked cards and clear agent-operable causes through supported transitions (recipe: `references/clearing-blockers-yourself.md`). Keep true approvals and safety holds; verify a new claim or completed acceptance, not merely `ready`.
 Applies to every board-status reply, including "why are only N running": what waits on him is written as concrete actions grouped by where he does them (reply here / phone / Mac / when on site), each with the device and what done looks like. No card ids, no "see t_x", no table of cards for him to open.
 2. Bring genuine decisions to him INLINE as a `clarify` form. Use one question per decision in plain words, recommended option first, and batch the low-stakes defaults into one "accept all recommended" question. Never answer with card ids or links, or with "answer in a comment on t_x". Then record his answers on the cards yourself (comment the decision on the card and on every card waiting on it, then `hermes kanban complete` the decision card).
+   Not a decision: "close it unproven, or keep waiting?" on an approved goal whose acceptance is unmet. The
+   ask-gate refuses it (`replan_hold`): write a new approach to reach the acceptance on the owner card, archive
+   the stale decision card and unlink it from its child, then send the work to a reviewer-plus-executor
+   pinned to opus. Only a changed limit (spend, permission, lower acceptance) or a hands-only step goes to him.
    The ask he sees must be the decision itself in household terms ("should unattended agents refuse dangerous commands?"), never card mechanics ("unblock = yes, archive = no", "option C"): he reads a blocked card and finds nothing to do. If the `clarify` is cancelled or interrupted (app restart), re-ask it with `clarify` on the next turn rather than falling back to card-status instructions.
    Before you relay a human ask, re-test its premise; block reasons go stale. "Reconnect Desktop / the relay has no connected client" is disproved by a successful `cross_session read` of the target session. Check "needs a credential/access" against `token-broker scopes` (workers miss auto-tier scopes like host SSH or a token minter), against where the value already lives (e.g. repo-level GitHub secrets can be re-sealed into Environments by a one-shot workflow without anyone seeing them; a secret with "no safe home" can go straight into its consumers' existing 0600 configs), against what other profiles on the host already hold, and against local cloud SSO profiles (`aws sts get-caller-identity --profile <p>` may already be admin in the named account). Check that a PR the ask names is still open, and that a requested restart hasn't already happened. If the premise is false, comment the evidence and the working route, then unblock.
    An ask's age is evidence too: the chat-closeout relay now prints "asked N h ago" and flags asks over 12 h as
