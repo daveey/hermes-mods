@@ -20,7 +20,8 @@ COACH_BACKEND_TIMEOUTS_THRESHOLD, or --threshold) it runs `hermes kanban create 
 backend-timeouts:<host>:<date>`; later firings comment only while that card remains open (at most once an hour).
 Closed or unreadable cards start a recurrence with a :2, :3, ... key suffix.
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
-logs (for checking past bursts). No Inbox items. Exit 0 unless the scan itself crashes.
+logs (for checking past bursts). No Inbox items. Exit 2 with count:null when
+clock/coverage evidence is unresolved; this is not a healthy raw-zero receipt.
 """
 from __future__ import annotations
 
@@ -33,12 +34,12 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 NEEDLE = "Timed out connecting to Hermes backend"
-STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} ")
+STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} (?:([+-]\d{2}:\d{2}) )?")
 API_RE = re.compile(r"\[hermes:api (?:[A-Z]+ )?(\S+?)\]")
 PATH_RE = re.compile(r"(/api/[^\s\]\)'\"?,:]+)")
 CONN_RE = re.compile(r"\bconn=([\w.-]+)")
@@ -82,7 +83,7 @@ def route_of(line: str) -> str:
     return "(no path)"
 
 
-def iter_timeouts(files: list):
+def iter_timeouts(files: list, *, strict=False, evidence=None):
     """Yield (datetime, route, conn, lookback_s) per log entry naming the timeout. Stack/continuation lines without a stamp count only
     if their entry's stamped line did not already (one entry = one timeout)."""
     for path in files:
@@ -90,6 +91,8 @@ def iter_timeouts(files: list):
         try:
             fh = open(path, "r", encoding="utf-8", errors="replace")
         except OSError:
+            if strict:
+                raise ValueError(f'log unreadable: {path}')
             continue
         with fh:
             for line in fh:
@@ -97,9 +100,16 @@ def iter_timeouts(files: list):
                 if m:
                     try:
                         last_ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                        if m.group(2):
+                            last_ts = datetime.strptime(m.group(1) + " " + m.group(2),
+                                                        "%Y-%m-%d %H:%M:%S %z").astimezone(timezone.utc)
                     except ValueError:
                         last_ts = None
+                    if evidence is not None and last_ts is not None and last_ts.tzinfo:
+                        evidence['coverage_start'] = min(evidence.get('coverage_start', last_ts), last_ts)
                     counted = False
+                if strict and NEEDLE in line and last_ts is None:
+                    raise ValueError('timeout has missing or invalid timestamp')
                 if NEEDLE not in line or last_ts is None or counted:
                     continue
                 counted = True
@@ -128,7 +138,7 @@ def power_intervals(text: str, now: datetime) -> list:
         if not m:
             continue
         ts = datetime.strptime(m[1] + ' ' + m[2], '%Y-%m-%d %H:%M:%S %z')
-        ts = ts.astimezone().replace(tzinfo=None)
+        ts = ts.astimezone(timezone.utc) if now.tzinfo else ts.astimezone().replace(tzinfo=None)
         if ts > now:
             continue
         if m[3] in ('Sleep', 'DarkWake'):
@@ -176,19 +186,36 @@ def spanned_sleep(ts: datetime, lookback_s: float, intervals) -> bool:
 
 
 def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
+    # Production scans use UTC instants, never the caller's local wall clock.
+    if now.tzinfo:
+        now = now.astimezone(timezone.utc)
     start = now - timedelta(minutes=window_min)
     by_path: Counter = Counter()
+    by_conn: Counter = Counter()
     awake_by_path: Counter = Counter()
     awake_by_conn: Counter = Counter()
     awake_since_wake: Counter = Counter()
     wake_ends = sorted(hi for _, hi in intervals)
     sleep_count = 0
     spanning_count = 0
+
     first = last = None
     files = log_files(home)
-    for ts, route, conn, lookback in iter_timeouts(files):
+    if now.tzinfo and not files:
+        raise ValueError('no Desktop logs found; bounded count unproven')
+    evidence = {}
+    for ts, route, conn, lookback in iter_timeouts(files, strict=bool(now.tzinfo), evidence=evidence):
+        if now.tzinfo and ts.tzinfo is None:
+            # Any legal datetime UTC offset is strictly within +/-24 hours.
+            # Exclude only when ALL possible instants are outside this window;
+            # this is not a guess about the writer's historical timezone.
+            wall = ts.replace(tzinfo=timezone.utc)
+            if wall + timedelta(hours=24) < start or wall - timedelta(hours=24) > now:
+                continue
+            raise ValueError('legacy timeout lacks immutable UTC offset; bounded count unproven')
         if start <= ts <= now:
             by_path[route] += 1
+            by_conn[conn] += 1
             if any(lo <= ts <= hi for lo, hi in intervals):
                 sleep_count += 1
             elif spanned_sleep(ts, lookback, intervals):
@@ -200,9 +227,14 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
                 awake_since_wake[wake_bucket(ts, wake_ends)] += 1
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
+    coverage_start = evidence.get('coverage_start')
+    if now.tzinfo and not by_path and (coverage_start is None or coverage_start > start):
+        raise ValueError('raw zero unproven: retained offset-stamped logs do not cover window start')
     return {"window_start": start.isoformat(sep=" "), "window_end": now.isoformat(sep=" "),
+            "coverage_start": coverage_start.isoformat() if coverage_start else None,
             "files": [str(p) for p in files], "count": sum(by_path.values()),
-            "by_path": dict(by_path.most_common()),
+            "by_path": dict(by_path.most_common()), "by_conn": dict(by_conn.most_common()),
+
             "sleep_count": sleep_count, "sleep_spanning_count": spanning_count, "awake_count": sum(awake_by_path.values()),
             "awake_by_path": dict(awake_by_path.most_common()),
             "awake_by_conn": dict(awake_by_conn.most_common()),
@@ -211,7 +243,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
 
 
 def hours(home: Path) -> dict:
-    c: Counter = Counter(ts.strftime("%Y-%m-%d %H") for ts, *_ in iter_timeouts(log_files(home)))
+    c: Counter = Counter(ts.strftime("%Y-%m-%d %H") + ('+00:00' if ts.tzinfo else '')
+                         for ts, *_ in iter_timeouts(log_files(home)))
     return dict(sorted(c.items()))
 
 
@@ -251,6 +284,8 @@ def config_value(name: str, default: int) -> int:
 
 
 def card_key(host: str, now: datetime) -> str:
+    if now.tzinfo:
+        now = now.astimezone()  # Preserve the existing host-local daily lifecycle.
     return f"backend-timeouts:{host}:{now.strftime('%Y-%m-%d')}"
 
 
@@ -273,7 +308,7 @@ def card_body(host: str, rep: dict, probe: dict, threshold: int, window_min: int
     return f"""Detected by hermes-mods plugins/coach/backend_timeouts.py (cron, every 10 min) on {host}.
 
 The Desktop app on {host} logged {rep['count']} "{NEEDLE}" lines in the last {window_min} min
-({rep['first']} .. {rep['last']}, local time; threshold {threshold}). Users see this as chats that won't load,
+({rep['first']} .. {rep['last']}, explicit UTC offsets; threshold {threshold}). Users see this as chats that won't load,
 archive asking "task status unavailable", stale boards.
 Of these, {rep.get("awake_count", rep["count"])} occurred while awake and
 {rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals (of which {rep.get("sleep_spanning_count", 0)} landed
@@ -401,7 +436,7 @@ def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, thre
         st[daily_key] = ent
         save_state(home, st)
         return {"key": key, "action": "throttled", "task_id": tid}
-    text = (f"Still firing at {now.strftime('%H:%M')} on {host}: {rep['count']} timeouts in {window_min} min "
+    text = (f"Still firing at {now.isoformat()} on {host}: {rep['count']} timeouts in {window_min} min "
             f"(threshold {threshold}).\nTop paths:\n{_paths_md(rep)}\n{_host_md(probe)}")
     r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", text])
     ent["last_comment"] = now_s
@@ -424,7 +459,7 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
     a = ap.parse_args(argv)
     home = hermes_home(a.home)
     host = a.host or socket.gethostname().split(".")[0]
-    now = now or datetime.now()
+    now = now or datetime.now(timezone.utc)
     if a.hours:
         h = hours(home)
         if a.json:
@@ -436,15 +471,28 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
     threshold = a.threshold if a.threshold is not None else (
         int(env_t) if env_t and env_t.isdigit() else config_value("threshold", DEFAULT_THRESHOLD))
     window = a.window if a.window is not None else config_value("window_minutes", DEFAULT_WINDOW_MIN)
+    clock = {"source": "per-entry-offset" if now.tzinfo else "injected-naive-compatibility",
+             "bounds_timezone": "UTC" if now.tzinfo else "unspecified",
+             "coverage": "retained log entries only; not backend health or continuous availability"}
+    if now.tzinfo:
+        now = now.astimezone(timezone.utc)
     power = (power_probe or probe_power)(now)
     intervals = power.get("intervals", [])
-    rep = scan(home, now, window, intervals)
+    try:
+        rep = scan(home, now, window, intervals)
+    except ValueError as exc:
+        print(json.dumps({"status": "clock_unresolved", "count": None, "cards": [],
+                          "error": str(exc), "clock": clock,
+                          "window_end": now.isoformat(),
+                          "window_start": (now - timedelta(minutes=window)).isoformat()}))
+        return 2
+    clock['coverage_start'] = rep.pop('coverage_start')
     power_report = {k: v for k, v in power.items() if k != "intervals"}
     power_report["intervals"] = [[lo.isoformat(sep=" "), hi.isoformat(sep=" ")]
                                  for lo, hi in intervals if hi >= now - timedelta(minutes=window)]
     res = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "host": host, "home": str(home),
            "dry_run": a.dry_run, "threshold": threshold, "window_min": window, **rep,
-           "power": power_report,
+           "power": power_report, "clock": clock,
            "over_threshold": rep["awake_count"] >= threshold, "cards": []}
     if res["over_threshold"]:
         res["host_probe"] = (probe or probe_host)()
