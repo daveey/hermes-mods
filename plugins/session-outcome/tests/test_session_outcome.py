@@ -133,6 +133,12 @@ def test_done_passes_keep_crons_and_returns_released_jobs(plugin, fake, monkeypa
     assert out["released_crons"] == receipts
 
 
+def test_old_core_reports_unavailable_cron_release(plugin, fake):
+    out = call(plugin, {"kind": "done", "summary": "Installed."})
+    assert out["declared"]
+    assert "does not support cron ownership release" in out["note"]
+
+
 def test_done_without_summary_is_refused(plugin, fake):
     out = call(plugin, {"kind": "done", "summary": "  "})
     assert not out["ok"] and "summary" in out["error"] and fake.declared == []

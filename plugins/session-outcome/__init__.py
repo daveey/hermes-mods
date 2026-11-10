@@ -344,8 +344,12 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
             return json.dumps(result)
         try:
             stored = api.declare_outcome(session_id, outcome)
-            if isinstance(stored, dict) and "released_crons" in stored:
-                result["released_crons"] = stored["released_crons"]
+            if isinstance(stored, dict):
+                for key in ("released_crons", "cron_release_error"):
+                    if key in stored:
+                        result[key] = stored[key]
+            if outcome["kind"] == "done" and "released_crons" not in result:
+                result["note"] = "This core does not support cron ownership release; ownership was not changed. Upgrade core before relying on automatic release."
         except Exception as exc:
             us = _user_steps() if added else None
             if us is not None:

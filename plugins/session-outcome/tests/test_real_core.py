@@ -70,6 +70,29 @@ def gate(plugin, reply, msgs=None, attempt=0):
                                  turn_messages=msgs or [], attempt=attempt, hold_budget=2)
 
 
+@pytest.mark.parametrize("keep,corrupt", [(False, False), (True, False), (False, True)])
+def test_done_cron_lifecycle_against_real_core(real, tmp_path, keep, corrupt):
+    import json
+    from cron import jobs
+
+    so, plugin = real
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(prompt="Check status", schedule="every 1h", owner_session_id="chat")
+        if corrupt:
+            (tmp_path / "cron" / "jobs.json").write_text("broken", encoding="utf-8")
+        result = json.loads(plugin.handle({"kind": "done", "summary": "Installed.", "keep_crons": keep}, session_id="chat"))
+        assert result["declared"]
+        assert so.get_outcome("chat")["kind"] == "done"
+        if corrupt:
+            assert result["cron_release_error"]
+            assert (tmp_path / "cron" / "jobs.json").read_text(encoding="utf-8") == "broken"
+        elif keep:
+            assert jobs.get_job(job["id"])["owner_session_id"] == "chat"
+        else:
+            assert result["released_crons"][0]["id"] == job["id"]
+            assert not jobs.get_job(job["id"])["owner_session_id"]
+
+
 def test_gate_against_real_core(real, monkeypatch):
     so, plugin = real
     # A live turn marker would make plain derive say "running"; the gate must look past it.
