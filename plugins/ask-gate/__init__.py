@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, replan, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -40,6 +40,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     pr_approval_request = _sib("pr_approval_request")
     chat_delivery = _sib("chat_delivery")
     superseding = _sib("superseding")
+    replan = _sib("replan")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -589,6 +590,10 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
         if denial is not None:
             record_verdict(session_id, "held", final_response)
             return denial
+        replanned = None if howto else _replan_reply_hold(session_id, asks, attempt, budget, final_response)
+        if replanned is not None:
+            record_verdict(session_id, "held", final_response)
+            return replanned
         held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
         if held is not None and attempt < budget:
             return held
@@ -819,6 +824,52 @@ def _superseding_reply_hold(session_id: str, text: str, attempt: int, budget: in
     return {"hold": True, "nudge": superseding.reply_message(core, hits)}
 
 
+# Process-local hold counts per (session, tool, ask hash): an unchanged ask is held MAX_HOLDS times, then passes.
+_REPLAN_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _replan_hold(session_id: str, tool_name: str, text: str, chat: bool = False) -> dict | None:
+    """Hold an ask that hands David "end the approved goal unmet, or new approach/expand scope" without naming a
+    changed limit (self-heal agent-866a12f54f). Deterministic; fails open."""
+    try:
+        if not (text or "").strip():
+            return None
+        hit = {"shape": "chat", "quote": " ".join(text.split())[:240]} if chat else replan.structured_hit(text)
+        if hit is None:
+            return None
+        key = (session_id, tool_name, core.text_hash(" ".join(text.split())))
+        n = _REPLAN_HELD.get(key, 0)
+        if n >= replan.MAX_HOLDS:
+            core.log_event("replan_released", tool=tool_name, session=session_id, holds=n, quote=hit["quote"])
+            return None
+        _REPLAN_HELD[key] = n + 1
+        core.log_event("replan_hold", tool=tool_name, session=session_id, shape=hit["shape"], attempt=n,
+                       task=os.environ.get("HERMES_KANBAN_TASK") or "", quote=hit["quote"])
+        return {"action": "block", "message": replan.HOLD_MESSAGE}
+    except Exception as e:
+        core.log_event("replan_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+
+
+def _replan_reply_hold(session_id: str, asks: list[str], attempt: int, budget: int, reply: str = "") -> dict | None:
+    """Chat-reply side of _replan_hold: bounded by the reply hold budget. An ask is read with its paragraph, since
+    "Your call: which way?" carries the choice in the sentence before it."""
+    try:
+        hits = replan.chat_hits(replan.ask_contexts(asks, reply))
+    except Exception as e:
+        core.log_event("replan_error", tool="reply", session=session_id, error=repr(e)[:300])
+        return None
+    if not hits:
+        return None
+    if attempt >= budget:
+        core.log_event("replan_released", tool="reply", session=session_id, holds=attempt, quote=hits[0][:240])
+        return None
+    core.log_event("replan_hold", tool="reply", session=session_id, shape="chat", attempt=attempt,
+                   quote=" ".join(hits[0].split())[:240])
+    return {"hold": True, "nudge": replan.HOLD_MESSAGE.replace("ask-gate: replan_hold. ", "ask-gate held this reply "
+            "(replan_hold). ") + " Do not relay a worker's 'end it or expand scope' question: replan on its card."}
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -828,6 +879,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             raise ValueError("human_request cannot accompany dependency/time/transient blocks")
         if tool_name == "kanban_create" and args.get("initial_status") != "blocked":
             raise ValueError("human_request requires initial_status=blocked on creation")
+        replanned = _replan_hold(session_id, tool_name, request["action"] + "\n" + request["why_human"])
+        if replanned is not None:
+            return replanned
         filing = _pr_filing_hold(session_id, tool_name, args, request)
         if filing is not None:
             return filing
@@ -922,6 +976,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             denial = _superseding_reply_hold(session_id, "\n".join(candidates), 0, 1, surface="clarify")
             if denial is not None:
                 return {"action": "block", "message": denial["nudge"]}
+            replanned = _replan_hold(session_id, tool_name, "\n".join(replan.chat_hits(candidates)), chat=True)
+            if replanned is not None:
+                return replanned
         delivery = _chat_delivery_gate(session_id, tool_name, args)
         if delivery is not None:
             return delivery
@@ -941,6 +998,10 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             return reconciled
         if tool_name == "kanban_block" and str(args.get("kind") or "") in _WORKER_NO_ASK_KINDS:
             return None
+        if tool_name == "kanban_block" or args.get("initial_status") == "blocked":
+            replanned = _replan_hold(session_id, tool_name, candidate)
+            if replanned is not None:
+                return replanned
         reconciled = _retired_block(session_id, found)
         if reconciled is not None:
             return reconciled

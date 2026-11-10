@@ -48,7 +48,11 @@ case: the reply says an API token lacks a permission and asks David to add it in
 minter scope (name ends in "-minter") or a broader credential scope for that vendor: agent_can_do, always.
 - ok: everything else. In particular ALWAYS ok: physical actions (plug in, press, hold, say a phrase, walk to a \
 device), clicking Allow / typing a password or code into a prompt only he can see, approving an OAuth consent screen for the \
-agent, spending money or any irreversible/destructive action, choices between options, preferences, optional \
+agent, spending money or any irreversible/destructive action, choices between options (except a choice between \
+ending an approved goal with its target unmet and a "new scope"/redesign/new approach to that same goal: a new \
+approach to the same approved goal is not new scope, so return agent_can_do with how = write the new approach on \
+the owner card, get an independent review and continue, unless the ask names the spend, permission, acceptance or \
+safety limit that changes), preferences, optional \
 offers ("Want me to look into X?"), "tell me when X is done" (waiting on a person or on time), UI legends and \
 explanations that merely describe a state, hypotheticals, and facts already verified this turn. Approval-tier \
 token-broker scopes (tier "approval") exist so that only David approves them: never agent_can_do. A statement \

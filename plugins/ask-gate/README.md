@@ -68,6 +68,19 @@ past decisions, and negated direct-reply requests remain negative controls.
 
 **action_request approvals (L3).** user-steps `action_request` publishes an approval/choice card directly, so `pre_tool_call` judges each `kind: approval|choice` publish (never a `withdraw`) on its COMPLETE action identity (title, requestId/expectedRevision, limits, exclusions, outcomes, choices, source refs and the full scope markdown, so the verdict never depends on where in the plan the object or limits sit) against the user's typed messages from the WHOLE session (runtime notices dropped; the most relevant ones plus the newest 8, cut to the judge's 30-message window). Large-input policy (`AR_IDENTITY_CAP` 24000 chars): structured fields come first, each item clipped at 1500 chars and all together at half the cap; the plan fills the rest, head and tail kept around an explicit marker. Any clip or cut makes the identity incomplete, and a repeat verdict on an incomplete identity never holds (`action_request_repeat_unproven`; `agent_can_do` still does). The whole request is one judge item, so sentence screens (soft-instruction routing, the "I can't" short-circuit) do not run on its plan text; the irreversible keep does. A repeat for a request whose title + plan name more than a label must cite the request's object-bearing words, and a source that names a reused stage label ("run stage b") must share one of them: a reused "Stage B" is not equivalence. `already_answered` or `agent_can_do` blocks, quoting the verdict's own validated source evidence (or saying it is unavailable, never a word-overlap pick), and tells the agent to do the work; any other verdict, or no reachable judge, lets it publish. Held at most twice per (session, title). Log events: `action_request_held|judged|released|judge_unavailable|repeat_unproven`. Tests: `tests/test_action_request_gate.py`, `tests/test_action_request_scope.py`.
 
+**Replan holds (L2/L3, no model call).** `replan.py` holds an ask that hands David "end the approved goal with its
+target unmet/unproven, or expand scope / new scope / redesign / new approach" when it names no changed limit
+(spend over an approved cap, a permission/access grant, the acceptance criteria or target, a safety/irreversible
+step, or a human-only step). A new approach to the same approved goal is not new scope: the hold tells the agent to
+write the new approach on the owner card, get an independent review and continue. Surfaces: `kanban_block` /
+blocked `kanban_create` (`human_request` action + why_human, or a legacy needs_input reason; broad shape),
+`clarify` and chat replies (strict shape: no bare "redesign"/"new approach", and a decision cue; an ask is read with
+its paragraph). Naming the limit releases it; an unchanged ask is held twice, then passes (`replan_released`).
+Logs `replan_hold` (with the card id), counted by `coach_askgate.py`'s weekly section. The judge's "choices between
+options" ok no longer covers this shape. Why: self-heal agent-866a12f54f (babybear CI-cost card t_c21c170e asked
+David to "end the project with its >=50% target unproven, or expand scope", relayed three times). Tests:
+`tests/test_replan_hold.py` (incl. the $6 GPU over-cap and EBS resize asks passing).
+
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
 delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>
