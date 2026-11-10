@@ -4,7 +4,7 @@
 
 ## Machine-wide workload policy
 
-The runner checks **before creating a key directory/file or starting SSH/SCP**. This covers both plugin tools (including approved requests) and direct `token-broker exec -- python runner.py` calls with jobs on stdin. Workload refusals return JSON with `rc: 126`, `ran: false`, `blocked: true`, and an explanation. Approval does not override workload placement.
+The runner checks workload syntax **before creating a key directory/file or starting SSH/SCP**. This covers both plugin tools (including approved requests) and direct `token-broker exec -- python runner.py` calls with jobs on stdin. These refusals return JSON with `rc: 126`, `ran: false`, `blocked: true`, and an explanation. Protected downloads additionally perform authenticated metadata preflight before SCP; failed metadata returns a nonzero rc without transferring the file. Approval does not override workload placement.
 
 An administrator may install this private JSON file at **`Path.home() / ".hermes/tailnet/workload-policy.json"`**. It is intentionally not relative to `HERMES_HOME`, a profile, or a job-supplied path. Keep real machine identities out of this public repository.
 
@@ -42,7 +42,7 @@ Ordinary read/cleanup commands remain available, including `hostname`, `df`, `du
 
 On protected targets, `put` must stat as a regular file, be within the caller's `max_bytes`, and be **strictly below 1 GiB** regardless of an increased caller limit. The plugin's existing 25 MiB staging limit is unchanged.
 
-**All protected `get` jobs are refused before SSH**, even with a small requested limit: this runner has no safe pre-transfer remote-size enforcement. Checking the local file after SCP is not a workload bound. Route the transfer elsewhere rather than raising the limit. Unprotected/absent-policy copy behavior remains unchanged, including its legacy post-download size check.
+Protected `get` jobs require a literal absolute path (letters, digits, underscore, dot, slash and hyphen only; no `.` or `..` components) and a positive integer bound no larger than 25 MiB. The public tool supplies this bound internally; no extra argument is needed. The same pinned, isolated SSH transport checks that the source is a regular file, not a final symlink, then reads its size with BSD stat or GNU stat. Failed, malformed or oversized metadata refuses the copy. SCP inherits an OS file-size limit, so growth after stat cannot write past the bound; failed transfers discard partial output. Unprotected/absent-policy copy behavior remains unchanged, including its legacy post-download size check.
 
 ## Boundaries
 
@@ -54,4 +54,4 @@ This is a workload-placement guard, not a shell sandbox or a resource quota. It 
 uv run --with pytest --with pyyaml python -m pytest -q -p no:cacheprovider plugins/tailnet/tests_tailnet.py
 ```
 
-`tests_tailnet.py` drives the real runner subprocess through a fake broker and fake SSH/SCP. DNS is replaced in child processes; no target network is contacted. Tests assert that refusals create no key directory and invoke no SSH, cover both direct and plugin entry paths, policy failures, address aliases/resolution, classifier failure, wrappers/opt-outs, safe commands and unprotected CI, plus sparse-file upload cap boundaries and protected download refusal.
+`tests_tailnet.py` drives the real runner subprocess through a fake broker and fake SSH/SCP. DNS is replaced in child processes; no target network is contacted. Tests assert that syntax refusals create no key directory and invoke no SSH, cover both direct and plugin entry paths, policy failures, address aliases/resolution, classifier failure, wrappers/opt-outs, safe commands and unprotected CI, plus sparse-file upload cap boundaries. Download tests cover a small protected copy, failed/malformed/oversized metadata, unsafe paths, unbounded limits and growth after stat. The generated stat command also runs through a real local shell against regular files, directories, FIFOs, symlinks and missing paths.

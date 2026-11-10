@@ -67,6 +67,13 @@ info = {"prog": os.path.basename(sys.argv[0]), "argv": a, "key_exists": os.path.
         "key_dir": os.path.dirname(kf)}
 open(d + "/ssh.log", "a").write(json.dumps(info) + "\n")
 cmd = a[-1]
+if os.environ.get("FAKE_GET") and info["prog"] == "ssh":
+    sys.stdout.write(os.environ.get("FAKE_STAT", "557523\n"))
+    sys.exit(int(os.environ.get("FAKE_STAT_RC", "0")))
+if os.environ.get("FAKE_GET") and info["prog"] == "scp":
+    with open(a[-1], "wb") as f:
+        f.write(b"x" * int(os.environ.get("FAKE_COPY_SIZE", "557523")))
+    sys.exit(0)
 if "leak" in cmd:
     sys.stdout.write(open(kf).read())
     sys.stderr.write(open(kf).read())
@@ -581,7 +588,7 @@ socket.getaddrinfo = resolve
     return env
 
 
-def runner_job(env, command="xcodebuild build", addr="192.0.2.10", **extra):
+def runner_job(env, command="xcodebuild build", addr="192.0.2.10", **extra) -> dict:
     return dict(target={"addr": addr, "user": "me"}, mode="exec", command=command,
                 known_hosts=str(env.home / "tailnet" / "known_hosts"), **extra)
 
@@ -738,20 +745,104 @@ def test_protected_put_caps(workload, size, limit, allowed):
         assert_refused(workload, result, "size limit")
 
 
-@pytest.mark.parametrize("limit", [1, 25 * 1024**2, 8 * 1024**3])
-def test_protected_get_refused_without_preflight(workload, limit):
+def get_job(workload, **changes):
     job = runner_job(workload)
-    job.update(mode="get", local=str(workload.state / "download"), remote="/tmp/data", max_bytes=limit)
-    assert_refused(workload, direct_runner(workload, job), "remote size")
+    job.update(mode="get", local=str(workload.state / "download"), remote="/tmp/data",
+               max_bytes=25 * 1024**2)
+    job.update(changes)
+    workload.monkeypatch.setenv("FAKE_GET", "1")
+    return job
 
 
-def test_plugin_protected_copy_get_refused(workload):
+def test_plugin_protected_copy_small_get_passes(workload):
     workload.policy.write_text(json.dumps(dict(POLICY, protected_addresses=["100.1.1.1"])))
     workload.session()
+    get_job(workload)
     result = call(tn.tool_copy, host="mini", direction="get", remote_path="/tmp/data", local_name="data",
                   reason="test bounded get")
-    assert not result["ran"] and "remote size" in result["error"]
-    assert workload.ssh_log() == []
+    assert result["ok"] and result["ran"], result
+    assert (workload.home / "tailnet/files/data").stat().st_size == 557523
+    logs = workload.ssh_log()
+    assert [x["prog"] for x in logs] == ["ssh", "scp"]
+    assert all(x["argv"][x["argv"].index("-F") + 1] == "/dev/null" for x in logs)
+    assert "test -f /tmp/data" in logs[0]["argv"][-1]
+    assert all(not x["env_has_key"] and not Path(x["key_dir"]).exists() for x in logs)
+
+
+@pytest.mark.parametrize("output,rc", [("26214401\n", 0), ("1073741824\n", 0),
+    ("", 0), ("garbage", 0), ("-1\n", 0), ("2\n3\n", 0), ("2\n", 1)])
+def test_protected_get_bad_stat_never_copies(workload, output, rc):
+    job = get_job(workload)
+    workload.monkeypatch.setenv("FAKE_STAT", output)
+    workload.monkeypatch.setenv("FAKE_STAT_RC", str(rc))
+    result = direct_runner(workload, job)
+    assert result["rc"] != 0 and "remote size" in result["stderr"]
+    assert [x["prog"] for x in workload.ssh_log()] == ["ssh"]
+    assert not Path(job["local"]).exists()
+
+
+@pytest.mark.parametrize("path", ["relative", "/tmp/*", "/tmp/../data", "/tmp/$(id)",
+                                    "/tmp/a;id", "/tmp/a\n", "/tmp/{a,b}"])
+def test_protected_get_unsafe_paths_refused(workload, path):
+    assert_refused(workload, direct_runner(workload, get_job(workload, remote=path)), "literal absolute")
+
+
+@pytest.mark.parametrize("limit", [0, -1, 8 * 1024**3])
+def test_protected_get_unbounded_limit_refused(workload, limit):
+    assert_refused(workload, direct_runner(workload, get_job(workload, max_bytes=limit)), "size limit")
+
+
+def test_protected_get_growth_is_bounded_and_discarded(workload):
+    job = get_job(workload, max_bytes=4096)
+    workload.monkeypatch.setenv("FAKE_STAT", "2\n")
+    workload.monkeypatch.setenv("FAKE_COPY_SIZE", "8192")
+    result = direct_runner(workload, job)
+    assert result["rc"] != 0
+    assert [x["prog"] for x in workload.ssh_log()] == ["ssh", "scp"]
+    assert "File too large" in result["stderr"]
+    assert not Path(job["local"]).exists()
+
+
+def test_protected_get_direct_success(workload):
+    job = get_job(workload)
+    result = direct_runner(workload, job)
+    assert result["rc"] == 0
+    assert Path(job["local"]).stat().st_size == 557523
+
+
+def test_preflight_failure_preserves_previous_download(workload):
+    job = get_job(workload)
+    Path(job["local"]).write_bytes(b"previous")
+    workload.monkeypatch.setenv("FAKE_STAT_RC", "1")
+    assert direct_runner(workload, job)["rc"] != 0
+    assert Path(job["local"]).read_bytes() == b"previous"
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "fifo", "missing"])
+def test_stat_command_actual_shell(tmp_path, kind):
+    import importlib.util
+    import subprocess
+    spec = importlib.util.spec_from_file_location("runner_probe", HERE / "runner.py")
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    path = tmp_path / "data"
+    if kind == "file":
+        path.write_bytes(b"tiny")
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.write_bytes(b"tiny")
+        path.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(path)
+    result = subprocess.run(["/bin/sh", "-c", runner.get_stat_command(str(path))],
+                            capture_output=True, text=True, timeout=5)
+    if kind == "file":
+        assert result.returncode == 0 and result.stdout == "4\n"
+    else:
+        assert result.returncode != 0 and result.stdout == ""
 
 
 def test_plugin_protected_copy_small_put_passes(workload):

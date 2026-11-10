@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import re
+import resource
 import shutil
 import socket
 import stat
@@ -164,6 +165,7 @@ def workload_reason(command):
 
 
 def enforce_workload(job):
+    job.pop("_bounded_get", None)  # Internal decision, never supplied by the caller.
     policy = load_policy()
     if policy is None:
         return False
@@ -184,8 +186,14 @@ def enforce_workload(job):
             raise ValueError("tailnet workload policy: put size limit (regular file, below 1 GiB and "
                              "within max_bytes); " + policy["routing_message"])
     if protected and job["mode"] == "get":
-        raise ValueError("tailnet workload policy: get refused: remote size is not safely bounded before "
-                         "transfer; " + policy["routing_message"])
+        remote = job.get("remote", "")
+        if (not re.fullmatch(r"/[A-Za-z0-9_./-]+", remote)
+                or any(part in (".", "..") for part in remote.split("/"))):
+            raise ValueError("tailnet workload policy: get requires a literal absolute path")
+        limit = job.get("max_bytes")
+        if type(limit) is not int or not 0 < limit <= 25 * 1024**2:
+            raise ValueError("tailnet workload policy: get size limit must be within 25 MiB")
+        job["_bounded_get"] = True
     # Pin the inspected resolution, including the jump host, and ignore SSH config.
     if addresses is None:
         _, addresses = resolved_target(job["target"])
@@ -194,6 +202,24 @@ def enforce_workload(job):
         _, hop_addresses = resolved_target(job["via"])
         job["via"]["addr"] = hop_addresses[0]
     return True
+
+
+def get_stat_command(remote):
+    # The protected-get path validator permits only literal shell/SFTP-safe paths.
+    # Check type before stat: directories, devices, FIFOs and final symlinks fail closed.
+    return (f"test -f {remote} && test ! -L {remote} && "
+            f"{{ size=$(stat -f '%z' {remote} 2>/dev/null) || "
+            f"size=$(stat -c '%s' {remote}); }} && printf '%s\\n' \"$size\"")
+
+
+def preflight_get(job, keyfile, env):
+    probe = dict(job, mode="exec", command=get_stat_command(job["remote"]))
+    p = subprocess.run(build(probe, keyfile, True), capture_output=True, text=True,
+                       timeout=min(int(job.get("timeout") or 120), 30), env=env,
+                       stdin=subprocess.DEVNULL)
+    value = p.stdout.strip()
+    if p.returncode or not re.fullmatch(r"[0-9]{1,10}", value) or int(value) > job["max_bytes"]:
+        raise ValueError("tailnet workload policy: remote size preflight failed (regular file within size limit required)")
 
 
 def main():
@@ -225,11 +251,18 @@ def main():
         env = {k: v for k, v in os.environ.items() if k not in ("TAILNET_SSH_KEY", "SSH_AUTH_SOCK")}
         if job["mode"] == "put" and os.path.getsize(job["local"]) > int(job.get("max_bytes") or 0):
             raise ValueError("file too large")
+        copy_started = False
         try:
+            if job.get("_bounded_get"):
+                preflight_get(job, kf, env)
+                # This is a single-job subprocess. Inherit the hard write bound in scp,
+                # so a remote file growing after stat cannot fill local storage.
+                resource.setrlimit(resource.RLIMIT_FSIZE, (job["max_bytes"], job["max_bytes"]))
             if job["mode"] == "put" and job.get("sha256"):
                 with open(job["local"], "rb") as f:
                     if hashlib.sha256(f.read()).hexdigest() != job["sha256"]:
                         raise ValueError("staged file changed since it was requested/approved; not uploaded")
+            copy_started = True
             p = subprocess.run(build(job, kf, isolated), capture_output=True, text=True, errors="replace",
                                timeout=int(job.get("timeout") or 120), env=env, stdin=subprocess.DEVNULL)
             rc, out, err = p.returncode, p.stdout, p.stderr
@@ -237,6 +270,8 @@ def main():
             rc, out, err = 124, (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""), "timed out"
         except Exception as exc:
             rc, out, err = 255, "", f"{type(exc).__name__}: {exc}"
+        if job.get("_bounded_get") and copy_started and rc != 0:
+            Path(job["local"]).unlink(missing_ok=True)
         if job["mode"] == "get" and rc == 0 and os.path.exists(job["local"]) \
                 and os.path.getsize(job["local"]) > int(job.get("max_bytes") or 0):
             os.unlink(job["local"])
