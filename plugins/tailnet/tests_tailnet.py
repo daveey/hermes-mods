@@ -220,6 +220,43 @@ def test_auto_hosts_does_not_cover_other_hosts(env):
     assert r["status"] == "approval_requested" and env.ssh_log() == []
 
 
+@pytest.mark.parametrize("auto_hosts", [[], ["imac"]])
+@pytest.mark.parametrize("operation", ["exec", "copy"])
+def test_local_approval_warns_about_missing_auto_host(env, caplog, auto_hosts, operation):
+    env.auto_hosts(auto_hosts)
+    with caplog.at_level("WARNING", logger=tn.logger.name):
+        if operation == "exec":
+            r = call(tn.tool_exec, host="mini", command="hostname", reason="local check")
+        else:
+            r = call(tn.tool_copy, host="mini", direction="put", remote_path="/tmp/x",
+                     local_name="x", content="hi", reason="local check")
+    assert r["status"] == "approval_requested" and not r["ran"] and r["request_id"]
+    assert [b[0] for b in env.broker_log()] == ["request"]
+    assert env.ssh_log() == []
+    hint = f"add host to tailnet.auto_hosts in {env.home / 'config.yaml'}"
+    assert r["hint"] == hint
+    assert f"hint: {hint}" in caplog.text
+    assert str(env.home) in caplog.text and "mini" in caplog.text
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+@pytest.mark.parametrize("sess", [
+    dict(ctype="channel", chat="C0CHAN", user=OWNER),
+    dict(chat="D0OTHER", user="U0OTHER"),
+    dict(ctype="channel", chat="C0CHAN", user=""),
+    dict(chat="", user="U0OTHER"),
+])
+def test_chat_approval_has_no_auto_hosts_hint_or_warning(env, caplog, sess):
+    env.session(**sess)
+    with caplog.at_level("WARNING", logger=tn.logger.name):
+        r = call(tn.tool_exec, host="mini", command="hostname", reason="chat check")
+    assert r["status"] == "approval_requested" and not r["ran"]
+    assert "hint" not in r and "auto_hosts" not in json.dumps(r)
+    assert not [record for record in caplog.records if record.name == tn.logger.name]
+    assert [b[0] for b in env.broker_log()] == ["request"]
+    assert env.ssh_log() == []
+
+
 def test_no_auto_hosts_keeps_approval_for_local_turns(env):
     env.session(**DESKTOP)
     r = call(tn.tool_exec, host="mini", command="hostname", reason="from a local session")

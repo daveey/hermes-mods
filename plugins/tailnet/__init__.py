@@ -518,10 +518,18 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
            "scope": inv.approval_scope, "ran": False, "approval": rid, "status": "approval requested"})
     thread_line(req, f"tailnet {kind} on {host}: `{what[:160]}` needs the owner's approval (request {rid}); "
                      f"nothing has run.")
-    return json.dumps({"ok": False, "ran": False, "status": "approval_requested", "request_id": rid,
-                       "message": "The owner got a Slack DM with the host, command and requester. Nothing has run. "
-                                  "Tell the requester it is waiting for approval; after the owner approves, call "
-                                  "this tool again with this request_id (and nothing else changed)."})
+    result = {"ok": False, "ran": False, "status": "approval_requested", "request_id": rid,
+              "message": "The owner got a Slack DM with the host, command and requester. Nothing has run. "
+                         "Tell the requester it is waiting for approval; after the owner approves, call "
+                         "this tool again with this request_id (and nothing else changed)."}
+    # An identity-free turn on an auto host already returned above. Diagnose the
+    # missing opt-in here, without changing the approval request or its scope.
+    if not req.get("user") and not req.get("channel"):
+        home = _home()
+        result["hint"] = f"add host to tailnet.auto_hosts in {home / 'config.yaml'}"
+        logger.warning("tailnet local approval request: HERMES_HOME=%s host=%s; hint: %s",
+                       home, host, result["hint"])
+    return json.dumps(result)
 
 
 def _gc_pinned(d: Path) -> None:
