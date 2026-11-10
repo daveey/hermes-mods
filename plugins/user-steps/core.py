@@ -2754,7 +2754,31 @@ def literal_options(step: dict) -> list[str]:
             out = whether
         # a model option that is part of a derived alternative is the same choice, not a second button
         out += [x for x in found if not any(x.casefold() in y.casefold() for y in out)]
+        # A single-proposition ask ("Decide whether to X", "Should I X?") with no literal alternatives is a
+        # yes/no question: Yes and No answer it without paraphrasing anything. Live repro (hermes-hub 2026-11-10,
+        # "grow the hub disk further to 800 GB"): paraphrased model options left only the free-text button.
+        if len(out) < 2 and yes_no_question(step):
+            out = ['Yes', 'No']
     return list(dict.fromkeys(out))[:4]
+
+
+_WHETHER_ONE = re.compile(r"^(?:decide|choose|confirm|say|tell me)\s+whether\s+(?:or\s+not\s+)?(?:to\s+)?\S", re.I)
+_YES_NO_Q = re.compile(r"^(?:should|shall|do|does|did|can|could|would|will|is|are|was|ok(?:ay)?|want me to)\b", re.I)
+
+
+def yes_no_question(step: dict) -> bool:
+    """True when the step asks one thing to accept or decline: a 'Decide whether to X' title, or a single
+    'Should I X?'-shaped question in the span. Either/or and open (which/what) questions are not yes/no."""
+    title = re.sub(r"[*_`]+", "", _ws(step.get('text')))
+    if _WHETHER_ONE.match(title) and not re.search(r"\bor\b", re.sub(r"\bor\s+not\b", "", title, flags=re.I), re.I):
+        return True
+    span = re.sub(r"[*_`]+", "", _ws(step.get('verbatim_span') or step.get('paragraph')))
+    qs = [q.strip() for q in re.findall(r"[^.?!\n]*\?", span)]
+    if len(qs) != 1:
+        return False
+    q = re.sub(r"^[A-Za-z][\w ]{0,20}:\s*", "", qs[0])
+    # "Should I add something else?" invites a free-text answer, not a yes/no.
+    return bool(_YES_NO_Q.match(q)) and not re.search(r"\bor\b|\b(?:something|anything) else\b", q, re.I)
 
 
 ANSWER_TEXT = {'id': 'answer-text', 'label': 'Answer in your own words', 'effect': 'answer'}
