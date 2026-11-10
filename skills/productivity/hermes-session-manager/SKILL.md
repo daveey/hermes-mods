@@ -120,9 +120,12 @@ say what's running, never what needs the user.
   untouched as a named follow-up. Then `kanban_comment` the ruling and unblock, rather than asking the user again.
 - "Still red" / "no green bar" is about the Desktop sidebar stripe, not the stored outcome. The app can paint a row
   red on its own (a queue card a restart lost, an open prompt, a turn gone quiet) while `outcome --refresh` reads
-  `waiting` or `done`. Never tell David a chat is green or isn't red from `outcome` alone: ask what the stripe's tooltip says
-  (a restart-lost queue card reads "A message queued before a restart may not have run: Send again or Discard";
-  Discard or Send again clears it), or check the row on the machine he sees it on. A `done` outcome with a non-empty
+  `waiting` or `done`. Never tell David a chat is green or isn't red from `outcome` alone: read the row yourself on the Mac he
+  uses (inspecting-hermes-desktop-dom `rend-eval.mjs`: the row's `[data-slot=session-status-stripe]`
+  `data-status-stripe` and `aria-label`) before asking him. A restart-lost queue card reads "A message queued
+  before a restart may not have run: Send again or Discard" (either clears it). A red row with an empty tooltip
+  whose `outcome --refresh` is `decision` is still that ask: lead the reply with its `items` question and choices,
+  and say it is answered in the chat's "This session → Needs you" panel above the composer. A `done` outcome with a non-empty
   `crons` list (the chat is `owner_session_id` of a live job in `cron/jobs.json`) draws a green loop glyph, never
   the bar, so check `crons` in `outcome --refresh --json` before promising green. That owner field only feeds the
   sidebar; releasing it doesn't change how the job runs.
