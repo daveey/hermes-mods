@@ -1321,7 +1321,11 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 log_.append({"verdict": "repeat_uncorroborated", "tile": r.get("id"),
                              "verbatim_span": r.get("verbatim_span"), "session": session_id, "at": now})
             del log_[:-50]
-    card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or (), reply)) for s in res["steps"]]
+    # Cards this reply relays by the extractor's own corroborated repeat (split_repeats kept only those): a step
+    # in such a reply that shares the card's subject is that card's ask, even when it adds a fallback the card
+    # does not carry yet (live: "... or send his current username" minted two unlinked tiles beside the card).
+    relayed = {r.get('id') for r in res.get("repeats") or () if isinstance(r, dict)} & {e['id'] for e in card_asks}
+    card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or (), reply, relayed=relayed)) for s in res["steps"]]
     restated = [(s, e) for s, e in card_hits if e is not None]
     res["steps"] = [s for s, e in card_hits if e is None]
     # The model may also leave a relay out of "steps" and report it only as a repeat of the card's id: record that
@@ -1649,6 +1653,7 @@ _CARD_NOUN = re.compile(r"\bcards?\b", re.I)
 # "Unblock X, then approve Y" / "Unblock X and approve Y": the follow-on is the card's own next step.
 _FOLLOW_ON = re.compile(r"\s*(?:[,;]\s*)?\b(?:and then|then|and|after that)\b\s+|\s*;\s+", re.I)
 _CARD_TITLE_OVERLAP = 0.5
+_RELAY_SHARED = 3  # distinctive words a step shares with a card this same reply relays
 
 
 def _distinctive(text) -> set:
@@ -1666,7 +1671,7 @@ def _names_card(named: set, task_id) -> bool:
     return bool(tid) and any(tid == n or tid.startswith(n) for n in named)
 
 
-def card_ask_for(candidate: dict, entries: list[dict], repeats=(), reply: str = "") -> Optional[dict]:
+def card_ask_for(candidate: dict, entries: list[dict], repeats=(), reply: str = "", relayed=()) -> Optional[dict]:
     """The blocked card's ask ``candidate`` (an extracted step) restates, or None.
 
     Covered when: the model marked this exact sentence as a repeat of the card's entry and the sentence (or its
@@ -1676,13 +1681,22 @@ def card_ask_for(candidate: dict, entries: list[dict], repeats=(), reply: str = 
     sides so a short generic ask never matches. For an entry that carries the card's title, also: the step tells
     the user to unblock or archive a card and shares a distinctive word with exactly one listed card's title (or
     names its id); or at least half its words are the card's title plus ask words. A compound step ("Unblock X and
-    approve the Touch ID prompt") is covered when its first action is: the follow-on is the card's own next step."""
+    approve the Touch ID prompt") is covered when its first action is: the follow-on is the card's own next step.
+    ``relayed``: ids of cards the extractor named as a corroborated repeat elsewhere in this same reply. A step in
+    that reply sharing at least ``_RELAY_SHARED`` distinctive words with exactly one such card's ask or title is
+    that card's ask (a relay that adds a fallback or reorders the ask stays one request)."""
     cards = [e for e in entries or () if e.get("kind") == KANBAN_ASK]
     if not cards:
         return None
     hit = _card_ask_match(candidate, cards, repeats, reply)
     if hit is not None:
         return hit
+    if relayed:
+        mine = _distinctive(candidate.get("text")) | _distinctive(candidate.get("verbatim_span"))
+        near = [e for e in cards if e["id"] in relayed
+                and len(mine & (_distinctive(e["text"]) | _distinctive(e.get("title")))) >= _RELAY_SHARED]
+        if len(near) == 1:
+            return near[0]
     first = {"text": _first_action(candidate.get("text")), "verbatim_span": _first_action(candidate.get("verbatim_span")),
              "options": []}
     if first["text"] or first["verbatim_span"]:

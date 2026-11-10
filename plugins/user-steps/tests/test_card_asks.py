@@ -275,3 +275,46 @@ def test_gate_holds_the_same_approval_once_the_card_is_unblocked(plugin, monkeyp
             'verbatim_span': final, 'options': []}
     out = gate(plugin, monkeypatch, 'rent it?', final, [step])
     assert out and out.get('hold') is True
+
+
+# ---- a relay that adds a fallback the card's ask lacks ------------------------------------------------------
+# Live shape (sanitized): the chat relayed a blocked card's ask plus a fallback the card did not carry yet ("or
+# send his current username"). The step shared 4 of 11 words with the card's ask (< the 0.6 paraphrase bar), so
+# it minted an unlinked request; the next reply restated it and minted a second. With the card row, the user saw
+# the same ask three times. The extractor had named the card as a corroborated repeat in both replies.
+
+INVITE_ACTION = ("Ask Sam (samexample) to accept the two invites at https://github.com/example-org/alpha/invitations "
+                 "and https://github.com/example-org/beta/invitations before 2026-11-17. Unblock = he has accepted, "
+                 "so the run verifies and closes; archive = drop his access.")
+INVITE_POINTER = "Both of Sam's invites to alpha and beta are tracked on the blocked card."
+INVITE_STEP = {'text': 'Ask Sam to accept the two GitHub invites, or send his current GitHub username', 'kind': 'do',
+               'options': []}
+
+
+def test_relay_with_an_added_fallback_publishes_no_request_when_the_reply_relays_the_card(plugin, monkeypatch, boards):
+    add_card(boards['default'], action=INVITE_ACTION)
+    ask1 = "Can you ask him to accept the invites below, or tell me his current GitHub username if that account is old?"
+    turn(plugin, monkeypatch, 'did Sam get access?', f"{INVITE_POINTER}\n\n{ask1}", [{**INVITE_STEP, 'verbatim_span': ask1}],
+         repeats=[{'id': f'kanban:default:{CARD}', 'verbatim_span': INVITE_POINTER}])
+    ask2 = "One item still waits on you: Sam doesn't have repo access yet."
+    turn(plugin, monkeypatch, 'status?', f"{ask2}\n\n{INVITE_POINTER}", [{**INVITE_STEP, 'verbatim_span': ask2}],
+         repeats=[{'id': f'kanban:default:{CARD}', 'verbatim_span': INVITE_POINTER}])
+    assert live(plugin) == []
+    assert {r['card'] for r in ledger_card_asks(plugin)} == {CARD}
+
+
+def test_same_relay_without_the_reply_naming_the_card_still_publishes(plugin, monkeypatch, boards):
+    # Lexical overlap alone stays below the bar: only the extractor's corroborated card repeat links it.
+    add_card(boards['default'], action=INVITE_ACTION)
+    ask1 = "Can you ask him to accept the invites below, or tell me his current GitHub username if that account is old?"
+    turn(plugin, monkeypatch, 'did Sam get access?', ask1, [{**INVITE_STEP, 'verbatim_span': ask1}])
+    assert [r['title'] for r in live(plugin)] == [INVITE_STEP['text']]
+
+
+def test_unrelated_ask_beside_a_card_relay_is_still_published(plugin, monkeypatch, boards):
+    add_card(boards['default'], action=INVITE_ACTION)
+    other = 'Want me to deploy build 412 to the test environment?'
+    turn(plugin, monkeypatch, 'status?', f"{INVITE_POINTER}\n\n{other}",
+         [{'text': 'Approve deploying build 412 to the test environment', 'kind': 'approve', 'verbatim_span': other, 'options': []}],
+         repeats=[{'id': f'kanban:default:{CARD}', 'verbatim_span': INVITE_POINTER}])
+    assert [r['title'] for r in live(plugin)] == ['Approve deploying build 412 to the test environment']

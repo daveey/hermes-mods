@@ -416,7 +416,11 @@ least three, are the ask's words; it tells the user to unblock or archive a card
 plus "card" or a card id) and shares a distinctive word with exactly one listed card's
 title, or names its id (generic words such as card, agent, window, request, macbook,
 hermes, prompt, terminal and function words identify nothing); or half its words are
-exactly one card's title plus ask words) publishes nothing. A compound step ("Unblock
+exactly one card's title plus ask words; or the extractor named that card as a
+corroborated repeat elsewhere in the same reply and the step shares at least three
+distinctive words with exactly one such card's ask or title, which covers a relay that
+adds a fallback the card lacks, e.g. "accept the invites, or send his current username")
+publishes nothing. A compound step ("Unblock
 the fseventsd card, then approve Touch ID in the terminal window") is covered when its
 first action is: the follow-on is the card's own next step. Such a step is not framed,
 does not hold the gate, and is recorded (a relay the model reports only under "repeats"
