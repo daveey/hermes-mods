@@ -298,32 +298,101 @@ def _ro(p: Path) -> sqlite3.Connection:
     return _ro_connect(p, timeout=2)
 
 
+LINKED_CAP = 25  # total cards in the live list; cards waiting on a human are never cut (self-heal agent-d9399023fc)
+_FINAL = ("done", "archived", "cancelled")
+_NO_HUMAN_KINDS = ("dependency", "time", "transient")  # blocked on a clock or another card, not on David
+
+
+def _task_cols(c: sqlite3.Connection) -> set[str]:
+    try:
+        return {r[1] for r in c.execute("pragma table_info(tasks)")}
+    except sqlite3.Error:
+        return set()
+
+
 def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None = None) -> list[dict]:
-    """Cards created by this chat or notifying it (kanban_notify_subs), newest first."""
+    """Cards created by this chat or notifying it (kanban_notify_subs), newest first.
+
+    The ``limit`` newest cards, plus every open card that needs a person (blocked, in review, or carrying a
+    human_request) however old: in a long chat the oldest cards drop out of a recency list first, and those are
+    the ones blocked on David (self-heal agent-d9399023fc). Total capped at LINKED_CAP by dropping the oldest
+    non-pinned cards; a pinned card is never cut."""
     out: list[dict] = []
     if not session_id:
         return out
     for p in db_paths if db_paths is not None else boards():
         try:
             c = _ro(p)
-            rows = c.execute("select id, title, status, assignee, created_at, completed_at from tasks "
-                             "where session_id=? order by created_at desc limit ?", (session_id, limit)).fetchall()
+            cols = _task_cols(c)
+            extra = ", " + ", ".join(f"t.{x}" if x in cols else "null" for x in ("block_kind", "human_request"))
+            base = f"select t.id, t.title, t.status, t.assignee, t.created_at, t.completed_at{extra} from tasks t "
+            needs = ("t.status not in ('done','archived','cancelled') and (t.status in ('blocked','review')"
+                     + (" or t.human_request is not null" if "human_request" in cols else "") + ")")
+            rows = c.execute(base + "where t.session_id=? order by t.created_at desc limit ?",
+                             (session_id, limit)).fetchall()
+            pinned = c.execute(base + f"where t.session_id=? and {needs}", (session_id,)).fetchall()
             try:  # cards created elsewhere but notifying this chat count too (matches the sidebar count)
-                rows += c.execute("select t.id, t.title, t.status, t.assignee, t.created_at, t.completed_at "
-                                  "from tasks t where t.id in (select task_id from kanban_notify_subs "
-                                  "where chat_id=?) order by t.created_at desc limit ?", (session_id, limit)).fetchall()
+                sub = "t.id in (select task_id from kanban_notify_subs where chat_id=?)"
+                rows += c.execute(base + f"where {sub} order by t.created_at desc limit ?",
+                                  (session_id, limit)).fetchall()
+                pinned += c.execute(base + f"where {sub} and {needs}", (session_id,)).fetchall()
             except sqlite3.Error:
                 pass
-            for r in rows:
+            pin_ids = {r[0] for r in pinned}
+            for r in rows + pinned:
+                hr = None
+                if r[7]:
+                    try:
+                        hr = json.loads(r[7]) if isinstance(r[7], str) else None
+                    except ValueError:
+                        hr = {"action": str(r[7])}
                 out.append({"id": r[0], "title": r[1], "status": r[2], "assignee": r[3],
-                            "created": r[4], "completed": r[5], "db": str(p)})
+                            "created": r[4], "completed": r[5], "db": str(p), "block_kind": r[6],
+                            "human_request": hr if isinstance(hr, dict) else None, "pinned": r[0] in pin_ids})
             c.close()
         except sqlite3.Error:
             continue
     seen: set[str] = set()
-    out = [x for x in sorted(out, key=lambda x: x.get("created") or 0, reverse=True)
+    out = [x for x in sorted(out, key=lambda x: (not x["pinned"], -(x.get("created") or 0)))
            if not (x["id"] in seen or seen.add(x["id"]))]
-    return out[:limit]
+    pins = [x for x in out if x["pinned"]]
+    rest = [x for x in out if not x["pinned"]][:max(0, min(limit, LINKED_CAP - len(pins)))]
+    return sorted(pins + rest, key=lambda x: x.get("created") or 0, reverse=True)
+
+
+def waiting_on_david(cards: list[dict]) -> list[dict]:
+    """Listed cards blocked on a person: blocked with a human_request, or blocked with no typed agent-side kind."""
+    return [x for x in cards if x.get("status") == "blocked"
+            and (x.get("human_request") or (x.get("block_kind") or "") not in _NO_HUMAN_KINDS)]
+
+
+def card_ask(card: dict, n: int = 160) -> str:
+    hr = card.get("human_request") or {}
+    ask = " ".join(str(hr.get("action") or "").split())
+    return ask[:n] if ask else "(no ask recorded on the card: kanban_show it)"
+
+
+# A reply telling David nothing waits on him (self-heal agent-d9399023fc: "This repair is not waiting for your
+# approval." while a card blocked on him sat off the live list).
+_DENIED_WAIT = re.compile(
+    r"\b(?:not|nothing(?:'s|\s+is)?|isn't|aren't|no\s+(?:card|task|step|request)s?\s+(?:is|are))\s+"
+    r"(?:currently\s+|now\s+|still\s+)?(?:waiting|blocked)\s+(?:on|for)\s+(?:you|your)\b"
+    r"|\bnothing\s+(?:needs|requires)\s+(?:you|your)\b|\bnothing\s+(?:is\s+)?(?:left\s+)?for\s+you\s+to\s+do\b"
+    r"|\b(?:doesn't|does\s+not|don't|do\s+not)\s+need\s+anything\s+from\s+you\b", re.I)
+
+
+def denies_wait(text: str) -> bool:
+    return bool(_DENIED_WAIT.search(text or ""))
+
+
+def denied_wait(text: str, cards: list[dict]) -> tuple[str, list[dict]] | None:
+    """(quoted phrase, cards) when ``text`` says nothing waits on David while a linked card is blocked on him
+    with a human_request the reply does not name. None otherwise."""
+    m = _DENIED_WAIT.search(text or "")
+    if not m:
+        return None
+    hits = [x for x in waiting_on_david(cards) if x.get("human_request") and x["id"] not in text]
+    return (m.group(0), hits) if hits else None
 
 
 def card_status(ids: list[str], db_paths: list[Path] | None = None) -> dict[str, dict]:
@@ -421,6 +490,9 @@ def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | No
                      "resuming does not grant approvals or clear retired account/action records.")
     if cards:
         parts.append("Cards linked to this chat:\n" + render_cards(cards))
+    waiting = waiting_on_david(cards)
+    if waiting:
+        parts.append("Waiting on David now:\n" + "\n".join(f"- {x['id']}: {card_ask(x)}" for x in waiting))
     if answered:
         parts.append("Asks David has already answered or dismissed (do not ask these again):\n" + "\n".join(
             f"- {a['topic'][:120]} -> {a['answer'][:120]} ({fmt_ts(a['ts'])})" for a in answered))

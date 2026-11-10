@@ -559,6 +559,9 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
                        _user_step_directives(final_response), exact.get("message", ""),
                        attempt, budget, directives_only=True)
     rejected = False
+    denied = _denied_wait_gate(session_id, final_response, attempt, budget)
+    if denied is not None:
+        return denied
     try:
         users = _user_msgs(session_id)
         howto = bool(users) and core.asked_how_to(users[-1])
@@ -634,6 +637,29 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
                     "No action or approval is requested by this notice."}
         core.log_event("gate_error", session=session_id, error=repr(e))
         return None
+
+
+def _denied_wait_gate(session_id: str, draft: str, attempt: int, budget: int) -> dict | None:
+    """Hold a reply that says nothing waits on David while a card linked to this chat is blocked on him with a
+    human_request the reply doesn't name (self-heal agent-d9399023fc). Deterministic; fails open; released past
+    the hold budget."""
+    try:
+        hit = core.denied_wait(draft, core.linked_cards(session_id)) if core.denies_wait(draft) else None
+    except Exception as e:
+        core.log_event("denied_wait_error", session=session_id, error=repr(e)[:300])
+        return None
+    if not hit:
+        return None
+    quote, cards = hit
+    core.log_event("denied_wait_held" if attempt < budget else "denied_wait_released", session=session_id,
+                   attempt=attempt, quote=quote[:200], cards=[x["id"] for x in cards[:5]])
+    if attempt >= budget:
+        return None
+    record_verdict(session_id, "held", draft)
+    named = "; ".join(f"{x['id']} ({core.card_ask(x, 120)})" for x in cards[:3])
+    return {"hold": True, "nudge": f"ask-gate: your reply says \"{quote}\", but {named} is blocked waiting on "
+            "David's answer right now. kanban_show it, then tell him exactly what it needs from him (or why it "
+            "no longer does, and fix the card)."}
 
 
 def _repeat_gate(session_id: str, asks: list[str], attempt: int, budget: int, draft: str) -> dict | None:
