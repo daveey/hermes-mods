@@ -1764,6 +1764,62 @@ def test_headerless_worker_storm_has_no_crash_time_line(tmp_path):
     assert "log lines carry no timestamps" in s["details"]
 
 
+# kanban-e302b50679: 4 MacBook workers parked on a Claude Opus quota wall (booked as a typed rate_limited park, exit
+# 75) were filed as a "crash storm within 30 min"; their header times were 15 h apart.
+SQ_EXC = "agent.model_routing_unavailable.SubscriptionQuotaUnavailable"
+SQ_MSG = "Subscription quota unavailable for anthropic/claude-opus-5-5; resets at 1793814000.0"
+
+
+def _stamps(start, step_s, n):
+    from datetime import datetime, timezone
+    return [datetime.fromtimestamp(start + i * step_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") for i in range(n)]
+
+
+def test_worker_quota_wall_blocks_are_not_a_crash_storm(tmp_path):
+    """(a) 4 headered blocks ending in SubscriptionQuotaUnavailable within 10 min: a booked quota park, no signal."""
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, *[_worker_block(p, SQ_EXC, SQ_MSG, stamp=t)
+                        for p, t in zip((19778, 19789, 19807, 34550), _stamps(NOW - 900, 150, 4))])
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+    # any module path, and core's "HTTP 429: " prefixed message form
+    lines = _worker_block(41, "SubscriptionQuotaUnavailable", "HTTP 429: " + SQ_MSG).splitlines()
+    assert sg.parse_worker_crashes(lines) == []
+
+
+def test_worker_no_eligible_routes_storm_still_files(tmp_path):
+    """(b) control: another ModelRoutingError message is not the typed quota wall, so the storm files."""
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, *[_worker_block(p, "agent.model_routing.ModelRoutingError", "No eligible deep routes", stamp=t)
+                        for p, t in zip((19778, 19789, 19807, 34550), _stamps(NOW - 900, 150, 4))])
+    st = _storms(sg.collect(h, cur, "hubhost", NOW))
+    assert len(st) == 1 and "No eligible deep routes" in st[0]["symptom"], st
+
+
+def test_worker_crashes_logged_hours_apart_read_in_one_pass_are_not_a_storm(tmp_path):
+    """(c) 4 real crashes whose headers are 15 h apart, read in one pass (a Mac back online), are no storm; the
+    same crashes 3 min apart are one."""
+    h, cur = _primed_worker_home(tmp_path)
+    _append_worker(h, *[_worker_block(p, stamp=t) for p, t in zip((101, 102, 103, 104), _stamps(NOW - 54000, 18000, 4))])
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+    h2, cur2 = _primed_worker_home(tmp_path / "b")
+    _append_worker(h2, *[_worker_block(p, stamp=t) for p, t in zip((101, 102, 103, 104), _stamps(NOW - 600, 180, 4))])
+    st = _storms(sg.collect(h2, cur2, "hubhost", NOW))
+    assert len(st) == 1, st
+    assert "4 managed kanban workers died with agent.model_routing.ModelRoutingError within 9 min" in st[0]["details"]
+
+
+def test_worker_burst_after_an_old_stamped_crash_files_on_the_burst(tmp_path):
+    """an old crash 15 h before a 3-pid burst does not hide the burst; the storm names the burst's pids and times."""
+    h, cur = _primed_worker_home(tmp_path)
+    old = _stamps(NOW - 54000, 1, 1)
+    burst = _stamps(NOW - 600, 120, 3)
+    _append_worker(h, _worker_block(100, stamp=old[0]), *[_worker_block(p, stamp=t) for p, t in zip((101, 102, 103), burst)])
+    st = _storms(sg.collect(h, cur, "hubhost", NOW))
+    assert len(st) == 1, st
+    d = st[0]["details"]
+    assert "pids: 101, 102, 103" in d and f"earliest {burst[0]}, latest {burst[-1]}" in d
+
+
 def _hold_board(db, events):
     db.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(db)

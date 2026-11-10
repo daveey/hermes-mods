@@ -737,6 +737,11 @@ PID_LINE_RE = re.compile(r"^\[pid (\d+)\] ?(.*)$")
 # "[pid N] @ <ISO8601 UTC> core=<short sha>" header. Older logs have none; their crashes keep the pass time.
 PID_HEADER_RE = re.compile(r"^\[pid (\d+)\] @ (\d{4}-\d\d-\d\dT[\d:.]+(?:Z|[+-]\d\d:?\d\d)) core=(\S+)$")
 WORKER_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*): (.*)$")
+# Typed exits the worker already booked on the card before printing its traceback (core
+# session_kanban.record_start_failure: a quota wall is requeued as rate_limited with a quota episode, no failure
+# counted). They are a correct park, not a crash (kanban-e302b50679). Only these exact classes: other
+# ModelRoutingError messages ("No eligible ... routes") stay crashes.
+WORKER_BOOKED_EXCS = frozenset({"SubscriptionQuotaUnavailable"})
 SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}")
 
 
@@ -855,6 +860,8 @@ def parse_worker_crashes(lines: List[str]) -> List[dict]:
             continue
         em = WORKER_EXC_RE.match(blk[ei])
         exc, msg = em.group(1), em.group(2)
+        if exc.rsplit(".", 1)[-1] in WORKER_BOOKED_EXCS:
+            continue
         if (TRANSIENT_RE.search(f"{exc}: {msg}") or EXIT_NOISE_RE.search(msg)
                 or provider_5xx(exc, blk[ei], _exc_body(blk[tbs[-1]:ei + 1 + EXC_BODY_LINES], blk[ei]))):
             continue
@@ -889,6 +896,16 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
         pids = sorted({e["pid"] for e in mine}, key=lambda p: (len(p), p))
         if len(pids) < WORKER_STORM_N or k in filed:
             continue
+        span_s = WORKER_STORM_S
+        if all(e.get("t") is not None for e in mine):
+            # every crash carries its logged time: the window runs on those, not on pass times, so a Mac that
+            # was offline for hours and is read in one pass does not bunch its crashes (kanban-e302b50679)
+            mine = _stamped_cluster(mine)
+            if not mine:
+                continue
+            pids = sorted({e["pid"] for e in mine}, key=lambda p: (len(p), p))
+            ts = [e["t"] for e in mine]
+            span_s = max(60, int(-(-(max(ts) - min(ts)) // 60)) * 60)
         filed[k] = now
         evs = [e for e in evs if e["k"] != k]
         norm = _norm_msg(c["msg"])
@@ -898,7 +915,7 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
                     "symptom": f"managed-worker crash storm on {host or 'this host'}: {len(pids)} workers died "
                                f"with {c['exc'].split('.')[-1]}: {_scrub(c['msg'])[:120]}",
                     "details": _scrub(f"{len(pids)} managed kanban workers died with {c['exc']} within "
-                                      f"{WORKER_STORM_S // 60} min (logs/managed-worker.log). pids: "
+                                      f"{span_s // 60} min (logs/managed-worker.log). pids: "
                                       f"{', '.join(pids)}\n{when}{_span_note(c)}"
                                       f"Latest (pid {c['pid']}):\n{tb}")[:1500],
                     "fp": fp("kanban", "worker-storm", c["exc"], norm)})
@@ -907,6 +924,17 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
     else:
         cur.pop("worker_storm", None)
     return out
+
+
+def _stamped_cluster(evs: List[dict]) -> List[dict]:
+    """The latest run of header-timed crashes from WORKER_STORM_N distinct pids within WORKER_STORM_S of each
+    other, or [] when none: crashes hours apart are not a storm however many the pass read at once."""
+    evs = sorted(evs, key=lambda e: e["t"])
+    for j in range(len(evs) - 1, -1, -1):
+        run = [e for e in evs[:j + 1] if e["t"] >= evs[j]["t"] - WORKER_STORM_S]
+        if len({e["pid"] for e in run}) >= WORKER_STORM_N:
+            return run
+    return []
 
 
 def _crash_times(evs: List[dict], pids: List[str], now: float) -> Tuple[str, float]:
