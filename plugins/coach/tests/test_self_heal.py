@@ -343,6 +343,26 @@ def test_audit_files_only_self_admissions():
     assert sh.detect_admission("That was my mistake, I skipped the test.", llm2)["kind"] == "admission"
 
 
+def test_audit_prompt_keeps_the_end_of_a_long_request():
+    """agent-feed37636b: a reviewer brief said "Read the full diff of EVERY path" at char 1156 and allowed a coverage
+    row marked "partial, with why" at char 3929. The audit kept only the first 1500 chars, so the judge saw the rule
+    but not the permission and filed the honest partial row as a self-admission (p=0.99)."""
+    head = "Read the full diff of EVERY path. " * 50
+    tail = " A coverage row may be partial or no, with why. Deliverable: the coverage table, then the verdict."
+    ask = (head + "x" * 4000)[:4000 - len(tail)] + tail
+    assert len(ask) == 4000
+    p = sh.admission_prompt("Lane T1 APPROVE; 51 of 52 full, 1 partial (blob-verified).", ["-> read_file(a)"], ask)
+    assert ask[-200:] in p and ask[:1500] in p
+    assert "[...]" in p and len(p) < len(ask) + 1000  # head + tail, not the whole brief
+    short = "fix the sidebar sort " * 40  # <= 3000 chars: sent whole, no marker
+    q = sh.admission_prompt("done", None, short)
+    assert short.strip() in q and "[...]" not in q
+
+
+def test_audit_rule_names_allowed_disclosed_scope_limits_as_honest():
+    assert "disclosed scope limit" in sh.AUDIT_SYS and "unless" in sh.AUDIT_SYS.split("disclosed scope limit")[1][:500]
+
+
 def test_complaint_cascade_gate_second_opinion_and_confirm():
     first, c1 = judge(0.8, kind="agent_fault")
     no, c2 = judge(0.2, kind="none")

@@ -377,7 +377,10 @@ Score p_defect (0-1): this turn shows a defect in the agent or its system that s
 - contradiction: the message contradicts the tool log or itself (claims a check that never ran).
 Low (<0.3): honest status reports that state plainly what is unverified or failed and what happens next; a bug that IS
 the task he gave (root cause + fix report); apologies with no defect; external outages it surfaces clearly; legitimate
-questions about his preferences.
+questions about his preferences; a disclosed scope limit that the request itself allows or asks for (a coverage row
+marked partial with its reason and a substitute check, a 'not reviewed' / 'what I did not check' list, an unmet
+requirement the request puts out of scope) is an honest status report, not a self-admission, unless the agent hides
+it or its verdict depends on the part it skipped.
 
 component: agent, desktop, plugin, cron, kanban, bot, gateway, provider, browser, bb, other.
 symptom: <=10 words naming what is wrong, neutral words, no names.
@@ -898,8 +901,22 @@ def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "
             f"USER'S NEW MESSAGE:\n{clean_user(user_text)[:2000]}")
 
 
+ASK_HEAD_TAIL = 1500  # a request over 2x this is sent as its first and last ASK_HEAD_TAIL chars
+
+
+def _ask_text(ask) -> str:
+    """The request as the audit sees it: whole up to 2*ASK_HEAD_TAIL chars, else head + "[...]" + tail. Briefs put
+    the deliverable and its permissions at the END ("a coverage row may be partial, with why"); a head-only cut showed
+    the judge the rule but not the permission, so an honest, allowed partial row filed as a self-admission
+    (agent-feed37636b, p=0.99)."""
+    t = clean_user(ask)
+    if len(t) <= 2 * ASK_HEAD_TAIL:
+        return t
+    return f"{t[:ASK_HEAD_TAIL]}\n[...]\n{t[-ASK_HEAD_TAIL:]}"
+
+
 def admission_prompt(final_reply: str, tool_log=None, ask="") -> str:
-    return (f"USER'S REQUEST:\n{clean_user(ask)[:1500] or '(unknown)'}\n\n"
+    return (f"USER'S REQUEST:\n{_ask_text(ask) or '(unknown)'}\n\n"
             f"TOOL LOG THIS TURN:\n{_log_text(tool_log, 30, 3500)}\n\n"
             f"AGENT'S FINAL MESSAGE:\n{(final_reply or '(empty)')[-4000:]}")
 
@@ -3717,7 +3734,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
               filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
               fix_card=None if not prev else st.get("fix_card"), gen=gen,
               cards=sorted(known | {tid}), proposed_at=None, family=root_family(d), held=[],
-              complaint_owner=None, complaint_previous=None,
+              complaint_owner=None, complaint_previous=None, source=d.get("source"),
               **_complaint_identity(d))
     if prev:
         kw["recurrences"] = int(st.get("recurrences") or 0) + 1
@@ -4055,7 +4072,7 @@ def late_adopt_counts(root: Optional[Path] = None, now: Optional[float] = None, 
 
 
 def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None,
-                 owner: str = "", result: str = "", require_known: bool = False) -> dict:
+                 owner: str = "", result: str = "", require_known: bool = False, runner=None) -> dict:
     """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>.
     `result` (a file path, `fixed` only) is copied to <coach>/selfheal-results/<fp>.md: the quiet home for
     finished work (the Inbox is for decisions only). `require_known` (the CLI) refuses a fingerprint this lane never
@@ -4120,7 +4137,108 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
                "component": e.get("component"), "note": note[:300], "recurrence": bool(e.get("recurrences")),
                **({"cron_check": cron_check} if cron_check else {}),
                **({"result_file": result_path} if result_path else {})})
+    if kind == "not_defect":
+        admission_negative(fp, e, note, store=store, now=now, runner=runner)
     return e
+
+
+ADMISSION_NEG_FILE = "eval/admission-negatives.jsonl"  # under the private coach data repo (COACH_DATA)
+ADMISSION_NEG_CARD_AT = 3     # this many audit false alarms inside ADMISSION_NEG_DAYS open one detector card
+ADMISSION_NEG_DAYS = 7
+ADMISSION_NEG_STATE = "selfheal_admission_negatives.json"  # <coach>/: the open detector card
+
+
+def _coach_data() -> Path:
+    return Path(os.environ.get("COACH_DATA") or Path.home() / "code" / "hermes-coach-data")
+
+
+def _detect_record(store, fp: str) -> dict:
+    """The newest selfheal_detect / selfheal_filed row for `fp` (source, session, evidence), {} when none."""
+    best: dict = {}
+    try:
+        with (Path(store.root) / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if fp not in ln or ('"selfheal_detect"' not in ln and '"selfheal_filed"' not in ln):
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("fingerprint") == fp and r.get("source"):
+                    best = {**best, **{k: v for k, v in r.items() if v not in (None, "")}}
+    except OSError:
+        pass
+    return best
+
+
+def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optional[float] = None,
+                       runner=None) -> Optional[dict]:
+    """Detection for turn-end audit false alarms (agent-feed37636b): a `not_defect` verdict on an audit (`admission`)
+    finding is appended to <coach data>/eval/admission-negatives.jsonl as a label-0 replay row, and the
+    ADMISSION_NEG_CARD_AT-th inside ADMISSION_NEG_DAYS opens ONE detector card (later cases comment on it while it is
+    open; a done/archived/unreadable card means the next repeat files a fresh one). Three honest, allowed scope notes
+    closed not_defect in one day before anything counted them. Never raises."""
+    store = _store(store)
+    now = now or time.time()
+    try:
+        rec = _detect_record(store, fp)
+        source = st.get("source") or rec.get("source")
+        if source != "admission":
+            return None
+        row = {"id": fp, "label": 0, "source": "admission", "component": st.get("component") or rec.get("component"),
+               "symptom": st.get("symptom") or rec.get("symptom"),
+               "session_id": st.get("session_id") or rec.get("session_id"), "p": rec.get("p"),
+               "evidence": str(rec.get("evidence") or "")[-1500:], "note": note[:500], "card": st.get("card"),
+               "at": now, "host": host_name()}
+        path = _coach_data() / ADMISSION_NEG_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        if path.exists():
+            for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    rows.append(json.loads(ln))
+                except ValueError:
+                    pass
+        if not any(r.get("id") == fp and r.get("card") == row["card"] for r in rows):
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+            rows.append(row)
+        since = now - ADMISSION_NEG_DAYS * 86400
+        recent = [r for r in rows if float(r.get("at") or 0) >= since]
+        out: dict = {"event": "selfheal_admission_negative", "fingerprint": fp, "recent": len(recent),
+                     "file": str(path)}
+        if len(recent) >= ADMISSION_NEG_CARD_AT:
+            spath = Path(store.root) / ADMISSION_NEG_STATE
+            card = _open_card(spath, runner)
+            if card:
+                argv = ["hermes", "kanban", "comment", card,
+                        f"Another audit false alarm closed not_defect: {fp} ({row['symptom']}), session "
+                        f"{row['session_id']}. Note: {note[:400]}\nEvidence: {row['evidence'][-600:]}"]
+                rc, o, err = _run(argv, runner)
+                out.update(action="comment" if rc == 0 else "error", card=card)
+            else:
+                lines = "\n".join(f"- `{r.get('id')}` ({r.get('symptom')}), session {r.get('session_id')}: "
+                                  f"{str(r.get('note') or '')[:200]}" for r in recent[-10:])
+                body = (f"The self-heal turn-end audit (AUDIT_SYS + admission_prompt in "
+                        f"plugins/coach/self_heal.py) filed {len(recent)} findings in {ADMISSION_NEG_DAYS} days that "
+                        f"investigation closed as not_defect:\n{lines}\n\nRows: {path} (label 0). Find what these "
+                        f"turns share that the audit misreads (five-whys), change the prompt or rule, and gate it with "
+                        f"`plugins/coach/eval/selfheal_replay.py --mode admission` over these rows plus known real "
+                        f"catches (fixed admission fingerprints): false alarms under {AUDIT_THRESHOLD} on 3 of 3 "
+                        f"samples, real catches still at or above it. Ship it in hermes-mods (hermes-mods-repo). "
+                        f"Post nothing to the Inbox.")
+                res = _lane_card(f"self-heal audit: {len(recent)} admission findings closed not_defect in "
+                                 f"{ADMISSION_NEG_DAYS} days", body,
+                                 f"selfheal-admission-negatives:{_utc_day(now)}:{fp}", runner)
+                if res.get("card"):
+                    spath.parent.mkdir(parents=True, exist_ok=True)
+                    spath.write_text(json.dumps({"card": res["card"], "at": now}))
+                out.update(action=res.get("action"), card=res.get("card"), why=res.get("why"))
+        store.log(out)
+        return out
+    except Exception as exc:  # detection only: never block recording the event
+        store.log({"event": "selfheal_admission_negative_error", "fingerprint": fp, "error": str(exc)[:200]})
+        return None
 
 
 def inbox_outcome(fp: str, runner=None) -> Optional[dict]:

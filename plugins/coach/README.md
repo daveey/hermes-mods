@@ -870,6 +870,12 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
   errors, a turn-end audit by the same judge; only self-admissions file (the other audit kinds cost more false alarms
   than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set).
+  The audit sees a request over 3000 chars as its first and last 1500 (briefs put the deliverable and its
+  permissions at the end), and scores a disclosed scope limit the request allows (a `partial` coverage row with its
+  reason, a "not reviewed" list) low unless hidden or the verdict depends on it (agent-feed37636b). A `not_defect`
+  event on an audit finding appends a label-0 row to `<COACH_DATA>/eval/admission-negatives.jsonl`
+  (`selfheal_admission_negative`); the 3rd in 7 days opens one detector card, later ones comment on it while open
+  (`tests/test_self_heal_admission_negatives.py`).
 
 Both judges append the private overlay `COACH_REPLY_PROFILE` / `<HERMES_HOME>/coach/reply_profile.md` (shared with
 the reply check), so they know your standing rules. The overlay is rules and environment only: output-format lines
