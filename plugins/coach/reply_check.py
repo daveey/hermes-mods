@@ -293,11 +293,13 @@ _ITEM_ID_RE = re.compile(r"\bt_[0-9a-f]{8,}\b|(?<![\w&])#\d{2,6}\b|\b(?=[0-9a-f]
 _ITEM_WORD_RE = re.compile(r"[a-z0-9]{3,}")
 
 
-def evidence_ids(reply: str, evidence: str, user_ask: str = "") -> list[str]:
+def evidence_ids(reply: str, evidence: str, user_ask: str = "", tool_log: Optional[list] = None) -> list[str]:
     """Card / PR / commit ids (commits cut to 7 hex) in the paragraph of `reply` sharing the most words with
     `evidence` (the evidence's own ids first). [] when no paragraph shares a word.
     agent-b22d5f6bb5: when that paragraph and the evidence name no id, the cards `user_ask` names (a notice's
-    "Existing delivery card t_..."): the draft called it "the existing task", the revision named it."""
+    "Existing delivery card t_..."): the draft called it "the existing task", the revision named it.
+    agent-8381864e1e: when still no card id but the evidence or the paragraph says "the card", the cards this turn's
+    tool calls touched (turn_card_ids) stand in, so a nudge and its outcome about the same unnamed card share an id."""
     def ids(text):
         out = []
         for m in _ITEM_ID_RE.finditer(text or ""):
@@ -315,7 +317,10 @@ def evidence_ids(reply: str, evidence: str, user_ask: str = "") -> list[str]:
     out = list(dict.fromkeys(ids(evidence) + ids(best)))[:12]
     if not out and user_ask:
         out = list(dict.fromkeys(NAMED_CARD_RE.findall(user_ask)))[:NAMED_CARD_MAX]
-    return out
+    if not any(v.startswith("t_") for v in out) and (CARD_REF_RE.search(evidence or "") or
+                                                      (score and CARD_REF_RE.search(best))):
+        out += [c for c in turn_card_ids(tool_log)[:3] if c not in out]
+    return out[:12]
 
 
 def fresh_ready_owner(reply: str, tool_log: Optional[list] = None) -> list[str]:
@@ -430,21 +435,63 @@ def _named_or_ask_text(reply: str, user_ask: str = "") -> str:
     return user_ask[:ASK_HEAD]
 
 
+# agent-8381864e1e: the replies left the fix to "the self-heal card" / "The card's fix ..." without its id, so the
+# board read (ids written in the reply only) gave the judges nothing and they scored the same hand-off 0.9 and 0.1.
+# A reply ending that refers to a card with no id (and an ask naming none) falls back to the cards this turn's tool
+# calls touched.
+CARD_REF_RE = re.compile(r"\b(?:the|that|this|its|their)\s+(?:[\w-]+\s+){0,2}?card(?:s|'s|’s)?\b", re.I)
+_TOUCH_TOOLS_RE = re.compile(r"^\s*->\s*(?:mcp__)?(kanban_comment|kanban_show|kanban_create|tool_call)\(")
+
+
+def turn_card_ids(tool_log: Optional[list]) -> list[str]:
+    """Card ids this turn's kanban_comment / kanban_show / kanban_create / tool_call calls touched (a kanban_create's
+    id is in its result line), most recent first."""
+    lines = list(tool_log or [])
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        m = _TOUCH_TOOLS_RE.match(line or "")
+        if not m:
+            continue
+        text = line or ""
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if (nxt or "").lstrip().startswith("<-") and not (nxt or "").lstrip().startswith("<- ERROR") and (
+                m.group(1) in ("kanban_create", "tool_call")):
+            text += " " + nxt
+        for cid in NAMED_CARD_RE.findall(text):
+            if cid in out:
+                out.remove(cid)
+            out.append(cid)
+    return list(reversed(out))
+
+
+def tail_card_ids(reply: str, tool_log: Optional[list] = None, user_ask: str = "") -> tuple[list[str], bool]:
+    """(ids, fallback): the unquoted card ids the reply's ending names, in order (callers cap at NAMED_CARD_MAX).
+    When it names none: the cards `user_ask` names (agent-b22d5f6bb5), else, when it refers to "the card", the cards
+    this turn's tool calls touched (agent-8381864e1e); fallback=True for either."""
+    tail = _named_or_ask_text(reply, user_ask)
+    ids: list[str] = []
+    for m in NAMED_CARD_RE.finditer(tail):
+        cid = m.group(0)
+        if cid not in ids and not _in_dquotes(tail, m.start()):
+            ids.append(cid)
+    reply_tail = (reply or "")[-1500:]
+    if NAMED_CARD_RE.search(reply_tail):
+        return ids, False
+    if ids:
+        return ids, True
+    if NAMED_CARD_RE.search(tail) or not CARD_REF_RE.search(reply_tail):
+        return [], False
+    return turn_card_ids(tool_log), True
+
+
 def named_card_facts(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None,
                      dbs: Optional[list] = None, user_ask: str = "") -> list[str]:
     """`<- BOARD task=...` lines for cards the reply's ending names (unquoted) that this turn's tool log never read
     with a status; [] when there are none, no board has them, or a read fails (fail-open). A reply naming no card
-    reads the cards `user_ask` names instead."""
+    reads the cards `user_ask` names instead, or, when it says "the card", the cards this turn touched."""
     try:
-        tail = _named_or_ask_text(reply, user_ask)
-        ids: list[str] = []
-        for m in NAMED_CARD_RE.finditer(tail):
-            cid = m.group(0)
-            if cid in ids or _in_dquotes(tail, m.start()) or _read_this_turn(cid, tool_log):
-                continue
-            ids.append(cid)
-            if len(ids) >= NAMED_CARD_MAX:
-                break
+        ids = [cid for cid in tail_card_ids(reply, tool_log, user_ask)[0]
+               if not _read_this_turn(cid, tool_log)][:NAMED_CARD_MAX]
         if not ids:
             return []
         ar = _cache.load_sibling(_HERE, "agent_rules")
@@ -464,7 +511,8 @@ def owner_source(reply: str, tool_log: Optional[list] = None, board: Optional[li
     """Where report_only's owner evidence for the cards the reply names came from (telemetry, agent-a8184f8541):
     `ok` (an `<- OK` line of the turn's own read), `board` / `replica` (the coach's own read of this host's board /
     of its replica of another gateway's board), or `none`."""
-    named = list(dict.fromkeys(NAMED_CARD_RE.findall(_named_or_ask_text(reply, user_ask))))
+    named = (list(dict.fromkeys(NAMED_CARD_RE.findall(_named_or_ask_text(reply, user_ask))))
+             or tail_card_ids(reply, tool_log, user_ask)[0])
     if not named:
         return "none"
     if any(_read_this_turn(cid, [l for l in tool_log or [] if (l or "").lstrip().startswith("<- OK")])
@@ -514,16 +562,11 @@ def _minus_turn_notes(facts: dict, tool_log: Optional[list]) -> dict:
 def queued_owner_facts(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None,
                        dbs: Optional[list] = None) -> list[dict]:
     """Board facts (this turn's comments not counted as stall notes) for ready/todo cards the reply's ending names
-    unquoted, up to NAMED_CARD_MAX, whether or not the turn read them. [] on any failure (fail-open)."""
+    unquoted (or, with no id, the cards the turn touched when it says "the card": `unnamed`), up to NAMED_CARD_MAX,
+    whether or not the turn read them. [] on any failure (fail-open)."""
     try:
-        tail = (reply or "")[-1500:]
-        ids: list[str] = []
-        for m in NAMED_CARD_RE.finditer(tail):
-            cid = m.group(0)
-            if cid not in ids and not _in_dquotes(tail, m.start()):
-                ids.append(cid)
-            if len(ids) >= NAMED_CARD_MAX:
-                break
+        ids, fallback = tail_card_ids(reply, tool_log)
+        ids = ids[:NAMED_CARD_MAX]
         if not ids:
             return []
         ar = _cache.load_sibling(_HERE, "agent_rules")
@@ -532,7 +575,8 @@ def queued_owner_facts(reply: str, tool_log: Optional[list] = None, now: Optiona
         for cid in ids:
             f = ar.board_card_facts(cid, now=now, dbs=dbs)
             if f and f.get("status") in ar.QUEUED_STATUSES and f.get("ready_since"):
-                out.append({**_minus_turn_notes(f, tool_log), "ready_for_s": int(now - f["ready_since"])})
+                out.append({**_minus_turn_notes(f, tool_log), "ready_for_s": int(now - f["ready_since"]),
+                            **({"unnamed": True} if fallback else {})})
         return out
     except Exception:
         return []
@@ -577,14 +621,16 @@ def stalled_queue_owner(reply: str, tool_log: Optional[list] = None, now: Option
     try:
         now = time.time() if now is None else now
         tail = (reply or "")[-1500:]
+        ar = _cache.load_sibling(_HERE, "agent_rules")
         for f in queued_owner_facts(reply, tool_log, now=now, dbs=dbs):
             cid = str(f["id"])
             if f.get("waits_on") or not _turn_comments(cid, tool_log):
                 continue
-            if f["ready_for_s"] < STALL_COMMENT_GRACE_S and not f.get("stall_notes"):
+            # agent-8381864e1e: inside the grace a first comment still counts, unless the queue won't reach the card
+            if f["ready_for_s"] < STALL_COMMENT_GRACE_S and not f.get("stall_notes") and not ar.deep_in_queue(f):
                 continue
             i = tail.find(cid)
-            window = tail[max(0, i - 250):i + len(cid) + 250]
+            window = tail if f.get("unnamed") else tail[max(0, i - 250):i + len(cid) + 250]
             if not STALL_WAIT_RE.search(window):
                 continue
             if _remedied(cid, tool_log, now, dbs):
@@ -596,7 +642,8 @@ def stalled_queue_owner(reply: str, tool_log: Optional[list] = None, now: Option
 
 
 def stall_telemetry(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None) -> dict:
-    """report_only_scored fields: the longest-queued named ready/todo card's queue age and earlier stall notes."""
+    """report_only_scored fields: the longest-queued named ready/todo card's queue age and earlier stall notes, and
+    the most ready cards ahead of any named ready card (owner_ahead)."""
     try:
         fs = queued_owner_facts(reply, tool_log, now=now)
     except Exception:
@@ -604,7 +651,11 @@ def stall_telemetry(reply: str, tool_log: Optional[list] = None, now: Optional[f
     if not fs:
         return {}
     f = max(fs, key=lambda x: x["ready_for_s"])
-    return {"owner_ready_for_s": f["ready_for_s"], "owner_stall_notes": int(f.get("stall_notes") or 0)}
+    out = {"owner_ready_for_s": f["ready_for_s"], "owner_stall_notes": int(f.get("stall_notes") or 0)}
+    aheads = [x["queue"]["ahead"] for x in fs if x.get("queue")]
+    if aheads:  # agent-8381864e1e: the deepest named ready card's queue position
+        out["owner_ahead"] = max(aheads)
+    return out
 
 
 def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = None, user_ask: str = "") -> str:
@@ -1801,7 +1852,8 @@ def wake_sources(session_id: str, tool_log: Optional[list] = None) -> list[str]:
 # agent-0bab362bcd: one clause shared by the report_only nudges and both report_only judges, so a card that can't run
 # fails the same bar at nudge time and at outcome time.
 STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible route, or ready and unclaimed for 30 min "
-                 "or more, or already commented on while it waited) is not a started fix, and another comment on it "
+                 "or more, or already commented on while it waited, or ready behind as many cards as there are worker "
+                 "slots) is not a started fix, and another comment on it "
                  "doesn't start it: do it in this chat if your model can, raise its priority (`hermes kanban edit "
                  "<id> --priority N`), or re-place it (`placement`) on a gateway with capacity, and say which.")
 
@@ -1814,7 +1866,12 @@ BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the co
                "status=, created= (card age), claimed= (newest claim, or never), "
                "run= (newest run state) and last=<age>(<event>); a ready or todo card also shows ready_for=<age> (time "
                "since it last entered the queue; comments don't reset it) and stall_notes=<n> (comments left on it "
-               "since then, before this turn). The named card is a started owner when it is "
+               "since then, before this turn); a ready card also shows prio=<priority> ahead=<n> (ready, unclaimed "
+               "cards on its board the dispatcher picks first) slots=<running>/<max_in_progress>. A message that "
+               "refers to \"the card\" without its id gets the line of the card this turn's tool calls touched: "
+               "that is the card it means. A ready card with ahead= at or above the slots max won't start soon: it "
+               "is waiting on capacity, not started, unless the turn raised its priority (`hermes kanban edit <id> "
+               "--priority N`), re-placed it or did the work. The named card is a started owner when it is "
                "running or claimed with its last event under 24 h; or ready or todo, created under 24 h ago, with "
                "no failed, crashed or timed_out run; or todo, scheduled or blocked on a dependency with `waits_on=` "
                "a parent that is running or claimed with activity under 24 h (the work is sequenced behind a started "
@@ -2544,9 +2601,17 @@ REPORT_ONLY_CARD_CLOSED = (
 CARD_CLOSED_TAIL = (" Your card is closed (kanban_complete ran this turn), so nothing wakes you. Finish now, in this turn "
                     "(wait on CI in the foreground with `wait_for_ci.py --timeout`, run the proof), or kanban_create "
                     "a follow-up card and name it. " + EXISTING_OWNER_ROUTE + " A done card owns nothing.")
+def _queue_clause(q: Optional[dict]) -> str:
+    """` (priority 0, 55 ready cards ahead of it, 7/7 worker slots busy)` for STALLED_QUEUE_NUDGE, or ""."""
+    if not q:
+        return ""
+    return (f" (priority {q['prio']}, {q['ahead']} ready card(s) ahead of it, {q['running']}/{q['max'] or '?'} "
+            "worker slots busy)")
+
+
 STALLED_QUEUE_NUDGE = (
     "[coach] Your message says the work waits on card {card}, but that card has sat {status} and unclaimed for {age} "
-    "with {notes} earlier comment(s) on it, and this turn only commented on it again: a comment doesn't start a card "
+    "with {notes} earlier comment(s) on it{queue}, and this turn only commented on it: a comment doesn't start a card "
     "that is waiting on capacity. Fix it this turn: do the work here if your model can, raise its priority "
     "(`hermes kanban edit {card} --priority N`), or re-place it (`placement`) on a gateway with capacity, then say "
     "which you did.")
@@ -2829,18 +2894,22 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         if stalled:  # deterministic: another stall comment on a card queued 30+ min or already nudged (agent-a0262d55e5)
             cid, age = str(stalled["id"]), _cache.load_sibling(_HERE, "agent_rules")._ago(stalled["ready_for_s"])
             notes = int(stalled.get("stall_notes") or 0)
-            ev = f"card {cid} {stalled['status']} and unclaimed for {age}, {notes} earlier comment(s); this turn only commented"
+            q = stalled.get("queue") or {}
+            ev = f"card {cid} {stalled['status']} and unclaimed for {age}, {notes} earlier comment(s)" + (
+                f", {q['ahead']} ready card(s) ahead" if q else "") + "; this turn only commented"
             if audit is not None:
                 try:
                     audit({"event": "report_only_scored", "source": "stalled_queue_owner", "final_p": 1.0,
                            "passing": True, "owner_ready_for_s": stalled["ready_for_s"], "owner_stall_notes": notes,
-                           "owner_card": cid})
+                           "owner_card": cid, **({"owner_ahead": q["ahead"]} if q else {}),
+                           **({"owner_unnamed": True} if stalled.get("unnamed") else {})})
                 except Exception:
                     pass  # telemetry never changes a verdict
             return {"rule": "report_only", "p": 1.0, "evidence": ev, "reason": "stalled_queue_owner",
                     **({"variant": "card_closed"} if closed else {}),
                     "verdict": {"report_only": 1.0, "report_only_src": "stalled_queue_owner", "evidence": ev},
-                    "nudge": STALLED_QUEUE_NUDGE.format(card=cid, status=stalled["status"], age=age, notes=notes)
+                    "nudge": STALLED_QUEUE_NUDGE.format(card=cid, status=stalled["status"], age=age, notes=notes,
+                                                        queue=_queue_clause(q))
                     + tail}
     if (not only or "status_only" in only) and not scoped:
         ev = status_only(user_ask, reply, tool_log)

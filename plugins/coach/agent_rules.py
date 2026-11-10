@@ -1778,6 +1778,58 @@ def queue_text(facts: dict, now: float) -> str:
     return f"ready_for={_ago(now - facts['ready_since'])} stall_notes={int(facts.get('stall_notes') or 0)}"
 
 
+# agent-8381864e1e: a ready card at priority 0 behind ~55 other ready cards sat 7 h while three replies called it the
+# started fix; a priority bump started it in 26 s. A ready card's facts carry `queue` = {prio, ahead, running, max}:
+# `ahead` counts ready, unclaimed cards on the same board the dispatcher picks first (priority DESC, created_at ASC),
+# `running` the board's running cards, `max` the host's kanban.max_in_progress (None when unknown).
+def max_in_progress_slots() -> Optional[int]:
+    """COACH_KANBAN_MAX_IN_PROGRESS (tests/replays; 0 = unknown), else core's resolved kanban.max_in_progress."""
+    raw = os.environ.get("COACH_KANBAN_MAX_IN_PROGRESS")
+    if raw is not None:
+        try:
+            return int(raw) if int(raw) > 0 else None
+        except ValueError:
+            return None
+    try:
+        from hermes_cli.kanban_db_dispatch import configured_max_in_progress, resolve_max_in_progress  # type: ignore
+        v = resolve_max_in_progress(configured_max_in_progress())
+        return int(v) if v and int(v) > 0 else None
+    except Exception:
+        return None
+
+
+def _queue_position(conn, card_id: str) -> Optional[dict]:
+    """{prio, ahead, running, max} for a ready card, read-only; None on any read failure (fail-open)."""
+    try:
+        row = conn.execute("select coalesce(priority, 0), created_at from tasks where id=?", (card_id,)).fetchone()
+        if not row:
+            return None
+        prio, created = int(row[0] or 0), row[1]
+        ahead = conn.execute(
+            "select count(*) from tasks where status='ready' and id<>? and coalesce(claim_lock,'')='' and "
+            "(coalesce(priority,0)>? or (coalesce(priority,0)=? and created_at<?))",
+            (card_id, prio, prio, created)).fetchone()[0]
+        running = conn.execute("select count(*) from tasks where status='running'").fetchone()[0]
+    except Exception:
+        return None
+    return {"prio": prio, "ahead": int(ahead), "running": int(running), "max": max_in_progress_slots()}
+
+
+def queue_position_text(facts: dict) -> str:
+    """`prio=<p> ahead=<n> slots=<running>/<max|?>` for a ready card whose position was read, else ""."""
+    q = facts.get("queue") if isinstance(facts, dict) else None
+    if not q:
+        return ""
+    return f"prio={q['prio']} ahead={q['ahead']} slots={q['running']}/{q['max'] or '?'}"
+
+
+def deep_in_queue(facts: dict) -> bool:
+    """A ready card with at least max_in_progress cards ahead of it: the dispatcher won't reach it soon. False when
+    the position or the slot count is unknown (fail-open)."""
+    q = facts.get("queue") if isinstance(facts, dict) else None
+    return bool(q and q.get("max") and q["ahead"] >= q["max"])
+
+
 def board_card_facts(card_id: str, now: Optional[float] = None, dbs: Optional[list] = None) -> Optional[dict]:
     """A card's state on this host's boards as of `now` (events after `now` are ignored, for replays):
     {id, status, created_at, claimed_at, last_kind, last_at, run, run_failed, waits_on: [(id, status, age_s)],
@@ -1848,8 +1900,9 @@ def _card_facts_in(card_id: str, now: float, paths: list, replica: bool) -> Opti
                     ready_since, notes = queue_facts_from_events([(str(k), _ts(t)) for k, t in qs], now)
                 except Exception:
                     ready_since, notes = None, 0
+            queue = _queue_position(conn, card_id) if str(row[0]) == "ready" else None
             return {"id": card_id, "status": str(row[0]), "created_at": _ts(row[1]),
-                    "ready_since": ready_since, "stall_notes": notes,
+                    "ready_since": ready_since, "stall_notes": notes, "queue": queue,
                     "claimed_at": _ts(cl[0]) if cl and cl[0] else None,
                     "last_kind": str(ev[0]) if ev else None, "last_at": _ts(ev[1]) if ev else None,
                     "run": run_state, "run_failed": bool(run_state and _FAILED_RUN_RE.search(run_state)),
@@ -1943,6 +1996,9 @@ def board_fact_line(facts: dict, now: Optional[float] = None) -> str:
     qt = queue_text(facts, now)
     if qt:
         parts.append(qt)
+    qp = queue_position_text(facts)
+    if qp:
+        parts.append(qp)
     pr = probe_text(facts)
     if pr:
         parts.append(pr)

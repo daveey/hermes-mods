@@ -967,7 +967,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 return None
             nid = _new_nudge_id()
             try:  # signals.same_item: ids of the paragraph the evidence quotes (agent-61b50f34ae)
-                item_ids = rc.evidence_ids(final_response, hit.get("evidence") or "", user_ask=ask)
+                item_ids = rc.evidence_ids(final_response, hit.get("evidence") or "", tool_log=log_lines,
+                                           user_ask=ask)
             except Exception:
                 item_ids = []
             out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"], "nudge_id": nid,
@@ -1056,7 +1057,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                    confirm_floor=rc.CONFIRM_FLOOR, human_confirm_floor=rc.human_confirm_floor(plat),
                                    report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK))
             try:
-                out_ids = rc.evidence_ids(final_response, res.get("evidence") or "", user_ask=ask) if res.get("evidence") else []
+                out_ids = (rc.evidence_ids(final_response, res.get("evidence") or "", tool_log=log_lines,
+                                          user_ask=ask)
+                           if res.get("evidence") else [])
             except Exception:
                 out_ids = []
             _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
