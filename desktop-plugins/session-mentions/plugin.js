@@ -81,7 +81,7 @@ const tokenize = text =>
     .filter(Boolean)
 
 /** 0 = no match; higher is better. Every query token must hit the title (word-prefix beats
- *  substring); preview, gateway name, and id are weaker fallbacks. */
+ *  substring, which may start mid-word); preview, gateway name, and id are weaker fallbacks. */
 export function score(row, query) {
   const q = tokenize(query)
   if (!q.length) return 0
@@ -92,7 +92,7 @@ export function score(row, query) {
   let total = 0
   for (const t of q) {
     if (words.some(w => w.startsWith(t))) total += 3
-    else if (t.length >= 3 && title.includes(t)) total += 2
+    else if (t.length >= 2 && title.includes(t)) total += 2 // mid-word: `ahead` → "typeahead"
     else if (gw.some(w => w.startsWith(t))) total += 1
     else if (t.length >= 3 && preview.includes(t)) total += 1
     else if (String(row.id).toLowerCase().startsWith(t)) total += 1
@@ -1111,7 +1111,10 @@ export function sessionItems(rows, rawQuery, { active = 'local', conns = [], exc
   const picked = !q.trim()
     ? [...candidates].sort(recency).slice(0, MAX_RECENT)
     : candidates
-        .map(row => ({ row, s: score(row, q) }))
+        // A multi-word query is a name being typed across spaces (`@baby bear`): its words must hit
+        // the title/gateway/id, not the preview, or ordinary prose after `@name ` would keep matching
+        // some transcript and hold the popover (and Enter) open.
+        .map(row => ({ row, s: score(/\s/.test(q.trim()) ? { ...row, preview: '' } : row, q) }))
         .filter(x => x.s > 0)
         .sort((a, b) => b.s - a.s || recency(a.row, b.row))
         .slice(0, MAX_MATCHES)
@@ -1648,6 +1651,8 @@ export default {
           const status = fetchStatus(rowCache, rowInflight, rowErrors, conns)
           return sessionItems(cachedRows(), query, { active: activeConnectionId(conns), conns, exclude: focusedIds(), status })
         },
+        // Titles have spaces: core keeps the popover open across one while rows still match.
+        multiWord: true,
         subscribe: subscribeRows
       }
     })
@@ -1662,6 +1667,7 @@ export default {
           const status = fetchStatus(taskCache, taskInflight, taskErrors, conns)
           return taskItems(cachedTasks(), query, { active: activeConnectionId(conns), conns, status })
         },
+        multiWord: true,
         subscribe: subscribeRows
       }
     })
