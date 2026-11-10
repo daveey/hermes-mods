@@ -82,20 +82,42 @@ const tokenize = text =>
 
 /** 0 = no match; higher is better. Every query token must hit the title (word-prefix beats
  *  substring, which may start mid-word); preview, gateway name, and id are weaker fallbacks. */
-export function score(row, query) {
-  const q = tokenize(query)
+// Typeahead scores every cached row (tens of thousands across gateways) on each keystroke, so
+// each row's lowercased/tokenized fields are computed once and kept until the row object goes.
+const prepCache = new WeakMap()
+function prepared(row) {
+  let p = prepCache.get(row)
+  if (!p) {
+    p = {
+      title: (row.title || '').toLowerCase(),
+      // ' w1 w2 …': `includes(' ' + t)` is a word-prefix test without a closure per word.
+      words: ` ${tokenize(row.title).join(' ')}`,
+      preview: (row.preview || '').toLowerCase(),
+      gw: ` ${tokenize(row._gwLabel).join(' ')}`,
+      id: String(row.id).toLowerCase()
+    }
+    prepCache.set(row, p)
+  }
+  return p
+}
+let lastQuery = { raw: null, tokens: [] }
+const queryTokens = query => {
+  if (lastQuery.raw !== query) lastQuery = { raw: query, tokens: tokenize(query) }
+  return lastQuery.tokens
+}
+
+export function score(row, query, { noPreview = false } = {}) {
+  const q = queryTokens(query)
   if (!q.length) return 0
-  const title = (row.title || '').toLowerCase()
-  const words = tokenize(row.title)
-  const preview = (row.preview || '').toLowerCase()
-  const gw = tokenize(row._gwLabel)
+  const { title, words, gw, id } = prepared(row)
+  const preview = noPreview ? '' : prepared(row).preview
   let total = 0
   for (const t of q) {
-    if (words.some(w => w.startsWith(t))) total += 3
+    if (words.includes(` ${t}`)) total += 3
     else if (t.length >= 2 && title.includes(t)) total += 2 // mid-word: `ahead` → "typeahead"
-    else if (gw.some(w => w.startsWith(t))) total += 1
+    else if (gw.includes(` ${t}`)) total += 1
     else if (t.length >= 3 && preview.includes(t)) total += 1
-    else if (String(row.id).toLowerCase().startsWith(t)) total += 1
+    else if (id.startsWith(t)) total += 1
     else return 0
   }
   if (title.startsWith(q.join(' '))) total += 2
@@ -497,10 +519,16 @@ async function allRows(force = false) {
   return dedupeRows(lists.flat())
 }
 
+// Merged + deduped rows, rebuilt only when some connection's row list is replaced: provide()
+// runs on every keystroke and re-merging ~30k rows each time cost tens of ms.
+let mergedRows = { lists: [], rows: [] }
 function cachedRows() {
+  const lists = [...rowCache.values()].map(e => e.rows)
+  if (lists.length === mergedRows.lists.length && lists.every((l, i) => l === mergedRows.lists[i])) return mergedRows.rows
   const out = []
-  for (const { rows } of rowCache.values()) out.push(...rows)
-  return dedupeRows(out)
+  for (const rows of lists) out.push(...rows)
+  mergedRows = { lists, rows: dedupeRows(out) }
+  return mergedRows.rows
 }
 
 export const CHANGE_DEBOUNCE_MS = 400
@@ -1091,6 +1119,24 @@ export function statusItems(status, kind, prefix) {
   return items
 }
 
+/** The `limit` best rows by score (ties: `tiebreak`), without sorting every match: a short query
+ *  can match thousands of rows and this runs per keystroke. Exported for tests. */
+export function topMatches(rows, scoreOf, tiebreak, limit) {
+  const top = [] // ascending by rank: top[0] is the weakest kept
+  const worse = (a, b) => a.s < b.s || (a.s === b.s && tiebreak(a.row, b.row) > 0)
+  for (const row of rows) {
+    const s = scoreOf(row)
+    if (s <= 0) continue
+    const hit = { row, s }
+    if (top.length === limit && !worse(top[0], hit)) continue
+    if (top.length === limit) top.shift()
+    let i = 0
+    while (i < top.length && worse(top[i], hit)) i++
+    top.splice(i, 0, hit)
+  }
+  return top.reverse().map(x => x.row)
+}
+
 export function sessionItems(rows, rawQuery, { active = 'local', conns = [], exclude = new Set(), now = Date.now(), status = null } = {}) {
   const query = String(rawQuery || '')
   const lower = query.toLowerCase()
@@ -1104,21 +1150,17 @@ export function sessionItems(rows, rawQuery, { active = 'local', conns = [], exc
   const q = scoped ? query.slice('session:'.length) : query
   if (!scoped && q.length < 2) return items
 
-  const multi = new Set(rows.map(r => r._conn)).size > 1 || conns.length > 1
-  const candidates = rows.filter(r => r && r.id && !(r._conn === active && exclude.has(r.id)))
+  const multi = conns.length > 1 || rows.some(r => r._conn !== rows[0]._conn)
+  const keep = r => r && r.id && !(r._conn === active && exclude.has(r.id))
   const recency = (a, b) => Number(b.last_active || b.started_at || 0) - Number(a.last_active || a.started_at || 0)
 
+  const opts = { noPreview: /\s/.test(q.trim()) }
   const picked = !q.trim()
-    ? [...candidates].sort(recency).slice(0, MAX_RECENT)
-    : candidates
-        // A multi-word query is a name being typed across spaces (`@baby bear`): its words must hit
-        // the title/gateway/id, not the preview, or ordinary prose after `@name ` would keep matching
-        // some transcript and hold the popover (and Enter) open.
-        .map(row => ({ row, s: score(/\s/.test(q.trim()) ? { ...row, preview: '' } : row, q) }))
-        .filter(x => x.s > 0)
-        .sort((a, b) => b.s - a.s || recency(a.row, b.row))
-        .slice(0, MAX_MATCHES)
-        .map(x => x.row)
+    ? rows.filter(keep).sort(recency).slice(0, MAX_RECENT)
+    : // A multi-word query is a name being typed across spaces (`@baby bear`): its words must hit
+      // the title/gateway/id, not the preview, or ordinary prose after `@name ` would keep matching
+      // some transcript and hold the popover (and Enter) open.
+      topMatches(rows, row => (keep(row) ? score(row, q, opts) : 0), recency, MAX_MATCHES)
 
   for (const row of picked) {
     const bits = ['Session']
