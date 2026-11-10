@@ -75,6 +75,13 @@ Hand it over only when it can't.
   ONE human step: "click OK, then type the password in the window that opens". The job waits `awaiting_consent` and
   opens the window by itself after the click (retries every 15 s until max wait). Keep waiting with its `job_id`;
   never add "unblock the card" or "reply done" so an agent retries (coach `consent_relay` holds that reply).
+- When the user answers "done" on a password/prompt step but the result is still absent, don't just re-ask. First check
+  that their input actually reached the prompt: look for auth attempts (`log show --last 60m --predicate 'process ==
+  "sudo"'`), and `sample` the app hosting the prompt. Terminal.app whose main thread sits in
+  `CA::Context::commit_transaction` at 0% CPU (and `open -a Terminal` fails with -1712) is hung and swallows every
+  keystroke; the user sees a beachball. If `ps -t <tty>` shows the stuck prompt is its only session, kill Terminal,
+  reopen the same `.command` file with `open`, confirm a fresh `sample` is idle in `_BlockUntilNextEventMatchingListInMode`,
+  then ask once more for the password in the new window.
 
 ## Inbox posts
 
