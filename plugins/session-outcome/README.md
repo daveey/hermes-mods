@@ -8,7 +8,10 @@ the outcome and feeds core the two things only plugins know: open user decisions
 
 - **Tool `session_outcome`.** It is offered only in desktop, tui and cli chats (a no-cache `check_fn`; the handler
   also refuses other session sources), and only when core has `hermes_state_outcome`.
-  - `{"kind": "done", "summary": "..."}` declares `{"kind": "done", "summary"}`.
+  - `{"kind": "done", "summary": "..."}` declares completion. On a core with cron ownership lifecycle support,
+    this releases ownership of live crons without stopping them or changing their schedules/delivery. The result
+    names `released_crons`; `cron_release_error` reports partial failures. Add `"keep_crons": true` for a continuing
+    watch whose chat should retain ownership. Older cores return an explicit unsupported-release note.
   - `{"kind": "decide", "items": [{"question", "choices": [≥2 {"label", "value"}], "card_id"?}]}` writes each
     question into the user-steps ledger with `add_step` (a `choose` step whose labels become its buttons), then
     declares `{"kind": "decision", "items": [{id, question, choices, state: "open", card_id?}]}`. Nothing is
@@ -69,6 +72,10 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - Off switch: `HERMES_SESSION_OUTCOME_OFF=1`. Kanban workers and subagents are skipped.
 
 ## Tests
+
+`tests/test_real_core.py::test_done_cron_lifecycle_against_real_core` exercises the plugin handler with real
+core storage for default release, explicit retention and corrupt-store error forwarding. The fake-core tests
+also cover receipt passthrough and the older-core warning. Actual Desktop rendering is a separate rollout check.
 
 `tests/test_session_outcome.py`, with a fake `hermes_state_outcome` that records calls (contract signatures):
 
