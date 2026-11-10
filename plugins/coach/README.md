@@ -935,6 +935,15 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   histories for message/guard edits, absent/broken digests, wrong file/function/message, time bounds and session
   policy isolation. This intentionally does not infer fixes from arbitrary nearby code, dynamic messages or outer
   guards.
+- **Session fixes in either repo:** `session_commit_fix` searches `origin/main` of the fork (`COACH_FORK_REPO`) and
+  hermes-mods (`COACH_MODS_REPO`, default `~/code/hermes-mods`): plugin and desktop-plugin fixes land in the second.
+  A sha the session named in its full reply to the complaint (this host's `state.db`, from the complaint to the
+  next user message) is adopted when the commit names the defect or touches the component's code
+  (`COMPONENT_PATHS`, desktop = `apps/desktop/` or `desktop-plugins/`); a sha named only in a later turn is not.
+  Sessions not in the local `state.db` fall back to the digest, whose `last_reply` is clipped. A window `fix…`
+  candidate must touch the component's paths, not just say its name in the subject. A `fixed`/`not_defect` event
+  citing a commit older than the lane's filed card logs `selfheal_late_adopt` (`status` → `late_adopt`): the
+  "already fixed?" check missed it. Tests: `tests/test_session_commit_mods.py` (defect desktop-9077b82c2d).
 - **SQLite incidents:** `database disk image is malformed`, `KanbanDbCorruptError`, and `file is not a database`
   share a fingerprint by source host, normalized DB path and UTC event-hour. Explicit `db_path` wins, then a path
   in evidence; pathless Kanban tracebacks default to `~/.hermes/kanban.db`. Other pathless SQLite errors are not

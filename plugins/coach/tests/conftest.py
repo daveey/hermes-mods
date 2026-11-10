@@ -303,3 +303,5 @@ def _no_system_one_network(monkeypatch, tmp_path):
     # upstream `fix(<component>): ...` commit near a fixture's NOW gets "adopted" and the test's outcome depends on
     # whatever the fork has fetched. Point it at a missing repo; tests that exercise it build their own repo.
     monkeypatch.setenv("COACH_FORK_REPO", str(tmp_path / "no-fork-repo"))
+    # Same for hermes-mods (session_commit_fix and selfheal_late_adopt also read ~/code/hermes-mods).
+    monkeypatch.setenv("COACH_MODS_REPO", str(tmp_path / "no-mods-repo"))

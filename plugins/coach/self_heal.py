@@ -2612,6 +2612,69 @@ def _fork_repo() -> Path:
     return Path(os.environ.get("COACH_FORK_REPO") or Path.home() / ".hermes" / "hermes-agent")
 
 
+def _mods_repo() -> Path:
+    """hermes-mods: plugin, desktop-plugin and skill fixes land here, not in the fork (desktop-9077b82c2d)."""
+    return Path(os.environ.get("COACH_MODS_REPO") or Path.home() / "code" / "hermes-mods")
+
+
+def _fix_repos(repo: Optional[Path] = None) -> list:
+    """Repos a session's fix can land in: an explicit `repo` alone, else the fork and hermes-mods."""
+    if repo:
+        return [Path(repo)]
+    out = []
+    for r in (_fork_repo(), _mods_repo()):
+        if r not in out:
+            out.append(r)
+    return out
+
+
+# A commit is a fix for a component only if its diff touches that component's code. A subject word is no proof:
+# `fix(desktop): an inline update report...` (gateway code) matched, `fix(session-panel)` (desktop-plugins/) didn't.
+COMPONENT_PATHS = {"desktop": ("apps/desktop/", "desktop-plugins/")}
+
+
+def _commit_files(repo: Path, sha: str) -> list:
+    return _git_lines(repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", sha)
+
+
+def _commit_in_component(repo: Path, sha: str, subject: str, comp: str) -> bool:
+    """Window candidate selection: the diff touches COMPONENT_PATHS[comp]; a component with no path map falls back
+    to its name as a word in the subject."""
+    paths = COMPONENT_PATHS.get(comp)
+    if paths:
+        return any(f.startswith(p) for f in _commit_files(repo, sha) for p in paths)
+    return bool(comp) and bool(re.search(r"\b%s\b" % re.escape(comp), subject.lower()))
+
+
+def _complaint_reply_text(sid: str, since: float) -> Optional[str]:
+    """The assistant's full reply to the complaint (messages after `since` up to the next user message) from this
+    host's state.db; None when the session is not there (another host's session: use its digest). The coach digest's
+    last_reply is clipped and is the session's LAST reply, so a fix sha named while answering the complaint was lost
+    in it (desktop-9077b82c2d: "…[clipped" cut before f986de8c)."""
+    import sqlite3
+    db = hermes_home() / "state.db"
+    if not sid or not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            if not con.execute("SELECT 1 FROM messages WHERE session_id=? LIMIT 1", (sid,)).fetchone():
+                return None
+            rows = con.execute("SELECT role, timestamp, content FROM messages WHERE session_id=? AND timestamp>? "
+                               "AND role IN ('user','assistant') ORDER BY timestamp, id", (sid, since - 2)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    out = []
+    for role, ts, content in rows:
+        if role == "user" and (ts or 0) > since + 2:  # the next user turn ends the complaint's reply
+            break
+        if role == "assistant" and content:
+            out.append(str(content))
+    return "\n".join(out)
+
+
 def _git_lines(repo: Path, *args: str) -> list:
     import subprocess
     try:
@@ -2696,16 +2759,44 @@ def _commit_binds_defect(repo: Path, sha: str, subject: str, d: dict) -> bool:
 
 def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo: Optional[Path] = None,
                        now: Optional[float] = None) -> Optional[dict]:
-    """A fix the origin session shipped as a bare commit (no kanban card): a commit on the fork's origin/main made
-    after `since` that is bound to THIS defect (_commit_binds_defect) and either (a) the session's digest names by
-    sha, or (b) landed inside the session's active window (since .. last_activity_at + slack) as a `fix` whose
-    subject names the defect's component, e.g. `fix(desktop): ...`. Window and component only select candidates;
-    without defect-bound proof the defect stays unresolved (a session can report several defects, and a nearby fix
-    for another one proves nothing). -> {sha, at, subject, via} or None."""
+    """A fix the origin session shipped as a bare commit (no kanban card): a commit on origin/main of the fork or
+    hermes-mods (_fix_repos; an explicit `repo` alone) made after `since` and either
+    (a) named by sha in the session's reply to the complaint (full transcript in this host's state.db) and bound to
+        the defect by _commit_binds_defect or by touching the component's code (COMPONENT_PATHS): answering the
+        complaint with that commit is the defect binding;
+    (b) named in the session's digest (other hosts' sessions; a clipped, whole-session summary) and bound by
+        _commit_binds_defect; or
+    (c) landed inside the session's active window (since .. last_activity_at + slack) as a `fix` whose diff touches
+        the component (_commit_in_component) and is bound by _commit_binds_defect.
+    Window and component only select candidates; without defect-bound proof the defect stays unresolved (a session
+    can report several defects, and a nearby fix for another one proves nothing). -> {sha, at, subject, via}|None."""
     sid, host, comp = d.get("session_id"), d.get("host"), (d.get("component") or "").lower()
     root = Path(data) if data else Path(os.environ.get("COACH_DATA") or Path.home() / "code" / "hermes-coach-data")
     paths = (sorted(root.glob(f"{host}/*/{sid}.json")) if host else sorted(root.glob(f"*/*/{sid}.json"))) if sid else []
-    repo = Path(repo) if repo else _fork_repo()
+    repos = _fix_repos(repo)
+    reply = _complaint_reply_text(sid, since) if sid else None
+
+    cache: dict = {}
+
+    def history(r: Path) -> list:  # (sha, committer ts, subject) on origin/main since the complaint; lazy, cached
+        if r not in cache:
+            out = []
+            for ln in _git_lines(r, "log", "origin/main", f"--since={int(since)}", "--format=%H\t%ct\t%s"):
+                sha, _, rest = ln.partition("\t")
+                ts, _, subj = rest.partition("\t")
+                if ts.isdigit() and int(ts) > since:
+                    out.append((sha, int(ts), subj))
+            cache[r] = out
+        return cache[r]
+
+    if reply is not None:
+        named = set(_SHA.findall(reply))
+        for r in (repos if named else []):
+            for sha, ts, subj in history(r):
+                if any(sha.startswith(n) for n in named) and (
+                        _commit_binds_defect(r, sha, subj, d) or
+                        (comp in COMPONENT_PATHS and _commit_in_component(r, sha, subj, comp))):
+                    return {"sha": sha, "at": ts, "subject": subj, "via": "named", "repo": str(r)}
     has_digest = False
     for path in paths:
         try:
@@ -2716,26 +2807,26 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
             continue
         has_digest = True
         until = (dg.get("last_activity_at") or since) + SESSION_COMMIT_SLACK_S
-        commits = []  # (sha, committer ts, subject) on origin/main since the complaint
-        for ln in _git_lines(repo, "log", "origin/main", f"--since={int(since)}", "--format=%H\t%ct\t%s"):
-            sha, _, rest = ln.partition("\t")
-            ts, _, subj = rest.partition("\t")
-            if ts.isdigit() and int(ts) > since:
-                commits.append((sha, int(ts), subj))
-        text = " ".join([str(dg.get("last_reply") or "")] + [str(t.get(k) or "") for t in dg.get("user_turns") or []
-                                                            if (t.get("t") or 0) > since for k in ("prev", "text")])
-        named = set(_SHA.findall(text))
-        for sha, ts, subj in commits:
-            if any(sha.startswith(n) for n in named) and _commit_binds_defect(repo, sha, subj, d):
-                return {"sha": sha, "at": ts, "subject": subj, "via": "named"}
-        for sha, ts, subj in sorted(commits, key=lambda c: c[1]):
-            head = subj.lower()
-            if ts <= until and head.startswith("fix") and comp and re.search(r"\b%s\b" % re.escape(comp), head):
-                if not _commit_binds_defect(repo, sha, subj, d):
-                    continue
-                return {"sha": sha, "at": ts, "subject": subj, "via": "window"}
+        if reply is None:
+            text = " ".join([str(dg.get("last_reply") or "")] + [str(t.get(k) or "") for t in dg.get("user_turns") or []
+                                                                if (t.get("t") or 0) > since for k in ("prev", "text")])
+            named = set(_SHA.findall(text))
+            for r in repos:
+                for sha, ts, subj in history(r):
+                    if any(sha.startswith(n) for n in named) and _commit_binds_defect(r, sha, subj, d):
+                        return {"sha": sha, "at": ts, "subject": subj, "via": "named", "repo": str(r)}
+        for r in repos:
+            for sha, ts, subj in sorted(history(r), key=lambda c: c[1]):
+                if ts <= until and subj.lower().startswith("fix") and _commit_in_component(r, sha, subj, comp):
+                    if not _commit_binds_defect(r, sha, subj, d):
+                        continue
+                    return {"sha": sha, "at": ts, "subject": subj, "via": "window", "repo": str(r)}
     if not has_digest:
-        return _traceback_commit_fix(d, since, repo, time.time() if now is None else now)
+        tnow = time.time() if now is None else now
+        for r in repos:
+            fix = _traceback_commit_fix(d, since, r, tnow)
+            if fix:
+                return fix
     return None
 
 
@@ -3788,6 +3879,51 @@ def resolve_event_card(card: str, st: dict) -> str:
     return st.get("card") or st.get("fix_card") or ""
 
 
+def _log_late_adopt(store, fp: str, st: dict, note: str, now: float) -> Optional[dict]:
+    """Detection for adoption misses: a filed card closed as fixed/not_defect citing a commit that landed BEFORE the
+    card was filed means the lane's "already fixed?" check (session_commit_fix) missed an existing fix and the lane
+    paid for a card to rediscover it (desktop-9077b82c2d: f986de8c, then a filed investigation 47 h later). Logs
+    `selfheal_late_adopt`; `status` counts them (late_adopt_counts)."""
+    filed_at = st.get("filed_at")
+    if not filed_at or not st.get("card"):
+        return None
+    try:
+        for sha in fix_shas(note):
+            for r in _fix_repos():
+                ct = _git_lines(r, "show", "-s", "--format=%H\t%ct", sha)
+                full, _, ts = (ct[0] if ct else "").partition("\t")
+                if ts.isdigit() and int(ts) < float(filed_at):
+                    rec = {"event": "selfheal_late_adopt", "fingerprint": fp, "card": st.get("card"),
+                           "commit": full, "commit_at": int(ts), "filed_at": float(filed_at), "repo": str(r),
+                           "late_s": round(float(filed_at) - int(ts))}
+                    store.log(rec)
+                    return rec
+    except Exception as exc:  # detection only: never block recording the event
+        store.log({"event": "selfheal_late_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
+    return None
+
+
+def late_adopt_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
+    """selfheal_late_adopt events over `days` (status): filed cards whose fix predated them."""
+    root = Path(root) if root is not None else coach_root()
+    since = (time.time() if now is None else now) - days * 86400
+    fps = []
+    try:
+        with (root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if '"selfheal_late_adopt"' not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("event") == "selfheal_late_adopt" and float(r.get("ts") or 0) >= since:
+                    fps.append(r.get("fingerprint"))
+    except OSError:
+        pass
+    return {"late_adopt": len(fps), "days": days, "fingerprints": sorted(set(f for f in fps if f))}
+
+
 def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None,
                  owner: str = "", result: str = "", require_known: bool = False) -> dict:
     """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>.
@@ -3848,6 +3984,8 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     if kind in ("not_defect", "declined"):
         kw["closed_at"] = now
     e = lane.update(fp, **kw)
+    if kind in ("fixed", "not_defect"):
+        _log_late_adopt(store, fp, st, note, now)
     store.log({"event": f"selfheal_{kind}", "fingerprint": fp, "card": card or e.get("card"),
                "component": e.get("component"), "note": note[:300], "recurrence": bool(e.get("recurrences")),
                **({"cron_check": cron_check} if cron_check else {}),
@@ -4232,6 +4370,7 @@ def main(argv=None) -> int:
                           "held_total": sum(len(v.get("held") or []) for v in st.values()),
                           "handoff_nudges": handoff_nudge_counts(),
                           "nudges": nudge_counts(),
+                          "late_adopt": late_adopt_counts(),
                           "deploy_grace_hours": deploy_grace_s() / 3600}, indent=1))
     return 0
 

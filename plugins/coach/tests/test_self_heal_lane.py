@@ -1730,7 +1730,7 @@ def test_file_fix_reserves_fix_budget_by_default(store, monkeypatch):
 
 
 # ── the origin session fixed it with a bare commit (no card): record fixed, file nothing ──
-def _fork_repo_with_commit(tmp_path, subject, ts):
+def _fork_repo_with_commit(tmp_path, subject, ts, path="apps/desktop/f"):
     import subprocess
     repo = tmp_path / "fork"
     repo.mkdir()
@@ -1738,8 +1738,10 @@ def _fork_repo_with_commit(tmp_path, subject, ts):
            "GIT_COMMITTER_EMAIL": "t@t", "GIT_AUTHOR_DATE": f"{int(ts)} +0000", "GIT_COMMITTER_DATE": f"{int(ts)} +0000"}
     g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True, env=env)
     g("init", "-q", "-b", "main")
-    (repo / "f").write_text("x")
-    g("add", "f")
+    # A desktop path by default: a window `fix` counts for component desktop only if its diff touches desktop code.
+    (repo / path).parent.mkdir(parents=True, exist_ok=True)
+    (repo / path).write_text("x")
+    g("add", path)
     g("commit", "-q", "-m", subject)
     g("update-ref", "refs/remotes/origin/main", "HEAD")
     return repo, g("rev-parse", "HEAD").stdout.strip()
