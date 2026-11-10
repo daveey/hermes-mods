@@ -64,6 +64,14 @@ asking you directly (and operator sessions outside Slack) skip approval.
 
 ## Engaged channels (follower)
 
+Operator recovery: repeated identical follower failures now persist a retry budget (three failures →
+5-minute exponential backoff, capped at one hour) and emit one `SLACK_FOLLOW_STALLED` self-heal signal.
+Read the diagnostic head, not a workspace-restore banner. Existing sessions must resume by stored ID
+without creation-policy overrides; research-model selection applies to new sessions only. Verify the
+running ticker was replaced after deployment: rediscovery alone is not activation proof. See the
+plugin's `FOLLOW-RECOVERY.md`. When preserving queued work after temporary maintenance, use the
+engagement store's `set_state(id, 'active')`; the user-facing `resume` operation skips paused backlog.
+
 A Hermes session can *engage* the bot in a channel or one thread (`slack_engage`). From then on every
 message there goes to a **follower** agent (a separate profile with the owner's context, one
 long-lived session per engagement) and the ambient bot stays out, so each message gets at most one

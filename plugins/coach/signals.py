@@ -454,6 +454,16 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             lease_lines[r["sid"]] = f"{r['level']} {r['logger']}: {r['msg']}"
         if SKIP_LOGGERS.match(r["logger"]) or i in held:
             continue
+        stalled = re.match(r"^SLACK_FOLLOW_STALLED engagement=(eng_[0-9a-f]+) fingerprint=([0-9a-f]{64}) failures=(\d+) rc=(-?\d+):", r["msg"])
+        if (stalled and r["level"] == "ERROR"
+                and r["logger"] == "hermes_plugins.slack_workspace.follow"):
+            eid, fingerprint, count, rc = stalled.groups()
+            out.append({"kind": "errors", "component": "plugin", "at": r["at"],
+                        "session_id": r["sid"], "profile": prof,
+                        "symptom": f"Slack follower {eid} stalled: {count} identical failures rc={rc}; backing off",
+                        "details": home_tilde("\n".join([r["msg"]] + r["cont"]))[:1500],
+                        "fp": fp("plugin", "slack-follow", host, prof, eid, fingerprint)})
+            continue
         hm = HOOK_RE.match(r["msg"])
         if hm:
             surface, hook, cb, err = hm.groups()

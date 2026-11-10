@@ -168,7 +168,7 @@ def test_runner_kickoff_then_one_turn_per_batch_and_watermark(env):
     assert len(spawned) == 2
 
 
-def test_runner_failed_turn_does_not_spin_and_keeps_work_for_the_next_tick(env):
+def test_runner_failed_turn_does_not_spin_and_keeps_work_for_the_next_tick(env, monkeypatch):
     store, engs, _, _ = env
     e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
     calls = []
@@ -180,6 +180,8 @@ def test_runner_failed_turn_does_not_spin_and_keeps_work_for_the_next_tick(env):
                       root_home=store.root, spawn=bad)
     assert not r.run_once(e["id"])  # kickoff failed: stop, the tick retries
     assert engs.get(e["id"])["kickoff"] == 1
+    next_tick = time.time() + 61
+    monkeypatch.setattr(follow.time, "time", lambda: next_tick)
     engs.update(e["id"], kickoff=0)
     rec(store, "C1", "2.0", "hello")
     assert not r.run_once(e["id"])
@@ -204,6 +206,92 @@ def test_spawn_env_points_hermes_home_at_the_gateway_root(env, monkeypatch, tmp_
     r._spawn(e, "hi")
     assert seen["env"]["HERMES_HOME"] == str(tmp_path)
     assert seen["cmd"][seen["cmd"].index("-p") + 1] == "slack-follow"
+
+
+@pytest.mark.parametrize("kind", ["kickoff", "note", "batch"])
+def test_failure_backoff_survives_restart_and_signals_once(env, monkeypatch, caplog, kind):
+    store, engs, _, _ = env
+    now = [1000.0]
+    monkeypatch.setattr(follow.time, "time", lambda: now[0])
+    e = engs.create("C1", "x", private=True, last_handled_ts="1.0")
+    if kind != "kickoff":
+        engs.update(e["id"], kickoff=0)
+    if kind == "note":
+        engs.add_note(e["id"], "result", final=True)
+    if kind == "batch":
+        rec(store, "C1", "2.0", "hello")
+    calls = []
+    def failed(*a, **kw):
+        calls.append(1)
+        return 2, "Error: frozen policy mismatch\n" + "banner\n" * 300
+    def runner():
+        return follow.Runner(store, engs, token=lambda: "x", bot_user_id=lambda: BOTSELF,
+                             name=str, root_home=store.root, spawn=failed)
+    for _ in range(3):
+        assert not runner().run_once(e["id"])
+        now[0] += 60
+    assert len(calls) == 3
+    for _ in range(3):
+        assert not runner().run_once(e["id"])
+    assert len(calls) == 3
+    now[0] += 300
+    assert not runner().run_once(e["id"])
+    assert len(calls) == 4
+    assert caplog.text.count("SLACK_FOLLOW_STALLED") == 1
+    assert "Error: frozen policy mismatch" in caplog.text
+    assert engs.get(e["id"])["last_handled_ts"] == "1.0"
+    now[0] += 3600
+    r = runner()
+    r.spawn = lambda *a, **kw: (0, "session_id: s1")
+    assert r.run_once(e["id"])
+    assert engs.turn_failure(e["id"]) is None
+
+
+def test_spawn_resume_keeps_frozen_policy_and_error_head(env, monkeypatch):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    e = engs.update(e["id"], follower_session="session-existing")
+    seen = []
+    def run(cmd, **kw):
+        seen.append(cmd)
+        return type("Result", (), {"returncode": 2, "stdout": "banner" * 500,
+                                    "stderr": "Error: real failure\n" + "detail" * 500})()
+    monkeypatch.setattr(follow.subprocess, "run", run)
+    r = make_runner(store, engs, [])
+    rc, out = r._spawn(e, "probe", model="research-model")
+    assert rc == 2 and out.startswith("Error: real failure")
+    assert "--resume" in seen[0] and "session-existing" in seen[0]
+    assert not {"-m", "--yolo", "--pass-session-id", "--create-if-missing", "-c"} & set(seen[0])
+
+
+def test_failure_budget_caps_delay_and_rearms_for_new_error(env):
+    _, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    states = [engs.record_turn_failure(e["id"], "same", 1000.0) for _ in range(20)]
+    assert sum(s["signal"] for s in states) == 1
+    assert states[-1]["next_at"] == 4600.0
+    changed = engs.record_turn_failure(e["id"], "different", 1000.0)
+    assert changed == {"consecutive": 1, "next_at": 1060.0, "signal": False}
+
+
+def test_spawn_exception_uses_failure_budget(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    r = make_runner(store, engs, [])
+    def broken(*a, **kw):
+        raise OSError("cannot launch")
+    r.spawn = broken
+    assert not r.run_once(e["id"])
+    assert engs.turn_failure(e["id"])["consecutive"] == 1
+
+
+def test_current_cli_session_footer_is_retained(env):
+    store, engs, _, _ = env
+    e = engs.create("C1", "x", private=True)
+    r = make_runner(store, engs, [])
+    r.spawn = lambda *a, **kw: (0, "Session: new-session\n")
+    assert r.run_once(e["id"])
+    assert engs.get(e["id"])["follower_session"] == "new-session"
 
 
 def test_runner_skips_ended_engagements(env):

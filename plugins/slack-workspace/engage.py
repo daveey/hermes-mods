@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS engagements (
   follower_profile TEXT, follower_session TEXT, last_handled_ts TEXT, state TEXT NOT NULL,
   kickoff INTEGER DEFAULT 1, created REAL, updated REAL, expires REAL, last_activity REAL,
   warned_quiet REAL);
+CREATE TABLE IF NOT EXISTS eng_turn_failures (
+  engagement TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, consecutive INTEGER NOT NULL,
+  next_at REAL NOT NULL, signaled INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS eng_replies (channel TEXT, reply_to TEXT, posted_ts TEXT, at REAL,
   PRIMARY KEY (channel, reply_to));
 CREATE TABLE IF NOT EXISTS eng_bot_turns (channel TEXT, thread TEXT, n INTEGER, at REAL,
@@ -133,6 +136,29 @@ class Engagements:
                 and (not e["thread"] or e["thread"] == thread_ts)]
         hits.sort(key=lambda e: 0 if e["thread"] else 1)
         return hits[0] if hits else None
+
+    # ---- durable follower failure budget ---------------------------------------------------------
+    def turn_failure(self, eid: str) -> Optional[dict]:
+        with self.store._conn() as c:
+            row = c.execute("SELECT * FROM eng_turn_failures WHERE engagement=?", (eid,)).fetchone()
+        return dict(row) if row else None
+
+    def clear_turn_failure(self, eid: str) -> None:
+        with self.store._conn() as c:
+            c.execute("DELETE FROM eng_turn_failures WHERE engagement=?", (eid,))
+
+    def record_turn_failure(self, eid: str, fingerprint: str, now: float) -> dict:
+        with self.store._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT * FROM eng_turn_failures WHERE engagement=?", (eid,)).fetchone()
+            same = row is not None and row["fingerprint"] == fingerprint
+            n = row["consecutive"] + 1 if same else 1
+            signaled = bool(row["signaled"]) if same else False
+            signal = n >= 3 and not signaled
+            delay = 60 if n < 3 else min(3600, 300 * 2 ** min(n - 3, 4))
+            c.execute("INSERT OR REPLACE INTO eng_turn_failures VALUES (?,?,?,?,?)",
+                      (eid, fingerprint, n, now + delay, int(signaled or signal)))
+        return {"consecutive": n, "next_at": now + delay, "signal": signal}
 
     # ---- batches --------------------------------------------------------------------------------
     def in_scope(self, e: dict, row: dict) -> bool:

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -362,7 +363,7 @@ def hermes_bin() -> list[str]:
 
 
 def parse_session_id(output: str) -> str:
-    m = re.findall(r"session_id:\s*([\w.-]+)", output or "")
+    m = re.findall(r"(?:session_id|Session):\s*([\w.-]+)", output or "")
     return m[-1] if m else ""
 
 
@@ -399,12 +400,18 @@ class Runner:
         env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_SESSION_")}
         env["HERMES_HOME"] = str(self.root_home)
         cmd = hermes_bin() + ["-p", e.get("follower_profile") or DEFAULT_FOLLOWER, "chat", "-Q",
-                              "--query-file", str(qf), "-c", self.session_title(e), "--create-if-missing",
-                              "--yolo", "--pass-session-id"] + (["-m", model] if model else [])
+                              "--query-file", str(qf)]
+        if e.get("follower_session"):
+            # Resume the frozen route; creation overrides can reject legacy sessions.
+            cmd += ["--resume", e["follower_session"]]
+        else:
+            cmd += ["-c", self.session_title(e), "--create-if-missing", "--yolo", "--pass-session-id"]
+            if model:
+                cmd += ["-m", model]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=TURN_TIMEOUT_S, env=env,
                                cwd=str(self.root_home))
-            return r.returncode, (r.stdout or "") + (r.stderr or "")[-2000:]
+            return r.returncode, (r.stderr or "") + "\n" + (r.stdout or "")
         except subprocess.TimeoutExpired as exc:
             return 124, f"timeout: {exc}"
         finally:
@@ -417,19 +424,42 @@ class Runner:
         sid = e.get("follower_session")
         return f"@session:{e.get('follower_profile') or DEFAULT_FOLLOWER}@{self.self_gateway}/{sid}" if sid else ""
 
+    def _turn(self, e: dict, prompt: str, model: str = "") -> tuple[int, str]:
+        try:
+            rc, out = self.spawn(e, prompt, model=model) if model else self.spawn(e, prompt)
+        except Exception as exc:
+            rc, out = 1, f"{type(exc).__name__}: {exc}"
+        if rc == 0:
+            self.engs.clear_turn_failure(e["id"])
+        sid = parse_session_id(out)
+        if sid:
+            self.engs.update(e["id"], follower_session=sid)
+        if rc != 0:
+            # Hash full diagnostics, normalizing only the per-attempt query filename.
+            stable = re.sub(r"eng_[0-9a-f]+-[0-9a-f]{6}\.txt", "eng-query.txt", out)
+            fingerprint = hashlib.sha256(f"{rc}\n{stable}".encode()).hexdigest()
+            state = self.engs.record_turn_failure(e["id"], fingerprint, time.time())
+            if state["signal"]:
+                logger.error("SLACK_FOLLOW_STALLED engagement=%s fingerprint=%s failures=%s rc=%s: %s",
+                             e["id"], fingerprint, state["consecutive"], rc, out[:1500])
+        return rc, out
+
     def run_once(self, eid: str) -> bool:
         """One follower turn for *eid* if it has work. Returns True when a turn ran."""
         e = self.engs.get(eid)
         if not e or e["state"] != "active":
             return False
+        failure = self.engs.turn_failure(eid)
+        if failure and failure["next_at"] > time.time():
+            return False
         bot = self.bot_user_id()
         if e.get("kickoff"):
             self._join_if_public(e)
-            rc, out = self.spawn(e, kickoff_prompt(e))
+            rc, out = self._turn(e, kickoff_prompt(e))
             sid = parse_session_id(out)
             self.engs.update(eid, kickoff=0 if rc == 0 else 1, **({"follower_session": sid} if sid else {}))
             if rc != 0:  # stop here; the next tick retries (no tight retry loop)
-                logger.warning("slack-follow %s kickoff failed rc=%s: %s", eid, rc, out[-500:])
+                logger.warning("slack-follow %s kickoff failed rc=%s: %s", eid, rc, out[:1500])
                 return False
             return True
         notes = self.engs.notes(eid)
@@ -442,9 +472,9 @@ class Runner:
                       "prefix; detail stays in the PR/README. If a note is not a result (a question, an answer for "
                       "someone), handle it per the participation rules. " + GROUNDING_RULE,
                       "End with a one-line activity note."]
-            rc, out = self.spawn(e, "\n".join(lines))
+            rc, out = self._turn(e, "\n".join(lines))
             if rc != 0:
-                logger.warning("slack-follow %s note turn failed rc=%s: %s", eid, rc, out[-500:])
+                logger.warning("slack-follow %s note turn failed rc=%s: %s", eid, rc, out[:1500])
                 return False
             self.engs.take_notes(eid, len(notes))
             return True
@@ -465,7 +495,7 @@ class Runner:
             model = ""
         own = self._own_posts(e, bot, first) if asks_about_our_posts(batch["trigger"], bot) else None
         prompt = batch_prompt(e, batch, ctx, self.name, bot, self._escalations(e), own_posts=own)
-        rc, out = self.spawn(e, prompt, model=model) if model else self.spawn(e, prompt)
+        rc, out = self._turn(e, prompt, model=model)
         logger.info("slack-follow: %s turn for %d message(s) rc=%s in %.0fs (waited %.1fs from message to spawn)%s",
                     eid, len(batch["trigger"]), rc, time.time() - t0, t0 - first,
                     f" model={model}" if model else "")
@@ -473,7 +503,7 @@ class Runner:
         if sid and sid != e.get("follower_session"):
             self.engs.update(eid, follower_session=sid)
         if rc != 0:
-            logger.warning("slack-follow %s turn failed rc=%s: %s", eid, rc, out[-500:])
+            logger.warning("slack-follow %s turn failed rc=%s: %s", eid, rc, out[:1500])
             return False
         self.engs.mark_handled(eid, batch["newest"])
         return True
