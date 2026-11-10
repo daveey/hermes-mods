@@ -1955,14 +1955,33 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
 PARK_TOOLS = ("kanban_block", "kanban_schedule", "kanban_request_review", "kanban_request_changes")
 
 
-def park_result_line(tool: str, args: Any) -> Optional[str]:
-    """The `   <- OK park={...}` line for a park call (direct or via tool_call), else None. Callers skip failed calls."""
+_PARK_CARD_RE = re.compile(r"\bt_[0-9a-f]{8,}\b")
+
+
+def linked_parents(tool: str, args: Any) -> list:
+    """Parent card ids a kanban_link call (direct or via tool_call) links. Callers skip failed calls."""
+    name = (tool or "").rsplit("__", 1)[-1]
+    a = args if isinstance(args, dict) else {}
+    if name == "tool_call":
+        out: list = []
+        for c in a.get("calls") or []:
+            if isinstance(c, dict):
+                out += [p for p in linked_parents(str(c.get("name") or ""), c.get("arguments")) if p not in out]
+        return out
+    pid = str(a.get("parent_id") or "") if name == "kanban_link" else ""
+    return [pid] if _PARK_CARD_RE.fullmatch(pid) else []
+
+
+def park_result_line(tool: str, args: Any, linked: Optional[list] = None) -> Optional[str]:
+    """The `   <- OK park={...}` line for a park call (direct or via tool_call), else None. Callers skip failed calls.
+    A dependency block also records the parent cards it waits on: ids its reason names plus `linked` (parents this
+    turn's successful kanban_link calls linked), for reply_check.lifecycle_park (agent-b04f510c13)."""
     name = (tool or "").rsplit("__", 1)[-1]
     a = args if isinstance(args, dict) else {}
     if name == "tool_call":
         for c in a.get("calls") or []:
             if isinstance(c, dict):
-                got = park_result_line(str(c.get("name") or ""), c.get("arguments"))
+                got = park_result_line(str(c.get("name") or ""), c.get("arguments"), linked)
                 if got:
                     return got
         return None
@@ -1973,7 +1992,43 @@ def park_result_line(tool: str, args: Any) -> Optional[str]:
         facts.update(kind=str(a.get("kind") or ""), human_request=bool(isinstance(a.get("human_request"), dict)
                                                                        and a.get("human_request")),
                      needs=bool(a.get("needs")))
+        if facts["kind"] == "dependency":
+            parents = list(dict.fromkeys(_PARK_CARD_RE.findall(str(a.get("reason") or "")) + list(linked or [])))
+            if parents:
+                facts["parents"] = parents[:4]
     return "   <- OK park=" + json.dumps(facts, sort_keys=True)
+
+
+# Events that show a parent card's owner moving: a status change or a run (agent-b04f510c13). Comments and links
+# don't: a card nobody works can still collect comments, and a child's kanban_link is logged on the child.
+_OWNER_MOVE_EXCLUDED = ("commented", "linked", "unlinked")
+
+
+def parent_owner_live(card_id: str, now: Optional[float] = None, dbs: Optional[list] = None,
+                      fresh_s: float = 24 * 3600) -> bool:
+    """True when this host's boards have `card_id` open (not done/archived) with a status change or run event in
+    the last `fresh_s` seconds as of `now`. Unknown cards and read errors are False (the turn stays judged)."""
+    now = time.time() if now is None else now
+    for path in (board_dbs() if dbs is None else dbs):
+        try:
+            conn = _board_connect(path)
+        except Exception:
+            continue
+        try:
+            row = conn.execute("select status from tasks where id=?", (card_id,)).fetchone()
+            if not row:
+                continue
+            if str(row[0]) in ("done", "archived"):
+                return False
+            marks = ",".join("?" * len(_OWNER_MOVE_EXCLUDED))
+            ev = conn.execute(f"select max(created_at) from task_events where task_id=? and created_at<=? "
+                              f"and kind not in ({marks})", (card_id, now, *_OWNER_MOVE_EXCLUDED)).fetchone()
+            return bool(ev and ev[0] and now - float(ev[0]) < fresh_s)
+        except Exception:
+            continue
+        finally:
+            conn.close()
+    return False
 
 
 class AgentCoach:
@@ -2018,6 +2073,7 @@ class AgentCoach:
         s["turn_log"].clear()
         s["turn_rich"].clear()
         s.pop("turn_commits", None)
+        s.pop("turn_linked", None)
         s["turn_t0"] = time.time()  # wall clock: the diff review asks git for commits made since the turn began
         if isinstance(user_message, str) and user_message.strip():
             # the user's own request (preloaded-skill blocks dropped), capped: "Diagnosis only." can end a Kanban body
@@ -2171,7 +2227,10 @@ class AgentCoach:
             if ok:  # what a successful owner check found, for the report_only judges (agent-9516de5af8)
                 s["turn_log"].append(ok)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(ok)
-            park = park_result_line(tool, args)
+            linked = linked_parents(tool, args)
+            if linked:  # parents a dependency park this turn waits on (agent-b04f510c13)
+                s.setdefault("turn_linked", []).extend(p for p in linked if p not in s.get("turn_linked", []))
+            park = park_result_line(tool, args, s.get("turn_linked"))
             if park:  # this turn parked its run: reply_check.lifecycle_park (agent-9f966b0682)
                 s["turn_log"].append(park)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(park)

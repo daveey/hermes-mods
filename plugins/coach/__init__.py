@@ -971,6 +971,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref(),
                           **({"asks": hit["asks"]} if "asks" in hit else {}),  # denied_ask: which cards (agent-5c9b041010)
                           **({"item_ids": item_ids} if item_ids else {}),
+                          # a nudge after a successful run-ending Kanban call: the worker can only reword now
+                          # (agent-b04f510c13); counted so such nudges are measured, not just felt
+                          **({"nudge_after_run_end": _run_end} if (_run_end := rc.run_end_tool(log_lines)) else {}),
                           **({"outcome": True} if tracked else {})}
             if tracked:  # judged again on attempt 1 (any rule): self-heal files the outcome, not the nudge
                 st = coach.loop_state(session_id)

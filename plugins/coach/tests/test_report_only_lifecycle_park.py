@@ -256,3 +256,131 @@ def test_core_run_lifecycle_tools_are_all_classified():
     assert core_tools, m.group(0)
     assert core_tools <= set(RUN_ENDING_TOOLS), f"new run-ending core tools: {core_tools - set(RUN_ENDING_TOOLS)}"
     assert not [t for t in core_tools if not _classified(t)]
+
+
+# agent-b04f510c13: the same class again, for a dependency block on a live parent card. A hub Kanban worker found a
+# newer canonical landing card already carrying its fix, linked itself under it (kanban_link parent=<landing>) and
+# parked with kanban_block(kind="dependency") — the protocol's own "a wait on another card is a parent link". The block
+# ended the run (run_ended=true); report_only nudged "Not landed yet. This card resumes after that task completes",
+# and the revision ("still failing: publication/landing pending") failed again. A dependency park on a parent that is
+# open and moved in the last 24 h has a named, moving owner; a bare dependency block, or one on a done/idle parent,
+# still asks nobody and stays judged.
+DEP_SELF = "t_01a1c0ceb1408e6e"
+DEP_PARENT = "t_01a1c114f63380e5"
+DEP_ASK = (f"# Kanban task {DEP_SELF}: Resolve later upstream CI-workflow conflicts at 9dcf7714\n\nAssignee: default\n"
+           "Status:   running\n\n## Body\nNew delta after predecessor PR964 landed: resolve the five conflicts and land.")
+DEP_DRAFT = ("Verified the newer candidate includes this upstream target and the bootstrap/OAuth fixes. Linked this card "
+             "to its canonical landing task rather than staging a competing merge.\n\nNot landed yet. This card resumes "
+             "after that task completes to verify CI, the natural hub update, and worktree cleanup.\n\n"
+             "Done means (patching-local-hermes): 4/5 first pass, 0 fix rounds; still failing: publication/landing "
+             "pending; n/a: API, renderer and plugin verification.")
+LINK_ARGS = {"parent_id": DEP_PARENT, "child_id": DEP_SELF}
+LINK_OK = json.dumps({"ok": True, "parent_id": DEP_PARENT, "child_id": DEP_SELF, "gated": False})
+# the replayed turn's real block reason names the parent too
+DEP_ARGS = {"kind": "dependency", "reason": f"Waiting for linked canonical integration producer {DEP_PARENT}, which "
+                                            "imported our fixes and is scheduled after its mandatory cooldown."}
+DEP_BARE = {"kind": "dependency", "reason": "Waiting for the linked canonical landing task to finish."}
+DEP_OK = json.dumps({"ok": True, "task_id": DEP_SELF, "status": "todo", "block_kind": "dependency", "run_ended": True})
+NOW = 1794260883.0  # the replayed nudge's time
+
+
+def _board(tmp_path, monkeypatch, status="scheduled", idle_s=4 * 3600, kind="continued", extra=()):
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    c = sqlite3.connect(db)
+    c.executescript("create table tasks(id text primary key, status text, created_at integer);"
+                    "create table task_events(id integer primary key autoincrement, task_id text, kind text, "
+                    "payload text, created_at integer);")
+    c.execute("insert into tasks values(?,?,?)", (DEP_PARENT, status, int(NOW - 3 * 86400)))
+    c.execute("insert into task_events(task_id, kind, created_at) values(?,?,?)", (DEP_PARENT, kind, int(NOW - idle_s)))
+    for k, age in extra:
+        c.execute("insert into task_events(task_id, kind, created_at) values(?,?,?)", (DEP_PARENT, k, int(NOW - age)))
+    c.commit()
+    c.close()
+    monkeypatch.setenv("COACH_BOARD_DBS", str(db))
+    return db
+
+
+def _dep_check(log):
+    return rc.check(DEP_DRAFT, DEP_ASK, log, _judge(0.95), threshold=0.7, thresholds=rc.settings()["thresholds"],
+                    confirm=CONFIRMED, confirm_floor=rc.CONFIRM_FLOOR)
+
+
+def test_dependency_block_on_a_fresh_linked_parent_is_a_lifecycle_park(tmp_path, monkeypatch):
+    _board(tmp_path, monkeypatch)
+    for block in ((("kanban_block", DEP_ARGS, DEP_OK)), (("kanban_block", DEP_BARE, DEP_OK)),
+                  _deferred("kanban_block", DEP_ARGS) + (DEP_OK,)):
+        log = _log(BEFORE + [("kanban_link", LINK_ARGS, LINK_OK), block])
+        assert rc.lifecycle_park(log, now=NOW), log
+        assert rc.report_only_guard(DEP_ASK, DEP_DRAFT, log, now=NOW) == "lifecycle_park"
+    # the parent named only in the block's reason (linked at create time, no kanban_link this turn) counts too
+    log = _log(BEFORE + [("kanban_block", DEP_ARGS, DEP_OK)])
+    assert rc.lifecycle_park(log, now=NOW), log
+
+
+def test_dependency_block_on_a_stale_closed_or_unknown_parent_stays_judged(tmp_path, monkeypatch):
+    cases = [dict(idle_s=25 * 3600), dict(status="done", idle_s=600), dict(status="archived", idle_s=600),
+             # only comments in 24 h: a comment is not a status change or a run
+             dict(idle_s=30 * 3600, extra=[("commented", 600)])]
+    for case in cases:
+        sub = tmp_path / f"c{cases.index(case)}"
+        sub.mkdir()
+        _board(sub, monkeypatch, **case)
+        log = _log(BEFORE + [("kanban_link", LINK_ARGS, LINK_OK), ("kanban_block", DEP_ARGS, DEP_OK)])
+        assert not rc.lifecycle_park(log, now=NOW), case
+        assert rc.report_only_guard(DEP_ASK, DEP_DRAFT, log, now=NOW) is None, case
+    # a parent no board on this host has (another gateway, a typo): fail closed, still judged
+    monkeypatch.setenv("COACH_BOARD_DBS", "")
+    log = _log(BEFORE + [("kanban_link", LINK_ARGS, LINK_OK), ("kanban_block", DEP_ARGS, DEP_OK)])
+    assert not rc.lifecycle_park(log, now=NOW)
+    # a refused link and a bare reason name no parent
+    sub = tmp_path / "fresh"
+    sub.mkdir()
+    _board(sub, monkeypatch)
+    log = _log(BEFORE + [("kanban_link", LINK_ARGS, json.dumps({"ok": False, "error": "cycle"})),
+                         ("kanban_block", DEP_BARE, DEP_OK)])
+    assert not rc.lifecycle_park(log, now=NOW), log
+    # a refused dependency block parks nothing
+    log = _log(BEFORE + [("kanban_link", LINK_ARGS, LINK_OK), ("kanban_block", DEP_ARGS, ERR)])
+    assert not rc.lifecycle_park(log, now=NOW), log
+
+
+def test_pre_verify_logs_guard_lifecycle_park_after_a_dependency_park_on_a_live_parent(tmp_path, monkeypatch):
+    import time as _t
+    hooks, logf = _hooks(tmp_path, monkeypatch)
+    sub = tmp_path / "board"
+    sub.mkdir()
+    db = _board(sub, monkeypatch)
+    import sqlite3
+    c = sqlite3.connect(db)  # live hook reads at wall-clock now: make the parent's last run fresh relative to it
+    c.execute("update task_events set created_at=?", (int(_t.time() - 3600),))
+    c.commit()
+    c.close()
+    sid = "w3"
+    hooks["pre_llm_call"](session_id=sid, user_message=DEP_ASK, platform="kanban")
+    hooks["post_tool_call"](tool_name="kanban_link", session_id=sid, args=LINK_ARGS, result=LINK_OK)
+    hooks["post_tool_call"](tool_name="kanban_block", session_id=sid, args=DEP_ARGS, result=DEP_OK)
+    assert hooks["pre_verify"](session_id=sid, platform="kanban", attempt=0, final_response=DEP_DRAFT) is None
+    logged = [json.loads(l) for l in logf.read_text().splitlines()]
+    assert any(r["event"] == "reply_checked" and r.get("guard") == "lifecycle_park" for r in logged)
+    assert not any(r["event"] == "reply_nudge" for r in logged)
+
+
+def test_nudge_after_a_run_ending_park_is_counted(tmp_path, monkeypatch):
+    """Detection: a report_only nudge after a successful run-ending tool (here a bare dependency block, still judged)
+    logs nudge_after_run_end, so nudges the worker can no longer act on are counted, not just felt."""
+    hooks, logf = _hooks(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_BOARD_DBS", "")
+    sid = "w4"
+    hooks["pre_llm_call"](session_id=sid, user_message=DEP_ASK, platform="kanban")
+    hooks["post_tool_call"](tool_name="kanban_block", session_id=sid, args=DEP_BARE, result=DEP_OK)
+    hooks["pre_verify"](session_id=sid, platform="kanban", attempt=0, final_response=DEP_DRAFT)
+    logged = [json.loads(l) for l in logf.read_text().splitlines()]
+    nudges = [r for r in logged if r["event"] == "reply_nudge"]
+    assert nudges and nudges[0].get("nudge_after_run_end") == "kanban_block:dependency", nudges
+    # a nudge in a turn with no run-ending tool carries no such field
+    hooks2, logf2 = _hooks(tmp_path / "b", monkeypatch)
+    hooks2["pre_llm_call"](session_id="w5", user_message=DEP_ASK, platform="kanban")
+    hooks2["pre_verify"](session_id="w5", platform="kanban", attempt=0, final_response=DEP_DRAFT)
+    n2 = [json.loads(l) for l in logf2.read_text().splitlines() if '"reply_nudge"' in l]
+    assert n2 and "nudge_after_run_end" not in n2[0]

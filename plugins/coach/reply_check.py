@@ -1180,8 +1180,12 @@ def continued_run(tool_log: Optional[list] = None) -> bool:
 # closed with "H5 is blocked, not complete, on the remaining scope decision". report_only nudged it; the block had
 # ended the run, so the revision turn's kanban_schedule was refused and no revised reply could pass. A turn that
 # parked its run the protocol's way (a block that asks a human per human_block, a goal-mode kind=time block, or a
-# kanban_schedule) is not a diagnosis left unowned. Dependency/transient/assignment blocks and capability+needs blocks
-# ask nobody and stay judged. Reads the `<- OK park={...}` facts line agent_rules.observe writes after a successful
+# kanban_schedule) is not a diagnosis left unowned. Transient/assignment blocks and capability+needs blocks ask nobody
+# and stay judged. A dependency block is a park only when a parent it waits on (named in its reason, or linked by this
+# turn's kanban_link) is open on this host's board and moved within 24 h (agent-b04f510c13: a worker linked under the
+# live landing card and parked, the protocol's "a wait on another card is a parent link", and got nudged after its run
+# ended). A bare dependency block, or one on a done/archived/idle/unknown parent, stays judged. Reads the
+# `<- OK park={...}` facts line agent_rules.observe writes after a successful
 # park call (the call line itself is cut at 140 chars); a failed call gets `<- ERROR` and no park line.
 _PARK_LINE = "<- OK park="
 
@@ -1198,9 +1202,76 @@ JUDGED_AFTER_RUN_END = (
 _HANDOFF_PARKS = ("kanban_request_review", "kanban_request_changes")
 
 
-def lifecycle_park(tool_log: Optional[list] = None) -> bool:
-    """True when this turn's tool log shows a successful human block, kind=time block, kanban_schedule or review
-    handoff (kanban_request_review / kanban_request_changes)."""
+def _park_facts(tool_log: Optional[list]) -> list:
+    """The `<- OK park={...}` facts dicts in this turn's tool log, in order."""
+    out = []
+    for line in tool_log or []:
+        s = (line or "").lstrip()
+        if not s.startswith(_PARK_LINE):
+            continue
+        try:
+            f = json.loads(s[len(_PARK_LINE):])
+        except ValueError:
+            continue
+        if isinstance(f, dict):
+            out.append(f)
+    return out
+
+
+def live_dependency_parent(tool_log: Optional[list] = None, now: Optional[float] = None,
+                           dbs: Optional[list] = None) -> Optional[str]:
+    """The first parent card a successful kind=dependency block this turn waits on (named in its reason or linked
+    this turn) that is open on this host's boards and moved (status change or run) within FRESH_OWNER_S; else None."""
+    ar = None
+    for f in _park_facts(tool_log):
+        if f.get("tool") != "kanban_block" or f.get("kind") != "dependency":
+            continue
+        for pid in f.get("parents") or []:
+            try:
+                ar = ar or _cache.load_sibling(_HERE, "agent_rules")
+                if ar.parent_owner_live(str(pid), now=now, dbs=dbs, fresh_s=FRESH_OWNER_S):
+                    return str(pid)
+            except Exception:
+                continue
+    return None
+
+
+# Run-ending tools by call line (kanban_continue / kanban_complete / kanban_move write no park line).
+_RUN_END_CALL_RE = re.compile(
+    r"^\s*->\s*(?:mcp__)?(kanban_continue|kanban_complete|kanban_move)\(|"
+    r"^\s*->\s*tool_call\(.*[\"']name[\"']\s*:\s*[\"'](?:mcp__)?(kanban_continue|kanban_complete|kanban_move)[\"']",
+    re.I)
+
+
+def run_end_tool(tool_log: Optional[list] = None) -> Optional[str]:
+    """`<tool>[:<kind>]` of this turn's last successful run-ending Kanban call (a park, kanban_continue,
+    kanban_complete, kanban_move), else None. Telemetry for nudges a worker can no longer act on (agent-b04f510c13)."""
+    lines = list(tool_log or [])
+    last = None
+    for i, line in enumerate(lines):
+        s = (line or "").lstrip()
+        if s.startswith(_PARK_LINE):
+            try:
+                f = json.loads(s[len(_PARK_LINE):])
+            except ValueError:
+                continue
+            if isinstance(f, dict) and f.get("tool"):
+                last = f"{f['tool']}:{f['kind']}" if f.get("kind") else str(f["tool"])
+            continue
+        m = _RUN_END_CALL_RE.search(line or "")
+        if m:
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not (nxt or "").lstrip().startswith("<- ERROR"):
+                last = m.group(1) or m.group(2)
+    return last
+
+
+def lifecycle_park(tool_log: Optional[list] = None, now: Optional[float] = None, dbs: Optional[list] = None) -> bool:
+    """True when this turn's tool log shows a successful human block, kind=time block, kanban_schedule, review
+    handoff (kanban_request_review / kanban_request_changes), or a dependency block on a live parent card
+    (live_dependency_parent)."""
+    if live_dependency_parent(tool_log, now=now, dbs=dbs):
+        return True
     for line in tool_log or []:
         s = (line or "").lstrip()
         if not s.startswith(_PARK_LINE):
@@ -1224,16 +1295,17 @@ def lifecycle_park(tool_log: Optional[list] = None) -> bool:
     return False
 
 
-def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None,
+                      now: Optional[float] = None) -> Optional[str]:
     """Why report_only can't apply to this turn ("scope_limited" / "scheduled_wait" / "continued_run" /
-    "lifecycle_park"), else None."""
+    "lifecycle_park"), else None. `now` dates the board read (replays)."""
     if scope_limited(user_ask):
         return "scope_limited"
     if scheduled_wait_status(user_ask, reply):
         return "scheduled_wait"
     if continued_run(tool_log):
         return "continued_run"
-    if lifecycle_park(tool_log):
+    if lifecycle_park(tool_log, now=now):
         return "lifecycle_park"
     return None
 
