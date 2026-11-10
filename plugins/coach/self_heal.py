@@ -56,7 +56,7 @@ OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF
 # is derived from the plugin directories (this repo's plugins/ and <home>/plugins/, read at import), each name's first
 # segment too ("[kanban-honest-done]" -> kanban), plus tags written by core or by a plugin under another name.
 # tests/test_selfheal_synthetic_tags.py fails CI when a plugin writes a "[<tag>" notice this set does not cover.
-EXTRA_HERMES_TAGS = ("kanban", "runtime", "owner-wake", "coach", "chat-closeout")
+EXTRA_HERMES_TAGS = ("kanban", "runtime", "owner-wake", "coach", "chat-closeout", "workflow-state")
 _NOT_HERMES_TAGS = ("selfheal-probe", "selfheal")  # probes must reach PROBE_RE (selfheal_skip why=probe)
 
 
