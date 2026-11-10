@@ -1199,6 +1199,9 @@ def bug_signature(tool: str, result: Any, status: Optional[str], error_type: Opt
     payloads.append(text)
     if tool == "execute_code" and d.get("status") == "success" and not d.get("error"):
         return None  # A successful cell may be reading someone else's traceback.
+    if (tool == "terminal" and d.get("exit_code") == 0
+            and not (d.get("error") or d.get("hint") or text or error_type)):
+        return None  # Reading logs/source successfully is not a terminal failure.
     cell_failure = False
     for payload in payloads:
         cells = list(re.finditer(r'^\s*File "<cell>",', payload, re.M))
@@ -1212,6 +1215,10 @@ def bug_signature(tool: str, result: Any, status: Optional[str], error_type: Opt
         if frames:
             last = re.findall(
                 r"^((?:[\w]+\.)*[A-Z][\w]*(?:Error|Exception):[^\n]{0,120})", payload, re.M)
+            if tool == "terminal" and not last:
+                # Prefixed log excerpts, source fixtures and truncated frames do not
+                # identify a defect. Never merge unrelated output into "traceback".
+                continue
             head = last[-1] if last else "traceback"
             return _normalize_sig(f"{tool}: {head}")
     if cell_failure:

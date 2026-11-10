@@ -64,6 +64,57 @@ def test_successful_output_quoting_traceback_is_not_a_failure():
     assert rules.bug_signature('execute_code', json.dumps(result), 'success', None, None) is None
 
 
+@pytest.mark.parametrize('shape', ['dict', 'json', 'hinted'])
+@pytest.mark.parametrize('output', [CORE, '[pid 123] ' + CORE.replace('\n', '\n[pid 123] '),
+                                   CORE.rsplit('json.decoder.', 1)[0]])
+def test_successful_terminal_log_reads_are_not_bugs(shape, output):
+    d = {'output': output, 'exit_code': 0, 'error': None}
+    result = d if shape == 'dict' else json.dumps(d)
+    if shape == 'hinted':
+        result = json.dumps(d) + '\n[retry guidance]'
+    assert rules.bug_signature('terminal', result, 'ok', None, None) is None
+
+
+@pytest.mark.parametrize('output', [CORE.rsplit('json.decoder.', 1)[0],
+                                   '[pid 123] ' + CORE.replace('\n', '\n[pid 123] '),
+                                   repr(CORE)])
+def test_terminal_frames_without_exception_identity_do_not_form_generic_bug(output):
+    assert rules.bug_signature('terminal', envelope(output, 'json'), 'error', None, 'exit 1') is None
+
+
+@pytest.mark.parametrize('shape', ['raw', 'dict', 'json', 'hinted'])
+def test_failed_terminal_core_traceback_keeps_identity(shape):
+    assert rules.bug_signature('terminal', envelope(CORE, shape), 'error', None, None) == (
+        'terminal: json.decoder.JSONDecodeError: Extra data: line <n> column <n> (char <n>)')
+
+
+@pytest.mark.parametrize('field', ['error', 'hint'])
+def test_terminal_zero_exit_with_explicit_failure_is_not_hidden(field):
+    d = {'output': CORE, 'exit_code': 0, field: 'pipeline failed'}
+    assert rules.bug_signature('terminal', d, 'error', None, None)
+
+
+def test_terminal_explicit_infrastructure_error_survives_zero_exit():
+    assert rules.bug_signature('terminal', {'exit_code': 0, 'output': ''},
+                               'error', 'RuntimeError', 'backend failed') == (
+        'terminal: RuntimeError: backend failed')
+
+
+def test_terminal_observer_ignores_repeated_log_reads_but_records_failure():
+    class Sink:
+        def __init__(self): self.bugs = []
+        def bug(self, *args): self.bugs.append(args)
+        def log(self, *args): pass
+    sink = Sink()
+    observer = rules.AgentCoach(signals=sink)
+    for i in range(3):
+        observer.observe(str(i), 'terminal', {'command': 'read logs'},
+                         json.dumps({'output': CORE, 'exit_code': 0, 'error': None}), status='ok')
+    assert sink.bugs == []
+    observer.observe('core', 'terminal', {}, envelope(CORE, 'json'), status='error')
+    assert len(sink.bugs) == 1
+
+
 def test_observer_does_not_record_three_caller_errors():
     class Sink:
         def __init__(self): self.bugs = []
