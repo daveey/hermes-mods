@@ -438,7 +438,7 @@ def named_card_facts(reply: str, tool_log: Optional[list] = None, now: Optional[
         for cid in ids:
             facts = ar.board_card_facts(cid, now=now, dbs=dbs)
             if facts:
-                out.append(ar.board_fact_line(facts, now=now))
+                out.append(ar.board_fact_line(_minus_turn_notes(facts, tool_log), now=now))
         return out
     except Exception:
         return []
@@ -458,6 +458,137 @@ def owner_source(reply: str, tool_log: Optional[list] = None, board: Optional[li
     if any("(replica)" in l for l in lines):
         return "replica"
     return "board" if lines else "none"
+# ── agent-a0262d55e5: a stall comment on a card that never starts ─────────────────────────────────────────────────
+# Hub 20261031_064851_d0f106: "the rollout is waiting on card t_01a19f3049f432d5, ready but has not started. I've
+# flagged it as the immediate blocker." The turn's only action on that card was a kanban_comment; it had sat ready
+# and unclaimed for 83 min and this chat had already commented the same stall twice. Both rubrics counted "the turn
+# commented the stall on the owner card" as a started fix with no limit, so the strong judge passed it (p 0.1).
+# The exemption now holds for the first such comment within STALL_COMMENT_GRACE_S of the card entering the queue;
+# past that, or after an earlier comment, the gate below holds the reply unless this turn raised the card's priority,
+# re-placed or reassigned it, or the card left the queue (the work was done here).
+STALL_COMMENT_GRACE_S = 1800
+STALL_REMEDY_WINDOW_S = 900
+_TURN_COMMENT_RE = r"(?:\bkanban_comment\b|\bhermes\s+kanban\s+comment\b)"
+STALL_REMEDY_CMD_RE = re.compile(
+    r"\bhermes\s+kanban\s+(?:edit|assign|reassign|move|claim|reclaim|promote|dispatch|set-model|unblock|complete|"
+    r"archive)\b|--priority\b|\bpriority\b|\bplacement\b|\bkanban_(?:move|supervisor_request|complete|archive)\b",
+    re.I)
+STALL_REMEDY_EVENTS = ("reprioritized", "assigned", "placement_repinned", "placement_forwarded", "moved",
+                       "model_override_set", "reclaimed", "capability_routed")
+STALL_WAIT_RE = re.compile(
+    r"\b(?:wait(?:s|ing|ed)?|blocker|blocked|block(?:s|ing)|queued?|ready|pending|flagged|stall(?:s|ed)?|until|"
+    r"behind|not (?:yet )?(?:started|claimed|picked up|running)|(?:has|hasn't|has not|hasn’t) (?:not )?"
+    r"(?:started|been picked up|been claimed))\b", re.I)
+
+
+def _turn_comments(cid: str, tool_log: Optional[list]) -> int:
+    """kanban_comment calls this turn on `cid` (the tool, the deferred tool_call wrapper, or the CLI)."""
+    return sum(1 for l in tool_log or [] if (l or "").lstrip().startswith("->") and cid in l
+               and re.search(_TURN_COMMENT_RE, l))
+
+
+def _minus_turn_notes(facts: dict, tool_log: Optional[list]) -> dict:
+    """The board's comment count since the card entered the queue, minus this turn's own comments on it."""
+    if not isinstance(facts, dict) or not facts.get("ready_since"):
+        return facts
+    n = max(0, int(facts.get("stall_notes") or 0) - _turn_comments(str(facts.get("id")), tool_log))
+    return {**facts, "stall_notes": n}
+
+
+def queued_owner_facts(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None,
+                       dbs: Optional[list] = None) -> list[dict]:
+    """Board facts (this turn's comments not counted as stall notes) for ready/todo cards the reply's ending names
+    unquoted, up to NAMED_CARD_MAX, whether or not the turn read them. [] on any failure (fail-open)."""
+    try:
+        tail = (reply or "")[-1500:]
+        ids: list[str] = []
+        for m in NAMED_CARD_RE.finditer(tail):
+            cid = m.group(0)
+            if cid not in ids and not _in_dquotes(tail, m.start()):
+                ids.append(cid)
+            if len(ids) >= NAMED_CARD_MAX:
+                break
+        if not ids:
+            return []
+        ar = _cache.load_sibling(_HERE, "agent_rules")
+        now = time.time() if now is None else now
+        out = []
+        for cid in ids:
+            f = ar.board_card_facts(cid, now=now, dbs=dbs)
+            if f and f.get("status") in ar.QUEUED_STATUSES and f.get("ready_since"):
+                out.append({**_minus_turn_notes(f, tool_log), "ready_for_s": int(now - f["ready_since"])})
+        return out
+    except Exception:
+        return []
+
+
+def _remedied(cid: str, tool_log: Optional[list], now: float, dbs: Optional[list]) -> bool:
+    """This turn raised the card's priority, re-placed, reassigned or claimed it (tool log), or the board shows such
+    an event in the last STALL_REMEDY_WINDOW_S."""
+    for l in tool_log or []:
+        s = (l or "").lstrip()
+        if s.startswith("->") and cid in s and not re.search(_TURN_COMMENT_RE, s) and STALL_REMEDY_CMD_RE.search(s):
+            return True
+    ar = _cache.load_sibling(_HERE, "agent_rules")
+    for path in (ar.board_dbs() if dbs is None else dbs):
+        try:
+            conn = ar._board_connect(path)
+        except Exception:
+            continue
+        try:
+            row = conn.execute(
+                "select count(*) from task_events where task_id=? and created_at>=? and created_at<=? and kind in "
+                f"({','.join('?' * len(STALL_REMEDY_EVENTS))})",
+                (cid, now - STALL_REMEDY_WINDOW_S, now + 1, *STALL_REMEDY_EVENTS)).fetchone()
+            if row and row[0]:
+                return True
+        except Exception:
+            continue
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return False
+
+
+def stalled_queue_owner(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None,
+                        dbs: Optional[list] = None) -> Optional[dict]:
+    """The facts of a ready/todo card the reply's ending names as what the work waits on, when this turn's action
+    on it was a stall comment and the card has sat in the queue STALL_COMMENT_GRACE_S or longer, or already carried
+    a comment from before this turn; None when the turn remedied it, the card waits on an open parent, or on any
+    read failure (fail-open)."""
+    try:
+        now = time.time() if now is None else now
+        tail = (reply or "")[-1500:]
+        for f in queued_owner_facts(reply, tool_log, now=now, dbs=dbs):
+            cid = str(f["id"])
+            if f.get("waits_on") or not _turn_comments(cid, tool_log):
+                continue
+            if f["ready_for_s"] < STALL_COMMENT_GRACE_S and not f.get("stall_notes"):
+                continue
+            i = tail.find(cid)
+            window = tail[max(0, i - 250):i + len(cid) + 250]
+            if not STALL_WAIT_RE.search(window):
+                continue
+            if _remedied(cid, tool_log, now, dbs):
+                continue
+            return f
+    except Exception:
+        return None
+    return None
+
+
+def stall_telemetry(reply: str, tool_log: Optional[list] = None, now: Optional[float] = None) -> dict:
+    """report_only_scored fields: the longest-queued named ready/todo card's queue age and earlier stall notes."""
+    try:
+        fs = queued_owner_facts(reply, tool_log, now=now)
+    except Exception:
+        fs = []
+    if not fs:
+        return {}
+    f = max(fs, key=lambda x: x["ready_for_s"])
+    return {"owner_ready_for_s": f["ready_for_s"], "owner_stall_notes": int(f.get("stall_notes") or 0)}
 
 
 def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = None) -> str:
@@ -1504,8 +1635,10 @@ def wake_sources(session_id: str, tool_log: Optional[list] = None) -> list[str]:
 
 # agent-0bab362bcd: one clause shared by the report_only nudges and both report_only judges, so a card that can't run
 # fails the same bar at nudge time and at outcome time.
-STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible route) is not a started fix: do it in "
-                 "this chat if your model can, or re-place it (`placement`) on a gateway with capacity, and say which.")
+STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible route, or ready and unclaimed for 30 min "
+                 "or more, or already commented on while it waited) is not a started fix, and another comment on it "
+                 "doesn't start it: do it in this chat if your model can, raise its priority (`hermes kanban edit "
+                 "<id> --priority N`), or re-place it (`placement`) on a gateway with capacity, and say which.")
 
 # agent-9ac78980e2 / agent-61f2644a68: one clause for both report_only judges on the coach's own board read and on
 # dependency-gated owners.
@@ -1514,7 +1647,9 @@ BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the co
                "same as an `<- OK` line. A line ending `home=<gateway> (replica)` was read from this host's synced "
                "copy of that gateway's board (the card lives there): it counts the same as a local one. It shows "
                "status=, created= (card age), claimed= (newest claim, or never), "
-               "run= (newest run state) and last=<age>(<event>). The named card is a started owner when it is "
+               "run= (newest run state) and last=<age>(<event>); a ready or todo card also shows ready_for=<age> (time "
+               "since it last entered the queue; comments don't reset it) and stall_notes=<n> (comments left on it "
+               "since then, before this turn). The named card is a started owner when it is "
                "running or claimed with its last event under 24 h; or ready or todo, created under 24 h ago, with "
                "no failed, crashed or timed_out run; or todo, scheduled or blocked on a dependency with `waits_on=` "
                "a parent that is running or claimed with activity under 24 h (the work is sequenced behind a started "
@@ -1525,7 +1660,11 @@ BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the co
                "the probe and wakes the card the moment the condition holds, which is the wait the Kanban protocol "
                "prescribes. `probe=stale(...)` (the probe stopped running or is broken), a scheduled card with no "
                "`probe=` fact and no such parent, or a live probe waiting on agent work nobody is doing, is not. "
-               "Ready or todo idle over 24 h, blocked with "
+               "A turn whose only action on a ready or todo card is a comment saying what holds it gets that credit "
+               "only for the first such comment within 30 min of the card entering the queue (ready_for= under 30m "
+               "and stall_notes=0): with ready_for= 30m or more and claimed=never, or stall_notes= 1 or more, the "
+               "card is waiting on capacity, not started, and the hand-off stays high unless the turn did the work, "
+               "raised the card's priority or re-placed it. Ready or todo idle over 24 h, blocked with "
                "no such parent, a failed run, or done/archived is not. A BOARD status that contradicts the message "
                "(it says running, the board says ready, blocked or done) is evidence the claim is false: score "
                "that hand-off high.")
@@ -1583,8 +1722,12 @@ probabilities (0-1):
     with its last activity under 24 h and no failed or crashed last run (`run=` absent, or not crashed/failed/
     timed_out): a card filed minutes ago and waiting in a normal queue is a started fix, not a stalled one; or when
     the owner was created this turn; and the message is about that owner's work. A queued owner that is waiting on
-    priority or capacity also counts as started when the turn commented the stall on the owner card (kanban_comment
-    saying what holds it). A `<- OK` line showing it blocked or done, ready or todo idle for over 24 h, a failed or
+    priority or capacity also counts as started when the turn commented the stall on the owner card (a kanban_comment
+    saying what holds it), but only for the first such comment within 30 min: the line shows ready_for= under 30m and
+    stall_notes=0. A card ready_for= 30 min or more and never claimed, or with stall_notes= 1 or more (it was already
+    commented on and still has not started), is not started by another comment: score high unless the turn did the
+    work itself, raised the card's priority or re-placed it. A `<- OK` line showing it blocked or done, ready or todo
+    idle for over 24 h, a failed or
     crashed last run, or a bare claim with no such line, stays high.
     An in-session subagent the agent spawned is an owner too: a `<- OK subagents:` line (from delegate_task
     action=list this turn, or ending `[live registry]`: the runtime's own read of the subagents this session started,
@@ -1665,7 +1808,10 @@ CLI, a read-only query of the board db, the worker's process) is followed by a
 owner is "started" when that line shows the named owner running or claimed with activity in the last 24 h, or ready or
 todo (queued, not picked up yet) with its last activity under 24 h and no failed or crashed last run (or the owner was
 created this turn), and it owns this problem: a card filed minutes ago and waiting in a normal queue is a started fix.
-A queued owner waiting on priority or capacity is also "started" when the turn commented the stall on the owner card.
+A queued owner waiting on priority or capacity is also "started" when the turn commented the stall on the owner card,
+but only for the first such comment within 30 min (ready_for= under 30m and stall_notes=0 on its line). A card
+ready_for= 30 min or more and never claimed, or with stall_notes= 1 or more, is not started by another comment: that is
+"report_only" unless the turn did the work, raised the card's priority or re-placed it.
 A `<- OK` line showing it blocked or done, ready or todo idle for over 24 h, a failed or crashed last run, or no such
 line, leaves it "report_only". An in-session subagent the agent spawned is an owner too: a `<- OK subagents:` line
 (from delegate_task action=list this turn, or ending `[live registry]`: the runtime's own read of the subagents this
@@ -2231,6 +2377,12 @@ REPORT_ONLY_CARD_CLOSED = (
 CARD_CLOSED_TAIL = (" Your card is closed (kanban_complete ran this turn), so nothing wakes you. Finish now, in this turn "
                     "(wait on CI in the foreground with `wait_for_ci.py --timeout`, run the proof), or kanban_create "
                     "a follow-up card and name it. " + EXISTING_OWNER_ROUTE + " A done card owns nothing.")
+STALLED_QUEUE_NUDGE = (
+    "[coach] Your message says the work waits on card {card}, but that card has sat {status} and unclaimed for {age} "
+    "with {notes} earlier comment(s) on it, and this turn only commented on it again: a comment doesn't start a card "
+    "that is waiting on capacity. Fix it this turn: do the work here if your model can, raise its priority "
+    "(`hermes kanban edit {card} --priority N`), or re-place it (`placement`) on a gateway with capacity, then say "
+    "which you did.")
 CLOSED_OWNER_NUDGE = (
     "[coach] Your message names card {card} as the owner of the remaining work (\"{evidence}\"), but that card is "
     "{status}: a {status} card owns nothing and no worker will pick this up. Finish the work yourself now (wait on CI "
@@ -2408,7 +2560,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           capped_nudge: bool = True,
           report_only_fallback: str = REPORT_ONLY_FALLBACK,
           prev_turn: Optional[dict] = None, deny_quoted: bool = False, platform: str = "",
-          relay_repeat: bool = False) -> Optional[dict]:
+          relay_repeat: bool = False, now: Optional[float] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
     `relay_repeat` (relay_repeat.py, agent-1406d53913): this turn's user asked again while the previous reply relayed
     an unfinished owner. report_only joins the candidates (unless scoped), the second opinion always runs whatever the
@@ -2495,6 +2647,23 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                     **({"variant": "card_closed"} if closed else {}),
                     "verdict": {"report_only": 1.0, "report_only_src": "unverified_owner", "evidence": phrase},
                     "nudge": OWNER_NUDGE.format(evidence=phrase[:200]) + (OWNER_KANBAN_DOWN if down else "") + tail}
+        stalled = stalled_queue_owner(reply, tool_log, now=now)
+        if stalled:  # deterministic: another stall comment on a card queued 30+ min or already nudged (agent-a0262d55e5)
+            cid, age = str(stalled["id"]), _cache.load_sibling(_HERE, "agent_rules")._ago(stalled["ready_for_s"])
+            notes = int(stalled.get("stall_notes") or 0)
+            ev = f"card {cid} {stalled['status']} and unclaimed for {age}, {notes} earlier comment(s); this turn only commented"
+            if audit is not None:
+                try:
+                    audit({"event": "report_only_scored", "source": "stalled_queue_owner", "final_p": 1.0,
+                           "passing": True, "owner_ready_for_s": stalled["ready_for_s"], "owner_stall_notes": notes,
+                           "owner_card": cid})
+                except Exception:
+                    pass  # telemetry never changes a verdict
+            return {"rule": "report_only", "p": 1.0, "evidence": ev, "reason": "stalled_queue_owner",
+                    **({"variant": "card_closed"} if closed else {}),
+                    "verdict": {"report_only": 1.0, "report_only_src": "stalled_queue_owner", "evidence": ev},
+                    "nudge": STALLED_QUEUE_NUDGE.format(card=cid, status=stalled["status"], age=age, notes=notes)
+                    + tail}
     if (not only or "status_only" in only) and not scoped:
         ev = status_only(user_ask, reply, tool_log)
         if ev:  # deterministic: the judge path's owner-check exemption counts card bookkeeping as acting
@@ -2580,6 +2749,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "owner_probe_live": bool(owner_probe_live(reply, list(tool_log or []) + list(
                        named_board), user_ask)),
                    "owner_source": owner_source(reply, tool_log, board=named_board),
+                   **stall_telemetry(reply, tool_log, now=now),
                    **({"forced": forced_by} if forced and confirm_attempted else {}),
                    **({"relay_repeat": True} if relay_repeat else {}),
                    **({"elapsed_s": budget_elapsed()} if budget_elapsed() is not None else {}),

@@ -396,6 +396,14 @@ name it); the `reply_nudge` event logs `variant=card_closed`. (2) "owned by / be
 owner ("owned by card t_…", "card t_… owns it", "tracked on card t_…") that is `done`/`archived` on this host's boards
 (read-only lookup) fires report_only with `reason=closed_owner`, even after a `kanban_show`. Cards on another
 gateway's board are unknown and never fire.
+`stalled_queue_owner` (agent-a0262d55e5, deterministic): the reply's ending names a ready/todo card as what the work
+waits on, this turn's only action on it was a `kanban_comment`, and the board shows it queued and unclaimed for 30 min
+or more (`ready_for=`, time since its last queue-entry event, comments ignored) or already carrying a comment from
+before this turn (`stall_notes=`). report_only fires with `reason=stalled_queue_owner` unless this turn raised its
+priority, re-placed, reassigned or claimed it (tool log, or such a board event in the last 15 min). BOARD and
+kanban_show `<- OK` lines of ready/todo cards carry both facts, both judges give the stall-comment credit only to the
+first comment within 30 min, and `report_only_scored` logs `owner_ready_for_s` / `owner_stall_notes`.
+Tests: `tests/test_report_only_stall_comment.py`.
 Six explicit scope-limit fixtures (`tests/fixtures/report_only_scope_limits.json`) never fire; the deterministic
 `scope_limited()` guard drops them and the judge alone scores them <= 0.1.
 Scheduled-wait exemption (deterministic, no AI call): a pure status question ("is this session done? it was green but

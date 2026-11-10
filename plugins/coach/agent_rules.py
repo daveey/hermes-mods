@@ -1587,6 +1587,11 @@ def _task_summary(task: dict, runs: list, events: list, now: float) -> str:
             at, kind = max(stamps)
             parts.append(f"last={kind} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(at))} ({_ago(now - at)} ago)")
         parts.append(f"gw={task.get('_gw') or task.get('gw')}")
+    if str(task.get("status")) in QUEUED_STATUSES and evs:  # agent-a0262d55e5: queue age, comments ignored
+        since, notes = queue_facts_from_events([(str(e.get("kind")), t) for t, _, e in evs], now)
+        qt = queue_text({"status": str(task.get("status")), "ready_since": since, "stall_notes": notes}, now)
+        if qt:
+            parts.append(qt)
     if str(task.get("status")) == "scheduled" and task.get("id"):
         parts.append(_card_probe_text(str(task["id"]), now))  # agent-61b50f34ae: is its wake probe still running?
     return " ".join(p for p in parts if p)
@@ -1745,12 +1750,40 @@ def _board_connect(path: str):
         return c
 
 
+# agent-a0262d55e5: `last=` counts comments, so a chat's own stall comments made a card ready and unclaimed for 83
+# min look fresh, and nothing showed how often it had been nudged. For a ready or todo card the facts carry
+# `ready_since` (its newest queue-entry event: created, promoted, released, requeued after a crash or lost worker,
+# a claim that didn't stick; comments and other notes ignored) and `stall_notes` (comments since then).
+QUEUE_ENTRY_KINDS = ("created", "promoted", "promoted_manual", "released", "unblocked", "reclaimed", "reopened",
+                     "owner_wake_requeue", "changes_requested", "condition_met", "continuation_woken", "crashed",
+                     "timed_out", "worker_lost", "owner_restart_lost", "self_heal_requeue", "claimed", "spawned",
+                     "moved", "restart_resume", "gave_up", "oom_killed")
+QUEUED_STATUSES = ("ready", "todo")
+STALL_NOTE_KIND = "commented"
+
+
+def queue_facts_from_events(events: list, now: float) -> tuple:
+    """(ready_since, stall_notes) from a card's (kind, epoch) events up to `now`; (None, 0) with no entry event."""
+    evs = [(k, t) for k, t in events if t is not None and t <= now + 1]
+    since = max((t for k, t in evs if k in QUEUE_ENTRY_KINDS), default=None)
+    if since is None:
+        return None, 0
+    return since, sum(1 for k, t in evs if k == STALL_NOTE_KIND and t >= since)
+
+
+def queue_text(facts: dict, now: float) -> str:
+    """`ready_for=<age> stall_notes=<n>` for a ready/todo card with a known queue entry, else ""."""
+    if not isinstance(facts, dict) or facts.get("status") not in QUEUED_STATUSES or not facts.get("ready_since"):
+        return ""
+    return f"ready_for={_ago(now - facts['ready_since'])} stall_notes={int(facts.get('stall_notes') or 0)}"
+
+
 def board_card_facts(card_id: str, now: Optional[float] = None, dbs: Optional[list] = None) -> Optional[dict]:
     """A card's state on this host's boards as of `now` (events after `now` are ignored, for replays):
     {id, status, created_at, claimed_at, last_kind, last_at, run, run_failed, waits_on: [(id, status, age_s)],
-    replica, home}. With `dbs` None, a card on no local board is looked up in this host's replicas of other
-    gateways' boards (shadow_dbs; replica=True, home=<created_on>). None when no board has the card or every
-    read fails."""
+    ready_since, stall_notes, replica, home}. With `dbs` None, a card on no local board is looked up in this
+    host's replicas of other gateways' boards (shadow_dbs; replica=True, home=<created_on>). None when no
+    board has the card or every read fails."""
     now = time.time() if now is None else now
     if dbs is not None:
         return _card_facts_in(card_id, now, dbs, replica=False)
@@ -1805,7 +1838,18 @@ def _card_facts_in(card_id: str, now: float, paths: list, replica: bool) -> Opti
                     home = str(h[0]) if h and h[0] else None
                 except Exception:
                     home = None
+            ready_since, notes = None, 0
+            if str(row[0]) in QUEUED_STATUSES:
+                try:
+                    qs = conn.execute(
+                        "select kind, created_at from task_events where task_id=? and created_at<=? and kind in "
+                        f"({','.join('?' * (len(QUEUE_ENTRY_KINDS) + 1))})",
+                        (card_id, now, *QUEUE_ENTRY_KINDS, STALL_NOTE_KIND)).fetchall()
+                    ready_since, notes = queue_facts_from_events([(str(k), _ts(t)) for k, t in qs], now)
+                except Exception:
+                    ready_since, notes = None, 0
             return {"id": card_id, "status": str(row[0]), "created_at": _ts(row[1]),
+                    "ready_since": ready_since, "stall_notes": notes,
                     "claimed_at": _ts(cl[0]) if cl and cl[0] else None,
                     "last_kind": str(ev[0]) if ev else None, "last_at": _ts(ev[1]) if ev else None,
                     "run": run_state, "run_failed": bool(run_state and _FAILED_RUN_RE.search(run_state)),
@@ -1896,6 +1940,9 @@ def board_fact_line(facts: dict, now: Optional[float] = None) -> str:
              f"run={facts.get('run') or 'none'}"]
     if facts.get("last_at"):
         parts.append(f"last={age(facts['last_at'])}({facts.get('last_kind')})")
+    qt = queue_text(facts, now)
+    if qt:
+        parts.append(qt)
     pr = probe_text(facts)
     if pr:
         parts.append(pr)
