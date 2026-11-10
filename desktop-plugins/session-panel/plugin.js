@@ -2,7 +2,7 @@
  * Session Panel — one panel above the composer that answers, for the focused chat:
  *   is work moving, how much is left, what is waiting on me, and what is stuck.
  *
- *   header       agent working now / idle since …, and a progress bar over the chat's kanban cards:
+ *   header       agent replying in this chat / idle since …, a progress bar over the chat's kanban cards:
  *                done · running · needs you · stuck · waiting · queued
  *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks; a card
  *                no ask covers shows its own human_request as "Do this / Why you / Next" (askView), never its
@@ -15,6 +15,7 @@
  *   In progress  running and in-review cards, sub-agents, background processes, rented machines
  *   Waiting      parked cards and what they wait on
  *   footer       finished and not-yet-started cards, folded
+ *   collapsed    header, Needs you, and one line per waiting card (up to 3) saying what it waits on
  *
  * Data: session-tasks' snapshot (window.__sessionTasks: cards, sub-agents, processes, machines; it keeps polling),
  * user-steps' asks (window.__userSteps), and finished cards from user-steps' /session-cards (every 30 s; core's
@@ -30,6 +31,7 @@ const VERSION = 'session-panel-v1'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
+const WAIT_LINES_COLLAPSED = 3 // waiting cards named while collapsed; the rest count as "+N more"
 const COLLAPSED_KEY = 'hermes.sessionPanel.collapsed.v1'
 
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
@@ -371,7 +373,12 @@ export function Panel() {
   const attention = attentionKeys(asks, sorted)
   const collapsed = !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
   const toggle = () => { const next = collapsed ? null : attention; writeCollapsed(next); setCollapsedState(next) }
-  const status = busy ? 'Agent working now' : sorted.lastActivity ? `Idle · last activity ${ago(sorted.lastActivity, now)}` : 'Idle'
+  // `busy` is this chat's own turn (the agent writing a reply), not card work: say so, or "working" next to
+  // "2 waiting" reads as a card running when none is.
+  const status = busy ? 'Agent replying in this chat' : sorted.lastActivity ? `Idle · last activity ${ago(sorted.lastActivity, now)}` : 'Idle'
+  // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
+  const waitLines = sorted.waiting.slice(0, WAIT_LINES_COLLAPSED)
+  const waitMore = sorted.waiting.length - waitLines.length
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }, 'queue'),
@@ -388,6 +395,10 @@ export function Panel() {
     ] }),
     !collapsed && jsx(Bar, { n }),
     // Collapse folds progress, never an ask: a muted "1 needs you" behind a chevron reads as nothing needing you.
+    collapsed && waitLines.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { ...muted, marginTop: 4, minWidth: 0 }, children: [
+      ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.detail}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `${i.label} · ${i.detail || 'waiting'}` }, i.key)),
+      waitMore > 0 && jsx('div', { children: `+${waitMore} more waiting` }, 'more')
+    ] }),
     collapsed && n.needsYou > 0 && jsx('div', { 'data-panel-needs-you': '', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0 }, children: needsYou }),
     !collapsed && jsxs('div', { 'data-panel-body': '', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0 }, children: [
       ...needsYou,

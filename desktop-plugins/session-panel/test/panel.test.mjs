@@ -209,6 +209,27 @@ test('panel: a collapsed panel still shows what needs you (collapse folds progre
   assert.equal(kept.textContent.includes('t_run'), false, 'running work stays folded')
 })
 
+test('panel: a collapsed panel names what each waiting card waits on, not just a count', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [
+    card('t_soak', 'scheduled', { look: 'waiting', waitingOn: 'deploy abc123 (gateway restart, then 30-minute soak)', label: 'Slack follower loop' }),
+    card('t_pr', 'scheduled', { look: 'waiting', waitingOn: 'ci https://github.com/o/r/pull/1', label: 'Mini link fix' }),
+    card('t_old', 'scheduled', { label: 'Old park' }),
+    card('t_4', 'scheduled', { look: 'waiting', waitingOn: 'clock 11:00', label: 'Fourth' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'collapse-waiting' }))
+  await React.act(async () => { el().querySelector('[data-panel-toggle]').click(); await flush() })
+  assert.equal(el().querySelector('[data-panel-body]'), null, 'progress is folded')
+  const box = el().querySelector('[data-collapsed-waiting]')
+  assert.ok(box, 'waiting reasons stay visible while collapsed')
+  const lines = [...box.querySelectorAll('[data-waiting-line]')].map(x => x.textContent)
+  assert.equal(lines.length, 3, 'at most three lines')
+  assert.match(lines[0], /Slack follower loop.*waiting on deploy abc123/)
+  assert.match(lines[1], /Mini link fix.*waiting on ci https:\/\/github.com\/o\/r\/pull\/1/)
+  assert.match(lines[2], /Old park.*scheduled/)
+  assert.match(box.textContent, /\+1 more/)
+})
+
 test('panel: collapse holds until a new stuck item appears, then reopens', async () => {
   window.localStorage.clear()
   const s = Date.now() / 1000
@@ -226,7 +247,7 @@ test('panel: busy session says so; nothing to show renders nothing', async () =>
   host.state.busy.value = true
   bridges({ chips: [card('t_run', 'running', { activityAt: Date.now() / 1000 - 30 })] })
   await show(React.createElement(m.Panel, { key: 'busy' }))
-  assert.equal(el().querySelector('[data-session-status]').textContent, '●Agent working now')
+  assert.equal(el().querySelector('[data-session-status]').textContent, '●Agent replying in this chat')
   host.state.busy.value = false
   bridges({ chips: [] })
   window.hermesDesktop = { api: async () => ({ tasks: [], includes: ['done'] }) }
