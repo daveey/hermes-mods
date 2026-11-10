@@ -1363,7 +1363,7 @@ HANDOFF_GRACE_S = 15 * 60  # a nudge waits this long for its reply_nudge_outcome
 NUDGE_OPEN_S = 3 * 3600
 NUDGE_DELIVERY = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
 NUDGE_OUTCOME = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
-                 "nudge_outcome_missing", "nudge_outcome_unconfirmed")
+                 "nudge_outcome_missing", "nudge_outcome_unconfirmed", "nudge_outcome_unjudged")
 # report_only outcome verdicts that may file (reply_check.STRONG_REPORT_ONLY_SRC; a test pins the match).
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 # reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
@@ -1429,6 +1429,8 @@ def _handoff_signal(r: dict, why: str) -> dict:
                    else f"{what}: {item[:120]}")
         details = (f"coach reply_check {rule} outcome failed on: {item}; {why}"
                    + (f" (nudged on: {ev})" if other else f"; nudge (p={r.get('p')}): {ev}"))
+        if r.get("outcome_status"):  # agent-614ed52ae7: the outcome's own words, whatever its resolved value
+            details += f"; outcome said: {r['outcome_status']}"
     else:
         symptom = f"{what}: {ev[:120]}"
         details = f"coach reply_check {rule} nudge (p={r.get('p')}): {ev}; {why}"
@@ -1438,6 +1440,37 @@ def _handoff_signal(r: dict, why: str) -> dict:
             "details": (details + (f"; revised reply: {reply}" if reply else ""))[:1500],
             "fp": (fp("agent", rule, r.get("session_id") or "", key) if key is not None
                    else fp("agent", rule, r.get("session_id") or ""))}
+
+
+def unjudged_outcome(o: dict) -> str:
+    """agent-614ed52ae7: a reply_nudge_outcome nobody scored (resolved=None and not a screen-only `unconfirmed`
+    verdict): the re-check judge gave no verdict, or the check raised. Returns its class for the fingerprint
+    ("no_verdict" | "error" | "check_failed"), "" for a judged or unconfirmed outcome. It is a coach-health defect
+    (unjudged_signal), never filed under the agent whose revision went unread."""
+    if o.get("resolved") is not None or o.get("unconfirmed") or unconfirmed_outcome(o):
+        return ""
+    ev = str(o.get("evidence") or "").lower()
+    if ev.startswith("outcome check error"):
+        return "error"
+    if ev.startswith("outcome check failed"):
+        return "check_failed"
+    return "no_verdict"
+
+
+def unjudged_signal(n: dict, r: dict, cls: str, at: float) -> dict:
+    """One coach defect per rule and unjudged class (repeats across sessions collapse onto it)."""
+    rule = str(r.get("rule") or n.get("rule") or "?")
+    reason = str(r.get("evidence") or cls)
+    return {"kind": "coach", "component": "coach", "at": at, "session_id": n.get("session_id") or "",
+            "symptom": f"coach {rule} nudge re-check gave no verdict: {reason[:120]}",
+            "details": (f"coach reply_check {rule} nudge {n.get('nudge_id') or '?'} (p={n.get('p')}) in session "
+                        f"{n.get('session_id') or '?'} got a reply_nudge_outcome with resolved=None, p={r.get('p')}, "
+                        f"judged={r.get('judged')}: {reason}. Nobody scored the revised reply, so it is not filed "
+                        f"under the agent; fix the re-check (reply_check.nudge_outcome / coach __init__ "
+                        f"_nudge_outcome). Nudged on: {str(n.get('evidence') or '')[:300]}"
+                        + (f"; revised reply: {r.get('reply')}" if r.get("reply") else ""))[:1500],
+            "fp": fp("coach", "outcome_unjudged", rule, cls),
+            "comment_open_card": True}
 
 
 def unconfirmed_outcome(o: dict) -> bool:
@@ -1978,12 +2011,22 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                                   "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
                                   "p": r.get("p"), "src": r.get("src") or "legacy_screen", **_nid(n)})
                 _mark(opened, n, "o")
+            elif unjudged_outcome(r):  # agent-614ed52ae7: no verdict is a coach-health defect, not the agent's
+                cls = unjudged_outcome(r)
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_unjudged", "session_id": n.get("session_id") or "",
+                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
+                                  "p": r.get("p"), "judged": r.get("judged"), "class": cls,
+                                  "evidence": str(r.get("evidence") or "")[:200], **_nid(n)})
+                out.append(unjudged_signal(n, r, cls, at))
+                _mark(opened, n, "o")
             elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
                 why = f"the revised reply {still} (outcome p={r.get('p')})"
                 rec = {**n, "reply": r.get("reply") or "",
                        # a judged failure names its own item; resolved=None carries a status text, not an item
                        "outcome_evidence": str(r.get("evidence") or "") if r.get("resolved") is False else "",
+                       # ...but whatever resolved is, its words reach the signal (agent-614ed52ae7)
+                       "outcome_status": str(r.get("evidence") or "") if r.get("resolved") is not False else "",
                        "outcome_item_ids": r.get("item_ids") or []}
                 if rec["outcome_evidence"] and not same_item(rec["outcome_evidence"], n.get("evidence") or "",
                                                              rec["outcome_item_ids"], n.get("item_ids")):

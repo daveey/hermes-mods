@@ -2473,7 +2473,8 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
     (agent-e5b6dcf428: the outcome used to be judged by the screen alone, a weaker judge than the nudge's).
     Returns {"p", "resolved", "evidence", "judged"} (+ "src" for report_only: the verdict's source, see
     STRONG_REPORT_ONLY_SRC); resolved=None when the judge gave no usable verdict or the check failed (the self-heal
-    collector then files, as it would without an outcome), and resolved=None with unconfirmed=True when the report_only
+    collector files that as one coach-health defect, signals.unjudged_signal, never under the agent: agent-614ed52ae7),
+    and resolved=None with unconfirmed=True when the report_only
     second opinion was due but unavailable (daily cap, error) and the screen alone would fail it: never filed."""
     if rule == "handoff":
         return handoff_outcome(reply, user_ask, tool_log, llm, threshold=threshold, thresholds=thresholds)

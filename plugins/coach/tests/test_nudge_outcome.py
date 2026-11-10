@@ -460,3 +460,129 @@ def test_report_only_nudge_says_the_recheck_reads_the_whole_reply():
         t = rc.nudge_for("report_only", "x", **kw)
         assert "The re-check reads your whole reply" in t, kw
         assert "'not pursuing'" in t
+
+
+# ── agent-614ed52ae7: an outcome with no verdict (resolved=None) is a coach-health defect, not the agent's ──────────
+# 11-06 13:38 PT, MacBook: the report_only nudge (p 0.9) was followed by a revision that named the existing owner card
+# and started a worker, but the outcome record came back p=None, resolved=None (the re-check judge gave no verdict or
+# errored). The collector filed it as "agent's revised reply still failed the coach report_only check (outcome
+# p=None)", blaming the agent for a re-check nobody scored.
+
+U_SID = "20261025_104956_99e2e1"
+U_NUDGE = {"ts": NOW - 700, "event": "reply_nudge", "session_id": U_SID, "rule": "report_only", "nudge_id": "n_614e",
+           "p": 0.9, "evidence": "The separate Desktop sidebar-refresh follow-up remains open.", "draft_id": "d_614e",
+           "platform": "desktop", "outcome": True}
+U_REPLY = ("Started local verification on this MacBook under the existing card `t_01a1a0e78968dc4d`. The fix is "
+           "already merged; the running worker is checking the installed Desktop.")
+
+
+def _uout(evidence, sid=U_SID, nid="n_614e", **kw):
+    return {"ts": NOW - 60, "event": "reply_nudge_outcome", "session_id": sid, "rule": "report_only", "nudge_id": nid,
+            "draft_id": "d_614e", "p": None, "resolved": None, "judged": evidence != "outcome check error: TimeoutError",
+            "evidence": evidence, "reply": U_REPLY, **kw}
+
+
+def _collect(tmp_path, rows, name="h", now=NOW):
+    h = _home(tmp_path / name, rows)
+    cur = {}
+    got = _nudges(sg.collect_coach(h, cur, now))
+    later = _nudges(sg.collect_coach(h, cur, now + sg.NUDGE_OPEN_S + 60))
+    logged = [json.loads(l) for l in (h / "coach" / "log.jsonl").read_text().splitlines()]
+    return got, later, logged
+
+
+def test_unjudged_outcome_files_a_coach_defect_not_the_agent(tmp_path):
+    """(a) the incident record: judge gave no verdict -> no agent signal, one coach outcome_unjudged signal quoting
+    the reason, a nudge_outcome_unjudged log line, and nothing more (no late 'no outcome' filing)."""
+    got, later, logged = _collect(tmp_path, [U_NUDGE, _uout("judge gave no verdict")])
+    assert [s for s in got if s["component"] == "agent"] == [], got
+    assert len(got) == 1 and got[0]["component"] == "coach"
+    s = got[0]
+    assert s["symptom"] == "coach report_only nudge re-check gave no verdict: judge gave no verdict"
+    assert s["fp"] == sg.fp("coach", "outcome_unjudged", "report_only", "no_verdict")
+    assert "judge gave no verdict" in s["details"] and U_SID in s["details"]
+    assert later == []
+    u = [r for r in logged if r.get("event") == "nudge_outcome_unjudged"]
+    assert len(u) == 1 and u[0]["nudge_id"] == "n_614e" and u[0]["rule"] == "report_only"
+    assert u[0]["session_id"] == U_SID and u[0]["evidence"] == "judge gave no verdict"
+    assert not [r for r in logged if r.get("event") in ("nudge_outcome_missing", "nudge_outcome_lost")]
+
+
+def test_outcome_check_error_files_a_coach_defect_not_the_agent(tmp_path):
+    """(b) the __init__ error path: 'outcome check error: TimeoutError' -> coach signal keyed 'error'; reply_check's
+    own exception path 'outcome check failed' -> keyed 'check_failed'."""
+    got, _, _ = _collect(tmp_path, [U_NUDGE, _uout("outcome check error: TimeoutError")])
+    assert [s["component"] for s in got] == ["coach"], got
+    assert got[0]["fp"] == sg.fp("coach", "outcome_unjudged", "report_only", "error")
+    assert "TimeoutError" in got[0]["symptom"]
+    got2, _, _ = _collect(tmp_path, [U_NUDGE, _uout("outcome check failed")], name="h2")
+    assert [s["component"] for s in got2] == ["coach"]
+    assert got2[0]["fp"] == sg.fp("coach", "outcome_unjudged", "report_only", "check_failed")
+
+
+def test_judged_failing_outcome_still_files_the_agent(tmp_path):
+    """(c) resolved=False with a strong verdict (p 0.9, src confirm) still files under the agent, with the outcome's
+    evidence kept in details."""
+    out = {**_uout("The sidebar-refresh follow-up is still open with no owner."), "p": 0.9, "resolved": False,
+           "judged": True, "src": "confirm"}
+    got, _, _ = _collect(tmp_path, [U_NUDGE, out])
+    assert [s["component"] for s in got] == ["agent"]
+    assert "still failed the coach report_only check" in got[0]["symptom"]
+    assert "still open with no owner" in got[0]["details"]
+
+
+def test_two_unjudged_sessions_share_one_fingerprint(tmp_path):
+    """(d) repeats collapse: unjudged outcomes in different sessions are one coach defect per rule and reason."""
+    a, _, _ = _collect(tmp_path, [U_NUDGE, _uout("judge gave no verdict")], name="a")
+    other = {**U_NUDGE, "session_id": "20261107_000000_abcdef", "nudge_id": "n_2"}
+    b, _, _ = _collect(tmp_path, [other, _uout("judge gave no verdict", sid=other["session_id"], nid="n_2")], name="b")
+    assert a[0]["fp"] == b[0]["fp"]
+    assert a[0]["session_id"] != b[0]["session_id"]
+
+
+def test_handoff_signal_keeps_the_outcome_evidence_whatever_resolved_is():
+    """_handoff_signal quotes the outcome's evidence in details even when it is a status text, not an item."""
+    rec = {**U_NUDGE, "reply": U_REPLY, "outcome_evidence": "", "outcome_status": "judge gave no verdict"}
+    s = sg._handoff_signal(rec, "the revised reply still failed report_only (outcome p=None)")
+    assert "judge gave no verdict" in s["details"]
+
+
+def test_live_hooks_unparseable_outcome_verdict_files_coach_not_agent(tmp_path, monkeypatch):
+    """Entry path: the live pre_verify hook, whose re-check judge returns no parseable verdict, logs resolved=None and
+    the collector files it as a coach defect."""
+    z = {k: 0 for k in rc.RULES}
+    mod = load("coach_init_nudge_outcome_unjudged", ROOT / "__init__.py")
+    c = mod._load("core")
+    rcm = mod._load("reply_check")
+    calls = []
+
+    def judge(s, p):
+        calls.append(p)
+        return json.dumps({**z, "confirm": 0.9, "evidence": "asks permission to run the tests"}) if len(calls) == 1 \
+            else "sorry, I can't help with that"
+    monkeypatch.setattr(rcm, "aux_judge", judge)
+    monkeypatch.setenv("COACH_SYSTEM_ONE", "off")
+    monkeypatch.setenv("COACH_STALLED_GOAL", "0")
+    monkeypatch.setenv("COACH_REPLY_RULES", "confirm")
+    root = tmp_path / "coach"
+    _, hooks = mod.build(store=c.Store(root=root), checkout=None)
+    hooks["pre_llm_call"](session_id="s_u", user_message="fix the flaky test", platform="desktop")
+    out = hooks["pre_verify"](session_id="s_u", platform="desktop", attempt=0,
+                              final_response="I found the race. Want me to apply the fix and run the tests?")
+    assert out and out["action"] == "continue"
+    hooks["pre_verify"](session_id="s_u", platform="desktop", attempt=1, final_response="Applied the fix; tests pass. Should I also open a PR?")
+    rows = [json.loads(l) for l in (root / "log.jsonl").read_text().splitlines()]
+    outs = [r for r in rows if r["event"] == "reply_nudge_outcome"]
+    assert len(outs) == 1 and outs[0]["resolved"] is None and outs[0]["evidence"] == "judge gave no verdict"
+    h = _home(tmp_path / "h", rows)
+    got = _nudges(sg.collect_coach(h, {}, time.time()))
+    assert [s["component"] for s in got] == ["coach"] and "no verdict" in got[0]["symptom"]
+
+
+def test_nudge_counts_puts_unjudged_outcomes_under_unjudged(tmp_path):
+    """Detection: self_heal status counts unjudged outcomes on their own, outside `filed` (they file as coach)."""
+    now = NOW
+    rows = [{**U_NUDGE, "ts": now - 300}, {**_uout("judge gave no verdict"), "ts": now - 290}]
+    (tmp_path / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    c = sh.nudge_counts(tmp_path, now=now)["report_only"]
+    assert c.get("unjudged") == 1 and c["still_failing"] == 0 and c["filed"] == 0

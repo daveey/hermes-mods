@@ -1407,7 +1407,7 @@ def _unconfirmed_outcome(o: dict) -> bool:
 def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
     """reply_nudges per rule over `days`, by their reply_nudge_outcome (agent-3ba1979f34): resolved (not filed),
     still_failing / no_outcome (filed by signals.collect_coach), unconfirmed (a screen-only report_only outcome: not
-    filed), waiting (inside the grace window), untracked (a
+    filed), unjudged (resolved=None, no verdict: filed as one coach defect, not in `filed`; agent-614ed52ae7), waiting (inside the grace window), untracked (a
     non-handoff nudge from a backend on the old plugin, no `outcome` marker: never filed). For `status`: a rule whose
     nudges never get outcomes, or never resolve, shows here."""
     root = Path(root) if root is not None else coach_root()
@@ -1446,12 +1446,14 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
         if o is not None:
             outcomes.remove(o)
             k = ("resolved" if o.get("resolved") is True else
-                 "unconfirmed" if _unconfirmed_outcome(o) else "still_failing")
+                 "unconfirmed" if _unconfirmed_outcome(o) else
+                 # agent-614ed52ae7: nobody scored it; it files as one coach defect, outside `filed`
+                 "unjudged" if o.get("resolved") is None else "still_failing")
         elif rule != "handoff" and not n.get("outcome"):
             k = "untracked"
         else:
             k = "waiting" if _nudge_waiting(n, delivered, now) else "no_outcome"
-        c[k] += 1
+        c[k] = c.get(k, 0) + 1  # `unjudged` appears only when it happened
         c["filed"] = c["still_failing"] + c["no_outcome"]
     return out
 

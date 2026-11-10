@@ -1070,8 +1070,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            "reason": f"error:{type(exc).__name__}", "detail": str(exc)[:200],
                            **(_ids(n) if n else {})})
                 if n and "outcome_nudge" not in coach.loop_state(session_id):
-                    # taken off but not judged: its outcome record says so, and resolved=None (not True) still
-                    # files it in signals.collect_coach, as an outcome check that failed always did
+                    # taken off but not judged: its outcome record says so; resolved=None files it in
+                    # signals.collect_coach as a coach-health defect, not the agent's (agent-614ed52ae7)
                     _log_outcome(session_id, n, "reply_nudge_outcome", p=None, resolved=None, judged=False,
                                  evidence=f"outcome check error: {type(exc).__name__}",
                                  reply=(final_response or "")[:300])
