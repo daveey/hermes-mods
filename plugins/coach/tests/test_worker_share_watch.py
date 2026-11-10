@@ -76,6 +76,53 @@ def test_only_unmarked_unpinned_ready_cards_count(home):
     assert [c["id"] for c in w.waiting_unmarked(home / "kanban.db")] == ["t_a1", "t_a2", "t_b1"]
 
 
+@pytest.mark.parametrize("failure", ["connect", "probe"])
+def test_ro_failure_falls_back_to_query_only(home, monkeypatch, failure):
+    real_connect = sqlite3.connect
+    opened = []
+
+    class FailedProbe:
+        closed = False
+
+        def execute(self, sql):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        def close(self):
+            self.closed = True
+
+    probe = FailedProbe()
+
+    def connect(database, **kwargs):
+        if "mode=" + "ro" in database:
+            if failure == "connect":
+                raise sqlite3.OperationalError("unable to open database file")
+            return probe
+        con = real_connect(database, **kwargs)
+        opened.append(con)
+        return con
+
+    monkeypatch.setattr(w.sqlite3, "connect", connect)
+    assert [c["id"] for c in w.waiting_unmarked(home / "kanban.db")] == ["t_a1", "t_a2", "t_b1"]
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")  # caller closes the fallback
+    con = w._ro_connect(home / "kanban.db")
+    try:
+        assert con.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            con.execute("DELETE FROM tasks")
+    finally:
+        con.close()
+    if failure == "probe":
+        assert probe.closed
+
+
+def test_missing_board_is_not_created(tmp_path):
+    missing = tmp_path / "missing.db"
+    with pytest.raises(sqlite3.OperationalError):
+        w.waiting_unmarked(missing)
+    assert not missing.exists()
+
+
 def test_three_starved_samples_file_one_card_with_top_reasons(home):
     r = Runner()
     outs = [go(home, r, registry(), i) for i in range(5)]

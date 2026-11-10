@@ -47,9 +47,29 @@ def _fresh(m: dict, now_ms: int) -> bool:
     return m.get("state") == "active" and isinstance(at, (int, float)) and now_ms - at <= FRESH_MS
 
 
+def _ro_connect(path: Path, timeout: float = 10):
+    """Probe WAL reads; fall back to an existing database with SQL writes disabled."""
+    uri = path.resolve().as_uri()
+    con = None
+    try:
+        con = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        return con
+    except sqlite3.OperationalError:
+        if con is not None:
+            con.close()
+    con = sqlite3.connect(f"{uri}?mode=rw", uri=True, timeout=timeout)
+    try:
+        con.execute("PRAGMA query_only=ON")
+        return con
+    except Exception:
+        con.close()
+        raise
+
+
 def waiting_unmarked(db: Path) -> list:
     """Ready cards on this board the pool is never offered (no worker-first mark, not pinned to a machine)."""
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+    con = _ro_connect(db)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute("SELECT id, title, body, assignee, requires, skills, runs_on, workspace_kind,"
