@@ -96,6 +96,28 @@ def test_permission_cooldown_is_scope_local_and_survives_restart(status, code):
     assert 'fictional-test-token' not in repr(state)
 
 
+@pytest.mark.parametrize('status,code', [(301, 'moved'), (302, 'moved'), (307, 'moved'),
+                                         (308, 'moved'), (410, 'not_found')])
+def test_moved_or_gone_scope_does_not_back_off_the_shared_credential(status, code):
+    """A renamed/transferred repo answers 301 for the old name. That is a fact about
+    that one scope; it must not put every other scope on the credential in backoff."""
+    moved = scope(name='example/renamed')
+    allowed = scope(name='example/allowed')
+    h = Harness([HTTPResponse(status, {'Location': 'https://evil.invalid'}, {'message': 'Moved'}),
+                 response([runner()]), response([runner()])])
+    assert h.api.enumerate(moved).error == code
+    assert h.api.enumerate(allowed).complete
+    h.now += 1
+    assert h.api.enumerate(allowed).complete
+    assert h.api.enumerate(moved).error == code  # its own cooldown, no new request
+    assert len(h.calls) == 3
+    state = h.api.export_state()
+    assert state[moved['credential_ref']]['failures'] == 0
+    restarted = Harness([])
+    restarted.api.restore_state(state)
+    assert restarted.api.enumerate(moved).error == code and not restarted.calls
+
+
 @pytest.mark.parametrize('headers,body', [
     ({'Retry-After': '60'}, {}),
     ({'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1100'}, {}),

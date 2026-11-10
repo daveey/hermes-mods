@@ -101,7 +101,7 @@ class GitHubActions:
                 if type(key) is not str or not key or len(key) > 256 or type(value) is not dict:
                     raise ValueError('invalid_budget_state')
                 budget = _Budget(**value)
-                if budget.cause not in (None, 'forbidden', 'not_found', 'rate_limited', 'unauthorized', 'server_error', 'network_error', 'unexpected_status'):
+                if budget.cause not in (None, 'forbidden', 'not_found', 'moved', 'rate_limited', 'unauthorized', 'server_error', 'network_error', 'unexpected_status'):
                     raise ValueError('invalid_budget_state')
                 if budget.remaining is not None and (type(budget.remaining) is not int or budget.remaining < 0):
                     raise ValueError('invalid_budget_state')
@@ -224,7 +224,11 @@ class GitHubActions:
             budget.next_at = max(now, budget.next_at) + max(0, budget.reset-now)/budget.remaining
         status = response.status
         if status not in (200, 304):
-            code = {401:'unauthorized',403:'forbidden',404:'not_found',429:'rate_limited'}.get(status)
+            # 3xx: the scope's repo/org was renamed or transferred (redirects are never
+            # followed). 410: gone. Both describe one resource, like 403/404, so they
+            # get a scope-local cooldown and never back off the shared credential.
+            code = {301:'moved',302:'moved',307:'moved',308:'moved',401:'unauthorized',403:'forbidden',
+                    404:'not_found',410:'not_found',429:'rate_limited'}.get(status)
             message = response.body.get('message', '') if type(response.body) is dict else ''
             throttled = status == 403 and (
                 'retry-after' in h or budget.remaining == 0 or
@@ -232,7 +236,8 @@ class GitHubActions:
                  for marker in ('secondary rate limit', 'rate limit exceeded', 'abuse detection'))))
             if throttled:
                 code = 'rate_limited'
-            if status in (403, 404) and not throttled:
+            scope_local = status in (301, 302, 307, 308, 403, 404, 410) and not throttled
+            if scope_local:
                 permission = self._budgets.setdefault(permission_key, _Budget())
                 permission.cause = code
                 self._delay(permission, h)
@@ -244,13 +249,13 @@ class GitHubActions:
             # An authorization failure must invalidate cached authorization evidence.
             if status == 401:
                 self._cache = {k: v for k, v in self._cache.items() if k[0] != credential.key}
-            elif status in (403, 404) and not throttled:
+            elif scope_local:
                 self._cache = {k: v for k, v in self._cache.items()
                                if k[0] != credential.key or not
                                (k[2].split('?', 1)[0] == resource or k[2].startswith(resource + '/'))}
             if status == 401 and hasattr(self.credential_resolver, 'invalidate'):
                 self.credential_resolver.invalidate(key=credential.key)
-            cooldown = permission if status in (403, 404) and not throttled else budget
+            cooldown = permission if scope_local else budget
             raise _Failure(code or ('server_error' if isinstance(status, int) and status >= 500 else 'unexpected_status'),
                            max(0, math.ceil(cooldown.until - self.clock())))
         if status == 304:
