@@ -150,6 +150,8 @@ Undone notices are always plain cards.
 
 ## Pitfalls
 
+- Exercise the coach worker's startup and request routing separately. An inherited class-selector model must not be pinned to the worker's historical Anthropic default before the judge model is known. Keep explicit selector/provider conflicts visible. Price the resolved concrete route and freeze its model/provider in every runner (including transcript/dictionary judge paths) before reserving budget; otherwise another pooled worker can select a different route after pricing. Run `scripts/test-all -k hermes-coach` from a complete checkout: copying only scripts loses sibling-plugin fixtures and Git-based repository guards. Require a budget-reserved real judge response before calling a startup repair complete; all-None results are INCOMPLETE.
+
 - Keep weekly regex candidates separate from adjudicated human corrections. An explicit one-shot reviewer opener,
   a stamped Subagent relay, or a generated Kanban warning is not a correction; appended `[System: ...]` text must
   not supply the matching words. Keep ambiguous legacy operator stamps for review. A session-level detection or

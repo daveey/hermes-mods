@@ -314,7 +314,8 @@ class TranscriptRunner(ce.DirectRunner):
         r = TReq()
         r.provider = prompt.get("provider") or self.provider_for(model, ignore_rules)  # the tool simulator: own wire
         p = self.price(model, r.provider)
-        r.model, r.price = model, p
+        r.model, r.price = p.get("model") or model, p
+        r.provider = p.get("provider") or r.provider
         if "messages" in prompt:
             r.system, r.user, r.messages, r.tools = compose(home, cwd, self.preload), "", prompt["messages"], prompt["tools"]
             if prompt.get("system_extra"):
