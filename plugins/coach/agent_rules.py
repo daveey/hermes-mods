@@ -2125,7 +2125,11 @@ def park_result_line(tool: str, args: Any, linked: Optional[list] = None, result
         return None
     if name not in PARK_TOOLS:
         return None
-    facts: dict = {"tool": name}
+    # every PARK_TOOLS call that succeeded ended the run of the card it names (`task`; absent = the worker's own):
+    # reply_check.own_run_ended routes a report_only finding to that card instead of nudging (agent-689886b70b)
+    facts: dict = {"tool": name, "run_ended": True}
+    if a.get("task_id"):
+        facts["task"] = str(a.get("task_id"))[:40]
     if name == "kanban_block":
         facts.update(kind=str(a.get("kind") or ""), human_request=bool(isinstance(a.get("human_request"), dict)
                                                                        and a.get("human_request")),

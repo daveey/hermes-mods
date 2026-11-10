@@ -1374,10 +1374,20 @@ BACKEND_KEYS = ("pid", "host", "proc_start")
 NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}
 
 
+# agent-689886b70b: a nudged "Still unresolved: X" came back as "Remaining prerequisites: X" and counted as a new item.
+# A leading label of up to 4 words ending in ":" (markdown emphasis allowed) is not the item; a longer lead-in is.
+_ITEM_LABEL_RE = re.compile(r"^[\s*_#>`-]*(?:[^\W\d_][\w'’-]*\s+){0,3}[^\W\d_][\w'’-]*\s*[*_`]*\s*:[\s*_`]*")
+
+
 def item_key(evidence: str) -> str:
     """The item a verdict names: a hash of its first 80 lowercase alphanumeric chars, so re-spacing, punctuation and
-    case don't make a new item, but a different line does (agent-e5b6dcf428)."""
-    return h10(re.sub(r"[^a-z0-9]", "", str(evidence or "").lower())[:80])
+    case don't make a new item, but a different line does (agent-e5b6dcf428). A short leading label ("Still
+    unresolved:", "Open:") is dropped first, so relabelling the same line doesn't either (agent-689886b70b)."""
+    text = str(evidence or "")
+    rest = _ITEM_LABEL_RE.sub("", text, count=1)
+    if re.search(r"[A-Za-z0-9]", rest):
+        text = rest
+    return h10(re.sub(r"[^a-z0-9]", "", text.lower())[:80])
 
 
 # agent-61b50f34ae: a judge quotes ~20 words of the reply and the revision rewords the paragraph, so an exact item_key

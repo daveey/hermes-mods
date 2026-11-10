@@ -956,6 +956,15 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                               else {})})
                 return None
             tracked = hit["rule"] in rc.RULES
+            # agent-689886b70b: a report_only hit after a successful park that ended this worker's own run can't be
+            # acted on in this turn (every lifecycle call is refused): put the finding on the card for its next run
+            _own = os.environ.get("HERMES_KANBAN_TASK", "") if platform == "kanban" else ""
+            if hit["rule"] == "report_only" and (_ended := rc.own_run_ended(log_lines, _own)):
+                res = rc.report_only_to_card(hit.get("evidence") or "", _own, reply=final_response)
+                store.log({"event": "report_only_to_card", "session_id": session_id, "platform": platform,
+                           "rule": hit["rule"], "p": hit["p"], "evidence": hit["evidence"], "run_end": _ended,
+                           **res, **({"variant": hit["variant"]} if hit.get("variant") else {}), **draft_ref()})
+                return None
             nid = _new_nudge_id()
             try:  # signals.same_item: ids of the paragraph the evidence quotes (agent-61b50f34ae)
                 item_ids = rc.evidence_ids(final_response, hit.get("evidence") or "")

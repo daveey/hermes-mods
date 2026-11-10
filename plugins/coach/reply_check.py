@@ -1452,6 +1452,116 @@ def lifecycle_park(tool_log: Optional[list] = None, now: Optional[float] = None,
     return False
 
 
+# report_only after the worker's own run ended (self-heal agent-689886b70b): a hub worker parked its card with a
+# dependency block on another team's card, then report_only nudged its reply. The block had ended the run, so every lifecycle
+# call was refused and the revision could only reword ("Still unresolved: X" -> "Remaining prerequisites: X"); it
+# failed again, and the card spent 10 more runs ending on the same items. Fourth time (agent-9f966b0682,
+# agent-081fb3bbc3, agent-8a6863884a): each fix exempted one park kind. A turn that still fails report_only after a
+# successful run-ending park on the worker's OWN card is still judged, but the finding goes to that card as a comment
+# the next run reads, not to a turn that can no longer act. kanban_complete / kanban_move stay nudged
+# (JUDGED_AFTER_RUN_END): the worker can still file a follow-up card. Every run-ending tool is in exactly one list
+# (tests/test_report_only_run_ended.py).
+RUN_ENDED_TO_CARD = (
+    "kanban_block", "kanban_schedule", "kanban_request_review", "kanban_request_changes",
+    "kanban_continue",  # also exempt as continued_run; listed so the classification is complete
+)
+
+
+def own_run_ended(tool_log: Optional[list] = None, own_card: str = "") -> Optional[str]:
+    """`<tool>[:<kind>]` of this turn's last successful park that ended the run of `own_card` (the park line's `task`
+    is absent or names it; agent_rules.park_result_line writes run_ended), or of a successful kanban_continue; None
+    when `own_card` is empty (not a Kanban worker) or no such call ran."""
+    if not own_card:
+        return None
+    last = None
+    lines = list(tool_log or [])
+    for i, line in enumerate(lines):
+        s = (line or "").lstrip()
+        if s.startswith(_PARK_LINE):
+            try:
+                f = json.loads(s[len(_PARK_LINE):])
+            except ValueError:
+                continue
+            if (isinstance(f, dict) and f.get("run_ended") and f.get("tool") in RUN_ENDED_TO_CARD
+                    and str(f.get("task") or own_card) == own_card):
+                last = f"{f['tool']}:{f['kind']}" if f.get("kind") else str(f["tool"])
+            continue
+        if _CONTINUE_RE.search(line or ""):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not (nxt or "").lstrip().startswith("<- ERROR"):
+                last = "kanban_continue"
+    return last
+
+
+def card_status(card: str, dbs: Optional[list] = None) -> tuple:
+    """(status, board db path) of `card` on this host's boards, else (None, None)."""
+    try:
+        ar = _cache.load_sibling(_HERE, "agent_rules")
+        paths = ar.board_dbs() if dbs is None else dbs
+    except Exception:
+        return None, None
+    for path in paths:
+        try:
+            conn = ar._board_connect(path)
+        except Exception:
+            continue
+        try:
+            row = conn.execute("select status from tasks where id=?", (card,)).fetchone()
+            if row:
+                return str(row[0]), str(path)
+        except Exception:
+            continue
+        finally:
+            conn.close()
+    return None, None
+
+
+def post_card_comment(card: str, body: str, db: Optional[str] = None) -> int:
+    """Append `body` to `card`'s thread on board `db` (core's kanban_db.add_comment, author "coach"); the comment id."""
+    from hermes_cli import kanban_db as kb  # type: ignore
+    from hermes_cli.kanban_db_connect import connect  # type: ignore
+    conn = connect(db_path=Path(db)) if db else connect()
+    try:
+        return int(kb.add_comment(conn, card, "coach", body) or 0)
+    finally:
+        conn.close()
+
+
+def _evidence_line(evidence: str, reply: str = "") -> str:
+    """The reply line the judge's quote comes from (a confirm quote can be two words), else the quote itself."""
+    q = " ".join(str(evidence or "").split())
+    norm = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())  # noqa: E731
+    key = norm(q)[:60]
+    if key:
+        for line in str(reply or "").splitlines():
+            if key in norm(line) and len(line.strip()) > len(q):
+                return " ".join(line.split())
+    return q
+
+
+def report_only_card_body(evidence: str, reply: str = "") -> str:
+    item = _evidence_line(evidence, reply)[:400] or "an open item left unowned"
+    return (f"coach report_only, last run's reply: \"{item}\". The run had already ended, so it could not act on it. "
+            "Next run: name a live owner card for it (status changed or ran in the last 24 h) or do it; rewording "
+            "the same item is not a fix.")
+
+
+def report_only_to_card(evidence: str, own_card: str, dbs: Optional[list] = None, post=None, reply: str = "") -> dict:
+    """Post the report_only finding on `own_card` when it is open; the report_only_to_card event's fields
+    ({"card", "posted", "comment_id"} or {"card", "posted": False, "why"}). Never raises."""
+    status, path = card_status(own_card, dbs)
+    out: dict = {"card": own_card, "card_status": status}
+    if not status:
+        return {**out, "posted": False, "why": "card_unknown"}
+    if status in ("done", "archived"):
+        return {**out, "posted": False, "why": f"card_{status}"}
+    try:
+        cid = (post or post_card_comment)(own_card, report_only_card_body(evidence, reply), db=path)
+        return {**out, "posted": True, **({"comment_id": cid} if cid else {})}
+    except Exception as exc:
+        return {**out, "posted": False, "why": f"error:{type(exc).__name__}", "detail": str(exc)[:160]}
+
+
 def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None,
                       now: Optional[float] = None) -> Optional[str]:
     """Why report_only can't apply to this turn ("scope_limited" / "scheduled_wait" / "continued_run" /
