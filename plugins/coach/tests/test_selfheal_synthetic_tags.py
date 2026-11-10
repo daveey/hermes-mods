@@ -39,6 +39,7 @@ REAL_NOTICES = [
     "[kanban] Task t_01a18c02e0a94004 blocked; needs attention.\nTitle: Disk H5: mini hit 15 GB",
     "[runtime] Your draft above was NOT shown to the user. Your next reply replaces it: include its full content",
     "[kanban-honest-done] The card you completed still has failing acceptance",
+    "[workflow-state] The workflow is still blocked; a card entering review is not recovery",
 ]
 
 
