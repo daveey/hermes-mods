@@ -22,6 +22,19 @@ MISSES = ["i keep asking what time is it and getting no reply",
 
 
 class T(unittest.TestCase):
+    def test_replan_lines_count_holds_in_window(self):
+        import json as _j, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "logs").mkdir()
+            rows = [{"t": 150, "kind": "replan_hold", "task": "t_c21c170e"}, {"t": 160, "kind": "replan_hold"},
+                    {"t": 170, "kind": "replan_released"}, {"t": 50, "kind": "replan_hold", "task": "t_old"},
+                    {"t": 155, "kind": "verdict"}]
+            (Path(d) / "logs" / "ask-gate.jsonl").write_text("\n".join(map(_j.dumps, rows)) + "\nnot json\n")
+            line = g.replan_lines([Path(d)], 100, 200)[0]
+        self.assertIn("2 held, 1 released", line)
+        self.assertIn("t_c21c170e", line)
+        self.assertNotIn("t_old", line)
+
     def test_unfiled_is_not_automatically_a_detector_miss(self):
         finding = g.hit_defect({'class': g.FIX_CLASS, 'quote': 'sidebar is broken',
                                 'pattern': 'is-broken', 'session': 'example', 't': 1})

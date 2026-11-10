@@ -506,6 +506,36 @@ def skill_outcome_lines(data, homes, lo, hi):
         return [f"Skill outcomes section unavailable: {type(e).__name__}: {e}"]
 
 
+def replan_lines(homes, lo, hi):
+    """Weekly count of ask-gate replan holds (self-heal agent-866a12f54f): asks that handed David "end the approved
+    goal unmet, or expand scope" with no changed limit named. Source: each home's logs/ask-gate.jsonl."""
+    homes = homes or [Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()]
+    held, released, tasks = 0, 0, set()
+    for h in homes:
+        try:
+            lines = (Path(h) / "logs" / "ask-gate.jsonl").read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if '"replan_' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not lo <= float(r.get("t") or 0) < hi:
+                continue
+            if r.get("kind") == "replan_hold":
+                held += 1
+                if r.get("task"):
+                    tasks.add(r["task"])
+            elif r.get("kind") == "replan_released":
+                released += 1
+    return [f"Replan holds (ask-gate `replan_hold`): {held} held, {released} released after the hold budget"
+            + (f", cards: {', '.join(sorted(tasks))}" if tasks else "") + ". A release means an unchanged "
+            "'end it or expand scope' ask reached David: check it named a real changed limit."]
+
+
 def lane_sessions(home):
     """Session ids the self-heal lane already has a filing for (any status)."""
     try:
@@ -814,6 +844,7 @@ def main():
     if a.last_week:
         homes = [Path(h).expanduser() for h in a.home] or None
         so_lines = skill_outcome_lines(data, homes, weeks[0].timestamp(), until)
+        so_lines = so_lines + [""] + replan_lines(homes, weeks[0].timestamp(), until)
         md += "\n\n" + "\n".join(so_lines)
     if a.json:
         dc = doit_counts(doit, weeks)
