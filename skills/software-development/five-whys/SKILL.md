@@ -97,6 +97,8 @@ another actor before filesystem or log forensics: open cards on that subsystem o
 comments, and sessions working on the same object. Agents often write to a host over ssh from another host, so the
 target host's logs, process list and session DB never show the change; the actor's card or transcript does.
 
+**Before profiling a live service, rule out observer-induced stalls.** Use `py-spy record/top --nonblocking` for attached production targets, with a bounded duration. Default ptrace sampling can suspend threads long enough to create the timeout being investigated; a requested duration is not a bound when sampling falls behind. Correlate profiler start/end and lag warnings with server loop coverage gaps and client failures, and discard those intervals as ordinary-load evidence. Never reproduce blocking attachment against the user's live backend; use a separate fixture. The coach profiler-safety pre-tool guard enforces common command forms, not dynamically generated scripts.
+
 ### 3. Branch where causes split
 
 One problem often has several independent causes. When one why has two true answers, branch and follow each.
