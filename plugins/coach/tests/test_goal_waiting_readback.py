@@ -1,6 +1,7 @@
 """Read native producers, without promoting or running wake commands."""
 from contextlib import closing
 import sqlite3
+from sqlite_fixture import transaction
 import time
 import pytest
 from test_goal_ownership import owner, TID
@@ -11,7 +12,7 @@ PARENT = 't_abcdef12'
 
 def link_native(owner):
     from hermes_cli import kanban_db as kb
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL")
         conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES (?, 'Prerequisite','ready',?)", (PARENT, int(time.time())))
@@ -40,7 +41,7 @@ def test_native_dependency_readback_and_release(owner):
     before = owner[0].read_bytes()
     assert snapshot(owner) == {'kind': 'dependency', 'parents': ((PARENT, 'ready'),)}
     assert owner[0].read_bytes() == before
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (PARENT,))
         conn.commit()
@@ -55,7 +56,7 @@ def test_native_scheduled_producer_readback_does_not_run_wake(owner, producer):
     from hermes_cli.kanban_continuation import continue_task, wake_due_continuations
     marker = owner[0].parent / 'must-not-run'
     command = 'touch ' + str(marker)
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.row_factory = sqlite3.Row
         if producer == 'continue':
             result = continue_task(conn, TID, checkpoint='Wait for prerequisite', resume_after_seconds=600, wake_check=command)
@@ -69,7 +70,7 @@ def test_native_scheduled_producer_readback_does_not_run_wake(owner, producer):
     with pytest.raises(ValueError, match='owner_dispatcher_unverified'):
         certify(owner)
     assert not marker.exists()
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute('DELETE FROM task_wake_checks')
         conn.commit()
@@ -80,7 +81,7 @@ def test_native_scheduled_producer_readback_does_not_run_wake(owner, producer):
 @pytest.mark.parametrize('corruption', ['missing', 'cycle', 'too_many'])
 def test_dependency_readback_rejects_corrupt_graph(owner, corruption):
     link_native(owner)
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         if corruption == 'missing':
             conn.execute('DELETE FROM tasks WHERE id=?', (PARENT,))
         elif corruption == 'cycle':
@@ -98,7 +99,7 @@ def test_shared_ancestor_is_not_a_cycle(owner):
     from hermes_cli import kanban_db as kb
     link_native(owner)
     sibling, ancestor = 't_abcdef13', 't_abcdef14'
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.row_factory = sqlite3.Row
         for tid in (sibling, ancestor):
             conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES (?, 'Prerequisite','ready',1)", (tid,))
@@ -113,7 +114,7 @@ def test_shared_ancestor_is_not_a_cycle(owner):
 
 def test_terminal_parents_alone_do_not_certify_pending_child(owner):
     link_native(owner)
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (PARENT,))
     with pytest.raises(ValueError, match='owner_dependency_unverified'):
         snapshot(owner)
@@ -121,7 +122,7 @@ def test_terminal_parents_alone_do_not_certify_pending_child(owner):
 
 def test_readback_rejects_dangling_transitive_parent(owner):
     link_native(owner)
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', ('t_abcdef13', PARENT))
     with pytest.raises(ValueError, match='owner_dependency_unverified'):
         snapshot(owner)

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import select
 import sqlite3
+from sqlite_fixture import transaction
 import subprocess
 import sys
 import threading
@@ -97,7 +98,7 @@ def assert_stopped(home, frames):
     assert TEXTS['abandoned'] not in wire
     assert 'Unresolved goal' not in wire
     assert not any(f.get('params', {}).get('type') == 'tool.start' for f in frames.frames)
-    with sqlite3.connect(home / 'state.db') as db:
+    with transaction(home / 'state.db') as db:
         persisted = '\n'.join(r[0] or '' for r in db.execute(
             "SELECT content FROM messages WHERE role='assistant'"))
     assert TEXTS['abandoned'] not in persisted
@@ -254,7 +255,7 @@ def test_cli_pty_ctrl_c(tmp_path):
         text = output.decode(errors='replace')
         assert TEXTS['abandoned'] not in text
         assert 'Unresolved goal' not in text
-        with sqlite3.connect(home / 'state.db') as db:
+        with transaction(home / 'state.db') as db:
             persisted = '\n'.join(r[0] or '' for r in db.execute(
                 "SELECT content FROM messages WHERE role='assistant'"))
         assert TEXTS['abandoned'] not in persisted

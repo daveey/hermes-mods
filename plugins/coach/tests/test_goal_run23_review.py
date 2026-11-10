@@ -1,6 +1,7 @@
 """Independent whole-change acceptance probes; isolated, no live services."""
 import json
 import sqlite3
+from sqlite_fixture import transaction
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +15,7 @@ pytest_plugins = ["tests.agent.test_pre_final_gate"]
 
 def test_queued_receipt_cannot_certify_current_kanban_owner(owner, consumer):
     assert certify(owner)["disposition"] == "owned_continuing"
-    with sqlite3.connect(owner[0].parent / "state.db") as conn:
+    with transaction(owner[0].parent / "state.db") as conn:
         conn.execute("UPDATE messages SET display_metadata=? WHERE role='user'", (json.dumps({"_queued_prompt": True}),))
     with pytest.raises(ValueError):
         certify(owner)

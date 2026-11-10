@@ -5,6 +5,7 @@ with ``t_[0-9a-f]{8}`` fullmatch, so every ref to a current card raised ``owner_
 """
 import importlib.util
 import sqlite3
+from sqlite_fixture import transaction
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ CURRENT = 't_01a19e2574fa8b00'
 
 def _rename(owner, new_id):
     db, v, _ = owner
-    with sqlite3.connect(db) as c:
+    with transaction(db) as c:
         for table in ('tasks', 'task_runs', 'kanban_notify_subs'):
             col = 'id' if table == 'tasks' else 'task_id'
             c.execute(f'UPDATE {table} SET {col}=? WHERE {col}=?', (new_id, TID))

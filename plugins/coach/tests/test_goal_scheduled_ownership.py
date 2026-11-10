@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import sqlite3
+from sqlite_fixture import transaction
 import time
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ spec.loader.exec_module(ownership)
 
 @pytest.fixture
 def scheduled(owner):
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute("UPDATE tasks SET status='scheduled', current_run_id=NULL")
         conn.execute("DELETE FROM task_runs")
         conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'scheduled',?,?)", (TID,json.dumps({'wake_at':time.time()+300}),int(time.time())))
@@ -92,7 +93,7 @@ def test_scheduling_does_not_replace_return_receipt(scheduled, dispatcher, monke
 
 
 def test_scheduling_cannot_override_scope(scheduled, consumer, dispatcher):
-    with sqlite3.connect(scheduled[0]) as conn:
+    with transaction(scheduled[0]) as conn:
         conn.execute("UPDATE tasks SET body='Unrelated task'")
     with pytest.raises(ValueError, match='owner_task_scope_or_state_mismatch'):
         ownership.authoritative_owner(scheduled[1], scheduled[2], SID)

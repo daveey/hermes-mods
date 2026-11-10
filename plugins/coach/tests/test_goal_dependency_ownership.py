@@ -1,5 +1,6 @@
 """Native dependency edges compose live ancestors and child return receipts."""
 import sqlite3
+from sqlite_fixture import transaction
 import os
 import time
 import sys
@@ -18,7 +19,7 @@ def dependency(scheduled, dispatcher):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_dispatch import _process_fingerprint
     from hermes_cli.kanban_host_identity import claim_prefix
-    with sqlite3.connect(scheduled[0]) as c:
+    with transaction(scheduled[0]) as c:
         c.row_factory = sqlite3.Row
         c.execute("UPDATE tasks SET status='ready'")
         c.execute("INSERT INTO tasks(id,title,assignee,status,created_at,current_run_id) VALUES (?, 'Prerequisite','default','running',1,2)", (PARENT,))
@@ -63,7 +64,7 @@ def test_native_dependency_owner_and_public_gate(dependency, consumer, monkeypat
     "DELETE FROM kanban_notify_subs WHERE task_id='t_1234abcd'",
 ])
 def test_unverified_ancestor_or_return_unknown(dependency, consumer, sql):
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute(sql)
     with pytest.raises(ValueError):
         certify(dependency)
@@ -83,11 +84,11 @@ def test_dependency_requires_child_consumer(dependency):
 
 def test_scheduled_ancestor_needs_native_future_wake(dependency, consumer):
     import json
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("UPDATE tasks SET status='scheduled',current_run_id=NULL WHERE id=?", (PARENT,))
         c.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'scheduled',?,?)", (PARENT,json.dumps({"wake_at":time.time()+300}),int(time.time())))
     certify(dependency)
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("DELETE FROM task_events WHERE task_id=? AND kind='scheduled'", (PARENT,))
     with pytest.raises(ValueError):
         certify(dependency)
@@ -95,7 +96,7 @@ def test_scheduled_ancestor_needs_native_future_wake(dependency, consumer):
 
 def test_transitive_shared_ancestor_checked(dependency, consumer):
     from hermes_cli import kanban_db as kb
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.row_factory = sqlite3.Row
         for tid in ("t_abcdef13", "t_abcdef14"):
             c.execute("INSERT INTO tasks(id,title,status,assignee,created_at) VALUES (?,'Intermediate','ready','default',1)", (tid,))
@@ -104,14 +105,14 @@ def test_transitive_shared_ancestor_checked(dependency, consumer):
             kb.link_tasks(c, PARENT, tid)
             kb.link_tasks(c, tid, TID)
     certify(dependency)
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("UPDATE task_runs SET claim_expires=1")
     with pytest.raises(ValueError):
         certify(dependency)
 
 
 def test_terminal_ancestor_does_not_hide_failed_transitive_owner(dependency, consumer):
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("INSERT INTO tasks(id,title,status,assignee,created_at,completed_at) VALUES ('t_abcdef13','Terminal','done','default',1,2)")
         c.execute("INSERT INTO task_links VALUES ('t_abcdef13','t_1234abcd')")
         c.execute("INSERT INTO tasks(id,title,status,assignee,created_at) VALUES ('t_abcdef14','Failed','blocked','default',1)")
@@ -138,7 +139,7 @@ def test_dependency_dispatcher_scope_and_age(dependency, consumer, dispatcher, c
 
 
 def test_dependency_graph_limit(dependency, consumer):
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         for i in range(65):
             tid = f"t_{i:08x}"
             c.execute("INSERT INTO tasks(id,title,status,assignee,created_at,completed_at) VALUES (?,'Completed','done','default',1,2)", (tid,))
@@ -149,7 +150,7 @@ def test_dependency_graph_limit(dependency, consumer):
 
 @pytest.mark.parametrize("status", ["archived", "failed", "review", "todo", "done"])
 def test_ambiguous_terminal_or_unowned_ancestor(dependency, consumer, status):
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("UPDATE tasks SET status=? WHERE id=?", (status,PARENT))
     with pytest.raises(ValueError):
         certify(dependency)
@@ -164,7 +165,7 @@ def test_sql_work_budget_is_bounded(dependency):
 
 def test_scheduled_ancestor_review_lane_not_certified_by_ready(dependency, consumer):
     import json
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("UPDATE tasks SET status='scheduled',current_run_id=NULL WHERE id=?", (PARENT,))
         c.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'continued',?,?)", (PARENT,json.dumps({"wake_at":time.time()+300,"resume_status":"review"}),int(time.time())))
     with pytest.raises(ValueError, match="owner_scheduled_wake_unverified"):
@@ -174,7 +175,7 @@ def test_scheduled_ancestor_review_lane_not_certified_by_ready(dependency, consu
 @pytest.mark.parametrize("ancestor_status", ["blocked", "running"])
 def test_scheduled_child_also_requires_live_dependencies(dependency, consumer, ancestor_status):
     # A timed wake lands in todo when its native parents remain unfinished.
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (TID,))
         c.execute("UPDATE tasks SET status=? WHERE id=?", (ancestor_status, PARENT))
         if ancestor_status == "running":
@@ -184,6 +185,6 @@ def test_scheduled_child_also_requires_live_dependencies(dependency, consumer, a
 
 
 def test_scheduled_child_with_live_dependency(dependency, consumer):
-    with sqlite3.connect(dependency[0]) as c:
+    with transaction(dependency[0]) as c:
         c.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (TID,))
     certify(dependency)

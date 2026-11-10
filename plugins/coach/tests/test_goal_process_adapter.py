@@ -4,6 +4,7 @@ import importlib.util
 import shlex
 import socket
 import sqlite3
+from sqlite_fixture import transaction
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,7 +72,7 @@ def test_native_process_adapter_positive(owned):
     "UPDATE sessions SET profile_name='other'",
 ])
 def test_latest_canonical_scope_must_match(owned, tmp_path, sql):
-    with sqlite3.connect(tmp_path / "state.db") as conn:
+    with transaction(tmp_path / "state.db") as conn:
         conn.execute(sql)
     with pytest.raises(ValueError):
         gd.validate_disposition(owned[0], owned[1], session_id="origin")

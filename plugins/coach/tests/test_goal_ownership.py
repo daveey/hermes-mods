@@ -3,6 +3,7 @@ import importlib.util
 import os
 import socket
 import sqlite3
+from sqlite_fixture import transaction
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +38,7 @@ def owner(tmp_path, monkeypatch):
     # Real producers need the migrations and auxiliary tables too, not just
     # SCHEMA_SQL. Bootstrap through the same initializer as production.
     assert kb.init_db(db) == db
-    with sqlite3.connect(db) as c:
+    with transaction(db) as c:
         c.execute("INSERT INTO tasks (id,title,body,assignee,status,created_at,session_id,current_run_id) VALUES (?,?,?,'default','running',?,?,1)", (TID,REQUEST,REQUEST,int(time.time()),SID))
         c.execute("INSERT INTO task_runs (id,task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_started_at,started_at) VALUES (1,?,'default','running',?,?,?,?,?)", (TID,claim_prefix() + str(os.getpid()),int(time.time())+300,os.getpid(),_process_fingerprint(os.getpid()),int(time.time())))
         c.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,notifier_profile,created_at) VALUES (?,'tui',?,'default',?)", (TID,SID,int(time.time())))
@@ -78,7 +79,7 @@ def test_authoritative_running_owner(consumer, owner):
     "UPDATE kanban_notify_subs SET notifier_profile='other'", "DELETE FROM tasks",
 ])
 def test_invalid_owner_cannot_certify(owner, sql):
-    with sqlite3.connect(owner[0]) as c:
+    with transaction(owner[0]) as c:
         c.execute(sql)
     with pytest.raises(ValueError):
         certify(owner)
@@ -94,14 +95,14 @@ def test_exact_route_no_fallback(owner, field, value):
 def test_cached_success_and_assistant_claim_never_replace_readback(owner):
     owner[2]['tool:cached'] = dict(role='tool',content={'success':True,'status':'running'})
     owner[1]['evidence_refs'].append('tool:cached')
-    with sqlite3.connect(owner[0]) as c:
+    with transaction(owner[0]) as c:
         c.execute('DELETE FROM tasks')
     with pytest.raises(ValueError):
         certify(owner)
 
 
 def test_independent_current_request_required(owner):
-    with sqlite3.connect(owner[0].parent / 'state.db') as c:
+    with transaction(owner[0].parent / 'state.db') as c:
         c.execute("UPDATE messages SET content='Only explain; do not repair'")
     with pytest.raises(ValueError):
         certify(owner)
@@ -116,7 +117,7 @@ def test_gate_public_entry_certifies_fresh_owner_without_writes(consumer, owner,
     assert gate(session_id=SID, final_response='Worker continuing', turn_messages=[dict(role='user',content=REQUEST)]) is None
     assert events[-1]['disposition'] == 'owned_continuing'
     assert all(p.read_bytes() == data for p,data in before.items())
-    with sqlite3.connect(owner[0]) as c:
+    with transaction(owner[0]) as c:
         c.execute("UPDATE tasks SET status='done'")
     with pytest.raises(ValueError):
         gate(session_id=SID, final_response='Worker continuing', turn_messages=[dict(role='user',content=REQUEST)], attempt=1)
@@ -184,7 +185,7 @@ def test_missing_or_conflicting_authority(owner, change):
     if change == 'missing_state':
         (home / 'state.db').unlink()
     elif change == 'missing_origin':
-        with sqlite3.connect(home / 'state.db') as c:
+        with transaction(home / 'state.db') as c:
             c.execute('DELETE FROM sessions')
     elif change == 'changed_goal':
         owner[1]['goal'] = 'An unrelated goal'
@@ -232,7 +233,7 @@ def test_authoritative_reads_survive_readonly_wal_open_failure(consumer, owner, 
 
 def test_owner_readonly_helper_rejects_writes_and_missing_database(tmp_path, monkeypatch):
     p = tmp_path / 'owner.db'
-    with sqlite3.connect(p) as c:
+    with transaction(p) as c:
         c.execute('CREATE TABLE proof (x)')
     original = sqlite3.connect
     def connect(database, *args, **kwargs):

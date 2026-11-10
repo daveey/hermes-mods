@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import sqlite3
+from sqlite_fixture import transaction
 import subprocess
 import sys
 import threading
@@ -159,7 +160,7 @@ def test_guard_over_transport(tmp_path, route, case):
         payload = event.get('payload', event)
         channels.setdefault(event.get('type', ''), []).append(str(payload.get('text', '')))
     visible_text = '\n'.join(''.join(parts) for parts in channels.values())
-    with sqlite3.connect(home / 'state.db') as db:
+    with transaction(home / 'state.db') as db:
         persisted = '\n'.join(row[0] or '' for row in db.execute(
             "SELECT content FROM messages WHERE role='assistant'"))
     calls = [json.loads(line) for line in (home / 'provider.jsonl').read_text().splitlines()]

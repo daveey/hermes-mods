@@ -1,6 +1,7 @@
 """Isolated ownership regressions; never create fixtures in a live home."""
 import importlib.util
 import sqlite3
+from sqlite_fixture import transaction
 import threading
 import time
 from pathlib import Path
@@ -29,14 +30,14 @@ def test_subscription_is_not_live_consumer(owner):
 
 @pytest.mark.parametrize('status', ['scheduled', 'todo'])
 def test_waiting_without_dispatcher_is_unknown(owner, status):
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute('UPDATE tasks SET status=?', (status,))
     with pytest.raises(ValueError, match='owner_(scheduled_wake|dependency|dispatcher)_unverified'):
         certify(owner)
 
 
 def test_unknown_schema_never_creates_evidence(owner):
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute('DROP TABLE task_runs')
     before = owner[0].read_bytes()
     with pytest.raises(ValueError):
@@ -48,7 +49,7 @@ def test_live_native_poller_and_completion_to_exact_origin(owner, consumer):
     before = {p: p.read_bytes() for p in owner[0].parent.glob('*.db')}
     certify(owner)
     assert all(p.read_bytes() == data for p, data in before.items())
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute("UPDATE tasks SET status='done', completed_at=?", (int(time.time()),))
         conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'completed','{}',?)",
                      (TID, int(time.time())))
@@ -81,7 +82,7 @@ def test_consumer_must_be_scoped_and_live(owner, consumer, change):
 def test_native_scheduled_evidence_still_needs_dispatcher(owner, wake):
     import json
     value = {'future':time.time()+300, 'past':1, 'nan':float('nan'), 'bool':True}[wake]
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute("UPDATE tasks SET status='scheduled'")
         conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'scheduled',?,?)",
                      (TID, json.dumps({'wake_at':value}), int(time.time())))
@@ -91,7 +92,7 @@ def test_native_scheduled_evidence_still_needs_dispatcher(owner, wake):
 
 
 def test_native_dependency_link_still_needs_dispatcher(owner):
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute("UPDATE tasks SET status='todo', block_kind='dependency'")
         conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES ('t_87654321','Prerequisite','running',?)",
                      (int(time.time()),))
@@ -109,7 +110,7 @@ def test_native_dependency_link_still_needs_dispatcher(owner):
     "UPDATE kanban_notify_subs SET chat_id='other'",
 ])
 def test_live_consumer_never_overrides_bad_owner(owner, consumer, sql):
-    with sqlite3.connect(owner[0]) as conn:
+    with transaction(owner[0]) as conn:
         conn.execute(sql)
     with pytest.raises(ValueError):
         certify(owner)

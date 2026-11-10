@@ -8,6 +8,7 @@ This is the private loopback session-token mode, not public OAuth or Electron.
 import json
 from pathlib import Path
 import sqlite3
+from sqlite_fixture import transaction
 import subprocess
 import sys
 import threading
@@ -186,7 +187,7 @@ def test_production_serve_auth_and_next_turn(tmp_path, queued):
                 assert not any(f.get('params', {}).get('type') == 'tool.start' for f in frames.frames)
                 _idle(frames, sid)
                 frames.rpc('session.close', dict(session_id=sid))
-            with sqlite3.connect(home / 'state.db') as db:
+            with transaction(home / 'state.db') as db:
                 persisted = '\n'.join(r[0] or '' for r in db.execute("SELECT content FROM messages WHERE role='assistant'"))
             assert TEXTS['abandoned'] not in persisted
             assert 'Unresolved goal' in persisted

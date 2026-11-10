@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+from sqlite_fixture import transaction
 import subprocess
 import sys
 import threading
@@ -58,7 +59,7 @@ def test_real_electron_guard(tmp_path, control):
             assert result.returncode == 0, result.stdout + repr([(str(p),p.read_text()[-14000:]) for p in home.rglob('desktop.log')])
             receipt=json.loads((home/'electron-receipt.json').read_text())
             assert receipt['passed'] and receipt['electron']
-            with sqlite3.connect(home/'state.db') as db:
+            with transaction(home/'state.db') as db:
                 persisted='\n'.join(row[0] or '' for row in db.execute("SELECT content FROM messages WHERE role='assistant'"))
                 # Queued sends retain an inactive accept-time row; stop adds a typed runtime marker.
                 user_rows = db.execute("SELECT session_id, content FROM messages WHERE role='user' AND active=1 AND COALESCE(display_kind, '') != 'turn_stopped' ORDER BY timestamp").fetchall()
