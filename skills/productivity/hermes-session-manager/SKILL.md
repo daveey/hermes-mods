@@ -73,7 +73,10 @@ say what's running, never what needs the user.
   summed across every board DB. Also grep that log for `dispatch held for a core update drain`, or check
   for `~/.hermes/core-update/drain-hold`. Remembered capacity goes stale, and a drain holds every spawn
   however many slots are free. A `scheduled` card whose awaited review or parent just finished can be
-  `kanban_unblock`ed at once instead of waiting out its wake interval.
+  `kanban_unblock`ed at once instead of waiting out its wake interval. Before saying when a `scheduled` card
+  wakes, read its `wake_episode_started` event's `cmd` (its `wake_check`): `SCHEDULED_UNTIL` is only the backstop
+  when a check on the producer wakes it sooner. Report "wakes when <producer> finishes" and name that producer's
+  live heartbeat; don't quote the backstop time as the next step or add a redundant link that changes nothing.
 - For a completion sweep ("get all sessions green"), inspect each remaining deliverable and why it stopped,
   then resolve authorized asks and resume concrete work. If a recipient only relays the instruction back,
   direct it to produce the missing artifact in its own session; a coordination reply is not execution.
