@@ -2113,12 +2113,129 @@ def _sqlite_incident_over(d: dict, store, now: float) -> Optional[str]:
     return f"sqlite incident over (no occurrence since {_iso(at)})"
 
 
+def _crash_evidence(text: str, host: str) -> Optional[dict]:
+    """Conservative legacy evidence reader: explicit crash ranges, never detection/event timestamps.
+
+    Require an exception class and a machine reason (e.g. storage_unavailable). General prose is not
+    enough to suppress an investigation. Partial header ranges describe only the observed crashes.
+    """
+    import datetime
+    text = str(text or "")
+    error = re.search(r"\b([A-Z][A-Za-z0-9]*Error)\b[^\n]*?\b([a-z]+(?:_[a-z]+)+)\b", text)
+    if not error or not host:
+        return None
+    # Stack function names are not machine error reasons. Prefer the final token after a colon.
+    reasons = re.findall(r":\s*([a-z]+(?:_[a-z]+)+)\b", error.group(0) + text[error.end():].split("\n", 1)[0])
+    if not reasons:
+        return None
+    stamp = r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"
+    window = re.search(r"Crash times[^\n]*?earliest " + stamp + r", latest " + stamp, text)
+    if not window:
+        # Investigation comments also use a single explicit range with the end date elided.
+        # Multiple ranges are ambiguous: do not combine an outage/deploy window with a crash window.
+        ranges = list(re.finditer(stamp + r"`?\s*(?:\.\.|–|—| - |to)\s*`?"
+                                 r"((?:\d{4}-\d{2}-\d{2}T)?\d{2}:\d{2}:\d{2}Z)", text))
+        window = ranges[0] if len(ranges) == 1 else None
+    if not window:
+        return None
+    first, last = window.groups()
+    if "T" not in last:
+        last = first.split("T")[0] + "T" + last
+    try:
+        start, end = (datetime.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+                      for t in (first, last))
+    except ValueError:
+        return None
+    if end < start:
+        return None
+    return {"host": host, "error": error.group(1), "reason": reasons[-1], "start": start, "end": end}
+
+
+def _crash_card_evidence(st: dict, host: str) -> list:
+    """Read legacy investigation evidence, not the owner card's unrelated incidents. No board writes."""
+    import sqlite3
+    if not isinstance(st, dict) or not isinstance(st.get("board", "default"), (str, type(None))):
+        return []
+    path = _kanban_board_path(st.get("board") or "default", _kanban_home())
+    if not path or not path.is_file() or not st.get("card"):
+        return []
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)) as db:
+            db.execute("PRAGMA query_only=ON")
+            body = db.execute("SELECT body FROM tasks WHERE id=?", (st["card"],)).fetchone()
+            texts = ([body[0]] if body else []) + [r[0] for r in db.execute(
+                "SELECT body FROM task_comments WHERE task_id=?", (st["card"],))]
+    except sqlite3.Error:
+        return []
+    # Host, exception and range must be in the SAME evidence record; never borrow the host from another comment.
+    return [e for text in texts if isinstance(text, str)
+            and re.search(r"(?<![\w.-])" + re.escape(host) + r"(?![\w.-])", text)
+            if (e := _crash_evidence(text, host))]
+
+
+def _resolved_crash_signal(d: dict, store) -> Optional[str]:
+    try:
+        return _resolved_crash_signal_checked(d, store)
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return None  # corrupt/old evidence must never prevent the ordinary admission pass
+
+
+def _resolved_crash_signal_checked(d: dict, store) -> Optional[str]:
+    """A sibling disposition is proof only with matching incident evidence and a locally deployed core fix.
+
+    Duplicate maps to approved then stale in the lane, so consult lifecycle events, not status alone.
+    Missing/rotated logs, unreadable cards, remote hosts and unknown commits all fail open to investigation.
+    """
+    if (d.get("source") != "signal" or d.get("host") != host_name()
+            or "crash storm" not in str(d.get("symptom") or "")):
+        return None
+    evidence = _crash_evidence(str(d.get("symptom") or "") + "\n" + str(d.get("details") or ""), d["host"])
+    if not evidence:
+        return None
+    lane = LaneState(store.root).read()
+    dispositions = {}
+    try:
+        with (Path(store.root) / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                fp, event = row.get("fingerprint"), row.get("event")
+                if fp not in lane or fp == d.get("fingerprint"):
+                    continue
+                if event in ("selfheal_duplicate", "selfheal_fixed"):
+                    dispositions[fp] = row
+                elif event in ("selfheal_reverted", "selfheal_filed", "selfheal_not_defect", "selfheal_declined"):
+                    dispositions.pop(fp, None)
+    except OSError:
+        return None
+    for fp, row in dispositions.items():
+        if evidence["end"] > float(row.get("ts") or 0):
+            continue  # a post-disposition crash is a recurrence, not a deferred old observation
+        # A note often names old HEADs too: only accept commits explicitly attributed as the fix.
+        shas = re.findall(r"(?i:\bfix(?:ed)?(?:\s+(?:by|in))?\s+)`?([0-9a-f]{7,40})\b", str(row.get("note") or ""))
+        if not shas:
+            continue
+        for sibling in _crash_card_evidence(lane[fp], evidence["host"]):
+            if (any(sibling[k] != evidence[k] for k in ("host", "error", "reason"))
+                    or evidence["start"] > sibling["end"] + 7200
+                    or sibling["start"] > evidence["end"] + 7200):
+                continue
+            if all(_git_rc(_fork_repo(), "merge-base", "--is-ancestor", sha, "HEAD")[0] == 0 for sha in shas):
+                return f"resolved under {fp}"
+    return None
+
+
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     """Recheck due investigations through normal admission, never automatically release a card.
 
     Highest priority first (`_pending_priority`); the pass stops at the first renewed denial, since every later row
     would hit the same cap. Rows whose detection is older than PENDING_MAX_AGE_S are dropped (`selfheal_skip`,
-    why `stale pending`), which bounds the queue when input outruns the budget."""
+    why `stale pending`), which bounds the queue when input outruns the budget. Resolved sibling crash
+    incidents are withdrawn before the cap-ordered filing pass, with `resolved under <fp>` evidence."""
     store = _store(store)
     now = now or time.time()
     if not (Path(store.root) / "selfheal_pending.sqlite").exists():
@@ -2147,7 +2264,8 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                 out.append({"action": "skip", "why": "synthetic_tag"})
                 continue
             closed = (_sqlite_incident_over(d, store, now)
-                      or kanban_trigger_closed(d, now=now) or _monitor_withdrawn(d, store))
+                      or kanban_trigger_closed(d, now=now) or _monitor_withdrawn(d, store)
+                      or _resolved_crash_signal(d, store))
             if closed:  # the owner closed the card, or the monitor withdrew its verdict, while this waited
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))

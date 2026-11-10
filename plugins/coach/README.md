@@ -1003,7 +1003,13 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
 - **Budget**: engine_budget lane `selfheal` ($200/UTC day, its own cap outside the $20 engine total; spend = these
   cards' worker sessions), ≤ 3 running, ≤ 1 filing per fingerprint per UTC day. A known spend/concurrency denial
   creates **no card**: investigations persist in `coach/selfheal_pending.sqlite`, retried through admission by the
-  live cron after midnight / one hour; failed retries retain their full evidence. Fixes remain proposed so Inbox
+  live cron after midnight / one hour; failed retries retain their full evidence. Before retrying a local
+  crash-storm signal, the lane checks sibling duplicate/fixed log dispositions (including entries now stale),
+  the original investigation's persisted crash range, host, exception and machine reason, and core fix ancestry.
+  Overlapping ranges within two hours are dropped as `selfheal_skip` / `resolved under <fp>` only with a
+  deployed fix explicitly named in the disposition. Post-disposition crashes, remote hosts and missing or
+  ambiguous evidence still go through admission. Detection/disposition timestamps never substitute for crash
+  ranges. Regression coverage: `tests/test_resolved_crash_pending.py`. Fixes remain proposed so Inbox
   sync retries the existing Do-it outcome. Unavailable or invalid accounting refuses admission. Each card body
   carries a `Budget for this card` line ($8 investigation, $15 fix) for the engine watchdog.
   This is not a strict monetary reservation system: queued/concurrent admissions, cross-board accounting,
