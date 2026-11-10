@@ -118,7 +118,7 @@ test('409 reads changed scope, preserves revision text, requires fresh decision'
 
 test('queue registration uses canonical region; aliases suppress only exact references and progress', async()=>{
  const r=freshRequest(); r.aliases.push({gatewayId:'G1',profile:'default',type:'user_step',id:'us_12345678'})
- const cards=[{id:'same',board:'ops',gatewayId:'G1',profile:'default',loaded:true,title:'Stage A',text:'Original card',human_request:{interaction:'approval',action:'Approve',why_human:'owner',scope:'stage',evidence:'record'}},{id:'same',board:'other',gatewayId:'G1',profile:'default',loaded:true,title:'Stage A',text:'Separate board',human_request:{interaction:'approval',action:'Approve',why_human:'owner',scope:'stage',evidence:'record'}}]
+ const cards=[{id:'same',board:'ops',gatewayId:'G1',profile:'default',loaded:true,title:'Stage A',text:'Original card',human_request:{interaction:'approval',action:'Approve',why_human:'owner',scope:'stage',evidence:'record'}},{id:'same',board:'other',gatewayId:'G1',profile:'default',loaded:true,title:'Stage A',text:'Separate board',human_request:{interaction:'approval',action:'Approve the separate board stage',why_human:'owner',scope:'stage',evidence:'record'}}]
  window.__blockedPanel={snapshot:{stored:'S1',items:cards}}
  window.hermesDesktop={api:async({path})=>path.includes('/requests')?{requests:[r,r]}:{steps:[{id:'us_12345678',gatewayId:'G1',profile:'default',text:'Original step',status:'open'}]}}
  const registrations=[];const dispose=m.default.register({register:c=>registrations.push(c)})
@@ -127,7 +127,8 @@ test('queue registration uses canonical region; aliases suppress only exact refe
  assert.equal(el().querySelectorAll('[data-action-request]').length,1)
  assert.equal(el().querySelectorAll('[data-user-steps-step]').length,0)
  assert.equal(el().querySelectorAll('[data-user-steps-card]').length,1)
- assert.match(el().querySelector('[data-user-steps-card]').textContent,/Separate board/)
+ // 90a4031b: cards render the requested step, not card text; the other board's own ask survives
+ assert.match(el().querySelector('[data-user-steps-card-action]').textContent,/Approve the separate board stage/)
  assert.equal(el().querySelector('[data-action-scope]').textContent,r.scope.markdown)
  const progress=await import('../session-tasks/plugin.js')
  const chip={kind:'kanban',gatewayId:'G1',profile:'default',board:'ops',id:'same',state:'blocked'}
