@@ -139,6 +139,46 @@ class FeedStatusTest(unittest.TestCase):
         st = json.loads(g(repo, "show", "HEAD:h/feed-status.json"))
         self.assertEqual(st["signals"], "no-hub")
 
+    def test_main_reports_phase_times_and_never_commits_the_digest_cursor(self):
+        """cron-c89ed44e95: the feed's creep to its 600 s kill was invisible; the status line now carries
+        per-phase elapsed_s, stderr logs each phase as it ends (survives a kill), and the cursor stays local."""
+        import sqlite3, time
+        d = Path(tempfile.mkdtemp())
+        repo, home = d / "repo", d / "home"
+        repo.mkdir(); home.mkdir()
+        g(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("x\n")
+        g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+        con = sqlite3.connect(home / "state.db")
+        con.executescript("create table sessions (id text primary key, source text, model text, parent_session_id text,"
+                          " started_at real, ended_at real, end_reason text, message_count int, tool_call_count int,"
+                          " api_call_count int, input_tokens int, output_tokens int, cache_read_tokens int,"
+                          " actual_cost_usd real, estimated_cost_usd real, title text, last_activity_at real);"
+                          "create table messages (id integer primary key, session_id text, role text, content text,"
+                          " tool_name text, tool_calls text, timestamp real);")
+        con.execute("insert into sessions (id, started_at) values ('s1', ?)", (time.time(),))
+        con.execute("insert into messages (session_id, role, content, timestamp) values ('s1','user','hi',?)",
+                    (time.time(),))
+        con.commit(); con.close()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        run = lambda: subprocess.run([sys.executable, str(HERE / "coach_feed.py"), "--host", "h", "--repo-dir",
+                                      str(repo), "--home", str(home), "--no-push"], capture_output=True, text=True,
+                                     env=env)
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(set(st["elapsed_s"]), {"signals", "pull", "digest", "commit", "push", "total"})
+        self.assertEqual(st["digest"]["written"], 1)
+        self.assertIn("coach_feed: phase digest", r.stderr)
+        self.assertTrue((repo / "h" / ".digest-cursor.json").exists())
+        self.assertIn("h/default/s1.json", g(repo, "ls-files"))
+        self.assertNotIn(".digest-cursor.json", g(repo, "ls-files"))
+        self.assertEqual(g(repo, "status", "--porcelain"), "")
+        st2 = json.loads(run().stdout.strip().splitlines()[-1])
+        self.assertEqual(st2["digest"]["skipped"], 1)
+        self.assertIsNone(st2["commit"])
+
 
 class SkillOutcomesCopy(unittest.TestCase):
     def test_flushes_then_copies_home_and_profiles_as_a_union(self):

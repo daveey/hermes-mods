@@ -158,6 +158,24 @@ def collect_selfheal_seen(home, repo, host):
     return len(seen)
 
 
+LOCAL_STATE = ".digest-cursor*"  # session_digest.py's incremental cursor (+ its tmp file): per clone, never pushed
+
+
+def exclude_local_state(repo):
+    """Keep the digest cursor out of `git add -A <host>` via .git/info/exclude (local, nothing to commit)."""
+    try:
+        gd = git(repo, "rev-parse", "--git-dir", check=False).stdout.strip()
+        if not gd:
+            return
+        p = Path(gd if os.path.isabs(gd) else Path(repo) / gd) / "info" / "exclude"
+        cur = p.read_text() if p.exists() else ""
+        if LOCAL_STATE not in cur.split("\n"):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(cur + ("" if not cur or cur.endswith("\n") else "\n") + LOCAL_STATE + "\n")
+    except OSError as e:
+        print(f"coach_feed: warn: cannot exclude {LOCAL_STATE}: {e}", file=sys.stderr)
+
+
 def write_feed_status(repo, host, out, now=None):
     """<repo>/<host>/feed-status.json = {signals: state, detail, since}: lets the hub see a Mac forwarder that never
     reached it (no config, ssh refused, crash) from the data repo, without a shell on that Mac. Rewritten only when
@@ -188,7 +206,22 @@ def main():
     a = ap.parse_args()
     repo = Path(a.repo_dir)
     status = {"host": a.host, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    # Per-phase wall time (cron-c89ed44e95: the feed crept from ~170 s to its 600 s kill with nothing showing it).
+    # Each phase is also logged to stderr as it ends, so a killed run's partial stderr still says where it was.
+    t0 = mark = time.monotonic()
+    el = status["elapsed_s"] = {k: 0.0 for k in ("signals", "pull", "digest", "commit", "push")}
+
+    def phase(name):
+        nonlocal mark
+        now = time.monotonic()
+        el[name] = round(now - mark, 1)
+        el["total"] = round(now - t0, 1)
+        mark = now
+        print(f"coach_feed: phase {name} {el[name]}s (total {el['total']}s)", file=sys.stderr, flush=True)
+
+    el["total"] = 0.0
     status["signals"] = forward_signals(a.host, a.home)
+    phase("signals")
 
     def heal(when):
         resolved, unresolved = resolve_unmerged(repo)
@@ -211,6 +244,8 @@ def main():
         if not heal("after pull"):  # autostash pop can leave a conflicted index
             print(json.dumps(status))
             return
+    phase("pull")
+    exclude_local_state(repo)
     cmd = [sys.executable, str(HERE / "session_digest.py"), "--host", a.host, "--out", str(repo),
            "--since-days", a.since_days]
     if a.home:
@@ -219,6 +254,7 @@ def main():
         cmd += ["--exclude-profile", p]
     r = subprocess.run(cmd, capture_output=True, text=True)
     status["digest"] = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else r.stderr[-300:]
+    phase("digest")
     home = Path(a.home or os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
     overlay, copy = home / "coach" / "curriculum.yaml", repo / "curriculum" / f"{a.host}.yaml"
     if overlay.exists() and (not copy.exists() or copy.read_bytes() != overlay.read_bytes()):
@@ -239,6 +275,7 @@ def main():
         git(repo, "add", str(copy.relative_to(repo)))
     if git(repo, "diff", "--cached", "--quiet", check=False).returncode == 0:
         status["commit"] = None
+        phase("commit")
     else:
         r = git(repo, "commit", "-q", "-m", f"{a.host}: digests {status['ts']}", check=False)
         if r.returncode:
@@ -248,6 +285,7 @@ def main():
             print(json.dumps(status))
             return
         status["commit"] = git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+        phase("commit")
         if not a.no_push:
             r = git(repo, "push", "-q", check=False)
             if r.returncode:  # someone else pushed in between: rebase once and retry
@@ -256,6 +294,7 @@ def main():
             status["pushed"] = r.returncode == 0
             if r.returncode:
                 status["push_error"] = r.stderr.strip()[-300:]
+            phase("push")
     print(json.dumps(status))
 
 

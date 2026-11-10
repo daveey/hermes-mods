@@ -8,6 +8,12 @@ Each top-level session becomes DIR/<host>/<profile>/<session_id>.json. A digest 
 when the session has changed (more messages or later activity), so a git commit of DIR shows
 real deltas. Child (subagent) sessions are folded into their parent as counts and cost.
 
+Incremental: DIR/<host>/.digest-cursor.json keeps a key per session (DIGEST_V, sessions row, children, message
+row count/max id, Inbox Do-it prompt, session-start writer rows); a session whose key is unchanged and whose
+output file exists is skipped without reading its transcript. --full ignores the cursor. The cursor is
+local state, never committed (coach_feed.py adds it to .git/info/exclude). The JSON status line reports
+`skipped` and `elapsed_s`.
+
 What goes in: session stats, the user's turns (injected context stripped, secrets redacted,
 truncated), tool counts and tool-error counts, pattern signals, and the tail of the last
 assistant reply. What never goes in: tool output, system prompts, reasoning, file contents.
@@ -312,12 +318,46 @@ def start_writers(con):
     return out
 
 
-def digest_db(profile, db, host, since):
+def start_writer_sessions(con):
+    """{session id: sorted [namespace, user_row_id, first_turn_id] rows} from session_start_requests, so a writer
+    row that lands after a session was digested still changes that session's cursor key. Missing table -> {}."""
+    try:
+        scols = cols(con, "session_start_requests")
+        if not {"stored_session_id", "namespace"} <= scols:
+            return {}
+        keys = [c for c in ("user_row_id", "first_turn_id") if c in scols]
+        out = collections.defaultdict(list)
+        for row in con.execute(f"select stored_session_id, namespace{''.join(', ' + k for k in keys)}"
+                               " from session_start_requests"):
+            out[row[0]].append([str(v) for v in row[1:]])
+        return {k: sorted(v) for k, v in out.items()}
+    except sqlite3.Error:
+        return {}
+
+
+def session_key(row, kids, doit, writer_rows, msg_stat):
+    """Everything a session's digest is computed from, hashed: DIGEST_V, its sessions row, its folded children,
+    its Inbox Do-it prompt, its session-start writer rows, and (count, max id) of its message rows (compaction and
+    new turns both insert rows, so any transcript change moves it). Equal key + existing output file = skip."""
+    import hashlib
+    blob = json.dumps([DIGEST_V, {k: row[k] for k in row.keys()}, kids, doit, writer_rows, list(msg_stat)],
+                      sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:20]
+
+
+def digest_db(profile, db, host, since, prev=None, have=None, keys=None, stats=None):
+    """Yield one digest per top-level session. Incremental when `prev` ({"<profile>/<sid>": key} from the last
+    run) is given: a session whose key is unchanged and whose output `have(profile, sid)` exists is skipped
+    without reading its transcript (stats["skipped"] += 1). `keys` collects every in-window session's key."""
+    prev = prev or {}
+    keys = {} if keys is None else keys
+    stats = {} if stats is None else stats
     doit_prompts = inbox_prompts(db)
     con = sqlite3.connect(f"file:{db}", uri=True, timeout=30)
     con.execute("pragma query_only = 1")
     con.row_factory = sqlite3.Row
     writers = start_writers(con)
+    writer_sess = start_writer_sessions(con)
     scols = cols(con, "sessions")
     opt = lambda c, alias=None: (c if c in scols else f"NULL") + f" as {alias or c}"
     act = "coalesce(last_activity_at, ended_at, started_at)" if "last_activity_at" in scols else "coalesce(ended_at, started_at)"
@@ -348,6 +388,14 @@ def digest_db(profile, db, host, since):
         if r["parent_session_id"]:
             continue
         sid = r["id"]
+        prof = r["profile_name"] or profile
+        ck = f"{prof}/{sid}"
+        stat = con.execute("select count(*), max(id) from messages where session_id=?", (sid,)).fetchone()
+        key = session_key(r, kids.get(sid), doit_prompts.get(sid), writer_sess.get(sid), stat)
+        keys[ck] = key
+        if prev.get(ck) == key and (have is None or have(prof, sid)):
+            stats["skipped"] = stats.get("skipped", 0) + 1
+            continue
         msgs = transcript(con, sid, mcols)
         users, tools, terr = [], collections.Counter(), collections.Counter()
         sig = collections.Counter()
@@ -468,7 +516,12 @@ def main():
     ap.add_argument("--since-days", type=float, default=45)
     ap.add_argument("--exclude-profile", action="append", default=[],
                     help="skip a discovered profile; glob ok, e.g. 'alpha*' (shared team bots holding other people's chats)")
+    ap.add_argument("--full", action="store_true",
+                    help="ignore the cursor and re-read every session's transcript (rebuild)")
+    ap.add_argument("--full-every-days", type=float, default=7,
+                    help="rebuild in full when the cursor's last full run is older than this (bounds a stale skip)")
     a = ap.parse_args()
+    t0 = time.monotonic()
 
     dbs = []
     for d in a.db or []:
@@ -478,21 +531,52 @@ def main():
     dbs = [(p, d) for p, d in dbs if not excluded_profile(p, a.exclude_profile)]
     since = time.time() - a.since_days * 86400
     out = Path(a.out) / a.host
+    # Incremental cursor {"<profile>/<sid>": key}: local per clone, never committed (coach_feed excludes it).
+    cursor = out / CURSOR_NAME
+    try:
+        old = json.loads(cursor.read_text())
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError):
+        old = {}
+    full = a.full or time.time() - float(old.get("full_at") or 0) > a.full_every_days * 86400
+    prev = {} if full else (old.get("keys") or {})
+    full_at = time.time() if full else old.get("full_at")
+    have = lambda prof, sid: (out / prof / f"{sid}.json").exists()
+    keys, stats = {}, {"skipped": 0}
     written = unchanged = 0
+    errors = False
     for profile, db in dbs:
         try:
-            for d in digest_db(profile, db, a.host, since):
+            for d in digest_db(profile, db, a.host, since, prev=prev, have=have, keys=keys, stats=stats):
                 p = out / (d["profile"] or profile) / f"{d['id']}.json"
                 body = json.dumps(d, ensure_ascii=False, indent=1, sort_keys=True)
                 if p.exists() and p.read_text() == body:
                     unchanged += 1
-                    continue
-                p.parent.mkdir(parents=True, exist_ok=True)
-                tmp = p.with_suffix(".tmp"); tmp.write_text(body); tmp.replace(p)
-                written += 1
+                else:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = p.with_suffix(".tmp"); tmp.write_text(body); tmp.replace(p)
+                    written += 1
+                if (written + unchanged) % 2000 == 0:  # a run killed mid-db still keeps the work done so far
+                    _save_cursor(cursor, {**prev, **keys}, old.get("full_at"))
         except sqlite3.Error as e:
+            errors = True
             print(f"warn: {profile} {db}: {e}", file=sys.stderr)
-    print(json.dumps({"host": a.host, "dbs": len(dbs), "written": written, "unchanged": unchanged}))
+        _save_cursor(cursor, {**prev, **keys}, old.get("full_at"))
+    # Final: drop sessions that left the window, unless a db failed (then keep its old entries).
+    _save_cursor(cursor, {**prev, **keys} if errors else keys, old.get("full_at") if errors else full_at)
+    print(json.dumps({"host": a.host, "dbs": len(dbs), "written": written, "unchanged": unchanged,
+                      "skipped": stats["skipped"], "full": bool(full),
+                      "elapsed_s": round(time.monotonic() - t0, 1)}))
+
+
+CURSOR_NAME = ".digest-cursor.json"
+
+
+def _save_cursor(path, keys, full_at=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp-cursor")
+    tmp.write_text(json.dumps({"v": 1, "full_at": full_at, "keys": keys}, sort_keys=True))
+    tmp.replace(path)
 
 
 if __name__ == "__main__":

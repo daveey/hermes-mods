@@ -282,5 +282,122 @@ class DigestPluginStartedOpener(unittest.TestCase):
         self.assertEqual(dg["user_turns_total"], 1)
 
 
+class DigestIncremental(unittest.TestCase):
+    """A rerun re-reads only sessions that changed since the last run (self-heal cron-c89ed44e95: the hub feed
+    re-digested all ~14k sessions every 30 min and hit coach_common's 600 s kill)."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.db = self.d / "state.db"
+        con = sqlite3.connect(self.db)
+        con.executescript(SCHEMA)
+        now = time.time()
+        for i, sid in enumerate(("s1", "s2", "s3")):
+            con.execute("insert into sessions (id, source, started_at, last_activity_at, message_count)"
+                        " values (?, 'desktop', ?, ?, 2)", (sid, now - 100, now - 100))
+            con.execute("insert into messages (session_id, role, content, timestamp, message_uid)"
+                        " values (?, 'user', ?, ?, ?)", (sid, f"ask {i}", now - 100, f"u{sid}"))
+            con.execute("insert into messages (session_id, role, content, timestamp, message_uid)"
+                        " values (?, 'assistant', 'ok', ?, ?)", (sid, now - 99, f"a{sid}"))
+        con.commit(); con.close()
+        self.out = self.d / "out"
+        self.calls = []
+        real = sd.transcript
+        def counting(con, sid, mcols):
+            self.calls.append(sid)
+            return real(con, sid, mcols)
+        self._real, sd.transcript = real, counting
+
+    def tearDown(self):
+        sd.transcript = self._real
+
+    def run_main(self, *extra):
+        import contextlib, io
+        self.calls.clear()
+        buf = io.StringIO()
+        argv = ["session_digest.py", "--host", "h", "--out", str(self.out), "--db", f"default={self.db}", *extra]
+        old, sys.argv = sys.argv, argv
+        try:
+            with contextlib.redirect_stdout(buf):
+                sd.main()
+        finally:
+            sys.argv = old
+        return json.loads(buf.getvalue().strip().splitlines()[-1])
+
+    def test_unchanged_rerun_reads_no_transcript(self):
+        first = self.run_main()
+        self.assertEqual((first["written"], first.get("skipped")), (3, 0))
+        self.assertEqual(sorted(self.calls), ["s1", "s2", "s3"])
+        self.assertIn("elapsed_s", first)
+        second = self.run_main()
+        self.assertEqual(second.get("skipped"), 3)
+        self.assertEqual(second["written"], 0)
+        self.assertEqual(self.calls, [])
+
+    def test_only_the_changed_session_is_redigested(self):
+        self.run_main()
+        con = sqlite3.connect(self.db)  # a new row with no sessions-row bump still counts as a change
+        con.execute("insert into messages (session_id, role, content, timestamp, message_uid)"
+                    " values ('s2', 'user', 'one more', ?, 'u2b')", (time.time(),))
+        con.commit(); con.close()
+        st = self.run_main()
+        self.assertEqual(self.calls, ["s2"])
+        self.assertEqual((st["written"], st["skipped"]), (1, 2))
+        dg = json.loads((self.out / "h" / "default" / "s2.json").read_text())
+        self.assertEqual([u["text"] for u in dg["user_turns"]][-1], "one more")
+
+    def test_digest_version_bump_and_full_redigest_everything(self):
+        self.run_main()
+        old = sd.DIGEST_V
+        sd.DIGEST_V = old + 1
+        try:
+            self.run_main()
+            self.assertEqual(sorted(self.calls), ["s1", "s2", "s3"])
+        finally:
+            sd.DIGEST_V = old
+        self.run_main()  # back on the old version: everything again
+        self.run_main("--full")
+        self.assertEqual(sorted(self.calls), ["s1", "s2", "s3"])
+
+    def test_missing_output_file_is_redigested(self):
+        self.run_main()
+        (self.out / "h" / "default" / "s3.json").unlink()
+        st = self.run_main()
+        self.assertEqual(self.calls, ["s3"])
+        self.assertTrue((self.out / "h" / "default" / "s3.json").exists())
+        self.assertEqual(st["skipped"], 2)
+
+    def test_stale_full_rebuild_and_kill_resume(self):
+        self.run_main()
+        cur = self.out / "h" / ".digest-cursor.json"
+        c = json.loads(cur.read_text())
+        self.assertEqual(len(c["keys"]), 3)
+        c["full_at"] = time.time() - 8 * 86400  # last full rebuild over a week ago -> rebuild in full
+        cur.write_text(json.dumps(c))
+        st = self.run_main()
+        self.assertTrue(st["full"])
+        self.assertEqual(sorted(self.calls), ["s1", "s2", "s3"])
+        self.assertFalse(self.run_main()["full"])
+        self.assertEqual(self.calls, [])
+        cur.write_text("{not json")  # a corrupt cursor is a full run, never a crash
+        self.assertEqual(self.run_main()["skipped"], 0)
+
+    def test_title_or_inbox_prompt_change_is_redigested(self):
+        self.run_main()
+        con = sqlite3.connect(self.db)
+        con.execute("update sessions set title='renamed' where id='s1'")
+        con.commit(); con.close()
+        self.run_main()
+        self.assertEqual(self.calls, ["s1"])
+        inbox = self.d / "inbox"
+        inbox.mkdir()
+        con = sqlite3.connect(inbox / "inbox.db")
+        con.execute("create table items (session_id text, accept_prompt text)")
+        con.execute("insert into items values ('s3', 'ask 2')")
+        con.commit(); con.close()
+        self.run_main()
+        self.assertEqual(self.calls, ["s3"])
+
+
 if __name__ == "__main__":
     unittest.main()

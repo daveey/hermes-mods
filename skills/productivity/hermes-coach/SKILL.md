@@ -30,7 +30,7 @@ which finds anti-patterns and proposes improvements. Phase 1 of a measure → de
 
 | Script | Runs on | Does |
 |---|---|---|
-| `scripts/session_digest.py` | every host | `state.db` (+ `profiles/*/state.db`) → `<out>/<host>/<profile>/<id>.json`, rewritten only on change |
+| `scripts/session_digest.py` | every host | `state.db` (+ `profiles/*/state.db`) → `<out>/<host>/<profile>/<id>.json`, rewritten only on change; incremental via local `<out>/<host>/.digest-cursor.json` (unchanged sessions skip the transcript read; `--full`, auto-full every 7 d) |
 | `scripts/coach_feed.py` | hosts that push | pull → digest → commit `<host>/` → push, to a private git repo (`--exclude-profile` skips shared bots holding other people's chats); first runs the self-heal machine-signal forwarder (`plugins/coach/signals.py forward`, ssh to the hub, no-op without `hub_ssh` in `coach/selfheal-config.json`); also writes `<host>/selfheal-seen.json` (this host's detections, ids + times only) so the hub's ask-gate counts another host's shadow/live detection as "Detected, not a miss" |
 | `scripts/coach_mine.py` | the coach | KPIs per host + overall (this window vs previous; interactive = allow list `INTERACTIVE_SOURCES` desktop/tui/cli/slack/telegram/discord/whatsapp/signal with a user turn, so bot sources like `bb-reviewer`/`taxprep-*` never dilute p50/p90; those print on an `other_sources:` line with counts + cost and land in the `kpis.jsonl` row), top-N unlabeled sessions by waste score; digests matching `DIR/exclude-profiles.txt` / `--exclude-profile` `HOST/PROFILE_GLOB` (shared team bots) are dropped at load; `--write-kpis` writes today's row of `reports/kpis.jsonl` (a rerun replaces it); `--write-adoption` evaluates the coach plugin's curriculum `adopted` tests (public file + `curriculum/*.yaml` overlays) into sticky `reports/adoption.json` (needs PyYAML or ruamel.yaml) |
 | `scripts/coach_weekly.py` | the coach | weekly context: the 6 plan KPIs (latest `kpis.jsonl` row vs the row a week earlier, gaps recomputed from digests), top findings by est. waste, spend vs output per agent (host/profile × cron job / kanban / chats / source: $ vs the previous window, no-op share from `[SILENT]`/"nothing to fix" last replies, flags for mostly-no-op agents ≥ $5, crons repeated across hosts, doubled spend), `--check key=value@UTC#signal` before/after verdicts (keep / raise / revert), the self-heal lane (filed / proposed / approved / fixed / reverted / not-a-defect, recurrence, $ per fix from `selfheal_*` coach events + `selfheal:<component>-<hash>` cards, or the hub's `reports/selfheal-lane.jsonl` written by `--selfheal-export`; "no activity" when there is none), proposal state + rejected list |
@@ -184,7 +184,9 @@ Undone notices are always plain cards.
 - Keyword signals (`hermes_meta` etc.) hit incidental mentions. Classify a session by title keywords or by the
   signal's share of real turns, never by a raw count ≥ N.
 - A new curriculum `adopted` test that needs a fact the digest lacks: add a counter to `call_features()` /
-  `CMD_FEATURES` in `session_digest.py` (names only, never argument text), bump `DIGEST_V`, re-ship, rerun every feed.
+  `CMD_FEATURES` in `session_digest.py` (names only, never argument text), bump `DIGEST_V` (that also invalidates every host's digest cursor, so the next feed re-reads all sessions), re-ship, rerun every feed.
+- Feed slow or timing out: read `elapsed_s` (per phase) in the coach_feed status line and `skipped`/`elapsed_s` in its
+  `digest`; a no-change digest should skip nearly every session in well under a minute. The hub wrapper warns past 300 s.
   Sanity-check new adoption counts against real sessions before trusting them (agent-run commands count too).
 - Reply-check rules match one model's failure modes, so silence after a default-model change means nothing: Opus fails
   by asking ("Want me to…?", the `confirm` rule), GPT-6 Astra by reporting accurately and stopping ("not fixed; nothing
