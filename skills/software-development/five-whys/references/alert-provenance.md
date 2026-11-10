@@ -9,6 +9,7 @@ fixtures, dry runs and other copies of a job can post the same alert with the sa
 you debug the reported failure:
 - Match the alert's creation time against the real job log and journal
   (`journalctl --user -u <svc>`). Did a real run fail at that moment?
+- For retried Kanban workers, match run ID, PID and admission/exit events before trusting the notification's “last output.” Bound the shared task-log excerpt by the previous `[kanban-worker-exit]` trailer: a new attempt refused during gateway drain can inherit an older successful run's `superseded` text. Compare the dispatcher’s boot revision with the excerpt-boundary fix, not just checkout HEAD; deployed files do not replace already-loaded code. Reproduce status-label errors separately from the actual exit cause, then verify recovery with a new admitted run and its own exit outcome.
 - Compare the alert's error text with what the code would really print. A path-less `cannot read board`, where
   production prints `cannot read {db}: …`, is a hard-coded fixture string. Grep the tests for it.
 - Read the alert store directly for the post time; for the Hermes Inbox that is `~/.hermes/inbox/inbox.db`,
