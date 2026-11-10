@@ -504,7 +504,10 @@ async function lineageIds(storedId, connection, profile = 'default') {
       cur = str(row.parent_session_id)
       if (cur) ids.add(cur)
     } catch (error) {
-      ids.incomplete = `GET /api/sessions/${cur} failed: ${String(error?.message ?? error).slice(0, 200)}`
+      const message = String(error?.message ?? error)
+      ids.incomplete = `GET /api/sessions/${cur} failed: ${message.slice(0, 200)}`
+      // The focused id itself has no row yet: a new chat before its first turn is stored.
+      if (hop === 0 && /^404\b/.test(message)) ids.unstored = true
       return ids
     }
   }
@@ -731,6 +734,17 @@ export async function refresh() {
     const machinesDue = stored && (!sameSession || Date.now() - lastMachinesAt >= MACHINE_POLL_MS)
     if (kanbanDue || machinesDue) {
       const ids = await lineageIds(stored, route.connectionId, route.profile)
+      if (ids.unstored) {
+        // Nothing can be linked to a chat that isn't stored yet: show no chips (no flashing
+        // "lineage unavailable" panel on every new chat) and re-read ancestry next poll.
+        await rpc
+        if (!stillFocused()) return
+        lastKanbanAt = 0
+        lastMachinesAt = 0
+        kanbanCache = []
+        machineCache = []
+        return publish()
+      }
       if (ids.incomplete) {
         await rpc
         if (!stillFocused()) return

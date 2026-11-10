@@ -763,6 +763,12 @@ export async function refreshRequests(call = api) {
     readbacks.forEach(check => check())
   } catch (e) {
     if (!currentRoute(route) || generation !== requestRead) return
+    // A new chat has no stored row until its first turn lands: it cannot own asks yet, so this is an
+    // empty queue, not an outage (the panel used to flash an error on every new session).
+    if (errorStatus(e) === 404 && /Unknown stored session/.test(str(e?.message))) {
+      canonical = { scope, requests: [], error: null }
+      return publishCanonical()
+    }
     canonical = { scope, requests: canonical.scope === scope ? canonical.requests : [], error: `Action queue unavailable: ${e.message}. Earlier asks shown below are not approvals.` }
     publishCanonical()
   }

@@ -580,6 +580,60 @@ test('failed lineage stays unknown and retries rather than caching an empty task
   } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
 })
 
+test('a new chat with no stored row yet shows no lineage-unavailable chip and re-reads next poll', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.state = {
+    focusedSessionId: { get: () => 'new-runtime' },
+    focusedStoredSessionId: { get: () => 'new-unstored' },
+    focusedSessionOwner: { get: () => ({ connectionId: 'owner', profile: 'default' }) }
+  }
+  host.request = async () => ({})
+  let stored = false
+  let lineageReads = 0
+  let taskReads = 0
+  globalThis.document = { hidden: false, getElementById: () => ({ remove() {} }), addEventListener() {}, removeEventListener() {} }
+  globalThis.window = { hermesDesktop: { api: async args => {
+    if (args.path.startsWith('/api/sessions/')) {
+      lineageReads++
+      if (!stored) throw new Error('404: {"detail":"Session not found"}')
+      return { id: 'new-unstored', parent_session_id: null }
+    }
+    taskReads++
+    return { tasks: [], machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    assert.deepEqual(window.__sessionTasks.snapshot.chips, [], 'an unstored chat has nothing linked: no unknown chip')
+    assert.equal(taskReads, 0)
+    stored = true
+    await m.refresh()
+    assert.equal(lineageReads, 2, 'not cached: ancestry is read again once the row exists')
+    assert.ok(taskReads > 0)
+  } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
+})
+
+test('a 404 on a parent hop still reads as lineage unavailable', async () => {
+  const { host } = await import('@hermes/plugin-sdk')
+  host.state = {
+    focusedSessionId: { get: () => 'child-runtime' },
+    focusedStoredSessionId: { get: () => 'child-stored' },
+    focusedSessionOwner: { get: () => ({ connectionId: 'owner', profile: 'default' }) }
+  }
+  host.request = async () => ({})
+  globalThis.document = { hidden: false, getElementById: () => ({ remove() {} }), addEventListener() {}, removeEventListener() {} }
+  globalThis.window = { hermesDesktop: { api: async args => {
+    if (args.path === '/api/sessions/child-stored') return { id: 'child-stored', parent_session_id: 'gone-parent' }
+    if (args.path.startsWith('/api/sessions/')) throw new Error('404: {"detail":"Session not found"}')
+    return { tasks: [], machines: [] }
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    assert.ok(window.__sessionTasks.snapshot.chips.some(c => c.label === 'Session lineage unavailable'))
+  } finally { dispose(); delete globalThis.window; delete globalThis.document; delete host.state; delete host.request }
+})
+
 test('archive guard warns when session ancestry is unavailable and retries recovery', async () => {
   let failed = true
   let reads = 0

@@ -886,3 +886,15 @@ test('historical confirmed decisions do not resurrect the attention count on a c
  assert.equal(m.openAskCount(), 0)
  await show(null)
 })
+
+test('a new chat with no stored row yet is an empty queue, not an outage', async () => {
+ window.hermesDesktop={api:async()=>{throw Error('404: {"detail":"Unknown stored session on this profile"}')}}
+ await show(React.createElement(m.ActionQueue,{key:'unstored'}))
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.doesNotMatch(el().textContent,/Action queue unavailable/)
+ assert.equal(el().querySelector('[data-action-queue]'),null)
+ window.hermesDesktop.api=async()=>{throw Error('404: {"detail":"Not Found"}')}
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.match(el().textContent,/Action queue unavailable/,'other 404s (e.g. plugin missing) still surface')
+ await show(null);delete window.hermesDesktop
+})
