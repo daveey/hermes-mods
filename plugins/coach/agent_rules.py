@@ -466,6 +466,22 @@ def is_kanban_call(tool: str, args: Any) -> bool:
     return name.startswith("kanban_")
 
 
+# agent-1f57a3258a: a sleeping MacBook made cross_task fail 3x with `"retryable": true` and "the gateway was
+# unavailable ... Retry in a few minutes", and self_heal's repeat-failure rule filed it as an agent defect. The turn log
+# keeps 120 chars of a result, which cuts both the flag and the cause, so the error line carries this mark (decided on
+# the whole result) and self_heal.repeated_tool_error skips marked lines. Keep the text in step with self_heal.py.
+GATEWAY_DOWN_MARK = "(retryable: gateway unavailable)"
+GATEWAY_DOWN_RE = re.compile(r"RemoteBackendDownError|is down \(connect failed|the gateway was unavailable")
+
+
+def gateway_down_result(result: Any) -> bool:
+    """A tool result that says it is retryable because a remote gateway is temporarily unreachable."""
+    d = _as_dict(result)
+    if not d or d.get("retryable") is not True:
+        return False
+    return bool(GATEWAY_DOWN_RE.search(" ".join(str(d.get(k) or "") for k in ("error", "message", "detail"))))
+
+
 def failed(tool: str, result: Any, status: Optional[str]) -> bool:
     if status in ("error", "timeout"):
         return True
@@ -2422,7 +2438,8 @@ class AgentCoach:
         if tool == "terminal" and "commit" in arg and "git" in arg:
             s.setdefault("turn_commits", deque(maxlen=20)).append(f"-> terminal({arg[:8000]})")
         if failed(tool, result, status) and not wait_check_not_yet(tool, args, result):
-            s["turn_log"].append(f"   <- ERROR {str(result)[:120]}")
+            mark = f" {GATEWAY_DOWN_MARK}" if gateway_down_result(result) else ""
+            s["turn_log"].append(f"   <- ERROR {str(result)[:120]}{mark}")
         else:
             ok = owner_result_line(tool, args, result, saved=s.get("owner_read_files") or ())
             if ok:  # what a successful owner check found, for the report_only judges (agent-9516de5af8)

@@ -1013,3 +1013,52 @@ def test_handle_leads_with_the_hit_evidence_whatever_the_caller_passes(tmp_path)
               evidence=f"{hit['evidence']} | reply: Done.", m="shadow", filer=lambda d, store=None, m=None: None)
     det2 = events(tmp_path)[-1]
     assert det2["evidence"].count("kanban_create failed 3x") == 1
+
+
+# agent-1f57a3258a: a hub subagent read a MacBook card 3x while the MacBook slept. cross_task answered each time with
+# `"retryable": true` and "the gateway was unavailable ... Retry in a few minutes", the agent said so and handed the
+# read up, and the repeat-failure rule still filed "repeated cross_task error" (p 0.85): it counted a sleeping remote
+# gateway as a broken tool. The turn log keeps only 120 chars of a result, which cut the error before both the
+# retryable flag and RemoteBackendDownError, so observe() now marks such a line and the rule skips marked lines.
+_rules_gw = load("coach_agent_rules_test_sh_gw", ROOT / "agent_rules.py")
+GW_CARD = "t_01a1b2ccc8865d8f"
+GW_DOWN = ("could not read task t_01a1b2ccc8865d8f: lookup failed on macbook: Error invoking remote method "
+           "'hermes:api': RemoteBackendDownError: Remote backend \"conn:macbook::default\" is down (connect failed: "
+           "SSH operation to daveey@test-key-gen timed out. The connection may be half-open (e.g. after sleep); "
+           "reconnecting., 124s ago); next try in 14s. Failing fast instead of wa\u2026[truncated]. This does not mean "
+           "the task is missing; the gateway was unavailable (e.g. draining for a restart). Retry in a few minutes.")
+
+
+def _gw_turn(results, tool="cross_task"):
+    """The real path: agent_rules.observe builds the turn log machine_signal reads (session 20261106_214444_efbd42)."""
+    coach = _rules_gw.AgentCoach(None)
+    for i, res in enumerate(results):
+        coach.observe("s", tool, {"action": "read", "limit": 6 + i, "target": f"@task:default@macbook/{GW_CARD}"},
+                      json.dumps(res))
+    return coach.turn_context("s")[1]
+
+
+def test_retryable_gateway_down_repeats_are_not_a_defect():
+    log = _gw_turn([{"ok": False, "error": GW_DOWN, "retryable": True}] * 3)
+    assert sum("<- ERROR" in ln for ln in log) == 3, log  # still logged as errors for the other readers
+    assert sh.machine_signal("The MacBook is unreachable; handing the read to the parent.", log) is None
+    # the same lines untruncated (a log that kept the whole result) are skipped too
+    full = [f"-> cross_task(read {GW_CARD})", "   <- ERROR " + json.dumps({"ok": False, "error": GW_DOWN,
+                                                                         "retryable": True})] * 3
+    assert sh.machine_signal("done", full) is None
+
+
+def test_gateway_errors_that_are_not_retryable_down_still_file():
+    no_flag = sh.machine_signal("done", _gw_turn([{"ok": False, "error": GW_DOWN}] * 3))
+    assert no_flag and no_flag["kind"] == "repeat_failure" and "cross_task" in no_flag["symptom"], no_flag
+    alias = sh.machine_signal("done", _gw_turn([{"ok": False, "retryable": True,
+                                                 "error": "no gateway named 'hub-ec2'; known: macbook, hermes-hub"}] * 3))
+    assert alias and alias["kind"] == "repeat_failure", alias
+    missing = sh.machine_signal("done", _gw_turn([{"ok": False, "error": f"no such task {GW_CARD}"}] * 3))
+    assert missing and missing["kind"] == "repeat_failure", missing
+
+
+def test_other_retryable_errors_still_file():
+    rl = {"ok": False, "retryable": True, "error": "GitHub API rate limit exceeded for installation; retry after 60s"}
+    hit = sh.machine_signal("done", _gw_turn([rl] * 3, tool="github_api"))
+    assert hit and hit["kind"] == "repeat_failure" and "github_api" in hit["symptom"], hit

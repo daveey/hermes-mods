@@ -271,6 +271,19 @@ PAUSE_NOTE_MARK = "paused at a step boundary for a Hermes update"
 # The update's land target: a pause that continued within this is working as designed; a longer one failed.
 PAUSE_LAND_S = 30 * 60
 ERR_LINE_RE = re.compile(r"(?:<-|->)\s*ERROR\b\s*(.*)")
+# agent-1f57a3258a: "remote gateway temporarily unreachable" (a sleeping MacBook: cross_task said `"retryable": true`,
+# "the gateway was unavailable ... Retry in a few minutes") is not an agent defect, however often a turn hits it.
+# agent_rules.observe marks such an error line with GATEWAY_DOWN_MARK (its 120-char cut drops flag and cause); an
+# untruncated line needs both the retryable flag and the cause. Non-retryable errors (an unknown gateway alias, a missing
+# task) and other retryable ones (rate limits) still count. Keep in step with agent_rules.py.
+GATEWAY_DOWN_MARK = "(retryable: gateway unavailable)"
+GATEWAY_DOWN_RE = re.compile(r"RemoteBackendDownError|is down \(connect failed|the gateway was unavailable")
+RETRYABLE_RE = re.compile(r'"retryable"\s*:\s*true\b')
+
+
+def gateway_down_error(text: str) -> bool:
+    t = str(text or "")
+    return GATEWAY_DOWN_MARK in t or bool(RETRYABLE_RE.search(t) and GATEWAY_DOWN_RE.search(t))
 
 COMPLAINT_SYS = """You watch a power user's chats with his AI agent system "Hermes" (the coding/ops agent, its Desktop
 app, plugins, skills, cron jobs, Kanban task cards and workers, chat bots, gateways, model providers) and the products
@@ -531,6 +544,8 @@ def repeated_tool_error(log) -> Optional[dict]:
             continue
         if calls:
             calls[-1][1] = True
+        if gateway_down_error(e.group(1)):  # agent-1f57a3258a: an unreachable remote gateway, not a broken tool
+            continue
         norm = normalize_error(e.group(1)[:200])
         if not norm:
             continue
