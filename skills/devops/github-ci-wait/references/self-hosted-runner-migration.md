@@ -52,8 +52,11 @@ A macOS LaunchDaemon needs sudo on that host: run it through `run_in_user_termin
 - A custom runner image baked in host setup that the workflows never declare. Before relabeling, list what it
   provided (bubblewrap, a lifted `kernel.apparmor_restrict_unprivileged_userns`, tmux and the like), then add an
   explicit step to every job that needs it. Otherwise tests fail on the new VM (for example "bubblewrap (bwrap)
-  is not installed"). Blacksmith's Ubuntu 24.04 needs both of these steps:
-  `sudo apt-get install -y -qq bubblewrap && sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+  is not installed"). On Blacksmith's Ubuntu 24.04, install bwrap, and only touch the AppArmor knob when the kernel
+  has it: Blacksmith kernels lack `/proc/sys/kernel/apparmor_restrict_unprivileged_userns`, so an unconditional
+  `sysctl -w` fails the step. Use `command -v bwrap || sudo apt-get install -y -qq bubblewrap`, then
+  `if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w ...=0; fi`, then a
+  `bwrap --ro-bind / / --unshare-user --unshare-pid true` self-test so the step still fails closed.
 - Routing tests encode lane labels: run them locally and update them in the same commit.
 - Confirm every runner size actually gets a runner (check the first run's jobs: `runner_name` and
   `started_at`) before routing heavy lanes to it. A size the org doesn't serve sits `queued` with no
