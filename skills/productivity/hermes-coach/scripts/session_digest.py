@@ -21,7 +21,7 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, fnmatch, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 8            # v8: user turns carry prev_tools (tool calls after the agent's last text)
+DIGEST_V = 9            # v9: sessions carry `hidden` (probe_token_watch leftover test chats); v8: prev_tools
                         # v7: bounded user-turn head/tail + explicit clipping metadata
                         # v6: each user turn carries `prev`, the agent reply before it (head+tail clip), for the
                         #     self-heal backstop judge (without it \"why didnt this work\" reads as a new issue)
@@ -366,7 +366,7 @@ def digest_db(profile, db, host, since, prev=None, have=None, keys=None, stats=N
         select id, source, model, parent_session_id, started_at, ended_at, end_reason, message_count,
                tool_call_count, api_call_count, input_tokens, output_tokens, cache_read_tokens,
                coalesce(actual_cost_usd, estimated_cost_usd) as cost, title,
-               {opt('cwd')}, {opt('git_repo_root')}, {opt('git_branch')}, {opt('archived')},
+               {opt('cwd')}, {opt('git_repo_root')}, {opt('git_branch')}, {opt('archived')}, {opt('hidden')},
                {opt('profile_name')}, {act} as activity
         from sessions where {act} >= ?""", (since,)).fetchall()
     mcols = cols(con, "messages")
@@ -463,6 +463,8 @@ def digest_db(profile, db, host, since, prev=None, have=None, keys=None, stats=N
             "source": r["source"], "title": r["title"], "model": r["model"],
             "started_at": r["started_at"], "ended_at": r["ended_at"], "last_activity_at": r["activity"],
             "end_reason": r["end_reason"], "archived": bool(r["archived"]),
+            # None = this store has no hidden column; probe_token_watch only flags leftover test chats when False.
+            "hidden": None if r["hidden"] is None else bool(r["hidden"]),
             "cwd": _home_rel(r["cwd"]), "repo": _home_rel(r["git_repo_root"]), "branch": r["git_branch"],
             "msgs": len(msgs), "tool_calls": sum(tools.values()), "api_calls": r["api_call_count"],
             "tokens": {"in": r["input_tokens"], "out": r["output_tokens"], "cache_read": r["cache_read_tokens"]},

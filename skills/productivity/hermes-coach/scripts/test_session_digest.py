@@ -68,6 +68,20 @@ class DigestDedupe(unittest.TestCase):
             con.commit(); con.close()
             (dg,) = list(sd.digest_db("default", db, "test", 0))
         self.assertEqual([u["text"] for u in dg["user_turns"]], ["hi"])
+        self.assertIsNone(dg["hidden"])  # no hidden column: unknown, so probe_token_watch never flags it
+
+    def test_hidden_flag_is_carried(self):
+        """probe_token_watch flags a leftover agent test chat only when the digest says it is visible."""
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, [("user", "Reply with just the word: x", time.time(), 1, 0, None, None, "u1")])
+            con = sqlite3.connect(db)
+            con.execute("alter table sessions add column hidden int not null default 0")
+            con.execute("insert into sessions (id, source, started_at, last_activity_at, hidden) "
+                        "values ('s2','desktop',?,?,1)", (time.time(), time.time()))
+            con.commit(); con.close()
+            got = {dg["id"]: dg["hidden"] for dg in sd.digest_db("default", db, "test", 0)}
+        self.assertEqual(got, {"s1": False, "s2": True})
 
 
 class DigestFeatures(unittest.TestCase):

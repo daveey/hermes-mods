@@ -42,9 +42,10 @@ _RUNTIME_NOTICE = re.compile(
 # The only sources where a user-role row can be words David typed. Everything else (peer-mail, kanban,
 # subagent, cron, task-dispatch, review/audit lanes, future machine lanes) is refused by default.
 HUMAN_SOURCES = frozenset({"desktop", "tui", "cli", "local"})
-# messages.display_kind: NULL = typed; ``steer`` = his mid-turn out-of-band message. Anything else
-# (kanban_notice, async_delegation_complete, process_complete, auto_continue, model_switch ...) was written by
-# the runtime.
+# NULL/empty display_kind rows remain eligible after text checks; this includes legacy/UI decision rows,
+# so eligibility does not prove exclusive keyboard authorship. ``steer`` marks a mid-turn out-of-band message.
+# Other kinds (kanban_notice, async_delegation_complete, process_complete, auto_continue, model_switch ...)
+# are refused.
 HUMAN_KINDS = frozenset({"", "steer"})
 _STEER = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]\n]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]\s*$", re.S)
 
@@ -104,16 +105,35 @@ def state_db(env=None) -> Path:
 
 
 def _ro_connect(path, timeout: float = 2) -> sqlite3.Connection:
-    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
-    so fall back to mode=rw + query_only, which reads the same data and never writes rows or creates a db."""
+    """Open existing evidence read-only, escaping URI metacharacters in its path.
+
+    Probe the schema because a WAL open can fail on first read rather than connect.
+    If sidecars need creating, mode=rw never creates a database and query_only
+    forbids row/schema writes. Close every connection whose setup fails.
+    """
+    uri = Path(path).resolve().as_uri()
+    conn = None
     try:
-        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
-        c.execute("select 1 from sqlite_master limit 1")
-        return c
+        conn = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=timeout)
+        conn.execute("select 1 from sqlite_master limit 1").close()
     except sqlite3.OperationalError:
-        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
-        c.execute("PRAGMA query_only=ON")
-        return c
+        if conn is not None:
+            conn.close()
+        conn = sqlite3.connect(f"{uri}?mode=rw", uri=True, timeout=timeout)
+        try:
+            conn.execute("PRAGMA query_only=ON").close()
+        except sqlite3.Error:
+            conn.close()
+            raise
+    except sqlite3.Error:
+        if conn is not None:
+            conn.close()
+        raise
+    return conn
+
+
+# Compatibility name used by existing authority-reader callers/tests.
+_ro = _ro_connect
 
 
 def typed_text(content: str, display_kind: Optional[str]) -> Optional[str]:

@@ -1313,9 +1313,17 @@ rotation/no double count, dry-run) and `tests/test_reply_check_elapsed.py`.
 The hub's dispatcher only offers worker-first cards (`placement_policy`) to its worker pool; every other ready card
 waits for one of the hub's own `max_card_runs` slots (kanban-12ee0e4b65: the hub sat at its cap for most of a day
 while worker-1 ran 3 cards). A hermes cron job on hermes-hub (no-agent, every 10 min, "worker-share watch (hub)")
-runs it with the hermes-agent venv: each run samples the worker registry and the board, and when the hub is at its
-cap, a fresh unpinned pool worker has room and unmarked ready cards wait, for 3 samples in a row, it files ONE card
-per day (`--idempotency-key worker-share-watch:<date>`) listing core's `portable_reason` for each waiting card.
+runs it with the Hermes runtime: each run samples the worker registry and the board. After three consecutive
+samples at hub capacity with a fresh eligible pool worker, it moves up to three (`--max-moves`) ready unpinned
+cards with an **explicit NULL creation audit**, no prior run/claim, and a still-portable current replay.
+Missing audits, marker refusals and prior-run scratch remain untouched. Core's move CLI owns all writes and
+`moved` events; a fresh event plus the exact target pin must read back before reporting success. Pending ready
+pins reserve capacity, CLI errors/timeouts stop the batch, and a nonblocking file lock prevents overlapping cron ticks.
+A successful spill files no diagnostic card that tick. If unresolved waiting work remains on a later tick, it
+files at most one diagnostic per day, pinned to a pool worker with capacity after pending reservations, with
+`terminal,file,git` requirements (cloneable repo work, not `host_repo`). Both CLI writes are bound to the sampled
+home/DB and preserve worker authority fences. Tests: `tests/test_worker_share_spill.py` and
+`tests/test_worker_share_watch.py` (scratch DB, supported CLI boundary, not a live claim-throughput proof).
 Every `created` event also carries `portable_reason` (core), so the marked share is a query. Self-heal splits a
 default-board fix into a portable FIX card (`FIX_REQUIRES`, proposal inside the placement evidence fence) and a
 `self-heal verify:` child that keeps `host_repo` for the live check and the lane `event`. Tests:

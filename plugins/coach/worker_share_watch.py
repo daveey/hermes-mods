@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Worker-share watch: file ONE Kanban card when the hub is full while a pool worker idles and cards wait unmarked.
+"""Worker-share watch: spill audited portable cards when the hub is full and a pool worker has room.
 
 The hub's dispatcher offers a card to the worker pool only when creation marked it worker-first
 (``placement_policy``); every other ready card waits for one of the hub's own slots (``max_card_runs``). In
 kanban-12ee0e4b65 that left the hub at its cap in 95 of 121 ten-minute slots while worker-1 ran 3 cards a day, and
 nothing noticed: the rollout check only tested fake probe cards. This watch samples the live board each run (hub
 cron, every 10 min): the hub at cap, a pool worker below its cap, and unmarked ready cards waiting. Three samples in
-a row file one card (per day) on the hub's board listing why the waiting cards were judged non-portable (core's own
-``portable_reason``), so the next fix starts from the top refusal reasons instead of a replay.
+a row move at most three never-started, explicitly audited portable cards through core's move CLI. Pending
+pins reserve capacity. Missing audits and host-bound reasons never move. If no move succeeds, one diagnostic
+card per day is pinned to a pool worker with room, listing core's refusal reasons.
 
     worker_share_watch.py [--dry-run] [--json] [--home PATH] [--streak 3]
 
 Needs the hermes-agent venv (imports ``hermes_cli``). --dry-run samples and prints, saves and files nothing.
-Prints only when it filed or failed; exit 0 unless the scan itself crashes.
+Prints only when it moved, filed or failed; exit 0 unless the scan itself crashes.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ AUTHOR = "worker-share-watch"
 STREAK = 3
 FRESH_MS = 15 * 60 * 1000  # a machine's metrics older than this say nothing about its load
 MAX_LISTED = 12
+MAX_MOVES = 3
 
 
 def hermes_home(home: Optional[str] = None) -> Path:
@@ -73,7 +75,9 @@ def waiting_unmarked(db: Path) -> list:
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute("SELECT t.*, (SELECT e.payload FROM task_events e"
-                           " WHERE e.task_id=t.id AND e.kind='created' ORDER BY e.id LIMIT 1) AS creation_payload"
+                           " WHERE e.task_id=t.id AND e.kind='created' ORDER BY e.id LIMIT 1) AS creation_payload,"
+                           " EXISTS(SELECT 1 FROM task_runs r WHERE r.task_id=t.id) OR"
+                           " EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=t.id AND e.kind='claimed') AS prior_run"
                            " FROM tasks t WHERE status = 'ready' AND placement_policy IS NULL"
                            " ORDER BY created_at").fetchall()
     finally:
@@ -118,7 +122,8 @@ def sample(registry: dict, waiting: list, now_ms: int, reason_fn: Callable[[dict
     me = registry.get("me") or "hub"
     hub = machines.get(me) or {}
     hub_runs, hub_cap = _runs(hub), hub.get("max_card_runs")
-    hub_full = isinstance(hub_cap, int) and hub_runs is not None and hub_runs >= hub_cap
+    hub_full = (_fresh(hub, now_ms) and isinstance(hub_cap, int) and hub_cap > 0
+                and hub_runs is not None and hub_runs >= hub_cap)
     room = {}
     for name, m in machines.items():
         cap = m.get("max_card_runs")
@@ -163,7 +168,11 @@ def card_body(s: dict, streak: int, examples: list) -> str:
                       f" ({c.get('reason_source', 'current replay')})"
                       for c in examples[:MAX_LISTED])
     room = ", ".join(f"{k} ({v} free)" for k, v in s["room"].items())
-    return f"""The hub ran {s['hub_runs']}/{s['hub_cap']} cards for {streak} samples in a row (10 min apart) while
+    return f"""Fix the portable repo producer from the carried evidence below; clone and push the repo as needed.
+Live host-only verification belongs on a separate capability owner, not this portable implementation.
+
+<!-- placement:evidence -->
+The hub ran {s['hub_runs']}/{s['hub_cap']} cards for {streak} samples in a row (10 min apart) while
 {room} had room and {s['waiting']} ready cards waited unmarked: the dispatcher only offers worker-first cards
 (`placement_policy`) to the pool, so these wait for a hub slot. Found by {AUTHOR} (hermes-mods
 plugins/coach/worker_share_watch.py, kanban-12ee0e4b65).
@@ -173,6 +182,7 @@ plugins/coach/worker_share_watch.py, kanban-12ee0e4b65).
 
 ## Examples
 {cards}
+<!-- /placement:evidence -->
 
 ## Acceptance
 1. For the top reason(s), find the producer (card title prefix / creator) and what the card really needs. A
@@ -184,19 +194,21 @@ plugins/coach/worker_share_watch.py, kanban-12ee0e4b65).
 """
 
 
-def _run(runner: Callable, argv: list):
-    return runner(argv, capture_output=True, text=True, timeout=120)
+def _run(runner: Callable, argv: list, home: Optional[Path] = None):
+    kw = {} if home is None else {'env': {**os.environ, 'HERMES_HOME': str(home),
+                                        'HERMES_KANBAN_DB': str(home / 'kanban.db')}}
+    return runner(argv, capture_output=True, text=True, timeout=120, **kw)
 
 
 def file_card(s: dict, streak: int, examples: list, runner: Callable = subprocess.run,
-              day: Optional[str] = None) -> Optional[str]:
+              day: Optional[str] = None, home: Optional[Path] = None) -> Optional[str]:
     day = day or time.strftime("%Y-%m-%d", time.gmtime(s["at"] / 1000))
     top = next(iter(s["reasons"]), "?")
     argv = ["hermes", "kanban", "create", f"worker share: hub full, {s['waiting']} cards wait unmarked (top: {top})",
             "--body", card_body(s, streak, examples), "--assignee", "default", "--created-by", AUTHOR,
             "--idempotency-key", f"{AUTHOR}:{day}", "--requires", "terminal", "--requires", "file",
-            "--requires", "git", "--requires", "host_repo", "--json"]
-    r = _run(runner, argv)
+            "--requires", "git", "--runs-on", f"machine:{max(s['room'], key=s['room'].get)}", "--json"]
+    r = _run(runner, argv, home)
     if r.returncode != 0:
         raise RuntimeError(f"kanban create failed ({r.returncode}): {(r.stderr or r.stdout)[-400:]}")
     import re
@@ -204,19 +216,103 @@ def file_card(s: dict, streak: int, examples: list, runner: Callable = subproces
     return m.group(1) if m else None
 
 
+def pending_pins(db: Path) -> collections.Counter:
+    """Reserve queued pins too: registry metrics count running cards, not waiting moves."""
+    con = _ro_connect(db)
+    try:
+        rows = con.execute("SELECT runs_on FROM tasks WHERE status='ready' AND runs_on IS NOT NULL").fetchall()
+    finally:
+        con.close()
+    pins = collections.Counter()
+    for (raw,) in rows:
+        try:
+            labels = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(labels, list):
+            for label in labels:
+                if isinstance(label, str) and label.startswith('machine:'):
+                    pins[label[8:]] += 1
+    return pins
+
+
+def move_verified(db: Path, task_id: str, machine: str, after_id: int) -> bool:
+    con = _ro_connect(db)
+    try:
+        row = con.execute("SELECT runs_on FROM tasks WHERE id=?", (task_id,)).fetchone()
+        event = con.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='moved' AND id>?"
+                            " ORDER BY id DESC LIMIT 1", (task_id, after_id)).fetchone()
+        return (bool(row and event) and json.loads(row[0]) == [f'machine:{machine}']
+                and json.loads(event[0]).get('runs_on') == [f'machine:{machine}'])
+    except (ValueError, TypeError, AttributeError):
+        return False
+    finally:
+        con.close()
+
+
+def spill(home: Path, s: dict, reason_fn: Callable, runner: Callable, limit: int) -> tuple:
+    """Only move explicitly audited, still-portable, never-started cards. Core owns the write/event."""
+    moved, errors = [], []
+    if not s['starved']:
+        return moved, errors
+    db = home / 'kanban.db'
+    pending = pending_pins(db)
+    room = {m: max(0, n - pending[m]) for m, n in s['room'].items()}
+    attempts = 0
+    for card in waiting_unmarked(db):
+        if attempts >= max(0, limit) or not any(room.values()):
+            break
+        # Missing audits are not NULL audits. Prior runs may own host-local scratch files.
+        if 'creation_reason' not in card or card['creation_reason'] is not None or card['prior_run']:
+            continue
+        try:
+            if reason_fn(card) is not None:
+                continue
+        except Exception:
+            continue
+        machine = max(room, key=lambda m: room[m])
+        attempts += 1
+        con = _ro_connect(db)
+        try:
+            after_id = con.execute('SELECT COALESCE(MAX(id),0) FROM task_events').fetchone()[0]
+        finally:
+            con.close()
+        argv = ['hermes', 'kanban', 'move', card['id'], '--runs-on', f'machine:{machine}',
+                '--reason', f'{AUTHOR}: hub at cap; audited portable, never started; pool has room', '--json']
+        try:
+            result = runner(argv, capture_output=True, text=True, timeout=120,
+                            env={**os.environ, 'HERMES_HOME': str(home), 'HERMES_KANBAN_DB': str(db)})
+            if result.returncode != 0 or not move_verified(db, card['id'], machine, after_id):
+                raise RuntimeError('move refused or readback did not confirm target and moved event')
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            errors.append({'task_id': card['id'], 'error': str(exc)})
+            # An ambiguous CLI outcome may have reserved the slot. Stop, never blind retry.
+            break
+        room[machine] -= 1
+        moved.append({'task_id': card['id'], 'machine': machine})
+    return moved, errors
+
+
 def run(home: Path, *, registry_fn: Callable[[], object], reason_fn: Callable[[dict], Optional[str]],
         now_ms: Optional[int] = None, streak_needed: int = STREAK, dry_run: bool = False,
-        runner: Callable = subprocess.run) -> dict:
+        runner: Callable = subprocess.run, max_moves: int = MAX_MOVES) -> dict:
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     waiting = waiting_unmarked(home / "kanban.db")
     s = sample(dict(registry_fn() or {}), waiting, now_ms, reason_fn)
     st = load_state(home)
     streak = (int(st.get("streak") or 0) + 1) if s["starved"] else 0
-    out = {"sample": s, "streak": streak, "filed": None}
+    out = {"sample": s, "streak": streak, "filed": None, "moved": [], "move_errors": []}
     if dry_run:
         return out
+    if streak >= streak_needed:
+        out["moved"], out["move_errors"] = spill(home, s, reason_fn, runner, max_moves)
+        waiting = waiting_unmarked(home / "kanban.db")
+        s = sample(dict(registry_fn() or {}), waiting, now_ms, reason_fn)
     day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
-    if streak >= streak_needed and st.get("filed_day") != day:
+    pending = pending_pins(home / 'kanban.db')
+    s['room'] = {m: n - pending[m] for m, n in s['room'].items() if n > pending[m]}
+    if (s["starved"] and s['room'] and not out['moved'] and not out['move_errors']
+            and streak >= streak_needed and st.get("filed_day") != day):
         examples = []
         for c in waiting:
             try:
@@ -224,7 +320,7 @@ def run(home: Path, *, registry_fn: Callable[[], object], reason_fn: Callable[[d
             except Exception:
                 reason = "check failed"
             examples.append({**c, "reason": reason})
-        out["filed"] = file_card(s, streak, examples, runner=runner, day=day)
+        out["filed"] = file_card(s, streak, examples, runner=runner, day=day, home=home)
         st["filed_day"], st["filed_card"] = day, out["filed"]
     st.update({"streak": streak, "last": {k: s[k] for k in ("at", "hub_runs", "hub_cap", "room", "waiting")}})
     save_state(home, st)
@@ -245,12 +341,28 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--home")
     ap.add_argument("--streak", type=int, default=STREAK)
+    ap.add_argument("--max-moves", type=int, default=MAX_MOVES)
     a = ap.parse_args(argv)
     home = hermes_home(a.home)
     registry_fn, reason_fn = _core()
-    out = run(home, registry_fn=registry_fn, reason_fn=reason_fn, streak_needed=a.streak, dry_run=a.dry_run)
+    if a.dry_run:
+        out = run(home, registry_fn=registry_fn, reason_fn=reason_fn, streak_needed=a.streak,
+                  dry_run=True, max_moves=a.max_moves)
+    else:
+        import fcntl
+        lock_path = state_path(home).with_suffix('.lock')
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 0
+            out = run(home, registry_fn=registry_fn, reason_fn=reason_fn, streak_needed=a.streak,
+                      max_moves=a.max_moves)
     if a.json or a.dry_run:
         print(json.dumps(out, indent=1))
+    elif out["moved"] or out["move_errors"]:
+        print(json.dumps(out))
     elif out["filed"]:
         print(f"{AUTHOR}: filed {out['filed']} (hub {out['sample']['hub_runs']}/{out['sample']['hub_cap']}, "
               f"{out['sample']['waiting']} waiting, room {out['sample']['room']})")
