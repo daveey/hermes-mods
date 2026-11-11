@@ -1,6 +1,19 @@
 # GitHub Actions outages
 
-Two outage shapes and how to recover from each. Linked from `SKILL.md`; paths below are relative to the skill dir.
+Outage shapes and how to handle each. Linked from `SKILL.md`; paths below are relative to the skill dir.
+
+## Incident: runs queue and none start
+
+Signs: githubstatus lists an unresolved Actions incident (`https://www.githubstatus.com/api/v2/incidents/unresolved.json`),
+no job in the repo has started since it began, and the queued count keeps rising. Before telling the user or a card
+that a fix waits on it, check what gates that fix's landing:
+- **Needs CI:** core landings through `hermes-core-wt ship` (it requires the exact-head aggregate check) and any merge
+  that branch protection gates. Tell their owners once, and leave the queued runs alone.
+- **Doesn't:** a change on the `state` branch (hermes-sync) deploys from the push itself, through each host's sync;
+  CI only checks it afterwards. Tell its owner to push as soon as its own tests pass.
+
+Once Actions recovers, run `--once` on each head you waited for before calling it green: runs created during the
+incident can be ghosts (next section).
 
 ## Ghost runs
 

@@ -182,7 +182,8 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
   already exist.
 - Runs created during a GitHub Actions incident can stay `queued` with 0 jobs forever (cancel, force-cancel and
   rerun all refused): close and reopen the PR to refire its CI on the same sha, never an empty commit. Guards and
-  branch pushes: `references/actions-outages.md` §Ghost runs.
+  branch pushes: `references/actions-outages.md` §Ghost runs. Before saying a fix waits on the outage, check that its
+  landing needs CI (§Incident: a `state`-branch hermes-sync push goes live without it).
 - A gate on the CURRENT head that sits `queued` is not a latch: it waits for a free runner with its labels. Read
   them first (`gh api repos/O/R/actions/jobs/<id> --jq .labels`; the id ends the check's `detailsUrl`), then
   diagnose that label's pool per `references/self-hosted-runner-migration.md` (Pitfalls, saturation by label).
