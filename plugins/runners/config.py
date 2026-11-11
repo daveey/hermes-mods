@@ -190,7 +190,7 @@ class ConfigFile:
         finally:
             os.close(fd)
 
-    def update(self, mapping, *, expected_revision, expected_owner_epoch):
+    def update(self, mapping, *, expected_revision, expected_owner_epoch, backup=False):
         """CAS full config, fsync file then atomic replace and directory fsync."""
         _require(type(expected_revision) is int and expected_revision >= 0)
         _require(type(expected_owner_epoch) is int and expected_owner_epoch >= 1)
@@ -209,6 +209,12 @@ class ConfigFile:
                 raise ConfigError('owner_conflict')
             if current and any(candidate[k] != current[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch')):
                 raise ConfigError('owner_conflict')
+            if backup and current:
+                backup_fd, _ = tempfile.mkstemp(prefix=self.path.name + '.pre-reconcile-', suffix='.bak', dir=self.path.parent)
+                with os.fdopen(backup_fd, 'wb') as stream:
+                    stream.write(self.path.read_bytes())
+                    stream.flush()
+                    os.fsync(stream.fileno())
             fd, name = tempfile.mkstemp(prefix='.runners-', dir=self.path.parent)
             try:
                 with os.fdopen(fd, 'w', encoding='utf-8') as stream:

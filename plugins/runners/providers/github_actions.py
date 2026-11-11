@@ -195,7 +195,7 @@ class GitHubActions:
         cached = self._cache.get(key)
         headers = {'Authorization': 'Bearer ' + credential.token,
                    'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
-        if cached:
+        if cached and not metadata:
             headers['If-None-Match'] = cached[0]
         if budget.remaining is not None:
             budget.remaining -= 1  # Conditional requests are not presumed free.
@@ -280,11 +280,15 @@ class GitHubActions:
                                (k[2].split('?', 1)[0] == resource or k[2].startswith(resource + '/'))}
             if status == 401 and hasattr(self.credential_resolver, 'invalidate'):
                 self.credential_resolver.invalidate(key=credential.key)
+            if metadata and status == 404:
+                # Only a fresh wire response is deletion evidence. Persist the
+                # same resource-local cooldown; a later cached _Failure is not.
+                return response
             cooldown = permission if scope_local else budget
             raise _Failure(code or ('server_error' if isinstance(status, int) and status >= 500 else 'unexpected_status'),
                            max(0, math.ceil(cooldown.until - self.clock())))
         if status == 304:
-            if not cached:
+            if metadata or not cached:
                 raise _Failure('unbacked_304')
             body = deepcopy(cached[1])
         else:
@@ -298,7 +302,7 @@ class GitHubActions:
         budget.cause = None
         budget.failures = 0
         budget.until = 0
-        return HTTPResponse(200, {}, body) if metadata else body
+        return HTTPResponse(200, h if status == 200 else {}, body) if metadata else body
 
     @staticmethod
     def _page(body, key):

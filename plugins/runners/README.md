@@ -25,12 +25,45 @@ when finished (including after a failed run). The generator shares its lifetime
 lock and persisted provider quota/backoff/crash fences, so it cannot run concurrently.
 It resolves repository metadata 301s through exactly
 `https://api.github.com/repositories/<numeric-id>`, verifies the returned ID, and
-preserves scope IDs, bindings and permissions. Unknown/deleted/inaccessible scopes
-are reported, not silently dropped. Job/workflow-referenced scopes are reported
-for coordinated allowlist updates, not automatically renamed. The JSON report
-contains names/IDs and sanitized failures, never credentials. Requests are serial,
-paced, bounded per scope, and stop on quota/backoff. Recheck fresh coverage after a
-full cycle. This replaces one-shot generation from historical inventory exports.
+preserves existing scope IDs, bindings and permissions. A repository scope can be
+removed only after real metadata 404s on two runs, absence from complete paginated
+same-credential organization listings on both runs, at least one hour between
+confirmations (configurable via `--confirmation-interval`), and an intervening
+completed collector snapshot for the same config/owner. 410s, cached permission
+failures, partial listings, stale/changed identities and unconfirmed 404s never
+remove a scope. For user-owned repositories, a missing org endpoint additionally
+requires verified `User` account metadata before a complete same-credential user
+repository listing can supply absence evidence.
+Over 25 confirmed removals refuses all removals in that run. Workflow/job-referenced
+scopes require coordinated allowlist updates, never automatic rename/removal.
+
+Opt into additions with repeatable `--discover-org example=cred_<opaque-ref>`;
+no other owners are enrolled automatically. New IDs retain the enrollment algorithm:
+`scope_` plus the first 32 SHA256 hex digits of `repository:<full_name>`. If a
+renamed scope already holds that ID, append `:<numeric-repository-id>` to the hash
+input for the new scope instead of recycling the existing identity. Credentials
+come only from the explicit option; permissions begin `not_checked`. Existing IDs
+are never regenerated. The JSON report includes `changes`, `additions`, `removals`,
+`pending`, and sanitized `errors`, never credentials. Dry runs leave YAML unchanged
+but save confirmation evidence (atomic 0600) and provider budgets. Applied changes
+use revision/owner-epoch CAS under the collector lock, with an exact-byte 0600
+`.pre-reconcile-*.bak` backup made inside the config writer lock.
+
+Requests are serial, paced, bounded per scope, and stop on quota/backoff. Recheck
+fresh coverage after a full cycle. Tests: `tests/test_scope_reconciliation.py`,
+`tests/test_runtime_reconcile.py`, and existing `tests/test_canonical*.py`.
+
+For unattended Linux use, invoke `scripts/runtime_reconcile.py` with the installed
+runtime Python, `-I`, `--core-root`, and the reconcile arguments. It activates the
+installed dependency generation, stops the active `hermes-runners-collector.service`,
+and restores it in `finally`, including normal maintenance failures. Run it from
+a systemd user oneshot with `UMask=0077`, `TimeoutStartSec=1800`, and
+`ExecStopPost=/usr/bin/systemctl --user start hermes-runners-collector.service` so a
+hard kill or timeout also restores collection. That recovery unit assumes the
+collector is intended to remain active: disable the maintenance timer before
+intentionally stopping collection. Use a timer with `OnActiveSec=2min` and
+`OnUnitActiveSec=6h`. Put org/credential policy only in the host's private unit.
+Never run a long maintenance pass under a short-lived interactive tool timeout.
 
 To tolerate future renames without waiting for regeneration, inventory GETs accept
 one GitHub numeric repository-ID 301 with the exact original pagination query.
