@@ -33,6 +33,12 @@ Hand it over only when it can't.
   terminal window, shows the command, the user confirms there, it runs, and you get the exit code and output.
 - The tool is eager on most hosts. Where it isn't in the tool list, call it through `tool_call` (name
   `run_in_user_terminal`); never fall back to pasting the command.
+- The window opens on the user's own Mac (e.g. the MacBook), even from a hub chat, so a command naming a hub path
+  fails there ("No such file"). Stage hub files on that Mac first with `tailnet_copy` (`direction=put`, host
+  from `tailnet_hosts`, e.g. `mbp`), have the command write its output to a file on that Mac, then bring it back
+  with `tailnet_copy get`. Print the staged file's sha256 in the command so the user can match it to the reviewed
+  copy. The user's shell is zsh, which doesn't word-split an unquoted `$VAR`: write ssh options inline, never in
+  a variable.
 - Remote hosts too: `ssh -t <host> 'sudo ...'`. When the SSH key is refused, run
   `ssh-copy-id -i ~/.ssh/id_ed25519.pub <user>@<host>` there.
 - Get a go-ahead in chat first for anything destructive: the window runs the command at once, with no y/N step.
