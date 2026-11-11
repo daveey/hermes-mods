@@ -155,6 +155,37 @@ def test_external_time_preserves_caller_state(multi, options):
     assert guard.refuse_reason(cmd, str(multi[1])) is None
 
 
+@pytest.mark.parametrize("option", ["--unknown", "-Z"])
+def test_external_time_parse_error_keeps_opaque_alias_evidence(multi, option):
+    wt = shlex.quote(str(multi[1]))
+    wrapper = f'/usr/bin/time {option} true'
+    # The time boundary already preserves caller state; EXTERNAL_WRAPPERS must also
+    # retain opaque-child alias evidence for later non-builtin Git subcommands.
+    reason = guard.refuse_reason(f'{wrapper}; git -C {wt} custom', str(multi[1]))
+    assert reason is not None and "opaque child" in reason
+    assert wrapper in reason and "custom" in reason
+    assert guard.refuse_reason(f'{wrapper}; git -C {wt} status', str(multi[1])) is None
+
+
+@pytest.mark.parametrize("option", ["-o", "-f", "--output", "--format"])
+def test_external_time_option_operand_is_not_a_command(multi, option):
+    # `git` is the output filename/format, not the executable. Leaving it in argv
+    # invents a Git restore that the original command does not invoke.
+    cmd = f'/usr/bin/time {option} git stash pop'
+    assert guard.refuse_reason(cmd, str(multi[1])) is None
+
+
+@pytest.mark.parametrize("option", ["-o", "-f", "--output", "--format"])
+def test_external_time_option_operand_preserves_known_git_target(multi, option):
+    main, wt = multi
+    # Unlike pop, same-branch apply is allowed: a fallback's unresolved repo would
+    # falsely refuse it, so a literal unsafe restore alone cannot pin option arity.
+    allowed = f'/usr/bin/time {option} timing.txt git -C {shlex.quote(str(main))} stash apply'
+    refused = f'/usr/bin/time {option} timing.txt git -C {shlex.quote(str(wt))} stash apply'
+    assert guard.refuse_reason(allowed, str(wt)) is None
+    assert guard.refuse_reason(refused, str(wt)) is not None
+
+
 @pytest.mark.parametrize("wrapper,changes_parent", [
     ("/usr/bin/time -p", False),
     ("command time -p", False),

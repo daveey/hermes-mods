@@ -1808,8 +1808,8 @@ class _Analyzer:
             return [unknown], [unknown]
         if external_time:
             # Arguments expand in the caller, not in an export-filtered child shell.
-            # Function precedence was resolved above; stripped names bypass it as
-            # before. A copy also contains direct writes by builtin modeling.
+            # Function precedence was resolved above; stripped names bypass it as before.
+            # Defensive isolation against future in-place models; current models copy first.
             st = st.copy()
         raw = words[len(lit) - len(kept):]
         lit = lit[len(lit) - len(kept):]
