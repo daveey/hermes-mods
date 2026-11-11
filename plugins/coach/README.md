@@ -1037,7 +1037,17 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   `<coach>/selfheal-results/<fp>.md`, logged as `selfheal_fixed`). Results are never posted to the Inbox (it is for
   decisions only; archived "Fixed:" cards got the poster muted). A legacy open `selfheal` proposal card is resolved
   as Do it by the same pass; an explicit Not now / Never on it is still honoured. Budget/concurrency denials leave the
-  fingerprint `proposed`, so the next pass retries.
+  fingerprint `proposed`, so the next pass retries. `selfheal_fix_deferred` logs once per fingerprint, UTC day
+  and admission reason (`daily_cap` or `concurrency`); changing spend/retry timestamps are metrics, not new reasons.
+  Dedupe lives in `selfheal-deferrals.json` under the same admission lock and survives process restarts.
+- **Missing completion receipts:** a completed approved owner with no verifier gets one idempotent, budget-gated
+  VERIFY child instead of immediately becoming stale. This covers legacy single-card fixes and adopted owners
+  that never received a lane-event instruction. Admission/create failure retains approved state for retry; existing
+  verifier and abandoned-card handling is unchanged. The verifier checks the exact symptom, deployed commits and
+  live evidence before recording fixed; unrelated adopted cards or commit-looking metadata are not proof.
+  Historical stale rows are not automatically mass-resurrected. Audit them before any backfill.
+  Tests: `tests/test_self_heal_completion_receipts.py` (own/adopted owners, failed create, cap/board preservation,
+  explicit receipt, process-persistent deferral dedupe, UTC rollover and admission recovery).
 - **`auto_approve: false`**: proposals wait in `proposed` until `self_heal.py fix <fp>`; Inbox outcomes on an existing
   `selfheal` card still decide (**Do it** → fix card, **Not now** snoozes 14 days, **Never** suppresses). (Do it is
   not a Kanban `task` action because a worker is fenced from creating cards via the CLI.)

@@ -1805,7 +1805,15 @@ the evidence you get (it describes where it happened, not where you work).
 
 def verify_brief(fp: str, st: dict, fix_card: str) -> str:
     """The VERIFY child (host_repo, stays here): host steps, live check, and the lane event, from the fix's handoff."""
-    return f"""Self-heal VERIFY for defect `{fp}`: fix card {fix_card} (its parent here) did the repo work. You run
+    return f"""Self-heal VERIFY for defect `{fp}`: owner/fix card {fix_card} (its parent here).
+Symptom to verify: {st.get('symptom') or fp}
+A completed card or a commit in its metadata is not proof that this symptom was fixed. The owner may be an
+adopted investigation or unrelated session card, not a self-heal fix card. First confirm the handoff addresses
+this exact defect. If investigation led to another fix card, follow that handoff and wait for its delivery.
+If no fix exists, repair the actual symptom here, or create/link a scoped repair owner and wait on it before
+recording fixed (do not call a real unresolved defect not_defect). Clear any mistaken adoption in your report.
+A false detection requires evidence before `event not_defect`.
+You run
 on the host that filed it, because the live check and the lane record need this host's coach store and logs.
 Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
 
@@ -2020,6 +2028,33 @@ def _admission_denied(b: dict, now: float) -> Optional[dict]:
         return {"action": "deferred", "retry_at": _iso(now + 3600),
                 "why": "self-heal concurrency limit reached"}
     return None
+
+
+def _log_deferral_once(store, fp: str, denied: dict, b: dict, now: float, stage: str = "fix") -> None:
+    """Caller holds _admission_lock. Persist before logging: at most once even across process restarts.
+
+    Budget amounts/retry_at change on each pass; the reason is the admission gate, not those metrics.
+    Keep only today's keys, independently of lane generations and state transitions.
+    """
+    path = Path(store.root) / "selfheal-deferrals.json"
+    stamp = store.clock()  # sync may have started before midnight; key and logged ts must agree
+    day = _utc_day(stamp)
+    reason = "daily_cap" if not b["ok_usd"] else "concurrency"
+    key = f"{stage}:{fp}:{reason}"
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    if state.get("day") != day:
+        state = {"day": day, "keys": []}
+    if key in state["keys"]:
+        return
+    state["keys"].append(key)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, path)
+    store.log({"event": f"selfheal_{stage}_deferred", "fingerprint": fp, **denied,
+               "reason": reason, "utc_day": day, "ts": stamp})
 
 
 def fixes_waiting(store, auto: Optional[bool] = None) -> int:
@@ -4075,7 +4110,7 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     denied = _admission_denied(b, now)
     if denied:
         # Keep status=proposed: sync rereads the same Do-it outcome and retries admission.
-        store.log({"event": "selfheal_fix_deferred", "fingerprint": fp, **denied})
+        _log_deferral_once(store, fp, denied, b, now)
         return denied
     rc, out, err = _run(kanban_argv(args), runner)
     tid = _task_id(out) if rc == 0 else None
@@ -4436,10 +4471,28 @@ def card_status(card: str, board: Optional[str] = None, runner=None) -> Optional
 ENDED = ("done", "archived", "missing")
 
 
+def _recover_completion_receipt(fp: str, store, runner, now: float) -> Optional[str]:
+    """One budgeted VERIFY handoff for a completed owner without a lane receipt; never infer a fix from prose."""
+    with _admission_lock(store):
+        st = LaneState(store.root).get(fp)  # another sync/event may have settled it while we waited
+        if st.get("status") != "approved" or st.get("verify_card"):
+            return st.get("verify_card")
+        r = route({"component": st.get("component")})
+        r["board"] = st.get("board") or r["board"]
+        b = budget(r["board"], now)
+        if _budget_unavailable(b, fp, store):
+            return None
+        denied = _admission_denied(b, now)
+        if denied:
+            _log_deferral_once(store, fp, denied, b, now, stage="receipt")
+            return None
+        return _file_verify(fp, st, st["fix_card"], r, store, runner, now)
+
+
 def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
-    """A `filed` (investigation) or `approved` (fix) fingerprint whose card ended without reporting proposed / fixed
-    (crashed, timed out, archived) would stay open forever and block every later filing: mark it `stale` so the next
-    detection refiles it under a new generation. Returns [(fp, what)]."""
+    """Recover a completed approved owner's missing receipt with a bounded VERIFY handoff.
+    Unreported investigations, abandoned owners, and ended verifiers become stale so later detection can refile.
+    Returns [(fp, what)]."""
     store = _store(store)
     now = now or time.time()
     lane = LaneState(store.root)
@@ -4450,6 +4503,12 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
         if not card:
             continue
         ks = card_status(card, st.get("board"), runner)
+        if ks == "done" and status == "approved" and not st.get("verify_card"):
+            # Legacy/non-split and adopted owners can finish without ever knowing this fingerprint.
+            # Preserve the generation while a budgeted verifier obtains the receipt (including create failure).
+            verify = _recover_completion_receipt(fp, store, runner, now)
+            done.append((fp, f"receipt verification -> {verify or 'pending admission'}"))
+            continue
         if ks == "done" and status == "approved" and st.get("verify_card"):
             # A split fix ends at its VERIFY child (it records fixed): judge that card, not the finished fix card.
             card = st["verify_card"]
