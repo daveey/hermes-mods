@@ -1272,6 +1272,8 @@ Each panel has one primary button and Dismiss. No menus.
 
 ### Guardrails (one gate, server side)
 
+- `hermes_bug` excludes typed `kanban_block` missing-wake-check validation refusals: they are retry guidance, not infrastructure defects. This does not weaken the park guard or suppress explicit exceptions, Hermes tracebacks, untyped refusals, or unrelated errors. `tests/test_bug_wake_refusal.py` covers dict/JSON/hinted envelopes and the observer's recording boundary.
+
 - At most 1 nudge per session per 15 user turns.
 - A dismissal mutes that rule for the session.
 - 3 dismissals of a rule within 7 days demote it to digest-only. It is then logged as `digest` and not shown.

@@ -1255,6 +1255,14 @@ def _guided_refusal(tool: str, d: dict) -> bool:
     an unreadable file (read_failed), external drift (drift_backup) and the terminal per-turn retry cap
     (done=True: the guidance failed to get the agent through).
     """
+    # Keep this narrow: invalid_args alone can also wrap unexpected failures.
+    # Core's shared wake guard intentionally rejects long parks without a probe.
+    # Exception/traceback detection in bug_signature runs before this exemption.
+    if tool == "kanban_block":
+        return d.get("rejection") == "invalid_args" and bool(re.match(
+            rf"^{re.escape(tool)} refused: this park wakes in \d+\.\d+h "
+            r"and has no wake_check, so a condition that comes true early "
+            r"would sit unnoticed until then\.", str(d.get("error") or "")))
     if tool != "memory" or d.get("success") is not False or d.get("done") or "drift_backup" in d:
         return False
     return "could not be read right now" not in str(d.get("error") or "")
