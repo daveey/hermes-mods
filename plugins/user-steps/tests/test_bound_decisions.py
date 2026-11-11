@@ -750,3 +750,130 @@ def test_reserved_phase_tool_schema_and_prompt(tmp_path):
         assert needle.lower() in text.lower(), needle
     low = text.lower()
     assert low.index('acknowledged') < low.index('reserved') < low.index('"applied"')
+
+
+# ---- authenticated snapshot-bound numbered answers (route + store + renderer contract) --------------------------
+
+def _lists_client(tmp_path, s):
+    pytest.importorskip('fastapi'); from fastapi.testclient import TestClient; from fastapi import FastAPI
+    api = load_module('bound_plugin_api_lists', ROOT / 'dashboard' / 'plugin_api.py')
+    app = FastAPI()
+    app.include_router(api.create_router(ledger_dir=tmp_path, state_db=tmp_path / 'state.db', action_store=s,
+                                         receiver=Receiver(),
+                                         owner_resolver=lambda sid: dict(OWNER, storedSessionId=sid)))
+    return TestClient(app)
+
+
+def _two_lists(s):
+    a = s.create(OWNER, choice_request('Runner?', ('canary', 'aws')))
+    b = s.create(OWNER, choice_request('Region?', ('us-east-1', 'eu-west-1')))
+    first = s.record_list(OWNER, 'msg-1', [dict(requestId=a['requestId'], choiceId='c0'),
+                                           dict(requestId=b['requestId'], choiceId='c1')])
+    second = s.record_list(OWNER, 'msg-2', [dict(requestId=b['requestId'], choiceId='c1'),
+                                            dict(requestId=a['requestId'], choiceId='c0')])
+    return a, b, first, second
+
+
+def _post(client, source, **kw):
+    body = dict(session='session-a', snapshotDigest=None, n=1, idempotencyKey=str(uuid.uuid4()))
+    body.update(kw)
+    return client.post(f'/lists/{source}/answers', json=body)
+
+
+def test_list_snapshot_entries_freeze_the_question_title(tmp_path):
+    s = store(tmp_path); a = s.create(OWNER, choice_request('Runner?', ('canary', 'aws')))
+    snap = s.record_list(OWNER, 'msg-1', [dict(requestId=a['requestId'], choiceId='c1')])
+    assert snap['entries'][0]['title'] == 'Runner?' and snap['entries'][0]['label'] == 'aws'
+
+
+def test_list_route_returns_the_exact_session_snapshot_only(tmp_path):
+    s = store(tmp_path); a, b, first, _ = _two_lists(s); client = _lists_client(tmp_path, s)
+    got = client.get('/lists/msg-1', params={'session': 'session-a'})
+    assert got.status_code == 200 and got.json()['list']['digest'] == first['digest']
+    assert [e['title'] for e in got.json()['list']['entries']] == ['Runner?', 'Region?']
+    assert client.get('/lists/msg-1', params={'session': 'session-b'}).status_code == 404  # other session
+    assert client.get('/lists/nope', params={'session': 'session-a'}).status_code == 404
+
+
+def test_list_route_does_not_authorize_through_lineage(tmp_path):
+    s = store(tmp_path); _two_lists(s); client = _lists_client(tmp_path, s)
+    # a compression continuation is a different stored session: the list is not found there
+    assert client.get('/lists/msg-1', params={'session': 'session-a2'}).status_code == 404
+    assert _post(client, 'msg-1', session='session-a2', snapshotDigest='x', n=1).status_code == 404
+
+
+def test_delayed_numbered_answer_maps_to_the_original_list_and_decides_once(tmp_path):
+    s = store(tmp_path); a, b, first, second = _two_lists(s); client = _lists_client(tmp_path, s)
+    key = str(uuid.uuid4())
+    got = _post(client, 'msg-1', snapshotDigest=first['digest'], n=2, idempotencyKey=key)  # "2" of the FIRST list
+    assert got.status_code == 200, got.text
+    op = got.json()['operation']
+    assert op['requestId'] == b['requestId'] and op['intent']['revisionText'] == 'eu-west-1'
+    assert op['decision']['choiceId'] == 'c1' and op['intent']['permissionGrants'] == []
+    assert op['provenance'] == {'type': 'numbered_list', 'sourceId': 'msg-1', 'snapshotDigest': first['digest'], 'n': 2}
+    again = _post(client, 'msg-1', snapshotDigest=first['digest'], n=2, idempotencyKey=key)
+    assert again.status_code == 200 and again.json()['operation']['operationId'] == op['operationId']
+    # the replay also works after the request is decided (list is now stale) and after a new store handle (crash)
+    s2 = core.ActionStore(s.path)
+    assert s2.answer_numbered(OWNER, 'msg-1', first['digest'], 2, key)['operation']['operationId'] == op['operationId']
+    # a conflicting reuse of the key fails; so does a direct decide with the same key
+    assert _post(client, 'msg-1', snapshotDigest=first['digest'], n=1, idempotencyKey=key).status_code == 409
+    assert _post(client, 'msg-2', snapshotDigest=second['digest'], n=1, idempotencyKey=key).status_code == 409
+
+
+def test_numbered_answer_rejections_record_no_decision(tmp_path):
+    s = store(tmp_path); a, b, first, second = _two_lists(s); client = _lists_client(tmp_path, s)
+    bad = [
+        _post(client, 'msg-1', snapshotDigest='0' * 64, n=1),             # wrong digest
+        _post(client, 'msg-1', snapshotDigest=second['digest'], n=1),     # another list's digest
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n=3),      # no such option
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n=0),
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n=True),   # strict int
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n='1'),
+        _post(client, 'unknown', snapshotDigest=first['digest'], n=1),    # unknown list
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n=1, session='session-b'),  # wrong owner
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n=1, owner=OWNER),          # caller owner field
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n=1, choiceId='c0'),        # caller choice
+        _post(client, 'msg-1', snapshotDigest=first['digest'], n=1, expectedRevision=1),
+    ]
+    assert [r.status_code for r in bad] == [409, 409, 422, 422, 422, 422, 404, 404, 422, 422, 422]
+    s.revise(OWNER, a['requestId'], 1, dict(a, title='Synthetic change v2'))
+    assert _post(client, 'msg-1', snapshotDigest=first['digest'], n=1).status_code == 409  # revision moved on
+    with s._read() as c: assert c.execute('SELECT COUNT(*) FROM operations').fetchone()[0] == 0
+
+
+def test_concurrent_duplicate_numbered_answers_share_one_operation(tmp_path):
+    s = store(tmp_path); a, b, first, _ = _two_lists(s); key = str(uuid.uuid4())
+    def go(_): return core.ActionStore(s.path).answer_numbered(OWNER, 'msg-1', first['digest'], 1, key)['operation']['operationId']
+    with ThreadPoolExecutor(8) as pool: ids = list(pool.map(go, range(8)))
+    assert len(set(ids)) == 1
+    with s._read() as c: assert c.execute('SELECT COUNT(*) FROM operations').fetchone()[0] == 1
+    # two different keys for the same revision: the second loses, one decision stands
+    with pytest.raises(core.ActionError): s.answer_numbered(OWNER, 'msg-1', first['digest'], 1, 'other-key')
+
+
+def test_lineage_snapshots_sharing_a_source_id_are_ambiguous(tmp_path):
+    s = store(tmp_path); a = s.create(OWNER, choice_request('Runner?', ('canary', 'aws')))
+    child = dict(OWNER, storedSessionId='session-a2')
+    s.record_list(OWNER, 'msg-1', [dict(requestId=a['requestId'], choiceId='c0')])
+    ac = s.create(child, choice_request('Runner?', ('canary', 'aws'), owner=child))
+    s.record_list(child, 'msg-1', [dict(requestId=ac['requestId'], choiceId='c1')])
+    with pytest.raises(core.ActionError) as err: s.resolve_numbered(child, 'msg-1', 1, lineage=['session-a2', 'session-a'])
+    assert err.value.status == 409 and 'ambiguous' in str(err.value).lower()
+
+
+def test_numbered_tool_stays_non_authorizing_and_list_response_gives_marker_after_persistence(tmp_path, monkeypatch):
+    plugin = load_module('bound_init_marker', ROOT / '__init__.py')
+    s = store(tmp_path); a = s.create(OWNER, choice_request('Runner?', ('canary', 'aws')))
+    monkeypatch.setattr(plugin.core, 'ActionStore', lambda *a_, **k: s)
+    monkeypatch.setattr(plugin.core, 'server_owner', lambda sid: dict(OWNER, storedSessionId=sid))
+    monkeypatch.setattr(plugin.core, 'lineage', lambda sid, db=None: [sid])
+    out = json.loads(plugin.publish_action_request(
+        {'list': {'sourceId': 'm1', 'entries': [dict(requestId=a['requestId'], choiceId='c0')]}}, session_id='session-a'))
+    assert out["marker"] == '::decision-list{id="m1" d="%s"}' % out['digest']
+    assert 'typed' in out['instructions'] and 'not' in out['instructions']
+    bad = json.loads(plugin.publish_action_request(
+        {'list': {'sourceId': 'm2', 'entries': [dict(requestId='nope', choiceId='c0')]}}, session_id='session-a'))
+    assert 'marker' not in bad  # no marker without persistence
+    num = json.loads(plugin.publish_action_request({'numbered': {'sourceId': 'm1', 'n': 1}}, session_id='session-a'))
+    assert num['authorizes'] is False

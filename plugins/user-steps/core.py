@@ -2482,7 +2482,8 @@ class ActionStore:
                 b = self._binding(c, owner, r['requestId'], r['revision'])
                 if b is None: raise ActionError('Request revision has no question binding', 409)
                 snap.append({'n': n, 'requestId': r['requestId'], 'revision': r['revision'], 'choiceId': choice['id'],
-                             'label': choice['label'], 'effect': choice['effect'], 'scopeDigest': b['scopeDigest']})
+                             'label': choice['label'], 'effect': choice['effect'], 'scopeDigest': b['scopeDigest'],
+                             'title': r.get('title') or ''})
             body = {'schemaVersion': BINDING_SCHEMA, 'owner': owner, 'source': {'type': 'message', 'id': source_id},
                     'entries': snap}
             body['digest'] = _sha(body)
@@ -2495,6 +2496,25 @@ class ActionStore:
             c.execute('INSERT INTO list_snapshots VALUES (?,?,?,?,?)',
                       (ns, owner['storedSessionId'], source_id, body['digest'], _json(body)))
             return body
+
+    def list_snapshot(self, owner, source_id):
+        """The frozen list exactly as shown, for the exact owner session only (no lineage). Each entry also says
+        whether it can still be answered (``open``); that flag is outside the digest."""
+        _string(source_id)
+        with self._read() as c:
+            row = c.execute('SELECT body FROM list_snapshots WHERE namespace=? AND session=? AND source=?',
+                            (self._ns(owner), owner['storedSessionId'], source_id)).fetchone()
+            if not row: raise ActionError('Unknown list in this session', 404)
+            snap = json.loads(row[0])
+            if snap.get('owner') != owner: raise ActionError('Unknown list in this session', 404)
+            for e in snap['entries']:
+                try:
+                    r = self._get(c, owner, e['requestId']); b = self._binding(c, owner, r['requestId'], r['revision'])
+                    e['open'] = bool(r['revision'] == e['revision'] and r['state'] in ('open', 'needs_context')
+                                     and not r.get('resolution') and b is not None and b['scopeDigest'] == e['scopeDigest'])
+                except ActionError:
+                    e['open'] = False
+            return snap
 
     def resolve_numbered(self, owner, source_id, number, *, lineage=()):
         """A numbered reply -> the exact decision fields for ``decide()``, only against its originating list.
@@ -2510,7 +2530,9 @@ class ActionStore:
                 'SELECT body FROM list_snapshots WHERE namespace=? AND session=? AND source=?',
                 (self._ns(owner), sid, source_id))]
             if not rows: raise ActionError('Unknown list in this session', 404)
-            snap = json.loads(rows[0][0])  # newest session first: a compression continuation sees ancestors' lists
+            if len({r[0] for r in rows}) > 1:  # distinct lists sharing a source id across the lineage: never pick by order
+                raise ActionError('Ambiguous list: several different lists share that message id; nothing is authorized', 409)
+            snap = json.loads(rows[0][0])
             entry = next((e for e in snap['entries'] if e['n'] == number), None)
             if entry is None: raise ActionError('No such option in that list', 422)
             r = self._get(c, snap['owner'], entry['requestId'])
@@ -2629,14 +2651,61 @@ class ActionStore:
                 out.update(reservation='new', mustVerify=False, applicationKey=body['applicationKey'])
             return out
 
-    def decide(self, owner, decision):
+    @staticmethod
+    def _check_decision(decision):
         _object(decision, ('requestId', 'expectedRevision', 'choiceId', 'idempotencyKey'), ('revisionText',))
         for key in ('requestId', 'choiceId', 'idempotencyKey'): _string(decision[key])
         if len(decision['idempotencyKey']) > 255: raise ActionError('Idempotency key too long')
         if type(decision['expectedRevision']) is not int: raise ActionError('Invalid expectedRevision')
         text = decision.get('revisionText')
         if text is not None and not isinstance(text, str): raise ActionError('Invalid revisionText')
-        fingerprint = _json(dict(decision, revisionText=text))
+        return text
+
+    def decide(self, owner, decision):
+        return self._decide(owner, decision)
+
+    def answer_numbered(self, owner, source_id, snapshot_digest, number, idempotency_key):
+        """A numbered answer to the exact list snapshot the person was shown, then the ordinary decide contract.
+
+        The server-derived ``owner`` must own the snapshot (exact session; no lineage). The digest and ``n`` the
+        caller saw select the ORIGINAL entry, never a newer list. The idempotency fingerprint is (source, digest, n),
+        so a duplicate replays the same operation even after the list went stale, and any other payload on the key
+        conflicts. Durable provenance on the operation records which list and number produced it."""
+        for v in (source_id, snapshot_digest, idempotency_key): _string(v)
+        if len(idempotency_key) > 255: raise ActionError('Idempotency key too long')
+        if type(number) is not int or number < 1: raise ActionError('Invalid option number', 422)
+
+        def resolve(c):
+            row = c.execute('SELECT digest,body FROM list_snapshots WHERE namespace=? AND session=? AND source=?',
+                            (self._ns(owner), owner['storedSessionId'], source_id)).fetchone()
+            if not row: raise ActionError('Unknown list in this session', 404)
+            if row['digest'] != snapshot_digest:
+                raise ActionError('That is not the list that was shown; nothing is authorized', 409)
+            snap = json.loads(row['body'])
+            if snap.get('owner') != owner: raise ActionError('List belongs to another owner', 403)
+            entry = next((e for e in snap['entries'] if e['n'] == number), None)
+            if entry is None: raise ActionError('No such option in that list', 422)
+            r = self._get(c, owner, entry['requestId'])
+            b = self._binding(c, owner, r['requestId'], r['revision'])
+            if (r['revision'] != entry['revision'] or r['state'] not in ('open', 'needs_context') or r.get('resolution')
+                    or b is None or b['scopeDigest'] != entry['scopeDigest']):
+                raise ActionError('That list is stale: the request changed or was decided; nothing is authorized', 409)
+            out = {'requestId': entry['requestId'], 'expectedRevision': entry['revision'], 'choiceId': entry['choiceId'],
+                   'idempotencyKey': idempotency_key}
+            if entry['effect'] == 'answer': out['revisionText'] = entry['label']
+            return out
+
+        provenance = {'type': 'numbered_list', 'sourceId': source_id, 'snapshotDigest': snapshot_digest, 'n': number}
+        fingerprint = _json({'numbered': provenance, 'idempotencyKey': idempotency_key})
+        return self._decide(owner, {'idempotencyKey': idempotency_key}, provenance=provenance,
+                            fingerprint=fingerprint, resolve=resolve)
+
+    def _decide(self, owner, decision, *, provenance=None, fingerprint=None, resolve=None):
+        if resolve is None:
+            text = self._check_decision(decision)
+            fingerprint = _json(dict(decision, revisionText=text))
+        else:
+            text = None
         ns = self._ns(owner)
         with self._tx() as c:
             existing = c.execute('SELECT id,fingerprint FROM operations WHERE namespace=? AND session=? AND idem=?',
@@ -2644,6 +2713,9 @@ class ActionStore:
             if existing:
                 if existing['fingerprint'] != fingerprint: raise ActionError('Idempotency key payload conflict', 409)
                 return self._operation(c, owner, existing['id'])
+            if resolve is not None:
+                decision = resolve(c)
+                text = self._check_decision(decision)
             r = self._get(c, owner, decision['requestId'])
             if r['revision'] != decision['expectedRevision'] or r['state'] not in ('open', 'needs_context'):
                 raise ActionError('Stale or closed request', 409)
@@ -2662,6 +2734,7 @@ class ActionStore:
             op = {'operationId': oid, 'owner': owner, 'requestId': r['requestId'], 'revision': r['revision'],
                   'idempotencyKey': decision['idempotencyKey'], 'decision': decision,
                   'recordedAt': stamp, 'dispatchState': 'pending', 'attempts': 0,
+                  **({'provenance': provenance} if provenance else {}),
                   'intent': {'request': r, 'effect': effect, 'revisionText': text,
                              # A go answer to a run question authorizes exactly this frozen scope; free text never.
                              'executionAuthorized': effect == 'approve' or (

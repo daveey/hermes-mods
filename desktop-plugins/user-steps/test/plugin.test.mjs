@@ -328,8 +328,9 @@ test('strip: a .md path in a blocked card opens in the preview pane via ctx.open
 test('register: strip in composer.top and the user-step directive', () => {
   const got = []
   const dispose = m.default.register({ register: c => got.push(c) })
-  assert.deepEqual(got.map(c => c.area), ['composer.top', 'transcript.directives'])
+  assert.deepEqual(got.map(c => c.area), ['composer.top', 'transcript.directives', 'transcript.directives'])
   assert.equal(got[1].data.name, 'user-step')
+  assert.equal(got[2].data.name, 'decision-list')
   assert.equal(window.__userSteps.ownsComposer, true)
   dispose()
   assert.equal(window.__userSteps, undefined)

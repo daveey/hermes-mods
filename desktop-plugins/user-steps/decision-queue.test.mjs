@@ -935,3 +935,42 @@ test('owner phase: delivery alone is not acknowledgment; only owner receipts cha
  assert.equal(phase().dataset.ownerPhase,'applied');assert.match(phase().textContent,/commit abc123/)
  await show(null)
 })
+
+test('::decision-list renders the frozen snapshot and posts the exact displayed digest and number', async () => {
+ const snap={digest:'d'.repeat(64),owner,source:{type:'message',id:'msg-1'},entries:[
+  {n:1,requestId:'r1',revision:1,choiceId:'c0',title:'Runner?',label:'canary',effect:'answer'},
+  {n:2,requestId:'r2',revision:1,choiceId:'c1',title:'Region?',label:'eu-west-1',effect:'answer'}]}
+ const calls=[]; let finish
+ const call=async(path,opts={})=>{calls.push([path,opts]); if(opts.method==='POST') return new Promise(res=>{finish=res}); return {list:snap}}
+ const attrs={id:'msg-1',d:snap.digest}
+ await show(React.createElement(m.DecisionList,{key:'dl',attrs,deps:{call}}))
+ await React.act(async()=>{await flush();await flush()})
+ const [getPath,getOpts]=calls[0]
+ assert.equal(getPath,'/api/plugins/user-steps/lists/msg-1?session=S1')
+ assert.equal(getOpts.connectionId,'C1');assert.equal(getOpts.profile,'default')
+ assert.match(el().textContent,/Runner\?/);assert.match(el().textContent,/canary/);assert.match(el().textContent,/Region\?/);assert.match(el().textContent,/eu-west-1/)
+ const buttons=[...el().querySelectorAll('button')]; assert.deepEqual(buttons.map(b=>b.textContent),['1','2'])
+ await React.act(async()=>{buttons[1].click();buttons[1].click();await flush()})
+ const posts=calls.filter(([,o])=>o.method==='POST'); assert.equal(posts.length,1,'double click posts once')
+ assert.equal(posts[0][0],'/api/plugins/user-steps/lists/msg-1/answers')
+ assert.deepEqual(Object.keys(posts[0][1].body).sort(),['idempotencyKey','n','session','snapshotDigest'])
+ assert.equal(posts[0][1].body.snapshotDigest,snap.digest);assert.equal(posts[0][1].body.n,2);assert.equal(posts[0][1].body.session,'S1')
+ assert.equal(typeof posts[0][1].body.idempotencyKey,'string')
+ await React.act(async()=>{finish({operation:{operationId:'op1',dispatchState:'delivered'}});await flush()})
+ assert.match(el().textContent,/Answered 2|Sent/)
+ await show(null)
+})
+
+test('::decision-list never offers buttons when the marker digest differs from the fetched snapshot or the fetch fails', async () => {
+ const snap={digest:'d'.repeat(64),entries:[{n:1,requestId:'r1',revision:1,choiceId:'c0',title:'Runner?',label:'canary',effect:'answer'}]}
+ await show(React.createElement(m.DecisionList,{key:'dl-mismatch',attrs:{id:'msg-1',d:'e'.repeat(64)},deps:{call:async()=>({list:snap})}}))
+ await React.act(async()=>{await flush();await flush()})
+ assert.equal(el().querySelectorAll('button').length,0)
+ await show(React.createElement(m.DecisionList,{key:'dl-fail',attrs:{id:'msg-1',d:snap.digest},deps:{call:async()=>{throw Error('404')}}}))
+ await React.act(async()=>{await flush();await flush()})
+ assert.equal(el().querySelectorAll('button').length,0)
+ await show(React.createElement(m.DecisionList,{key:'dl-nodigest',attrs:{id:'msg-1'},deps:{call:async()=>({list:snap})}}))
+ await React.act(async()=>{await flush();await flush()})
+ assert.equal(el().querySelectorAll('button').length,0)
+ await show(null)
+})

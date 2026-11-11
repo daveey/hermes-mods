@@ -50,6 +50,15 @@ class DecisionBody(BaseModel):
     idempotencyKey: StrictStr
 
 
+class ListAnswerBody(BaseModel):
+    """A numbered answer to a frozen list snapshot. The owner, request, choice and revision come from the server."""
+    model_config = ConfigDict(extra='forbid')
+    session: StrictStr
+    snapshotDigest: StrictStr
+    n: StrictInt
+    idempotencyKey: StrictStr
+
+
 class ChatReconcileBody(BaseModel):
     model_config = ConfigDict(extra='forbid')
     session: StrictStr
@@ -251,6 +260,20 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             results = _load('chat').reconcile(_load('core'), st, own,
                 db=state_db, request_id=request_id, expected_revision=body.expectedRevision)
             return {'request': st.get(own, request_id), 'results': results}
+        return run(action)
+
+    @router.get('/lists/{source_id}')
+    def list_snapshot(source_id: str, session: str):
+        # Exact-session read of a frozen numbered list. Owner is the mounted/authenticated owner of ``session``;
+        # no lineage-derived access.
+        return run(lambda: {'list': store().list_snapshot(owner(session), source_id)})
+
+    @router.post('/lists/{source_id}/answers')
+    def answer_list(source_id: str, body: ListAnswerBody):
+        def action():
+            own = owner(body.session); st = store()
+            recorded = st.answer_numbered(own, source_id, body.snapshotDigest, body.n, body.idempotencyKey)
+            return st.dispatch(own, recorded['operation']['operationId'], delivery())
         return run(action)
 
     @router.get('/operations')

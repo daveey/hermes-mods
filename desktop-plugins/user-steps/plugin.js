@@ -1185,6 +1185,55 @@ export function ActionQueue({ embedded = false } = {}) {
   ] })
 }
 
+/** `::decision-list{id="<sourceId>" d="<digest>"}`: the numbered list frozen when the agent showed it. Buttons post the
+ * DISPLAYED snapshot digest and number to the authenticated mounted route; a typed bare number is never trusted. */
+export function DecisionList({ attrs, deps }) {
+  useValue(host.state.focusedSessionOwner || host.state.connectionId || host.state.focusedStoredSessionId)
+  const call = deps?.call || api
+  const route = decisionRoute(), scope = routeKey(route)
+  const sourceId = decodeAttr(attrs?.id), marked = str(attrs?.d)
+  const [state, setState] = useState({ scope, list: null, failed: false, sent: null, error: '', busy: false })
+  const keys = useRef(new Map()) // one idempotency key per (digest, n): a retry replays the same operation
+  const busy = useRef(false)
+  useEffect(() => {
+    let live = true
+    setState({ scope, list: null, failed: false, sent: null, error: '', busy: false })
+    if (!sourceId || !marked || !route.session) { setState(st => ({ ...st, failed: true })); return }
+    call(`${BASE}/lists/${encodeURIComponent(sourceId)}?session=${encodeURIComponent(route.session)}`, route)
+      .then(r => { if (live && currentRoute(route)) setState(st => ({ ...st, list: r?.list?.digest === marked && Array.isArray(r.list.entries) ? r.list : null, failed: r?.list?.digest !== marked })) })
+      .catch(() => { if (live && currentRoute(route)) setState(st => ({ ...st, failed: true })) })
+    return () => { live = false }
+  }, [sourceId, marked, scope])
+  const list = state.scope === scope ? state.list : null
+  if (!list) return state.failed ? jsx('div', { 'data-decision-list-unavailable': '', style: { fontSize: 11, opacity: 0.7 }, children: 'Numbered options unavailable \u2014 answer from the decision queue above the composer.' }) : null
+  const answer = async n => {
+    if (busy.current) return
+    busy.current = true
+    setState(st => ({ ...st, busy: true, error: '' }))
+    const kk = `${list.digest}:${n}`
+    if (!keys.current.has(kk)) keys.current.set(kk, globalThis.crypto.randomUUID())
+    try {
+      const result = await call(`${BASE}/lists/${encodeURIComponent(sourceId)}/answers`, { ...route, method: 'POST', body: { session: route.session, snapshotDigest: list.digest, n, idempotencyKey: keys.current.get(kk) } })
+      if (!currentRoute(route)) return
+      setState(st => ({ ...st, sent: { n, delivery: str(result?.operation?.dispatchState) || 'recorded' }, busy: false }))
+    } catch (e) {
+      if (currentRoute(route)) setState(st => ({ ...st, busy: false, error: `Not recorded: ${e.message}. The list may be stale; use the decision queue.` }))
+    } finally { busy.current = false }
+  }
+  return jsxs('div', {
+    'data-decision-list': list.digest,
+    style: { ...SELECTABLE, margin: '6px 0', padding: '8px 10px', borderRadius: 8, border: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 },
+    children: [
+      ...list.entries.map(e => jsxs('div', { 'data-decision-list-entry': e.n, style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }, children: [
+        jsx('button', { type: 'button', style: actionStyle, disabled: state.busy || !!state.sent || e.open === false, 'aria-label': `Choose option ${e.n}: ${str(e.label)}`, onClick: () => void answer(e.n), children: String(e.n) }),
+        jsxs('span', { children: [e.title ? `${str(e.title)}: ` : '', str(e.label)] })
+      ] }, e.n)),
+      state.sent && jsx('small', { role: 'status', children: `Answered ${state.sent.n} \u2014 ${state.sent.delivery}` }),
+      state.error && jsx('div', { role: 'alert', style: { fontSize: 11 }, children: state.error })
+    ]
+  })
+}
+
 export default {
   id: ID,
   name: 'User Steps',
@@ -1194,6 +1243,7 @@ export default {
     // With the session panel loaded, it draws these (window.__userSteps.ActionQueue / Strip) in its own sections.
     ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => typeof window !== 'undefined' && window.__sessionPanel?.active ? null : jsxs('div', { style: { minWidth: 0, width: '100%' }, children: [jsx(ActionQueue, {}), jsx(Strip, {})] }) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
+    ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
     if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, ActionQueue, Strip, openAskCount }

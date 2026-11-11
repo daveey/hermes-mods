@@ -371,7 +371,15 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
             owner = core.server_owner(session_id); st = core.ActionStore()
             if 'list' in args:
                 core._object(args, ('list',)); core._object(args['list'], ('sourceId', 'entries'))
-                return json.dumps(st.record_list(owner, args['list']['sourceId'], args['list']['entries']))
+                snap = st.record_list(owner, args['list']['sourceId'], args['list']['entries'])
+                # The marker exists only after the snapshot is persisted. Desktop renders it as buttons that post
+                # THIS digest and number to the authenticated route; a typed bare number authorizes nothing.
+                sid = str(args['list']['sourceId'])
+                esc = sid.replace('\\', '\\\\').replace('"', '\\q').replace('\n', '\\n').replace('{', '\\(').replace('}', '\\)')
+                return json.dumps(dict(snap, marker='::decision-list{id="%s" d="%s"}' % (esc, snap['digest']),
+                                       instructions='Put the marker on its own line in the message that shows this list. '
+                                                    'The person answers with the numbered buttons it renders. A bare number '
+                                                    'typed in chat is NOT trusted and authorizes nothing.'))
             core._object(args, ('numbered',)); core._object(args['numbered'], ('sourceId', 'n'))
             found = st.resolve_numbered(owner, args['numbered']['sourceId'], args['numbered']['n'],
                                         lineage=core.lineage(session_id))
