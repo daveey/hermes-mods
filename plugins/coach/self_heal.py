@@ -1300,7 +1300,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #                     `selfheal_would_file` with the full card args and creates nothing.
 #   investigation     card `selfheal:<fp>` for generation 1, `selfheal:<fp>:r<gen>` after (one monotonic counter per
 #                     fingerprint over refiles AND recurrences; kanban idempotency returns done cards too), model
-#                     claude-opus-5-5, 1 h. Investigates LIVE (kanban.db, logs, processes, git log), writes the
+#                     the board's model tier (no pin), 1 h. Investigates LIVE (kanban.db, logs, processes, git log), writes the
 #                     five-whys chain and proposal.md, records `event proposed` (posts nothing to the Inbox; the
 #                     inbox plugin's post() refuses self-heal posts while auto_approve is on).
 #   auto-approve      sync files the fix card for every `proposed` fingerprint (manual mode: the Inbox outcome on key
@@ -1325,8 +1325,13 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 # selfheal_fixed, selfheal_reverted, selfheal_not_defect, selfheal_declined.
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-MODEL = "claude-opus-5-5"
+MODEL = "claude-opus-5-5"  # fix, backport and lane-defect cards (they write and ship code)
 PROVIDER = "anthropic"  # pinned with MODEL: a host whose default provider is another (hub: openai-codex) refuses the bare model (model_provider_mismatch)
+# Investigation, verify and "host hasn't synced" cards carry no model pin: the board's model tier decides
+# (kanban.default_model first; kanban.strong_model after a failed run or a reviewer's change request), so the
+# lane's largest card class no longer queues behind one provider's wall. Set both to MODEL/PROVIDER to restore the pin.
+TRIAGE_MODEL: Optional[str] = None
+TRIAGE_PROVIDER: Optional[str] = None
 INVESTIGATION_RUNTIME = 3600
 FIX_RUNTIME = 7200
 INVESTIGATION_BUDGET = 8
@@ -2735,7 +2740,7 @@ def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[
     sym = re.sub(r"\s+", " ", d.get("symptom") or "defect").strip()[:90]
     return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
             "body": investigation_brief(d, previous, cfg) + (f"\n\n{different_error}\n" if different_error else ""),
-            "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+            "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
 
@@ -2743,9 +2748,11 @@ def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[
 def kanban_argv(args: dict, hermes: str = "hermes") -> list:
     argv = [hermes, "kanban"] + (["--board", args["board"]] if args.get("board") else []) + [
         "create", args["title"], "--body", args["body"], "--assignee", args["assignee"],
-        "--idempotency-key", args["idempotency_key"], "--model", args["model"],
+        "--idempotency-key", args["idempotency_key"],
         "--max-runtime", str(args["max_runtime"]), "--created-by", args["created_by"], "--json"]
-    if args.get("provider"):
+    if args.get("model"):
+        argv += ["--model", args["model"]]
+    if args.get("model") and args.get("provider"):
         argv += ["--provider", args["provider"]]
     for s in args.get("skills") or []:
         argv += ["--skill", s]
@@ -3990,7 +3997,7 @@ def _file_undeployed(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[s
         return {"action": "skip", "why": why, "not_deployed": True}
     r = route(d, cfg)
     args = {"title": f"host {dec['label']} hasn't synced fix {dec['sha'][:11]}"[:200],
-            "body": undeployed_brief(d, fp, st, dec), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+            "body": undeployed_brief(d, fp, st, dec), "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": ["hermes-mods-repo"], "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
     if m != "live" or not is_hub(cfg):
@@ -4100,7 +4107,7 @@ def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: 
     """File the VERIFY child of ``fix_card`` (stays on this host: host_repo). -> its id, or None (logged)."""
     lane = LaneState(store.root)
     args = {"title": f"{VERIFY_TITLE} {(st.get('symptom') or fp)[:90]}", "body": verify_brief(fp, st, fix_card),
-            "idempotency_key": verify_key(fp, generation(st) or 1), "model": MODEL, "provider": PROVIDER,
+            "idempotency_key": verify_key(fp, generation(st) or 1), "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": VERIFY_RUNTIME, "skills": list(VERIFY_SKILLS), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
             "parents": [fix_card]}

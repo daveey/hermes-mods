@@ -1022,7 +1022,7 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   as `fix_card`, `family_owner=<fp>`, and `selfheal_adopted_owner via=family` is logged. A fixed or closed family
   lane is not adopted, so a recurrence still files. Lanes record `family` when filed (`root_family()`). Tests:
   `test_self_heal_lane.py` replays the disk-I/O-then-corrupt pair (`test_replay_kanban_disk_io_then_corrupt_...`).
-- **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
+- **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, no model pin (board model tier: default model, strong model after a failed run), 1 h, skills five-whys +
   hermes-mods-repo (Baby Bear: hub board `bb`, assignee `default`, five-whys + bb-self-fix). A missing `bb_board`
   is deferred (`selfheal_deferred`, payload kept for the cron retry), not dropped and not auto-created. The brief makes it investigate live, with a
   per-component checklist (Kanban events/runs, surface writer + backing state, processes/launchd/logs, git log), write

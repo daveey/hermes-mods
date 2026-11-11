@@ -92,7 +92,7 @@ def test_shadow_logs_would_file_with_full_card_args_and_creates_nothing(store):
     assert out["action"] == "would_file" and not r.calls
     (w,) = ev(store, "selfheal_would_file")
     a = w["args"]
-    assert a["idempotency_key"] == f"selfheal:{w['fingerprint']}" and a["model"] == "claude-opus-5-5"
+    assert a["idempotency_key"] == f"selfheal:{w['fingerprint']}" and a["model"] is None  # board model tier decides
     assert a["max_runtime"] == 3600 and a["skills"] == ["five-whys", "hermes-mods-repo"]
     assert a["created_by"] == "self-heal" and a["board"] is None
     for part in ("What happened", "Why", "Plan", "Undo", "event proposed", "@session:",
@@ -109,8 +109,9 @@ def test_live_on_hub_creates_the_card_with_the_spec_args(store):
     (argv,) = r.creates()
     assert out == {"action": "filed", "card": "t_00000001", "key": f"selfheal:{d['fingerprint']}", "scheduled": None}
     assert opt(argv, "--idempotency-key") == f"selfheal:{d['fingerprint']}"
-    assert opt(argv, "--model") == "claude-opus-5-5" and opt(argv, "--max-runtime") == "3600"
-    assert opt(argv, "--provider") == "anthropic"  # hub default provider is openai-codex: a bare opus model is refused
+    assert opt(argv, "--max-runtime") == "3600"
+    # an investigation carries no pin, so the board's model tier picks (default first, strong after a failed run)
+    assert "--model" not in argv and "--provider" not in argv
     assert [argv[i + 1] for i, a in enumerate(argv) if a == "--skill"] == ["five-whys", "hermes-mods-repo"]
     assert "--board" not in argv[:4]
     (f,) = ev(store, "selfheal_filed")
@@ -1016,9 +1017,9 @@ def test_do_it_creates_the_fix_card_with_red_green_acceptance(store, monkeypatch
     argv, verify = r.creates()[-2:]  # a default-board fix is a portable FIX card plus its hub VERIFY child
     assert out["action"] == "filed" and opt(argv, "--idempotency-key") == f"selfheal:{fp}:fix"
     assert opt(verify, "--idempotency-key") == f"selfheal:{fp}:verify" and opt(verify, "--parent") == out["card"]
-    for a in (argv, verify):
-        assert opt(a, "--model") == "claude-opus-5-5"
-        assert opt(a, "--provider") == "anthropic"
+    assert opt(argv, "--model") == "claude-opus-5-5"  # the fix card writes and ships code: pinned
+    assert opt(argv, "--provider") == "anthropic"  # hub default provider is openai-codex: a bare opus model is refused
+    assert "--model" not in verify and "--provider" not in verify  # verify follows the board model tier
     body = opt(argv, "--body")
     for part in ("add test_sort_stable", "FAILING", "PASSING", "fix_shas"):
         assert part in body, part
