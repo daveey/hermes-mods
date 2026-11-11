@@ -120,7 +120,8 @@ def _seen_in_chat(state_db: Optional[Path], keys: Iterable[str], needle: str) ->
 def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: Optional[float] = None,
                    max_age_s: float = 7 * 86400) -> list[dict]:
     """Completed child cards this chat subscribed to whose handoff is explicitly undelivered and that nothing
-    has delivered yet, plus completions whose notice never reached this chat. Newest first."""
+    has delivered yet, plus completions whose notice never reached this chat (only when the chat was already
+    subscribed at completion). Newest first."""
     now = time.time() if now is None else now
     keys = session_keys(state_db, session_id)
     found: list[dict] = []
@@ -132,8 +133,8 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
         with conn:
             try:
                 subs = conn.execute(
-                    "SELECT task_id, last_event_id FROM kanban_notify_subs WHERE lower(platform)='tui' AND chat_id IN (%s)"
-                    % ",".join("?" * len(keys)), tuple(keys)).fetchall() if keys else []
+                    "SELECT task_id, last_event_id, created_at FROM kanban_notify_subs WHERE lower(platform)='tui' "
+                    "AND chat_id IN (%s)" % ",".join("?" * len(keys)), tuple(keys)).fetchall() if keys else []
             except sqlite3.Error:
                 continue
             for sub in subs:
@@ -162,7 +163,11 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
                     (tid, FOLLOWUP_KEY_PREFIX + "%")).fetchone() if "idempotency_key" in task.keys() else None
                 undelivered = undelivered_handoff(summary) or kept_obligation(task["body"] or "") or \
                     any(kept_obligation(c or "") for c in comments)
-                missed = not _seen_in_chat(state_db, keys, f"Kanban {tid} done")
+                # Only a chat already subscribed when the card completed was owed its notice. A later subscription
+                # (the chat commented on, or linked, the done card) starts past the completion event, so the
+                # notifier never sends it one: that is not a missed notice.
+                owed_notice = (sub["created_at"] or 0) <= (ev["created_at"] or 0)
+                missed = owed_notice and not _seen_in_chat(state_db, keys, f"Kanban {tid} done")
                 if resolved or followup or not (undelivered or missed):
                     continue
                 authority = [s.strip() for s in [task["body"] or "", *comments] if kept_obligation(s or "")]

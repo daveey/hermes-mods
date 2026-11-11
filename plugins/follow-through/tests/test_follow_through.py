@@ -102,6 +102,29 @@ def test_completion_notice_that_never_reached_the_chat_is_recovered(home):
     assert "never reached this chat" in note and "do it now" not in note and "act on anything" in note
 
 
+def _subscribe_after_completion(home, tid=CHILD):
+    """The chat subscribed only after the card completed (e.g. it commented on the done card): the notifier starts a
+    new subscription past the existing events, so no completion notice was ever owed to it."""
+    with _k(home) as c:
+        done_at = c.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='completed'",
+                            (tid,)).fetchone()[0]
+        c.execute("UPDATE kanban_notify_subs SET created_at=? WHERE task_id=?", (done_at + 30, tid))
+
+
+def test_subscription_made_after_completion_is_not_a_missed_notice(home):
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    _subscribe_after_completion(home)
+    _say(home, "user", "✔ Kanban t_1111bbbb done — some other card")
+    assert _followups(home) == []
+
+
+def test_late_subscription_keeps_an_undelivered_handoff_without_the_missed_flag(home):
+    _child(home)
+    _subscribe_after_completion(home)
+    [item] = _followups(home)
+    assert item["undelivered"] and not item["missed_notice"]
+
+
 def test_running_child_and_other_chats_subscriptions_are_ignored(home):
     _child(home, done=False)
     _child(home, tid="t_2222cccc", sub_chat="some_other_chat")
