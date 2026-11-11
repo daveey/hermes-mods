@@ -74,10 +74,11 @@ say what's running, never what needs the user.
   for `~/.hermes/core-update/drain-hold`. Remembered capacity goes stale, and a drain holds every spawn
   however many slots are free. The latest `dispatcher stuck` line names each held card's reason
   (`update_admission_hold`, `labels_mismatch`, `waiting_for_worker_capacity`). When you bump a card the chat
-  waits on, first read the ready queue's priority spread
-  (`select priority,count(*) from tasks where status='ready' group by priority`) and set it above the top.
-  The notices' suggested `--priority 10` does nothing when other cards sit at 100–1100. Confirm a run
-  starts (`current_run_id`) instead of assuming it will.
+  waits on, first read the priority spread across `ready`, `scheduled` and `todo`, plus the priorities of
+  recent `spawned` events (`task_events` joined to `tasks`). Set it above the top of all of them, because
+  scheduled cards and continuations that wake later, at 9000+, jump ahead of a value that only beat the ready
+  queue. The notices' suggested `--priority 10` does nothing in this case. Confirm a run starts
+  (`current_run_id`, or `hermes kanban show` reading `~0 ahead`) instead of assuming it will.
 - When a chain waits on a PR whose exact head is green and `CLEAN`, with no changes requested, but its owner card
   is queued, merge it yourself (`gh pr merge --rebase --match-head-commit <head>` via token-broker). Then
   `kanban_comment` each owner card that the merge step is done, so it resumes from the next step.
