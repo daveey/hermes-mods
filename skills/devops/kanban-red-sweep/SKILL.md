@@ -119,6 +119,33 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
 - Physical or sign-in steps are not questions. Before listing one, check it's still true (e.g. open the page in the
   signed-in browser); then list it with its device and what "done" looks like.
 
+## 5. Log every red card (so fewer get blocked next time)
+
+`R=~/.hermes/repos/hermes-mods/skills/devops/kanban-red-sweep/scripts/red_cards.py` (`~/code/hermes-mods/...` on the Macs).
+
+- One line per red card, every sweep, whatever you did with it:
+  `python3 $R log --card <id> --board <b> --title "<short>" --cls <class> --action <cleared|guessed|asked|left-to-owner|left-blocked> --avoidable <yes|partly|no> --slug <prevention-slug> --prevention "<what would have kept it from blocking>" --blocked-event <id from list> --run <chat or cron id>`.
+  `--blocked-event` dedupes a card seen again in the same blocked state.
+- `avoidable=yes` means the worker or the card's author could have resolved it without the user (a standing
+  rule covered it, the premise was checkable, the default was stated, an interactive session had the access).
+  Name the fix as a rule on the source (worker skill, card template, guard, reporter script), not on this card.
+- Reuse a `--slug` verbatim when the same prevention recurs. `python3 $R stats` lists slugs; at 3 or more, file
+  ONE prevention card for the slug (`idempotency_key='red-sweep-prevent:<slug>'`, body = the logged cards as
+  evidence, the source to change, and a test that the next such card does not block). That card is the point
+  of the log: the goal is fewer red cards, not faster sweeps.
+
+## 6. Unattended runs (cron `kanban-red-sweep`, hub, every 30 min)
+
+The cron's monitor is `red_cards.py list`: the agent wakes only when the set of red cards (or a card's blocked
+event) changed, so cards that keep waiting on the user cost nothing.
+
+- Follow steps 1-3 and 5. Skip step 4: a cron run can't show a form. A card you are really unsure about stays
+  blocked (its ask is already in the user's For-you queue); log it `--action left-blocked` and don't comment on
+  it again unless its state changed. Don't re-link it to a chat.
+- Read state first and record last with recurring-job-state (`job_state.py show|record kanban-red-sweep`).
+- Final response: only decisions you guessed (card title, pick, how to reverse) and cards still waiting on the
+  user, a few lines. Nothing cleared, guessed or newly waiting: reply `[SILENT]`.
+
 ## Pitfalls
 
 - `gh` on the hub default profile is not logged in. Use `token-broker exec --scope user/github -- gh ...`.
@@ -136,3 +163,4 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
 - [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
 - [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
 - [ ] The report names the unlinked and reaped-only cards that still need the user?
+- [ ] Every red card has a `red_cards.py log` line with class, action, avoidable and a prevention slug, and any slug at 3+ in `stats` has its one prevention card?
