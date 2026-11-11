@@ -68,6 +68,8 @@ from the edge; 0% before the 14:02 deploy of a1b2c3" is.
 
 When an alert triggers analysis, read `references/alert-provenance.md` (production versus fixtures, gateway ownership and Inbox audit metrics).
 
+**For duplicate alerts, compare the original alert's captured evidence with later target readbacks.** A target's current skip reason does not prove what the detector knew when it filed. Trace sweep ordering relative to telemetry collection: first-start or post-drain sweeps can classify missing evidence as target-specific before the next pass records one shared cause. Test aged inputs on the very first tick, as well as same-cause repetition after telemetry exists; keep cause identity separate from occurrence/window accounting.
+
 **Validate what the metric measures before attributing its cause.** Preserve the original report and its
 measurement timestamp before rerunning a detector: even a dry run may overwrite its report, and concurrent
 workers can create or remove evidence. Reconcile every group in the machine-readable report, not just the
