@@ -5,6 +5,21 @@ shepherd`, and because a shepherded card keeps a chat "waiting", one look at a c
 that card ended (2,300 such links, 131 chats on a single incident). A chat that really owns the work takes it with
 `hermes-hub adopt-task`.
 
+## Headless Board readers
+
+A managed headless host can opt into `hermes config set session_mentions.task_transport board_replica`.
+This changes **only cross_task**: read/list use the selected board's existing authorized read-only sync
+replica, without Desktop credentials or a courier. Desktop remains the default everywhere else.
+Bare task ids are board-scoped (never a global first-match search); qualified references preserve the
+board grant fence and require the exact replica `created_on` gateway id. Listings retain the core
+`kanban_list` orchestrator gate. Comments fail closed as `read_only_transport`; there is no silent
+local write or owner request. A missing replica is an error, not a fallback to the live table.
+Reads return `source=replica`, owner, `live=false`, file mtime (not owner liveness), and explicit
+history truncation indicators. They do not manufacture a worker capsule or live queue authority.
+Cross-session transcripts and message sending still require Desktop. Tests: `test_board_tasks.py`
+(entry routing regression, real SQLite read projections, target validation, owner mismatch, missing
+replica and comment refusal). This mode does not install or enable the plugin by itself.
+
 ## Failure analysis
 
 The sender previously forwarded legacy replica keys unchanged (`locate` stripped

@@ -14,6 +14,7 @@ import uuid
 
 if __package__:
     from . import relay_files as rf
+    from . import board_tasks as bt
 else:  # pytest imports this hyphen-named plugin dir without a parent package
     import importlib.util as _ilu
     from pathlib import Path as _Path
@@ -25,6 +26,7 @@ else:  # pytest imports this hyphen-named plugin dir without a parent package
         return mod
 
     rf = _load_sibling("relay_files")
+    bt = _load_sibling("board_tasks")
 
 TOOLSET = "session_mentions"
 PICKUP_TIMEOUT = 30.0  # Desktop drains every ~3s; no claim by then = Desktop not running
@@ -175,7 +177,11 @@ def handle(args: dict, session_id: str | None = None, **_kw) -> str:
 TASK_SCHEMA = {
     "name": "cross_task",
     "description": (
-        "List, read, or comment on Kanban tasks on ANY gateway connected to the user's Hermes Desktop "
+        "List, read, or comment on Kanban tasks. Headless hosts configured with "
+        "session_mentions.task_transport=board_replica read/list only their selected authorized "
+        "Board replica (possibly stale, never live authority); comments are refused. Bare IDs are "
+        "scoped to that board, not searched globally. Explicit gateway must match the replica owner id. "
+        "Otherwise tasks are reached on ANY gateway connected to the user's Hermes Desktop "
         "app (this Mac and remote/Nous-hosted gateways). Use it to resolve task links of the form "
         "`@task:<board>@<gateway>/<task_id>` (a task on another gateway — kanban_show cannot see "
         "those). Plain `@task:<board>/<task_id>` links live on this gateway: kanban_show(task_id, "
@@ -199,6 +205,7 @@ TASK_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["list", "read", "comment"]},
             "target": {"type": "string", "description": "Task link (`@task:...`), `<gateway>:<task_id>` or a bare task id, for read/comment."},
+            "board": {"type": "string", "description": "Headless replica mode: selected board (worker board grants still apply)."},
             "query": {"type": "string", "description": "list: title / id search terms."},
             "status": {"type": "string", "description": "list: comma-separated statuses to keep."},
             "gateway": {"type": "string", "description": "list: only this gateway (name or id)."},
@@ -228,6 +235,8 @@ def handle_task(args: dict, session_id: str | None = None, *, timeout_seconds: f
                     "(e.g. target=\"@task:default@nous-1/t_1a2b3c4d\"); got keys: " + (", ".join(got) or "none"))
     if action == "comment" and not str(args.get("message") or "").strip():
         return _err("message is required for comment — pass the text as `message`")
+    if bt.enabled():
+        return json.dumps(bt.handle(args))
     out = _relay(f"task_{action}", args, session_id, 0, **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}))
     return out
 
