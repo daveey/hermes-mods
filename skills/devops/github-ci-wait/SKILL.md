@@ -263,12 +263,7 @@ See [required-context regression and causal chain](references/required-context-c
   every patch identical: main moved underneath it. Ask the SAME reviewer lineage for a delta review of the new
   sha (a done card can't be reopened unless it sits in review; create a continuation card, pinned to the same
   model, and link it as parent of the ship card).
-- Exact-head failure: first list main's commits since the merge-base
-  (`gh api repos/O/R/compare/<head>...main --jq '.commits[].commit.message'`); one that fixes the failing test
-  means it is inherited and already fixed, so rebase. Otherwise re-run only the failing test files on a detached
-  worktree at the PR's merge-base. Failing there too means it is inherited; route it to the owner of the breaking commit (search cards and comments for
-  the test name first), wait for that fix to merge, rebase onto it, re-verify range-diff, push with
-  `--force-with-lease=<ref>:<old sha>`, then request the delta review. Never merge over a red aggregate.
+- Exact-head failure: first read main HEAD's own failing checks (`gh api repos/O/R/commits/main/check-runs`) and their test ids: the same tests red on main mean every PR inherits them (shard numbers differ per PR), so find or file the main fix. Else check main's commits since the merge-base for a fix (rebase), or re-run the failing files on a detached worktree at the merge-base. Inherited: route it to the breaking commit's owner (search cards for the test name), rebase onto the fix, re-verify range-diff, push `--force-with-lease=<ref>:<old sha>`, request the delta review. Never merge over a red aggregate.
 - Hosted Actions refused for billing on a repo WITHOUT branch protection or required checks: run the workflow's
   exact commands locally at the exact head for every matrix entry (`uv run --no-project --python 3.X --with
   pytest python -m pytest ...`), run any tests a worker's mutation fence blocked as the supervisor in a clean
