@@ -151,16 +151,41 @@ def check_request(request: Any, refused: Iterable[str] = (), context: str = "") 
     return ref
 
 
-def refusal(ref: str, *, worker: bool) -> str:
-    route = (f"As a Kanban worker: call cross_session action=send target={ref} once (it is refused, and the refusal "
-             f"subscribes that chat to your card), then kanban_complete with a line `FINAL SEND for {ref}: <text>`; "
-             f"the chat receives exactly that text when the card completes. "
+# Core's canonical owner-terminal attestation (hermes_cli.kanban_block_policy). Copied, not imported: this plugin also
+# runs without core. tests/test_incomplete_worker_owner_handoff.py compares them with core when core is importable.
+OWNER_TERMINAL_REASON = "host_only boundary: only the owner's Desktop chat may open a terminal"
+OWNER_TERMINAL_EVIDENCE = (
+    "run_in_user_terminal refused: Kanban caller, owner chats only. "
+    "cross_session send refused: Kanban worker cannot send into a human chat.")
+_TASK_ID = re.compile(r"t_[0-9a-f]{8}(?:[0-9a-f]{8})?")
+
+
+def owner_terminal_action(task_id: str) -> str:
+    task = task_id if _TASK_ID.fullmatch(task_id or "") else "<task_id>"
+    return (f"From your own Hermes chat open the owner-terminal flow for task {task}. "
+            "Unblock = resume verification; archive = abandon reconciliation.")
+
+
+def refusal(ref: str, *, worker: bool, task_id: str = "") -> str:
+    route = (f"As a Kanban worker whose card is genuinely finished: call cross_session action=send target={ref} once "
+             f"(it is refused, and the refusal subscribes that chat to your card), then kanban_complete with a line "
+             f"`FINAL SEND for {ref}: <text>`; the chat receives exactly that text when the card completes. "
+             f"If the card is NOT finished (acceptance unmet), never kanban_complete just to send: that misstates the "
+             f"card. When the need is an owner-only terminal step (run_in_user_terminal refused you), keep the card "
+             f"incomplete and call kanban_block(kind='needs_input' or 'capability', human_request={{"
+             f"interaction: 'user_terminal', action: {owner_terminal_action(task_id)!r}, "
+             f"why_human: {OWNER_TERMINAL_REASON!r}, evidence: {OWNER_TERMINAL_EVIDENCE!r}, "
+             f"scope: <host, absolute working directory, exact command and arguments, bounded effects, and the step "
+             f"David performs from his own chat; chat refs go here, never in action>}}). Attest the two refusals "
+             f"only if you got them this turn; do not manufacture them. The card stays blocked and visible to David; "
+             f"nothing is relayed or executed for him. "
              if worker else
              f"Send it yourself with cross_session action=send target={ref} message=<text>. ")
     return ("ask-gate: refused. This ask has a human deliver a message into a Hermes chat, and that is agent work, "
             "not a human step. " + route
             + ("(Outside a worker, a session sends it directly with cross_session action=send.) " if worker else
-               f"(A Kanban worker uses a `FINAL SEND for {ref}: <text>` line in kanban_complete instead.) ")
+               f"(A Kanban worker uses a `FINAL SEND for {ref}: <text>` line in kanban_complete instead, only when "
+               "its card is finished.) ")
             + "\"Workers are refused sending into Desktop chats\" is not a reason to ask "
               "David: the refusal is what arms FINAL SEND. If the real need is David's decision, ask for that "
               "decision itself (interaction=approval, the exact thing to approve), not for him to relay text.")

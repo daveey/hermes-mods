@@ -1273,7 +1273,8 @@ def _chat_delivery_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         if not ref:
             return None
         core.log_event("chat_delivery_ask_refused", tool=tool_name, session=session_id, ref=ref)
-        return {"action": "block", "message": chat_delivery.refusal(ref, worker=_is_worker())}
+        return {"action": "block", "message": chat_delivery.refusal(ref, worker=_is_worker(),
+                                                                  task_id=os.environ.get("HERMES_KANBAN_TASK", ""))}
     except Exception as e:
         core.log_event("chat_delivery_error", tool=tool_name, session=session_id, error=repr(e)[:300])
         return None
