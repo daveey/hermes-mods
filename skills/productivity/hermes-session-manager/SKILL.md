@@ -72,7 +72,21 @@ say what's running, never what needs the user.
   `kanban dispatcher: max_in_progress=N` line in `~/.hermes/logs/gateway.log` against running counts
   summed across every board DB. Also grep that log for `dispatch held for a core update drain`, or check
   for `~/.hermes/core-update/drain-hold`. Remembered capacity goes stale, and a drain holds every spawn
-  however many slots are free. A `scheduled` card whose awaited review or parent just finished can be
+  however many slots are free. The latest `dispatcher stuck` line names each held card's reason
+  (`update_admission_hold`, `labels_mismatch`, `waiting_for_worker_capacity`). When you bump a card the chat
+  waits on, first read the ready queue's priority spread
+  (`select priority,count(*) from tasks where status='ready' group by priority`) and set it above the top.
+  The notices' suggested `--priority 10` does nothing when other cards sit at 100–1100. Confirm a run
+  starts (`current_run_id`) instead of assuming it will.
+- When a chain waits on a PR whose exact head is green and `CLEAN`, with no changes requested, but its owner card
+  is queued, merge it yourself (`gh pr merge --rebase --match-head-commit <head>` via token-broker). Then
+  `kanban_comment` each owner card that the merge step is done, so it resumes from the next step.
+  A green PR left unmerged behind a queue is a stall, not progress.
+- David wants execution on workers and the hub kept for sessions. Before accepting "it runs on the hub", read
+  the card's `requires` (a `host_repo` entry pins it to the dispatcher host), `placement_policy`/`runs_on`, and
+  any `moved` events back to the hub. Give the concrete reason: an old card made before worker-first, a missing
+  worker capability, or a check that really is hub-local. Then push the capability fix or split out the hub-only
+  part. "It needs the hub" is a claim you must back with evidence. A `scheduled` card whose awaited review or parent just finished can be
   `kanban_unblock`ed at once instead of waiting out its wake interval. Before saying when a `scheduled` card
   wakes, read its `wake_episode_started` event's `cmd` (its `wake_check`): `SCHEDULED_UNTIL` is only the backstop
   when a check on the producer wakes it sooner. Report "wakes when <producer> finishes" and name that producer's
