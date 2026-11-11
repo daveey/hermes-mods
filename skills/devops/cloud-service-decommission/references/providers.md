@@ -17,6 +17,9 @@ One SSH pass (`ssh -o BatchMode=yes root@<ip>`) gives the inventory:
 - `docker ps`, `ss -tlnp`, `crontab -l` (root and service users), `df -h` including attached volumes (`/mnt/HC_Volume_*` on Hetzner are separately billed disks).
 - For each data directory found, check the newest mtime (`find <dir> -newermt -30days -type f`) to tell live data from stale.
 
+## AWS EC2: stop when the caller's role can't call StopInstances
+If `ec2 stop-instances` is denied but SSM works (`ssm send-command` with `AWS-RunShellScript`), run `shutdown -h +0` on the instance itself. That stops the instance only when its shutdown behavior is `stop` (the default when `instance_initiated_shutdown_behavior` is unset in Terraform). Check that before you run it: `terminate` deletes the root disk. A persistent Spot instance stopped this way disables its Spot request, so it won't relaunch. Confirm with `describe-instances` until `StateReason` reads `Client.InstanceInitiatedShutdown`.
+
 ## Cloudflare tunnels on a VM
 - List tunnels and where their connectors run: `GET /accounts/<acct>/cfd_tunnel?is_deleted=false` (connections[].origin_ip shows the host).
 - Read ingress: `GET /accounts/<acct>/cfd_tunnel/<id>/configurations` → `result.config.ingress`. Map each hostname's `service` target to a machine (Tailscale IPs via `tailscale status`) and probe the hostname with curl (502 = dead origin, 401/200 = live).
