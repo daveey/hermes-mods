@@ -57,6 +57,15 @@ class EvaluateTests(unittest.TestCase):
         state = w.evaluate([run("d"), run("b", conclusion="cancelled")], ["b"], contains, None)["CI"]
         self.assertEqual(state["done"]["url"], "u/CI/d0")
 
+    def test_an_older_own_run_still_running_does_not_hold_a_final_own_red(self):
+        # Review of 4e59f8df: b's newest own run is red while an older own run of b is still running. The older one
+        # can't displace the newest, so it is no activity: a --once probe read "not yet" instead of the final red.
+        state = w.evaluate([run("d"), run("b", conclusion="failure", n=1), run("b", status="in_progress", conclusion="")],
+                           ["b"], contains, None)["CI"]
+        self.assertIsNone(state["done"])
+        self.assertEqual(state["failed"]["url"], "u/CI/b1")
+        self.assertEqual(state["active"], 0)
+
     def test_active_run_keeps_waiting(self):
         runs = [run("d", status="queued", conclusion=""), run("c", conclusion="failure")]
         state = w.evaluate(runs, ["b"], contains, None)
@@ -253,6 +262,21 @@ class GhRepoTests(unittest.TestCase):
         self.assertEqual(w.gh_cmd("me/fork", "workflow", "run", "ci.yaml", "--ref", "main"),
                          ["gh", "workflow", "run", "ci.yaml", "--ref", "main", "-R", "me/fork"])
 
+    def test_listing_window_is_100_runs_or_40_per_workflow(self):
+        # SKILL.md: own runs are found only in this window, so an older commit's own run can fall outside it.
+        from unittest import mock
+        calls = []
+
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            import subprocess
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+        with mock.patch.object(w.subprocess, "run", side_effect=fake):
+            w.list_runs(self.repo, "main", [], "me/fork")
+            w.list_runs(self.repo, "main", ["ci.yaml"], "me/fork")
+        self.assertIn(["-L", "100"], [calls[0][i:i + 2] for i in range(len(calls[0]) - 1)])
+        self.assertIn(["-L", "40"], [calls[1][i:i + 2] for i in range(len(calls[1]) - 1)])
+
 
 class ContainsCacheTests(unittest.TestCase):
     """A run listed between a push and the next fetch must count once its commit is fetched."""
@@ -445,6 +469,18 @@ class BoundedCallTests(unittest.TestCase):
         rc, out = self._main_out([[later, red]], "--once")
         self.assertEqual(rc, 1, out)
         self.assertIn("stalled: newest finished run containing the commit ended failure: u/CI/" + "c" * 40 + "0", out)
+
+    def test_own_red_with_an_older_own_run_still_running_is_final_under_once(self):
+        # The newest own run is red and an older own run (a re-run of it, say) is still in progress: that run can't
+        # change the verdict, so --once reports the red (1) instead of "not yet" (2) until it ends.
+        green = dict(run("d" * 40), _wf="ci.yml")
+        red = dict(run("c" * 40, conclusion="failure", n=1), _wf="ci.yml")
+        older = dict(run("c" * 40, status="in_progress", conclusion=""), _wf="ci.yml")
+        rc, out = self._main_out([[green, red, older]], "--once")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stalled: its own run on cccccccccc ended failure: u/CI/" + "c" * 40 + "1; a later commit's green "
+                      "run does not clear it (u/CI/" + "d" * 40 + "0 (ran on dddddddddd, a later commit containing it))",
+                      out)
 
     def test_pass_cites_the_commits_own_green_run_over_a_later_one(self):
         rc, out = self._main_out([[dict(run("d" * 40), _wf="ci.yml"), dict(run("c" * 40), _wf="ci.yml")]], "--once")
@@ -750,8 +786,9 @@ class PerJobFailureTests(unittest.TestCase):
             rc, out = self._main_out(listings, jobs, "--dispatch", grace=0)
         self.assertEqual(rc, 0, out)
         dispatch.assert_called_once()
-        self.assertEqual(dispatch.call_args.args[0],
-                         ["gh", "workflow", "run", "ci.yml", "--ref", "main", "-R", "o/r"])
+        # Run 7 is the commit's own red run, so --dispatch re-runs its failed jobs: a branch dispatch builds the
+        # branch head, whose run can't clear an own red run once the branch has moved on.
+        self.assertEqual(dispatch.call_args.args[0], ["gh", "run", "rerun", "7", "--failed", "-R", "o/r"])
         self.assertEqual(self.calls, [7] * 4)
 
     def test_list_jobs_is_bounded_and_names_the_repo(self):
@@ -766,3 +803,114 @@ class PerJobFailureTests(unittest.TestCase):
         cmd, timeout = seen[0]
         self.assertEqual(cmd, ["gh", "run", "view", "41", "--json", "jobs", "-R", "o/r"])
         self.assertTrue(timeout)
+
+
+class StallRetryTests(unittest.TestCase):
+    """--dispatch retries what can still turn the wait green; only runs that can change the verdict are activity.
+
+    Review of 4e59f8df (a commit's own runs decide): a `gh workflow run` on a branch that had moved past the commit
+    built a later commit, whose green run can't clear the commit's own red one, so both dispatches were spent and
+    the wait still ended red; and an older own run still running held a final own red at "not yet".
+    """
+
+    SHA = "c" * 40
+
+    def _wait(self, world, *extra, rerun_polls=1, cap=12):
+        """main() against a fake GitHub. `world` is the branch's runs, newest first, and the retries change it:
+        `gh run rerun <id> --failed` puts that run in progress for `rerun_polls` listings, then green;
+        `gh workflow run <wf>` adds a green run of <wf> on the branch head d, and a release tag."""
+        import contextlib
+        import io
+        from unittest import mock
+        self.cmds, self.timeouts, pending, listed, tagged = [], [], {}, [0], []
+
+        def list_runs(repo, branch, workflows, slug=None):
+            listed[0] += 1
+            if listed[0] > cap:
+                raise AssertionError(f"the wait never ended: listed {cap} times")
+            out = [dict(r) for r in world]
+            for rid in list(pending):
+                pending[rid] -= 1
+                if pending[rid] <= 0:
+                    del pending[rid]
+                    next(r for r in world if r["databaseId"] == rid).update(status="completed", conclusion="success")
+            return out
+
+        def fake_run(cmd, **kw):
+            self.cmds.append(cmd)
+            self.timeouts.append(kw.get("timeout"))
+            if cmd[1:3] == ["run", "rerun"]:
+                rid = int(cmd[3])
+                next(r for r in world if r["databaseId"] == rid).update(status="in_progress", conclusion="")
+                pending[rid] = rerun_polls
+            elif cmd[1:3] == ["workflow", "run"]:
+                nid = max([r["databaseId"] for r in world] + [99]) + 1
+                world.insert(0, dict(run("d" * 40, n=nid), _wf=cmd[3], databaseId=nid))
+                tagged.append(cmd[3])
+            return w.subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def fake_git(repo, *args):
+            return self.SHA if args[0] == "rev-parse" else ""
+        buf = io.StringIO()
+        patches = [mock.patch.object(w, "resolve_repo", side_effect=lambda p, slug=None: p),
+                   mock.patch.object(w, "git", side_effect=fake_git),
+                   mock.patch.object(w, "make_contains", return_value=lambda commit, sha: commit.startswith("origin/")
+                                     or contains(commit[0], sha[0])),
+                   mock.patch.object(w, "list_runs", side_effect=list_runs),
+                   mock.patch.object(w, "list_jobs", return_value=[]),
+                   mock.patch.object(w, "tags_done", side_effect=lambda repo, shas, globs: {
+                       g: ("v1" if tagged else None) for g in globs}),
+                   mock.patch.object(w.subprocess, "run", side_effect=fake_run),
+                   mock.patch.object(w, "STARTUP_GRACE_S", 0),
+                   mock.patch.object(w.time, "sleep")]
+        with contextlib.ExitStack() as stack, contextlib.redirect_stdout(buf):
+            for p in patches:
+                stack.enter_context(p)
+            rc = w.main([self.SHA, "--gh-repo", "o/r", "--interval", "0", "--timeout-min", "5", *extra])
+        return rc, buf.getvalue()
+
+    def test_loop_mode_stalls_on_own_red_without_waiting_for_an_older_own_run(self):
+        # Run 7, older than the red run 8 on the same commit, never finishes here: it can't change the verdict.
+        world = [dict(run("d" * 40), _wf="ci.yml", databaseId=9),
+                 dict(run(self.SHA, conclusion="failure", n=1), _wf="ci.yml", databaseId=8),
+                 dict(run(self.SHA, status="in_progress", conclusion=""), _wf="ci.yml", databaseId=7)]
+        rc, out = self._wait(world, "--workflow", "ci.yml")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stalled: its own run on cccccccccc ended failure: u/CI/" + self.SHA + "1", out)
+        self.assertEqual(self.cmds, [])
+
+    def test_dispatch_reruns_the_commits_own_red_run_after_the_branch_moved_on(self):
+        # main is at d. `gh workflow run` builds d, whose green run can't clear c's own red one: two dispatches were
+        # spent and the wait still ended red (exit 1). Re-running the own run's failed jobs can clear it.
+        world = [dict(run("d" * 40), _wf="ci.yml", databaseId=9),
+                 dict(run(self.SHA, conclusion="failure"), _wf="ci.yml", databaseId=7)]
+        rc, out = self._wait(world, "--workflow", "ci.yml", "--dispatch", rerun_polls=2)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cmds, [["gh", "run", "rerun", "7", "--failed", "-R", "o/r"]])
+        self.assertTrue(all(self.timeouts), self.timeouts)
+        self.assertIn("re-ran the failed jobs of ci.yml's own run 7 #1", out)
+        self.assertIn("passed ccccccccc: ci.yml u/CI/" + self.SHA + "0", out)
+
+    def test_dispatch_still_dispatches_the_branch_when_the_commit_has_no_own_run(self):
+        # c's push ran CI only on d, and d's run failed: a fresh run on the branch can stand in for c.
+        world = [dict(run("d" * 40, conclusion="failure"), _wf="ci.yml", databaseId=9)]
+        rc, out = self._wait(world, "--workflow", "ci.yml", "--dispatch")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cmds, [["gh", "workflow", "run", "ci.yml", "--ref", "main", "-R", "o/r"]])
+
+    def test_release_wait_still_dispatches_the_branch(self):
+        # A tag made on the branch head contains the commit, so a release wait dispatches the branch even when the
+        # commit's own release run went red.
+        world = [dict(run(self.SHA, conclusion="failure"), _wf="release.yml", databaseId=7)]
+        rc, out = self._wait(world, "--workflow", "release.yml", "--tag-glob", "v*", "--dispatch")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cmds, [["gh", "workflow", "run", "release.yml", "--ref", "main", "-R", "o/r"]])
+        self.assertIn("released ccccccccc: v1", out)
+
+    def test_dispatch_leaves_a_workflow_that_already_passed_alone(self):
+        world = [dict(run("d" * 40), _wf="ci.yml", databaseId=9),
+                 dict(run(self.SHA, wf="Lint"), _wf="lint.yml", databaseId=8),
+                 dict(run(self.SHA, conclusion="failure"), _wf="ci.yml", databaseId=7)]
+        rc, out = self._wait(world, "--workflow", "ci.yml", "--workflow", "lint.yml", "--dispatch")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cmds, [["gh", "run", "rerun", "7", "--failed", "-R", "o/r"]])

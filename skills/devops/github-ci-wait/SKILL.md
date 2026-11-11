@@ -62,7 +62,8 @@ anything is queued or running. Pass `--gh-repo OWNER/NAME` (dispatches often tar
 Exit codes: 0 done (prints the run URLs or tags; a run that built a later commit containing yours is marked
 `(ran on <sha>, a later commit containing it)`, so cite it as CI on that commit, not on yours. Such a run stands in
 only when your commit has no run of that workflow of its own (none, or cancelled/skipped); otherwise your newest own
-run decides, so a red own run is exit 1 even after a later commit's run passed: that run need not have run what
+run decides, so a red own run is exit 1 even after a later commit's run passed (an older own run still queued or
+running doesn't hold it at "not yet"): that run need not have run what
 failed (plugin-suites picks suites by changed path). Clear it with `gh run rerun <id> --failed`, or wait on the commit
 that fixed it. When a workflow's
 newest finished run containing your commit went red after the green run that proved it (a later push broke it),
@@ -71,8 +72,12 @@ but that workflow is red on the branch now. Never report the branch green from a
 and the failing run's URL is printed; under `--once`, exit 1 also covers a failed job in a still-active run
 when no other active run can finish the wait), or `gh run list` failed 5 times in a row (prints `gh kept failing`: a `gh`
 auth or repo problem, not a CI failure); 2 timed out (default 120 min) or not yet with `--once` (a failed listing
-included); 3 the sha isn't on `origin/<branch>` (default `main`; `--branch` to change). `--dispatch` (requires `--workflow`) re-runs the
-workflow via `gh workflow run` on a stall, at most twice, instead of exiting 1. Pass several shas to wait
+included); 3 the sha isn't on `origin/<branch>` (default `main`; `--branch` to change). `--dispatch` (requires `--workflow`)
+retries on a stall, at most twice, instead of exiting 1: a workflow whose own run on your commit went red gets that
+run's failed jobs re-run (`gh run rerun <id> --failed`), because `gh workflow run` builds the branch head, and once the
+branch has moved on, that later commit's run can't clear your commit's own red run. A workflow with no own run is
+dispatched on the branch (`gh workflow run`), one that already passed is left alone, and a `--tag-glob` wait
+dispatches every `--workflow` on the branch. Pass several shas to wait
 until one run or tag contains all of them.
 
 How to run it from an agent:
@@ -154,6 +159,9 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
 - Workflows with `paths:` filters don't run for every commit. Without `--workflow`, the script waits on the
   workflows that have a run on a commit containing yours. With `--workflow X`, when X never runs it reports a
   stall after the 3-minute startup grace period plus two idle polls.
+- Own runs are found in the listing: the newest 100 runs on the branch, or the newest 40 per `--workflow`. On a
+  busy branch, an older commit's own run can fall outside that window; it then reads as having none, and a later
+  commit's run stands in. For an old commit, read its own runs with `gh run list --commit <sha>` before trusting a pass.
 - `workflow_run`-triggered workflows (for example, "runner-loss recovery" and CI review comments) carry the
   default branch's head, not the triggering run's commit. The script ignores these events when discovering
   workflows and evaluating success, failure and activity; otherwise another PR's meta-run can delay or fail a

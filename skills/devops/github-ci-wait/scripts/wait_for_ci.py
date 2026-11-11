@@ -31,8 +31,11 @@ failed job in a still-active run when no other active run can finish the wait);
 2 timed out, or not yet done
 with --once (a failed listing under --once is also 2); 3 a sha is not on origin/<branch>.
 Every gh/git call is bounded by CALL_TIMEOUT_S, so a hung call can't outlive the deadline.
---dispatch: on a stall, `gh workflow run` each --workflow (at most twice) and
-keep waiting instead of exiting 1.
+--dispatch: on a stall, retry each --workflow that has not passed (at most twice) and
+keep waiting instead of exiting 1. A workflow whose verdict is the commit's own red run
+gets that run's failed jobs re-run (`gh run rerun <id> --failed`): a run on a later
+commit can't clear it. Otherwise (no own run, or a --tag-glob wait, which retries every
+--workflow) it is `gh workflow run` on the branch.
 
 Exact-run mode, for dispatched runs and experiments (RED/GREEN controls, helper branches):
 
@@ -142,6 +145,8 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
     picks suites by changed path, and its run on 40e9695fbc, which selected 0 of 73 suites, "passed" 7876ab05a
     although that commit's own run had failed (hermes-mods runs 43005757224 and 43005018913). Without such a
     run (none started, or it was cancelled or skipped), a run on a later commit containing it stands in.
+    Then only that newest own run's activity counts: an older own run still queued or running can't change the
+    verdict, so a finished own red is final at once.
     """
     if not workflows:
         runs = [r for r in runs if r.get("event") != "workflow_run"]
@@ -167,8 +172,9 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
             green = latest["status"] == "completed" and latest["conclusion"] == "success"
             own_failed = latest if latest["status"] == "completed" and not green else None
             done, skipped = (latest if green else None), None
-            # Only a run on the commit itself can still change its verdict.
-            active = sum(1 for r in own if r["status"] in ACTIVE)
+            # Only the newest own run can still change the verdict: an older own run still queued or running can't
+            # displace it, so it is no reason to wait (it held a final own red at "not yet" under --once).
+            active = 1 if latest["status"] in ACTIVE else 0
         state[name] = {
             "done": done or skipped,
             "skipped": done is None and skipped is not None,
@@ -284,6 +290,33 @@ def red_reason(state: dict, shas: list[str]) -> str:
         reason += (f"; a later commit's green run does not clear it ({run_ref(later, shas)}): that run need not "
                    "have run what failed here. Re-run its failed jobs, or wait on the commit that fixed it")
     return reason
+
+
+def stall_retries(slug: str | None, workflows: list[str], branch: str, wf_state: dict,
+                  release: bool) -> list[tuple[list[str], str]]:
+    """What --dispatch runs on a stall: (gh command, what it did) per --workflow that a retry can still turn green.
+
+    A workflow whose verdict is the commit's own red run gets that run's failed jobs re-run in place. `gh workflow
+    run` builds the branch head: once the branch has moved past the commit, that is a later commit's run, which
+    can't clear the commit's own red one, so both dispatches were spent and the wait still ended red. With no own
+    run, a run on the branch head containing the commit stands in, so the branch is dispatched. A workflow that
+    already passed is left alone. A release wait (--tag-glob) dispatches every --workflow on the branch, as before:
+    a tag made there contains the commit.
+    """
+    out = []
+    for wf in workflows:
+        st = wf_state.get(wf) or {}
+        rid = (st.get("own_failed") or {}).get("databaseId")
+        if release:
+            out.append((gh_cmd(slug, "workflow", "run", wf, "--ref", branch), f"dispatched {wf}"))
+        elif st.get("done"):
+            continue
+        elif rid is not None:
+            out.append((gh_cmd(slug, "run", "rerun", str(rid), "--failed"),
+                        f"re-ran the failed jobs of {wf}'s own run {rid}"))
+        else:
+            out.append((gh_cmd(slug, "workflow", "run", wf, "--ref", branch), f"dispatched {wf}"))
+    return out
 
 
 def gh_repo(repo: Path) -> str | None:
@@ -633,12 +666,14 @@ def main(argv: list[str] | None = None) -> int:
         if idle >= 2 and time.monotonic() - start >= STARTUP_GRACE_S:
             reason = (red_reason(reds[0], shas) if reds
                       else "no run containing the commit succeeded and none is queued or running")
-            if a.dispatch and a.workflow and dispatches < 2:
-                for wf in a.workflow:
-                    subprocess.run(gh_cmd(slug, "workflow", "run", wf, "--ref", a.branch), cwd=repo, check=True)
+            retries = (stall_retries(slug, a.workflow, a.branch, wf_state, bool(a.tag_glob))
+                       if a.dispatch and a.workflow and dispatches < 2 else [])
+            if retries:
+                for cmd, _ in retries:
+                    subprocess.run(cmd, cwd=repo, check=True, timeout=CALL_TIMEOUT_S)
                 dispatches += 1
                 idle = 0
-                print(f"stalled ({reason}); dispatched {', '.join(a.workflow)} #{dispatches}", flush=True)
+                print(f"stalled ({reason}); {'; '.join(what for _, what in retries)} #{dispatches}", flush=True)
             else:
                 print(f"stalled: {reason}")
                 return 1
