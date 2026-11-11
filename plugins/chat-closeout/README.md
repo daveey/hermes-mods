@@ -54,9 +54,14 @@ reports and containment (not a root-cause fix). They preserve remaining scope/qu
 owners and do not turn explicit deferral into execution, publication or retry authority.
 Receipt references remain historical, including when current execution evidence is stale.
 The receipt is never a substitute for the existing owner-attestation/settlement gate.
+Task-run provenance is validated by core before rendering or budget fallback: only
+bounded source fields and relocations of actual evidence/superseded references are
+accepted. Invalid provenance leaves artifact acceptance unspecified, not an arbitrary
+JSON/UID fallback. Prompt-budget omissions name the qualified task ref, not raw UIDs.
 `tests/test_completion_receipt.py` exercises the read projection and generated prompt,
-including legacy absence and all dispositions. Remote publication/projection and live
-Desktop delivery are separate integration surfaces, not proved by these local tests.
+including legacy absence, all dispositions, malformed/oversized provenance and prompt
+bounds. `tests/test_remote_completion_receipt_closeout.py` exercises real remote
+projection through brief/wake delivery. Live Desktop delivery is not proved here.
 
 ## Ownership and evidence
 
