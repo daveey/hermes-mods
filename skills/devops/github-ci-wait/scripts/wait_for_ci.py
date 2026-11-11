@@ -40,6 +40,9 @@ Exact-run mode, for dispatched runs and experiments (RED/GREEN controls, helper 
   a skipped job matches only an expected skip); a run with no --expect must end `success`. Exit 1 at once for an
   empty manifest ("no runs to wait on"), an unknown run id, a job that ended otherwise, or an expected job absent
   from a completed run; 2 while anything is queued/running under --once, or on timeout.
+  --head-sha FULL_SHA additionally requires every run's exact headSha (no containment or PR-head lookup).
+  Required-job manifests must use all current validated context names with =success; never infer renamed jobs
+  or substitute an optional path-gated skip. --expect remains usable for explicit RED/SKIP experiments.
 
 Run it from inside the repo checkout (needs `git` and an authenticated `gh`). From any other directory,
 --gh-repo OWNER/NAME uses that repo's ~/code/<name> checkout; without one it exits 1 at once.
@@ -387,7 +390,7 @@ def parse_manifest(run_ids: list[str], expects: list[str]) -> tuple[list[str], d
     return ids, exp
 
 
-def judge_run(run: dict, expected: dict[str, str]) -> tuple[str, str]:
+def judge_run(run: dict, expected: dict[str, str], head_sha: str | None = None) -> tuple[str, str]:
     """('ok'|'wait'|'fail', detail) for one run against its expected jobs.
 
     No expectations: the run must complete `success`. With expectations: each named job must complete with exactly
@@ -398,6 +401,8 @@ def judge_run(run: dict, expected: dict[str, str]) -> tuple[str, str]:
     status = run.get("status") or ""
     head = (run.get("headSha") or "")[:10]
     where = f"run {rid} ({run.get('workflowName') or '?'} on {run.get('headBranch') or '?'}@{head}) {run.get('url') or ''}".rstrip()
+    if head_sha is not None and run.get("headSha") != head_sha:
+        return "fail", f"{where}: head mismatch: got {run.get('headSha')!r}, expected {head_sha}"
     jobs = {j.get("name"): j for j in run.get("jobs") or []}
     seen = []
     for name, want in expected.items():
@@ -435,7 +440,7 @@ def wait_runs(a, run_ids: list[str], expects: dict[str, dict[str, str]]) -> int:
         err = None
         for rid in run_ids:
             try:
-                verdicts[rid] = judge_run(view_run(repo, slug, rid), expects.get(rid, {}))
+                verdicts[rid] = judge_run(view_run(repo, slug, rid), expects.get(rid, {}), a.head_sha)
             except RunMissing as e:
                 print(f"stalled: {e}")
                 return 1
@@ -485,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="exact-run mode: a run id from the dispatch output (repeatable; blank entries are dropped)")
     p.add_argument("--expect", action="append", default=[], metavar="ID:JOB=CONCLUSION",
                    help=f"exact-run mode: job JOB of run ID must end CONCLUSION ({'|'.join(EXPECTABLE)}; repeatable)")
+    p.add_argument("--head-sha", help="exact-run mode: every run must have this exact full 40-character head SHA")
     p.add_argument("--repo", type=Path, default=Path.cwd())
     p.add_argument("--branch", default="main")
     p.add_argument("--workflow", action="append", default=[], help="workflow file or name (repeatable)")
@@ -495,6 +501,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dispatch", action="store_true")
     p.add_argument("--gh-repo", help="OWNER/NAME for gh (default: the checkout's origin remote)")
     a = p.parse_args(argv)
+    if a.head_sha is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", a.head_sha) or a.shas:
+            print("--head-sha requires a full lowercase 40-character SHA and exact-run mode (no positional shas)")
+            return 1
     if a.run_id or a.expect or not a.shas:
         if a.shas:
             print("pass either shas (containment wait) or --run-id/--expect (exact runs), not both")

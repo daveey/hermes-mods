@@ -227,8 +227,27 @@ workers to stop chasing tests.
 
 ## Landing a reviewed PR with a head-pinned watcher
 
-Order: exact-head review verdict AND exact-head required aggregate ("All required checks pass") green, then
-`gh pr merge N --rebase --match-head-commit <full sha>`. The watcher aborts on head move, aggregate failure or REJECT.
+Order: exact-head review verdict AND **every required context** green, then
+`gh pr merge N --rebase --match-head-commit <full sha>`. The watcher aborts on head move, any required-context failure or REJECT.
+Never copy an aggregate display name from this skill into a manifest. Read the base branch's current protection
+(`gh api repos/OWNER/REPO/branches/BASE/protection/required_status_checks`) and applicable repository rulesets;
+record the exact context names and verify they are jobs on the pinned run. If policy cannot be read, use an
+explicit independently validated manifest, not a guessed name or a success-only subset. Keep all required
+contexts, including a separate platform-state gate. No prefix/version stripping, fuzzy fallback or missing-name
+alias is safe: an absent required context remains failure. These job expectations are not a complete branch
+protection/ruleset evaluator (nor app-identity validation); external status contexts need their own exact-head proof.
+
+For example, with a validated two-job policy, use the supported one-shot probe, not a custom waiter:
+```bash
+python3 -B "$S" --gh-repo OWNER/REPO --run-id "$RUN" --head-sha "$HEAD" --once \
+  --expect "$RUN:All required checks pass (v2)=success" \
+  --expect "$RUN:macOS state required (v1)=success"
+```
+`--head-sha` accepts a full lowercase 40-character SHA and requires every listed run's `headSha` to match;
+it does not look up or pin the PR's current head. Re-read the PR head/state before and after proof and pin the
+merge separately. A path-gated native lane's `skipped` conclusion is not that lane passing, nor a substitute for
+any required gate. A successful policy gate can coexist with an optional native skip; report those distinctly.
+See [required-context regression and causal chain](references/required-context-contract.md).
 - Treat an empty or null `headRefOid` as a failed lookup and retry it, never as a head move: a broker or quota-guard refusal (`Denied`, a reserve brake) prints nothing to stdout, so `[[ "$head" != $pinned* ]]` fires on every PR at once and the watcher abandons them all. Poll at least 5 min apart, since each check costs core quota that other hub jobs share.
 - Read a Kanban reviewer's verdict from the run, not the card: `select summary,metadata from task_runs where
   task_id=? order by id desc limit 1`. `tasks.result` is often empty, so a watcher grepping it never sees APPROVE and

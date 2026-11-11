@@ -155,6 +155,60 @@ class ExactRunWaitTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(sum(1 for c in self.calls() if c[:3] == ["run", "view", "11"]), 3)
 
+    def required_fixture(self):
+        # Sanitized contract from a renamed aggregate plus a second required context.
+        self.required = ["All required checks pass (v2)", "macOS state required (v1)"]
+        self.runs = {"11": [run("11", [job(n) for n in self.required] +
+                                [job("native path-gated lane", "skipped")])]}
+        return ["--expect", f"11:{self.required[0]}=success",
+                "--expect", f"11:{self.required[1]}=success", "--once"]
+
+    def test_stale_name_false_failure_and_validated_manifest_green(self):
+        args = self.required_fixture()
+        rc, out = self.wait("--expect", "11:All required checks pass=success", "--once")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no job 'All required checks pass'", out)
+        rc, out = self.wait(*args)
+        self.assertEqual(rc, 0, out)
+        for name in self.required:
+            self.assertIn(name + "=success", out)
+
+    def test_each_required_context_must_be_present_and_successful(self):
+        for index in (0, 1):
+            for conclusion in ("failure", "skipped", "cancelled", "neutral", None):
+                with self.subTest(index=index, conclusion=conclusion):
+                    args = self.required_fixture()
+                    jobs = self.runs["11"][0]["jobs"]
+                    if conclusion is None:
+                        del jobs[index]
+                    else:
+                        jobs[index]["conclusion"] = conclusion
+                    rc, out = self.wait(*args)
+                    self.assertEqual(rc, 1, out)
+
+    def test_exact_head_valid_green(self):
+        args = self.required_fixture()
+        rc, out = self.wait(*args, "--head-sha", "a" * 40)
+        self.assertEqual(rc, 0, out)
+
+    def test_exact_head_rejects_moved_or_missing_sha(self):
+        for head in ("b" * 40, None):
+            with self.subTest(head=head):
+                args = self.required_fixture()
+                self.runs["11"][0]["headSha"] = head
+                rc, out = self.wait(*args, "--head-sha", "a" * 40)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("head mismatch", out)
+
+    def test_head_pin_must_be_full_sha_and_exact_run_only(self):
+        for args in (("--run-id", "11", "--head-sha", "a" * 7),
+                     ("a" * 40, "--head-sha", "a" * 40)):
+            with self.subTest(args=args):
+                rc, out = self.wait(*args)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("--head-sha", out)
+        self.assertEqual(self.calls(), [])
+
     def test_gh_calls_name_the_repo(self):
         self.runs = {"11": [run("11", [job("plan")])]}
         self.wait("--run-id", "11")
