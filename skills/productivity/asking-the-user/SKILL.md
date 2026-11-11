@@ -81,6 +81,12 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 - Remote hosts too: `ssh -t <host> 'sudo ...'`. When the SSH key is refused, run
   `ssh-copy-id -i ~/.ssh/id_ed25519.pub <user>@<host>` there.
 - Get a go-ahead in chat first for anything destructive: the window runs the command at once, with no y/N step.
+  For an approved destructive apply, run the read-only checks as their own window first, then make the apply
+  script re-check its bound state (plan hash, state serial) itself and wait for a typed phrase
+  (`printf ... >/dev/tty; read -r ans </dev/tty`): another chat can apply between your two windows, and the
+  in-script guard is what stops a second apply.
+- In a multi-line `bash <<'EOF'` command, give every `ssh`, `aws` and `terraform` call `-n` or `</dev/null`:
+  `ssh` reads the heredoc as its stdin and silently swallows the remaining script lines (exit 0, steps missing).
 - ask-gate refuses a final reply that hands such a step back, and user-steps drops it from the reply.
 
 ## Chrome steps
