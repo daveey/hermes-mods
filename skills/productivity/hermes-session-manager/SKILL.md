@@ -77,8 +77,12 @@ say what's running, never what needs the user.
   waits on, first read the priority spread across `ready`, `scheduled` and `todo`, plus the priorities of
   recent `spawned` events (`task_events` joined to `tasks`). Set it above the top of all of them, because
   scheduled cards and continuations that wake later, at 9000+, jump ahead of a value that only beat the ready
-  queue. The notices' suggested `--priority 10` does nothing in this case. Confirm a run starts
-  (`current_run_id`, or `hermes kanban show` reading `~0 ahead`) instead of assuming it will.
+  queue. The notices' suggested `--priority 10` does nothing in this case. Verify a claimed run and
+  attributable worker activity; `~0 ahead` is queue position, not execution. If a repeat notice arrives
+  without execution, dispatch an independent reviewer directly or re-place the existing work rather than
+  repeating priority-only updates. Have the reviewer check for a dispatcher claim before running tests:
+  if that worker has started, coordinate through the card and distinguish source-only findings from the
+  test-backed verdict so concurrent recovery neither duplicates tests nor bypasses the review gate.
 - When a chain waits on a PR whose exact head is green and `CLEAN`, with no changes requested, but its owner card
   is queued, merge it yourself (`gh pr merge --rebase --match-head-commit <head>` via token-broker). Then
   `kanban_comment` each owner card that the merge step is done, so it resumes from the next step.
