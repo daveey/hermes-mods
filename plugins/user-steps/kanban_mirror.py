@@ -6,6 +6,7 @@ exact blocked ask and block generation under the board write transaction.
 """
 
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -274,9 +275,34 @@ class Mirror:
                 return None
             n += 1
 
+    def _fenced_core(self):
+        # A core without fenced transitions would accept a click and then fail
+        # delivery. Publish no new tiles there; existing bindings still reconcile.
+        try:
+            api = self._api()
+        except ImportError:
+            return False
+        for name in ("unblock_task", "archive_task"):
+            try:
+                params = inspect.signature(getattr(api, name)).parameters
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+                continue
+            if not {"precondition", "comment", "event_extra"} <= set(params):
+                return False
+        return True
+
     def reconcile(self, owner):
         self.core.validate_owner(owner)
-        for board, path in self.boards.items():
+        if not self._fenced_core():
+            logging.getLogger("user-steps").warning(
+                "Card projection paused: core lacks fenced unblock/archive (deploy core first)"
+            )
+            boards = {}
+        else:
+            boards = self.boards
+        for board, path in boards.items():
             try:
                 c = self.core._ro_connect(path)
                 c.row_factory = sqlite3.Row
