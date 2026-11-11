@@ -697,6 +697,32 @@ def test_linked_cards_include_cards_subscribed_to_the_chat(tmp_path, gate):
     assert ids == ["t_sub", "t_own"]
 
 
+
+def test_touch_only_subscription_is_marked_notice_only(tmp_path, gate):
+    """A comment on another chat's card (touch sub) lists it but says it is not counted in this chat's status, so a
+    green sidebar with an open "linked" card is explained, not silent drift; a shepherd sub is tracked."""
+    import json as _json
+    import sqlite3
+    db = tmp_path / "k.db"
+    c = sqlite3.connect(db)
+    c.executescript("""create table tasks(id text, title text, status text, assignee text, created_at int, completed_at int, session_id text);
+        create table kanban_notify_subs(task_id text, platform text, chat_id text, delivery_metadata text);""")
+    c.executemany("insert into tasks values(?,?,?,?,?,?,?)", [
+        ("t_touch", "touch", "running", "a", 3, None, "other"), ("t_herd", "herd", "running", "a", 4, None, "other"),
+        ("t_touchdone", "td", "done", "a", 2, 5, "other")])
+    c.executemany("insert into kanban_notify_subs values(?,?,?,?)", [
+        ("t_touch", "tui", "chat", _json.dumps({"reason": "touch"})),
+        ("t_herd", "tui", "chat", _json.dumps({"reason": "touch"})),
+        ("t_herd", "tui", "chat", _json.dumps({"reason": "shepherd"})),
+        ("t_touchdone", "tui", "chat", _json.dumps({"reason": "touch"}))])
+    c.commit(); c.close()
+    cards = {x["id"]: x for x in gate.core.linked_cards("chat", db_paths=[db])}
+    assert cards["t_touch"]["notice_only"] and not cards["t_herd"]["notice_only"]
+    text = gate.core.render_cards(list(cards.values()), replica=lambda gw: [])
+    lines = {l.split()[1]: l for l in text.splitlines()}
+    assert "notices only" in lines["t_touch"]
+    assert "notices only" not in lines["t_herd"] and "notices only" not in lines["t_touchdone"]
+
 def test_card_ids_match_current_16_hex_ids():
     """Board ids are now t_ + 16 hex (t_01a18b22ba05938e); the 8-hex-only pattern found none of them, so the
     deterministic live-status check never saw a current card (found while fixing self-heal agent-31a66d274a)."""

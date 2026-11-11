@@ -351,6 +351,19 @@ def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None =
             except sqlite3.Error:
                 pass
             pin_ids = {r[0] for r in pinned}
+            # A touch-only sub (comment/link/unblock on someone else's card) notifies the chat but the sidebar does
+            # not count it as the chat's work (core kanban_session_activity.COUNTED_SUB_REASONS). Mark it, so a
+            # green chat with open "linked" cards reads as notice-only, not as tracking drift.
+            try:
+                untracked = {r[0] for r in c.execute(
+                    "select s.task_id from kanban_notify_subs s join tasks t on t.id = s.task_id "
+                    "where s.chat_id=? and coalesce(t.session_id,'') != ? and json_valid(s.delivery_metadata) "
+                    "and json_extract(s.delivery_metadata, '$.reason') in ('touch', 'send_refused') "
+                    "and s.task_id not in (select task_id from kanban_notify_subs where chat_id=? and "
+                    "(not json_valid(delivery_metadata) or coalesce(json_extract(delivery_metadata, '$.reason'), '') "
+                    "not in ('touch', 'send_refused')))", (session_id, session_id, session_id))}
+            except sqlite3.Error:
+                untracked = set()
             for r in rows + pinned:
                 hr = None
                 if r[7]:
@@ -360,7 +373,8 @@ def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None =
                         hr = {"action": str(r[7])}
                 out.append({"id": r[0], "title": r[1], "status": r[2], "assignee": r[3],
                             "created": r[4], "completed": r[5], "db": str(p), "block_kind": r[6],
-                            "human_request": hr if isinstance(hr, dict) else None, "pinned": r[0] in pin_ids})
+                            "human_request": hr if isinstance(hr, dict) else None, "pinned": r[0] in pin_ids,
+                            "notice_only": r[0] in untracked})
             c.close()
         except sqlite3.Error:
             continue
@@ -506,6 +520,8 @@ def render_cards(cards: list[dict], replica=None) -> str:
             hit = next((t for t in rows or [] if t.get("id") == pc["task_id"]), None)
             live = (hit or {}).get("status") or ("not in replica" if rows is not None else "status unknown")
             line += f" -> {gw}:{pc['task_id']} {live}"
+        if c.get("notice_only") and c.get("status") not in _FINAL:
+            line += " (notices only: another chat's card, not counted in this chat's status; shepherd it to track)"
         lines.append(line)
     return "\n".join(lines)
 
