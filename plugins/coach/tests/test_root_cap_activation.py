@@ -28,6 +28,7 @@ STEPS = Path(__file__).resolve().parents[2] / "user-steps" / "core.py"
 PHRASE = "Hub cap7 across boards/profiles"
 OWNER_SESSION = "owner-session"
 OWNER_REF = {"gatewayId": "test-gateway", "profile": "default", "storedSessionId": OWNER_SESSION}
+OWNER_CARD_REF = {"gatewayId": "test-gateway", "profile": "default", "type": "kanban", "id": OWNER, "board": "default"}
 
 
 def _steps():
@@ -57,8 +58,11 @@ def approve_native(w):
 class Steps:
     """A real ActionStore with one approved request; the owner card is bound to the approving session."""
 
-    def __init__(self, w, tmp_path, phrase=PHRASE, choice="approve"):
-        self.w, self.mod = w, _steps()
+    def __init__(self, w, tmp_path, phrase=PHRASE, choice="approve", bound=False):
+        """bound=False is the bare store-only record (no native user row, no owner sourceRef): never authority.
+        bound=True adds what the real flow produces: scope.sourceRefs naming the owner card and the canonical user
+        decision row the owning runtime admitted into the owner's (human-opened) chat."""
+        self.w, self.mod, self.bound = w, _steps(), bound
         self.path = tmp_path / "actions.sqlite3"
         self.store = self.mod.ActionStore(self.path)
         kdb = sqlite3.connect(w.kdb)
@@ -68,7 +72,7 @@ class Steps:
         kdb.close()
         r = dict(schemaVersion=2, owner=dict(OWNER_REF), requestId=str(uuid.uuid4()), revision=1, kind="approval",
                  title="Freeze the hub capacity", scope=dict(markdown=f"{phrase}. Worker-first rollout.", complete=True,
-                                                             sourceRefs=[]),
+                                                             sourceRefs=[dict(OWNER_CARD_REF)] if bound else []),
                  limits=[dict(key="spend", value="none")], exclusions=["No training"],
                  outcomes=dict(approve="Authorize this scope only", revise="Keep blocked", decline="Cancel"),
                  choices=[dict(id=e, label=e.title(), effect=e) for e in ["approve", "revise", "decline"]],
@@ -77,10 +81,23 @@ class Steps:
         self.operation = self.store.decide(OWNER_REF, dict(requestId=self.request["requestId"], expectedRevision=1,
                                                            choiceId=choice, revisionText="Needs changes" if choice == "revise" else None,
                                                            idempotencyKey=str(uuid.uuid4())))["operation"]
+        self.native_id = None
+        if bound:
+            w.session(OWNER_SESSION)  # a human-opened (desktop) chat
+            self.native_id = w.message(self.native_text(), session=OWNER_SESSION)
+
+    def native_text(self):
+        """Exactly what the owning runtime admits: user-steps PromptAdmission._params(op)['text']."""
+        spec = importlib.util.spec_from_file_location("pd_for_rootcap", STEPS.with_name("prompt_delivery.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.PromptAdmission._params(self.operation)["text"]
 
     def source(self, **over):
         auth = {"type": "action_operation", "db": str(self.path), "operation_id": self.operation["operationId"],
                 "request_id": self.request["requestId"], "revision": 1, "owner": dict(OWNER_REF)}
+        if self.native_id is not None:
+            auth["native_message_id"] = self.native_id
         auth.update(over.pop("authority", {}))
         src = native_source(self.w, 0, source_id="rollout-operation", authority=auth,
                             mapping={"phrase": PHRASE, "rationale": "reviewed: hub cap across boards is the root cap key",
@@ -198,13 +215,13 @@ def test_declare_cli_writes_the_root_descriptor(w, capsys):
 @pytest.mark.parametrize("surface", SURFACES)
 class TestActionOperationAuthority:
     def test_explicit_operation_reference_protects_without_registration(self, w, tmp_path, surface):
-        st = Steps(w, tmp_path)
+        st = Steps(w, tmp_path, bound=True)
         write_sources(w, st.source())
         assert w.blocked(surface, SET8, texts=[QUEUE])
         assert (w.shared / "root_cap_contracts.json").exists()
 
     def test_legacy_and_bound_rows_are_both_verified(self, w, tmp_path, surface):
-        st = Steps(w, tmp_path)
+        st = Steps(w, tmp_path, bound=True)
         assert "binding" in st.operation  # v1 bound row: scopeDigest is checked
         st.sql("update operations set body=?, id=id where id=?",
                json.dumps({k: v for k, v in st.operation.items() if k != "binding"}), st.operation["operationId"])
@@ -212,7 +229,7 @@ class TestActionOperationAuthority:
         assert w.blocked(surface, SET8, texts=[QUEUE])  # legacy-unbound accepted on the equalities, still frozen
 
     def test_genuine_user_authorization_still_possible(self, w, tmp_path, surface):
-        st = Steps(w, tmp_path)
+        st = Steps(w, tmp_path, bound=True)
         write_sources(w, st.source())
         w.session("s-human")
         assert not w.blocked(surface, SET8, session="s-human", texts=[PERM])
@@ -231,7 +248,7 @@ class TestActionOperationAuthority:
                                    st.request["requestId"]), "differs from the stored revision", id="intent-differs"),
 ])
 def test_operation_conflicts_refuse_the_targeted_write_with_the_exact_reason(w, tmp_path, mutate, why):
-    st = Steps(w, tmp_path)
+    st = Steps(w, tmp_path, bound=True)
     mutate(st)
     write_sources(w, st.source())
     out = w.call("terminal", SET8, texts=[QUEUE])
@@ -245,7 +262,7 @@ def test_operation_conflicts_refuse_the_targeted_write_with_the_exact_reason(w, 
     pytest.param("phrase", {"phrase": "Some other scope"}, id="unrelated-scope-wording"),
 ])
 def test_operation_that_is_not_this_approval_is_refused(w, tmp_path, name, kwargs):
-    st = Steps(w, tmp_path, **kwargs)
+    st = Steps(w, tmp_path, bound=True, **kwargs)
     src = st.source()
     if name == "phrase":
         src["mapping"]["phrase"] = PHRASE  # the request says something else
@@ -254,7 +271,7 @@ def test_operation_that_is_not_this_approval_is_refused(w, tmp_path, name, kwarg
 
 
 def test_wrong_owner_namespace_or_session_is_refused(w, tmp_path):
-    st = Steps(w, tmp_path)
+    st = Steps(w, tmp_path, bound=True)
     for patch in ({"owner": {**OWNER_REF, "profile": "someone-else"}}, {"owner": {**OWNER_REF, "gatewayId": "other"}},
                   {"owner": {**OWNER_REF, "storedSessionId": "another-session"}}):
         write_sources(w, st.source(authority=patch))
@@ -262,7 +279,7 @@ def test_wrong_owner_namespace_or_session_is_refused(w, tmp_path):
 
 
 def test_owner_card_bound_to_another_session_is_refused(w, tmp_path):
-    st = Steps(w, tmp_path)
+    st = Steps(w, tmp_path, bound=True)
     kdb = sqlite3.connect(w.kdb)
     kdb.execute("update tasks set session_id='different' where id=?", (OWNER,))
     kdb.commit()
@@ -273,7 +290,7 @@ def test_owner_card_bound_to_another_session_is_refused(w, tmp_path):
 
 
 def test_tampered_scope_digest_of_a_bound_row_is_refused(w, tmp_path):
-    st = Steps(w, tmp_path)
+    st = Steps(w, tmp_path, bound=True)
     op = dict(st.operation)
     op["binding"] = {**op["binding"], "scopeDigest": "0" * 64}
     st.sql("update operations set body=? where id=?", json.dumps(op), op["operationId"])
@@ -283,7 +300,7 @@ def test_tampered_scope_digest_of_a_bound_row_is_refused(w, tmp_path):
 
 
 def test_operation_descriptor_without_a_reviewed_mapping_is_malformed(w, tmp_path):
-    st = Steps(w, tmp_path)
+    st = Steps(w, tmp_path, bound=True)
     src = st.source()
     del src["mapping"]
     write_sources(w, src)
