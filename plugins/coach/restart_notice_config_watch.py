@@ -28,6 +28,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+
 ALLOW_FILE = "restart-notice-allow.txt"
 ENV_SUFFIX = "_HOME_CHANNEL"
 FALSE_TOKENS = {"false", "no", "off", "0"}
@@ -146,12 +155,18 @@ def card_key(host: str, f: dict) -> str:
 
 def card_body(host: str, f: dict) -> str:
     p = "" if f["profile"] == "default" else f"-p {f['profile']} "
-    return f"""Detected by restart_notice_config_watch.py (hermes-mods plugins/coach) on {host}.
+    name = f" ({f['home_channel_name']})" if f['home_channel_name'] else ''
+    seen = fence_evidence(f"Detected by restart_notice_config_watch.py (hermes-mods plugins/coach) on {host}.\n"
+                          f"- profile `{f['profile']}`, platform `{f['platform']}`\n"
+                          f"- home channel `{f['home_channel']}`{name}, set in {f['home_source']}\n"
+                          f"- `platforms.{f['platform']}.gateway_restart_notification` = "
+                          f"`{f['gateway_restart_notification']!r}` (unset means true) in `{f['config']}`")
+    return f"""A home channel gets gateway restart notices.
+
+{home_pin_note("the fix edits this gateway's own profile config, which a worker node does not hold")}
 
 ## Evidence
-- profile `{f['profile']}`, platform `{f['platform']}`
-- home channel `{f['home_channel']}`{f" ({f['home_channel_name']})" if f['home_channel_name'] else ''}, set in {f['home_source']}
-- `platforms.{f['platform']}.gateway_restart_notification` = `{f['gateway_restart_notification']!r}` (unset means true) in `{f['config']}`
+{seen}
 
 ## What it means
 Every gateway restart (auto-updates restart it often) posts "Hermes is restarting" / "Gateway online" to that home
@@ -162,7 +177,7 @@ channel. On a channel other people read that is noise (alpha-askeve: 26 notices 
    then read it back with `hermes {p}config get platforms.{f['platform']}.gateway_restart_notification`.
    The running gateway re-reads the flag at shutdown, so no restart is needed.
 2. If it is the owner's own DM and the notices are wanted: add `{f['profile']}:{f['platform']}` to
-   `~/.hermes/{ALLOW_FILE}` on {host}.
+   `~/.hermes/{ALLOW_FILE}` on this host.
 3. Rerun `python3 ~/code/hermes-mods/plugins/coach/restart_notice_config_watch.py --dry-run` and confirm it no longer
    lists this profile.
 """
@@ -170,7 +185,7 @@ channel. On a channel other people read that is noise (alpha-askeve: 26 notices 
 
 def create_argv(host: str, f: dict) -> list:
     return ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", card_key(host, f),
-            "--created-by", "restart-notice-config-watch", "--body-file", "-", "--json",
+            "--created-by", "restart-notice-config-watch", "--body-file", "-", "--json", *HOME_REQUIRES_ARGV,
             f"Profile {f['profile']}: {f['platform']} home channel gets gateway restart notices "
             f"(gateway_restart_notification not false)"]
 

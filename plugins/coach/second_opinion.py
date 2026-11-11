@@ -37,6 +37,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+try:
+    from .placement_evidence import fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    fence_evidence, home_pin_note = _pe.fence_evidence, _pe.home_pin_note
+
 if __package__:
     from .reply_check import render_tool_log
 else:  # Standalone plugin/eval loader.
@@ -246,20 +255,26 @@ def card_args(session_id: str, recs: list[dict], ask: str = "", settings: Option
         "report: what the code/system actually does on the user's path, where it diverges from what the agent "
         "claimed, and the evidence (commands + output) for each point. Say plainly what you could not check.",
         "",
+        home_pin_note("the user's path and the files it touched are on this gateway, so the trace has to run here"),
+        "",
     ]
+    # The quoted ask, claims and replies are evidence (they name hosts, paths and products): fenced, not instructions.
+    ev: list[str] = []
     if ask:
-        lines += ["## Original ask", ask[:1500], ""]
+        ev += ["## Original ask", ask[:1500], ""]
     for i, r in enumerate(recs, 1):
-        lines += [f"## Failure {i}", "**Agent claimed:**", "> " + r.get("claim", "").replace("\n", "\n> ")[:2500],
-                  "", "**User replied:**", "> " + r.get("user", "").replace("\n", "\n> ")[:1500], ""]
-    lines += ["## Files touched in the failing turns", *([f"- `{f}`" for f in files] or ["- (none recorded)"]), "",
+        ev += [f"## Failure {i}", "**Agent claimed:**", "> " + r.get("claim", "").replace("\n", "\n> ")[:2500],
+               "", "**User replied:**", "> " + r.get("user", "").replace("\n", "\n> ")[:1500], ""]
+    ev += ["## Files touched in the failing turns", *([f"- `{f}`" for f in files] or ["- (none recorded)"])]
+    lines += [fence_evidence("\n".join(ev)), "",
               "Finish with `kanban_complete`: summary = the 1-3 most likely causes with their evidence; "
               "metadata.findings = list of {claim, observed, evidence}."]
     issue = (recs[-1].get("issue") if recs else "") or "failed fix"
     args = {"title": f"Second opinion (read-only): {issue}"[:120], "assignee": setting("fixloop_review_assignee", settings),
             "body": "\n".join(lines),
             "idempotency_key": f"coach-fixloop:{session_id}:{int(recs[0]['ts']) if recs else 0}",
-            "max_runtime_seconds": 1800, "model": model}
+            "max_runtime_seconds": 1800, "model": model,
+            "placement": "local"}  # explicit pin: see the reason sentence in the body
     if provider:
         args["provider"] = provider
     if session_id:

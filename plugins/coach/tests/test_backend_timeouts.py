@@ -96,7 +96,8 @@ def test_40_timeouts_open_one_card_with_counts_paths_cpu_and_acceptance(tmp_path
     (argv, body), = r.creates()
     assert argv[argv.index("--idempotency-key") + 1] == "backend-timeouts:laptop-1:2026-10-27"
     assert argv[argv.index("--assignee") + 1] == "default"
-    assert "40" in argv[-1] and "laptop-1" in argv[-1]
+    assert "40" in argv[-1] and "laptop-1" not in argv[-1]  # the title never names where it was observed
+    assert "laptop-1" in body  # the host is in the (fenced) evidence
     assert "/api/sessions/<id>" in body and "281.0" in body and "44.1" in body
     assert "zero" in body.lower() and "30-minute" in body  # acceptance: a fresh clean window, not a restart
     assert r.comments() == []

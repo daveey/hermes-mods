@@ -28,6 +28,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import fence_evidence
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    fence_evidence = _pe.fence_evidence
+
 AUTHOR = "worker-share-watch"
 STREAK = 3
 FRESH_MS = 15 * 60 * 1000  # a machine's metrics older than this say nothing about its load
@@ -199,11 +208,7 @@ def card_body(s: dict, streak: int, examples: list) -> str:
                       f" ({c.get('reason_source', 'current replay')})"
                       for c in examples[:MAX_LISTED])
     room = ", ".join(f"{k} ({v} free)" for k, v in s["room"].items())
-    return f"""Fix the portable repo producer from the carried evidence below; clone and push the repo as needed.
-Live host-only verification belongs on a separate capability owner, not this portable implementation.
-
-<!-- placement:evidence -->
-The hub was constrained ({', '.join(s.get('hub_pressure', ['cap']))}); latest runs {s['hub_runs']}/{s['hub_cap']},
+    evidence = fence_evidence(f"""The hub was constrained ({', '.join(s.get('hub_pressure', ['cap']))}); latest runs {s['hub_runs']}/{s['hub_cap']},
 for {streak} samples in a row (10 min apart) while
 {room} had room and {s['waiting']} ready cards waited unmarked: the dispatcher only offers worker-first cards
 (`placement_policy`) to the pool, so these wait for a hub slot. Found by {AUTHOR} (hermes-mods
@@ -213,8 +218,11 @@ plugins/coach/worker_share_watch.py, kanban-12ee0e4b65).
 {reasons}
 
 ## Examples
-{cards}
-<!-- /placement:evidence -->
+{cards}""")
+    return f"""Fix the portable repo producer from the carried evidence below; clone and push the repo as needed.
+Live host-only verification belongs on a separate capability owner, not this portable implementation.
+
+{evidence}
 
 ## Acceptance
 1. For the top reason(s), find the producer (card title prefix / creator) and what the card really needs. A
