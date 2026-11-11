@@ -138,6 +138,14 @@ This plugin also:
   unknown values, but retain exported names so Git selectors cannot disappear;
 - analyzes trap handlers with unknown run-time repository selection, even with absolute
   `-C`; delayed prompt strings and shell-alias bodies likewise cannot prove a repository.
+  A double-quoted `trap "... $R ..."` word expands known plain variable values at
+  installation time (no space/glob/quote/`$`); single-quoted, escaped, unquoted, or
+  substitution-containing handler words retain conservative deferred analysis. Runtime exports
+  and repository selectors remain unknown even after this early expansion.
+  Embedded interpreter program text is scanned conservatively: SQL `LIKE` strings are not
+  exempt, since those same strings can be passed to a shell. Such refusals name the matched
+  interpreter and explain that the possible restore may be data, not executed code. Inferred
+  shell-word refusals also name the originating command rather than inventing a literal restore.
   Earlier `git config core.worktree` writes (including `-f`) or redirects to `config` /
   `config.worktree` make later restores uncertain. Regressions exercise these with real
   wrong-worktree restores (`test_unknown_export_selectors_and_deferred_restores`,

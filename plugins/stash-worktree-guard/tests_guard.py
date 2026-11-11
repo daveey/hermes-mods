@@ -2389,3 +2389,135 @@ def test_arithmetic_substitutions_still_refuse(multi, template):
     main, wt = multi
     cmd = template.format(wt=wt)
     assert _blocked(cmd, main), cmd
+
+
+# --- Phantom `stash pop` from trap handlers and SQL LIKE data (public, anonymized fixtures) ---
+# Reported: an ssh script with `trap "...git -C $R worktree remove --force $W..." EXIT` was
+# refused as `git stash pop` although the command never mentions stash. The double-quoted trap
+# word is expanded when `trap` runs, so $R was known; the handler used to be analyzed with every
+# variable lost, so `-C $R` could "split" and shift the subcommand.
+TRAP_SSH_REPORTED = (
+    'timeout 150 ssh -o ConnectTimeout=20 -o BatchMode=yes -o UserKnownHostsFile="$HOME/.hermes/cache/scratch/example_known_hosts" '
+    "you@worker.example.com 'R=~/code/hermes-mods; "
+    'for w in $(git -C $R worktree list --porcelain | sed -n "s|^worktree \\(/tmp/cc-wt-.*\\)|\\1|p"); '
+    'do git -C $R worktree remove --force $w && echo "removed leftover $w"; done; git -C $R worktree prune; '
+    "W=/tmp/sm-wt-$$; git -C $R worktree add -q --detach $W HEAD || exit 1; "
+    'trap "cd /; git -C $R worktree remove --force $W; rm -f /tmp/sm-$$.*" EXIT; cd $W; '
+    "timeout 100 env -i PATH=/usr/bin:/bin HOME=$HOME scripts/test-all --hermes-core $HOME/.hermes/hermes-agent "
+    "-k plugins/session-mentions --exact --json /tmp/sm-$$.json > /tmp/sm-$$.log 2>&1; "
+    'echo "worker session-mentions rc=$? | $(tail -1 /tmp/sm-$$.log | cut -c1-80)"; '
+    'echo "leftover /tmp worktrees: $(git -C $R worktree list | grep -c /tmp/)"\'; echo "ssh rc=$?"'
+)
+TRAP_DQ_LOCAL = 'R=/srv/repo; W=/tmp/w-$$; git -C $R worktree add -q --detach $W HEAD; trap "git -C $R worktree remove --force $W" EXIT'
+# SQL LIKE pattern naming a command: data for the database, not shell code.
+SQL_LIKE_HEREDOC = """/usr/bin/python3 - <<'EOF'
+import sqlite3
+c = sqlite3.connect("x.db")
+print(c.execute("select * from t where body LIKE '%`git stash pop`%'").fetchall())
+EOF"""
+SQL_LIKE_ARGV = """/usr/bin/python3 -c "import sqlite3; sqlite3.connect('x.db').execute(\\"select 1 where b LIKE '%git stash pop%'\\")\""""
+
+
+@pytest.mark.parametrize("cmd", [TRAP_SSH_REPORTED, TRAP_DQ_LOCAL])
+def test_phantom_stash_pop_false_positives_allowed(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main)) is None, cmd
+    assert not _blocked(cmd, main), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    # Real restores in ssh/trap/substitution forms stay refused.
+    "ssh you@worker.example.com 'git stash pop'",
+    "ssh you@worker.example.com 'git -C $R stash pop'",
+    'ssh you@worker.example.com \'R=/srv/repo; git -C "$R" stash apply\'',
+    'R=/srv/repo; trap "git -C $R stash pop" EXIT',
+    "R=/srv/repo; trap 'git -C $R stash pop' EXIT",
+    'trap "git -C $VAR stash drop" EXIT',
+    'R=/srv/repo; trap "git -C \\$R stash pop" EXIT; R=/other',
+    'R=/srv/repo; trap "git -C $R $SUB pop" EXIT',
+    'R=/srv/repo; trap "cd /; git -C $R worktree remove --force $W; git stash pop" EXIT',
+    'git -C "$VAR" stash pop',
+    'echo "$(git -C "$VAR" stash drop)"',
+    # Deferred expansion stays unknown (single quotes), as before.
+    "trap 'git -C $R $W' EXIT",
+    # A real command after, or hidden in, SQL-LIKE-looking text is still refused.
+    SQL_LIKE_HEREDOC.replace("print(", "import os; os.system('git stash pop'); print("),
+    """/usr/bin/python3 - <<'EOF'
+import os
+os.system("echo LIKE '%'; git stash pop; echo '%'")
+EOF""",
+    """/usr/bin/python3 - <<'EOF'
+import subprocess
+subprocess.run("git stash apply", shell=True)  # LIKE '%x%'
+EOF""",
+])
+def test_phantom_fix_keeps_real_restores_blocked(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main)) is not None, cmd
+    assert _blocked(cmd, main), cmd
+
+
+def test_inferred_stash_pop_diagnostic_is_not_misleading(multi):
+    main, _wt = multi
+    # Nothing here says `stash`: the refusal must say it is inferred from an unresolved word.
+    why = guard.refuse_reason("trap 'git -C $R worktree remove $W' EXIT", str(main))
+    assert why and "inferred" in why and "no literal" in why, why
+    assert 'git -C $R worktree remove $W' in why, why
+    assert 'Quote the word' not in why, why
+
+
+def test_embedded_interpreter_diagnostic_exact_report(multi):
+    main, _wt = multi
+    cmd = (HERE / 'fixtures/sql_inventory.txt').read_text()
+    # Deliberate bounded false refusal: never execute this personal-DB query.
+    why = guard.refuse_reason(cmd, str(main))
+    assert why and 'conservative embedded interpreter scanning' in why, why
+    assert '/usr/bin/python3 -' in why and 'data' in why, why
+    assert 'blocked `git stash pop`' not in why, why
+
+
+@pytest.mark.parametrize('cmd', [SQL_LIKE_HEREDOC, SQL_LIKE_ARGV,
+    """python3 -c 'import os; os.system("echo LIKE \\"%$(git stash pop)%\\"")'"""])
+def test_sql_like_is_not_an_execution_exemption(multi, cmd):
+    main, _wt = multi
+    assert guard.refuse_reason(cmd, str(main)), cmd
+    # A literal restore keeps the plain wording (no "inferred" claim).
+    plain = guard.refuse_reason("git -C $R stash pop", str(main))
+    assert plain and "no literal" not in plain, plain
+
+
+@pytest.mark.parametrize('op', ['pop', 'apply', 'drop'])
+@pytest.mark.parametrize('form', ['direct', 'quoted-C', 'ssh', 'substitution'])
+def test_review_restore_matrix(multi, op, form):
+    main, wt = multi
+    literal = f'git -C "{wt}" stash {op}'
+    cmd = {
+        'direct': f'git stash {op}',
+        'quoted-C': f'R={shlex.quote(str(wt))}; git -C "$R" stash {op}',
+        'ssh': f'ssh you@worker.example.com {shlex.quote(literal)}',
+        'substitution': f'echo "$({literal})"',
+    }[form]
+    before = subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV)
+    assert guard.refuse_reason(cmd, str(wt)), cmd
+    assert _blocked(cmd, wt), cmd
+    assert subprocess.check_output(['git', 'rev-parse', 'refs/stash'], cwd=main, env=GIT_ENV) == before
+    assert (wt / 'f.txt').read_text() == 'base\n'
+
+
+@pytest.mark.parametrize('when', ['before', 'after'])
+def test_early_trap_expansion_keeps_runtime_exports_unknown(multi, when):
+    main, wt = multi
+    gd = _gitdir(wt)
+    export = f'export GIT_DIR={shlex.quote(gd)} GIT_WORK_TREE={shlex.quote(str(wt))}'
+    trap = f'R={shlex.quote(str(main))}; trap "git -C $R stash pop" EXIT'
+    cmd = f'{export}; {trap}' if when == 'before' else f'{trap}; {export}'
+    assert _blocked(cmd, main), cmd
+    _assert_real_restore(cmd, main, wt)
+
+
+def test_sql_looking_string_can_really_execute_shell(multi):
+    main, wt = multi
+    program = 'import os; s="LIKE \'%git stash pop%\'"; os.system(s.split("%")[1])'
+    cmd = f'cd {shlex.quote(str(wt))}; python3 -c ' + shlex.quote(program)
+    assert _blocked(cmd, wt), cmd
+    _assert_real_restore(cmd, main, wt)

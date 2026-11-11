@@ -1041,6 +1041,59 @@ class _State:
                 tuple(sorted(self.exported)), tuple(sorted((k, id(v)) for k, v in self.funcs.items())))
 
 
+class _EvidenceNote(str):
+    """Diagnostic provenance only; never a reason to suppress a refusal."""
+
+
+class _WordNote(str):
+    """An unresolved word with its actual originating command."""
+    source: str
+
+    def __new__(cls, word, source):
+        obj = super().__new__(cls, word)
+        obj.source = source
+        return obj
+
+
+_TRAP_SAFE_VALUE = re.compile(r"[\w./:@%+=,-]+")
+
+
+def _expand_trap_word(raw: str, variables: dict) -> Optional[str]:
+    """Handler text of a `trap` argument: quote removal plus the expansion bash does when
+    `trap` runs. Only a variable with a known, plainly safe value (no space, glob, quote,
+    `$`, backtick or operator) is replaced; every other `$name`, and any backslash-escaped one, is
+    left as written so the handler still sees an unknown value. Single quotes expand nothing.
+    """
+    # Substitution results can contain fresh shell syntax; do not expand through
+    # their nested quoting. Keep the ordinary conservative deferred analysis.
+    if _substitutions(raw):
+        return None
+    out, quote, i = [], None, 0
+    while i < len(raw):
+        char = raw[i]
+        if char in "\"'" and (quote is None or quote == char):
+            quote = char if quote is None else None
+            i += 1
+            continue
+        if char == "\\" and quote != "'":
+            if i + 1 >= len(raw):
+                return None
+            nxt = raw[i + 1]
+            out.append(nxt if quote is None or nxt in "$\"`\\" else char + nxt)
+            i += 2
+            continue
+        if char == "$" and quote == '"':
+            match = _PARAM.match(raw, i)
+            value = variables.get(match[1] or match[2]) if match else None
+            if match and value is not None and _TRAP_SAFE_VALUE.fullmatch(value):
+                out.append(value)
+                i = match.end()
+                continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
 def _command_unknown(word: str, st) -> bool:
     """Whether ``word`` is unknown because of this command (not inherited terminal state)."""
     if re.search(r"\$\(|`|<\(|\$[@*#0-9]|\$\{[@*#0-9]", word):
@@ -1272,6 +1325,7 @@ class _Analyzer:
             r"\b(?:stash|pop|apply)\b|\.git/config|git\s+config|alias\.|\[alias\]|include|GIT_CONFIG",
             text, re.IGNORECASE))
         self.calls: list = []
+        self.source = ""
         self.steps = 0
         # Set when any fragment could not be analyzed (parse error, depth limit, unknown eval).
         # A fragment's boundaries come from the same matcher that may have failed (a quoted
@@ -1297,6 +1351,15 @@ class _Analyzer:
 
     def record(self, repo, sub, args, note: Optional[str] = None):
         """``note``: the unresolved shell word that alone made this a possible restore."""
+        if type(note) is str:
+            note = _WordNote(note, self.source)
+        elif (note is None and sub == "stash" and self.source
+              and (repo is None or self.shadow or self.config_repo)
+              and not re.search(r"\bstash\b", self.source, re.IGNORECASE)):
+            note = _EvidenceNote(
+                f"inferred a possible stash operation from matched command `{self.source}`; "
+                "it has no literal `stash` word. Unresolved shell words or deferred execution "
+                "prevent proving the effective Git arguments and repository")
         self.calls.append((None if self.shadow or self.config_repo else repo, sub, list(args), note))
 
     def shadow_text(self, text: str, st: _State, depth: int):
@@ -1406,7 +1469,7 @@ class _Analyzer:
         if not _substitutions(value):
             self.shadow_string(_literal(value), st, depth)
 
-    def evidence(self, text: Optional[str], loose: bool = False):
+    def evidence(self, text: Optional[str], loose: bool = False, note=None):
         """Textual restores in input a shell reads without the guard seeing it as a script.
 
         ``loose``: text generated for a shell (`printf '… %s%s pop' sta sh | bash`) may build
@@ -1417,7 +1480,7 @@ class _Analyzer:
             flat = re.sub(r"[\"']", "", re.sub(r"\\[a-z]", " ", text or ""))
             ops |= {op for op in REFUSE_OPS if re.search(rf"\b{op}\b", flat)}
         for op in sorted(ops):
-            self.record(None, "stash", [op])
+            self.record(None, "stash", [op], note)
 
     def _run_text(self, text: str, states: list, depth: int) -> list:
         if depth > MAX_DEPTH:
@@ -1636,6 +1699,16 @@ class _Analyzer:
 
     def simple(self, node, st: _State, depth: int, nested: bool = False,
                unknown_command: Optional[str] = None):
+        previous = self.source
+        if not nested:
+            self.source = " ".join(node[1] + node[2])
+        try:
+            return self._simple(node, st, depth, nested, unknown_command)
+        finally:
+            self.source = previous
+
+    def _simple(self, node, st: _State, depth: int, nested: bool = False,
+                unknown_command: Optional[str] = None):
         self.steps += 1
         if self.steps > MAX_STEPS:
             raise _Budget()
@@ -1818,6 +1891,9 @@ class _Analyzer:
         if cmd == "trap":
             args = [w for w in lit[1:] if w not in ("--", "-p", "-l")]
             if args and args[0] != "-":
+                # `trap "... $R ..." EXIT` expands a known $R when `trap` runs, not at signal time.
+                handler = next(w for w in raw[1:] if _literal(w) == args[0])
+                args[0] = _expand_trap_word(handler, st.vars) or args[0]
                 # The handler runs with the environment/config at signal time, not
                 # declaration time. Even an absolute -C cannot establish its repo.
                 self.shadow += 1
@@ -1904,8 +1980,13 @@ class _Analyzer:
                 re.search(r"(?:^|[;\n{}])\s*e(?:\s|;|$)|^s(.).*\1.*\1[gpwIiMm0-9]*e", w)
                 for w in lit[1:]))):
             # Program text in argv, here-docs or a pipe may run git (`sed 's/^//e'`).
-            self.evidence(" ".join([*raw[1:], *(r[2] or r[1] for r in redirs)]))
-            self.evidence(self.pipe_text, loose=True)
+            note = _EvidenceNote(
+                f"matched command `{' '.join(raw[:1] + (raw[1:2] if len(raw) > 1 else []))}`: "
+                "conservative embedded interpreter scanning found possible stash execution "
+                "in program text or input. This may be data rather than an executed shell "
+                "command; the guard cannot prove that distinction and refuses conservatively")
+            self.evidence(" ".join([*raw[1:], *(r[2] or r[1] for r in redirs)]), note=note)
+            self.evidence(self.pipe_text, loose=True, note=note)
         return [st], [st]
 
     def assign(self, st: _State, raw: str) -> str:
@@ -2466,6 +2547,10 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
                 "live-checkout-guard/reconcile.py retirement helper. " + _safe_recipe()
             )
     calls = list(_stash_invocations(cmd, cwd))
+    for repo, op, _args, note in calls:
+        if (isinstance(note, _EvidenceNote) and repo is None
+                and op in PUSH_OPS | ARGV_RESTORE_OPS | {"drop", "clear", "import"}):
+            return f"STASH WORKTREE GUARD: blocked: {note}. " + _safe_recipe()
     # Branch names cannot establish ownership of a repository-wide stack. Even
     # a same-branch pop/drop can consume another worker's newly pushed entry.
     for repo, op, _args, _note in calls:
@@ -2490,7 +2575,8 @@ def refuse_reason(cmd: str, cwd: Optional[str] = None) -> Optional[str]:
     if notes and all(notes):
         word = notes[0]
         return (
-            f"STASH WORKTREE GUARD: blocked: the unquoted word `{word}` has an unknown value, so it "
+            f"STASH WORKTREE GUARD: blocked: matched command `{getattr(word, 'source', cmd)}`; "
+            f"the unquoted word `{word}` has an unknown value, so it "
             "may split into several words and shift git's subcommand (it could become "
             f"`stash pop`). Quote it (`\"{word}\"`) or assign it a literal earlier in the same "
             "command."
