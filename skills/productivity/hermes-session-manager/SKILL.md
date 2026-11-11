@@ -142,6 +142,8 @@ say what's running, never what needs the user.
 
 ## Done means
 - Did you re-run the checker before acting on a 'worker-N owner observation unavailable' row (it is usually a collection blip, not a closed card)?
+- Did you treat a worker-N 'closed on owner (done), never released' row as a lingering slot record (leave it unless its age grows past hours)?
+- Did you confirm a core-update drain hold is live (hermes-sync.log core-drain lines) and leave its ready-unclaimed rows alone unless it persists past the 2h max?
 
 ## Archive rule (needs the user's standing approval; record it in memory)
 
