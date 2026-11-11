@@ -1,6 +1,6 @@
 ---
 name: github-ci-wait
-description: "Use when waiting for GitHub CI or a release. Track runs/tags containing the commit; diagnose Actions billing blocks."
+description: "Use when waiting for GitHub CI or a release."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
