@@ -68,6 +68,11 @@ bypassed with another writer.
   steps (live checks, a PR on a moved repo), comment the corrected premise and unblock so the owner finishes. Don't force it.
 - A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
 - Cards whose dependents wait on them: unblocking or completing promotes the children. Check them.
+- Link every card still waiting on the user to this chat, so its wake lands here:
+  `hermes kanban [--board B] notify-subscribe <id> --platform tui --chat-id <this session id> --delivery-mode notify+wake`.
+  The sync loop's chat-link reconcile turns that `tui` subscription into a `shepherd` row in `task_chat_links`
+  within about a minute. Check `released=0`. A raw `INSERT INTO task_chat_links` is released again by the next
+  reconcile, so don't write that table directly.
 - Mac probes that a worker reports "no agent route" for (mini/MacBook check_compat, git ancestry, sqlite reads) often
   run directly with `tailnet_exec` from the user's interactive chat. A host outside `tailnet.auto_hosts` returns an
   approval request instead; name it in the report.
