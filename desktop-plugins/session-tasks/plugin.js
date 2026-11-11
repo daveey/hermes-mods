@@ -27,6 +27,7 @@
  * Compute Rentals status-bar popover. Hover any chip for the full title.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
+import * as SDK from '@hermes/plugin-sdk' // namespace: the optional projector exports are absent on older hosts
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -75,6 +76,168 @@ export const chipColor = state => STATE_COLOR[state] || STATE_COLOR.running
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 const truncate = (s, n = MAX_LABEL) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 const log = (...a) => console.info(`[${ID}]`, ...a)
+
+// ── execution observations (consumer of the SDK's optional pure v1 projector) ───────────────────────────────
+// Same block in session-tasks and session-panel; test/execution-observations.test.mjs runs both against the shared
+// golden fixture so they cannot drift. Producers send raw v1 records (`execution_observations`); every verdict
+// (state, expiry, identity fencing, receipts) comes from the SDK projector, called at RENDER time with the clock the
+// caller already has, so a cached record expires without any new fetch or timer. Hosts or producers that lack the
+// projector or the records show an explicit "unknown", never a zero or an implied running/done. Capacity records
+// (kanban.dispatch / kanban.capacity) are diagnostics about WHY work waits: they never become a work state.
+const OBS_FNS = ['projectExecutionObservation', 'selectExecutionObservation', 'summarizeExecutionObservations', 'executionIdentityKey']
+const CAPACITY_SOURCES = new Set(['kanban.dispatch', 'kanban.capacity'])
+const obsOwn = (o, k) => (o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined)
+const obsNum = v => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const obsText = v => (typeof v === 'string' && v.trim() ? v : '')
+
+/** The SDK projector, or null on a host that predates it (feature-detected, never assumed). */
+export const observationSdk = (sdk = SDK) => (OBS_FNS.every(k => typeof sdk?.[k] === 'function') ? sdk : null)
+
+/** Split a producer's `execution_observations` into work records and capacity diagnostics. `present` = the field
+ *  was an array at all (an older producer omits it: that is "unknown", not "no work"). */
+export function splitObservations(raw) {
+  if (!Array.isArray(raw)) return { present: false, work: [], capacity: [] }
+  const work = [], capacity = []
+  for (const r of raw) (CAPACITY_SOURCES.has(obsOwn(r, 'source')) ? capacity : work).push(r)
+  return { present: true, work, capacity }
+}
+
+const span = s => (s < 60 ? `${Math.max(0, Math.floor(s))} s` : s < 3600 ? `${Math.floor(s / 60)} min` : s < 86_400 ? `${Math.floor(s / 3600)} h` : `${Math.floor(s / 86_400)} d`)
+const qual = o => [obsOwn(o, 'gateway'), obsOwn(o, 'profile')].filter(obsText).join('/')
+
+function identityText(identity) {
+  const run = obsOwn(identity, 'run_id') ?? obsOwn(identity, 'generation')
+  const head = [qual(identity), obsText(obsOwn(identity, 'board'))].filter(Boolean).join('/')
+  const work = `${obsText(obsOwn(identity, 'kind')) || '?'}:${obsText(obsOwn(identity, 'work_id')) || '?'}`
+  return `${head ? `${head}/` : ''}${work}${run != null ? `#${run}` : ''}`
+}
+
+function waitView(w, nowSec) {
+  if (!w || typeof w !== 'object') return null
+  const target = obsOwn(w, 'target')
+  const since = obsNum(obsOwn(w, 'since')), due = obsNum(obsOwn(w, 'due_at'))
+  return {
+    kind: obsText(obsOwn(w, 'kind')) || null,
+    predicate: obsText(obsOwn(w, 'predicate')) || null,
+    target: target && typeof target === 'object' ? [qual(target), obsText(obsOwn(target, 'board')), obsText(obsOwn(target, 'work_id'))].filter(Boolean).join('/') || null : null,
+    owner: qual(obsOwn(w, 'owner')) || null,
+    sinceAgeSec: since == null ? null : Math.max(0, nowSec - since),
+    dueInSec: due == null ? null : due - nowSec
+  }
+}
+
+/** Display model of one PROJECTED observation (what the SDK returned), nothing re-derived. */
+export function observationView(obs, nowSec, sdk = observationSdk(), sourceClass = 'sidebar') {
+  const progressAt = obsNum(obsOwn(obs, 'last_progress'))
+  const asks = sdk ? obsNum(sdk.summarizeExecutionObservations([obs], nowSec, sourceClass)?.outstanding_human_requests) : null
+  const historical = obsOwn(obs, 'historical_delivery_receipts')
+  const receipt = obsOwn(obs, 'delivery_receipt')
+  const activityAt = obsNum(obsOwn(obs, 'last_activity'))
+  return {
+    sourced: true,
+    state: obsOwn(obs, 'state') || 'unknown',
+    freshness: obsOwn(obs, 'freshness') || 'unknown',
+    reason: obsText(obsOwn(obs, 'unknown_reason')) || null,
+    lastKnown: obsText(obsOwn(obs, 'last_known_state')) || null,
+    ageSec: obsNum(obsOwn(obs, 'age_seconds')),
+    source: obsText(obsOwn(obs, 'source')) || null,
+    id: identityText(obsOwn(obs, 'identity')),
+    owner: qual(obsOwn(obs, 'owner')) || null,
+    progress: progressAt == null ? null : { ageSec: Math.max(0, nowSec - progressAt), kind: obsOwn(obs, 'last_progress_kind') || null, ref: obsOwn(obs, 'last_progress_ref') || null },
+    activity: activityAt == null ? null : { ageSec: Math.max(0, nowSec - activityAt), kind: obsText(obsOwn(obs, 'last_activity_kind')) || null },
+    wait: waitView(obsOwn(obs, 'wait'), nowSec),
+    // Receipts stay historical evidence of an execution even once the CURRENT state is unknown/stale.
+    receipts: Array.isArray(historical) ? historical.length : receipt ? 1 : 0,
+    asks
+  }
+}
+
+const missingView = (reason, extra = {}) => ({
+  sourced: false, state: 'unknown', freshness: 'unknown', reason, lastKnown: null, ageSec: null, source: null, id: '', owner: null,
+  progress: null, activity: null, wait: null, receipts: 0, asks: null, ...extra
+})
+
+const classOf = c => c || 'sidebar'
+
+/** One record -> view. */
+export function projectView(record, nowSec, sourceClass = 'sidebar', sdk = observationSdk(), expectedIdentity) {
+  if (!sdk) return missingView('sdk_projector_unavailable')
+  return observationView(sdk.projectExecutionObservation(record, nowSec, classOf(sourceClass), expectedIdentity), nowSec, sdk, classOf(sourceClass))
+}
+
+/** Records of ONE exact execution identity -> view (SDK selection: old runs and other owners never overwrite). */
+export function selectView(records, identity, nowSec, sourceClass = 'sidebar', sdk = observationSdk()) {
+  if (!sdk) return missingView('sdk_projector_unavailable')
+  return observationView(sdk.selectExecutionObservation(records, identity, nowSec, classOf(sourceClass)), nowSec, sdk, classOf(sourceClass))
+}
+
+/** Counts across records, per the SDK. Never a zero for what could not be read: empty is `uncertain`. */
+export function summaryView(records, nowSec, sourceClass = 'sidebar', sdk = observationSdk()) {
+  if (!sdk) return { counts: null, uncertain: true, outstanding: null, states: [], reason: 'sdk_projector_unavailable' }
+  const s = sdk.summarizeExecutionObservations(records, nowSec, classOf(sourceClass))
+  return { counts: s.counts, uncertain: !!s.uncertain, outstanding: s.outstanding_human_requests, states: s.observations.map(o => o.state), reason: null }
+}
+
+/** The chip's card evidence at `nowSec`. `chip.observations` = the producer's raw records (null = older producer).
+ *  Records are matched by exact card coordinates; two different execution identities stay unknown, never merged. */
+export function chipObservation(chip, nowSec, { sdk = observationSdk(), sourceClass = 'sidebar' } = {}) {
+  if (!sdk) return missingView('sdk_projector_unavailable')
+  const split = splitObservations(chip?.observations)
+  if (!split.present) return missingView('producer_sent_no_observations')
+  const candidates = split.work.filter(r => {
+    const id = obsOwn(r, 'identity')
+    if (obsOwn(id, 'kind') !== 'card' || obsOwn(id, 'work_id') !== chip.id) return false
+    for (const [k, mine] of [['board', chip.board], ['profile', chip.profile], ['gateway', chip.gateway]]) {
+      const theirs = obsOwn(id, k)
+      if (obsText(mine) && theirs !== undefined && theirs !== mine) return false
+    }
+    return true
+  })
+  if (!candidates.length) return missingView('no_observation_for_card', { capacityOnly: split.capacity.length > 0 })
+  const keys = new Set(candidates.map(r => sdk.executionIdentityKey(obsOwn(r, 'identity')) ?? 'invalid'))
+  let view
+  if (keys.size > 1) view = missingView('ambiguous_execution_identity', { sourced: true })
+  else {
+    const identity = obsOwn(candidates[0], 'identity')
+    view = keys.has('invalid') ? projectView(candidates[0], nowSec, sourceClass, sdk) : selectView(candidates, identity, nowSec, sourceClass, sdk)
+  }
+  // The row is session-tasks' cached copy after a failed read: whatever it last said, it is not current now.
+  if (chip.stale && view.state !== 'unknown') view = { ...view, lastKnown: view.state, state: 'unknown', freshness: 'stale', reason: 'cached_after_failed_read' }
+  return view
+}
+
+/** Capacity diagnostics for the chip, shown apart from work state. */
+export function chipCapacity(chip) {
+  const out = []
+  for (const r of splitObservations(chip?.observations).capacity) {
+    for (const k of ['reasons', 'diagnostics', 'machine_reasons']) {
+      for (const d of Array.isArray(obsOwn(r, k)) ? r[k] : []) if (obsText(obsOwn(d, 'code'))) out.push(d.code)
+    }
+    if (obsText(obsOwn(r, 'code'))) out.push(r.code)
+  }
+  return [...new Set(out)].slice(0, 3)
+}
+
+/** One plain line for a view (and a diagnostic line, if any). */
+export function observationLine(v, nowSec) {
+  const parts = [v.state === 'unknown' ? `unknown${v.reason ? ` (${v.reason.replace(/_/g, ' ')})` : ''}` : v.state.replace(/_/g, ' ')]
+  if (v.state === 'unknown' && v.lastKnown) parts.push(`last known ${v.lastKnown.replace(/_/g, ' ')}`)
+  if (v.ageSec != null) parts.push(`observed ${span(v.ageSec)} ago`)
+  if (v.wait) {
+    const w = v.wait
+    parts.push(`waiting: ${[w.kind, w.predicate].filter(Boolean).join(' ') || 'condition unknown'}${w.target ? ` on ${w.target}` : ''}${w.owner ? ` · owner ${w.owner}` : ''}${w.sinceAgeSec != null ? ` · ${span(w.sinceAgeSec)}` : ''}${w.dueInSec != null ? (w.dueInSec >= 0 ? ` · due in ${span(w.dueInSec)}` : ` · overdue ${span(-w.dueInSec)}`) : ''}`)
+  }
+  parts.push(v.progress ? `progress ${[v.progress.kind, `${span(v.progress.ageSec)} ago`, v.progress.ref && `(${v.progress.ref})`].filter(Boolean).join(' ')}` : 'progress unknown')
+  if (v.receipts) parts.push(v.state === 'done' ? 'verified completion receipt' : `${v.receipts} historical completion receipt${v.receipts === 1 ? '' : 's'}`)
+  if (v.id) parts.push(v.id)
+  return parts.join(' · ')
+}
+
+export const chipEvidenceLine = (chip, nowSec, opts) => {
+  const v = chipObservation(chip, nowSec, opts)
+  const cap = chipCapacity(chip)
+  return `${observationLine(v, nowSec)}${cap.length ? ` · capacity diagnostic (not work state): ${cap.join(', ')}` : ''}`
+}
 
 export function elapsed(sinceSec, nowMs = Date.now()) {
   if (!sinceSec) return ''
@@ -176,6 +339,8 @@ function taskChip(t, status) {
     waitingSince,
     // What the card asks the user to do, in its own words (Needs you shows this, never the card title).
     humanRequest: humanRequestOf(t.human_request),
+    // The producer's raw v1 work records (null = older producer); projected at render time, never here.
+    observations: Array.isArray(t.execution_observations) ? t.execution_observations : null,
     key: `kb:${taskKey(t.gateway || connectionId, t.board, t.id, t.profile)}`,
     kind: 'kanban',
     id: str(t.id),
@@ -908,6 +1073,7 @@ export function cardRowModel(chip, now = Date.now()) {
     meta: [chip.assignee, chip.gateway ? `on ${chip.gateway}` : '', activity && age ? `${activity} ${age} ago` : activity || (age ? `${age}` : '')]
       .filter(Boolean).join(' · '),
     note: chip.note || '',
+    evidence: chipEvidenceLine(chip, now / 1000),
     prLabel: pr ? `PR #${pr[1]}` : chip.prUrl ? 'PR' : '',
     prUrl: chip.prUrl || null
   }
@@ -950,6 +1116,11 @@ function CardRow({ chip, now }) {
             'data-session-task-wait': chip.look || 'waiting',
             style: { fontSize: 11, lineHeight: '15px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: chip.look === 'stalled' ? color : undefined, opacity: chip.look === 'stalled' ? 1 : 0.7 },
             children: m.wait
+          }),
+          jsx('span', {
+            'data-session-task-evidence': '',
+            style: { fontSize: 11, lineHeight: '15px', opacity: 0.7, overflowWrap: 'anywhere' },
+            children: `evidence: ${m.evidence}`
           }),
           (m.meta || m.note) && jsx('span', {
             style: { fontSize: 11, lineHeight: '15px', opacity: 0.7, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },

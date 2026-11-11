@@ -124,7 +124,7 @@ test('a card row reads as status, title, who, what happened last, note and PR', 
   })], { connectionId: 'conn', profile: 'default' })
   assert.deepEqual(m.cardRowModel(chip, now), {
     status: 'review', onHub: false, look: null, wait: '', title: 'Fix the flaky wake test', meta: 'worker · review requested 5m ago',
-    note: 'Opened the PR; CI green', prLabel: 'PR #42', prUrl: 'https://github.com/o/r/pull/42'
+    note: 'Opened the PR; CI green', evidence: 'unknown (sdk projector unavailable) · progress unknown', prLabel: 'PR #42', prUrl: 'https://github.com/o/r/pull/42'
   })
   const [unsafe] = m.sessionTaskChips([card('t_x', 'running', { pr_url: 'javascript:alert(1)' })], { connectionId: 'conn', profile: 'default' })
   assert.equal(m.cardRowModel(unsafe, now).prUrl, null, 'only GitHub links render as links')
