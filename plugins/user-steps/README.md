@@ -160,7 +160,8 @@ crash between the board commit and outbox acknowledgment. Dedicated metadata
 cards described above remain on their separate delivery path.
 
 Requires core `archive_task(precondition=..., comment=..., event_extra=...)`;
-deploy core before this plugin. `action_request` kinds are explicitly enumerated:
+on an older core the projection publishes no tiles (logged "Card projection paused") instead
+of offering clicks that cannot be delivered. `action_request` kinds are explicitly enumerated:
 `approval`, `choice`, `input`, `external_step` (not `decision` or `question`).
 
 Tests: `test_kanban_mirror.py` covers projection, exact values, lifecycle and REST;
