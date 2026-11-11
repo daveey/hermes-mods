@@ -70,9 +70,10 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 - `ssh host 'cmd'` runs a non-login shell whose PATH lacks `~/bin` (where the hub's `gh` lives). A script that
   resolves tools with `which` / `shutil.which` passes under the agent's own terminal, then refuses mid-apply on the
   owner route. Before running a reviewed hub apply this way, check that the package pins absolute tool paths, or
-  that its read-only `check` exercises the same lookup. On a hub, also wait until `~/.hermes/core-update/drain-hold`
-  is gone before an apply: a core-update drain restarts owner gateways, so the owner check fails or the apply rolls
-  back.
+  that its read-only `check` exercises the same lookup. On a hub, also wait for the core-update drain to end before an apply: a drain restarts owner gateways, so the
+  owner check fails or the apply rolls back. Test `[ -e ~/.hermes/core-update/drain-hold ]` (it follows the link):
+  the path is a symlink to an episode file and is deliberately left dangling when the drain ends, so waiting for
+  the path itself to disappear never finishes.
 - Remote hosts too: `ssh -t <host> 'sudo ...'`. When the SSH key is refused, run
   `ssh-copy-id -i ~/.ssh/id_ed25519.pub <user>@<host>` there.
 - Get a go-ahead in chat first for anything destructive: the window runs the command at once, with no y/N step.
