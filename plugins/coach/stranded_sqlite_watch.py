@@ -23,6 +23,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+
 SIDECARS = ("kanban.db-wal", "kanban.db-shm", "state.db-wal", "state.db-shm")
 DELETED = " (deleted)"
 CMDLINE_MAX = 200
@@ -111,13 +120,14 @@ def card_body(host: str, f: dict) -> str:
         f"- fd {s['fd']}: `{s['path']} (deleted)`, inode ctime "
         f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(s['deleted_ctime'])) if s['deleted_ctime'] else '?'}"
         for s in f["sidecars"])
-    return f"""Detected by stranded_sqlite_watch.py on {host}.
+    seen = fence_evidence(f"Detected by stranded_sqlite_watch.py on {host}.\n- pid {f['pid']} (start time "
+                          f"{f['starttime']} ticks since boot)\n- cmdline: `{f['cmdline']}`\n- db: `{f['db']}`\n{side}")
+    return f"""A process holds deleted SQLite WAL/SHM sidecars.
+
+{home_pin_note("the process, its descriptors and the database exist only on the host that detected them")}
 
 ## Evidence
-- pid {f['pid']} (start time {f['starttime']} ticks since boot)
-- cmdline: `{f['cmdline']}`
-- db: `{f['db']}`
-{side}
+{seen}
 
 ## What it means
 This process still holds deleted WAL/SHM sidecars. This can indicate a stale generation for a live database,
@@ -137,7 +147,7 @@ lock loss. Entire absent profile homes are excluded as retired-reader cleanup; r
 
 def create_argv(host: str, f: dict) -> list:
     return ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", card_key(host, f),
-            "--created-by", "stranded-sqlite-watch", "--body-file", "-", "--json",
+            "--created-by", "stranded-sqlite-watch", "--body-file", "-", "--json", *HOME_REQUIRES_ARGV,
             f"Process {f['pid']} stranded on deleted {Path(f['db']).name} WAL/SHM"]
 
 

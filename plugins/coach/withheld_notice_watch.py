@@ -26,6 +26,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+
 PREFIXES = ("I withheld a", "The workflow remains stopped", "I suppressed a repeated")
 AUTHOR = "withheld-notice-watch"
 
@@ -108,13 +117,16 @@ def _hits_md(hits: list) -> str:
 
 def card_body(host: str, hits: list) -> str:
     sessions = sorted({h["session"] for h in hits})
-    return f"""ask-gate delivered {len(hits)} bare "withheld" notice(s) to David on {host} in {len(sessions)} session(s).
+    seen = fence_evidence(f"Seen on {host}: {len(hits)} bare notice(s) in {len(sessions)} session(s).\n\n{_hits_md(hits)}")
+    return f"""ask-gate delivered bare "withheld" notice(s) to David.
 A bare notice means the gate replaced a whole reply with a fixed sentence: David lost the findings and got no reason.
 Since the agent-37decfd37a fix the gate holds first and then keeps the draft minus the refused ask, so a bare notice
 is now the last-resort path: the refused ask could not be cut out cleanly, or the gate errored after a rejection.
 
+{home_pin_note("the diagnosis reads this gateway's own ask-gate log and chat store, which a worker node does not have")}
+
 ## Hits
-{_hits_md(hits)}
+{seen}
 
 ## Do this
 1. For each session, read `~/.hermes/logs/ask-gate.jsonl` around the hit time (`refused_held`, `refused_replaced`
@@ -135,9 +147,9 @@ def file_card(home: Path, host: str, now: datetime, hits: list, runner: Callable
     st = load_state(home)
     tid = (st.get("cards") or {}).get(key)
     if not tid:
-        title = f"ask-gate delivered {len(hits)} bare withheld notice(s) on {host}"
+        title = f"ask-gate delivered {len(hits)} bare withheld notice(s)"
         r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
-                          "--created-by", AUTHOR, "--body-file", "-", "--json", title], card_body(host, hits))
+                          "--created-by", AUTHOR, "--body-file", "-", "--json", *HOME_REQUIRES_ARGV, title], card_body(host, hits))
         if r.returncode != 0:
             return {"key": key, "action": "create_failed", "out": ((r.stdout or "") + (r.stderr or ""))[-300:]}
         try:

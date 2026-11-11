@@ -38,6 +38,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+
 NEEDLE = "Timed out connecting to Hermes backend"
 STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} (?:([+-]\d{2}:\d{2}) )?")
 API_RE = re.compile(r"\[hermes:api (?:[A-Z]+ )?(\S+?)\]")
@@ -301,15 +310,14 @@ def _host_md(probe: dict) -> str:
 
 
 def card_title(host: str, rep: dict, window_min: int) -> str:
-    return f"Desktop backend timeouts on {host}: {rep['count']} in {window_min} min"
+    return f"Desktop backend timeouts: {rep['count']} in {window_min} min"
 
 
 def card_body(host: str, rep: dict, probe: dict, threshold: int, window_min: int) -> str:
-    return f"""Detected by hermes-mods plugins/coach/backend_timeouts.py (cron, every 10 min) on {host}.
+    seen = fence_evidence(f"""Detected by hermes-mods plugins/coach/backend_timeouts.py (cron, every 10 min) on {host}.
 
 The Desktop app on {host} logged {rep['count']} "{NEEDLE}" lines in the last {window_min} min
-({rep['first']} .. {rep['last']}, explicit UTC offsets; threshold {threshold}). Users see this as chats that won't load,
-archive asking "task status unavailable", stale boards.
+({rep['first']} .. {rep['last']}, explicit UTC offsets; threshold {threshold}).
 Of these, {rep.get("awake_count", rep["count"])} occurred while awake and
 {rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals (of which {rep.get("sleep_spanning_count", 0)} landed
 after a wake but were issued before it).
@@ -321,7 +329,14 @@ Awake timeouts by backend connection: {rep.get("awake_by_conn") or "(none)"}; by
 {_paths_md(rep)}
 
 ## Host
-{_host_md(probe)}
+{_host_md(probe)}""")
+    return f"""The Desktop backend timed out on requests. Users see this as chats that won't load,
+archive asking "task status unavailable", stale boards.
+
+{home_pin_note("the diagnosis times the local backend and samples its busiest process, which only the gateway that logged the timeouts has")}
+
+## Evidence
+{seen}
 
 ## Do this
 1. Find what makes the backend slow (it is usually CPU-starved or a request is doing heavy work per call): time the
@@ -410,7 +425,7 @@ def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, thre
             key = f"{daily_key}:{sequence}"
         r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
                           "--created-by", "backend-timeouts-watch", "--body-file", "-", "--json",
-                          card_title(host, rep, window_min)],
+                          *HOME_REQUIRES_ARGV, card_title(host, rep, window_min)],
                  card_body(host, rep, probe, threshold, window_min) + previous)
         if r.returncode != 0:
             return {"key": key, "action": "create_failed", "rc": r.returncode,

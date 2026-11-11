@@ -155,13 +155,27 @@ def audit(items: list[dict], now: float) -> dict:
     return out
 
 
+def _fence_evidence():
+    """coach's shared ``fence_evidence`` (the filing plugin owns it), loaded by path; plain text if coach is absent."""
+    for root in (Path(__file__).resolve().parents[1], Path(__file__).parents[1]):
+        helper = root / "coach" / "placement_evidence.py"
+        if helper.is_file():
+            spec = importlib.util.spec_from_file_location("_inbox_junk_placement_evidence", helper)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.fence_evidence
+    return lambda text: text
+
+
 def card_body(res: dict) -> str:
-    lines = ["Daily Inbox strict audit: ANY untouched archive, test/status card, or unregistered poster is a finding.",
+    """Instructions first; the findings (gateway names, session ids, poster titles) are fenced evidence, so the
+    producer repair this card asks for is judged on its own words, not on where the junk was seen."""
+    head = ["Daily Inbox strict audit: ANY untouched archive, test/status card, or unregistered poster is a finding.",
              "This is separate from the unchanged consecutive-archive noise breaker. An archive does not prove",
              "why a draft was rejected. Investigate the producer without suppressing legitimate publication, spend",
              "or login decisions. Preserve history; do not relabel archived publication drafts to claim zero junk.",
-             "Reuse existing producer repair owners; do not duplicate their work or post to the Inbox.",
-             "Bounds/gaps: " + json.dumps(res.get("observation", {}), sort_keys=True), ""]
+             "Reuse existing producer repair owners; do not duplicate their work or post to the Inbox.", ""]
+    lines = ["Bounds/gaps: " + json.dumps(res.get("observation", {}), sort_keys=True), ""]
     for f in res.get("strict_findings", []):
         lines.append(f"- strict {','.join(f['reasons'])} on {f['gw']} / {f['session_id']}: "
                      f"{f['family']} `{f['key']}` {str(f['title'])[:100]}"
@@ -174,7 +188,7 @@ def card_body(res: dict) -> str:
                      f"{' (NEW)' if f['fresh'] else ''}: {str(f['title'])[:80]}")
     for f in res["test_cards"]:
         lines.append(f"- test/probe card on {f['gw']}{' (NEW)' if f['fresh'] else ''}: `{f['key']}` {str(f['title'])[:80]}")
-    return "\n".join(lines)
+    return "\n".join(head) + "\n" + _fence_evidence()("\n".join(lines))
 
 
 def file_card(res: dict, now: float, runner=subprocess.run) -> str | None:

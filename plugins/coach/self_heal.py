@@ -45,6 +45,17 @@ else:  # Standalone plugin/cron/CLI loader.
     CROSS_SESSION_HEADER = _reply_check.CROSS_SESSION_HEADER
     CROSS_SESSION_RE = _reply_check.CROSS_SESSION_RE
 
+# The placement helper (fence_evidence / home_pin_note) is shared by every coach card producer.
+if __package__:
+    from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, fence_evidence, home_pin_note
+else:
+    _spec = importlib.util.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    assert _spec and _spec.loader
+    _placement_evidence = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_placement_evidence)
+    EVIDENCE_OPEN, EVIDENCE_CLOSE = _placement_evidence.EVIDENCE_OPEN, _placement_evidence.EVIDENCE_CLOSE
+    fence_evidence, home_pin_note = _placement_evidence.fence_evidence, _placement_evidence.home_pin_note
+
 COMPONENTS = ("agent", "desktop", "plugin", "cron", "kanban", "bot", "gateway", "provider", "browser", "bb", "other")
 
 OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
@@ -1357,8 +1368,14 @@ FIX_REQUIRES = ("terminal", "file", "git")
 VERIFY_TITLE = "self-heal verify:"
 VERIFY_RUNTIME = 3600
 VERIFY_SKILLS = ("five-whys", "hermes-mods-repo")
-# Same strings as core's kanban_placement.EVIDENCE_OPEN/CLOSE: the placement scan skips a complete fenced block.
-EVIDENCE_OPEN, EVIDENCE_CLOSE = "<!-- placement:evidence -->", "<!-- /placement:evidence -->"
+# EVIDENCE_OPEN/CLOSE (same strings as core's kanban_placement) come from placement_evidence.py: the placement scan
+# skips a complete fenced block. Reasons a self-heal card stays on the gateway that filed it:
+PIN_INVESTIGATION = "it reads this gateway's own logs, state files and coach store, which a worker node does not have"
+PIN_FIX = "it records its result in this gateway's coach lane and verifies live on it"
+PIN_VERIFY = "its live check and lane event need this gateway's coach store and logs"
+PIN_BACKPORT = "it patches a checkout that exists only on the gateway that raised the error"
+PIN_DEPLOY = "it checks this gateway's sync log and its connection to the other hosts"
+PIN_LANE = "it repairs this gateway's own self-heal lane and its cron"
 STUCK_PROPOSAL_S = 2 * 3600  # proposed, budget open, no fix card for this long = the lane is not filing
 PULL_FAIL_CARD_AFTER = 3     # consecutive coach-data pull failures before the lane files its own card
 CREATED_BY = "self-heal"
@@ -1695,13 +1712,7 @@ def investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[
                     "on old code; filed now because it kept happening or came after the window):\n" +
                     "".join(f"- {_pt(h['at'])} on {h.get('host') or '?'} ({h.get('source') or '?'})\n" for h in held))
     proposal = f"~/.hermes/coach/selfheal/{fp}/proposal.md"
-    return f"""Self-heal investigation for defect `{fp}`. Nothing here needs a human; David's standing approval of this
-lane covers the investigation AND the fix. You do NOT ship the fix yourself: you write the proposal, and the lane's
-next pass auto-approves it and starts the fix card. Post NOTHING to the Inbox (David only wants finished fixes there).
-Budget for this card <= ${INVESTIGATION_BUDGET}.
-
-## Evidence (from the detector)
-- Symptom: {d.get('symptom') or '?'}
+    evidence = fence_evidence(f"""- Symptom: {d.get('symptom') or '?'}
 - Component: {comp} · detector: {d.get('source') or '?'} ({d.get('kind') or '?'}, p={d.get('p_defect', '?')})
 - When: {when} · host: {d.get('host') or '?'} · session: {('@session:' + (d.get('profile') or 'default') + '/' + sid) if sid else 'none (no chat, e.g. a cron run)'}
 - Quote: "{(d.get('quote') or '').strip()[:500]}"
@@ -1709,7 +1720,15 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
 {('- Stop evidence (captured on ' + str(d.get('stop_host') or d.get('host') or '?') + '): cause ' +
   str(d.get('stop_cause')) + (' — ' + str(d.get('stop_evidence'))[:600] if d.get('stop_evidence') else
   ' (no update receipt, mods-reload, gateway exit or sleep line in the window)'))
- if d.get('stop_cause') else ''}
+ if d.get('stop_cause') else ''}""")
+    return f"""Self-heal investigation for defect `{fp}`. Nothing here needs a human; David's standing approval of this
+lane covers the investigation AND the fix. You do NOT ship the fix yourself: you write the proposal, and the lane's
+next pass auto-approves it and starts the fix card. Post NOTHING to the Inbox (David only wants finished fixes there).
+Budget for this card <= ${INVESTIGATION_BUDGET}.
+{home_pin_note(PIN_INVESTIGATION)}
+
+## Evidence (from the detector)
+{evidence}
 {rec}
 ## Do this
 1. Reproduce or confirm it LIVE, not from the transcript alone. Scope it from the user's own words and the session's
@@ -1755,10 +1774,7 @@ def _proposal_text(fp: str, st: dict) -> str:
         return f"(proposal file {proposal} missing: read the investigation card {st.get('card') or '?'} comments)"
 
 
-def fenced_evidence(text: str) -> str:
-    """``text`` inside the placement evidence fence (markers in it are dropped: they would end the fence early)."""
-    inner = (text or "").replace(EVIDENCE_OPEN, "").replace(EVIDENCE_CLOSE, "")
-    return f"{EVIDENCE_OPEN}\n{inner}\n{EVIDENCE_CLOSE}"
+fenced_evidence = fence_evidence  # the old name; the shared helper lives in placement_evidence.py
 
 
 def split_fix(st: dict, board: Optional[str]) -> bool:
@@ -1811,7 +1827,8 @@ the evidence you get (it describes where it happened, not where you work).
 def verify_brief(fp: str, st: dict, fix_card: str) -> str:
     """The VERIFY child (host_repo, stays here): host steps, live check, and the lane event, from the fix's handoff."""
     return f"""Self-heal VERIFY for defect `{fp}`: owner/fix card {fix_card} (its parent here).
-Symptom to verify: {st.get('symptom') or fp}
+{home_pin_note(PIN_VERIFY)}
+{fence_evidence('Symptom to verify: ' + str(st.get('symptom') or fp))}
 A completed card or a commit in its metadata is not proof that this symptom was fixed. The owner may be an
 adopted investigation or unrelated session card, not a self-heal fix card. First confirm the handoff addresses
 this exact defect. If investigation led to another fix card, follow that handoff and wait for its delivery.
@@ -1859,9 +1876,10 @@ def fix_brief(fp: str, st: dict) -> str:
     return f"""Self-heal FIX for defect `{fp}`. The proposal below is approved (David's standing self-heal approval;
 the lane auto-approves every proposal). Post nothing to the Inbox: the result is recorded quietly (step 6).
 Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGET}.
+{home_pin_note(PIN_FIX)}
 
-## Approved proposal
-{text}
+## Approved proposal (evidence)
+{fence_evidence(text)}
 
 ## Acceptance (all of it, in order)
 1. Re-check the defect still reproduces on the current code (it may have been fixed meanwhile: then say so, run
@@ -3937,10 +3955,7 @@ def _logged_fix_shas(store, fp: str) -> list:
 
 
 def backport_brief(d: dict, fp: str, st: dict, dec: dict) -> str:
-    return f"""Self-heal BACKPORT for defect `{fp}`: a runtime on {d.get('host')} still raises an error that fix
-{dec['sha'][:12]} (card {st.get('fix_card') or '?'}) already removed on main. That fix held; this checkout never
-got it, so this is not a "came back" investigation.
-
+    seen = fence_evidence(f"""Host: {d.get('host')}
 Checkout: {dec['checkout']}
 HEAD:     {dec['head']}  (does not contain {dec['sha']}, and the fix's diff is not in its working tree)
 Symptom:  {d.get('symptom')}
@@ -3948,7 +3963,13 @@ Symptom:  {d.get('symptom')}
 Evidence (traceback, home shown as ~):
 ```
 {str(d.get('details') or '')[-1500:]}
-```
+```""")
+    return f"""Self-heal BACKPORT for defect `{fp}`: a runtime still raises an error that fix
+{dec['sha'][:12]} (card {st.get('fix_card') or '?'}) already removed on main. That fix held; this checkout never
+got it, so this is not a "came back" investigation.
+{home_pin_note(PIN_BACKPORT)}
+
+{seen}
 
 Do this:
 1. Find who owns that checkout before touching it: a RUNBOOK.md next to it, the systemd unit or process running
@@ -4004,13 +4025,15 @@ def _file_backport(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[str
 
 
 def undeployed_brief(d: dict, fp: str, st: dict, dec: dict) -> str:
+    seen = fence_evidence(f"Host: {d.get('host')}\nLatest occurrence: {_iso(float(dec.get('at') or 0))}: {d.get('symptom')}")
     return f"""Self-heal DEPLOY check for defect `{fp}`: fix {dec['sha'][:12]} (card {st.get('fix_card') or '?'}) landed
-on the state branch at about {_iso(float(st.get('fixed_at') or 0))}, and host `{dec['label']}` ({d.get('host')}) still
+on the state branch at about {_iso(float(st.get('fixed_at') or 0))}, and host `{dec['label']}` still
 has no `sync: {dec['label']}` commit containing it. Its newest sync commit is {_iso(dec['last_sync'])}. Its post-fix
 occurrences are held as "not deployed", not filed as "the fix didn't hold"; this card exists so that hold doesn't
 go on silently.
+{home_pin_note(PIN_DEPLOY)}
 
-Latest occurrence: {_iso(float(dec.get('at') or 0))}: {d.get('symptom')}
+{seen}
 
 Do this:
 1. Find out why the host isn't syncing: is it reachable (`tailscale status`, the hub's hosts view), and when did
@@ -4433,9 +4456,11 @@ def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optio
             else:
                 lines = "\n".join(f"- `{r.get('id')}` ({r.get('symptom')}), session {r.get('session_id')}: "
                                   f"{str(r.get('note') or '')[:200]}" for r in recent[-10:])
+                seen = fence_evidence(lines + "\n\n" + f"Rows: {path} (label 0).")
                 body = (f"The self-heal turn-end audit (AUDIT_SYS + admission_prompt in "
                         f"plugins/coach/self_heal.py) filed {len(recent)} findings in {ADMISSION_NEG_DAYS} days that "
-                        f"investigation closed as not_defect:\n{lines}\n\nRows: {path} (label 0). Find what these "
+                        f"investigation closed as not_defect.\n{home_pin_note(PIN_LANE)}\n\n"
+                        f"{seen}\n\nFind what these "
                         f"turns share that the audit misreads (five-whys), change the prompt or rule, and gate it with "
                         f"`plugins/coach/eval/selfheal_replay.py --mode admission` over these rows plus known real "
                         f"catches (fixed admission fingerprints): false alarms under {AUDIT_THRESHOLD} on 3 of 3 "
@@ -5024,14 +5049,15 @@ def note_pull(store, err: Optional[str], now: float, runner=None) -> Optional[di
     res = None
     if st["fails"] >= PULL_FAIL_CARD_AFTER and not _open_card(path, runner):
         host = host_name()
-        body = (f"The self-heal lane on {host} could not refresh the coach digests {st['fails']} runs in a row "
-                f"(since {_iso(st['since'])}). It keeps running on the digests it has (Inbox outcomes, queue drain and "
-                f"fix filing still work), but the digest backstop judges stale turns.\n\n"
-                f"git error:\n```\n{st['error']}\n```\n\n"
+        body = (f"The self-heal lane could not refresh the coach digests. It keeps running on the digests it has "
+                f"(Inbox outcomes, queue drain and fix filing still work), but the digest backstop judges stale "
+                f"turns.\n{home_pin_note(PIN_LANE)}\n\n"
+                + fence_evidence(f"Seen on {host}: {st['fails']} runs in a row (since {_iso(st['since'])}).\n"
+                                 f"git error:\n```\n{st['error']}\n```") + "\n\n"
                 "Find what leaves the coach data clone unpullable (uncommitted tracked edits from a local writer, a "
                 "conflicted index, auth), fix it at the writer, and preserve its rows (commit + push, never discard). "
                 "Done when `selfheal_data_pull_recovered` appears in <coach>/log.jsonl.")
-        res = _lane_card(f"self-heal lane: coach-data pull failing on {host}", body,
+        res = _lane_card("self-heal lane: coach-data pull failing", body,
                          f"selfheal-data-pull:{host}:{time.strftime('%Y-%m-%d', time.gmtime(now))}", runner)
         if res.get("card"):
             st["card"] = res["card"]
@@ -5091,14 +5117,16 @@ def check_stuck(store=None, now: Optional[float] = None, budget_fn=None, runner=
     errs = [r.get("error") for r in _recent_events(store.root, "selfheal_file_error", now - 86400)][-3:]
     host = host_name()
     lines = "\n".join(f"- {fp}: proposed {a / 3600:.1f} h ago" for fp, a in stuck[:20])
-    body = (f"{len(stuck)} self-heal fingerprint(s) on {host} are `proposed` with no fix card although the budget "
-            f"admits one (oldest {stuck[0][1] / 3600:.1f} h; threshold {STUCK_PROPOSAL_S // 3600} h). The lane cron "
-            f"(`self_heal.cron` -> `sync`) files these every 5 min, so it is failing or not running.\n\n{lines}\n\n"
+    seen = (f"Seen on {host}: {len(stuck)} self-heal fingerprint(s) are `proposed` with no fix card although the "
+            f"budget admits one (oldest {stuck[0][1] / 3600:.1f} h; threshold {STUCK_PROPOSAL_S // 3600} h).\n\n{lines}\n\n"
             + (f"Lane cron: {lane_status}\n\n" if lane_status else "")
-            + (f"Recent selfheal_file_error: {json.dumps(errs)[:900]}\n\n" if errs else "")
+            + (f"Recent selfheal_file_error: {json.dumps(errs)[:900]}" if errs else ""))
+    body = (f"Self-heal fingerprints are `proposed` with no fix card although the budget admits one. The lane cron "
+            f"(`self_heal.cron` -> `sync`) files these every 5 min, so it is failing or not running.\n"
+            f"{home_pin_note(PIN_LANE)}\n\n{fence_evidence(seen)}\n\n"
             + "Fix the lane (read the cron's last output, `self_heal.py status`), then confirm the next pass logs "
               "`selfheal_approved` for these. Do not file fix cards by hand for fingerprints another card owns.")
-    res = _lane_card(f"self-heal lane: {len(stuck)} proposals stuck without fix cards on {host}", body,
+    res = _lane_card(f"self-heal lane: {len(stuck)} proposals stuck without fix cards", body,
                      f"selfheal-stuck:{host}:{time.strftime('%Y-%m-%d', time.gmtime(now))}", runner)
     if res.get("card"):
         path.write_text(json.dumps({"card": res["card"], "at": now}))

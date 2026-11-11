@@ -29,6 +29,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+
 AUTHOR = "pre-verify-latency-watch"
 WINDOW_S = 24 * 3600
 SPAN_S = 23 * 3600  # "stays over the limit for a day": the window must cover (nearly) a whole day of samples
@@ -143,12 +152,13 @@ def _run(runner: Callable, argv: list, body: Optional[str] = None):
 def card_body(host: str, s: dict, limit_s: float, slow: list) -> str:
     worst = "\n".join(f"- {datetime.fromtimestamp(r[0]).strftime('%m-%d %H:%M:%S')} session `{r[2]}`: {r[1]:.1f}s"
                       for r in slow[:15])
-    return f"""On {host} the end-of-turn reply check (`pre_verify` hooks) took p90 {s['p90_s']}s over the last day
-({s['count']} turns, {s['over_20s']} over 20 s, max {s['max_s']}s; limit {limit_s}s). That time is spent after the answer
+    seen = fence_evidence(f"Seen on {host}: the end-of-turn reply check (`pre_verify` hooks) took p90 {s['p90_s']}s "
+                          f"over the last day ({s['count']} turns, {s['over_20s']} over 20 s, max {s['max_s']}s; "
+                          f"limit {limit_s}s).\n\n## Slowest turns\n{worst}")
+    return f"""The end-of-turn reply check (`pre_verify` hooks) is slow. That time is spent after the answer
 has streamed: the user watches "Checking the reply before finishing…" under a finished answer (agent-7aa110cfd7).
 
-## Slowest turns
-{worst}
+{seen}
 
 ## Do this
 1. Match the slow sessions/times to `<HERMES_HOME>/coach/log.jsonl` `report_only_scored` / `reply_checked` /
@@ -168,7 +178,7 @@ def file_card(home: Path, host: str, now: datetime, s: dict, limit_s: float, slo
     tid = (st.get("cards") or {}).get(key)
     if tid:
         return {"key": key, "action": "already_filed", "task_id": tid}
-    title = f"coach reply check p90 {s['p90_s']}s over a day on {host} (limit {limit_s:g}s)"
+    title = f"coach reply check p90 {s['p90_s']}s over a day (limit {limit_s:g}s)"
     r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
                       "--created-by", AUTHOR, "--body-file", "-", "--json", title], card_body(host, s, limit_s, slow))
     if r.returncode != 0:
