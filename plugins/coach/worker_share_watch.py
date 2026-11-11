@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Worker-share watch: spill audited portable cards when the hub is full and a pool worker has room.
+"""Worker-share watch: spill audited portable cards when hub admission is constrained.
 
 The hub's dispatcher offers a card to the worker pool only when creation marked it worker-first
 (``placement_policy``); every other ready card waits for one of the hub's own slots (``max_card_runs``). In
 kanban-12ee0e4b65 that left the hub at its cap in 95 of 121 ten-minute slots while worker-1 ran 3 cards a day, and
 nothing noticed: the rollout check only tested fake probe cards. This watch samples the live board each run (hub
-cron, every 10 min): the hub at cap, a pool worker below its cap, and unmarked ready cards waiting. Three samples in
+cron, every 10 min): the hub at cap, draining, or refusing admission; a pool worker with room and cards waiting. Three samples in
 a row move at most three never-started, explicitly audited portable cards through core's move CLI. Pending
 pins reserve capacity. Missing audits and host-bound reasons never move. If no move succeeds, one diagnostic
 card per day is pinned to a pool worker with room, listing core's refusal reasons.
@@ -116,14 +116,45 @@ def card_reason(card: dict, reason_fn: Callable[[dict], Optional[str]]) -> str:
     return value or "portable (not re-enrolled)"
 
 
-def sample(registry: dict, waiting: list, now_ms: int, reason_fn: Callable[[dict], Optional[str]]) -> dict:
-    """One observation: is the hub full while a fresh pool worker has room and unmarked cards wait?"""
+def hub_pressure(home: Path, now_ms: int) -> list[str]:
+    """Read local admission evidence in the last ten-minute sampling window."""
+    from datetime import datetime
+
+    pressure = ['drain'] if (home / 'core-update' / 'drain-hold').exists() else []
+    # Bounded tails, including the last rotation. Logging uses local wall time.
+    for name in ('agent.log', 'agent.log.1'):
+        try:
+            with (home / 'logs' / name).open('rb') as stream:
+                stream.seek(0, 2)
+                start = max(0, stream.tell() - 2 * 1024 * 1024)
+                stream.seek(start)
+                if start:
+                    stream.readline()
+                lines = stream.read().decode('utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if 'Hub admission refused' not in line:
+                continue
+            try:
+                at = datetime.fromisoformat(line[:23].replace(',', '.')).timestamp() * 1000
+            except (ValueError, OverflowError):
+                continue
+            if now_ms - 600000 <= at <= now_ms:
+                return pressure + ['admission']
+    return pressure
+
+
+def sample(registry: dict, waiting: list, now_ms: int, reason_fn: Callable[[dict], Optional[str]],
+           pressure: Optional[list[str]] = None) -> dict:
+    """One observation: is hub admission constrained while a fresh pool worker has room?"""
     machines = registry.get("machines") or {}
     me = registry.get("me") or "hub"
     hub = machines.get(me) or {}
     hub_runs, hub_cap = _runs(hub), hub.get("max_card_runs")
     hub_full = (_fresh(hub, now_ms) and isinstance(hub_cap, int) and hub_cap > 0
                 and hub_runs is not None and hub_runs >= hub_cap)
+    pressure = (["cap"] if hub_full else []) + list(pressure or [])
     room = {}
     for name, m in machines.items():
         cap = m.get("max_card_runs")
@@ -140,7 +171,7 @@ def sample(registry: dict, waiting: list, now_ms: int, reason_fn: Callable[[dict
             reasons[f"check failed: {type(exc).__name__}"] += 1
     return {"at": now_ms, "hub": me, "hub_runs": hub_runs, "hub_cap": hub_cap, "hub_full": hub_full,
             "room": room, "waiting": len(waiting), "reasons": dict(reasons.most_common()),
-            "starved": bool(hub_full and room and waiting)}
+            "hub_pressure": pressure, "starved": bool(pressure and room and waiting)}
 
 
 def state_path(home: Path) -> Path:
@@ -172,7 +203,8 @@ def card_body(s: dict, streak: int, examples: list) -> str:
 Live host-only verification belongs on a separate capability owner, not this portable implementation.
 
 <!-- placement:evidence -->
-The hub ran {s['hub_runs']}/{s['hub_cap']} cards for {streak} samples in a row (10 min apart) while
+The hub was constrained ({', '.join(s.get('hub_pressure', ['cap']))}); latest runs {s['hub_runs']}/{s['hub_cap']},
+for {streak} samples in a row (10 min apart) while
 {room} had room and {s['waiting']} ready cards waited unmarked: the dispatcher only offers worker-first cards
 (`placement_policy`) to the pool, so these wait for a hub slot. Found by {AUTHOR} (hermes-mods
 plugins/coach/worker_share_watch.py, kanban-12ee0e4b65).
@@ -204,7 +236,7 @@ def file_card(s: dict, streak: int, examples: list, runner: Callable = subproces
               day: Optional[str] = None, home: Optional[Path] = None) -> Optional[str]:
     day = day or time.strftime("%Y-%m-%d", time.gmtime(s["at"] / 1000))
     top = next(iter(s["reasons"]), "?")
-    argv = ["hermes", "kanban", "create", f"worker share: hub full, {s['waiting']} cards wait unmarked (top: {top})",
+    argv = ["hermes", "kanban", "create", f"worker share: hub constrained, {s['waiting']} cards wait unmarked (top: {top})",
             "--body", card_body(s, streak, examples), "--assignee", "default", "--created-by", AUTHOR,
             "--idempotency-key", f"{AUTHOR}:{day}", "--requires", "terminal", "--requires", "file",
             "--requires", "git", "--runs-on", f"machine:{max(s['room'], key=s['room'].get)}", "--json"]
@@ -278,7 +310,7 @@ def spill(home: Path, s: dict, reason_fn: Callable, runner: Callable, limit: int
         finally:
             con.close()
         argv = ['hermes', 'kanban', 'move', card['id'], '--runs-on', f'machine:{machine}',
-                '--reason', f'{AUTHOR}: hub at cap; audited portable, never started; pool has room', '--json']
+                '--reason', f'{AUTHOR}: hub constrained; audited portable, never started; pool has room', '--json']
         try:
             result = runner(argv, capture_output=True, text=True, timeout=120,
                             env={**os.environ, 'HERMES_HOME': str(home), 'HERMES_KANBAN_DB': str(db)})
@@ -298,7 +330,7 @@ def run(home: Path, *, registry_fn: Callable[[], object], reason_fn: Callable[[d
         runner: Callable = subprocess.run, max_moves: int = MAX_MOVES) -> dict:
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     waiting = waiting_unmarked(home / "kanban.db")
-    s = sample(dict(registry_fn() or {}), waiting, now_ms, reason_fn)
+    s = sample(dict(registry_fn() or {}), waiting, now_ms, reason_fn, hub_pressure(home, now_ms))
     st = load_state(home)
     streak = (int(st.get("streak") or 0) + 1) if s["starved"] else 0
     out = {"sample": s, "streak": streak, "filed": None, "moved": [], "move_errors": []}
@@ -307,7 +339,7 @@ def run(home: Path, *, registry_fn: Callable[[], object], reason_fn: Callable[[d
     if streak >= streak_needed:
         out["moved"], out["move_errors"] = spill(home, s, reason_fn, runner, max_moves)
         waiting = waiting_unmarked(home / "kanban.db")
-        s = sample(dict(registry_fn() or {}), waiting, now_ms, reason_fn)
+        s = sample(dict(registry_fn() or {}), waiting, now_ms, reason_fn, hub_pressure(home, now_ms))
     day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
     pending = pending_pins(home / 'kanban.db')
     s['room'] = {m: n - pending[m] for m, n in s['room'].items() if n > pending[m]}

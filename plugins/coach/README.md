@@ -1314,8 +1314,12 @@ The hub's dispatcher only offers worker-first cards (`placement_policy`) to its 
 waits for one of the hub's own `max_card_runs` slots (kanban-12ee0e4b65: the hub sat at its cap for most of a day
 while worker-1 ran 3 cards). A hermes cron job on hermes-hub (no-agent, every 10 min, "worker-share watch (hub)")
 runs it with the Hermes runtime: each run samples the worker registry and the board. After three consecutive
-samples at hub capacity with a fresh eligible pool worker, it moves up to three (`--max-moves`) ready unpinned
+samples under hub pressure with a fresh eligible pool worker, it moves up to three (`--max-moves`) ready unpinned
 cards with an **explicit NULL creation audit**, no prior run/claim, and a still-portable current replay.
+Hub pressure means runs at cap, `core-update/drain-hold` present, or a timestamped `Hub admission refused`
+record in the last ten minutes. Bounded tails of `logs/agent.log` and its latest rotation are read using the
+logger's local timezone; old, future and malformed timestamps do not trigger pressure. JSON samples expose
+`hub_pressure` separately from `hub_full`. Regression tests: `tests/test_worker_share_admission.py`.
 Missing audits, marker refusals and prior-run scratch remain untouched. Core's move CLI owns all writes and
 `moved` events; a fresh event plus the exact target pin must read back before reporting success. Pending ready
 pins reserve capacity, CLI errors/timeouts stop the batch, and a nonblocking file lock prevents overlapping cron ticks.
