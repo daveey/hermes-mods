@@ -503,7 +503,7 @@ def _verify_operation(auth, mapping, owner_card, home):
     if not path.is_file():
         raise RootCapError("approval operation store not found")
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        conn = _acceptance()._ro_connect(path, timeout=5)
         conn.row_factory = sqlite3.Row
         try:
             op_row = conn.execute("select body, request, revision from operations where id=? and namespace=? "
