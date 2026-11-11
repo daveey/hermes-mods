@@ -47,6 +47,22 @@ A macOS LaunchDaemon needs sudo on that host: run it through `run_in_user_termin
    Worker, so local probes (two idle checks, pidfd children) race job assignment and lose jobs. Treat inspection errors as unknown, never empty. A general-node
    checker present in the repository is not evidence that it runs on the Docker node.
 
+## Moving off self-hosted to hosted/Blacksmith runners
+
+- A custom runner image baked in host setup that the workflows never declare. Before relabeling, list what it
+  provided (bubblewrap, a lifted `kernel.apparmor_restrict_unprivileged_userns`, tmux and the like), then add an
+  explicit step to every job that needs it. Otherwise tests fail on the new VM (for example "bubblewrap (bwrap)
+  is not installed"). Blacksmith's Ubuntu 24.04 needs both of these steps:
+  `sudo apt-get install -y -qq bubblewrap && sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+- Routing tests encode lane labels: run them locally and update them in the same commit.
+- Confirm every runner size actually gets a runner (check the first run's jobs: `runner_name` and
+  `started_at`) before routing heavy lanes to it. A size the org doesn't serve sits `queued` with no
+  runner indefinitely, while the smaller sizes start in seconds.
+- Blacksmith serves `actions/cache` from its own cache service, so a job that stubs or blackholes the
+  GitHub cache endpoint never reaches the stub there. Keep that kind of job on `ubuntu-24.04`.
+- A repo transfer changes `github.repository`: grep the workflows and scripts for `'OWNER/REPO'` identity
+  checks, or every fork-only gate flips silently.
+
 ## Pitfalls after the move
 
 - Self-hosted checkouts persist between jobs, so anything the build rewrites in a TRACKED file stays dirty and a
@@ -62,5 +78,9 @@ A macOS LaunchDaemon needs sudo on that host: run it through `run_in_user_termin
   extra general slots cannot consume `docker-ci` jobs. Check workflow concurrency and existing owners before
   provisioning. Preserve healthy work and current-head tests; use the superseded gate-only latch sweep in
   SKILL.md rather than cancelling an entire run merely because its commit has a newer descendant.
+- An offline runner whose service is disabled (`launchctl print-disabled gui/<uid>` shows `=> disabled`, or a
+  systemd unit `disable`d) was taken down on purpose, usually by a card mid-maintenance. Search the boards
+  for the runner/service name and comment on that owner card; never re-bootstrap it yourself, because that
+  races the owner's move or drain.
 - PRs refused during the outage: `gh run rerun` replays the PR head's workflow file, which still has the old
   `runs-on`. Rebase onto `origin/main` and `--force-with-lease` push.
