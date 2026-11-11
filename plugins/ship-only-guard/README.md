@@ -1,7 +1,8 @@
 # ship-only-guard
 
 A public, stdlib-only command guard that routes landing through a repository's
-trusted ship workflow. It makes no network requests and does not merge or push.
+trusted ship workflow for core main, with a narrow state-branch preflight below.
+It does not merge or push. State preflight makes one bounded read-only GitHub request.
 
 ## Configuration
 
@@ -23,7 +24,7 @@ The `pre_tool_call` hook checks `terminal`, `execute_code`, and nested `tool_cal
 (including qualified tool names). On a configured repository it refuses:
 
 - `gh pr merge`, regardless of merge/admin/auto flags, with URL, `-R`, `--repo`,
-  `GH_REPO`, or current repository selection.
+  `GH_REPO`, or current repository selection, except the exact state route below.
 - `gh api repos/OWNER/REPO/pulls/N/merge` and `repos/OWNER/REPO/merges`, including
   full API URLs and leading slashes. These merge endpoints are refused regardless
   of HTTP method, so omitting an explicit write method cannot bypass the guard.
@@ -43,6 +44,48 @@ Python is inspected with the AST: literal subprocess argv, literal shell strings
 with `shell=True`, `os.system`/`os.popen`, `terminal(...)`, and `tool_call(...)`.
 Simple literal variable assignments are supported. Comments, printed examples,
 and unrelated string constants are not treated as executed commands.
+
+## State-targeted landing (not core main)
+
+For a repository that also stores deployment/configuration on `state`, the owner
+must first obtain **independent approval of the full current head**, verify all
+required workflows on that same head (including expected workflows absent from
+GitHub's rollup), and resolve review findings/bot threads. Preserve the actual
+reviewer, verdict and full SHA in the owner's evidence. Genuine independent
+agent review is valid caller evidence; a self-authored approval is not.
+
+Then the supported immediate state landing command is:
+
+```sh
+gh pr merge 12 --repo example/protected --rebase --match-head-commit FULL_40_HEX_SHA
+```
+
+The parser accepts only numeric PR, explicit `--repo OWNER/REPO` (or `-R`),
+`--rebase`, and `--match-head-commit` with a lowercase full SHA. No auto/admin,
+implicit PR/repo, URL selector, extra flags, duplicate flags, or other merge mode.
+A fixed-argv `gh pr view` (15-second timeout, no shell) must confirm the same PR
+URL/number, OPEN state, base exactly `state`, matching head, and a nonempty
+all-success check rollup smaller than 100 entries. Missing/malformed/offline,
+main/other base, changed head, pending/failed/skipped/neutral checks and a possibly
+truncated rollup fail closed. This is not a blanket non-main exemption.
+
+**Gate boundary:** this guard does not authenticate independent review receipts
+or prove coverage of required-but-absent CI. Those remain the landing owner's
+mandatory gates, just as for existing state pushes. Passing this preflight alone
+is NOT approval to land. Main still requires `hermes-core-wt ship`; merge API
+endpoints remain blocked. Do not set a trusted marker for state landing.
+The head fence is atomic at GitHub; the base read is only a preflight, not an
+atomic base lock. Do not retarget a PR during landing; use server-side branch
+protection against concurrent main retargeting.
+
+To validate the route without changing the PR, run `guard.py --gh-args` with the
+same arguments (see below). It only classifies; never invoke real `gh pr merge`
+as a dry-run. After a genuine owner-controlled merge, read back MERGED/base/SHA
+and verify postmerge CI and deployment separately.
+
+`tests_state.py` covers allowed and refused preflights, malformed/unreadable
+responses, transport failures, head/base changes, CI states, bounded rollups,
+strict flags and terminal/Python/tool entry points. No test merges a live PR.
 
 ## Trusted land child and private gh shims
 

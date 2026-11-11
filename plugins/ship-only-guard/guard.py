@@ -82,6 +82,71 @@ def _path(value, cwd):
     return os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
 
 
+def _state_merge(words, repo, cwd, env):
+    """Narrow state-only exception, never a general non-main merge allowance.
+
+    Independent exact-head review and required-CI coverage remain caller duties;
+    this preflight additionally refuses missing/non-green visible checks. It is
+    not an atomic base lock (gh only offers an atomic head fence).
+    """
+    # Accept explicit numeric PR and repo only; avoid gh's implicit current PR,
+    # URL/repo precedence, aliases, unknown options, auto-merge or admin override.
+    if words[:2] != ["pr", "merge"]:
+        return False
+    args, options = [], {}
+    i = 2
+    while i < len(words):
+        word = words[i]
+        if word in {"--repo", "-R", "--match-head-commit"}:
+            key = "--repo" if word == "-R" else word
+            if key in options or i + 1 >= len(words):
+                return False
+            options[key] = words[i + 1]
+            i += 2
+        elif word == "--rebase" and word not in options:
+            options[word] = True
+            i += 1
+        elif not word.startswith("-"):
+            args.append(word)
+            i += 1
+        else:
+            return False
+    if (len(args) != 1 or not re.fullmatch(r"[1-9][0-9]*", args[0])
+            or options.get("--repo", "").lower() != repo
+            or not options.get("--rebase")
+            or not re.fullmatch(r"[0-9a-f]{40}", options.get("--match-head-commit", ""))):
+        return False
+    fields = "number,url,state,baseRefName,headRefOid,statusCheckRollup"
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    try:
+        p = subprocess.run(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
+                           cwd=cwd, env=probe_env, capture_output=True, text=True, timeout=15)
+        if p.returncode != 0:
+            return False
+        data = json.loads(p.stdout)
+        if not isinstance(data, dict):
+            return False
+        if (data.get("number") != int(args[0]) or data.get("state") != "OPEN"
+                or data.get("baseRefName") != "state"
+                or data.get("headRefOid") != options["--match-head-commit"]
+                or not isinstance(data.get("url"), str)
+                or data["url"].lower() != f"https://github.com/{repo}/pull/{args[0]}"):
+            return False
+        checks = data.get("statusCheckRollup")
+        # gh's connection is bounded; never infer success from a possibly capped
+        # rollup. Skipped/neutral/unknown checks conservatively require the ship path.
+        if not isinstance(checks, list) or not 0 < len(checks) < 100:
+            return False
+        return all(isinstance(c, dict) and (
+            c.get("__typename") == "CheckRun" and c.get("status") == "COMPLETED"
+            and c.get("conclusion") == "SUCCESS" or
+            c.get("__typename") == "StatusContext" and c.get("state") == "SUCCESS"
+        ) for c in checks)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
 def _gh(words, cwd, env, repos):
     # gh's repository flag may occur before, between, or after command words.
     rest, selected, i = [], None, 0
@@ -103,7 +168,10 @@ def _gh(words, cwd, env, repos):
         url = next((re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?", w) for w in rest[2:]
                     if re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?", w)), None)
         repo = _slug(url[1]) if url else selected if selected is not None else _context(cwd, env)
-        return _deny(repo, "gh pr merge", repos)
+        if repo in repos and _state_merge(words, repo, cwd, env):
+            return None
+        return _deny(repo, "gh pr merge (state requires explicit repo, numeric PR, --rebase, "
+                     "--match-head-commit FULL_SHA and readable green exact-head state preflight)", repos)
     if rest and rest[0] == "api":
         for w in rest[1:]:
             match = re.fullmatch(r"(?:https?://[^/]+/)?/?repos/([^/]+/[^/]+)/(?:pulls/\d+/merge|merges)/?(?:\?.*)?", w)
