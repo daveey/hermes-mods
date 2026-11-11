@@ -22,7 +22,9 @@ def config():
 
 
 def snapshot(c, at=150, ident='collection_bbbbbbbbbbbbbbbb', state='complete'):
-    return dict(at=at, collection=dict(id=ident, state=state), owner=cli._owner(c))
+    return dict(at=at, collection=dict(id=ident, state=state), owner=cli._owner(c),
+                scope_results={s['id']: dict(served_at=at, complete=True, error=None)
+                               for s in c['scopes']})
 
 
 def run(c, evidence, now=100, snap=None, replies=None, **kwargs):
@@ -31,6 +33,71 @@ def run(c, evidence, now=100, snap=None, replies=None, **kwargs):
         adapter=h.api, pause=lambda _: None, evidence=evidence, now=now,
         snapshot=snap, interval=100, **kwargs)
     return updated, report, h
+
+
+def test_real_collector_deleted_scope_allows_confirmed_removal(tmp_path):
+    from plugins.runners.collector import Collector
+    from plugins.runners.providers.base import ProviderResult
+    c = config(); evidence = {}; run(c, evidence)
+    class Deleted:
+        def enumerate(self, scope):
+            return ProviderResult((), False, 'not_found', 150, None)
+    with Store(tmp_path / 'collector.sqlite') as store:
+        s = Collector(store, c, Deleted(), clock=lambda: 150).tick()
+    assert s['collection']['state'] == 'partial'
+    updated, report, _ = run(c, evidence, now=200, snap=s)
+    assert updated['scopes'] == [] and len(report['removals']) == 1
+
+
+def test_two_deleted_scopes_require_entire_bounded_rotation(tmp_path):
+    from plugins.runners.collector import Collector
+    from plugins.runners.providers.base import ProviderResult
+    c = config()
+    c['scopes'].append(dict(scope(name='example/other'), id='scope_' + '2' * 16))
+    replies = [HTTPResponse(404, {}, {}), HTTPResponse(200, {}, []), HTTPResponse(404, {}, {})]
+    evidence = {}; run(c, evidence, replies=replies)
+    clock = [150]
+    class Deleted:
+        def enumerate(self, scope):
+            return ProviderResult((), False, 'not_found', clock[0], None)
+    with Store(tmp_path / 'collector.sqlite') as store:
+        collector = Collector(store, c, Deleted(), clock=lambda: clock[0], max_scopes=1)
+        partial = collector.tick()
+        updated, report, _ = run(c, evidence, now=200, snap=partial, replies=replies)
+        assert updated == c and not report['removals']
+        clock[0] += 1
+        swept = collector.tick()
+        assert swept['collection']['state'] == 'partial'
+        updated, report, _ = run(c, evidence, now=201, snap=swept, replies=replies)
+        assert updated['scopes'] == [] and len(report['removals']) == 2
+
+
+def test_partial_not_found_snapshot_confirms_real_deleted_scope():
+    c = config(); evidence = {}; run(c, evidence)
+    s = snapshot(c, state='partial')
+    s['scope_results'][scope()['id']].update(complete=False, error='not_found')
+    updated, report, _ = run(c, evidence, now=200, snap=s)
+    assert updated['scopes'] == [] and len(report['removals']) == 1
+
+
+@pytest.mark.parametrize('bad', [None, True, float('nan'), float('inf'), 100, 151])
+def test_invalid_or_unserved_sweep_timestamp_refuses(bad):
+    c = config(); evidence = {}; run(c, evidence)
+    s = snapshot(c)
+    s['scope_results'][scope()['id']]['served_at'] = bad
+    updated, report, _ = run(c, evidence, now=200, snap=s)
+    assert updated == c and not report['removals']
+
+
+@pytest.mark.parametrize('error,complete', [('backoff', False), ('cycle_budget', False),
+    ('budget_deferred', False), ('unauthorized', False), ('rate_limited', False),
+    ('forbidden', False), ('network_error', False), (None, False)])
+def test_unavailable_sweep_refuses_even_with_new_timestamp(error, complete):
+    c = config(); evidence = {}; run(c, evidence)
+    s = snapshot(c)
+    s['scope_results'][scope()['id']].update(error=error, complete=complete)
+    updated, report, _ = run(c, evidence, now=200, snap=s)
+    assert updated == c and not report['removals']
 
 
 def test_two_real_404s_interval_and_completed_intervening_collection():
@@ -50,7 +117,9 @@ def test_confirmation_requires_interval_and_new_complete_owned_snapshot(now, sna
     initial = snapshot(c, at=50, ident='collection_aaaaaaaaaaaaaaaa')
     run(c, evidence, snap=initial)
     s = snapshot(c) if snap else None
-    if snap == 'partial': s['collection']['state'] = 'partial'
+    if snap == 'partial':
+        s['collection']['state'] = 'partial'
+        s['scope_results'] = {}  # an unfinished sweep, not merely expired TTL
     if snap == 'old': s['at'] = 99
     if snap == 'future': s['at'] = 201
     if snap == 'wrong_owner': s['owner']['owner_epoch'] += 1

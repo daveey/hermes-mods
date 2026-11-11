@@ -29,7 +29,11 @@ preserves existing scope IDs, bindings and permissions. A repository scope can b
 removed only after real metadata 404s on two runs, absence from complete paginated
 same-credential organization listings on both runs, at least one hour between
 confirmations (configurable via `--confirmation-interval`), and an intervening
-completed collector snapshot for the same config/owner. 410s, cached permission
+bounded collector sweep for the same config/owner: each configured scope must have
+been serviced after the first confirmation, with either a successful complete read
+or `not_found`. Other failures and local budget deferrals fail closed. This is not
+the snapshot-wide inventory freshness flag (a deleted scope necessarily makes
+that flag partial); inventory TTL is unchanged. 410s, cached permission
 failures, partial listings, stale/changed identities and unconfirmed 404s never
 remove a scope. For user-owned repositories, a missing org endpoint additionally
 requires verified `User` account metadata before a complete same-credential user

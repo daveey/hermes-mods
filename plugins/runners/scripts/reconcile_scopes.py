@@ -1,7 +1,7 @@
 """Guarded repository reconciliation (dry-run default); stop the collector first.
 
 Renames retain stable IDs. Deletions require two real metadata 404s, complete
-same-credential org listings, and a completed intervening collector snapshot.
+same-credential org listings, and a completed intervening bounded collector sweep.
 Discovery is opt-in per organization. All maintenance shares the collector lock
 and persisted provider budgets. No execution allowlist is changed here.
 """
@@ -83,6 +83,42 @@ def _owner(config):
     return {k: config[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch', 'config_revision')}
 
 
+def _intervening_sweep(config, snapshot, old, first, now):
+    """Require service of every configured scope since the first confirmation.
+
+    `collection.state` also demands successful reads inside the inventory TTL;
+    a deleted scope (or a large bounded rotation) can never satisfy that flag.
+    Missing/budget/auth failures cannot substitute for a completed sweep. A
+    not_found collector result may be cached; only the two fresh metadata 404s
+    and complete owner listings in reconcile() authorize a deletion.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    collection = snapshot.get('collection', {})
+    at = snapshot.get('at')
+    if (not isinstance(collection, dict) or not collection.get('id')
+            or collection['id'] == old.get('collection_id')
+            or snapshot.get('owner') != _owner(config)
+            or type(at) not in (int, float) or not math.isfinite(at)
+            or not first < at < now):
+        return False
+    rows = snapshot.get('scope_results')
+    if not isinstance(rows, dict):
+        return False
+    for scope in config['scopes']:
+        row = rows.get(scope['id'])
+        if not isinstance(row, dict):
+            return False
+        served = row.get('served_at')
+        if (type(served) not in (int, float) or not math.isfinite(served)
+                or not first < served <= at):
+            return False
+        if not (row.get('error') == 'not_found'
+                or (row.get('error') is None and row.get('complete') is True)):
+            return False
+    return True
+
+
 def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter=None,
               evidence=None, snapshot=None, now=None, interval=INTERVAL, discover_org=()):
     if type(interval) not in (int, float) or not math.isfinite(interval) or interval <= 0:
@@ -161,18 +197,12 @@ def reconcile(config, runtime, transport, resolver, *, pause=time.sleep, adapter
                            collection_id=(snapshot or {}).get('collection', {}).get('id'))
                 first = now
             evidence[scope['id']] = old
-            collection = (snapshot or {}).get('collection', {})
-            snap_at = (snapshot or {}).get('at')
-            expected_owner = _owner(config)
-            intervened = (collection.get('state') == 'complete' and collection.get('id')
-                          and collection['id'] != old.get('collection_id')
-                          and (snapshot or {}).get('owner') == expected_owner
-                          and type(snap_at) in (int, float) and first < snap_at < now)
+            intervened = _intervening_sweep(config, snapshot, old, first, now)
             row = dict(id=scope['id'], name=scope['name'])
             if valid and now - first >= interval and intervened:
                 removals.append(row)
             else:
-                pending.append(dict(row, reason='confirmation_interval_or_collector_snapshot'))
+                pending.append(dict(row, reason='confirmation_interval_or_bounded_sweep'))
         except (_Failure, CanonicalError) as exc:
             failure(scope['id'], exc)
 
