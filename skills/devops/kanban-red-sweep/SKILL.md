@@ -53,7 +53,7 @@ already says "resolved", "green again" or "replacement found". The block reason 
 | Ask covered by a standing approval (e.g. spend under the user's no-ask cap, fixing something broken) | Comment the standing rule, then unblock |
 | Agent-doable from an interactive session but refused to a headless worker (guarded `rm -rf` of a verified scratch dir, a tailnet/ssh probe, a `gh` read the worker's profile lacked) | Do it here, verify it, comment, then complete or unblock |
 | Missing credential on the worker profile | Find it with token-broker (`user/github` etc.) before calling it human, then do the step or unblock with the route |
-| Real consent, policy, acceptance or scope decision; physical or sign-in step; protected-file Allow | Keep it. Link it to this chat, then ask (step 4) |
+| Real consent, policy, acceptance or scope decision; physical or sign-in step; protected-file Allow | Keep it and ask (step 4). If a live chat opened it in the last day, leave the ask to that chat |
 
 Never grant consent, change acceptance or approve protected paths on the user's behalf. A rejected guard is never
 bypassed with another writer.
@@ -61,9 +61,18 @@ bypassed with another writer.
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
-- Completing a card with a PR completion contract runs `pr_acceptance` as **your** profile: wrap it with
-  `token-broker exec --scope user/github -- hermes kanban complete ...` when `gh` isn't logged in.
+- A PR completion contract runs `pr_acceptance` with the **assignee profile's** `gh` login, not yours, so wrapping
+  your command in token-broker doesn't help. Verify the merge yourself (`token-broker exec --scope user/github -- gh pr view`),
+  then `hermes kanban edit <id> --completion-contract local-only --reason "<PR> merged at <sha>, verified"` and complete.
+- `complete` is also checked against the card's acceptance. When it's refused because the acceptance still has open
+  steps (live checks, a PR on a moved repo), comment the corrected premise and unblock so the owner finishes. Don't force it.
+- A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
 - Cards whose dependents wait on them: unblocking or completing promotes the children. Check them.
+- Mac probes that a worker reports "no agent route" for (mini/MacBook check_compat, git ancestry, sqlite reads) often
+  run directly with `tailnet_exec` from the user's interactive chat. A host outside `tailnet.auto_hosts` returns an
+  approval request instead; name it in the report.
+- Asks to delete a finished card's scratch workspace: core scratch GC removes terminal cards' scratch trees after
+  `kanban.worktree_retention_days`. Comment that and archive; no human `rm` is needed.
 
 ## 4. Ask about the rest: one `clarify` form
 
@@ -72,6 +81,7 @@ bypassed with another writer.
 - Batch low-stakes defaults into one "accept all recommended" question.
 - Physical or sign-in steps are not questions. List them as actions grouped by device, each with what "done" looks like.
 - Record each answer on the card yourself (comment, then unblock/archive/complete). Don't leave it to the user.
+- If the `clarify` times out, put the same questions in `session_outcome {"kind":"decide"}` so they wait in For you.
 
 ## Pitfalls
 
@@ -86,5 +96,5 @@ bypassed with another writer.
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
 - [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment?
-- [ ] The remaining asks went out in one `clarify` form, recommended option first, with no card ids?
-- [ ] Unlinked and reaped-only cards that still need the user are linked to this chat?
+- [ ] The remaining asks went out in one `clarify` form (or `session_outcome` decide on timeout), recommended option first, with no card ids?
+- [ ] The report names the unlinked and reaped-only cards that still need the user?
