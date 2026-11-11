@@ -60,6 +60,12 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   `ssh -tt <host> 'sudo ... > out; rm -f /tmp/x'`, copy the output back to the Mac, and `tailnet_copy get` it;
   passing a hub path to the window fails because the path does not exist on the Mac. In zsh, write SSH options inline rather
   than in an unquoted variable, which does not word-split.
+- `ssh host 'cmd'` runs a non-login shell whose PATH lacks `~/bin` (where the hub's `gh` lives). A script that
+  resolves tools with `which` / `shutil.which` passes under the agent's own terminal, then refuses mid-apply on the
+  owner route. Before running a reviewed hub apply this way, check that the package pins absolute tool paths, or
+  that its read-only `check` exercises the same lookup. On a hub, also wait until `~/.hermes/core-update/drain-hold`
+  is gone before an apply: a core-update drain restarts owner gateways, so the owner check fails or the apply rolls
+  back.
 - Remote hosts too: `ssh -t <host> 'sudo ...'`. When the SSH key is refused, run
   `ssh-copy-id -i ~/.ssh/id_ed25519.pub <user>@<host>` there.
 - Get a go-ahead in chat first for anything destructive: the window runs the command at once, with no y/N step.
