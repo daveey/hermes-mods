@@ -18,6 +18,16 @@ Why: a chat whose backend held a stale board view could only report "the board i
 next step, and its own `kanban_create` failed the same way. The coach plugin's report_only nudge now also skips
 "kanban_create" when the session's Kanban tools are down (see `plugins/coach`).
 
+## Missing card (`kanban_show`)
+
+`kanban_show` only reads this gateway's board, so a card created on another gateway (the hub, a worker node) comes
+back as `{"error": "task t_... not found"}`. Agents kept retrying that same call. When `kanban_show` returns exactly
+that error, the hook adds a `hint`: the id isn't on this board (named when `board` was passed), which doesn't mean it
+doesn't exist; don't retry `kanban_show`; read it with `cross_task(action='read', target='<id>')` (a bare id is
+searched on every gateway); if that also finds nothing, report the id as unknown. It matches only an exact top-level
+`error` of `kanban_show` (direct or via `tool_call`), never a card body that quotes the phrase, and never a mutation
+tool's refusal.
+
 ## Config (optional)
 
 `<HERMES_HOME>/kanban-db-hint.json`:

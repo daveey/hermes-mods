@@ -8,6 +8,9 @@ and what to do for each answer.
 
 Optional config ``<HERMES_HOME>/kanban-db-hint.json``: ``{"owner_cards": ["t_..."]}`` names the cards that own
 the stale-view fix, so the agent can point at them instead of opening a new card it can't create.
+
+A kanban_show "task <id> not found" gets a second hint: the card may live on another gateway's board, so read it with
+cross_task instead of retrying kanban_show.
 """
 from __future__ import annotations
 
@@ -68,9 +71,63 @@ def _is_kanban_tool(tool_name: str, args: Any) -> bool:
     return False
 
 
-def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, **_) -> Optional[str]:
-    if not isinstance(result, str) or MARK in result or not PATTERNS.search(result):
+# kanban_show's missing-card error. Core says "task <id> not found" (tool layer may prefix "kanban_show: ").
+# A card created on another gateway (hub, a worker node) is not on this host's board, so a bare kanban_show
+# fails and agents kept retrying it. Only the read tool is covered: a mutation refusal must stay as-is.
+MISSING = re.compile(r"^(?:kanban_show: )?task (t_[0-9A-Za-z_]+) not found\.?$")
+
+
+def missing_hint(task_id: str, board: Optional[str] = None) -> str:
+    where = f"board '{board}' on this gateway" if board else "this gateway's board"
+    return (f"{MARK} {task_id} is not on {where}. That is not proof it doesn't exist: cards made on another "
+            "gateway (hub, a worker node) or another board live there, and kanban_show cannot see them. "
+            f"Don't retry kanban_show. Read it with cross_task(action='read', target='{task_id}') "
+            "(tool_call name cross_task; a bare id is searched on every gateway). If that also finds nothing, "
+            "report the id as unknown rather than guessing its state.")
+
+
+def _calls_kanban_show(tool_name: str, args: Any) -> Optional[dict]:
+    """The kanban_show args when this result is a kanban_show call (direct or via tool_call), else None."""
+    name = (tool_name or "").rsplit("__", 1)[-1]
+    if name == "kanban_show":
+        return args if isinstance(args, dict) else {}
+    if name == "tool_call" and isinstance(args, dict):
+        calls = args.get("calls")
+        shows = [c for c in calls if isinstance(c, dict) and str(c.get("name", "")).rsplit("__", 1)[-1]
+                 == "kanban_show"] if isinstance(calls, list) else []
+        if shows:
+            a = shows[0].get("arguments")
+            return a if isinstance(a, dict) else {}
+    return None
+
+
+def _missing_card(tool_name: str, args: Any, result: str) -> Optional[str]:
+    """Hint for kanban_show's exact "task <id> not found" error. Core unwraps tool_call before this hook,
+    so the bridge branch in _calls_kanban_show is only a fallback for older runtimes."""
+    show_args = _calls_kanban_show(tool_name, args)
+    if show_args is None:
         return None
+    board = show_args.get("board") if isinstance(show_args.get("board"), str) else None
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        data = None
+    if data is not None:
+        err = data.get("error") if isinstance(data, dict) else None
+        m = MISSING.match(err.strip()) if isinstance(err, str) else None
+        if not m:  # a card body or comment that merely quotes the phrase is not this error
+            return None
+        data["hint"] = missing_hint(m.group(1), board)
+        return json.dumps(data, ensure_ascii=False)
+    m = MISSING.match(re.sub(r"^Error: ", "", result.strip()))
+    return result + "\n\n" + missing_hint(m.group(1), board) if m else None
+
+
+def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, **_) -> Optional[str]:
+    if not isinstance(result, str) or MARK in result:
+        return None
+    if not PATTERNS.search(result):
+        return _missing_card(tool_name, args, result)
     if not _is_kanban_tool(tool_name, args):
         return None
     try:
