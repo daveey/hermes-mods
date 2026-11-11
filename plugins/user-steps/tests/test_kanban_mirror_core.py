@@ -55,6 +55,7 @@ def test_projection_real_core_atomic_transition_and_retry(
             store,
             boards=[("default", path)],
             session_exists=lambda sid: sid == "session-a",
+            tip=lambda sid: sid,
         )
         mirror.reconcile(OWNER)
         request = store.requests(OWNER)[0]

@@ -8,6 +8,7 @@ Legacy reads remain passive; generic resolve is intentionally gone (410).
 import contextvars
 import importlib.util
 import os
+import sqlite3
 import sys
 import time
 import logging
@@ -210,7 +211,10 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         # Withdrawn requests are omitted unless asked for: older Desktop builds reject unknown states.
         def action():
             own = owner(session)
-            mirror().reconcile(own)
+            try:
+                mirror().reconcile(own)
+            except (ValueError, sqlite3.Error, OSError):
+                logging.getLogger('user-steps').exception('Card projection reconciliation deferred')
             st = migrate(own)
             _load('chat').reconcile(_load('core'), st, own, db=state_db)
             retire_moot(st, own)

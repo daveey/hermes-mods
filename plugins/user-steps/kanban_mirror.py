@@ -7,6 +7,7 @@ exact blocked ask and block generation under the board write transaction.
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import uuid
@@ -18,11 +19,23 @@ def encoded(value):
 
 
 class Mirror:
-    def __init__(self, core, store, *, boards=None, backend=None, session_exists=None):
+    def __init__(
+        self,
+        core,
+        store,
+        *,
+        boards=None,
+        backend=None,
+        session_exists=None,
+        tip=None,
+        session_present=None,
+    ):
         self.core, self.store, self.backend = core, store, backend
         board_source = core.kanban_boards if boards is None else boards
         self.boards = dict(board_source() if callable(board_source) else board_source)
         self.session_exists = session_exists or self._user_session
+        self.session_present = session_present or session_exists or self._stored_session
+        self.tip = tip or self._tip
         with store._tx() as c:
             c.execute(
                 "CREATE TABLE IF NOT EXISTS kanban_projections ("
@@ -31,9 +44,44 @@ class Mirror:
                 "PRIMARY KEY(namespace,request_id))"
             )
 
+    def _session_row(self, sid):
+        # Read failure is not evidence that a card lost its owner.
+        c = self.core._ro_connect(self.core._state_db())
+        try:
+            return c.execute(
+                "SELECT id,parent_session_id,end_reason,source FROM sessions WHERE id=?",
+                (sid,),
+            ).fetchone()
+        finally:
+            c.close()
+
+    def _stored_session(self, sid):
+        return bool(self._session_row(sid))
+
     def _user_session(self, sid):
-        row = self.core._row(self.core._state_db(), sid)
+        row = self._session_row(sid)
         return bool(row and row[3] in ("desktop", "cli", "tui", "web"))
+
+    def _tip(self, sid):
+        # Core alone owns continuation classification (branches/resets/delegates
+        # are NOT continuations). Never use the plugin's legacy substring walk.
+        try:
+            from hermes_state_compression import (
+                _CHAIN_STEP_SQL,
+                _walk_compression_chain,
+            )
+
+            c = self.core._ro_connect(self.core._state_db())
+            c.row_factory = sqlite3.Row
+            try:
+                chain = _walk_compression_chain(
+                    sid, lambda s: c.execute(_CHAIN_STEP_SQL, (s,)).fetchone()
+                )
+                return chain[-1]
+            finally:
+                c.close()
+        except ImportError as exc:
+            raise OSError("Core continuation resolver unavailable") from exc
 
     def _api(self):
         if self.backend is not None:
@@ -55,7 +103,7 @@ class Mirror:
             raise self.core.ActionError("Unknown projection board", 409)
         return Path(self.boards[board])
 
-    def _snapshot(self, c, task, owner):
+    def _snapshot(self, c, task, owner, *, presentation=True):
         row = c.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
         if row is None:
             return None
@@ -89,8 +137,10 @@ class Mirror:
                 ).fetchall()
             except sqlite3.OperationalError:
                 subs = []
-            sid = next((r[0] for r in subs if self.session_exists(r[0])), None)
-        if sid != owner["storedSessionId"]:
+            # The local user-surface subscription is provenance even for legacy
+            # custom-source chats. Require its stored session, not a source alias.
+            sid = next((r[0] for r in subs if self.session_present(r[0])), None)
+        if not sid or (presentation and self.tip(sid) != owner["storedSessionId"]):
             return None
         # A new identical block after an unblock is a NEW question, not an old answer replay.
         generation = c.execute(
@@ -106,11 +156,11 @@ class Mirror:
             title=row.get("title") or hr["action"],
         )
 
-    def _read_snapshot(self, board, task, owner):
+    def _read_snapshot(self, board, task, owner, *, presentation=True):
         c = self.core._ro_connect(self._path(board))
         c.row_factory = sqlite3.Row
         try:
-            return self._snapshot(c, task, owner)
+            return self._snapshot(c, task, owner, presentation=presentation)
         finally:
             c.close()
 
@@ -195,33 +245,19 @@ class Mirror:
             except (sqlite3.Error, OSError):
                 continue  # unavailable is NOT evidence to withdraw
             for snap in filter(None, snapshots):
-                request = self._request(owner, board, snap)
-                with self.store._tx() as c:
-                    c.execute(
-                        "INSERT OR IGNORE INTO kanban_projections VALUES (?,?,?,?,?,?,?)",
-                        (
-                            self.store._ns(owner),
-                            request["requestId"],
-                            owner["storedSessionId"],
-                            board,
-                            snap["task"],
-                            encoded(snap),
-                            encoded(request),
-                        ),
-                    )
                 try:
-                    self.store.get(owner, request["requestId"])
+                    request = self._request(owner, board, snap)
+                    if self._relocate(owner, board, snap):
+                        self._publish(owner, board, snap, request)
                 except self.core.ActionError as exc:
-                    if exc.status != 404:
-                        raise
-                    try:
-                        self.store.create(owner, request)
-                    except self.core.ActionError as race:
-                        if race.status != 409:
-                            raise
-                        self.store.get(
-                            owner, request["requestId"]
-                        )  # concurrent identical producer
+                    # A malformed legacy ask or conflicting identity must not hide
+                    # unrelated cards. Never adopt a different request as authority.
+                    logging.getLogger("user-steps").warning(
+                        "Card projection rejected board=%s task=%s: %s",
+                        board,
+                        snap["task"],
+                        exc,
+                    )
         with self.store._read() as c:
             bindings = [
                 dict(r)
@@ -231,31 +267,42 @@ class Mirror:
                 )
             ]
         for binding in bindings:
-            if binding["board"] not in self.boards:
-                continue  # a temporarily absent/archived board must not break other tiles
             try:
-                current = self._read_snapshot(binding["board"], binding["task"], owner)
-                request = self.store.get(owner, binding["request_id"])
-            except (sqlite3.Error, OSError):
-                continue
-            if encoded(current) == binding["snapshot"] or request["state"] not in (
-                "open",
-                "needs_context",
-            ):
-                continue
-            if request.get("resolution"):
-                oid = request["resolution"]["operationId"]
-                op = self.store.operation(owner, oid)["operation"]
-                if op["dispatchState"] in ("delivered", "cancelled"):
-                    continue
-                # A board commit may precede its outbox acknowledgment. Preserve that
-                # receipt for retry; cancel only a provably stale, undelivered decision.
-                c = self.core._ro_connect(self._path(binding["board"]))
+                self._reconcile_binding(owner, binding)
+            except (ValueError, sqlite3.Error, OSError) as exc:
+                logging.getLogger("user-steps").warning(
+                    "Card binding reconciliation deferred request=%s: %s",
+                    binding["request_id"],
+                    exc,
+                )
+
+    def _reconcile_binding(self, owner, binding):
+        if binding["board"] not in self.boards:
+            return  # temporarily absent board is not departure evidence
+        current = self._read_snapshot(
+            binding["board"], binding["task"], owner, presentation=False
+        )
+        request = self.store.get(owner, binding["request_id"])
+        tip = self.tip(current["session"]) if current is not None else None
+        if request["state"] not in ("open", "needs_context"):
+            return
+        if encoded(current) == binding["snapshot"]:
+            if not request.get("resolution") and tip != owner["storedSessionId"]:
+                self._withdraw(owner, request)
+            return
+        if request.get("resolution"):
+            oid = request["resolution"]["operationId"]
+            op = self.store.operation(owner, oid)["operation"]
+            if op["dispatchState"] in ("delivered", "cancelled"):
+                return
+            # Preserve a board commit whose outbox acknowledgment is still pending.
+            c = self.core._ro_connect(self._path(binding["board"]))
+            try:
+                delivered = self._receipt(c, binding, op)
+            finally:
+                c.close()
+            if not delivered:
                 try:
-                    delivered = self._receipt(c, binding, op)
-                finally:
-                    c.close()
-                if not delivered:
                     self.store.retire_operation(
                         owner,
                         oid,
@@ -263,7 +310,87 @@ class Mirror:
                         reason="Source card ask changed before delivery",
                         evidence="Exact blocked-card snapshot no longer matches",
                     )
-                continue
+                except self.core.ActionError as exc:
+                    if exc.status != 409 or self.store.operation(owner, oid)[
+                        "operation"
+                    ]["dispatchState"] not in ("delivered", "cancelled"):
+                        raise
+            return
+        self._withdraw(owner, request)
+
+    def _relocate(self, owner, board, snap):
+        # Presentation may rotate on compression, but a recorded answer remains
+        # bound to its original owner and blocks a second question for this ask.
+        with self.store._read() as c:
+            old = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT * FROM kanban_projections WHERE namespace=? AND board=? AND task=? AND snapshot=? AND session!=?",
+                    (
+                        self.store._ns(owner),
+                        board,
+                        snap["task"],
+                        encoded(snap),
+                        owner["storedSessionId"],
+                    ),
+                )
+            ]
+        for binding in old:
+            previous = dict(owner, storedSessionId=binding["session"])
+            request = self.store.get(previous, binding["request_id"])
+            if not request.get("resolution") and request["state"] in (
+                "open",
+                "needs_context",
+            ):
+                self._withdraw(previous, request)
+                request = self.store.get(previous, binding["request_id"])
+            if request.get("resolution"):
+                op = self.store.operation(
+                    previous, request["resolution"]["operationId"]
+                )["operation"]
+                if op["dispatchState"] != "cancelled":
+                    return False
+        return True
+
+    def _publish(self, owner, board, snap, request):
+        values = (
+            self.store._ns(owner),
+            request["requestId"],
+            owner["storedSessionId"],
+            board,
+            snap["task"],
+            encoded(snap),
+            encoded(request),
+        )
+
+        def bind(c, frozen):
+            c.execute("INSERT INTO kanban_projections VALUES (?,?,?,?,?,?,?)", values)
+
+        try:
+            self.store.create(owner, request, bind_transaction=bind)
+            return
+        except self.core.ActionError as exc:
+            if exc.status != 409:
+                raise
+        # A concurrent producer already committed both rows. Never adopt an
+        # unbound preexisting request, even if its public body was guessed exactly.
+        with self.store._tx() as c:
+            existing = self.store._get(c, owner, request["requestId"])
+            existing.pop("resolution", None)
+            existing["state"] = request["state"]
+            bound = c.execute(
+                "SELECT * FROM kanban_projections WHERE namespace=? AND request_id=?",
+                values[:2],
+            ).fetchone()
+            if (
+                encoded(existing) != encoded(request)
+                or bound is None
+                or tuple(bound) != values
+            ):
+                raise self.core.ActionError("Projection identity/binding conflict", 409)
+
+    def _withdraw(self, owner, request):
+        try:
             self.store.withdraw(
                 owner,
                 request["requestId"],
@@ -271,6 +398,14 @@ class Mirror:
                 reason="Source card left this block or its ask changed",
                 expected_revision=request["revision"],
             )
+        except self.core.ActionError as exc:
+            if exc.status != 409:
+                raise
+            current = self.store.get(owner, request["requestId"])
+            if current["state"] in ("open", "needs_context") and not current.get(
+                "resolution"
+            ):
+                raise  # only a proven concurrent terminal/decision transition is benign
 
     def _bound(self, op):
         binding = self.binding(op["owner"], op["requestId"])
@@ -287,6 +422,8 @@ class Mirror:
             (binding["task"],),
         ):
             payload = json.loads(row[0] or "{}")
+            if not isinstance(payload, dict):
+                raise self.core.ActionError("Invalid card event payload", 409)
             receipt = payload.get("user_steps_projection")
             if (
                 not isinstance(receipt, dict)
@@ -344,7 +481,9 @@ class Mirror:
             def fence(conn):
                 if self._receipt(conn, binding, op):
                     return "already recorded"
-                current = self._snapshot(conn, binding["task"], op["owner"])
+                current = self._snapshot(
+                    conn, binding["task"], op["owner"], presentation=False
+                )
                 return (
                     None
                     if current is not None and encoded(current) == binding["snapshot"]
