@@ -180,6 +180,9 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
   Root fix: `if: ${{ !cancelled() }}` and run gate/report jobs on a light runner label; PRs pick it up only after
   rebasing, so keep the sweep running until then. Before adding concurrency rules, grep the workflows; they may
   already exist.
+- Runs created during a GitHub Actions incident can stay `queued` with 0 jobs forever (cancel, force-cancel and
+  rerun all refused): close and reopen the PR to refire its CI on the same sha, never an empty commit. Guards and
+  branch pushes: `references/actions-outages.md` §Ghost runs.
 - A gate on the CURRENT head that sits `queued` is not a latch: it waits for a free runner with its labels. Read
   them first (`gh api repos/O/R/actions/jobs/<id> --jq .labels`; the id ends the check's `detailsUrl`), then
   diagnose that label's pool per `references/self-hosted-runner-migration.md` (Pitfalls, saturation by label).
@@ -189,56 +192,10 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
 
 ## CI refused for billing (account-wide outage)
 
-Symptom: every job fails in 1–4 s with zero steps, across all workflows and repos of the account. The cause is
-in the job's check-run annotation, not the log: `gh api repos/R/check-runs/<job id>/annotations --jq '.[].message'`
-contains "The job was not started because recent account payments have failed or your spending limit needs to
-be increased". This is not a code failure: don't fix-forward or revert anything for it, and tell running repair
-workers to stop chasing tests.
-
-1. **Wait for it to clear with this skill's `scripts/actions_billing_probe.sh OWNER/REPO [cheap-workflow.yml]`**
-   (don't write a new probe script: this one already handles the in-progress and zero-steps cases), started in
-   the background with notify on `ACTIONS OK` / `STILL BLOCKED`. The probe re-runs a cheap Linux workflow, so it
-   doesn't depend on someone pushing. "I raised the limit" isn't proof: confirm with the probe before relaying it.
-   For a one-shot "are we still blocked?", don't scan recent runs: once repos are on self-hosted runners, no
-   hosted job may have run for hours, so recent runs prove nothing. Re-run the refused job itself
-   (`gh run rerun <run id> -R O/R --failed`, ~60 s, reuses upstream job outputs) and read its annotation.
-2. **List everyone who is waiting before it clears**, and save the list to a scratch file so it survives compaction:
-   - chats: `session_search` on the exact phrases `"payments have failed"` and `"spending limit"`. One search
-     misses sessions that only quoted the other phrase.
-   - Kanban: read the *latest* `blocked` event reason of each blocked card, not the title:
-     `select t.id,t.session_id,json_extract(e.payload,'$.reason') from tasks t join task_events e on e.task_id=t.id where t.status='blocked' and e.kind='blocked' and e.created_at=(select max(created_at) from task_events where task_id=t.id and kind='blocked') and (e.payload like '%spending limit%' or e.payload like '%payments have failed%' or e.payload like '%billing%')`.
-     Run it on every board/host that has workers, e.g. a remote host's board db over ssh.
-   - The card `session_id`s add the chats that own those cards.
-3. **Notify only after the probe passes.** A message arrives as a user turn, so sending it early makes every
-   session retry into the same refusal. Once it passes: `cross_session send` each chat (CI is back, resume),
-   then `kanban_comment` + `kanban_unblock` each card (or `hermes kanban --board <b> comment/unblock` on the
-   remote board).
-4. **If the probe keeps failing more than ~30 min after the user's change,** tell the user what you observed (how
-   many probes, first and last times), then narrow the cause yourself before handing them pages to click:
-   - Scope: list the account's repos' newest runs. Public repos still running while private ones are refused
-     means GitHub is blocking all *paid* usage on the account, not one workflow or repo.
-   - Usage: `gh api "/users/<user>/settings/billing/usage?year=Y&month=M"` returns per-day, per-repo, per-SKU
-     items: aggregate `grossAmount` by (repo, sku) and by day to find the runaway workflow (hosted macOS is the
-     usual one). There's no API for a personal account's budgets (`/settings/billing/budgets` is 404): read the
-     Budgets, Payment information and Payment history pages yourself with `browser_exec(local=true)` (the user's
-     signed-in Chrome) instead of asking for screenshots.
-   - Mail: search the user's Gmail (same browser) for GitHub mail since the block began (budget reached,
-     payment failed, `[GitHub Support]`). No such mail plus a budget under its cap plus all-successful payments
-     points away from budget/charges.
-   - "The issue we filed" about billing usually means a GitHub Support ticket, not a Kanban/board card: find its
-     id in the `[GitHub Support]` mail and read it at `https://support.github.com/ticket/personal/0/<id>` before
-     answering. Check board cards only if no ticket exists.
-   - Then the remaining documented cause is a failed card **authorization hold**: GitHub places holds after
-     significant metered usage or a budget increase, a declined hold locks billing, and it never appears in
-     payment history (that only lists completed charges). Docs:
-     https://docs.github.com/en/billing/how-tos/troubleshooting/locked-account. Tell the user to look for a
-     declined GitHub authorization at the bank, re-save the card on the Payment information page (that triggers a
-     new authorization), and otherwise open a support ticket asking for a billing-lock review.
-   - Keep the probe running throughout; it ends the wait the moment any of these clears it.
-5. **When billing can't be fixed soon, move repos to self-hosted runners instead of waiting** (registration,
-   no-sudo workflow edits, dirty-checkout pitfalls, refused PR reruns; also moving back to hosted/Blacksmith): `references/self-hosted-runner-migration.md`.
-   Before moving a repo, check its `runs-on` and runners: another session may have moved it already.
-6. **Detection:** `~/.hermes/scripts/gh_actions_billing_watch.py` (hourly no_agent hub cron) files verified Kanban cards for refused jobs, spend thresholds, and persistent scan failures. Scan-unavailable errors are operational evidence, not confirmed billing locks: inspect broker vend failure_phase/failure_class, blocked reason, attempts and samples before choosing remediation. Never blindly retry exit75, which also represents quota denial. For read-only live verification, import and call `refused_jobs(now)` and `spend(now)` directly; `main()` and `--force` can create real cards, so tests must isolate the card sink and state.
+Every job fails in 1–4 s with zero steps across the account's repos, and the job's check-run annotation says it
+was not started because payments failed or the spending limit was reached. It is not a code failure: don't
+fix-forward or revert anything for it. Follow `references/actions-outages.md` §CI refused for billing: wait with
+`scripts/actions_billing_probe.sh`, list who is waiting, notify only after the probe passes, then narrow the cause.
 
 ## Landing a reviewed PR with a head-pinned watcher
 
