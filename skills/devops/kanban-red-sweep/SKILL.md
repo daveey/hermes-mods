@@ -79,14 +79,21 @@ bypassed with another writer.
 - Asks to delete a finished card's scratch workspace: core scratch GC removes terminal cards' scratch trees after
   `kanban.worktree_retention_days`. Comment that and archive; no human `rm` is needed.
 
-## 4. Ask about the rest: one `clarify` form
+## 4. Ask about the rest: `clarify`, no timeout
 
-- One question per remaining card, in plain household terms (what happens, not card mechanics). Recommended option
-  first. No card ids, no "unblock = / archive =" wording.
-- Batch low-stakes defaults into one "accept all recommended" question.
-- Physical or sign-in steps are not questions. List them as actions grouped by device, each with what "done" looks like.
-- Record each answer on the card yourself (comment, then unblock/archive/complete). Don't leave it to the user.
-- If the `clarify` times out, put the same questions in `session_outcome {"kind":"decide"}` so they wait in For you.
+- Before asking, set `hermes config set agent.clarify_timeout 0`. The default 90 s timeout made the form vanish
+  before the user answered, and he asked for forms with no timeout.
+- One `clarify` call holds up to 5 questions. The user wants to answer many at once, so batch them: one
+  self-contained question per card, numbered "N/total", plain household terms, the decisive fact in the question.
+- Choices: the recommended option first, labelled "(recommended)", one button per real option, and a last "Skip"
+  choice. Use no card ids in the labels and no "unblock = / archive =" wording. Free-text follow-ups (an allowlist,
+  a consent reference) get their own open question.
+- The ask-gate `superseding_work` check can refuse the form. Name the related cards it lists inside the question
+  text (e.g. "(t_x only covered docs, so it doesn't settle this)"), then resend.
+- Record each answer on its card right away (comment with the exact choice and the chat id, then unblock, archive
+  or complete). Then withdraw every For-you request this chat published for the same question
+  (`action_request {"withdraw": ...}`), so nothing stale stays in the queue.
+- Physical or sign-in steps are not questions. List them as actions, each with its device and what "done" looks like.
 
 ## Pitfalls
 
