@@ -567,7 +567,8 @@ def subscribe_refused_chat(target: Any, task: str, *, add_sub=None, this_gateway
     add = add_sub or _default_add_sub
     try:
         if gw and gw != me:
-            add(task_id=task, platform="hub", chat_id=f"{gw}/{profile}/{sid}", notifier_profile=profile)
+            add(task_id=task, platform="hub", chat_id=f"{gw}/{profile}/{sid}", notifier_profile=profile,
+                delivery_metadata={"reason": "send_refused"})
             return f"hub:{gw}/{profile}/{sid}"
         add(task_id=task, platform="tui", chat_id=sid, notifier_profile=profile,
             delivery_metadata={"reason": "send_refused"})

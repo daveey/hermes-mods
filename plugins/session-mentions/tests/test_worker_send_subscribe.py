@@ -71,6 +71,7 @@ def test_refused_send_to_remote_chat_creates_one_hub_subscription(subs):
         err = rf.worker_send_refusal(REMOTE)
         assert err and "subscribed" in err
     assert list(subs.rows) == [("t_worker", "hub", "macbook/default/20261023_204125_cb2658")]
+    assert next(iter(subs.rows.values()))["delivery_metadata"] == {"reason": "send_refused"}
 
 
 def test_refused_send_to_local_chat_creates_one_tui_subscription(subs):
@@ -166,10 +167,29 @@ def test_real_kanban_db_gets_exactly_one_row(isolated_board, monkeypatch):
         assert "subscribed" in rf.worker_send_refusal(target)
     with kbc.connect_closing() as conn:
         rows = kbn.list_notify_subs(conn, tid)
+    assert all(r["delivery_metadata"]["reason"] == "send_refused" for r in rows)
     assert sorted((r["platform"], r["chat_id"]) for r in rows) == [
         ("hub", "macbook/default/20261023_204125_cb2658"),
         ("tui", "20261027_133954_1b6eae"),
     ]
+
+
+@pytest.mark.parametrize("first", ["origin", "shepherd", None])
+def test_refused_remote_send_preserves_existing_ownership(monkeypatch, isolated_board, first):
+    kb = pytest.importorskip("hermes_cli.kanban_db")
+    kbc = pytest.importorskip("hermes_cli.kanban_db_connect")
+    kbn = pytest.importorskip("hermes_cli.kanban_db_notify")
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="Already watched", assignee="default")
+        kbn.add_notify_sub(conn, task_id=tid, platform="hub", notifier_profile="default",
+                           chat_id="macbook/default/20261023_204125_cb2658",
+                           delivery_metadata={"reason": first} if first else None)
+    # Opening the board may stamp legacy rows. Preserve whatever owning reason it had.
+    with kbc.connect_closing() as conn:
+        before = kbn.list_notify_subs(conn, tid)[0]["delivery_metadata"]
+    assert rf.subscribe_refused_chat(REMOTE, tid, this_gateway="hub")
+    with kbc.connect_closing() as conn:
+        assert kbn.list_notify_subs(conn, tid)[0]["delivery_metadata"] == before
 
 
 def test_default_add_sub_refuses_a_task_this_board_does_not_own(monkeypatch, isolated_board):
