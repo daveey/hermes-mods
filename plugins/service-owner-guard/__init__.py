@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import datetime
+import glob
 import importlib.util
 import inspect
 import json
@@ -152,17 +153,23 @@ def _segments(text: str) -> list:
     return out
 
 
+SHELL_KEYWORDS = {"then", "do", "else", "{", "!", "time", "if", "while", "until", "elif"}
+
+
 def _strip(argv: list) -> list:
     i = 0
     while i < len(argv):
         tok = argv[i]
+        if tok in SHELL_KEYWORDS:  # `if x; then systemctl stop u; fi`: the program follows the keyword
+            i += 1
+            continue
         if re.match(r"^[A-Za-z_]\w*=", tok) or os.path.basename(tok) in {
                 "sudo", "env", "nice", "timeout", "command", "nohup", "exec", "setsid"}:
             i += 1
             if os.path.basename(tok) == "timeout" and i < len(argv):
                 i += 1
             continue
-        if tok.startswith("-") and i > 0 and os.path.basename(argv[i - 1]) in {"sudo", "env", "nice"}:
+        if tok.startswith("-") and i > 0 and os.path.basename(argv[i - 1]) in {"sudo", "env", "nice", "setsid"}:
             i += 1
             continue
         break
@@ -226,26 +233,38 @@ def _systemctl(args: list, host) -> list:
 
 
 def _hermes(args: list, host) -> list:
-    """``hermes [-p NAME] gateway stop``: the stop of that profile's gateway unit."""
-    profile, i = "", 0
-    while i < len(args) and args[i] != "gateway":
-        if args[i] in {"-p", "--profile"} and i + 1 < len(args):
-            profile = args[i + 1]
-            i += 1
-        elif args[i].startswith("--profile="):
-            profile = args[i].split("=", 1)[1]
+    """``hermes [-p NAME] gateway stop [--all]``: the stop of that profile's gateway unit(s)."""
+    profile, words, i = "", [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg in {"-p", "--profile"} and i + 1 < len(args):
+            profile, i = args[i + 1], i + 1
+        elif arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1]
+        elif not arg.startswith("-"):
+            words.append(arg)
         i += 1
-    if i + 1 >= len(args) or args[i + 1] != "stop":
+    if words[:2] != ["gateway", "stop"]:
         return []
+    profile = profile.lower()
     unit = "hermes-gateway-" + profile if profile and profile != "default" else "hermes-gateway"
+    if "--all" in args:  # stops every profile's gateway
+        unit = "hermes-gateway-*"
     return [{"tool": "systemctl", "verb": "stop", "host": host, "unit": unit, "user": True, "label": unit,
              "key": unit}]
 
 
 def _script_text(args: list) -> str:
     """The text of the script file a shell/python invocation runs (first non-option argument), else ''."""
+    skip = False
     for arg in args:
-        if arg.startswith("-") or arg in {"&", ">"} or arg[:1] in {">", "<", "&"} or arg[:2] == "2>":
+        if skip:
+            skip = False
+            continue
+        if arg in {"-o", "+o", "-O", "+O"}:
+            skip = True  # `bash -o pipefail script.sh`: the option's value is not the script
+            continue
+        if arg.startswith(("-", "+")) or arg in {"&", ">"} or arg[:1] in {">", "<", "&"} or arg[:2] == "2>":
             continue
         path = Path(os.path.expanduser(arg))
         try:
@@ -314,8 +333,18 @@ def _extract(argv: list, host, depth: int, out: list) -> None:
         if not host:  # `bash script.sh`: the script's own commands
             _extract_text(_script_text(args), host, depth + 1, out)
     elif re.fullmatch(r"python[0-9.]*", prog) and depth < 3 and not host:
-        for cmd in _py_commands(_script_text(args)):
+        code = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "-c"), None)
+        for cmd in _py_commands(code if code is not None else _script_text(args)):
             _extract_text(cmd, host, depth + 1, out)
+    elif prog in {"source", "."} and depth < 3 and not host:
+        _extract_text(_script_text(args), host, depth + 1, out)
+    elif "/" in argv[0] and re.search(r"\.(sh|bash|py)$", prog) and depth < 3 and not host:  # direct exec
+        text = _script_text([argv[0]])
+        if prog.endswith(".py"):
+            for cmd in _py_commands(text):
+                _extract_text(cmd, host, depth + 1, out)
+        else:
+            _extract_text(text, host, depth + 1, out)
     elif prog == "hermes":
         out.extend(_hermes(args, host))
     elif prog == "ssh" and depth < 3:
@@ -345,7 +374,8 @@ def _py_commands(code: str) -> list:
         if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
             parts = [e.value if isinstance(e, ast.Constant) and isinstance(e.value, str) else
                      str(e.value) if isinstance(e, ast.Constant) else "?" for e in node.elts]
-            if os.path.basename(parts[0]) in {"launchctl", "systemctl", "kill", "pkill", "killall", "ssh"}:
+            if os.path.basename(parts[0]) in {"launchctl", "systemctl", "kill", "pkill", "killall", "ssh",
+                                                  "hermes", "bash", "sh", "zsh", "dash"}:
                 cmds.append(shlex.join(parts))
         elif isinstance(node, ast.Constant) and isinstance(node.value, str) and " " in node.value:
             cmds.append(node.value)
@@ -450,15 +480,26 @@ def _pinned_dropin(act: dict) -> str:
     """The pinned-owner drop-in of a local systemd unit, or '' (lookup failure reads as not pinned)."""
     if act["tool"] != "systemctl" or act["host"]:
         return ""
-    unit = act["unit"] if act["unit"].endswith(".service") else act["unit"] + ".service"
+    name = act["unit"]
+    unit = name if "." in os.path.basename(name) else name + ".service"
     argv = ["systemctl"] + (["--user"] if act["user"] else []) + ["show", "-p", "DropInPaths", "--value", unit]
     try:
         rc, out = run_cmd(argv, 5)
     except Exception:  # health: allow BLE001 -- a lookup bug must not break a tool call
-        return ""
-    if rc != 0:
-        return ""
-    return next((p for p in out.replace(" ", "\n").splitlines() if PINNED_DROPIN.search(p)), "")
+        rc, out = 1, ""
+    if rc == 0:
+        return next((p for p in out.replace(" ", "\n").splitlines() if PINNED_DROPIN.search(p)), "")
+    # No bus (sandboxed profile, sudo): read the unit's drop-in directory itself.
+    roots = [Path.home() / ".config/systemd/user", Path("/etc/systemd/user"), Path("/etc/systemd/system")]
+    pattern = (name if "*" in name else glob.escape(unit)).removesuffix(".service") + ".service.d/*pinned-owner*.conf"
+    for root in roots:
+        try:
+            hit = sorted(root.glob(pattern))
+        except OSError:
+            continue
+        if hit:
+            return str(hit[0])
+    return ""
 
 
 def _evaluate(text: str, actions: list) -> Optional[str]:
