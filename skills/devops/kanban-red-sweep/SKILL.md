@@ -68,6 +68,12 @@ bypassed with another writer.
   steps (live checks, a PR on a moved repo), comment the corrected premise and unblock so the owner finishes. Don't force it.
 - A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
 - Cards whose dependents wait on them: unblocking or completing promotes the children. Check them.
+- A card you unblock may sit `ready` behind a full worker pool. Read the queue head first
+  (`select id,priority from tasks where status='ready' order by priority desc limit 10`) and set
+  `hermes kanban edit <id> --priority <above the cards that should yield>`; a token bump like 10 leaves it behind
+  queues at 50-300.
+- A worker can't archive cards outside its own task; when its handoff names an exact archive/unblock command for
+  sibling cards that follows the user's recorded answer, run it here, read back the status, and re-queue the worker.
 - Link every card still waiting on the user to this chat, so its wake lands here:
   `hermes kanban [--board B] notify-subscribe <id> --platform tui --chat-id <this session id> --delivery-mode notify+wake`.
   The chat-link reconcile turns it into a `shepherd` row in `task_chat_links` within about a minute; read back
