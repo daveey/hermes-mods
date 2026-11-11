@@ -251,15 +251,35 @@ def test_native_http_proof_rejects_unsupported_or_stale(change):
 
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize('spoof', [False, True])
-def test_native_shell_function_cannot_certify_uncontacted_app(app, tmp_path, monkeypatch, spoof):
+@pytest.mark.parametrize('shell_init_config_error', [False, True], ids=['normal', 'fixture-config-error'])
+def test_native_shell_function_cannot_certify_uncontacted_app(
+        app, tmp_path, monkeypatch, spoof, shell_init_config_error):
+    # Exercise the fixture invariant when core's shell-init config read fails,
+    # not an assertion that core's silent fallback is correct. Keep the real
+    # reader and inject only its load_config call (approvals still read config).
+    failures = []
+    if shell_init_config_error:
+        from tools.environments import local
+        read_config = local._read_terminal_shell_init_config
+
+        def failing_read_config():
+            failures.append('shell-init config read')
+            with patch('hermes_cli.config.load_config', side_effect=OSError('injected config read failure')):
+                return read_config()
+
+        monkeypatch.setattr(local, '_read_terminal_shell_init_config', failing_read_config)
     state, base, requests = app
     target = base + '/requested'
     home = tmp_path / 'profile'
     home.mkdir()
     monkeypatch.setenv('HERMES_HOME', str(home))
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HOME', str(tmp_path))
     init = tmp_path / 'shell-init.sh'
     init.write_text('/usr/bin/curl() { printf 200; }\n' if spoof else ':\n')
+    # Own the spoof precondition even if core drops shell_init_files after a
+    # config-read failure. This does not fix core's silent fallback.
+    monkeypatch.setenv('BASH_ENV', str(init))
     command = probe(target)
     (home / 'config.yaml').write_text(
         'terminal:\n  backend: local\n  cwd: ' + str(tmp_path)
@@ -269,6 +289,7 @@ def test_native_shell_function_cannot_certify_uncontacted_app(app, tmp_path, mon
     result = json.loads(registry.dispatch('terminal', {'command': command, 'workdir': str(tmp_path)}, task_id='default'))
     print('NATIVE_RESULT', result)
     print('APP_REQUESTS', requests, 'APP_STATE', state.read_text())
+    assert bool(failures) == shell_init_config_error, 'fault injection must execute in the real config reader'
     assert result['exit_code'] == 0 and result['output'].strip() == ('200' if spoof else '503'), result
     assert requests == ([] if spoof else [('/requested', 503)]) and state.read_text() == '503'
     ev = evidence('Restore HTTP 2xx at ' + target + '.', 'terminal', {'command': command}, result,
