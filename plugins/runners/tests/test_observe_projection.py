@@ -97,6 +97,26 @@ def test_job_filter_limits_legacy_unknown_and_no_live_io(tmp_path):
     assert len(a.job_calls)==1
 
 
+def test_budget_limited_rows_remain_inspectable_as_latest_sample(tmp_path):
+    from plugins.runners.providers.base import ProviderResult
+    cfg=config(); path=tmp_path/'state.sqlite'; a=Jobs()
+    a.result=a.result.__class__((dict(F['Runner'],provider_runner_id='3'),),True,None,1000,1)
+    job=dict(repository='example/project',run_id='1',job_id='2',runner_id='3',status='in_progress',conclusion=None)
+    a.enrich_jobs=lambda *args,**kw:ProviderResult((job,),False,'request_budget',1000,None)
+    with Store(path) as store:
+        c=Collector(store,cfg,a,clock=lambda:1000,job_repositories={F['Scope']['id']:['example/project']})
+        c.tick()
+        detail=Service(path,cfg,clock=lambda:1001).inspect(F['Runner']['id'])
+        assert detail['data']['job_monitoring']['state']=='unavailable'
+        assert detail['data']['job_monitoring']['reason_code']=='request_budget'
+        assert detail['data']['observed_jobs'][0]['job_id']=='2'
+        validate('InspectResponse',detail)
+        a.enrich_jobs=lambda *args,**kw:ProviderResult((),False,'request_budget',1031,None)
+        c.clock=lambda:1031
+        c.tick()
+        assert Service(path,cfg,clock=lambda:1032).inspect(F['Runner']['id'])['data']['observed_jobs']==[]
+
+
 def test_partial_allowlist_revocation_filters_cached_rows_during_cooldown(tmp_path):
     from plugins.runners.providers.base import ProviderResult
     cfg=config();path=tmp_path/'state.sqlite';a=Jobs();sid=F['Scope']['id']

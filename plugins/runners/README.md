@@ -190,6 +190,20 @@ When any candidate is busy, bounded enrichment queries in-progress runs so newer
 queued/completed runs cannot exhaust the budget before active work is inspected.
 Recent-only candidates use the bounded unfiltered history query; neither mode
 claims exhaustive job history or turns a missing attribution into runner failure.
+Within each scope/repository/query, successful job-page reads rotate through the
+first 100 returned runs across polls (up to 10 runs and 10 requests per call,
+including the run-list request). Pending surviving IDs stay ahead of new arrivals,
+even if the last-read run completes. No extra requests or quota exemptions are
+introduced. `test_job_rotation.py` covers rotation, churn, failure retry, shared
+cycle limits and cursor isolation. Cursors are process-local scheduling hints:
+restart resets them, not durable credential budgets. Coverage remains a sample,
+not a cumulative history: only the latest poll's rows are exposed. Beyond the first
+100 runs or first 100 jobs per run is unobserved; persistent read failures and
+budget exhaustion in an earlier allowlisted repository can still prevent later
+work. Incomplete results retain their reason (`request_budget`, `cycle_budget`,
+`enrichment_truncated`); request/cycle budget results currently show monitoring as
+unavailable, while any returned rows remain inspectable. Never infer idleness
+from absent job rows.
 
 Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/fleet` (machines and slots for the Desktop panel;
 see `desktop-plugins/runners/README.md`), GET `/enrollment`, GET

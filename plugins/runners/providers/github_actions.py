@@ -75,6 +75,9 @@ class GitHubActions:
         self.max_cycle_requests, self.pace_requests = max_cycle_requests, pace_requests
         self._cycle_remaining = None
         self._budgets, self._cache, self._enriched = {}, {}, {}
+        # Advisory scheduling only; never evidence or an authorization cache.
+        # Restart resets the bounded window, without resetting durable quotas.
+        self._job_cursors = {}
         self._lock = RLock()
         self.state_sink = None
 
@@ -431,12 +434,21 @@ class GitHubActions:
                     if count < len(runs):
                         raise _Failure('count_mismatch')
                     truncated |= count > len(runs) or len(runs) > self.max_runs
-                    seen_runs = set()
-                    for run in runs[:self.max_runs]:
-                        run_id = self._id(run.get('id'))
-                        if run_id in seen_runs:
-                            raise _Failure('duplicate_id')
-                        seen_runs.add(run_id)
+                    # Rotate within the existing first-page horizon. Otherwise
+                    # every call spends its budget on the same newest runs and
+                    # an older active runner is permanently invisible.
+                    run_ids = [self._id(run.get('id')) for run in runs]
+                    if len(set(run_ids)) != len(run_ids):
+                        raise _Failure('duplicate_id')
+                    cursor_key = (c.key, s['id'], repo, status_filter)
+                    previous = self._job_cursors.get(cursor_key, ())
+                    current = set(run_ids)
+                    prior = set(previous)
+                    # Keep surviving pending work ahead of new arrivals even
+                    # when the last served run completed between polls.
+                    ordered = [rid for rid in previous if rid in current]
+                    ordered.extend(rid for rid in run_ids if rid not in prior)
+                    for index, run_id in enumerate(ordered[:self.max_runs]):
                         count, jobs = self._page(get(f'/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page=1'), 'jobs')
                         truncated |= count > len(jobs)
                         if count < len(jobs):
@@ -456,6 +468,8 @@ class GitHubActions:
                                 raise _Failure('invalid_payload')
                             rows.append(dict(repository=repo,run_id=run_id,job_id=jid,runner_id=rid,
                                              status=status,conclusion=conclusion))
+                        # Failed/denied/deferred reads never count as service.
+                        self._job_cursors[cursor_key] = ordered[index + 1:] + ordered[:index + 1]
                 return ProviderResult(tuple(rows), not truncated, 'enrichment_truncated' if truncated else None, self.clock(), None)
             except BudgetPersistenceError:
                 raise
