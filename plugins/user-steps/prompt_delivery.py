@@ -59,6 +59,13 @@ class PromptAdmission:
                 'need independent owner permission; no GPU permission is granted here. '
                 'Never repeat an operation already executed.\n' +
                 encode({'operationId': op['operationId'], **op['intent']}))
+        if op.get('binding'):
+            # Only operations recorded with a v1 question binding: older operations keep their exact admitted text
+            # (its digest is the admission identity a restarted readback recomputes).
+            text += ('\nOwner receipt: after validating, call action_request {"receipt": {"operationId": "%s", '
+                     '"phase": "acknowledged", "revision": %d, "scopeDigest": "%s"}}; after acting, phase "applied" '
+                     'with evidence refs, or "not_applied" with a reason. Receipts grant nothing.'
+                     % (op['operationId'], op['revision'], op['binding']['scopeDigest']))
         sid = op['owner']['storedSessionId']
         digest = hashlib.sha256(encode({'stored_session_id': sid, 'text': text}).encode()).hexdigest()
         return dict(profile=op['owner']['profile'], stored_session_id=sid,

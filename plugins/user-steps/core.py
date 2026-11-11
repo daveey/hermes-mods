@@ -2130,6 +2130,57 @@ def _redact_error(exc) -> str:
     return text[:240]
 
 
+# ---- v1 bound answers and owner receipts (approved durable-decision-delivery plan) ------------------------
+# A question binding freezes, per request revision, exactly what was asked: the qualified owner, the ordered
+# question/choice snapshot and a digest of the frozen scope. Answers (clarify early answers, numbered chat replies)
+# are matched against that snapshot, never against the newest list or the session alone. Owner receipts record what
+# the consuming agent did with a delivered decision; none of them grants anything.
+BINDING_SCHEMA = 1
+RECEIPT_PHASES = ('acknowledged', 'applied', 'not_applied')
+EVIDENCE_TYPES = ('message', 'tool_call', 'commit', 'pr', 'kanban', 'file', 'url', 'operation')
+
+
+def _sha(value) -> str:
+    return hashlib.sha256(_json(value).encode('utf-8')).hexdigest()
+
+
+def scope_digest(revision_body: dict) -> str:
+    """Digest of one frozen request revision: everything but its mutable projections (state, resolution, views)."""
+    return _sha({k: v for k, v in revision_body.items()
+                 if k not in ('state', 'resolution', 'createdAt', 'withdrawal')})
+
+
+def _qnorm(text) -> str:
+    return ' '.join(str(text or '').split()).casefold()
+
+
+def question_key(question, labels) -> str:
+    """Identity of one asked question: normalized text + ORDERED choice labels (order is part of what was shown)."""
+    return _sha({'question': _qnorm(question), 'choices': [_qnorm(x) for x in labels]})
+
+
+def question_binding(r: dict) -> dict:
+    """The immutable binding of request revision ``r`` (source: the structured ActionRequest itself)."""
+    choices = [{'id': c['id'], 'label': c['label']} for c in r['choices']]
+    body = {'schemaVersion': BINDING_SCHEMA, 'owner': r['owner'], 'requestId': r['requestId'],
+            'revision': r['revision'], 'source': {'type': 'action_request'},
+            'questions': [{'question': r['title'], 'choices': choices}],
+            'questionKey': question_key(r['title'], [c['label'] for c in choices]),
+            'scopeDigest': scope_digest(r)}
+    return dict(body, digest=_sha(body))
+
+
+def validate_evidence(evidence) -> list:
+    if not isinstance(evidence, list): raise ActionError('evidence must be a list of {type, id} references')
+    for ref in evidence:
+        _object(ref, ('type', 'id'), ('board', 'note'))
+        if ref['type'] not in EVIDENCE_TYPES: raise ActionError(f'evidence type must be one of {", ".join(EVIDENCE_TYPES)}')
+        for v in ref.values(): _string(v)
+        if len(_json(ref)) > 1000: raise ActionError('evidence reference too long')
+    if len({_json(x) for x in evidence}) != len(evidence): raise ActionError('Duplicate evidence reference')
+    return evidence
+
+
 class ActionStore:
     """SQLite FULL-sync transaction commits decision + frozen delivery intent before dispatch.
 
@@ -2165,6 +2216,16 @@ class ActionStore:
                 CREATE TABLE IF NOT EXISTS lifecycle (
                   namespace TEXT, id TEXT, created_at REAL, withdrawal TEXT, notified_at REAL,
                   asked_revision INTEGER, PRIMARY KEY(namespace,id));
+                -- v1 bound answers + owner receipts: side tables only, so older processes keep working.
+                CREATE TABLE IF NOT EXISTS question_bindings (
+                  namespace TEXT, request TEXT, revision INTEGER, digest TEXT, body TEXT,
+                  PRIMARY KEY(namespace,request,revision));
+                CREATE TABLE IF NOT EXISTS list_snapshots (
+                  namespace TEXT, session TEXT, source TEXT, digest TEXT, body TEXT,
+                  PRIMARY KEY(namespace,session,source));
+                CREATE TABLE IF NOT EXISTS owner_receipts (
+                  namespace TEXT, operation TEXT, phase TEXT, fingerprint TEXT, body TEXT,
+                  PRIMARY KEY(namespace,operation,phase));
             ''')
             if 'asked_revision' not in {row[1] for row in c.execute('PRAGMA table_info(lifecycle)')}:
                 c.execute('ALTER TABLE lifecycle ADD COLUMN asked_revision INTEGER')
@@ -2258,6 +2319,7 @@ class ActionStore:
                           (ns, r['requestId'], owner['storedSessionId'], 1, r['state']))
                 self._aliases(c, owner, r)
                 c.execute('INSERT INTO revisions VALUES (?,?,?,?)', (ns, r['requestId'], 1, _json(r)))
+                self._bind_question(c, r)
                 c.execute('INSERT OR IGNORE INTO lifecycle(namespace,id,created_at,asked_revision) VALUES (?,?,?,1)',
                           (ns, r['requestId'], float(created_at) if created_at else time.time()))
                 if bind is not None: bind(r, 0)
@@ -2294,6 +2356,7 @@ class ActionStore:
                 raise ActionError('Replacement must preserve aliases')
             self._aliases(c, owner, r)
             c.execute('INSERT INTO revisions VALUES (?,?,?,?)', (ns, rid, r['revision'], _json(r)))
+            self._bind_question(c, r)
             c.execute('UPDATE requests SET revision=?,state=?,resolution=NULL WHERE namespace=? AND id=?',
                       (r['revision'], r['state'], ns, rid))
             if fresh or old['state'] == 'withdrawn':
@@ -2319,6 +2382,221 @@ class ActionStore:
 
     def operation(self, owner, oid=None, key=None):
         with self._read() as c: return self._operation(c, owner, oid, key)
+
+
+    # ---- question bindings ------------------------------------------------------------------------------------
+
+    def _bind_question(self, c, r):
+        b = question_binding(r); ns = self._ns(r['owner'])
+        row = c.execute('SELECT body FROM question_bindings WHERE namespace=? AND request=? AND revision=?',
+                        (ns, r['requestId'], r['revision'])).fetchone()
+        if row:
+            if json.loads(row[0]) != b: raise ActionError('Question binding is immutable', 409)
+            return b
+        c.execute('INSERT INTO question_bindings VALUES (?,?,?,?,?)',
+                  (ns, r['requestId'], r['revision'], b['digest'], _json(b)))
+        return b
+
+    def _binding(self, c, owner, rid, revision):
+        row = c.execute('SELECT body FROM question_bindings WHERE namespace=? AND request=? AND revision=?',
+                        (self._ns(owner), rid, revision)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def binding(self, owner, rid, revision=None):
+        """The frozen question binding of a revision (current by default), or None for rows written before v1."""
+        with self._read() as c:
+            r = self._get(c, owner, rid)
+            return self._binding(c, owner, rid, r['revision'] if revision is None else revision)
+
+    def bind_clarify(self, owner, descriptor, related):
+        """Bind a clarify at render time: freeze, per displayed question, the ONE undecided-or-pending request
+        revision of a related session (``related(stored_session_id)``, i.e. compression lineage) whose question key
+        matches. No match or several matches freeze ``None`` (never answered early). The first display wins and is
+        immutable for that tool call, so a later look-alike request never takes the question over."""
+        _object(descriptor, ('schemaVersion', 'toolCallId', 'questions', 'digest'))
+        tcid = descriptor['toolCallId']; _string(tcid); _string(descriptor['digest'])
+        if not isinstance(descriptor['questions'], list) or not descriptor['questions']:
+            raise ActionError('A clarify binding needs its displayed questions')
+        ns = self._ns(owner); key = 'clarify:' + tcid
+        with self._read() as c:  # polled every 2 s while a clarify waits: a bound clarify needs no write lock
+            row = c.execute('SELECT body FROM question_bindings WHERE namespace=? AND request=? AND revision=0',
+                            (ns, key)).fetchone()
+        if row:
+            old = json.loads(row[0])
+            if old['digest'] == descriptor['digest'] and old['owner'] == owner: return old
+        with self._tx() as c:
+            row = c.execute('SELECT body FROM question_bindings WHERE namespace=? AND request=? AND revision=0',
+                            (ns, key)).fetchone()
+            if row:
+                old = json.loads(row[0])
+                if old['digest'] != descriptor['digest'] or old['owner'] != owner:
+                    raise ActionError('This clarify is already bound to another question', 409)
+                return old
+            pending = {(op['requestId'], op['revision']) for r in c.execute(
+                'SELECT body FROM operations WHERE namespace=?', (ns,))
+                if (op := json.loads(r[0]))['dispatchState'] not in ('delivered', 'cancelled')}
+            candidates = []
+            for r in c.execute("SELECT b.body AS b, q.revision AS rev, q.state AS state, q.resolution AS res "
+                               "FROM question_bindings b JOIN requests q ON q.namespace=b.namespace AND q.id=b.request "
+                               "WHERE b.namespace=? AND b.revision>0", (ns,)):
+                b = json.loads(r['b'])
+                if b['revision'] != r['rev'] or not related(b['owner']['storedSessionId']):
+                    continue
+                if r['state'] in ('open', 'needs_context') and not r['res'] or (
+                        b['requestId'], b['revision']) in pending:
+                    candidates.append(b)
+            matches = []
+            for q in descriptor['questions']:
+                qk = question_key(q.get('question') if isinstance(q, dict) else '',
+                                  (q.get('choices') or []) if isinstance(q, dict) else [])
+                hits = [b for b in candidates if b['questionKey'] == qk]
+                one = hits[0] if len(hits) == 1 else None
+                matches.append({'questionKey': qk, 'requestId': one and one['requestId'],
+                                'revision': one and one['revision'], 'scopeDigest': one and one['scopeDigest'],
+                                'ambiguous': len(hits) > 1})
+            body = {'schemaVersion': BINDING_SCHEMA, 'owner': owner, 'source': {'type': 'clarify', 'toolCallId': tcid},
+                    'questions': descriptor['questions'], 'digest': descriptor['digest'], 'matches': matches}
+            c.execute('INSERT INTO question_bindings VALUES (?,?,?,?,?)', (ns, key, 0, descriptor['digest'], _json(body)))
+            return body
+
+    def record_list(self, owner, source_id, entries):
+        """Freeze a numbered list exactly as displayed in message ``source_id``: entry n -> (request, revision,
+        choice, scope digest). Re-recording the same source with other entries is refused; identical is a no-op."""
+        _string(source_id)
+        if not isinstance(entries, list) or not entries or len(entries) > 50:
+            raise ActionError('entries must be a nonempty list (at most 50)')
+        ns = self._ns(owner)
+        with self._tx() as c:
+            snap = []
+            for n, e in enumerate(entries, 1):
+                _object(e, ('requestId', 'choiceId'))
+                r = self._get(c, owner, e['requestId'])
+                if r['state'] not in ('open', 'needs_context') or r.get('resolution'):
+                    raise ActionError('Only undecided requests can be listed', 409)
+                choice = next((x for x in r['choices'] if x['id'] == e['choiceId']), None)
+                if choice is None: raise ActionError('Unknown choice')
+                if choice['effect'] == 'revise' or choice['id'] == 'answer-text':
+                    raise ActionError('A numbered option cannot stand for free text or a change request')
+                b = self._binding(c, owner, r['requestId'], r['revision'])
+                if b is None: raise ActionError('Request revision has no question binding', 409)
+                snap.append({'n': n, 'requestId': r['requestId'], 'revision': r['revision'], 'choiceId': choice['id'],
+                             'label': choice['label'], 'effect': choice['effect'], 'scopeDigest': b['scopeDigest']})
+            body = {'schemaVersion': BINDING_SCHEMA, 'owner': owner, 'source': {'type': 'message', 'id': source_id},
+                    'entries': snap}
+            body['digest'] = _sha(body)
+            row = c.execute('SELECT body FROM list_snapshots WHERE namespace=? AND session=? AND source=?',
+                            (ns, owner['storedSessionId'], source_id)).fetchone()
+            if row:
+                old = json.loads(row[0])
+                if old != body: raise ActionError('A different list is already recorded for this message', 409)
+                return old
+            c.execute('INSERT INTO list_snapshots VALUES (?,?,?,?,?)',
+                      (ns, owner['storedSessionId'], source_id, body['digest'], _json(body)))
+            return body
+
+    def resolve_numbered(self, owner, source_id, number, *, lineage=()):
+        """A numbered reply -> the exact decision fields for ``decide()``, only against its originating list.
+
+        No source (ambiguous), an unknown list, a stale revision/scope or an already decided request raise; nothing
+        is ever remapped onto a newer list. The result authorizes nothing by itself: ``decide()`` still validates."""
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ActionError('A numbered answer needs the exact list it answers; nothing is authorized', 422)
+        if type(number) is not int: raise ActionError('Invalid option number')
+        sessions = [owner['storedSessionId'], *[x for x in (lineage or ()) if x != owner['storedSessionId']]]
+        with self._read() as c:
+            rows = [r for sid in sessions for r in c.execute(
+                'SELECT body FROM list_snapshots WHERE namespace=? AND session=? AND source=?',
+                (self._ns(owner), sid, source_id))]
+            if not rows: raise ActionError('Unknown list in this session', 404)
+            snap = json.loads(rows[0][0])  # newest session first: a compression continuation sees ancestors' lists
+            entry = next((e for e in snap['entries'] if e['n'] == number), None)
+            if entry is None: raise ActionError('No such option in that list', 422)
+            r = self._get(c, snap['owner'], entry['requestId'])
+            b = self._binding(c, snap['owner'], r['requestId'], r['revision'])
+            if (r['revision'] != entry['revision'] or r['state'] not in ('open', 'needs_context') or r.get('resolution')
+                    or b is None or b['scopeDigest'] != entry['scopeDigest']):
+                raise ActionError('That list is stale: the request changed or was decided; nothing is authorized', 409)
+        out = {'requestId': entry['requestId'], 'expectedRevision': entry['revision'], 'choiceId': entry['choiceId']}
+        if entry['effect'] == 'answer': out['revisionText'] = entry['label']
+        return out
+
+    # ---- owner receipts ---------------------------------------------------------------------------------------
+
+    def _receipts(self, c, ns, oid):
+        return [json.loads(row[0]) for row in c.execute(
+            'SELECT body FROM owner_receipts WHERE namespace=? AND operation=? ORDER BY rowid', (ns, oid))]
+
+    @staticmethod
+    def consumer_state(op, receipts):
+        """Owner-side phase, separate from delivery. No receipt = unknown (rows before v1 are never backfilled)."""
+        phases = {r['phase'] for r in receipts}
+        phase = ('not_applied' if 'not_applied' in phases else 'applied' if 'applied' in phases
+                 else 'acknowledged' if 'acknowledged' in phases else 'unknown')
+        return {'phase': phase, 'delivery': op.get('dispatchState'), 'receipts': receipts, 'grants': []}
+
+    def receipts(self, owner, oid):
+        with self._read() as c:
+            op = self._operation(c, owner, oid)['operation']
+            return self.consumer_state(op, self._receipts(c, self._ns(owner), oid))
+
+    def record_receipt(self, consumer, receipt, *, lineage=()):
+        """Durable, idempotent owner receipt for a delivered operation. Grants nothing.
+
+        ``consumer`` is the server-derived owner of the calling session; it must be the operation's exact owner or a
+        compression continuation of it (``lineage``, computed server-side). The receipt must name the delivered
+        revision and scope digest. acknowledged needs confirmed delivery; applied needs a prior acknowledgment,
+        exact-target evidence and a still-current request; applied and not_applied exclude each other."""
+        _object(receipt, ('operationId', 'phase', 'revision', 'scopeDigest'), ('evidence', 'reason'))
+        _string(receipt['operationId']); _string(receipt['scopeDigest'])
+        phase = receipt['phase']
+        if phase not in RECEIPT_PHASES: raise ActionError('phase must be acknowledged, applied or not_applied')
+        if type(receipt['revision']) is not int: raise ActionError('Invalid revision')
+        evidence = validate_evidence(receipt.get('evidence', []))
+        reason = receipt.get('reason')
+        if reason is not None:
+            _string(reason); reason = ' '.join(reason.split())[:500]
+        if phase == 'acknowledged' and (evidence or reason):
+            raise ActionError('acknowledged carries no evidence or reason')
+        if phase == 'applied' and not evidence: raise ActionError('applied requires exact-target evidence references')
+        if phase == 'not_applied' and not reason: raise ActionError('not_applied requires a reason')
+        ns = self._ns(consumer); oid = receipt['operationId']
+        from datetime import datetime, timezone
+        with self._tx() as c:
+            row = c.execute('SELECT body FROM operations WHERE namespace=? AND id=?', (ns, oid)).fetchone()
+            if not row: raise ActionError('Unknown operation for this owner', 404)
+            op = json.loads(row[0])
+            sid = op['owner']['storedSessionId']
+            if consumer['storedSessionId'] != sid and sid not in set(lineage or ()):
+                raise ActionError('Receipts come only from the owning session or its compression continuation', 403)
+            if receipt['revision'] != op['revision'] or receipt['scopeDigest'] != scope_digest(op['intent']['request']):
+                raise ActionError('Receipt does not match the delivered revision and scope', 409)
+            if op['dispatchState'] != 'delivered':
+                raise ActionError('Not delivered: a receipt requires confirmed delivery', 409)
+            body = {'operationId': oid, 'requestId': op['requestId'], 'revision': op['revision'],
+                    'scopeDigest': receipt['scopeDigest'], 'phase': phase, 'evidence': evidence}
+            if reason is not None: body['reason'] = reason
+            fingerprint = _sha(body)
+            existing = {r['phase']: r for r in self._receipts(c, ns, oid)}
+            if phase in existing:
+                if existing[phase]['fingerprint'] != fingerprint:
+                    raise ActionError('A different receipt is already recorded for this phase', 409)
+                return {'receipt': existing[phase], 'consumer': self.consumer_state(op, list(existing.values()))}
+            if phase != 'acknowledged':
+                other = 'not_applied' if phase == 'applied' else 'applied'
+                if other in existing: raise ActionError(f'Conflicting outcome: {other} is already recorded', 409)
+                if 'acknowledged' not in existing:
+                    raise ActionError('Acknowledge the exact revision before recording an outcome', 409)
+            if phase == 'applied':
+                if op['intent']['effect'] not in ('approve', 'answer'):
+                    raise ActionError('Only an approval or answer can be applied; record not_applied', 422)
+                current = self._get(c, op['owner'], op['requestId'])
+                if current['revision'] != op['revision'] or current['state'] != 'resolved':
+                    raise ActionError('Stale: the request is no longer resolved at the delivered revision; '
+                                      'applied cannot be recorded against it', 409)
+            rec = dict(body, fingerprint=fingerprint, consumer=consumer,
+                       recordedAt=datetime.now(timezone.utc).isoformat())
+            c.execute('INSERT INTO owner_receipts VALUES (?,?,?,?,?)', (ns, oid, phase, fingerprint, _json(rec)))
+            return {'receipt': rec, 'consumer': self.consumer_state(op, self._receipts(c, ns, oid))}
 
     def decide(self, owner, decision):
         _object(decision, ('requestId', 'expectedRevision', 'choiceId', 'idempotencyKey'), ('revisionText',))
@@ -2358,6 +2636,10 @@ class ActionStore:
                              'executionAuthorized': effect == 'approve' or (
                                  effect == 'answer' and choice.get('authorizes') is True and text == choice['label']),
                              'permissionGrants': []}}
+            bound = self._binding(c, owner, r['requestId'], r['revision'])
+            if bound is not None:
+                if bound['scopeDigest'] != scope_digest(r): raise ActionError('Question binding does not match scope', 409)
+                op['binding'] = {k: bound[k] for k in ('questionKey', 'scopeDigest', 'digest')}
             validate_admission_text({'operationId': oid, **op['intent']})
             try:
                 c.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)',
@@ -2370,7 +2652,7 @@ class ActionStore:
                       (_json(resolution), ns, r['requestId']))
             return self._operation(c, owner, oid)
 
-    def dispatch(self, owner, oid, receiver, *, early_tool_call_id=None):
+    def dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None):
         # Commit the attempt then release the DB lock BEFORE external I/O. Other
         # requests stay usable; concurrent retries share the receiver's durable key.
         # early_tool_call_id: deliver through a blocked clarify's tool result (receiver.deliver_early) instead of
@@ -2420,6 +2702,8 @@ class ActionStore:
             if confirmed:
                 cancelled = receipt.get('terminalCancelled') is True
                 op.update(dispatchState='cancelled' if cancelled else 'delivered', receipt=receipt)
+                if early_tool_call_id and early_binding is not None:
+                    op['clarifyBinding'] = early_binding  # the exact question this early answer was bound to
                 op.pop('error', None); op.pop('lastError', None)
                 effect = op['intent']['effect']
                 state = 'cancelled' if cancelled else {'revise': 'superseded', 'decline': 'cancelled'}.get(effect, 'resolved')

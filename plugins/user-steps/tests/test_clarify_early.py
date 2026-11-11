@@ -29,10 +29,31 @@ def recorded(tmp_path, *, session='session-a', key='k1', choice='approve', text=
 
 
 def provider(s, tmp_path, runs=None, db=None):
+    """The plugin provider, called the way a v1 core calls it: with the exact displayed question bound to the
+    decision's request (title + ordered choice labels). Unbound calls are covered in test_bound_decisions.py."""
     early = load_module('clarify_early_provider', ROOT / 'clarify_early.py')
     delivery = cards.DecisionDelivery(tmp_path / 'inbox.db', runs=runs or Runs())
-    return early.make_provider(store=lambda: s, delivery=lambda: delivery, db=db,
-                               owner_for=lambda sid: dict(OWNER, storedSessionId=sid))
+    raw = early.make_provider(store=lambda: s, delivery=lambda: delivery, db=db,
+                              owner_for=lambda sid: dict(OWNER, storedSessionId=sid))
+
+    def call(session_id, tool_call_id):
+        qs = [b['questions'][0] for b in _bindings(s)]
+        return raw(session_id, tool_call_id, question=descriptor(
+            [(q['question'], [c['label'] for c in q['choices']]) for q in qs], tool_call_id))
+    return call
+
+
+def _bindings(s):
+    with s._read() as c:
+        return [json.loads(x[0]) for x in c.execute('SELECT body FROM question_bindings WHERE revision>0 ORDER BY rowid')]
+
+
+def descriptor(questions, tool_call_id):
+    import hashlib
+    qs = [{'question': q, 'choices': list(c)} for q, c in questions]
+    return {'schemaVersion': 1, 'toolCallId': tool_call_id, 'questions': qs,
+            'digest': hashlib.sha256(json.dumps(qs, sort_keys=True, separators=(',', ':'),
+                                                ensure_ascii=False).encode()).hexdigest()}
 
 
 # ---- (b) busy is not an attempt ----------------------------------------------------------------------------
@@ -121,7 +142,12 @@ def test_blocked_clarify_returns_answered_elsewhere_and_marks_delivered(tmp_path
     ce.POLL_INTERVAL_S = 0.05
     try:
         s = store(tmp_path); owner = dict(OWNER); r = s.create(owner, request())
-        ce.register_provider(provider(s, tmp_path))
+        early = load_module('clarify_early_provider', ROOT / 'clarify_early.py')
+        delivery = cards.DecisionDelivery(tmp_path / 'inbox.db', runs=Runs())
+        ce.register_provider(early.make_provider(store=lambda: s, delivery=lambda: delivery, db=None,
+                                                 owner_for=lambda sid: dict(OWNER, storedSessionId=sid)))
+        if not hasattr(ce, 'question_descriptor'):
+            pytest.skip('core predates bound clarify questions: the provider fails closed (test_bound_decisions)')
 
         class Blocking:
             def __init__(self): self.event = threading.Event()
@@ -130,7 +156,8 @@ def test_blocked_clarify_returns_answered_elsewhere_and_marks_delivered(tmp_path
 
         box = {}
         t = threading.Thread(target=lambda: box.update(out=json.loads(clarify_tool(
-            [{'question': 'Which?', 'choices': ['a', 'b']}], callback=Blocking(), session_id='session-a', tool_call_id='call_z'))))
+            [{'question': r['title'], 'choices': [c['label'] for c in r['choices']]}], callback=Blocking(),
+            session_id='session-a', tool_call_id='call_z'))))
         t.start(); time.sleep(0.3)
         assert t.is_alive()
         op = s.decide(owner, decision(r))['operation']  # David decides in the For-you queue
@@ -139,6 +166,7 @@ def test_blocked_clarify_returns_answered_elsewhere_and_marks_delivered(tmp_path
         assert box['out']['status'] == 'answered_elsewhere'
         done = s.operation(owner, oid=op['operationId'])['operation']
         assert done['dispatchState'] == 'delivered' and done['receipt']['run']['toolCallId'] == 'call_z'
+        assert done['clarifyBinding']['toolCallId'] == 'call_z'
     finally:
         ce.reset_for_tests()
 
@@ -150,5 +178,39 @@ def test_register_installs_the_provider_with_core():
         plugin = load_module('user_steps_init_for_early', ROOT / '__init__.py')
         plugin._register_clarify_early(); plugin._register_clarify_early()
         assert len(ce._providers) == 1  # re-registering replaces, never stacks
+    finally:
+        ce.reset_for_tests()
+
+
+def test_blocked_clarify_ignores_an_unrelated_same_session_decision_end_to_end(tmp_path):
+    """Negative control through the real core clarify tool: same session, different question."""
+    ce = pytest.importorskip('tools.clarify_early')
+    if not hasattr(ce, 'question_descriptor'):
+        pytest.skip('core predates bound clarify questions')
+    from tools.clarify_tool import clarify_tool
+    ce.reset_for_tests(); ce.POLL_INTERVAL_S = 0.05
+    try:
+        s = store(tmp_path); owner = dict(OWNER); r = s.create(owner, request())
+        early = load_module('clarify_early_provider', ROOT / 'clarify_early.py')
+        delivery = cards.DecisionDelivery(tmp_path / 'inbox.db', runs=Runs())
+        ce.register_provider(early.make_provider(store=lambda: s, delivery=lambda: delivery, db=None,
+                                                 owner_for=lambda sid: dict(OWNER, storedSessionId=sid)))
+
+        class Blocking:
+            def __init__(self): self.event = threading.Event()
+            def __call__(self, qs): self.event.wait(5); return {'answers': {'0': 'b'}, 'outcome': 'answered'}
+            def cancel_early(self, reason): self.event.set(); return True
+        cb = Blocking(); box = {}
+        t = threading.Thread(target=lambda: box.update(out=json.loads(clarify_tool(
+            [{'question': 'Which colour?', 'choices': ['a', 'b']}], callback=cb, session_id='session-a',
+            tool_call_id='call_u'))))
+        t.start(); time.sleep(0.2)
+        op = s.decide(owner, decision(r))['operation']
+        s.dispatch(owner, op['operationId'], BusyReceiver())
+        time.sleep(0.5)
+        assert t.is_alive(), 'an unrelated decision of the same session must not end the clarify'
+        cb.event.set(); t.join(5)
+        assert box['out'].get('status') != 'answered_elsewhere'
+        assert s.operation(owner, oid=op['operationId'])['operation']['dispatchState'] == 'failed'
     finally:
         ce.reset_for_tests()

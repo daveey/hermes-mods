@@ -25,6 +25,11 @@ queued decision within a couple of seconds.
   It has no `responses` key: it is never shaped like text the user typed.
 - `commit()` (provider marks its decisions delivered) runs only when that early answer is the one returned. If the
   human answered first, their answer stands and the decision stays undelivered.
+- Bound questions: `question_descriptor(normalized, tool_call_id)` is the exact ordered `[{question, choices}]` the
+  surface shows plus `digest` = sha256 of its canonical JSON. A provider with `accepts_question = True` is called as
+  `fn(session_id, tool_call_id, question=descriptor)`. An early answer carrying `decisions` ends the clarify only when
+  its `binding` is `{toolCallId: <this call>, questionDigest: <descriptor digest>}`; legacy two-argument providers
+  still work for withdrawals without decisions (update pause), but their decision answers are ignored.
 - A surface whose callback has no `cancel_early` (plain CLI, messaging gateway) gets only the check before asking.
   The messaging-gateway path is untested.
 
@@ -42,6 +47,8 @@ queued decision within a couple of seconds.
   a real answer that wins the race is not replaced and nothing commits; provider failure is harmless; no
   session/no cancel hook means no polling; the inline executor passes session and tool-call ids.
 - `tests/tui_gateway/test_protocol.py::test_clarify_callback_cancel_early_ends_only_the_clarify_request`.
+- `tests/tools/test_clarify_early_bound.py`: descriptor order/digest; bound echo ends the clarify; same-session
+  unbound decision, legacy decision answer and foreign tool-call echo leave it waiting; update-pause withdrawal works.
 - Plugin side (hermes-mods `plugins/user-steps/tests/test_clarify_early.py`): store, receipt, lineage, guard and an
   end-to-end run against this core.
 

@@ -481,7 +481,7 @@ def test_rest_queue_reconciles_hides_withdrawn_and_lets_the_user_dismiss(tmp_pat
     step = extract_incident(store, ledger, now=time.time() - 120)
     keep = store.create(OWNER, complete_request(title='Pick a bot name'))
     client = router_client(tmp_path, store, boards)
-    assert client.get('/ping').json()['features'] == ['withdraw']
+    assert client.get('/ping').json()['features'] == ['withdraw', 'receipts']
     assert {r['requestId'] for r in client.get('/requests', params={'session': 'session-a'}).json()['requests']} == {
         step['requestId'], keep['requestId']}
     board(tmp_path, {'id': 't_1418b643', 'status': 'done', 'completed_at': int(time.time()),

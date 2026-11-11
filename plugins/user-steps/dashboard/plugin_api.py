@@ -198,7 +198,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
 
     @router.get('/ping')
     def ping():
-        out = {'ok': True, 'api': API_VERSION, 'features': ['withdraw']}
+        out = {'ok': True, 'api': API_VERSION, 'features': ['withdraw', 'receipts']}
         try:
             # Requests still up after their question was answered (desktop-1321064734); >0 needs a look.
             out['stale'] = _load('chat').stale_counts(_load('core'), store(), db=state_db)
@@ -260,6 +260,12 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
     @router.get('/operations/{operation_id}')
     def operation(operation_id: str, session: str):
         return run(lambda: store().operation(owner(session), oid=operation_id))
+
+    @router.get('/operations/{operation_id}/receipts')
+    def receipts(operation_id: str, session: str):
+        # Read only: owner receipts are written by the owning agent through its action_request tool (server-derived
+        # owner), never through this human surface, so the UI cannot claim an acknowledgment or application.
+        return run(lambda: store().receipts(owner(session), operation_id))
 
     @router.post('/operations/{operation_id}/retry')
     def retry(operation_id: str, session: str):

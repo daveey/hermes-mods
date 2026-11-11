@@ -598,6 +598,53 @@ the card asks (`cards.QualifiedCardDelivery._DECISION_COLUMNS`), never the Board
 (tests/test_card_delivery.py `test_replication_bookkeeping_*`, `test_legacy_*`). Delivery after a turn ends is still the 15 s retrier (no
 turn-end hook). Tests: `tests/test_clarify_early.py`.
 
+**Bound early answers (v1).** A decision ends a clarify only for the exact question it was asked as: each request
+revision gets an immutable `question_bindings` row (written in the same transaction as `create`/`revise`: qualified
+owner, request id, revision, source `{type: action_request}`, the ordered `[{question, choices: [{id, label}]}]`
+snapshot, `questionKey` = sha256(normalized question + ORDERED labels), `scopeDigest` = sha256 of the frozen revision
+minus `state`/`resolution`). `decide()` copies `{questionKey, scopeDigest, digest}` into the operation's `binding`.
+Core (`tools/clarify_early.question_descriptor`) passes the displayed question/choices and their digest to providers
+with `accepts_question = True`. On first display the provider binds the clarify (`ActionStore.bind_clarify`: a
+`question_bindings` row `request='clarify:<toolCallId>'`, revision 0, source `{type: clarify, toolCallId}`) to, per
+displayed question, the ONE undecided-or-pending request revision of the session lineage with that `questionKey`;
+none or several freeze `null`/`ambiguous` and that clarify is never answered early, and a look-alike request created
+later never takes it over. The clarify is answered only when every displayed question has a match with a recorded,
+undelivered decision at the same revision and scope digest (no partial answers), and the provider echoes
+`binding: {toolCallId, questionDigest}` (core ignores decision answers without a matching echo). A clarify worded
+differently from the request is not matched (fails safe: the decision waits for normal delivery). Session lineage is
+required but never sufficient: an unrelated decision of the same session stays in the outbox for normal delivery
+(`tests/test_bound_decisions.py`, `tests/test_clarify_early.py::test_blocked_clarify_ignores_an_unrelated_*`). With a
+core older than the descriptor the provider answers nothing (fail closed), so decisions then wait for the 15 s retrier.
+Rows written before v1 have no binding and are never early-answered.
+
+**Numbered replies (v1).** `ActionStore.record_list(owner, source_id, entries)` freezes a numbered list exactly as
+shown in message `source_id` (`list_snapshots`: `[{n, requestId, revision, choiceId, label, effect, scopeDigest}]`;
+free text and change requests cannot be numbered; re-recording a source with another list is 409).
+`resolve_numbered(owner, source_id, n)` maps a reply only against that list: no source is 422 (ambiguous, never the
+newest list), an unknown list 404, a revised/decided request or changed scope 409. Its result is input to `decide()`,
+which still enforces revision CAS; it authorizes nothing by itself. Agent entry path: `action_request {"list":
+{sourceId, entries}}` freezes the list it showed, `{"numbered": {sourceId, n}}` returns `{maps_to, authorizes: false}`
+(lists of compression ancestors are found through `lineage`); no decision is ever made from a numbered chat reply.
+
+**Owner receipts (v1).** Delivery (TUI runtime admission, local gateway FIFO admission, clarify early answer) is
+transport only. The owning agent records what it did with `action_request {"receipt": {operationId, phase, revision,
+scopeDigest, evidence?, reason?}}` (`owner_receipts`, one row per operation+phase): `acknowledged` (no evidence) needs
+confirmed delivery and the exact delivered revision + scope digest; `applied` needs a prior acknowledgment, nonempty
+evidence refs (`{type: message|tool_call|commit|pr|kanban|file|url|operation, id}`), an approve/answer effect and a
+request still resolved at that revision; `not_applied` needs a reason; applied and not_applied exclude each other.
+The owner is server-derived (`server_owner(session)`), and the session must be the operation's owner or a compression
+continuation of it (`lineage`); another session is 403, another gateway 404. Same phase + same body is idempotent
+(lost replies, restarts, concurrent writers keep one row); same phase + different body is 409. Receipts grant
+nothing (`consumer.grants == []`). Operations recorded with a binding get the receipt instruction appended to their
+admitted text; older in-flight operations keep their exact text (its digest is their admission identity). Rolling back to a pre-v1
+plugin while a bound operation is admitted but unconfirmed makes its retry an admission identity conflict (fails
+closed: nothing is admitted twice; the operation stays failed). Read-only
+route: `GET /operations/{id}/receipts?session=` (`/ping` feature `receipts`); there is no POST, so the human surface
+cannot claim acknowledgment. The Desktop tile shows, under "Confirmed — decision delivered.", "No owner
+acknowledgment recorded." / "...acknowledged this exact revision; not yet applied." / "...applied (commit abc)." /
+"...did not apply it: <reason>." (`ownerPhase` refuses a claimed phase without its receipt or evidence). Old rows
+have no receipts and show unknown; nothing is backfilled.
+
 ## Tests
 
 ### Legacy Local ownership regression

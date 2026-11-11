@@ -774,6 +774,26 @@ export async function refreshRequests(call = api) {
   }
 }
 const operationId = op => op?.operationId || op?.id
+// Owner-side phase of a delivered decision (v1 owner receipts). Delivery is transport admission only: it never
+// implies the agent acknowledged or applied it. Anything malformed or absent stays 'unknown'; nothing is inferred.
+const OWNER_PHASES = ['unknown', 'acknowledged', 'applied', 'not_applied']
+export const ownerPhase = consumer => {
+  if (!consumer || !OWNER_PHASES.includes(consumer.phase) || !Array.isArray(consumer.receipts)) return 'unknown'
+  if (consumer.phase !== 'unknown' && !consumer.receipts.some(x => x?.phase === consumer.phase)) return 'unknown'
+  if (consumer.phase === 'applied' && !consumer.receipts.some(x => x?.phase === 'applied' && Array.isArray(x.evidence) && x.evidence.length)) return 'unknown'
+  return consumer.phase
+}
+export const ownerPhaseText = consumer => {
+  const phase = ownerPhase(consumer)
+  const applied = phase === 'applied' && consumer.receipts.find(x => x.phase === 'applied')
+  const notApplied = phase === 'not_applied' && consumer.receipts.find(x => x.phase === 'not_applied')
+  return {
+    unknown: 'No owner acknowledgment recorded.',
+    acknowledged: 'Agent acknowledged this exact revision; not yet applied.',
+    applied: applied ? `Agent reports it applied (${applied.evidence.map(e => `${e.type} ${e.id}`).join(', ')}).` : '',
+    not_applied: notApplied ? `Agent did not apply it: ${notApplied.reason || 'no reason given'}.` : '',
+  }[phase]
+}
 const operationState = op => { const s = op?.dispatchState || op?.state || op?.status; return s === 'delivery_failed' ? 'failed' : s }
 const errorStatus = e => e?.status || e?.statusCode || e?.response?.status || Number(str(e?.message).match(/\b(400|403|404|409|422)\b/)?.[1])
 const actionStyle = { ...btn(), minHeight: 44, minWidth: 44, maxWidth: '100%', whiteSpace: 'normal', overflowWrap: 'anywhere' }
@@ -859,6 +879,12 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   useEffect(() => { if (editing) input.current?.focus() }, [editing])
   const query = `?session=${encodeURIComponent(route.session)}`
   const readOperation = async id => call(`${BASE}/operations/${encodeURIComponent(id)}${query}`, route)
+  const readReceipts = async id => {
+    try {
+      const consumer = await call(`${BASE}/operations/${encodeURIComponent(id)}/receipts${query}`, route)
+      if (live.current && currentRoute(route) && operationId(operations.get(key)?.operation) === id) update({ consumer: ownerPhase(consumer) === 'unknown' ? null : consumer })
+    } catch {} // an older backend has no receipts route: the owner phase simply stays unknown
+  }
   const findOperation = async decision => {
     try { return await call(`${BASE}/operations${query}&idempotencyKey=${encodeURIComponent(decision.idempotencyKey)}`, route) }
     catch (e) { if (errorStatus(e) === 404) return { operation: null }; throw e }
@@ -875,6 +901,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     update({ request: data.request, operation: data.operation, phase: status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? failedText(data.operation) : '' })
     if (['delivered','cancelled'].includes(status)) { try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {} }
     saveReadback(route, data.request)
+    if (status === 'delivered') void readReceipts(operationId(data.operation))
   }
   const check = async () => {
     if (!currentRoute(route)) return
@@ -892,9 +919,12 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   // Reconnect/remount: recorded resolution is not delivery confirmation. Read the durable operation.
   useEffect(() => { if ((r.resolution?.operationId || (state.phase === 'unknown' && state.decision)) && !state.operation) void check() }, [r.resolution?.operationId, state.decision?.idempotencyKey])
   useEffect(() => {
-    const poll = () => { if (['pending','failed','unknown'].includes(state.phase)) void check() }
+    const poll = () => {
+      if (['pending','failed','unknown'].includes(state.phase)) void check()
+      else if (state.phase === 'confirmed' && operationId(state.operation) && !['applied','not_applied'].includes(ownerPhase(state.consumer))) void readReceipts(operationId(state.operation))
+    }
     readbacks.add(poll); return () => readbacks.delete(poll)
-  }, [state.phase, state.operation, state.decision])
+  }, [state.phase, state.operation, state.decision, state.consumer])
   useEffect(() => {
     const onStorage = e => {
       if (e.key !== INTENT_PREFIX + key || operations.get(key)?.decision) return
@@ -1049,6 +1079,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     ] }, c.id)) }),
     !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', 'data-agent-completion-pending': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
     jsx('div', { role: 'status', 'aria-live': 'polite', children: phaseText }),
+    state.phase === 'confirmed' && jsx('div', { 'data-owner-phase': ownerPhase(state.consumer), children: ownerPhaseText(state.consumer) }),
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : explainOf(selected)}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [

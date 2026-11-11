@@ -898,3 +898,34 @@ test('a new chat with no stored row yet is an empty queue, not an outage', async
  assert.match(el().textContent,/Action queue unavailable/,'other 404s (e.g. plugin missing) still surface')
  await show(null);delete window.hermesDesktop
 })
+
+test('owner phase: delivery alone is not acknowledgment; only owner receipts change it, malformed stays unknown',async()=>{
+ assert.equal(m.ownerPhase(null),'unknown')
+ assert.equal(m.ownerPhase({phase:'applied',receipts:[]}),'unknown') // a claimed phase without its receipt is not trusted
+ assert.equal(m.ownerPhase({phase:'applied',receipts:[{phase:'applied',evidence:[]}]}),'unknown') // no evidence
+ assert.equal(m.ownerPhase({phase:'done',receipts:[{phase:'done'}]}),'unknown')
+ const ackd={phase:'acknowledged',receipts:[{phase:'acknowledged',evidence:[]}]}
+ assert.equal(m.ownerPhase(ackd),'acknowledged')
+ assert.match(m.ownerPhaseText(ackd),/acknowledged this exact revision; not yet applied/)
+ const applied={phase:'applied',receipts:[ackd.receipts[0],{phase:'applied',evidence:[{type:'commit',id:'abc123'}]}]}
+ assert.match(m.ownerPhaseText(applied),/applied \(commit abc123\)/)
+ assert.match(m.ownerPhaseText({phase:'not_applied',receipts:[{phase:'not_applied',reason:'Request was revised'}]}),/did not apply it: Request was revised/)
+ const r=freshRequest(); await m.refreshRequests(async()=>({requests:[r]}))
+ let consumer={phase:'unknown',receipts:[]}
+ const paths=[]
+ const call=async(path,opts={})=>{paths.push(path)
+  if(path.includes('/receipts'))return consumer
+  return opts.method==='POST'?{operation:{operationId:'ownerop',dispatchState:'delivered'},request:r}:{operation:{operationId:'ownerop',dispatchState:'delivered'},request:{...r,state:'resolved',resolution:{operationId:'ownerop',choiceId:'yes',revision:1}}}}
+ await show(React.createElement(m.DecisionRow,{request:r,route,call}))
+ await click('Approve')
+ await React.act(async()=>{await flush();await flush()})
+ const phase=()=>el().querySelector('[data-owner-phase]')
+ assert.match(el().textContent,/Confirmed — decision delivered/)
+ assert.equal(phase().dataset.ownerPhase,'unknown') // transport admission is shown as delivered, never acknowledged
+ assert.match(phase().textContent,/No owner acknowledgment recorded/)
+ assert.ok(paths.some(p=>/\/operations\/ownerop\/receipts\?/.test(p)))
+ consumer=applied
+ await React.act(async()=>{await m.refreshRequests(async()=>({requests:[{...r,state:'resolved',resolution:{operationId:'ownerop',choiceId:'yes',revision:1}}]}));await flush();await flush()})
+ assert.equal(phase().dataset.ownerPhase,'applied');assert.match(phase().textContent,/commit abc123/)
+ await show(null)
+})

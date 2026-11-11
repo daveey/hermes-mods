@@ -358,6 +358,25 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
     import json
     import uuid
     try:
+        if isinstance(args, dict) and 'receipt' in args:
+            # Owner receipt for a decision delivered to THIS session (or the session it was compressed from):
+            # acknowledged / applied (evidence refs) / not_applied (reason). Grants nothing.
+            core._object(args, ('receipt',))
+            owner = core.server_owner(session_id)
+            out = core.ActionStore().record_receipt(owner, args['receipt'], lineage=core.lineage(session_id))
+            return json.dumps(out)
+        if isinstance(args, dict) and ('list' in args or 'numbered' in args):
+            # Numbered lists: freeze the list exactly as shown in a message, and map a numbered reply back to THAT
+            # list only. Mapping authorizes nothing: the user still decides in the For-you queue (decide() CAS).
+            owner = core.server_owner(session_id); st = core.ActionStore()
+            if 'list' in args:
+                core._object(args, ('list',)); core._object(args['list'], ('sourceId', 'entries'))
+                return json.dumps(st.record_list(owner, args['list']['sourceId'], args['list']['entries']))
+            core._object(args, ('numbered',)); core._object(args['numbered'], ('sourceId', 'n'))
+            found = st.resolve_numbered(owner, args['numbered']['sourceId'], args['numbered']['n'],
+                                        lineage=core.lineage(session_id))
+            return json.dumps({'maps_to': found, 'authorizes': False,
+                               'note': 'A numbered reply only identifies the option; nothing is approved until the user decides it.'})
         if isinstance(args, dict) and 'withdraw' in args:
             core._object(args, ('withdraw',))
             w = args['withdraw']
@@ -521,7 +540,29 @@ PRODUCER_SCHEMA = {
                                                'properties': {'requestId': {'type': 'string'}, 'reason': {'type': 'string'},
                                                               'expectedRevision': {'type': 'integer'}},
                                                'required': ['requestId', 'reason'],
-                                               'description': 'Use alone (no request). Removes this session\'s undecided request from the user\'s For you queue; refused once a decision is recorded.'}}}}
+                                               'description': 'Use alone (no request). Removes this session\'s undecided request from the user\'s For you queue; refused once a decision is recorded.'},
+                                  'receipt': {'type': 'object', 'additionalProperties': False,
+                                              'properties': {'operationId': {'type': 'string'},
+                                                             'phase': {'type': 'string', 'enum': ['acknowledged', 'applied', 'not_applied']},
+                                                             'revision': {'type': 'integer'}, 'scopeDigest': {'type': 'string'},
+                                                             'evidence': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
+                                                                          'properties': {'type': {'type': 'string', 'enum': ['message', 'tool_call', 'commit', 'pr', 'kanban', 'file', 'url', 'operation']},
+                                                                                         'id': {'type': 'string'}, 'board': {'type': 'string'}, 'note': {'type': 'string'}},
+                                                                          'required': ['type', 'id']}},
+                                                             'reason': {'type': 'string'}},
+                                              'required': ['operationId', 'phase', 'revision', 'scopeDigest'],
+                                              'description': 'Use alone. Owner receipt for a decision delivered to this session: acknowledged (you validated the exact revision and scopeDigest), then applied (evidence refs naming what you did) or not_applied (reason). Receipts grant no permission, spend or new scope.'},
+                                  'list': {'type': 'object', 'additionalProperties': False,
+                                           'properties': {'sourceId': {'type': 'string'},
+                                                          'entries': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
+                                                                      'properties': {'requestId': {'type': 'string'}, 'choiceId': {'type': 'string'}},
+                                                                      'required': ['requestId', 'choiceId']}}},
+                                           'required': ['sourceId', 'entries'],
+                                           'description': 'Use alone. Freeze the numbered list you showed in message sourceId (1-based, in order).'},
+                                  'numbered': {'type': 'object', 'additionalProperties': False,
+                                               'properties': {'sourceId': {'type': 'string'}, 'n': {'type': 'integer'}},
+                                               'required': ['sourceId', 'n'],
+                                               'description': 'Use alone. Which option a numbered reply names in THAT list; refused when stale or ambiguous. Authorizes nothing.'}}}}
 
 
 _EARLY_DISPOSE = None
