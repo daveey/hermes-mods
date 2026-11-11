@@ -156,6 +156,26 @@ def test_clarify_changed_choice_order_or_revised_scope_is_not_the_same_question(
     assert provider('session-a', 'call_1', question=None) is None  # older core: no descriptor -> fail closed
     assert provider('session-a', 'call_1') is None
 
+    # A fresh displayed clarify freezes revision 1 before there is a decision.
+    # Changing only scope must not reuse the identical question/options as authority.
+    s2 = store(tmp_path / 'scope-only')
+    original = s2.create(OWNER, choice_request())
+    p2 = early_provider(s2, tmp_path / 'scope-only')
+    q = descriptor([('Which runner?', ('canary', 'aws'))], 'scope_call_1')
+    assert p2('session-a', 'scope_call_1', question=q) is None
+    revised = s2.revise(OWNER, original['requestId'], 1,
+                        dict(original, scope=dict(original['scope'], markdown='Only the new isolated target')))
+    assert revised['title'] == original['title'] and revised['choices'] == original['choices']
+    assert core.scope_digest(revised) != core.scope_digest(original)
+    op = busy_decided(s2, revised, 1)
+    assert p2('session-a', 'scope_call_1', question=q) is None
+    fresh = descriptor([('Which runner?', ('canary', 'aws'))], 'scope_call_2')
+    found = p2('session-a', 'scope_call_2', question=fresh)
+    assert found is not None
+    assert found.result['decisions'][0]['operationId'] == op['operationId']
+    assert found.result['decisions'][0]['revision'] == 2
+    assert found.result['decisions'][0]['scopeDigest'] == core.scope_digest(revised)
+
 
 def test_unbound_pre_v1_decision_never_ends_a_clarify(tmp_path):
     s = store(tmp_path); r = s.create(OWNER, choice_request())
@@ -408,8 +428,10 @@ def test_retired_operation_for_an_archived_task_cannot_be_acknowledged_or_applie
     s = store(tmp_path); r = s.create(OWNER, request())
     op = s.decide(OWNER, decision(r))['operation']
     s.retire_operation(OWNER, op['operationId'], by='system', reason='card archived', evidence='kanban:t_x')
-    with pytest.raises(core.ActionError) as err: s.record_receipt(OWNER, ack(op))
-    assert err.value.status == 409
+    for receipt in (ack(op), reserve(op), applied(op)):
+        with pytest.raises(core.ActionError) as err:
+            s.record_receipt(OWNER, receipt)
+        assert err.value.status == 409
     assert s.receipts(OWNER, op['operationId'])['phase'] == 'unknown'
 
 
