@@ -140,6 +140,9 @@ say what's running, never what needs the user.
   cleanup and no corresponding tool exists, hand the exact operation and evidence to the parent; never route
   around the fence or edit the subscription database.
 
+## Done means
+- Did you re-run the checker before acting on a 'worker-N owner observation unavailable' row (it is usually a collection blip, not a closed card)?
+
 ## Archive rule (needs the user's standing approval; record it in memory)
 
 Archive a session when **all** hold: not active in the last 30 min, not pinned, its work is done
