@@ -229,6 +229,7 @@ workers to stop chasing tests.
 
 Order: exact-head review verdict AND exact-head required aggregate ("All required checks pass") green, then
 `gh pr merge N --rebase --match-head-commit <full sha>`. The watcher aborts on head move, aggregate failure or REJECT.
+- Treat an empty or null `headRefOid` as a failed lookup and retry it, never as a head move: a broker or quota-guard refusal (`Denied`, a reserve brake) prints nothing to stdout, so `[[ "$head" != $pinned* ]]` fires on every PR at once and the watcher abandons them all. Poll at least 5 min apart, since each check costs core quota that other hub jobs share.
 - Read a Kanban reviewer's verdict from the run, not the card: `select summary,metadata from task_runs where
   task_id=? order by id desc limit 1`. `tasks.result` is often empty, so a watcher grepping it never sees APPROVE and
   waits until timeout. Verify the verdict yourself before arming the merge.
