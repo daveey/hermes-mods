@@ -108,6 +108,19 @@ class PinnedOwner(Base):
         script.write_text(f"# systemctl --user stop {PINNED}\necho \"never systemctl --user stop {PINNED}\"\n")
         self.assertIsNone(self.verdict(f"bash {script}"))
 
+    def test_binary_or_unreadable_script_does_not_raise_and_is_allowed(self):
+        binary = Path(self.tmp.name) / "blob.py"
+        binary.write_bytes(b"\x00\x01systemctl\xff")
+        self.assertIsNone(self.verdict(f"python3 {binary}"))
+        self.assertIsNone(self.verdict(f"bash {self.tmp.name}"))  # a directory
+        self.assertIsNone(self.verdict("bash /nonexistent/x.sh"))
+
+    def test_script_path_with_env_var_is_expanded(self):
+        script = Path(self.tmp.name) / "hold.sh"
+        script.write_text(f"systemctl --user stop {PINNED}\n")
+        with mock.patch.dict(os.environ, {"HOLDDIR": self.tmp.name}):
+            self.assertIsNotNone(self.verdict("bash $HOLDDIR/hold.sh"))
+
     def test_no_bus_falls_back_to_the_unit_dropin_directory(self):
         drop = self.home / ".config/systemd/user" / f"{PINNED}.service.d"
         drop.mkdir(parents=True)

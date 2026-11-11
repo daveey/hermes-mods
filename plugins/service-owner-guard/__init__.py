@@ -266,7 +266,7 @@ def _script_text(args: list) -> str:
             continue
         if arg.startswith(("-", "+")) or arg in {"&", ">"} or arg[:1] in {">", "<", "&"} or arg[:2] == "2>":
             continue
-        path = Path(os.path.expanduser(arg))
+        path = Path(os.path.expandvars(os.path.expanduser(arg)))
         try:
             if path.is_file() and path.stat().st_size <= MAX_SCRIPT_BYTES:
                 return path.read_text(errors="replace")
@@ -368,7 +368,7 @@ def _py_commands(code: str) -> list:
     cmds = []
     try:
         tree = ast.parse(code)
-    except SyntaxError:
+    except (SyntaxError, ValueError):  # ValueError: NUL bytes in a binary file
         return re.findall(r"""['"]((?:launchctl|systemctl|kill|pkill|killall|ssh)\b[^'"]*)['"]""", code)
     for node in ast.walk(tree):
         if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
