@@ -13,6 +13,38 @@ Coverage: `tests/test_stranded_sqlite_retired.py` checks missing/tombstoned/live
 `tests/test_stranded_sqlite_watch.py` retains real child-process deleted-sidecar detection and mock-only filing.
 
 
+## Frozen root-cap guard
+
+While an approved rollout contract freezes root `kanban.max_in_progress`, `pre_tool_call` refuses a
+terminal/`execute_code` mutation of that key (in that exact root home, not a profile home) that contradicts the
+frozen value. A queue notice, headroom or a generic go-ahead is not permission; the refusal names the contract and the
+queue alternatives (priority, re-placement, local work). Nothing else in config is restricted and no value is
+hardcoded: the freeze exists only as a registered record in `root_cap_contracts.json` in the coach store.
+
+- **Register** (`python3 root_cap.py register --store <coach dir> --target-home <root> --value N --contract-ref
+  <approved artifact> --approval-session <chat> --approval-message <id> --owner-card <card>`; `list` shows state).
+  It needs the digest-pinned artifact to state the value, a native typed human approval row (same reader as
+  kanban-honest-done: not assistant/notice/worker rows, same chat lineage) naming the key and value, and an open
+  owner card. The freeze lapses when the owner card is done/archived; an unreadable owner, changed artifact digest
+  or two conflicting active revisions refuse only the targeted key (never unrelated config).
+- **Authorized change**: the user's own native turn (coach goal_scope capture) says `authorize ... max_in_progress
+  from <frozen> to <new>` (or cites the revision digest) and it survives later revocation. Permanent: provenance is
+  kept in `root_cap_exceptions.json` and the contract is superseded only after `post_tool_call` reads the new value
+  back. Temporary: the same decision must also name an existing open owner card, restore the original value and give a
+  restore trigger (owner completion and/or a future UTC expiry); provenance is persisted and read back before the
+  call is admitted, then the exception is marked active only after the config reads back the override.
+  `root_cap.due_restores()` lists exceptions whose trigger fired (compare-and-set: a value a later decision
+  changed is reported as `conflict`, and a restore write over it is refused). No timer or auto-restorer is installed.
+- **Parsing**: executable `hermes config set` (wrappers, `bash -c`, `eval`, `$(...)`, `-p/--profile`, `HERMES_HOME=`),
+  in-place `sed/yq/perl` or redirects onto the root `config.yaml` that name the key, and literal `terminal()`,
+  `subprocess`, `os.system` calls in `execute_code` (constants and simple assignments folded). echo/grep/heredoc/quoted
+  text is data. Dynamic commands or config-API writes that name the key are refused as ambiguous. This is not a
+  sandbox: scripts run from files and fully dynamic Python are not covered.
+
+Tests: `tests/test_root_cap_guard.py` drives the real registered callbacks on both tool entry paths with fixture-owned
+contract registration, a fixture state.db/kanban db, adversarial parser variants and mutation-sensitive provenance
+cases. It is callback-level evidence, not live gateway activation proof.
+
 ## Nonblocking profiler attachment
 
 `pre_tool_call` refuses attached `py-spy record`/`top` commands without `--nonblocking`.

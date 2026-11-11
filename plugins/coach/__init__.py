@@ -206,6 +206,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         try:
             goal_gate.observe(session_id=session_id, tool_name=tool_name, args=args, result=result,
                               status=status, tool_call_id=_.get("tool_call_id"))
+            _load("root_cap").after(tool_name, args, session_id, store.root)
             coach.hint_tool_end(session_id, _.get("tool_call_id"), tool_name,
                                 args if isinstance(args, dict) else {}, result, status)
             coach.observe(session_id, tool_name, args, result, status, duration_ms or 0, error_type, error_message)
@@ -392,6 +393,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         if profiler.blocked(tool_name, args):
             store.log({"event": "agent_block", "rule": "profiler_safety", "tool": tool_name})
             return {"action": "block", "message": profiler.MESSAGE}
+        try:  # frozen-rollout cap: a queue notice is not permission (root_cap.py); a guard fault never blocks tools
+            cap = _load("root_cap").check(tool_name, args, session_id, store.root, authority_users.get(session_id, ()))
+        except Exception as exc:
+            log.debug("coach root_cap: %s", exc)
+            cap = None
+        if cap:
+            store.log(cap["event"])
+            return {"action": "block", "message": cap["message"]}
         if tool_name in ("kanban_block", "kanban_create", "tool_call"):
             try:
                 ce = _load("compute_envelope")
