@@ -136,7 +136,7 @@ def owner_status(card, target_home):
         seen.add(path)
         existing += 1
         try:
-            conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+            conn = _acceptance()._ro_connect(Path(path))
             try:
                 row = conn.execute("select status from tasks where id=?", (card,)).fetchone()
             finally:
@@ -221,7 +221,7 @@ def register_contract(store_root, *, target_home, key, frozen_value, contract_re
     ok, why = acc.verify_citation(int(approval_message_id), approval_session, db)
     if not ok:
         raise RootCapError(f"approval is not native human authority: {why}")
-    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+    conn = acc._ro_connect(db)
     try:
         content, kind = conn.execute("select content, display_kind from messages where id=?",
                                      (int(approval_message_id),)).fetchone()
