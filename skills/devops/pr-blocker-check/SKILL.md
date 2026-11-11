@@ -12,6 +12,8 @@ metadata:
 # Blocker-aware PR check (one shot)
 
 Never write a watcher that only tests OPEN/MERGED/CLOSED, and never escalate on a bare `BLOCKED`.
+A failed or empty lookup (`gh` error, broker quota-guard `Denied`, null head) is *unknown*, never a verdict:
+retry it, because reading it as "head moved" or "closed" abandons PRs that were about to merge.
 Run the checker once per wake; schedule the next look with `kanban_continue(resume_after_seconds=...)`
 (not a sleep loop or background script that dies on restart).
 
