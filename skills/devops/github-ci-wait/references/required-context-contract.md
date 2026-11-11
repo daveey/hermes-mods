@@ -17,8 +17,9 @@ both used the unversioned name, neither included the second required gate.
 Why 3: the landing instructions presented an aggregate display name as the whole readiness
 contract — evidence: the prior SKILL.md landing section named `All required checks pass` alone.
 
-Root (happened): a copied display-name example was treated as authoritative policy, with two
-independent hardcoded filters instead of a validated complete expectation manifest.
+Root (happened): unvalidated display names were treated as authoritative policy, with two
+independent hardcoded filters instead of a validated complete expectation manifest. The stale
+skill example was an additional recurrence risk; whether this wrapper copied it is unverified.
 Root (not caught): the existing subprocess suite covered missing jobs, skips and expected-red
 experiments, but not the caller's stale-name-to-current-two-context contract. Its fixtures
 proved strict matching, not that the wrapper selected the correct required jobs. Evidence:
