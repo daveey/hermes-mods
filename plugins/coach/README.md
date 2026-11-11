@@ -34,8 +34,23 @@ hardcoded: the freeze exists only as a registered record.
   revision**) that is positive (no negation/withdrawal), names the key and the frozen value, and names the artifact
   revision (digest prefix or file name) or the owner card. The freeze lapses when the owner card is done/archived; an
   unreadable owner, changed artifact digest or two conflicting active revisions refuse only the targeted key.
-  Registration is the supported activation step: it is not performed by this plugin and no existing rollout is
-  protected until it has been run for it (a machine-wide approved-source index does not exist).
+  Registration (`register`) stays supported for a freeze whose approval is a native typed message; the approving text must be the user's own first-person approval (a quoted or reported approval, `The assistant wrote: "I approve ..."`, `> I approve ...`, is refused, as is one from a machine-opened chat).
+- **Declare** (`python3 root_cap.py declare --target-home <root> --value N --contract-ref <approved artifact>
+  --owner-card <card>` plus EITHER `--approval-session/--approval-message` OR an explicit ActionStore operation
+  `--action-db --operation --request --revision --gateway --profile --stored-session --mapping-phrase
+  --mapping-rationale --mapping-reviewed-by`) writes a private task-local descriptor of explicit references to
+  `<root>/coach/root_cap_sources.json`. It is verified when declared and **re-verified by the guard at every targeted
+  call**, in every profile (the descriptor lives in the root store), so there is no separate registration step to
+  forget and a missing projection never erases a known protection; the verified record is projected lazily so a later
+  permanent supersession has a record to flip. The guard never scans prose: an approval with no referenced descriptor
+  freezes nothing. For an `action_operation` source it reads ONE operation read-only and requires: positive
+  execution-authorizing `approve` effect, current unwithdrawn revision whose recorded resolution is that operation,
+  frozen intent equal to the stored revision, the reviewed capacity wording (the explicit, reviewed mapping from the
+  approved wording to `kanban.max_in_progress`, not a hardcoded value), a matching owner namespace/session, the
+  owner card's `session_id`, and (bound rows) the scope digest; legacy unbound rows pass on those equalities. A
+  withdrawn/superseded approval, unreadable store, edited artifact or unreadable descriptor is a *known but unprovable*
+  freeze: only the targeted write is refused, with the exact conflict. A finished owner lapses the freeze.
+  The descriptor is an operator/owner step (it holds ids private to a rollout); this plugin never writes one itself.
 - **Authorized change**: the user's own native turn (coach goal_scope capture, with its `message_uid`) says
   `authorize ... max_in_progress from <frozen> to <new>` (or cites the revision digest). The deciding chat must be a
   human-opened session (desktop/tui/cli/local); a Kanban/cron/subagent session's opening prompt is machine content.
@@ -50,8 +65,11 @@ hardcoded: the freeze exists only as a registered record.
   writes a unique temp file, fsyncs, replaces atomically and reads back; completion is matched on tool + args + call id.
 - **Recovery**: `root_cap.due_restores()` lists temporary exceptions whose trigger fired. `restore` only when the
   config still holds the override AND the contract revision it was granted against is still active; anything else is a
-  `conflict`. `pre_llm_call` calls `report_due`, which logs one `root_cap_restore_due` coach event per exception (the
-  existing coach log/notice path). No timer or auto-restorer is installed; the owner performs the restore.
+  `conflict`. `pre_llm_call` delivers the due/conflict notice as coach context to the owner's chat (`owner_ref.session`)
+  and once to the next live chat when the owner's chat is gone (`root_cap.due_notices`), persisted in
+  `root_cap_notices.json` per exception + action + chat (so a restart or another chat never repeats it), and logs one
+  `root_cap_restore_due` coach event. A restore notice names the `hermes config set` the guard admits; a conflict
+  says do not overwrite. No timer or auto-restorer is installed; the owner performs the restore.
 - **Parsing**: executable `hermes config set` (wrappers, `bash -c`, `eval`, `$(...)`/backticks in unquoted *and*
   double-quoted words, heredocs that feed a shell or `python -`, `-p/--profile`, `HERMES_HOME=`), in-place
   `sed/yq/perl` or redirects onto the root `config.yaml` that name the key, and literal `terminal()`, `subprocess`,
@@ -61,7 +79,9 @@ hardcoded: the freeze exists only as a registered record.
 
 Tests: `tests/test_root_cap_guard.py` (matrix on both tool entry paths, native-session fixture) and
 `tests/test_root_cap_hardening.py` (independent-review findings R1-R6, distinct profile stores, concurrency race,
-real-bash grammar ground truth with a fixture-owned fake `hermes`) drive the real registered callbacks. They are
+real-bash grammar ground truth with a fixture-owned fake `hermes`) and `tests/test_root_cap_activation.py` (declared
+sources with no registration, a real user-steps ActionStore operation, quoted-approval refusal, notice delivery and
+dedupe) drive the real registered callbacks. They are
 callback-level evidence, not live gateway activation proof.
 
 ## Nonblocking profiler attachment
