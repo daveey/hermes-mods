@@ -180,5 +180,4 @@ untouched.
 - "Read-only" is an instruction, not enforcement: reviewers may execute source to probe behavior (useful
   evidence) and leave caches such as `__pycache__/`. Run `git status` on the source after the review and record
   anything they created.
-- Reviewers sometimes cite wrong line numbers (seen in a live run: lines 40-46 of a 19-line file). Check each
-  cited location before relying on it; keep the finding only on what you could verify.
+- Refute negative search claims against the original records before treating them as missing authority; literal schema-key searches can miss legacy semantic limits. Use the Refutation rubric's native-record comparison.

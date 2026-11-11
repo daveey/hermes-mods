@@ -67,8 +67,8 @@ You are the engineer who will build this tomorrow without access to the author.
 You receive a finding another reviewer reported. Try to refute it from the spec and source alone.
 1. Restate the finding's claim in one sentence.
 2. Look for text in the spec or behavior in the source that already answers it. Quote it with its location.
-3. Verdict: `refuted` (with the quote), `stands` (you looked where it would be answered and it is not), or
-   `partly` (say which part stands). Do not soften a finding that stands, and do not invent support.
+3. For absence claims, test the search scope before accepting the conclusion. A literal config-key search can miss an approved limit expressed under a semantic field. For authorization findings, follow the owner's native session reference, locate the decision operation and request revision, and compare the embedded request with the operation and stored revision body. Check current revision, withdrawal and later user steering. A missing newer binding field is not proof that an older approval never existed; do not manufacture a new approval or infer supersession from an assistant's interpretation.
+4. Verdict: `refuted` (with the quote), `stands` (with the inspected scope and evidence), or `partly` (say which part stands). A bounded search supports only a bounded absence claim, not a demand for the user to approve again.
 
 ## Drift
 
