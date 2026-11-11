@@ -28,6 +28,7 @@
  * (they check window.__sessionPanel.active). Nudge only drafts a message in the composer; the user sends it.
  */
 import { Codicon, COMPOSER_AREAS, DisclosureCaret, host, useValue } from '@hermes/plugin-sdk'
+import * as SDK from '@hermes/plugin-sdk' // namespace: the optional projector exports are absent on older hosts
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -41,6 +42,168 @@ const COLLAPSED_KEY = 'hermes.sessionPanel.collapsed.v1'
 
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 const log = (...a) => console.info(`[${ID}]`, ...a)
+
+// ── execution observations (consumer of the SDK's optional pure v1 projector) ───────────────────────────────
+// Same block in session-tasks and session-panel; test/execution-observations.test.mjs runs both against the shared
+// golden fixture so they cannot drift. Producers send raw v1 records (`execution_observations`); every verdict
+// (state, expiry, identity fencing, receipts) comes from the SDK projector, called at RENDER time with the clock the
+// caller already has, so a cached record expires without any new fetch or timer. Hosts or producers that lack the
+// projector or the records show an explicit "unknown", never a zero or an implied running/done. Capacity records
+// (kanban.dispatch / kanban.capacity) are diagnostics about WHY work waits: they never become a work state.
+const OBS_FNS = ['projectExecutionObservation', 'selectExecutionObservation', 'summarizeExecutionObservations', 'executionIdentityKey']
+const CAPACITY_SOURCES = new Set(['kanban.dispatch', 'kanban.capacity'])
+const obsOwn = (o, k) => (o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined)
+const obsNum = v => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const obsText = v => (typeof v === 'string' && v.trim() ? v : '')
+
+/** The SDK projector, or null on a host that predates it (feature-detected, never assumed). */
+export const observationSdk = (sdk = SDK) => (OBS_FNS.every(k => typeof sdk?.[k] === 'function') ? sdk : null)
+
+/** Split a producer's `execution_observations` into work records and capacity diagnostics. `present` = the field
+ *  was an array at all (an older producer omits it: that is "unknown", not "no work"). */
+export function splitObservations(raw) {
+  if (!Array.isArray(raw)) return { present: false, work: [], capacity: [] }
+  const work = [], capacity = []
+  for (const r of raw) (CAPACITY_SOURCES.has(obsOwn(r, 'source')) ? capacity : work).push(r)
+  return { present: true, work, capacity }
+}
+
+const span = s => (s < 60 ? `${Math.max(0, Math.floor(s))} s` : s < 3600 ? `${Math.floor(s / 60)} min` : s < 86_400 ? `${Math.floor(s / 3600)} h` : `${Math.floor(s / 86_400)} d`)
+const qual = o => [obsOwn(o, 'gateway'), obsOwn(o, 'profile')].filter(obsText).join('/')
+
+function identityText(identity) {
+  const run = obsOwn(identity, 'run_id') ?? obsOwn(identity, 'generation')
+  const head = [qual(identity), obsText(obsOwn(identity, 'board'))].filter(Boolean).join('/')
+  const work = `${obsText(obsOwn(identity, 'kind')) || '?'}:${obsText(obsOwn(identity, 'work_id')) || '?'}`
+  return `${head ? `${head}/` : ''}${work}${run != null ? `#${run}` : ''}`
+}
+
+function waitView(w, nowSec) {
+  if (!w || typeof w !== 'object') return null
+  const target = obsOwn(w, 'target')
+  const since = obsNum(obsOwn(w, 'since')), due = obsNum(obsOwn(w, 'due_at'))
+  return {
+    kind: obsText(obsOwn(w, 'kind')) || null,
+    predicate: obsText(obsOwn(w, 'predicate')) || null,
+    target: target && typeof target === 'object' ? [qual(target), obsText(obsOwn(target, 'board')), obsText(obsOwn(target, 'work_id'))].filter(Boolean).join('/') || null : null,
+    owner: qual(obsOwn(w, 'owner')) || null,
+    sinceAgeSec: since == null ? null : Math.max(0, nowSec - since),
+    dueInSec: due == null ? null : due - nowSec
+  }
+}
+
+/** Display model of one PROJECTED observation (what the SDK returned), nothing re-derived. */
+export function observationView(obs, nowSec, sdk = observationSdk(), sourceClass = 'sidebar') {
+  const progressAt = obsNum(obsOwn(obs, 'last_progress'))
+  const asks = sdk ? obsNum(sdk.summarizeExecutionObservations([obs], nowSec, sourceClass)?.outstanding_human_requests) : null
+  const historical = obsOwn(obs, 'historical_delivery_receipts')
+  const receipt = obsOwn(obs, 'delivery_receipt')
+  const activityAt = obsNum(obsOwn(obs, 'last_activity'))
+  return {
+    sourced: true,
+    state: obsOwn(obs, 'state') || 'unknown',
+    freshness: obsOwn(obs, 'freshness') || 'unknown',
+    reason: obsText(obsOwn(obs, 'unknown_reason')) || null,
+    lastKnown: obsText(obsOwn(obs, 'last_known_state')) || null,
+    ageSec: obsNum(obsOwn(obs, 'age_seconds')),
+    source: obsText(obsOwn(obs, 'source')) || null,
+    id: identityText(obsOwn(obs, 'identity')),
+    owner: qual(obsOwn(obs, 'owner')) || null,
+    progress: progressAt == null ? null : { ageSec: Math.max(0, nowSec - progressAt), kind: obsOwn(obs, 'last_progress_kind') || null, ref: obsOwn(obs, 'last_progress_ref') || null },
+    activity: activityAt == null ? null : { ageSec: Math.max(0, nowSec - activityAt), kind: obsText(obsOwn(obs, 'last_activity_kind')) || null },
+    wait: waitView(obsOwn(obs, 'wait'), nowSec),
+    // Receipts stay historical evidence of an execution even once the CURRENT state is unknown/stale.
+    receipts: Array.isArray(historical) ? historical.length : receipt ? 1 : 0,
+    asks
+  }
+}
+
+const missingView = (reason, extra = {}) => ({
+  sourced: false, state: 'unknown', freshness: 'unknown', reason, lastKnown: null, ageSec: null, source: null, id: '', owner: null,
+  progress: null, activity: null, wait: null, receipts: 0, asks: null, ...extra
+})
+
+const classOf = c => c || 'sidebar'
+
+/** One record -> view. */
+export function projectView(record, nowSec, sourceClass = 'sidebar', sdk = observationSdk(), expectedIdentity) {
+  if (!sdk) return missingView('sdk_projector_unavailable')
+  return observationView(sdk.projectExecutionObservation(record, nowSec, classOf(sourceClass), expectedIdentity), nowSec, sdk, classOf(sourceClass))
+}
+
+/** Records of ONE exact execution identity -> view (SDK selection: old runs and other owners never overwrite). */
+export function selectView(records, identity, nowSec, sourceClass = 'sidebar', sdk = observationSdk()) {
+  if (!sdk) return missingView('sdk_projector_unavailable')
+  return observationView(sdk.selectExecutionObservation(records, identity, nowSec, classOf(sourceClass)), nowSec, sdk, classOf(sourceClass))
+}
+
+/** Counts across records, per the SDK. Never a zero for what could not be read: empty is `uncertain`. */
+export function summaryView(records, nowSec, sourceClass = 'sidebar', sdk = observationSdk()) {
+  if (!sdk) return { counts: null, uncertain: true, outstanding: null, states: [], reason: 'sdk_projector_unavailable' }
+  const s = sdk.summarizeExecutionObservations(records, nowSec, classOf(sourceClass))
+  return { counts: s.counts, uncertain: !!s.uncertain, outstanding: s.outstanding_human_requests, states: s.observations.map(o => o.state), reason: null }
+}
+
+/** The chip's card evidence at `nowSec`. `chip.observations` = the producer's raw records (null = older producer).
+ *  Records are matched by exact card coordinates; two different execution identities stay unknown, never merged. */
+export function chipObservation(chip, nowSec, { sdk = observationSdk(), sourceClass = 'sidebar' } = {}) {
+  if (!sdk) return missingView('sdk_projector_unavailable')
+  const split = splitObservations(chip?.observations)
+  if (!split.present) return missingView('producer_sent_no_observations')
+  const candidates = split.work.filter(r => {
+    const id = obsOwn(r, 'identity')
+    if (obsOwn(id, 'kind') !== 'card' || obsOwn(id, 'work_id') !== chip.id) return false
+    for (const [k, mine] of [['board', chip.board], ['profile', chip.profile], ['gateway', chip.gateway]]) {
+      const theirs = obsOwn(id, k)
+      if (obsText(mine) && theirs !== undefined && theirs !== mine) return false
+    }
+    return true
+  })
+  if (!candidates.length) return missingView('no_observation_for_card', { capacityOnly: split.capacity.length > 0 })
+  const keys = new Set(candidates.map(r => sdk.executionIdentityKey(obsOwn(r, 'identity')) ?? 'invalid'))
+  let view
+  if (keys.size > 1) view = missingView('ambiguous_execution_identity', { sourced: true })
+  else {
+    const identity = obsOwn(candidates[0], 'identity')
+    view = keys.has('invalid') ? projectView(candidates[0], nowSec, sourceClass, sdk) : selectView(candidates, identity, nowSec, sourceClass, sdk)
+  }
+  // The row is session-tasks' cached copy after a failed read: whatever it last said, it is not current now.
+  if (chip.stale && view.state !== 'unknown') view = { ...view, lastKnown: view.state, state: 'unknown', freshness: 'stale', reason: 'cached_after_failed_read' }
+  return view
+}
+
+/** Capacity diagnostics for the chip, shown apart from work state. */
+export function chipCapacity(chip) {
+  const out = []
+  for (const r of splitObservations(chip?.observations).capacity) {
+    for (const k of ['reasons', 'diagnostics', 'machine_reasons']) {
+      for (const d of Array.isArray(obsOwn(r, k)) ? r[k] : []) if (obsText(obsOwn(d, 'code'))) out.push(d.code)
+    }
+    if (obsText(obsOwn(r, 'code'))) out.push(r.code)
+  }
+  return [...new Set(out)].slice(0, 3)
+}
+
+/** One plain line for a view (and a diagnostic line, if any). */
+export function observationLine(v, nowSec) {
+  const parts = [v.state === 'unknown' ? `unknown${v.reason ? ` (${v.reason.replace(/_/g, ' ')})` : ''}` : v.state.replace(/_/g, ' ')]
+  if (v.state === 'unknown' && v.lastKnown) parts.push(`last known ${v.lastKnown.replace(/_/g, ' ')}`)
+  if (v.ageSec != null) parts.push(`observed ${span(v.ageSec)} ago`)
+  if (v.wait) {
+    const w = v.wait
+    parts.push(`waiting: ${[w.kind, w.predicate].filter(Boolean).join(' ') || 'condition unknown'}${w.target ? ` on ${w.target}` : ''}${w.owner ? ` · owner ${w.owner}` : ''}${w.sinceAgeSec != null ? ` · ${span(w.sinceAgeSec)}` : ''}${w.dueInSec != null ? (w.dueInSec >= 0 ? ` · due in ${span(w.dueInSec)}` : ` · overdue ${span(-w.dueInSec)}`) : ''}`)
+  }
+  parts.push(v.progress ? `progress ${[v.progress.kind, `${span(v.progress.ageSec)} ago`, v.progress.ref && `(${v.progress.ref})`].filter(Boolean).join(' ')}` : 'progress unknown')
+  if (v.receipts) parts.push(v.state === 'done' ? 'verified completion receipt' : `${v.receipts} historical completion receipt${v.receipts === 1 ? '' : 's'}`)
+  if (v.id) parts.push(v.id)
+  return parts.join(' · ')
+}
+
+export const chipEvidenceLine = (chip, nowSec, opts) => {
+  const v = chipObservation(chip, nowSec, opts)
+  const cap = chipCapacity(chip)
+  return `${observationLine(v, nowSec)}${cap.length ? ` · capacity diagnostic (not work state): ${cap.join(', ')}` : ''}`
+}
 
 // ── pure helpers (exported for tests) ───────────────────────────────────────
 
@@ -79,7 +242,7 @@ export function trackSubagents(chips, nowMs, memory) {
 
 /** Sort the chat's work into the panel's sections. `isAsked(chip)` = a user-steps ask already covers this card. */
 const TERMINAL = new Set(['done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'])
-export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null } = {}) {
+export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
   const now = nowMs / 1000
   const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
@@ -125,6 +288,14 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     }
     // Finished cards come from the Done list (/session-cards); a terminal chip here is not waiting on anything.
     if (TERMINAL.has(str(c.state))) continue
+    // Source evidence that exists but is expired/incomplete/mismatched makes the card's status unknown, whatever the
+    // legacy fields still say (a cached running card must not read as running). A card with NO evidence (older
+    // producer) keeps its legacy section; the explicit unknown line is shown on its row instead.
+    const ev = evidence(c)
+    if (ev?.sourced && ev.state === 'unknown') {
+      out.waiting.push({ ...item(c), detail: `status unknown${ev.reason ? ` (${ev.reason.replace(/_/g, ' ')})` : ''} · last known: ${ev.lastKnown || c.state || 'unknown'}${ev.ageSec != null ? ` (observed ${span(ev.ageSec)} ago)` : ''}` })
+      continue
+    }
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if (c.state === 'running') {
       if (progress && now - progress >= STUCK_CARD_S) out.stuck.push({ ...item(c), reason: 'no-progress', lastAt: progress, detail: `running, no progress since ${clock(progress, nowMs)} (${ago(progress, nowMs)})${c.activity ? ` · last event: ${c.activity}` : ''}` })
@@ -145,6 +316,21 @@ export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) 
   const open = list => (list || []).some(i => !(i.kind === 'kanban' && TERMINAL.has(str(i.chip?.state))))
   return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) ||
     (Array.isArray(steps) && steps.some(s => s?.id && (s.status || 'open') === 'open')) || (Array.isArray(issues) && issues.length))
+}
+
+/** Attach each work row's evidence line (projected at `nowMs`, never cached); returns how many rows have SOURCE evidence that is unknown (rows with none show their own explicit unknown line). */
+export function annotateEvidence(sorted, nowMs, opts) {
+  let unknown = 0
+  for (const list of [sorted.active, sorted.stuck, sorted.waiting, sorted.queued, sorted.unasked]) {
+    for (const i of list) {
+      if (!['kanban', 'bg', 'sub'].includes(i.kind)) continue
+      const v = chipObservation(i.chip, nowMs / 1000, opts)
+      i.evidenceText = chipEvidenceLine(i.chip, nowMs / 1000, opts)
+      i.evidenceState = v.state
+      if (v.sourced && v.state === 'unknown') unknown++
+    }
+  }
+  return unknown
 }
 
 function item(c) {
@@ -432,7 +618,8 @@ function Row({ i, k }) {
     jsx('span', { 'aria-hidden': true, 'data-row-pip': k, ...(hub ? { 'data-row-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), justifySelf: 'center', marginTop: hub ? 3.5 : 5 }, children: hub ? 'H' : undefined }),
     jsxs('div', { style: { minWidth: 0 }, children: [
       jsx('div', { title: str(i.chip?.title) || i.label, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: i.label }),
-      i.detail && jsx('div', { style: { ...muted, overflowWrap: 'anywhere' }, children: i.detail })
+      i.detail && jsx('div', { style: { ...muted, overflowWrap: 'anywhere' }, children: i.detail }),
+      i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', style: { ...muted, fontSize: 11, overflowWrap: 'anywhere' }, children: `evidence: ${i.evidenceText}` })
     ] })
   ] })
 }
@@ -460,6 +647,7 @@ function AskRow({ i, session }) {
     jsx('div', { 'data-ask-step': '', title: v.full || undefined, style: { fontWeight: 600, fontSize: 13, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }, children: v.known ? `Do this: ${v.step}` : v.step }),
     v.why && jsx('div', { 'data-ask-why': '', style: { ...line, color: 'var(--muted-foreground)' }, children: `Why you: ${v.why}` }),
     jsx('div', { 'data-ask-next': '', style: line, children: `Next: ${v.next}` }),
+    i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', style: { ...muted, fontSize: 11, overflowWrap: 'anywhere' }, children: `evidence: ${i.evidenceText}` }),
     jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 6 }, children: [
       canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: btn, onClick: () => st.openTaskChip(i.chip), children: 'Open card' }),
       !v.known && jsx('button', { type: 'button', 'data-ask-agent': '', style: btn, title: 'Drafts a question to the agent in the composer; nothing is sent until you send it', onClick: ask, children: 'Ask agent' }),
@@ -475,6 +663,7 @@ function StuckCard({ i, session, now }) {
   return jsxs('div', { 'data-stuck': i.key, style: { border: `1px solid color-mix(in srgb, ${C.stuck} 45%, transparent)`, borderRadius: 6, padding: '8px 10px', marginBottom: 6 }, children: [
     jsx('div', { style: { fontWeight: 600, fontSize: 13, overflowWrap: 'anywhere' }, children: i.label }),
     jsx('div', { style: { ...muted, marginBottom: 4, overflowWrap: 'anywhere' }, children: i.detail }),
+    i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', style: { ...muted, fontSize: 11, marginBottom: 4, overflowWrap: 'anywhere' }, children: `evidence: ${i.evidenceText}` }),
     jsx('ol', { 'data-unblock-steps': '', style: { margin: '0 0 8px', paddingLeft: 18, fontSize: 12.5, lineHeight: 1.5 }, children: unblockSteps(i, now).map((s, n) => jsx('li', { children: s }, n)) }),
     jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 }, children: [
       jsx('button', { type: 'button', 'data-nudge': '', style: btn, title: 'Drafts a message to the agent in the composer; nothing is sent until you send it', onClick: nudge, children: 'Nudge agent' }),
@@ -527,7 +716,8 @@ export function Panel() {
   const silence = trackSubagents(chips, now, subMemory)
   const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const presentationFor = c => US?.presentationForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
-  const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor })
+  const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, now / 1000) : null) })
+  const evidenceUnknown = annotateEvidence(sorted, now)
   const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
   const finished = doneState.scope === scope ? doneState.rows : cachedDone(scope)
   const n = counts(sorted, { asks, done: finished ? finished.filter(d => !d.archived).length : null })
@@ -559,6 +749,9 @@ export function Panel() {
     legacy
   ].filter(Boolean)
   const summaryParts = PIP_ORDER.filter(k => n[k]).map(k => ({ k, text: `${n[k]} ${LABEL[k]}` }))
+  // Rows whose source evidence is unknown (expired, missing from an older producer, or SDK projector absent) are
+  // counted apart: they are neither green nor zero.
+  if (evidenceUnknown) summaryParts.push({ k: 'evidence', text: `${evidenceUnknown} evidence unknown` })
   // Same chrome as the composer status stack's sections (StatusSection): a full-width disclosure row with a caret,
   // a glyph and a muted label. The caret is the minimize toggle; folded, only this row (and waiting one-liners)
   // stays. A folded ask is never muted: its count keeps the needs-you colour, and a new ask reopens the panel.
