@@ -194,6 +194,35 @@ SCHEMA = {
         "properties": {
             "kind": {"type": "string", "enum": ["done", "decide", "wait"]},
             "summary": {"type": "string", "description": "done: what was done and the result."},
+            "completion_receipt": {
+                "type": "object", "additionalProperties": False, "required": ["version", "items"],
+                "description": "Optional historical scope dispositions, not execution authority. Workflow done does not mean artifact accepted. Pending work needs a verified existing linked owner; deferred work grants no authorization. Evidence verification is an attributed claim, never inferred from a reference.",
+                "properties": {
+                    "version": {"type": "integer", "enum": [1]},
+                    "items": {"type": "array", "minItems": 1, "maxItems": 32, "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["scope", "disposition", "evidence", "remaining"],
+                        "properties": {
+                            "scope": {"type": "string", "minLength": 1, "maxLength": 2000},
+                            "disposition": {"type": "string", "enum": ["delivered", "superseded", "contained", "rejected"]},
+                            "superseded_by": {"type": "string", "minLength": 1, "maxLength": 2048, "description": "Required only for superseded: replacement or decision reference."},
+                            "evidence": {"type": "array", "minItems": 1, "maxItems": 32, "items": {
+                                "type": "object", "additionalProperties": False,
+                                "required": ["ref", "observed_at", "verification"], "properties": {
+                                    "ref": {"type": "string", "minLength": 1, "maxLength": 2048},
+                                    "observed_at": {"type": "string", "maxLength": 64, "description": "ISO8601 timestamp with timezone of the evidence, not this projection."},
+                                    "verification": {"type": "string", "enum": ["reported", "independently_checked"]}}}},
+                            "remaining": {"type": "array", "maxItems": 32, "items": {
+                                "type": "object", "additionalProperties": False,
+                                "required": ["scope", "state", "owner", "reason"], "properties": {
+                                    "scope": {"type": "string", "minLength": 1, "maxLength": 2000},
+                                    "state": {"type": "string", "enum": ["pending", "deferred"]},
+                                    "owner": {"type": ["string", "null"], "maxLength": 2048, "description": "Fully qualified @task:board@gateway/id or @session:profile@gateway/id. Null only when deferred with explicit reason; pending requires existing verified ownership."},
+                                    "reason": {"type": "string", "minLength": 1, "maxLength": 2000}}}},
+                        },
+                    }},
+                },
+            },
             "keep_crons": {"type": "boolean", "description": "done: keep ownership of live cron jobs for a continuing watch. Default false releases ownership without stopping or changing the jobs."},
             "items": {"type": "array", "minItems": 1, "description": "decide: the questions for the user.",
                       "items": {"type": "object", "additionalProperties": False, "required": ["question", "choices"],
@@ -246,11 +275,25 @@ def _text(value: Any) -> str:
 def _validate(args: dict) -> dict:
     """Normalized tool args; ValueError with an actionable message when malformed. Writes nothing."""
     kind = args.get("kind")
+    receipt_fields = {}
+    if "completion_receipt" in args:
+        if kind != "done":
+            raise ValueError("completion_receipt is only valid for done declarations")
+        # Probe the loaded writer's validator, not a newly imported helper: an old
+        # running core may coexist with new files on disk and silently strip it.
+        api = _outcome_api()
+        validate = getattr(api, "validate_declaration", None)
+        if not callable(validate):
+            raise ValueError("completion_receipt needs a receipt-capable loaded core")
+        validated = validate(args)
+        if "completion_receipt" not in validated:
+            raise ValueError("completion_receipt unsupported by the loaded core; nothing declared")
+        receipt_fields["completion_receipt"] = validated["completion_receipt"]
     if kind == "done":
         summary = _text(args.get("summary"))
         if not summary:
             raise ValueError('done needs a non-empty "summary"')
-        return {"kind": "done", "summary": summary[:SUMMARY_MAX],
+        return {"kind": "done", "summary": summary[:SUMMARY_MAX], **receipt_fields,
                 **({"keep_crons": True} if args.get("keep_crons") is True else {})}
     if kind == "decide":
         items = args.get("items")

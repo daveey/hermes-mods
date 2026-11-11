@@ -4,6 +4,27 @@ Every non-archived chat should have exactly one stored outcome, and the sidebar 
 idleness. Core owns the storage and the derivation (`hermes_state_outcome`). This plugin lets the agent declare
 the outcome and feeds core the two things only plugins know: open user decisions and a summary judge.
 
+## Completion receipts
+
+An optional `completion_receipt` on `kind: done` carries v1 scoped dispositions
+(`delivered`, `superseded`, `contained`, `rejected`), evidence references with original
+ISO8601 observation times and `reported`/`independently_checked` verification claims,
+and remaining `pending`/`deferred` scope with qualified owners and reasons. This is
+historical evidence, not execution authority or a replacement for workflow status.
+Legacy declarations remain valid without a receipt and imply no artifact acceptance.
+The loaded core's validator must preserve the field before the tool calls its writer;
+an old running core that would discard it is refused, even if newer helper files exist
+on disk. Non-done receipt arguments and malformed receipts fail before side effects.
+Core still validates existing ownership for pending obligations at declaration time;
+merely supplying a qualified reference cannot establish ownership. Deferred scope does
+not authorize enforcement, publication or retries.
+
+Tests: `tests/test_completion_receipt.py` covers schema, old loaded cores and non-done
+admission; `tests/test_receipt_real_core.py` exercises the actual tool handler through
+canonical storage/refresh, all four dispositions, deferral and atomic rejection. These
+are isolated tests, not deployed UI proof. Wrapped tool/CLI/execute-code coverage is
+not claimed by this plugin section.
+
 ## Behavior
 
 - **Tool `session_outcome`.** It is offered only in desktop, tui and cli chats (a no-cache `check_fn`; the handler

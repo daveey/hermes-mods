@@ -40,6 +40,24 @@ Needs the fork core for the wake (`tui_gateway.server._wake_session_turn`) and t
 (`kanban_session_activity.register_waiting_source`); on an older core the ledger, brief and lint still work, the
 row goes green a little early, and no wake happens.
 
+## Historical completion receipts
+
+Full local-board inventory reads include core's canonical completed-event/run receipt
+projection when available. The source gateway comes from the task's original authority,
+not whichever worker currently holds a synced row. Portable run/event identities and
+original evidence observation/verification travel unchanged into the closeout prompt;
+a newer review handoff cannot replace the completion receipt. Light settlement reads
+are unchanged. Missing or invalid receipts leave artifact acceptance unspecified.
+
+Receipt-bearing closeouts distinguish rejected artifacts, superseded scope, delivered
+reports and containment (not a root-cause fix). They preserve remaining scope/qualified
+owners and do not turn explicit deferral into execution, publication or retry authority.
+Receipt references remain historical, including when current execution evidence is stale.
+The receipt is never a substitute for the existing owner-attestation/settlement gate.
+`tests/test_completion_receipt.py` exercises the read projection and generated prompt,
+including legacy absence and all dispositions. Remote publication/projection and live
+Desktop delivery are separate integration surfaces, not proved by these local tests.
+
 ## Ownership and evidence
 
 New batches use local `board/task` keys and remote `gateway/profile/board/task` keys (the local gateway/profile is implicit in the ledger's runtime scope). Remote reads use core's origin-ledger projection, including released rows omitted from `session_tasks`, plus core's unsuperseded historical associations. There is no second ownership ledger or replica-only completion rule.
