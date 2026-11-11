@@ -37,7 +37,7 @@ globalThis.producerHarness = { React, J, host }
 register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={
   'react':'const R=globalThis.producerHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef',
   'react/jsx-runtime':'const J=globalThis.producerHarness.J;export const jsx=J.jsx,jsxs=J.jsxs',
-  '@hermes/plugin-sdk':'export const host=globalThis.producerHarness.host,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get?.(),MessageTextContent=({text})=>text'
+  '@hermes/plugin-sdk':'export const host=globalThis.producerHarness.host,Codicon=({name})=>null,DisclosureCaret=({open})=>null,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get?.(),MessageTextContent=({text})=>text'
 };return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const tasksPlugin = await import('../../session-tasks/plugin.js')
 const blocked = await import('../../blocked-panel/plugin.js')

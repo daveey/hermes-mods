@@ -15,7 +15,9 @@
  *   In progress  running and in-review cards, sub-agents, background processes, rented machines
  *   Waiting      parked cards and what they wait on
  *   footer       finished and not-yet-started cards, folded
- *   collapsed    header, Needs you, and one line per waiting card (up to 3) saying what it waits on
+ *   collapsed    the header line alone (caret + counts, needs-you in amber) plus one line per waiting card (up to 3);
+ *                the header is the composer status stack's own disclosure row (caret, icon, label), so this panel
+ *                folds the same way the task list above it does
  *   hidden       when nothing is open (no ask, open card, sub-agent, process, step or issue): finished cards alone
  *                never show the panel
  *
@@ -24,7 +26,7 @@
  * list has no finished cards). While this plugin is loaded, session-tasks and user-steps hide their own strips
  * (they check window.__sessionPanel.active). Nudge only drafts a message in the composer; the user sends it.
  */
-import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
+import { Codicon, COMPOSER_AREAS, DisclosureCaret, host, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -416,22 +418,26 @@ export function Panel() {
     ...sorted.unasked.map(i => jsx(AskRow, { i, session: route.session }, i.key)),
     legacy
   ].filter(Boolean)
-  const summary = PIP_ORDER.filter(k => n[k]).map(k => `${n[k]} ${LABEL[k]}`).join(' · ')
-  return jsxs('section', { 'data-session-panel': '', 'aria-label': 'Session status', style: { width: '100%', minWidth: 0, boxSizing: 'border-box', padding: '10px 12px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
-    jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
-      jsx('h2', { style: { margin: 0, fontSize: 13.5, fontWeight: 600, flex: 'none' }, children: 'This session' }),
-      jsxs('span', { 'data-session-status': '', style: { ...muted, display: 'flex', alignItems: 'center', gap: 5, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [busy && jsx('span', { 'aria-hidden': true, style: { color: C.running }, children: '●' }), status] }),
+  const summaryParts = PIP_ORDER.filter(k => n[k]).map(k => ({ k, text: `${n[k]} ${LABEL[k]}` }))
+  // Same chrome as the composer status stack's sections (StatusSection): a full-width disclosure row with a caret,
+  // a glyph and a muted label. The caret is the minimize toggle; folded, only this row (and waiting one-liners)
+  // stays. A folded ask is never muted: its count keeps the needs-you colour, and a new ask reopens the panel.
+  const trigger = 'status-section-trigger flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1 text-left text-xs font-normal text-muted-foreground/92 transition-colors hover:text-foreground/90'
+  return jsxs('section', { 'data-session-panel': '', 'data-slot': 'status-section', 'aria-label': 'Session status', style: { width: '100%', minWidth: 0, boxSizing: 'border-box', paddingBottom: collapsed ? 2 : 6, borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', color: 'var(--foreground)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
+    jsx('div', { className: 'status-section-header flex items-center gap-1 pr-1', children: jsxs('button', { type: 'button', 'data-panel-toggle': '', className: trigger, 'aria-expanded': !collapsed, 'aria-label': collapsed ? 'Expand session status' : 'Collapse session status', title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: toggle, style: { background: 'transparent', border: 0, cursor: 'pointer', minWidth: 0 }, children: [
+      jsx(DisclosureCaret, { className: 'shrink-0', open: !collapsed, size: '1em' }),
+      jsx('span', { className: 'status-section-icon flex shrink-0 items-center', children: jsx(Codicon, { className: 'text-muted-foreground/70', name: 'pulse', size: '0.8rem' }) }),
+      jsx('span', { 'data-panel-title': '', className: 'shrink-0', children: 'This session' }),
+      jsxs('span', { 'data-session-status': '', className: 'min-w-0 truncate', style: { display: 'flex', alignItems: 'center', gap: 5, opacity: 0.8 }, children: [busy && jsx('span', { 'aria-hidden': true, style: { color: C.running }, children: '●' }), status] }),
       jsx(Pips, { n, hub: hubCounts(sorted) }),
-      summary && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), style: { ...muted, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: summary }),
-      jsx('button', { type: 'button', 'data-panel-toggle': '', 'aria-expanded': !collapsed, 'aria-label': collapsed ? 'Expand session status' : 'Collapse session status', title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: toggle, style: { ...btn, marginLeft: 'auto', flex: 'none', minHeight: 28, minWidth: 28, padding: '2px 6px' }, children: jsx('i', { 'aria-hidden': true, className: `codicon ${collapsed ? 'codicon-chevron-up' : 'codicon-chevron-down'}` }) })
-    ] }),
-    // Collapse folds progress, never an ask: a muted "1 needs you" behind a chevron reads as nothing needing you.
-    collapsed && waitLines.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { ...muted, marginTop: 4, minWidth: 0 }, children: [
+      summaryParts.length > 0 && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), className: 'min-w-0 truncate', children: summaryParts.flatMap((p, idx) => [idx > 0 && ' · ', jsx('span', { style: p.k === 'needsYou' || p.k === 'stuck' ? { color: C[p.k], fontWeight: 600 } : undefined, children: p.text }, p.k)].filter(Boolean)) })
+    ] }) }),
+    // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
+    collapsed && waitLines.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { ...muted, padding: '0 8px 0 30px', minWidth: 0 }, children: [
       ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.detail}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `${i.label} · ${i.detail || 'waiting'}` }, i.key)),
       waitMore > 0 && jsx('div', { children: `+${waitMore} more waiting` }, 'more')
     ] }),
-    collapsed && n.needsYou > 0 && jsx('div', { 'data-panel-needs-you': '', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0 }, children: needsYou }),
-    !collapsed && jsxs('div', { 'data-panel-body': '', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0 }, children: [
+    !collapsed && jsxs('div', { 'data-panel-body': '', className: 'status-section-body', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0, padding: '0 10px 0 12px' }, children: [
       ...needsYou,
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),

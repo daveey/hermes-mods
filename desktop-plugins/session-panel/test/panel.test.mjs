@@ -14,7 +14,7 @@ const atom = value => ({ value, get() { return this.value } })
 const drafts = []
 const host = { state: { focusedSessionId: atom('R1'), focusedStoredSessionId: atom('S1'), busy: atom(false), connectionId: atom('C1'), profile: atom('default'), focusedSessionOwner: atom({ connectionId: 'C1', profile: 'default' }) }, composer: { setDraft: (s, t) => drafts.push([s, t]), focus() {} } }
 globalThis.panelHarness = { React, J, host }
-register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.panelHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.panelHarness.J;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':'export const host=globalThis.panelHarness.host,COMPOSER_AREAS={top:"composer.top"},useValue=a=>a?.get()'};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
+register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.panelHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.panelHarness.J;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':'export const host=globalThis.panelHarness.host,Codicon=({name})=>null,DisclosureCaret=({open})=>null,COMPOSER_AREAS={top:"composer.top"},useValue=a=>a?.get()'};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const m = await import('../plugin.js')
 const { createRoot } = require('react-dom/client')
 const root = createRoot(document.getElementById('root'))
@@ -205,19 +205,37 @@ test('panel: an unmarked session-cards answer leaves done unknown instead of zer
   void b
 })
 
-test('panel: a collapsed panel still shows what needs you (collapse folds progress, never an ask)', async () => {
+test('panel: the caret folds the whole panel to its header, like the task list; asks keep their colour', async () => {
   window.localStorage.clear()
   const s = Date.now() / 1000
   bridges({ chips: [card('t_ask', 'blocked', { look: 'needs-you' }), card('t_run', 'running', { activityAt: s - 30 })] })
   await show(React.createElement(m.Panel, { key: 'collapse-ask' }))
+  const toggle = () => el().querySelector('[data-panel-toggle]')
+  assert.equal(toggle().getAttribute('aria-expanded'), 'true')
+  assert.ok(toggle().classList.contains('status-section-trigger'), 'same disclosure row as the composer status stack')
+  assert.match(toggle().textContent, /This session/)
+  await React.act(async () => { toggle().click(); await flush() })
+  assert.equal(toggle().getAttribute('aria-expanded'), 'false')
+  assert.equal(el().querySelector('[data-panel-body]'), null, 'body is folded')
+  assert.equal(el().querySelector('[data-section="needs-you"]'), null, 'asks fold too: the toggle minimizes the panel')
+  assert.equal(el().querySelector('[data-panel-row]'), null)
+  const summary = el().querySelector('[data-collapsed-summary]')
+  assert.match(summary.textContent, /1 needs you/)
+  const ask = [...summary.querySelectorAll('span')].find(x => x.textContent === '1 needs you')
+  assert.ok(ask && ask.style.color, 'the folded ask count keeps the needs-you colour, never muted')
+  await React.act(async () => { toggle().click(); await flush() })
+  assert.ok(el().querySelector('[data-section="needs-you"]'), 'expanding shows the asks again')
+})
+
+test('panel: a new ask reopens a folded panel', async () => {
+  window.localStorage.clear()
+  const s = Date.now() / 1000
+  const b = bridges({ chips: [card('t_run', 'running', { activityAt: s - 30 })] })
+  await show(React.createElement(m.Panel, { key: 'collapse-new-ask' }))
   await React.act(async () => { el().querySelector('[data-panel-toggle]').click(); await flush() })
-  assert.equal(el().querySelector('[data-panel-body]'), null, 'progress is folded')
-  assert.match(el().querySelector('[data-collapsed-summary]').textContent, /1 needs you/)
-  const kept = el().querySelector('[data-panel-needs-you]')
-  assert.ok(kept, 'needs-you section stays visible while collapsed')
-  assert.equal(kept.querySelector('[data-section="needs-you"]').textContent, 'Needs you · 1')
-  assert.ok(kept.querySelector('[data-panel-row]'), 'the card row itself is shown')
-  assert.equal(kept.textContent.includes('t_run'), false, 'running work stays folded')
+  assert.equal(el().querySelector('[data-panel-body]'), null, 'collapsed')
+  await React.act(async () => { b.push([card('t_run', 'running', { activityAt: s - 30 }), card('t_ask', 'blocked', { look: 'needs-you' })]); await flush() })
+  assert.ok(el().querySelector('[data-panel-body]'), 'a new needs-you card reopens the panel')
 })
 
 test('panel: a collapsed panel names what each waiting card waits on, not just a count', async () => {

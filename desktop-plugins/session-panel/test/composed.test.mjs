@@ -23,7 +23,7 @@ globalThis.composedHarness = { React, J, host }
 register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={
   'react':'const R=globalThis.composedHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef',
   'react/jsx-runtime':'const J=globalThis.composedHarness.J;export const jsx=J.jsx,jsxs=J.jsxs',
-  '@hermes/plugin-sdk':'export const host=globalThis.composedHarness.host,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get?.(),MessageTextContent=({text})=>text'
+  '@hermes/plugin-sdk':'export const host=globalThis.composedHarness.host,Codicon=({name})=>null,DisclosureCaret=({open})=>null,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get?.(),MessageTextContent=({text})=>text'
 };return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const panel = await import('../plugin.js')
 const steps = await import('../../user-steps/plugin.js')
