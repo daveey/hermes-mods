@@ -68,20 +68,33 @@ bypassed with another writer.
   steps (live checks, a PR on a moved repo), comment the corrected premise and unblock so the owner finishes. Don't force it.
 - A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
 - Cards whose dependents wait on them: unblocking or completing promotes the children. Check them.
+- Link every card still waiting on the user to this chat, so its wake lands here:
+  `hermes kanban [--board B] notify-subscribe <id> --platform tui --chat-id <this session id> --delivery-mode notify+wake`.
+  The chat-link reconcile turns it into a `shepherd` row in `task_chat_links` within about a minute; read back
+  `released=0`. Never `INSERT INTO task_chat_links` directly: the next reconcile releases it.
 - Mac probes that a worker reports "no agent route" for (mini/MacBook check_compat, git ancestry, sqlite reads) often
   run directly with `tailnet_exec` from the user's interactive chat. A host outside `tailnet.auto_hosts` returns an
   approval request instead; name it in the report.
 - Asks to delete a finished card's scratch workspace: core scratch GC removes terminal cards' scratch trees after
   `kanban.worktree_retention_days`. Comment that and archive; no human `rm` is needed.
 
-## 4. Ask about the rest: one `clarify` form
+## 4. Ask about the rest: `clarify`, no timeout
 
-- One question per remaining card, in plain household terms (what happens, not card mechanics). Recommended option
-  first. No card ids, no "unblock = / archive =" wording.
-- Batch low-stakes defaults into one "accept all recommended" question.
-- Physical or sign-in steps are not questions. List them as actions grouped by device, each with what "done" looks like.
-- Record each answer on the card yourself (comment, then unblock/archive/complete). Don't leave it to the user.
-- If the `clarify` times out, put the same questions in `session_outcome {"kind":"decide"}` so they wait in For you.
+- First `hermes config set agent.clarify_timeout 0`: the default 90 s makes the form vanish before the user
+  answers, and he wants forms with no timeout.
+- Batch: up to 5 questions per `clarify` call, numbered "N/total", one self-contained question per card in plain
+  household terms with the decisive fact inside it. Don't fold several decisions into one "accept all" question:
+  the user wants a button per choice.
+- Choices: recommended first, labelled "(recommended)", one button per real option, then "Skip". No card ids, no
+  "unblock = / archive =" wording. Free-text follow-ups (an allowlist, a consent reference) get their own open question.
+- If ask-gate `superseding_work` refuses the form, name the listed related cards inside the question text (why each
+  doesn't settle it) and resend.
+- Record each answer on its card right away (comment with the exact choice and chat id, then unblock/archive/complete).
+  A skipped question gets the safest narrow default, stated in the comment.
+- Don't re-publish unanswered questions as `session_outcome`/For-you tiles: they duplicate the form and each must be
+  withdrawn later. When done, `action_request {"withdraw": ...}` every open request this chat published.
+- Physical or sign-in steps are not questions. Before listing one, check it's still true (e.g. open the page in the
+  signed-in browser); then list it with its device and what "done" looks like.
 
 ## Pitfalls
 
@@ -96,5 +109,6 @@ bypassed with another writer.
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
 - [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment?
-- [ ] The remaining asks went out in one `clarify` form (or `session_outcome` decide on timeout), recommended option first, with no card ids?
+- [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
+- [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
 - [ ] The report names the unlinked and reaped-only cards that still need the user?
