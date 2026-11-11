@@ -59,7 +59,17 @@ test('classify sorts cards, sub-agents and processes into sections', () => {
   assert.match(out.stuck[0].detail, /^running, no progress since \d\d:\d\d \(2 h ago\) · last event: heartbeat$/)
   assert.match(out.waiting[0].detail, /^waiting on a timer since \d\d:\d\d$/)
   assert.match(out.stuck[2].detail, /^sub-agent · no new tool call for 30 min \(3 tool calls, last terminal\)$/)
-  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 2, needsYou: 2, stuck: 2, waiting: 1, queued: 1 })
+  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 3, needsYou: 2, stuck: 3, waiting: 1, queued: 1 },
+    'sub-agents and processes count like the rows listed under each section')
+})
+
+test('a lone running sub-agent shows one running pip, matching In progress · 1', async () => {
+  const out = m.classify([{ key: 'sub:solo', kind: 'sub', label: 'Fix it', toolCount: 70, lastTool: 'terminal' }], { nowMs: NOW })
+  const n = m.counts(out, { done: 4 })
+  assert.equal(n.running, 1)
+  await show(React.createElement(m.Pips, { n }))
+  assert.equal(el().querySelectorAll('[data-pip="running"]').length, 1)
+  assert.equal(el().querySelectorAll('[data-pip="done"]').length, 4)
 })
 
 test('a running card just under the threshold, or with fresh activity, is not stuck', () => {

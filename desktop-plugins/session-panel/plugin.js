@@ -170,17 +170,17 @@ export function askView(c) {
 /** Composer draft for Ask agent: a plain question about one card, sent only when the user presses send. */
 export const askAgentText = i => `Card ${i.id}: what exactly do you need me to do, and where? Please answer in one or two plain sentences.\n`
 
-/** Progress-bar counts. Cards only (sub-agents and processes are listed, not counted); needs you = open asks
- *  plus unasked cards that need the user. */
+/** Pip/summary counts: one per row the panel lists, so "In progress · 1" always shows one running box. Sub-agents,
+ *  background processes and rented machines count like cards (a sub-agent alone used to show no blue box).
+ *  Needs you = open asks plus unasked cards that need the user. */
 export function counts(sorted, { asks = 0, done = null } = {}) {
-  const cards = list => list.filter(i => i.kind === 'kanban').length
   return {
     done: done ?? 0,
-    running: cards(sorted.active),
+    running: sorted.active.length,
     needsYou: asks + sorted.unasked.length,
-    stuck: cards(sorted.stuck),
-    waiting: cards(sorted.waiting),
-    queued: cards(sorted.queued)
+    stuck: sorted.stuck.length,
+    waiting: sorted.waiting.length,
+    queued: sorted.queued.length
   }
 }
 
