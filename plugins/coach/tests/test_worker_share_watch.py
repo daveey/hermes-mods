@@ -42,6 +42,7 @@ def home(tmp_path):
     con.executemany("INSERT INTO tasks (id,title,body,assignee,requires,skills,runs_on,status,placement_policy,"
                     "created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
     con.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
+    con.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT)")
     con.commit()
     con.close()
     return tmp_path
