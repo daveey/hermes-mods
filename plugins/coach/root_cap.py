@@ -295,30 +295,9 @@ def register_contract(store_root, *, target_home, key, frozen_value, contract_re
     if not (home / "config.yaml").is_file():
         raise RootCapError(f"{home} is not a Hermes home (no config.yaml)")
     artifact = Path(contract_ref)
-    try:
-        raw = artifact.read_bytes()
-    except OSError as exc:
-        raise RootCapError(f"contract artifact unreadable ({type(exc).__name__})")
-    if len(raw) > 1_000_000 or not re.search(rf"{re.escape(_leaf(key))}[^\n]{{0,80}}\b{value}\b",
-                                             raw.decode("utf-8", "replace")):
-        raise RootCapError(f"contract artifact does not state {key} = {value}")
-    digest = _sha(raw)
-    acc = _acceptance()
+    digest = _artifact_digest(artifact, key, value)
     db = Path(state_db) if state_db else home / "state.db"
-    try:
-        after = artifact.stat().st_mtime  # approval of THIS revision cannot predate the revision's bytes
-    except OSError as exc:
-        raise RootCapError(f"contract artifact unreadable ({type(exc).__name__})")
-    ok, why = acc.verify_citation(int(approval_message_id), approval_session, db, after=after)
-    if not ok:
-        raise RootCapError(f"approval is not native human authority for this revision: {why}")
-    conn = acc._ro_connect(db)
-    try:
-        content, kind = conn.execute("select content, display_kind from messages where id=?",
-                                     (int(approval_message_id),)).fetchone()
-    finally:
-        conn.close()
-    _approval_binds(acc.typed_text(content, kind) or "", key, value, artifact, digest, owner_card)
+    _verify_native_approval(db, approval_session, approval_message_id, artifact, digest, key, value, owner_card)
     status = owner_status(owner_card, home)
     if status not in OPEN_STATES:
         raise RootCapError(f"owner card {owner_card} is not an open card (status {status!r})")
@@ -343,18 +322,63 @@ def register_contract(store_root, *, target_home, key, frozen_value, contract_re
     return _mutate(path, apply)
 
 
+def _artifact_digest(artifact, key, value):
+    """Digest of the artifact bytes, which must state `key ... value` (a pinned revision, not a path)."""
+    try:
+        raw = Path(artifact).read_bytes()
+    except OSError as exc:
+        raise RootCapError(f"contract artifact unreadable ({type(exc).__name__})")
+    if len(raw) > 1_000_000 or not re.search(rf"{re.escape(_leaf(key))}[^\n]{{0,80}}\b{value}\b",
+                                             raw.decode("utf-8", "replace")):
+        raise RootCapError(f"contract artifact does not state {key} = {value}")
+    return _sha(raw)
+
+
+def _verify_native_approval(db, session, message_id, artifact, digest, key, value, owner_card):
+    """The approving row must be native human authority: a typed row of a human-opened chat, newer than the artifact
+    revision, in the approval chat's lineage (same reader as kanban-honest-done), and its text a positive, first-person
+    approval of THIS rollout (not reported or quoted speech, not negated, naming the artifact revision or owner)."""
+    acc = _acceptance()
+    try:
+        after = Path(artifact).stat().st_mtime  # approval of THIS revision cannot predate the revision's bytes
+    except OSError as exc:
+        raise RootCapError(f"contract artifact unreadable ({type(exc).__name__})")
+    ok, why = acc.verify_citation(int(message_id), session, db, after=after)
+    if not ok:
+        raise RootCapError(f"approval is not native human authority for this revision: {why}")
+    human, why = human_origin(session, db)
+    if not human:
+        raise RootCapError(f"approval is not native human authority: {why}")
+    conn = acc._ro_connect(db)
+    try:
+        content, kind = conn.execute("select content, display_kind from messages where id=?",
+                                     (int(message_id),)).fetchone()
+    finally:
+        conn.close()
+    _approval_binds(acc.typed_text(content, kind) or "", key, value, Path(artifact), digest, owner_card)
+
+
 def _approval_binds(text, key, value, artifact, digest, owner_card):
     """The human's own message must be a positive, non-negated approval of THIS rollout: key, frozen value and the
     artifact revision (digest prefix, artifact file name or the owner card). Naming the key and a number is not
     approval ('Do not freeze X at 7. This is not approval.')."""
-    low = text.lower()
+    low = text.lower().replace("`", "")
     leaf = _leaf(key)
     named = [s for s in _sentences(low) if leaf in s and re.search(rf"\b{value}\b", s)]
     if not named:
         raise RootCapError(f"approval message does not name {key} and the frozen value {value}")
     if any(_NEG.search(s) or "not approv" in s for s in _sentences(low)):
         raise RootCapError("approval message is negative or withdraws the freeze")
-    if not any(re.search(r"\b(approv\w*|authori[sz]\w*|freez\w*|frozen|confirm\w*)\b", s) for s in named):
+    # Reported speech is not the human's own approval ('The assistant wrote: "I approve ..."', '> I approve ...'):
+    # same classifier as the override decision. A reported-speech cue anywhere in the sentence disqualifies it, and
+    # the key and value must stand outside quotation marks.
+    own = [s for s in named if not _REPORTED.search(s) and leaf in _QUOTED_DQ.sub(" ", s)
+           and re.search(rf"\b{value}\b", _QUOTED_DQ.sub(" ", s))]
+    if not own:
+        raise RootCapError("approval message is reported or quoted speech, not the user's own approval")
+    named = own
+    if not any(re.search(r"\b(approv\w*|authori[sz]\w*|freez\w*|frozen|confirm\w*)\b", _QUOTED_DQ.sub(" ", s))
+               for s in named):
         raise RootCapError("approval message does not approve the freeze")
     refs = (digest[:12], artifact.name.lower(), owner_card.lower())
     if not any(ref and ref in low for ref in refs):
@@ -366,6 +390,8 @@ def _contract_state(rec):
     """(state, why): active | lapsed | ambiguous. Unprovable means ambiguous, never active-and-unguarded."""
     if not rec.get("active"):
         return "lapsed", "inactive"
+    if rec.get("_unverified"):
+        return "ambiguous", rec["_unverified"]
     try:
         status = owner_status((rec.get("owner_ref") or {}).get("card", ""), rec.get("target_home", ""))
     except RootCapError as exc:
@@ -381,6 +407,254 @@ def _contract_state(rec):
     if digest != rec.get("contract_revision_digest"):
         return "ambiguous", "approved contract artifact changed since approval (revision digest mismatch)"
     return "active", ""
+
+
+# ----------------------------------------------------------------------------- approved-source activation
+# A rollout freeze is declared ONCE as a task-local descriptor of explicit references (artifact, approval authority,
+# owner card, reviewed capacity->key mapping). The guard consults every descriptor of the target root at each
+# targeted call and re-verifies its authority then, so there is no separate registration step to forget, a missing
+# projection never erases a known protection, and later steering (withdrawn/superseded approval, finished owner)
+# is re-read at admission. Nothing here scans prose: an unreferenced approval is not a contract.
+SOURCES_FILE = "root_cap_sources.json"
+_AUTH_TYPES = ("native_message", "action_operation")
+
+
+def _validate_source(rec):
+    """Strict descriptor schema; a malformed descriptor is a known-but-unreadable contract, never a silent allow."""
+    for field in ("source_id", "target_home", "key", "contract_ref"):
+        if not isinstance(rec.get(field), str) or not rec[field]:
+            raise RootCapError(f"source descriptor has an invalid {field}")
+    value = rec.get("frozen_value")
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RootCapError("source descriptor has an invalid frozen_value")
+    if not isinstance(rec.get("owner_card"), str) or not rec["owner_card"]:
+        raise RootCapError("source descriptor has no owner card")
+    auth = rec.get("authority")
+    if not isinstance(auth, dict) or auth.get("type") not in _AUTH_TYPES:
+        raise RootCapError("source descriptor has no recognised authority reference")
+    if auth["type"] == "native_message":
+        if not isinstance(auth.get("session"), str) or not auth["session"] \
+                or not isinstance(auth.get("message_id"), int) or isinstance(auth.get("message_id"), bool):
+            raise RootCapError("native_message authority needs session and message_id")
+    else:
+        for field in ("db", "operation_id", "request_id"):
+            if not isinstance(auth.get(field), str) or not auth[field]:
+                raise RootCapError(f"action_operation authority needs {field}")
+        if not isinstance(auth.get("revision"), int) or isinstance(auth.get("revision"), bool):
+            raise RootCapError("action_operation authority needs an integer revision")
+        owner = auth.get("owner")
+        if not isinstance(owner, dict) or not all(isinstance(owner.get(k), str) and owner[k]
+                                                  for k in ("gatewayId", "profile", "storedSessionId")):
+            raise RootCapError("action_operation authority needs owner gatewayId/profile/storedSessionId")
+        mapping = rec.get("mapping")
+        if not isinstance(mapping, dict) or not all(isinstance(mapping.get(k), str) and mapping[k].strip()
+                                                    for k in ("phrase", "rationale", "reviewed_by")):
+            raise RootCapError("action_operation authority needs a reviewed mapping (phrase, rationale, reviewed_by) "
+                               "from the approved capacity wording to the guarded key")
+    return rec
+
+
+def _load_sources(dirs):
+    out, known = [], False
+    for d in dirs:
+        path = Path(d) / SOURCES_FILE
+        if not path.exists():
+            continue
+        known = True
+        for rec in _read_list(path):
+            out.append(_validate_source(rec))
+    return out, known
+
+
+def _user_steps_core():
+    path = Path(__file__).resolve().parent.parent / "user-steps" / "core.py"
+    spec = importlib.util.spec_from_file_location("_root_cap_user_steps_core", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _strip_state(body):
+    return {k: v for k, v in body.items() if k not in ("state", "resolution")}
+
+
+def _verify_operation(auth, mapping, owner_card, home):
+    """Read-only check of ONE explicitly referenced ActionStore operation (never a search): a positive approval that
+    authorizes execution, recorded for the CURRENT, unwithdrawn revision of the request it names, whose frozen intent
+    equals the stored revision, whose text carries the reviewed capacity wording, and whose stored session is the
+    owner card's. Legacy rows without a question binding are accepted on these equalities; a bound row must also
+    carry the correct scope digest. Raises RootCapError with the exact conflict."""
+    owner = auth["owner"]
+    ns = json.dumps([owner["gatewayId"], owner["profile"]], sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False)
+    path = Path(auth["db"])
+    if not path.is_file():
+        raise RootCapError("approval operation store not found")
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            op_row = conn.execute("select body, request, revision from operations where id=? and namespace=? "
+                                  "and session=?", (auth["operation_id"], ns, owner["storedSessionId"])).fetchone()
+            req = conn.execute("select revision, state, resolution from requests where namespace=? and id=? "
+                               "and session=?", (ns, auth["request_id"], owner["storedSessionId"])).fetchone()
+            rev = conn.execute("select body from revisions where namespace=? and id=? and revision=?",
+                               (ns, auth["request_id"], auth["revision"])).fetchone()
+        finally:
+            conn.close()
+        op = json.loads(op_row["body"]) if op_row else None
+        stored = json.loads(rev["body"]) if rev else None
+        resolution = json.loads(req["resolution"]) if req and req["resolution"] else None
+    except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+        raise RootCapError(f"approval operation unreadable ({type(exc).__name__})")
+    if op is None or req is None or stored is None:
+        raise RootCapError("approval operation, request or revision not found for the referenced owner")
+    intent = op.get("intent") or {}
+    if (op.get("requestId"), op.get("revision"), op.get("owner")) != (auth["request_id"], auth["revision"], owner) \
+            or op_row["request"] != auth["request_id"] or op_row["revision"] != auth["revision"]:
+        raise RootCapError("approval operation does not match the referenced request, revision and owner")
+    if intent.get("effect") != "approve" or intent.get("executionAuthorized") is not True:
+        raise RootCapError("referenced operation is not a positive execution-authorizing approval "
+                           f"(effect {intent.get('effect')!r})")
+    if op.get("dispatchState") == "cancelled":
+        raise RootCapError("referenced approval operation was cancelled")
+    if req["state"] == "withdrawn":
+        raise RootCapError("referenced approval request was withdrawn (conflict: the freeze is no longer approved)")
+    if req["revision"] != auth["revision"]:
+        raise RootCapError(f"referenced approval revision {auth['revision']} is superseded by revision "
+                           f"{req['revision']} (conflict: the current revision must be re-approved)")
+    if not resolution or resolution.get("operationId") != auth["operation_id"]:
+        raise RootCapError("referenced operation is not the recorded resolution of the current revision")
+    request = intent.get("request")
+    if not isinstance(request, dict) or _strip_state(request) != _strip_state(stored):
+        raise RootCapError("approved intent differs from the stored revision (not the approved text)")
+    scope = stored.get("scope") or {}
+    if scope.get("complete") is not True:
+        raise RootCapError("approved request scope is incomplete")
+    text = f"{stored.get('title', '')}\n{scope.get('markdown', '')}".lower()
+    if mapping["phrase"].lower() not in text:
+        raise RootCapError("approved request does not carry the reviewed capacity wording "
+                           f"{mapping['phrase']!r}")
+    if "binding" in op:
+        try:
+            expected = _user_steps_core().scope_digest(request)
+        except Exception as exc:
+            raise RootCapError(f"approval scope digest could not be computed ({type(exc).__name__})")
+        if (op["binding"] or {}).get("scopeDigest") != expected:
+            raise RootCapError("approval scope digest does not match the approved request")
+    try:
+        task = owner_task(owner_card, home)
+    except RootCapError as exc:
+        raise RootCapError(f"owner card unreadable ({exc})")
+    if task is None:
+        raise RootCapError("owner card not found")
+    if "session_id" not in task:
+        raise RootCapError("owner card has no session_id to bind the approval to")
+    if task["session_id"] != owner["storedSessionId"]:
+        raise RootCapError("approval session is not the owner card's session")
+
+
+def _verify_source_authority(src, digest, home):
+    auth = src["authority"]
+    if auth["type"] == "native_message":
+        db = Path(auth["state_db"]) if auth.get("state_db") else Path(home) / "state.db"
+        _verify_native_approval(db, auth["session"], auth["message_id"], Path(src["contract_ref"]), digest,
+                                src["key"], src["frozen_value"], src["owner_card"])
+    else:
+        _verify_operation(auth, src["mapping"], src["owner_card"], home)
+
+
+def _source_rec(src, home, digest, why=None):
+    rec = {"target_home": str(home), "key": src["key"], "frozen_value": src["frozen_value"],
+           "contract_ref": str(Path(src["contract_ref"]).resolve()), "contract_revision_digest": digest,
+           "approval_ref": {"source_id": src["source_id"], "authority": src["authority"]["type"]},
+           "owner_ref": {"card": src["owner_card"]}, "active": True, "source_id": src["source_id"]}
+    if why:
+        rec["_unverified"] = why
+    return rec
+
+
+def _source_records(src, contracts):
+    """Records one descriptor contributes: [] (lapsed or already projected), [verified record] (also projected into the
+    root store so a later permanent supersession has a record to flip) or [unverified record] (known contract whose
+    authority cannot be proven now: the targeted write is refused with the exact reason, never allowed)."""
+    home = Path(_real(src["target_home"]))
+    key, value = src["key"], src["frozen_value"]
+    try:
+        if key not in GUARDED_KEYS:
+            raise RootCapError(f"unsupported key {key!r}")
+        digest = _artifact_digest(src["contract_ref"], key, value)
+    except RootCapError as exc:
+        return [_source_rec(src, home, "unverified", f"approved contract artifact: {exc}")]
+    same = [c for c in contracts if c.get("key") == key and _real(c.get("target_home", "")) == _real(home)
+            and c.get("contract_revision_digest") == digest]
+    if same and not any(c.get("active") for c in same):
+        return []  # superseded by a permanent authorized change or a newer revision: no longer frozen
+    try:
+        status = owner_status(src["owner_card"], home)
+        if status is None:
+            raise RootCapError("rollout owner card not found")
+        if status in TERMINAL_STATES:
+            return []  # the rollout is over: nothing is frozen
+        if status not in OPEN_STATES:
+            raise RootCapError(f"rollout owner card state {status!r} is not open")
+        _verify_source_authority(src, digest, home)
+    except RootCapError as exc:
+        return [_source_rec(src, home, digest, f"declared rollout authority cannot be verified now ({exc})")]
+    if same:
+        return []  # the active projection already carries this exact revision
+    rec = {**_source_rec(src, home, digest), "registered_at": time.time()}
+
+    def apply(data):
+        if any(c.get("key") == key and c.get("contract_revision_digest") == digest
+               and _real(c.get("target_home", "")) == _real(home) for c in data):
+            return None, None
+        return [*data, rec], rec
+
+    try:
+        _mutate(shared_dir(home) / CONTRACTS_FILE, apply)
+    except RootCapError as exc:
+        return [_source_rec(src, home, digest, f"verified freeze could not be projected ({exc})")]
+    return [rec]
+
+
+def _apply_sources(sources, contracts):
+    out = list(contracts)
+    for src in sources:
+        try:
+            out.extend(_source_records(src, contracts))
+        except Exception as exc:  # any fault on a declared freeze keeps it known and refuses only the targeted write
+            home = Path(_real(src["target_home"]))
+            out.append(_source_rec(src, home, "unverified", f"source resolution failed ({type(exc).__name__}: {exc})"))
+    return out
+
+
+def declare_source(store_root, *, target_home, key, frozen_value, contract_ref, owner_card, authority, mapping=None,
+                   source_id=None):
+    """Declare a rollout freeze by explicit reference. The descriptor is verified now (a freeze that cannot be proven
+    is not declared) and again at every guarded call. Written to the ROOT home's shared store."""
+    home = Path(_real(target_home))
+    if not (home / "config.yaml").is_file():
+        raise RootCapError(f"{home} is not a Hermes home (no config.yaml)")
+    value = _intval(frozen_value)
+    if value is None:
+        raise RootCapError("frozen value must be an integer")
+    rec = {"source_id": source_id or _sha(f"{home}|{key}|{Path(contract_ref).resolve()}")[:16],
+           "target_home": str(home), "key": key, "frozen_value": value,
+           "contract_ref": str(Path(contract_ref).resolve()), "owner_card": owner_card, "authority": authority,
+           **({"mapping": mapping} if mapping else {}), "declared_at": time.time()}
+    _validate_source(rec)
+    out = _source_records(rec, [])
+    if not out:
+        raise RootCapError("cannot declare: the freeze is not active (owner finished or revision superseded)")
+    if out[0].get("_unverified"):
+        raise RootCapError(f"cannot declare: {out[0]['_unverified']}")
+    path = shared_dir(home) / SOURCES_FILE
+
+    def apply(data):
+        return [*[d for d in data if d.get("source_id") != rec["source_id"]], rec], rec
+
+    return _mutate(path, apply)
 
 
 # ----------------------------------------------------------------------------- command parsing
@@ -755,6 +1029,7 @@ _AUTH = re.compile(r"\b(authori[sz]e|authori[sz]ed|approve|approved|permit|allow
 _REPORTED = re.compile(r"\b(said|says|wrote|writes|claimed?|claims|asked|asks|told|quote[sd]?|suggested|proposed|"
                        r"according to|reads?|reported)\b|^\s*(>|the (assistant|agent|worker|notice|bot|card))")
 _QUOTED = re.compile(r"\"[^\"]*\"|“[^”]*”|`[^`]*`")
+_QUOTED_DQ = re.compile(r"\"[^\"]*\"|“[^”]*”")
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})", re.I)
 _OWNER_TERMINAL = re.compile(r"\b(owner|card|run)\s+(completion|completes|is done|finishes|terminal)|"
                              r"\b(on|upon|at)\s+(owner |card )?(completion|done)\b|\bowner completion\b")
@@ -791,13 +1066,14 @@ def _state_db_home():
         return _env_home()
 
 
-def human_origin(session_id):
+def human_origin(session_id, db=None):
     """(ok, why): the deciding chat must be a human-opened session (desktop/tui/cli/local). A Kanban/cron/subagent
     session's opening prompt can quote any text, so its user-role rows are machine content, not the user's decision.
-    Unknown or unreadable means no authority (the safe direction: the change stays refused)."""
+    Unknown or unreadable means no authority (the safe direction: the change stays refused). `db` is the state.db
+    that holds the session (default: the running home's)."""
     try:
         acc = _acceptance()
-        conn = acc._ro_connect(Path(_state_db_home()) / "state.db")
+        conn = acc._ro_connect(Path(db) if db else Path(_state_db_home()) / "state.db")
         try:
             row = conn.execute("select source from sessions where id=?", (session_id,)).fetchone()
         finally:
@@ -997,9 +1273,14 @@ def _check(name, args, session_id, store_root, user_texts, now, tool_call_id):
     raw_homes = {Path(p).parent.as_posix() for r in parsed.raw for p in r["paths"] if p.endswith("config.yaml")}
     candidates = [w["home"] for w in wants if w["home"]] + [_env_home(), *raw_homes]
     try:
-        contracts, known = _load_contracts(_dirs(store_root, candidates))
+        dirs = _dirs(store_root, candidates)
+        contracts, known = _load_contracts(dirs)
+        sources, sources_known = _load_sources(dirs)
     except RootCapError as exc:
         return _refusal(None, f"the contract registry is unreadable ({exc})", key, None, session_id)
+    if sources:
+        contracts = _apply_sources(sources, contracts)
+    known = known or sources_known
     if not known:
         return None  # no projection anywhere: no contract, nothing is frozen (no hardcoded value)
     homes = sorted({_real(r.get("target_home", "")) for r in contracts if r.get("key") == key and r.get("active")})
@@ -1200,6 +1481,8 @@ def due_restores(store_root, now=None, homes=()):
                                     and c.get("active") for c in contracts)
                 out.append({"key": e["key"], "target_home": e["target_home"], "restore_value": e["restore_value"],
                             "owner_card": (e.get("owner_ref") or {}).get("card"),
+                            "owner_session": (e.get("owner_ref") or {}).get("session"),
+                            "override_value": e.get("override_value"),
                             "call_sha256": e.get("call_sha256"),
                             "action": "restore" if current == e["override_value"] and same_revision else "conflict",
                             "current": current})
@@ -1224,6 +1507,59 @@ def report_due(store_root, log, seen, now=None, homes=()):
     return fresh
 
 
+NOTICES_FILE = "root_cap_notices.json"
+
+
+def _notice_text(d):
+    key, card = d["key"], d.get("owner_card") or "?"
+    if d["action"] == "restore":
+        return (f"[coach] root-cap recovery due: the temporary raise of {key} (owner card {card}) reached its restore "
+                f"trigger and the config still holds the override ({d['current']}). Restore it now: "
+                f"`hermes config set {key} {d['restore_value']}` (the guard admits a restore to the frozen value). "
+                f"Nothing restores it automatically.")
+    return (f"[coach] root-cap recovery CONFLICT: the temporary raise of {key} (owner card {card}) reached its restore "
+            f"trigger but the current value is {d['current']} (override was {d.get('override_value')}) or its contract "
+            f"revision is no longer active. Do NOT overwrite it: a newer user decision may exist. Ask the user and "
+            f"resolve it explicitly.")
+
+
+def due_notices(store_root, session_id, log=None, now=None, homes=()):
+    """Notice texts owed to THIS session for due/conflicting temporary exceptions: the existing coach `pre_llm_call`
+    context path, so the owner's own chat (`owner_ref.session`) is told, and a first fallback delivery reaches the next
+    live chat when the owner's chat is gone. Delivery is persisted (`root_cap_notices.json`, locked, keyed by exception
+    call + action + session), so a restart or a second chat never repeats it. Never raises: a fault returns []."""
+    if not session_id:
+        return []
+    try:
+        due = due_restores(store_root, now=now, homes=homes)
+    except Exception:
+        return []
+    now = now if now is not None else time.time()
+    out = []
+    for d in due:
+        path = shared_dir(d["target_home"]) / NOTICES_FILE
+        ident = (d.get("call_sha256"), d["action"])
+
+        def apply(data, d=d, ident=ident):
+            mine = [n for n in data if (n.get("call_sha256"), n.get("action")) == ident]
+            if any(n.get("session") == session_id for n in mine):
+                return None, (False, False)
+            first = not mine
+            if not first and session_id != d.get("owner_session"):
+                return None, (False, False)
+            return [*data, {"call_sha256": ident[0], "action": ident[1], "session": session_id, "at": now,
+                            "owner_card": d.get("owner_card")}], (True, first)
+        try:
+            delivered, first = _mutate(path, apply)
+        except RootCapError:
+            continue
+        if delivered:
+            out.append(_notice_text(d))
+            if first and log:
+                log({"event": "root_cap_restore_due", "rule": "root_cap", **d})
+    return out
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="Register a frozen root-cap contract with the coach guard.")
@@ -1237,6 +1573,25 @@ def main(argv=None):
     reg.add_argument("--approval-session", required=True)
     reg.add_argument("--approval-message", type=int, required=True)
     reg.add_argument("--owner-card", required=True)
+    dec = sub.add_parser("declare", help="declare a freeze by explicit references (verified now and at every guarded call)")
+    dec.add_argument("--target-home", required=True)
+    dec.add_argument("--key", default=GUARDED_KEYS[0])
+    dec.add_argument("--value", type=int, required=True)
+    dec.add_argument("--contract-ref", required=True)
+    dec.add_argument("--owner-card", required=True)
+    dec.add_argument("--id", default=None)
+    dec.add_argument("--approval-session")
+    dec.add_argument("--approval-message", type=int)
+    dec.add_argument("--action-db")
+    dec.add_argument("--operation")
+    dec.add_argument("--request")
+    dec.add_argument("--revision", type=int)
+    dec.add_argument("--gateway")
+    dec.add_argument("--profile")
+    dec.add_argument("--stored-session")
+    dec.add_argument("--mapping-phrase")
+    dec.add_argument("--mapping-rationale")
+    dec.add_argument("--mapping-reviewed-by")
     lst = sub.add_parser("list")
     lst.add_argument("--store", required=True)
     lst.add_argument("--target-home", default=None, help="root home whose shared projection is listed too")
@@ -1245,6 +1600,27 @@ def main(argv=None):
         for d in _dirs(ns.store, [ns.target_home or _env_home()]):
             for r in _read_list(Path(d) / CONTRACTS_FILE):
                 print(json.dumps({**r, "state": _contract_state(r)[0], "projection": str(d)}))
+            for r in _read_list(Path(d) / SOURCES_FILE):
+                print(json.dumps({**r, "source": True, "projection": str(d)}))
+        return 0
+    if ns.cmd == "declare":
+        if ns.action_db:
+            authority = {"type": "action_operation", "db": ns.action_db, "operation_id": ns.operation,
+                         "request_id": ns.request, "revision": ns.revision,
+                         "owner": {"gatewayId": ns.gateway, "profile": ns.profile, "storedSessionId": ns.stored_session}}
+            mapping = {"phrase": ns.mapping_phrase, "rationale": ns.mapping_rationale,
+                       "reviewed_by": ns.mapping_reviewed_by}
+        else:
+            authority = {"type": "native_message", "session": ns.approval_session, "message_id": ns.approval_message}
+            mapping = None
+        try:
+            rec = declare_source(None, target_home=ns.target_home, key=ns.key, frozen_value=ns.value,
+                                 contract_ref=ns.contract_ref, owner_card=ns.owner_card, authority=authority,
+                                 mapping=mapping, source_id=ns.id)
+        except RootCapError as exc:
+            print(f"refused: {exc}")
+            return 1
+        print(json.dumps(rec, indent=2))
         return 0
     try:
         rec = register_contract(ns.store, target_home=ns.target_home, key=ns.key, frozen_value=ns.value,

@@ -171,14 +171,17 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             authority_asked[session_id] = []
             log.debug("coach compute authority answered asks unavailable: %s", exc)
-        try:  # existing owner recovery path: report due/conflicting temporary cap exceptions once (no auto-restore)
-            _load("root_cap").report_due(store.root, store.log, cap_due_seen,
-                                         homes=[os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")])
+        cap_notes = ""
+        try:  # existing owner recovery path: due/conflicting temporary cap exceptions ride this turn's coach context
+            rc = _load("root_cap")
+            home_dirs = [os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")]
+            rc.report_due(store.root, store.log, cap_due_seen, homes=home_dirs)  # log once per process
+            cap_notes = " ".join(rc.due_notices(store.root, session_id, log=None, homes=home_dirs))
         except Exception as exc:
             log.debug("coach root_cap due report: %s", exc)
         try:
             if not session_id:
-                return None
+                return {"context": cap_notes} if cap_notes else None
             goal_gate.capture(session_id=session_id, user_message=user_message,
                               conversation_history=conversation_history,
                               canonical_user_content=_.get("canonical_user_content"))
@@ -217,11 +220,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             plain_hint = _status_plain(session_id, user_message, platform, parent_session_id)
             stall_hint = _stalled_goal(session_id, platform)
             hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", relay_hint or "",
-                                        plain_hint or "", stall_hint or "") if h)
+                                        plain_hint or "", stall_hint or "", cap_notes) if h)
             return {"context": hint} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
-            return None
+            return {"context": cap_notes} if cap_notes else None
 
     def post_tool_call(tool_name="", args=None, result=None, session_id="", status=None, duration_ms=0,
                        error_type=None, error_message=None, **_):
