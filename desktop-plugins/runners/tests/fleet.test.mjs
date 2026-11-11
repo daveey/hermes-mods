@@ -72,7 +72,8 @@ test('waiting: header shows ready cards waiting, rows show the ones pinned to th
   body.gateways.machines = body.gateways.machines.map((m) => m.name === 'hub' ? { ...m, waiting: 18 } : { ...m, waiting: 0 })
   const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
   assert.match(ui.container.textContent, /1 \/ 7 slots busy · 90 waiting/)
-  assert.match(ui.container.querySelector('[data-machine="hub"] .hermes-fleet-count').textContent, /^1\/4 · 18 waiting$/)
+  assert.equal(ui.container.querySelector('[data-machine="hub"] .hermes-fleet-count').textContent, '1/4')
+  assert.equal(ui.container.querySelector('[data-machine="hub"] .hermes-fleet-slots > .hermes-fleet-waiting').textContent, '18 waiting')
   assert.doesNotMatch(ui.container.querySelector('[data-machine="mini"]').textContent, /waiting/)
   await ui.close()
   const old = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))  // older gateway: no count

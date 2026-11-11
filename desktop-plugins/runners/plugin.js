@@ -424,9 +424,10 @@ function GatewayRow({ m, now, investigator, route }) {
         title: `${r.task} · ${text(r.title)}\nboard ${r.board}${r.started_at ? ` · running ${ago(now - r.started_at * 1000)}` : ''}`,
         onClick: () => openCard(r)
       })),
-      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] }))),
-    h('span', { className: 'hermes-fleet-count', title: m.waiting ? `${m.waiting} ready card(s) pinned to ${m.name} waiting for a slot` : undefined },
-      (m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`) + (m.waiting ? ` · ${m.waiting} waiting` : '')),
+      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] })),
+      m.waiting ? h('span', { className: 'hermes-fleet-waiting', title: `${m.waiting} ready card(s) pinned to ${m.name} waiting for a slot` }, `${m.waiting} waiting`) : null),
+    h('span', { className: 'hermes-fleet-count' },
+      m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
     h('span', { className: 'hermes-fleet-meta' }, [meta, m.reason].filter(Boolean).join(' · ')),
     h(Meters, { load: m.load, now }),
     investigator && route ? h(Investigate, { m, now, investigator, route }) : null
@@ -758,7 +759,8 @@ const CSS = `
 .hermes-fleet-head:first-child{margin-top:0}
 .hermes-fleet-row{display:grid;grid-template-columns:150px minmax(0,1fr) 44px;column-gap:8px;align-items:center;min-height:20px}
 .hermes-fleet-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hermes-fleet-slots{display:flex;flex-wrap:wrap;gap:2px}
+.hermes-fleet-slots{display:flex;flex-wrap:wrap;align-items:center;gap:2px}
+.hermes-fleet-waiting{margin-left:6px;font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary)}
 .hermes-fleet-count{text-align:right;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary)}
 .hermes-fleet-meta,.hermes-fleet-warning{grid-column:2/4;font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-meta:empty{display:none}
