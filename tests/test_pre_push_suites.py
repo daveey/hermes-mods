@@ -111,6 +111,19 @@ def test_contract():
         self.assertNotIn('test-all:', result.stdout)
         self.assertEqual(self.tip(), self.git('rev-parse', 'HEAD').stdout.strip())
 
+    def test_failed_revalidation_removes_earlier_success(self):
+        self.test.write_text('import os\ndef test_contract():\n    assert not os.environ.get("FAIL_FIXTURE")\n')
+        self.commit()
+        command = [sys.executable, str(self.repo / 'scripts/pre-push-suites'), '--prepare', self.base, 'HEAD']
+        first = subprocess.run(command, cwd=self.repo, env=self.env, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        failed = subprocess.run(command, cwd=self.repo, env=dict(self.env, FAIL_FIXTURE='1'), capture_output=True, text=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse(list((self.repo / '.git/pre-push-suites').glob('*.json')))
+        pushed = self.git('push', 'origin', 'HEAD:main')
+        self.assertNotIn('verified local receipt', pushed.stdout)
+        self.assertIn('PASS', pushed.stdout)
+
     def test_changed_gate_invalidates_prepared_success(self):
         self.test.write_text('def test_contract():\n    assert 2 == 2\n')
         self.commit()
