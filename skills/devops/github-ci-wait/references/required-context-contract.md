@@ -1,51 +1,31 @@
-# Required-context contract: names are policy, not aliases
+# Required-context contract
 
-## Failure analysis
+## Build the manifest before waiting
 
-Problem: a completed successful run was reported as terminal failure by a wrapper requesting
-`All required checks pass`, while branch protection required `All required checks pass (v2)` and
-`macOS state required (v1)`, both successful. A native path-gated lane was skipped, not executed.
-The live observation is intentionally not embedded here; the publication's private handoff retains its run/head.
-The public regression uses synthetic run 11 and head `a` repeated 40 times.
+1. Read the target branch's current protection and applicable rulesets. Enumerate every required context, including its app identity where policy pins one. Use an independently validated complete manifest only when policy discovery is unavailable.
+2. Map each context to its actual run and literal job name. Preserve version suffixes; a similarly named aggregate is not an alias. Include required contexts outside the primary CI run separately.
+3. Verify the current PR head, then invoke the exact-run probe with a full lowercase commit pin:
 
-Why 1: the exact-run probe rejected an absent literal job — proof:
-`test_stale_name_false_failure_and_validated_manifest_green` reproduces the old false-negative
-and passes with both validated names. The probe's strict missing-job behavior is correct.
-Why 2: the wrapper supplied an obsolete name and separately duplicated that obsolete single-job
-lookup for its final proof — evidence: the inspected wrapper's `--expect` and aggregate filter
-both used the unversioned name, neither included the second required gate.
-Why 3: the landing instructions presented an aggregate display name as the whole readiness
-contract — evidence: the prior SKILL.md landing section named `All required checks pass` alone.
+   ```bash
+   python3 -B scripts/wait_for_ci.py --gh-repo OWNER/REPO \
+     --run-id RUN --head-sha FULL_SHA \
+     --expect 'RUN:REQUIRED_JOB=success' --once
+   ```
 
-Root (happened): unvalidated display names were treated as authoritative policy, with two
-independent hardcoded filters instead of a validated complete expectation manifest. The stale
-skill example was an additional recurrence risk; whether this wrapper copied it is unverified.
-Root (not caught): the existing subprocess suite covered missing jobs, skips and expected-red
-experiments, but not the caller's stale-name-to-current-two-context contract. Its fixtures
-proved strict matching, not that the wrapper selected the correct required jobs. Evidence:
-prior `test_wait_for_ci_runs.py`; the new stale-name fixture supplies the missing contract case.
+   Add an expectation for **every** required context. The probe is not a policy evaluator: omitted contexts are unchecked, not implicitly satisfied.
+4. Re-read the PR head and state before landing. `--head-sha` binds the probe's own run read, not the PR's current head. Keep both checks: a wrapper-only head read leaves a race before the probe reads the run.
+5. Use the same complete manifest for the final proof. Do not maintain a separate hardcoded aggregate-name filter; it can drift independently from the waiter.
 
-Recurrence: searched this skill's context-name references and script history. The earlier exact-run
-change (`e4ff1f31`) fixed an empty-manifest false positive, not this stale-name false negative.
-Existing skip handling (`d3968895`) applies to discovered workflows, not required job proof.
-No earlier identical stale-name fix found in that searched scope; broader incident history is unverified.
+## Interpret results without weakening policy
 
-## Countermeasures and proof
+- Reject a missing expected job; first compare the manifest with current policy before calling the CI run failed. An obsolete literal name can produce a false-negative monitor result even when the real required checks passed.
+- Require each expected context to succeed independently. Failure, skipped, cancelled and neutral are not success. An optional path-gated native lane may be skipped, but that does not prove the native workload ran or replace its required context.
+- Reject multiple jobs matching an expected name, regardless of their order or conclusions; a name-to-job dictionary can otherwise hide a red job behind a later green one.
+- Reject conflicting repeated `RUN:JOB` expectations before querying GitHub. Identical repeats are harmless; conflicting repeats must not become last-value-wins policy.
+- Check listing completeness and required app identity in the caller where applicable. The exact-run probe does not establish either automatically.
+- Correcting a stopped monitor's source does not restart it. Reconcile its terminal result with current run/head evidence before deciding whether another check is necessary.
 
-- Symptom: use both exact context names validated from protection in the wrapper's expectation
-  manifest and final proof; retain its before/after PR head/state checks. Never retry or restart
-  a stopped waiter as part of changing its source. Proof: private corrected-wrapper fixture receipt.
-- Root: the landing instructions now require reading current protection and applicable rulesets,
-  or an independently validated complete manifest. Do not infer equivalent names by stripping
-  version suffixes or accept only the currently present subset. Proof: updated SKILL.md recipe
-  plus `test_stale_name_false_failure_and_validated_manifest_green`.
-- Detection: each required context independently fails on missing, failure, skipped, cancelled
-  or neutral. An optional skipped native lane does not replace a required context. Proof:
-  `test_each_required_context_must_be_present_and_successful`.
-- Exact-head binding: optional `--head-sha` rejects moved or absent run heads before judging jobs;
-  malformed/short pins and mixing with containment mode fail before any gh call. Proof:
-  `test_exact_head_valid_green`, `test_exact_head_rejects_moved_or_missing_sha`,
-  `test_head_pin_must_be_full_sha_and_exact_run_only`.
+## Regression recipe
 
 Run from the skill directory:
 
@@ -53,14 +33,14 @@ Run from the skill directory:
 python3 -B -m unittest discover -s tests
 ```
 
-- Manifest hygiene: the probe cannot know which contexts are required, so an incomplete `--expect` set passes
-  silently; the caller must enumerate all of them. A repeated `RUN:JOB` with differing conclusions exits 1 before any
-  gh call, and duplicate job names matching an expected name fail in either order. Proof:
-  `test_duplicate_expected_job_name_rejected_in_either_order`,
-  `test_conflicting_repeated_expectation_rejected_before_gh`,
-  `test_missing_context_and_moved_head_keep_failing_with_pin`.
+Exercise the probe and its wrapper separately:
 
-This remains an exact-run job probe, not automatic branch policy discovery, PR-head tracking,
-review approval, app-identity verification or merge authorization. Required contexts outside the
-listed run(s) still need explicit separate proof. A green required gate does not prove that an
-optional path-gated native workload ran. No new watcher, policy weakening or merge is part of this fix.
+- Stale aggregate name fails; the validated complete manifest succeeds.
+- Each required context independently fails when red, missing or skipped.
+- Duplicate expected jobs fail in both red/green orders and when both are green.
+- Conflicting expectations fail before any `gh` call.
+- Malformed pins, absent run heads and moved run heads fail closed.
+- A run-head change between the wrapper's read and the probe's read fails. Remove only the probe's pin as a negative control: that case must then expose the missing protection. A wrapper harness that passes unchanged against the old probe does not prove the new flag is exercised.
+- Incomplete listings and moved PR heads are rejected by the wrapper's own checks; do not attribute that coverage to the probe.
+
+Keep fixture jobs and SHAs synthetic. A passing exact-run probe establishes only the supplied manifest at the pinned run head—not review approval, current PR identity, merge authorization or deployment.
