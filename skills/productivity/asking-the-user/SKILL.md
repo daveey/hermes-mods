@@ -22,12 +22,13 @@ The one-line rules stay in the user's `~/AGENTS.md` ("Commands That Need Me", "P
 skill is how to carry them out. A decision or approval that should wait on the board is a blocked Kanban card
 (`kanban-orchestrator`, "Card mechanics for this user"), not anything here.
 
-**Look first:** exhaust supported agent paths (broker credentials, existing authenticated sessions, browser tools)
-before handing over a step. When the user says “use your judgement” or “do it yourself,” remove discretionary
-choice blockers and resume the existing owner; don't repeat the same ask as a status update. For an ambiguous
-acceptance tolerance, pursue a stricter sufficient bound without declaring it the original requirement or selecting
-a tolerance to pass observed results. Keep genuine identity/permission boundaries separate: delegated judgement
-is not an authenticated login or authority to bypass a deny.
+**Look first:** check supported credentials and authenticated sessions before handing over a step. If live state
+contradicts an approved plan, use commit history and `cross_task`/`cross_session` to recover the newer setup's
+owner and actual user decision before offering choices: another session may already have resolved the premise.
+Do not infer personal execution or authorization from an SSO identity alone. Record the superseding decision on
+the existing owners and resume replanning; do not mechanically refresh/apply an obsolete plan or undo newer work.
+When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
+ambiguous acceptance tolerance, test a stricter sufficient bound without redefining the requirement to fit results.
 
 ## Commands that need the user
 
@@ -40,7 +41,11 @@ is not an authenticated login or authority to bypass a deny.
 - The window and `cwd` belong to the user's Mac, even from a hub chat. For a reviewed script already on the hub,
   omit the hub `cwd` and run `ssh <verified-hub> 'cd <checkout> && <clean-tree/exact-SHA guards> && <script>'`
   through `run_in_user_terminal`; do not copy it to the Mac merely to execute it back on the hub. Stage files with
-  `tailnet_copy` only when the command actually needs local Mac files. In zsh, write SSH options inline rather
+  `tailnet_copy` only when the command actually needs local Mac files. For a hub-held script that must run
+  as root on a THIRD host the Mac can reach (e.g. the mini), `tailnet_copy put` it to the Mac's `/tmp`, have the
+  window print its sha256 next to the expected one, `ssh <host> 'cat > /tmp/x' < /tmp/x`, then
+  `ssh -tt <host> 'sudo ... > out; rm -f /tmp/x'`, copy the output back to the Mac, and `tailnet_copy get` it;
+  passing a hub path to the window fails because the path does not exist on the Mac. In zsh, write SSH options inline rather
   than in an unquoted variable, which does not word-split.
 - Remote hosts too: `ssh -t <host> 'sudo ...'`. When the SSH key is refused, run
   `ssh-copy-id -i ~/.ssh/id_ed25519.pub <user>@<host>` there.
