@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+import { test, afterEach, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire, register } from 'node:module'
 import { resolve } from 'node:path'
@@ -21,6 +21,13 @@ const root = createRoot(document.getElementById('root'))
 const el = () => document.getElementById('root')
 const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
+// Every mounted Panel starts polling. Clean up even when an assertion fails or
+// a new rendered test is appended, otherwise node --test never exits.
+afterEach(async () => { await show(null) })
+after(async () => {
+  await React.act(async () => { root.unmount() })
+  dom.window.close()
+})
 
 const NOW = Date.parse('2026-10-29T15:00:00Z'), S = NOW / 1000
 const card = (id, state, extra = {}) => ({ key: `kb:${id}`, kind: 'kanban', id, state, label: `Card ${id}`, connectionId: 'C1', profile: 'default', board: 'default', gateway: 'G1', since: S - 600, activityAt: S - 60, ...extra })
