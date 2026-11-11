@@ -7,6 +7,7 @@ import contextlib
 from collections import OrderedDict
 import hashlib
 import json
+import math
 import logging
 import os
 import re
@@ -531,6 +532,67 @@ def ask_candidates(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> lis
         if premise and premise not in relayed and (tid not in covered or tid in told):
             out.append((tid, premise))
     return out
+
+
+def quoted_ask(state_dbs: Iterable[Path], ids: Iterable[str], card: dict[str, Any],
+               pool: Optional[ReadPool] = None) -> bool:
+    """Only an assistant's delivered text after this filing proves it was relayed.
+
+    User-role injected briefs/notices and tool results are not delivery. Missing
+    filing timestamps or unreadable transcripts fail open to the ordinary relay.
+    """
+    ask = ask_of(card)
+    ids = list(dict.fromkeys(i for i in ids if i))
+    try:
+        since = float(card['blocked_at'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not ask or not ids or not math.isfinite(since):
+        return False
+    action = _norm(ask['action'])
+    for path in state_dbs:
+        conn = None
+        failed = False
+        try:
+            conn = pool.get(path) if pool is not None else ro_connect(path)
+            cols = pool.cols(path, 'messages') if pool is not None else _cols(conn, 'messages')
+            filters = ["role='assistant'", 'timestamp > ?',
+                       f"session_id IN ({','.join('?' for _ in ids)})"]
+            # Retained delivered replies remain evidence after compaction, but
+            # synthetic summaries have no successful finish_reason.
+            if 'finish_reason' not in cols:
+                continue
+            if 'display_kind' in cols:
+                filters.append("(display_kind IS NULL OR display_kind IN ('', 'final'))")
+            if 'finish_reason' in cols:
+                filters.append("finish_reason IN ('stop', 'end_turn')")
+            if 'tool_calls' in cols:
+                filters.append("(tool_calls IS NULL OR tool_calls IN ('', '[]', 'null'))")
+            for r in conn.execute('SELECT content FROM messages WHERE ' + ' AND '.join(filters), (since, *ids)):
+                if action in _norm(r[0]):
+                    return True
+        except (sqlite3.Error, OSError):
+            failed = True
+        finally:
+            if pool is None and conn is not None:
+                conn.close()
+            elif failed and pool is not None:
+                pool.drop(path)
+    return False
+
+
+def reconcile_asks(row: dict[str, Any], cards: dict[str, dict[str, Any]],
+                   proof: Callable[[str, dict], bool]) -> dict[str, Any]:
+    """Learn delivery outside our own injected turns, once per current premise."""
+    relayed = set(row.get('relayed') or [])
+    covered = set(row.get('covered') or [])
+    for tid in row.get('batch') or []:
+        card = cards.get(tid)
+        premise = ask_premise(tid, card)
+        if premise and premise not in relayed and proof(tid, card):
+            relayed.add(premise)
+            covered.add(tid)
+    return {'relayed': relayed, 'covered': covered} if relayed != set(row.get('relayed') or []) else {}
 
 
 def ask_relay_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:

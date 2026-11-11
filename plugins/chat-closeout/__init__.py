@@ -1149,6 +1149,11 @@ def session_proof(sid: str, tid: str, card: dict) -> bool:
         return False
 
 
+def _reconcile_asks(sid: str, row: dict, cards: dict) -> dict:
+    return core.reconcile_asks(row, cards, lambda _t, c: core.quoted_ask(
+        state_dbs(), _lineage(sid), c, pool=_pass_pool()))
+
+
 def _eligible(session_id: str, platform: str = "") -> bool:
     return bool(session_id) and not _off() and not os.environ.get("HERMES_KANBAN_TASK") \
         and (platform or "").lower() not in SKIP_PLATFORMS
@@ -1210,7 +1215,8 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not row or not (row.get("batch") or core.unlinked_removed(row)):
             return None
         cards = read_cards(row["batch"])
-        fix = core.reconcile_done(row, cards, lambda t, c: session_proof(session_id, t, c))
+        fix = _reconcile_asks(session_id, row, cards)
+        fix.update(core.reconcile_done({**row, **fix}, cards, lambda t, c: session_proof(session_id, t, c)))
         if fix:
             ledger().write(session_id, **fix)
             row = {**row, **fix}
@@ -1403,6 +1409,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
             continue
         cards = core.canonical_view(read(row["batch"]))
         fix = core.reconcile(row, cards)
+        fix.update(_reconcile_asks(sid, {**row, **fix}, cards))
         fix.update(core.track_unlinked({**row, **fix}, cards, healthy=healthy, now=now, mono=mono))
         fix.update(core.reconcile_done({**row, **fix}, cards,
                                        lambda t, c, sid=sid: (proof or session_proof)(sid, t, c)))
