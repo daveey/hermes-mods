@@ -27,6 +27,10 @@ contradicts an approved plan, use commit history and `cross_task`/`cross_session
 owner and actual user decision before offering choices: another session may already have resolved the premise.
 Do not infer personal execution or authorization from an SSO identity alone. Record the superseding decision on
 the existing owners and resume replanning; do not mechanically refresh/apply an obsolete plan or undo newer work.
+Before filing an `action_request` for a card's ask, read the card's newest comments for a request id another chat
+already published, and the card's named sole owner chat: if either exists, don't file a second one. Duplicates
+split the user's answer, and the copy not consumed sits stale in For-you. Withdraw yours as soon as the card shows
+the ask was answered elsewhere or the card left `blocked`.
 When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
 ambiguous acceptance tolerance, test a stricter sufficient bound without redefining the requirement to fit results.
 
