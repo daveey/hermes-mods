@@ -33,5 +33,6 @@ For "we don't use X anymore, shut it down / make sure we aren't paying". The use
 10. **Report**: what was destroyed, what was revoked, the data-safety evidence, what is still running in the background, and any manual billing step. Admit any skipped gate up front.
 
 ## Pitfalls
+- Stopping a Kanban worker node strands every card workspace on its disk: unpushed commits, result trees, receipts. Moving the card to another worker (`hermes kanban move --runs-on`) moves only the claim, so the card wakes to an empty workspace. Before the stop, list the live card processes (`HERMES_KANBAN_TASK` in their environ), then copy each workspace and evidence dir to the same path on the destination worker. Any card parked on a wake-check that watches processes on the stopped host never fires: re-point or unblock it. If you're asked to stop now and the drain/kill question goes unanswered, preserve the workspaces first, then stop.
 - Stopping or suspending an app does not stop volume or IP charges. Only destroying the resources ends billing.
 - A one-shot cron job fired early with `run` keeps its original `next_run_at`. Remove it after the background run reports, or it fires again.
