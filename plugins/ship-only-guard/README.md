@@ -1,0 +1,95 @@
+# ship-only-guard
+
+A public, stdlib-only command guard that routes landing through a repository's
+trusted ship workflow. It makes no network requests and does not merge or push.
+
+## Configuration
+
+Create `$HERMES_HOME/ship-only-guard.json` (default home: `~/.hermes`):
+
+```json
+{"repos": ["example/protected", "example/another"]}
+```
+
+Names are exact, case-insensitive `owner/repo` matches. No file, an invalid file,
+or an empty list means **no scoped guards**. No private repository names or
+deployment defaults are bundled. `SHIP_ONLY_GUARD_REPOS='["example/protected"]'`
+replaces the file's list, for isolated fixtures and private shim bootstrapping.
+Configuration is read on each check, not cached at plugin activation.
+
+## Behavior
+
+The `pre_tool_call` hook checks `terminal`, `execute_code`, and nested `tool_call`
+(including qualified tool names). On a configured repository it refuses:
+
+- `gh pr merge`, regardless of merge/admin/auto flags, with URL, `-R`, `--repo`,
+  `GH_REPO`, or current repository selection.
+- `gh api repos/OWNER/REPO/pulls/N/merge` and `repos/OWNER/REPO/merges`, including
+  full API URLs and leading slashes. These merge endpoints are refused regardless
+  of HTTP method, so omitting an explicit write method cannot bypass the guard.
+- `git push` refspecs whose destination is `main` or `refs/heads/main`, including
+  `+` force prefixes, deletions, wildcard/matching refspecs, `--all`, and `--mirror`.
+  Implicit pushes resolve the current branch, push remote, `remote.NAME.push`,
+  `push.default`, and upstream branch configuration where available. Dry runs,
+  tag-only pushes, and explicit pushes to other branches are allowed.
+
+Repository inference follows literal `cd`, `git -C`, `env -C`, Git push URLs and
+remote push URLs. Probes are bounded read-only Git subprocesses with fixed argv;
+submitted shell text is **never executed** to discover cwd or remotes. Unknown or
+unreadable repository identity does not invent a protected repository and does
+not block unrelated repositories.
+
+Python is inspected with the AST: literal subprocess argv, literal shell strings
+with `shell=True`, `os.system`/`os.popen`, `terminal(...)`, and `tool_call(...)`.
+Simple literal variable assignments are supported. Comments, printed examples,
+and unrelated string constants are not treated as executed commands.
+
+## Trusted land child and private gh shims
+
+Only the trusted ship workflow's land child should inherit
+`HERMES_CORE_WT_LAND=1`. The exact environment value `1` permits the command; an
+arbitrary substring, quoted prose, or comment does not. A command-prefix assignment
+is scoped to that command (and its child shell), never later commands after `;`,
+`&&`, or a pipeline. Standalone assignment statements do not authorize later commands.
+
+The standalone entry point has no Hermes imports or sibling-plugin dependencies:
+
+```sh
+python3 /path/to/ship-only-guard/guard.py --gh-args pr merge 12 -R example/protected
+```
+
+It exits **0** to allow, **1** to refuse (reason on stderr), **2** for bad CLI usage.
+A private gh shim can invoke it with its original argv/environment before executing
+real gh. Do not interpolate argv into a shell command. The public interfaces
+`check_argv(argv, cwd=None, repos=None, env=None)`, `check_shell(...)`,
+`check_python(...)`, and `check_tool(...)` return a refusal string or `None`.
+
+## Scope and limitations
+
+This is **accident prevention, NOT adversarial security**. The marker is an
+unenforced convention, not proof of approval: any process can forge its own
+environment. Server-side branch protection and the trusted ship workflow's checks
+remain necessary. This plugin does not install or change that workflow.
+
+This bounded analyzer is not a shell/Python interpreter. Computed argv, arbitrary
+wrapper scripts, dynamic imports, HTTP clients other than `gh api`, Git aliases,
+complex shell expansion/substitutions, variable-based cwd, conditional shell state,
+and complete Python control-flow/scope analysis are not covered. Literal child
+shells and inline Python are inspected to a bounded depth. Shell cwd tracking is
+linear; use explicit tool `workdir`/subprocess `cwd` for unambiguous context. A
+process lacking an explicit cwd uses `TERMINAL_CWD`, then its actual working dir.
+The adapter loads the analyzer at activation; code updates need normal plugin reload.
+
+## Tests
+
+Run from the detached mods worktree:
+
+```sh
+scripts/test-all -k ship-only-guard
+```
+
+`tests_guard.py` covers blocked merge/API/push shapes, matching/default refspecs,
+trusted-marker allow and leakage controls, unrelated repo and branch allows,
+current cwd / `git -C` inference, config/override/no-config behavior, literal Python,
+registered terminal/execute_code/nested tool hooks, and real standalone CLI exit
+codes. Fixtures create disposable local Git repositories; no live merge/push occurs.
