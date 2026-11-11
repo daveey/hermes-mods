@@ -43,6 +43,9 @@ did not end with `end_reason='startup_orphan_reap'`. Report **unlinked** (no lin
 
 Then for each card read the latest ~6 `task_events` and the last 2 `task_comments`. The latest comment often
 already says "resolved", "green again" or "replacement found". The block reason alone is stale evidence.
+For a card from a recurring reporter, also list newer cards with the same title or `created_by`: a done sibling
+may have settled the question. Then read the files it claims on disk, since a redeploy from the tracked source
+can revert a worker's local edit after the card reported it.
 
 ## 2. Classify each card. Re-test the premise live first.
 
@@ -74,8 +77,9 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
 - Cards whose dependents wait on them: unblocking or completing promotes the children. Check them.
 - A card you unblock may sit `ready` behind a full worker pool. Read the queue head first
   (`select id,priority from tasks where status='ready' order by priority desc limit 10`) and set
-  `hermes kanban edit <id> --priority <above the cards that should yield>`; a token bump like 10 leaves it behind
-  queues at 50-300. If the hub is full, move portable cards to a pool worker:
+  `hermes kanban edit <id> --priority <above the head of that list>` in the same turn, for every card you
+  unblock (guessed decisions too). A bump below the head (e.g. 11000 under a 20000+ head) leaves the card
+  unstarted and the board flags it to the chat after 30 min. If the hub is full, move portable cards to a pool worker:
   `hermes kanban move <id> --runs-on machine:<worker> --reason "..."` (keep cards needing hub-only access,
   the Macs or another profile on the hub). `no_machine` for a worker usually means a Board hold; read its owner
   card before filing a fault. Free slots but nothing starting: check `~/.hermes/core-update/drain-hold` (a
@@ -137,7 +141,9 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
 ## 6. Unattended runs (cron `kanban-red-sweep`, hub, every 30 min)
 
 The cron's monitor is `red_cards.py list`: the agent wakes only when the set of red cards (or a card's blocked
-event) changed, so cards that keep waiting on the user cost nothing.
+event) changed, so cards that keep waiting on the user cost nothing. Cron `monitor`/`script` paths must be
+a bare filename under `~/.hermes/scripts/`, so the job points at the thin wrapper `kanban_red_monitor.py`
+there, which execs the skill script.
 
 - Follow steps 1-3 and 5. Skip step 4: a cron run can't show a form. A card you are really unsure about stays
   blocked (its ask is already in the user's For-you queue); log it `--action left-blocked` and don't comment on
