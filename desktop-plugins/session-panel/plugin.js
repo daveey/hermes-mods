@@ -245,6 +245,31 @@ let done = { scope: null, rows: null } // rows null = unknown (older owner, read
 const doneSubs = new Set()
 let doneTimer = null
 
+// Last-known finished cards per chat, so a switch paints the Done count at once instead of after the 2-5 s
+// /session-cards read (then the read replaces it). Memory + localStorage, newest DONE_CACHE_MAX chats.
+const DONE_CACHE_KEY = 'hermes.sessionPanel.done.v1'
+const DONE_CACHE_MAX = 200
+let doneCache = null
+function doneStore() {
+  if (doneCache) return doneCache
+  doneCache = new Map()
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(DONE_CACHE_KEY) || '{}')
+    for (const [k, v] of Object.entries(raw)) if (Array.isArray(v)) doneCache.set(k, v)
+  } catch {}
+  return doneCache
+}
+/** Last-known done rows for a chat scope, or null (exported for tests). */
+export const cachedDone = scope => doneStore().get(scope) || null
+function rememberDone(scope, rows) {
+  const store = doneStore()
+  store.delete(scope)
+  store.set(scope, rows)
+  while (store.size > DONE_CACHE_MAX) store.delete(store.keys().next().value)
+  try { window.localStorage.setItem(DONE_CACHE_KEY, JSON.stringify(Object.fromEntries(store))) } catch {}
+}
+export const resetDoneCacheForTests = () => { doneCache = null; done = { scope: null, rows: null } }
+
 export async function refreshDone() {
   const route = panelRoute(), scope = routeKey(route)
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
@@ -257,6 +282,7 @@ export async function refreshDone() {
     if (routeKey(panelRoute()) !== scope) return
     // Only an answer that says it lists finished cards counts; anything else leaves done unknown.
     done = { scope, rows: Array.isArray(r?.tasks) && Array.isArray(r.includes) && r.includes.includes('done') ? doneRows(r.tasks) : null }
+    if (done.rows) rememberDone(scope, done.rows)
   } catch (e) {
     log('session-cards read failed', e?.message || e)
     if (done.scope !== scope) done = { scope, rows: null }
@@ -397,15 +423,22 @@ export function Panel() {
     const offDone = subscribeDone(setDone)
     return () => { offTasks?.(); offAsks?.(); offDone() }
   }, [])
-  useEffect(() => { void refreshDone(); void window.__sessionTasks?.refresh?.() }, [scope])
+  // Kick every source on a switch: user-steps' queue and strip mount only once the panel shows, so a chat whose
+  // only open work is an ask used to wait for user-steps' 8 s poll before its panel appeared at all.
+  useEffect(() => {
+    void refreshDone(); void window.__sessionTasks?.refresh?.()
+    void window.__userSteps?.refresh?.(); void window.__userSteps?.refreshRequests?.()
+  }, [scope])
   if (!route.session) return null
   const now = Date.now()
-  const chips = tasks && tasks.runtime === focused && tasks.stored === stored ? tasks.chips || [] : []
+  // Match on the stored chat only: the runtime id lands later (resume), and gating on it hid this chat's
+  // already-painted cards until session-tasks' next round (seconds after a switch).
+  const chips = tasks && tasks.stored === stored ? tasks.chips || [] : []
   const silence = trackSubagents(chips, now, subMemory)
   const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const sorted = classify(chips, { nowMs: now, silence, isAsked })
   const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
-  const finished = doneState.scope === scope ? doneState.rows : null
+  const finished = doneState.scope === scope ? doneState.rows : cachedDone(scope)
   const n = counts(sorted, { asks, done: finished ? finished.length : null })
   // A legacy card listed above as an unasked row is the same exact qualified card the strip's "Earlier asks"
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.

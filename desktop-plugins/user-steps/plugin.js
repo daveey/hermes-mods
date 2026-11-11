@@ -221,10 +221,14 @@ const focusedId = () => {
 let snapshot = { stored: null, ledger: { steps: [], card: null }, kanban: [], issues: [], ok: null }
 const subs = new Set()
 let timer = null
-let running = false
+let running = null // scope of the read in flight; a read for another chat starts at once instead of queueing
 let rerun = false
 let unsubKanban = null
 const stepCache = new Map() // id → { at, step }
+// Last-known ledger/kanban/issues per chat (memory, newest LEDGER_CACHE_MAX), painted on a switch before the read.
+const LEDGER_CACHE_MAX = 100
+const ledgerCache = new Map()
+export const resetLedgerCacheForTests = () => ledgerCache.clear()
 
 const emit = () => subs.forEach(fn => fn(snapshot))
 
@@ -275,12 +279,23 @@ function attachKanban() {
   })
 }
 
+/** A switch paints the chat's last-known ledger at once, even while another chat's read is still running. */
+function paintCachedLedger() {
+  const stored = focusedId(), scope = routeKey(decisionRoute())
+  if (!stored || snapshot.scope === scope || !ledgerCache.has(scope)) return
+  snapshot = { ...ledgerCache.get(scope), stored, scope }
+  emit()
+}
+
 export async function refresh(call = api) {
-  if (running) {
+  paintCachedLedger()
+  const pending = routeKey(decisionRoute())
+  if (running === pending) {
     rerun = true
     return
   }
-  running = true
+  const me = pending
+  running = me
   try {
     attachKanban()
     const stored = focusedId()
@@ -309,10 +324,7 @@ export async function refresh(call = api) {
       ok = false
       log('steps fetch failed', e?.message || e)
     }
-    if (!currentRoute(route)) {
-      rerun = true
-      return
-    }
+    if (!currentRoute(route)) return // the newer chat's own read owns the snapshot now
     const bp = blockedPanel()?.snapshot
     snapshot = {
       stored,
@@ -322,12 +334,19 @@ export async function refresh(call = api) {
       issues: matchingBlocked(bp, route) ? bp.issues || [] : snapshot.scope === routeKey(route) ? snapshot.issues || [] : [],
       ok
     }
+    if (ok) {
+      ledgerCache.delete(snapshot.scope)
+      ledgerCache.set(snapshot.scope, { ledger: snapshot.ledger, kanban: snapshot.kanban, issues: snapshot.issues, ok })
+      while (ledgerCache.size > LEDGER_CACHE_MAX) ledgerCache.delete(ledgerCache.keys().next().value)
+    }
     emit()
   } finally {
-    running = false
-    if (rerun) {
-      rerun = false
-      void refresh(call)
+    if (running === me) {
+      running = null
+      if (rerun) {
+        rerun = false
+        void refresh(call)
+      }
     }
   }
 }
@@ -690,6 +709,12 @@ function rememberIntent(key, decision) {
   if (typeof window !== 'undefined') window.localStorage.setItem(INTENT_PREFIX + key, JSON.stringify(decision))
 }
 let canonical = { scope: null, requests: [], error: null }
+// Last confirmed request list per chat (memory only, newest CANONICAL_CACHE_MAX chats). A switch paints it at once
+// marked `stale`: counts and rows show immediately, but every decision control stays disabled until this chat's
+// own read lands, so nothing is ever answered from a cached revision.
+const CANONICAL_CACHE_MAX = 100
+const canonicalCache = new Map()
+export const resetCanonicalCacheForTests = () => { canonicalCache.clear(); canonical = { scope: null, requests: [], error: null } }
 const canonicalSubs = new Set()
 const readbacks = new Set()
 let requestRead = 0
@@ -713,7 +738,14 @@ function receiptStatus(attrs, ids, scope) {
 function signalDecisionChanges() {
   if (typeof window !== 'undefined' && window.dispatchEvent) window.dispatchEvent(new window.Event('hermes:user-steps-changed'))
 }
-const publishCanonical = () => { canonicalSubs.forEach(fn => fn(canonical)); signalDecisionChanges(); emit() }
+const publishCanonical = () => {
+  if (canonical.scope && !canonical.stale && !canonical.error) {
+    canonicalCache.delete(canonical.scope)
+    canonicalCache.set(canonical.scope, canonical.requests)
+    while (canonicalCache.size > CANONICAL_CACHE_MAX) canonicalCache.delete(canonicalCache.keys().next().value)
+  }
+  canonicalSubs.forEach(fn => fn(canonical)); signalDecisionChanges(); emit()
+}
 // Owner capabilities: GET /ping at most once per route scope per FEATURE_TTL_MS. A failed ping is not cached (the
 // next tile mount asks again) and an answer expires, so an owner that restarts onto a newer plugin is noticed.
 const FEATURE_TTL_MS = 5 * 60_000
@@ -745,6 +777,10 @@ export async function refreshRequests(call = api) {
   const generation = ++requestRead
   const route = decisionRoute(), scope = routeKey(route)
   if (!route.session) return
+  if (canonical.scope !== scope && canonicalCache.has(scope)) {
+    canonical = { scope, requests: canonicalCache.get(scope), error: null, stale: true }
+    publishCanonical()
+  }
   try {
     if (host.state?.focusedSessionOwner && !route.connectionId) throw Error('Session owner unavailable')
     // Withdrawn rows are requested so receipts and alias suppression know them; the queue never shows them.
@@ -1182,7 +1218,7 @@ export function ActionQueue({ embedded = false } = {}) {
     ] }),
     !minimized && snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
     !minimized && requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
-    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: embedded ? 'none' : '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
+    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: embedded ? 'none' : '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error || !!snap.stale }, `${scope}:${requestKey(r)}`)) })
   ] })
 }
 
@@ -1270,7 +1306,7 @@ export default {
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, ActionQueue, Strip, openAskCount }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, ActionQueue, Strip, openAskCount }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)

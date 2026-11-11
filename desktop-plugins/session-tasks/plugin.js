@@ -542,7 +542,7 @@ let lastKanbanAt = 0
 let kanbanCache = []
 let lastMachinesAt = 0
 let machineCache = []
-let running = false
+let inflight = null // the round now running: { scope }; a round for another chat never waits on it
 let rerun = false
 
 const emit = () => subs.forEach(fn => fn(snapshot))
@@ -670,7 +670,12 @@ function paintCached() {
   const { route, scope } = focusScope()
   if (!stored || !route.connectionId || scope === snapshot.scope) return false
   const cached = cachedChips(scope)
-  if (!cached) return false // nothing known yet: the strip already hides another chat's snapshot
+  if (!cached) {
+    // Nothing known yet: never let the previous chat's cards ride along in this chat's first publish.
+    kanbanCache = []
+    machineCache = []
+    return false
+  }
   kanbanCache = cached.kanban
   machineCache = cached.machines
   lastKanbanAt = 0
@@ -681,21 +686,24 @@ function paintCached() {
 }
 
 export async function refresh() {
-  // A focus change during an in-flight round must not be dropped (that left the
-  // strip empty for a whole poll interval after opening a chat): run again after,
-  // but paint the new chat's last-known cards right away instead of after the old round.
-  if (running) {
-    paintCached()
+  // A refresh for the chat a round is already reading (poll tick, runtime id landing after resume) runs again
+  // after it. A switch to another chat starts its own round at once: waiting for the old chat's 2-5 s reads
+  // left the new chat's panel empty or last-known that long. The old round's answers are dropped (scope check).
+  const pending = focusScope().scope
+  if (inflight && inflight.scope === pending) {
     rerun = true
     return
   }
   if (typeof document !== 'undefined' && document.hidden) return
-  running = true
+  const me = { scope: pending }
+  inflight = me
   try {
     const runtime = host.state.focusedSessionId.get()
     const stored = host.state.focusedStoredSessionId.get()
     const { route, scope } = focusScope()
-    const stillFocused = () => host.state.focusedSessionId.get() === runtime && focusScope().scope === scope
+    // Kanban and machine answers depend on the stored chat only, so a runtime id that lands mid-round (resume)
+    // must not throw them away; only process/sub-agent chips belong to one runtime session.
+    const stillFocused = () => focusScope().scope === scope
     if (!runtime && !stored) {
       snapshot = { runtime, stored, chips: [] }
       return emit()
@@ -720,9 +728,10 @@ export async function refresh() {
     // machine inventory, and vice versa.
     const publish = () => {
       if (!stillFocused()) return
+      const sameRuntime = host.state.focusedSessionId.get() === runtime
       snapshot = {
-        runtime, stored, scope, fresh: true,
-        chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
+        runtime: host.state.focusedSessionId.get(), stored, scope, fresh: true,
+        chips: [...kanbanCache, ...machineCache, ...(sameRuntime ? [...subagentChips(subagents?.subagents), ...processChips(procs?.processes)] : [])]
       }
       emit()
     }
@@ -793,7 +802,7 @@ export async function refresh() {
     } else {
       await rpc
     }
-    if (!stored) {
+    if (!stored && stillFocused()) {
       kanbanCache = []
       machineCache = []
     }
@@ -801,10 +810,12 @@ export async function refresh() {
   } catch (e) {
     log('refresh failed', e)
   } finally {
-    running = false
-    if (rerun) {
-      rerun = false
-      void refresh()
+    if (inflight === me) {
+      inflight = null
+      if (rerun) {
+        rerun = false
+        void refresh()
+      }
     }
   }
 }

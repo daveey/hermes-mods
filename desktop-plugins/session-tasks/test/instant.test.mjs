@@ -89,12 +89,87 @@ test('switching chats during an in-flight round paints the new chat at once', as
     const round = m.refresh() // stuck on the slow chat's ancestry read
     await new Promise(r => setTimeout(r, 0))
     focus.stored = 'chat-next'
-    await m.refresh() // a round is running: this must paint, not wait for it
+    const next = m.refresh() // a round is running: this must paint, not wait for it
     assert.equal(window.__sessionTasks.snapshot.scope, scopeOf('chat-next'))
     assert.deepEqual(window.__sessionTasks.snapshot.chips.map(c => c.id), ['t_next'])
     slow.resolve({ id: 'chat-slow' })
     await round
+    await next
   } finally { dispose(); delete globalThis.window; delete host.request }
+})
+
+test('a switch reads the new chat at once instead of queueing behind the old chat\'s slow round', async () => {
+  focus.stored = 'chat-old'
+  const slow = deferred(), paths = []
+  host.request = async () => ({})
+  globalThis.window = { hermesDesktop: { api: ({ path }) => {
+    paths.push(path)
+    if (path.includes('chat-old')) return slow.promise // the old chat's reads hang
+    if (path.startsWith('/api/sessions/')) return Promise.resolve({ id: 'chat-new', parent_session_id: null })
+    if (path.startsWith('/api/session-kanban-tasks')) return Promise.resolve({ tasks: [card('t_new', 'running')] })
+    return Promise.resolve({ machines: [] })
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    const old = m.refresh()
+    await new Promise(r => setTimeout(r, 0))
+    focus.stored = 'chat-new'
+    focus.runtime = 'rt-new'
+    await m.refresh()
+    assert.ok(paths.some(p => p.startsWith('/api/session-kanban-tasks') && p.includes('chat-new')), 'the new chat was read while the old round hung')
+    assert.equal(window.__sessionTasks.snapshot.stored, 'chat-new')
+    assert.deepEqual(window.__sessionTasks.snapshot.chips.map(c => c.id), ['t_new'])
+    slow.resolve({ id: 'chat-old', parent_session_id: null })
+    await old
+    assert.equal(window.__sessionTasks.snapshot.stored, 'chat-new', 'the old round never overwrites the new chat')
+    assert.deepEqual(window.__sessionTasks.snapshot.chips.map(c => c.id), ['t_new'])
+  } finally { dispose(); delete globalThis.window; delete host.request }
+})
+
+test('the runtime id landing mid-round (resume) keeps the round\'s kanban answer', async () => {
+  focus.stored = 'chat-resume'
+  focus.runtime = null // not resumed yet
+  const kb = deferred()
+  let kanbanReads = 0
+  host.request = async () => ({ processes: [], subagents: [] })
+  globalThis.window = { hermesDesktop: { api: ({ path }) => {
+    if (path.startsWith('/api/sessions/')) return Promise.resolve({ id: 'chat-resume', parent_session_id: null })
+    if (path.startsWith('/api/session-kanban-tasks')) return (kanbanReads++, kb.promise)
+    return Promise.resolve({ machines: [] })
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    const round = m.refresh()
+    await new Promise(r => setTimeout(r, 0))
+    focus.runtime = 'rt-resume' // resume finished while the kanban read is in flight
+    void m.refresh() // the strip's runtime effect: same chat, queued behind this round
+    kb.resolve({ tasks: [card('t_keep', 'review')] })
+    await round
+    for (let i = 0; i < 20 && window.__sessionTasks.snapshot.runtime !== 'rt-resume'; i++) await new Promise(r => setTimeout(r, 5))
+    assert.deepEqual(window.__sessionTasks.snapshot.chips.filter(c => c.kind === 'kanban').map(c => c.id), ['t_keep'])
+    assert.equal(window.__sessionTasks.snapshot.stored, 'chat-resume')
+    assert.equal(kanbanReads, 1, 'the answer was used, not thrown away and read again')
+  } finally { dispose(); delete globalThis.window; delete host.request }
+})
+
+test('a first visit never publishes the previous chat\'s cards under the new chat', async () => {
+  m.rememberChips(scopeOf('chat-prev'), m.sessionTaskChips([card('t_prev', 'running')], { connectionId: 'conn', profile: 'default' }), [])
+  focus.stored = 'chat-prev'
+  const never = deferred()
+  host.request = async () => ({ processes: [], subagents: [] })
+  globalThis.window = { hermesDesktop: { api: () => never.promise } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    void m.refresh()
+    await new Promise(r => setTimeout(r, 0))
+    assert.deepEqual(window.__sessionTasks.snapshot.chips.map(c => c.id), ['t_prev'])
+    focus.stored = 'chat-unseen'
+    void m.refresh()
+    for (let i = 0; i < 10; i++) await new Promise(r => setTimeout(r, 2))
+    const snap = window.__sessionTasks.snapshot
+    assert.equal(snap.stored, 'chat-unseen', 'the process/sub-agent answer published for the new chat')
+    assert.deepEqual(snap.chips.filter(c => c.kind === 'kanban'), [], 'no leftover cards from chat-prev')
+  } finally { never.resolve(null); dispose(); delete globalThis.window; delete host.request }
 })
 
 test('a chat ancestry walked once is reused from storage without requests', async () => {

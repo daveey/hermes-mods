@@ -461,3 +461,43 @@ test('rows lead with their state box, not a dot; hub cards carry the H there too
   assert.deepEqual(marks['kb:t_w_wait'], ['waiting', false, ''])
   assert.equal(el().querySelectorAll('[data-pip]').length, 4, 'header pips unchanged by row marks')
 })
+
+
+// [daveey] Switching chats shows the panel at once: last-known data paints first, reads replace it.
+test('panel: a chat whose runtime id has not landed yet (resume) still shows its cards', async () => {
+  window.localStorage.clear()
+  const b = bridges({ chips: [card('t_run', 'running', { activityAt: Date.now() / 1000 - 30 })] })
+  window.__sessionTasks.snapshot.runtime = null // session-tasks painted the stored chat before resume finished
+  await show(React.createElement(m.Panel, { key: 'no-runtime' }))
+  assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running'])
+  void b
+})
+
+test('panel: a revisited chat shows its last-known Done count before the session-cards read answers', async () => {
+  window.localStorage.clear()
+  m.resetDoneCacheForTests()
+  const s = Date.now() / 1000
+  bridges({ chips: [card('t_run', 'running', { activityAt: s - 30 })], cards: [{ id: 't_d1', status: 'done', title: 'Shipped A', activity_at: s - 60 }] })
+  await show(React.createElement(m.Panel, { key: 'first-visit' }))
+  await React.act(async () => { await m.refreshDone(); await flush() })
+  assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running', '1 done'])
+  await show(null)
+  // Back to the chat later: the read now hangs, the cached count still paints on the first render.
+  m.resetDoneCacheForTests() // a relaunch: memory gone, localStorage kept
+  let release
+  window.hermesDesktop = { api: () => new Promise(r => { release = r }) }
+  await show(React.createElement(m.Panel, { key: 'revisit' }))
+  assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running', '1 done'])
+  assert.equal(m.cachedDone(JSON.stringify(['C1', 'default', 'S1'])).length, 1)
+  release?.({ tasks: [], includes: ['done'] })
+})
+
+test('panel: switching chats kicks user-steps (queue and strip) instead of waiting for its poll', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [] })
+  const kicks = []
+  window.__userSteps.refresh = () => kicks.push('refresh')
+  window.__userSteps.refreshRequests = () => kicks.push('requests')
+  await show(React.createElement(m.Panel, { key: 'kick' }))
+  assert.deepEqual(kicks.sort(), ['refresh', 'requests'], 'nothing open yet: the panel is hidden but still asked for this chat\'s asks')
+})

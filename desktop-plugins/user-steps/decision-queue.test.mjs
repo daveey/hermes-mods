@@ -1050,3 +1050,30 @@ test('owner phase: a reservation is never displayed as not applied, even if a pa
  assert.match(m.ownerPhaseText({phase:'not_applied',receipts}),/uncertain/)
  assert.equal(m.ownerPhase({phase:'not_applied',receipts:[{phase:'acknowledged'},{phase:'not_applied',reason:'x'}]}),'not_applied')
 })
+
+
+// [daveey] Switching back to a chat shows its asks at once from the last confirmed list; every decision control
+// stays disabled until that chat's own read lands, so nothing is answered from a cached revision.
+test('a revisited chat counts and shows its last-known asks at once, decisions locked until the read lands', async () => {
+  m.resetCanonicalCacheForTests()
+  const r = freshRequest({ title: 'Cached ask' })
+  await React.act(async () => { await m.refreshRequests(async () => ({ requests: [r] })); await flush() })
+  assert.equal(m.openAskCount(), 1)
+  host.state.focusedStoredSessionId.value = 'S2'
+  await React.act(async () => { await m.refreshRequests(async () => ({ requests: [] })); await flush() })
+  assert.equal(m.openAskCount(), 0)
+  host.state.focusedStoredSessionId.value = 'S1'
+  const pending = []
+  const hang = () => new Promise(res => { pending.push(res) })
+  window.hermesDesktop = { api: hang }
+  try {
+    const read = m.refreshRequests(hang)
+    assert.equal(m.openAskCount(), 1, 'counted before the read answers')
+    await show(React.createElement(m.ActionQueue, { key: 'cached-revisit' }))
+    assert.match(el().textContent, /Cached ask/)
+    const approve = () => [...el().querySelectorAll('button')].find(b => b.textContent === 'Approve')
+    assert.equal(approve().disabled, true, 'a cached revision is never answerable')
+    await React.act(async () => { pending.forEach(res => res({ requests: [r] })); await read; await flush() })
+    assert.equal(approve().disabled, false, 'the fresh read unlocks it')
+  } finally { await show(null); delete window.hermesDesktop }
+})
