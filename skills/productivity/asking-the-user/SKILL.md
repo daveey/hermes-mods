@@ -87,6 +87,9 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   in-script guard is what stops a second apply.
 - In a multi-line `bash <<'EOF'` command, give every `ssh`, `aws` and `terraform` call `-n` or `</dev/null`:
   `ssh` reads the heredoc as its stdin and silently swallows the remaining script lines (exit 0, steps missing).
+- Never background a job inside the window (`nohup ... &`, `disown`): it dies when the window's command returns and
+  leaves no log, while the tool reports exit 0. Run it in the foreground with a long `wait_s`; when the call times
+  out the job keeps running, so keep waiting with its `job_id`. Say a retry is running only after reading its log.
 - ask-gate refuses a final reply that hands such a step back, and user-steps drops it from the reply.
 
 ## Chrome steps
