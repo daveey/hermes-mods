@@ -1258,6 +1258,16 @@ def _guided_refusal(tool: str, d: dict) -> bool:
     # Keep this narrow: invalid_args alone can also wrap unexpected failures.
     # Core's shared wake guard intentionally rejects long parks without a probe.
     # Exception/traceback detection in bug_signature runs before this exemption.
+    if tool == "kanban_create":
+        pin = d.get("placement")
+        # A stale/unknown explicit pin must be refused, not silently rerouted.
+        # Do not exempt other placement_unavailable causes (transport, storage,
+        # capabilities), or messages whose structured provenance does not match.
+        return (d.get("code") == "placement_unavailable" and d.get("created") is False
+                and isinstance(pin, str) and bool(pin)
+                and str(d.get("error") or "").startswith(
+                    f"placement={pin!r} was not honoured and no card was created: "
+                    f"no gateway is named {pin!r}:"))
     if tool == "kanban_block":
         return d.get("rejection") == "invalid_args" and bool(re.match(
             rf"^{re.escape(tool)} refused: this park wakes in \d+\.\d+h "
