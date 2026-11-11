@@ -33,12 +33,21 @@ class DesktopPluginCI(unittest.TestCase):
         self.assertIn('HERMES_DESKTOP_DIR: ${{ runner.temp }}/desktop-test-deps', self.text)
         self.assertIn('node-version: \'22.23.4\'', self.text)
         self.assertIn('npm install --prefix "$HERMES_DESKTOP_DIR"', self.text)
-        for package in ('react@19.3.0', 'react-dom@19.3.0', 'jsdom@29.1.1'):
+        for package in ('react@19.3.0', 'react-dom@19.3.0', 'jsdom@29.1.1',
+                        '@tanstack/react-query@5.104.1', 'radix-ui@1.7.0'):
             self.assertIn(package, self.text)
-        self.assertIn('run: node --test --test-concurrency=1 desktop-plugins/*/test/*.mjs', self.text)
+        self.assertIn('HERMES_DESKTOP_PACKAGE=$HERMES_DESKTOP_DIR/package.json', self.text)
+        self.assertIn('run: node --test --test-concurrency=1 desktop-plugins/*/test/*.mjs '
+                      'desktop-plugins/*/tests/*.test.mjs', self.text)
         files = list(ROOT.glob('desktop-plugins/*/test/*.mjs'))
-        self.assertTrue(files)
+        files += ROOT.glob('desktop-plugins/*/tests/*.test.mjs')
         self.assertIn(ROOT / 'desktop-plugins/session-panel/test/producer-composed.test.mjs', files)
+        self.assertIn(ROOT / 'desktop-plugins/runners/tests/fleet.test.mjs', files)
+
+    def test_every_desktop_plugin_test_file_is_globbed(self):
+        globbed = set(ROOT.glob('desktop-plugins/*/test/*.mjs')) | set(ROOT.glob('desktop-plugins/*/tests/*.test.mjs'))
+        for f in ROOT.glob('desktop-plugins/*/test*/*.test.mjs'):
+            self.assertIn(f, globbed)
 
 
 if __name__ == '__main__':
