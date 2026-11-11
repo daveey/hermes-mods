@@ -11,6 +11,15 @@ exactly <TOKEN>``, or whose last reply is just such a token. Sessions an agent o
 user turn is the probe) are not flagged. Each session gets one card (``probe-token:<host>:<session>``); newer evidence in the
 same chat is a comment on it.
 
+Second lane, leftover test chats: an agent's OWN test chat (the first user turn is the probe) is fine while it runs,
+but one left visible in the sidebar is litter the user has to look at. A latency harness drove six real new chats
+through a Desktop window ("[latency probe, please reply just ok] ...") and only closed the window; the six chats sat
+in David's sidebar until he asked. RPC harnesses create theirs ``hidden``; UI-driven ones cannot, so their teardown
+must delete them. A user-facing session whose digest says ``hidden: false`` and not archived, with at most
+LEFTOVER_MAX_TURNS user turns, a probe-shaped first turn and no activity for LEFTOVER_IDLE_S, is a hit. New hits on
+one host share ONE card (``leftover-test-chats:<host>:<first session>``) that asks to delete them AND fix the harness
+that left them.
+
     probe_token_watch.py [--dry-run] [--json] [--seed] [--days N] [--data DIR] [--home PATH] [--no-pull]
 
 --dry-run prints the findings and files nothing; --seed records current hits as known without filing (install).
@@ -36,6 +45,12 @@ USER_SOURCES = {"desktop", "cli", "tui", "telegram", "discord", "slack", "whatsa
 PROBE_ASK = re.compile(r"\breply\s+(?:with\s+)?exactly[:\s]+[`\"']?([A-Z][A-Z0-9]+(?:_[A-Za-z0-9]+)*)\b", re.I)
 # A whole reply that is one token with an underscore (ROUTE_INSTALLED_23ef49); "OK"/"Yes." are ordinary answers.
 TOKEN_REPLY = re.compile(r"^[`\"']?[A-Z][A-Z0-9]*(?:_[A-Za-z0-9]+)+[`\"'.]?$")
+# Probe-shaped FIRST turns of an agent's own test chat: "[latency probe, ...]", "[probe t_01a...]",
+# "Reply with just the word: fixb6233", "Reply with only: fresh_armF_one".
+PROBE_TAG = re.compile(r"^\s*\[[^\]\n]{0,80}\bprobe\b[^\]\n]{0,80}\]", re.I)
+REPLY_JUST = re.compile(r"\breply\s+(?:with\s+)?(?:just|only)\b(?:\s+the\s+word)?\s*[:`\"']?\s*[A-Za-z0-9_-]+\s*[.`\"']?\s*$", re.I)
+LEFTOVER_IDLE_S = 3600
+LEFTOVER_MAX_TURNS = 3
 
 
 def hermes_home(home: Optional[str] = None) -> Path:
@@ -85,6 +100,107 @@ def check(dg: dict) -> Optional[dict]:
     return {"session": dg.get("id"), "host": dg.get("host") or "", "profile": dg.get("profile") or "default",
             "source": dg.get("source"), "title": dg.get("title") or "", "ts": ts, "probe_ts": probe_ts or ts,
             "evidence": "\n".join(evidence[-6:]), "evidence_lines": evidence}
+
+
+def _probe_opener(text: str) -> bool:
+    first_line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return bool(_probe_ask(text) or PROBE_TAG.search(text or "") or REPLY_JUST.search(first_line))
+
+
+def leftover(dg: dict, now: float) -> Optional[dict]:
+    """A visible, idle test chat an agent opened for itself (first user turn is the probe), or None."""
+    if str(dg.get("source") or "").lower() not in USER_SOURCES:
+        return None
+    if dg.get("archived") or dg.get("hidden") is not False:  # hidden/unknown (pre-v9 digest) is not sidebar litter
+        return None
+    turns = [t for t in dg.get("user_turns") or [] if str(t.get("text") or "").strip()]
+    if not turns or len(turns) > LEFTOVER_MAX_TURNS or not _probe_opener(str(turns[0].get("text") or "")):
+        return None
+    ts = float(dg.get("last_activity_at") or 0)
+    if now - ts < LEFTOVER_IDLE_S:
+        return None
+    return {"session": dg.get("id"), "host": dg.get("host") or "", "profile": dg.get("profile") or "default",
+            "source": dg.get("source"), "title": dg.get("title") or "", "ts": ts,
+            "first": str(turns[0].get("text") or "")[:160]}
+
+
+def scan_leftovers(data: Path, since: float, now: float) -> list:
+    hits = []
+    for host_dir in sorted(p for p in data.iterdir() if p.is_dir() and not p.name.startswith(".")) \
+            if data.exists() else []:
+        for f in host_dir.glob("*/*.json"):
+            try:
+                if f.stat().st_mtime < since:
+                    continue
+                dg = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(dg, dict):
+                continue
+            dg.setdefault("host", host_dir.name)
+            dg.setdefault("profile", f.parent.name)
+            hit = leftover(dg, now)
+            if hit:
+                hit["host"] = hit["host"] or host_dir.name
+                hits.append(hit)
+    return sorted(hits, key=lambda h: (h["host"], h["ts"]))
+
+
+def leftover_body(host: str, hits: list) -> str:
+    rows = "\n".join(f"- `{h['session']}` ({h['profile']}, {h['source']}, {_pt(h['ts'])}) \"{h['title'][:60]}\": "
+                     f"{h['first'][:100]!r}" for h in hits)
+    ids = " ".join(h["session"] for h in hits)
+    return f"""Agent test chats were left VISIBLE in the user's sidebar on host {host}: each one's first user turn is a
+probe and nothing deleted it afterwards.
+
+{rows}
+
+An RPC harness creates its test chats with `hidden: true` (gateway_rpc.py, `?client=agent`); a harness that drives a
+real Desktop window (Cmd-N + Enter over the inspector) cannot, so its teardown must delete every chat it created.
+These got neither.
+
+## Do this
+1. Delete them on {host} (they are test litter, not the user's): `hermes sessions delete --yes <id>` for each of
+   `{ids}` (use `-p <profile>` for a non-default profile; `tailnet_exec` for another host).
+2. Find the harness that made them (grep `state.db` tool calls on {host} near the times above for the first-turn
+   text) and fix it at the source with five-whys: create the chat hidden, or delete each created id in the
+   harness's own teardown (a `finally`, not the agent's memory). A one-off scratch script gets the rule added to
+   the skill it followed instead.
+3. Do not add a sweeper that archives by title: it hides the symptom and the next harness leaks again.
+
+## Acceptance
+- `python3 ~/code/hermes-mods/plugins/coach/probe_token_watch.py --dry-run --days 2` lists none of these sessions
+  under `leftovers` once the digest refreshes; paste it in a comment.
+- The harness fix (commit or skill patch) is named in the completion summary.
+"""
+
+
+def file_leftovers(home: Path, hits: list, runner: Callable) -> list:
+    st = load_state(home)
+    known = st.setdefault("leftovers", {})
+    out = []
+    by_host: dict = {}
+    for h in hits:
+        if f"{h['host']}:{h['session']}" not in known:
+            by_host.setdefault(h["host"], []).append(h)
+    for host, new in by_host.items():
+        key = f"leftover-test-chats:{host}:{new[0]['session']}"
+        title = f"agent test chats left visible in the sidebar: {host} ({len(new)})"
+        r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
+                          "--created-by", AUTHOR, "--body-file", "-", "--json", title], leftover_body(host, new))
+        if r.returncode != 0:
+            out.append({"key": key, "action": "create_failed", "out": ((r.stdout or "") + (r.stderr or ""))[-300:]})
+            continue
+        try:
+            tid = json.loads(r.stdout).get("id")
+        except (ValueError, TypeError, AttributeError):
+            out.append({"key": key, "action": "create_unparsed", "out": (r.stdout or "")[-300:]})
+            continue
+        for h in new:
+            known[f"{host}:{h['session']}"] = {"task_id": tid, "ts": h["ts"]}
+        save_state(home, st)
+        out.append({"key": key, "action": "created", "task_id": tid, "sessions": [h["session"] for h in new]})
+    return out
 
 
 def _pt(ts) -> str:
@@ -248,7 +364,9 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[float] = No
     if not a.no_pull and (data / ".git").exists():
         subprocess.run(["git", "-C", str(data), "pull", "-q", "--ff-only"], capture_output=True, timeout=120)
     hits = scan(data, now - a.days * 86400)
-    rep = {"count": len(hits), "sessions": [f"{h['host']}:{h['session']}" for h in hits], "hits": hits[:20]}
+    lefts = scan_leftovers(data, now - a.days * 86400, now)
+    rep = {"count": len(hits), "sessions": [f"{h['host']}:{h['session']}" for h in hits], "hits": hits[:20],
+           "leftovers": [f"{h['host']}:{h['session']}" for h in lefts]}
     if a.seed:
         st = load_state(home)
         for h in hits:
@@ -258,7 +376,7 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[float] = No
         rep["seeded"] = len(hits)
     elif not a.dry_run:
         rep["cards"] = [c for c in (file_card(home, h, runner or subprocess.run) for h in hits)
-                        if c["action"] != "known"]
+                        if c["action"] != "known"] + file_leftovers(home, lefts, runner or subprocess.run)
     if a.json or a.dry_run or a.seed:
         print(json.dumps(rep, indent=1))
     elif rep.get("cards"):

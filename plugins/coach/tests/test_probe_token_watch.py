@@ -148,6 +148,54 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(w._is_new(h, {"ts": 1793321276.7395048, "seeded": True}))
         self.assertTrue(w._is_new(h, {"ts": 1793321000.0, "seeded": True}))
 
+    # --- leftover test chats: an agent's own probe chat left VISIBLE (latency harness, 6 desktop chats) ---
+    def leftover_dg(self, sid, text="[latency probe, please reply just ok] latency-probe-40379", hidden: object = False,
+                    archived=False, t=1793318618, source="desktop", turns=1):
+        dg = digest(sid, source=source, last_reply="ok", texts=(text,) + ("again",) * (turns - 1), t=t)
+        dg.update(hidden=hidden, archived=archived)
+        return dg
+
+    def test_leftover_incident_shapes_flagged(self):
+        now = 1793318618 + 7200
+        for text in ("[latency probe, please reply just ok] latency-probe-40379", "Reply with just the word: fixb6233",
+                     "Reply with only: fresh_armF_one", "[probe t_01a19a63867979de] Use the terminal tool once",
+                     "Check only. Reply exactly ROUTE_ACCEPTED_23ef49."):
+            self.assertIsNotNone(w.leftover(self.leftover_dg("s1", text), now), text)
+
+    def test_leftover_not_flagged(self):
+        now = 1793318618 + 7200
+        self.assertIsNone(w.leftover(self.leftover_dg("s", hidden=True), now))      # RPC harness: hidden
+        self.assertIsNone(w.leftover(self.leftover_dg("s", hidden=None), now))      # pre-v9 digest: unknown
+        self.assertIsNone(w.leftover(self.leftover_dg("s", archived=True), now))
+        self.assertIsNone(w.leftover(self.leftover_dg("s", source="kanban"), now))
+        self.assertIsNone(w.leftover(self.leftover_dg("s"), 1793318618 + 60))       # still running / just made
+        self.assertIsNone(w.leftover(self.leftover_dg("s", turns=4), now))          # became a real chat
+        for text in ("fix the latency of new chats", "can you reply with just a summary of the PR and the risks?",
+                     "why does the probe fail on the mini"):
+            self.assertIsNone(w.leftover(self.leftover_dg("s", text), now), text)
+
+    def test_leftovers_share_one_card_per_host_then_stay_quiet(self):
+        for i in range(6):
+            self.put(self.leftover_dg(f"20261111_06104{i}_abc", t=1793318618 + i))
+        self.put(self.leftover_dg("hidden1", hidden=True))
+        now = 1793318618 + 7200
+        run = FakeRun()
+        args = ["--data", str(self.data), "--home", str(self.home), "--no-pull", "--days", "100000"]
+        w.main(args, runner=run, now=now)
+        creates = [c for c in run.calls if "create" in c[0]]
+        self.assertEqual(len(creates), 1)
+        self.assertIn("leftover-test-chats:macbook:20261111_061040_abc", creates[0][0])
+        self.assertIn("hermes sessions delete --yes", creates[0][1])
+        self.assertNotIn("hidden1", creates[0][1])
+        run2 = FakeRun()
+        w.main(args, runner=run2, now=now)
+        self.assertEqual(run2.calls, [])
+        self.put(self.leftover_dg("20261111_070000_new", t=1793318618 + 10))
+        run3 = FakeRun()
+        w.main(args, runner=run3, now=now)
+        self.assertEqual(len(run3.calls), 1)
+        self.assertNotIn("abc", run3.calls[0][1])
+
     def test_dry_run_files_nothing(self):
         self.put(INCIDENT)
         run = FakeRun()
