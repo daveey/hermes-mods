@@ -322,9 +322,109 @@ def client(provider: str = "anthropic", *, model: Optional[str] = None, tier: Op
 
 
 # ------------------------------------------------------------------------------------------------------ serve --
+def _chat_tools_to_anthropic(body: dict, model: str) -> dict:
+    """Translate the non-streaming OpenAI function-tool protocol without losing history."""
+    messages = body.get("messages") or []
+    out = _chat_to_anthropic([], body.get("max_tokens") or body.get("max_completion_tokens") or 4096, model)
+    system = []
+    for msg in messages:
+        role, content = msg.get("role"), msg.get("content")
+        if role in ("system", "developer"):
+            if not isinstance(content, str):
+                raise ValueError("tool chat system/developer content must be text")
+            system.append(content)
+            continue
+        if role == "tool":
+            if not isinstance(content, str):
+                raise ValueError("tool result content must be text")
+            block = {"type": "tool_result", "tool_use_id": msg["tool_call_id"], "content": content}
+            previous = out["messages"][-1] if out["messages"] else None
+            if previous and previous["role"] == "user" and all(
+                b.get("type") == "tool_result" for b in previous["content"]):
+                previous["content"].append(block)
+            else:
+                out["messages"].append({"role": "user", "content": [block]})
+            continue
+        if role not in ("user", "assistant"):
+            raise ValueError(f"unsupported tool chat role: {role!r}")
+        if content is None:
+            blocks = []
+        elif isinstance(content, str):
+            blocks = [{"type": "text", "text": content}] if content else []
+        elif isinstance(content, list) and all(isinstance(b, dict) and b.get("type") == "text" for b in content):
+            blocks = [dict(b) for b in content]
+        else:
+            raise ValueError("tool chat content supports text only")
+        for call in msg.get("tool_calls") or []:
+            if role != "assistant" or call.get("type") != "function":
+                raise ValueError("only assistant function tool_calls are supported")
+            function = call["function"]
+            arguments = json.loads(function["arguments"])
+            if not isinstance(arguments, dict):
+                raise ValueError("function arguments must encode a JSON object")
+            blocks.append({"type": "tool_use", "id": call["id"], "name": function["name"], "input": arguments})
+        if not blocks:
+            raise ValueError("tool chat messages need text or tool_calls")
+        out["messages"].append({"role": role, "content": blocks})
+    if system:
+        out["system"] = "\n\n".join(system)
+    if "tools" in body:
+        tools = []
+        for tool in body["tools"] or []:
+            if tool.get("type") != "function":
+                raise ValueError("only function tools are supported")
+            function = tool["function"]
+            tools.append({"name": function["name"], "description": function.get("description", ""),
+                          "input_schema": function.get("parameters", {"type": "object", "properties": {}})})
+        if tools:
+            out["tools"] = tools
+    choice = body.get("tool_choice")
+    if choice is not None:
+        if isinstance(choice, str) and choice in ("auto", "none", "required"):
+            out["tool_choice"] = {"type": "any" if choice == "required" else choice}
+        elif isinstance(choice, dict) and choice.get("type") == "function":
+            out["tool_choice"] = {"type": "tool", "name": choice["function"]["name"]}
+        else:
+            raise ValueError("unsupported tool_choice")
+    if "parallel_tool_calls" in body and choice != "none":
+        out.setdefault("tool_choice", {"type": "auto"})["disable_parallel_tool_use"] = not body["parallel_tool_calls"]
+    return out
+
+
+def _anthropic_tool_chat_reply(resp: dict, model: str) -> dict:
+    text = "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text")
+    calls = [{"id": b["id"], "type": "function", "function": {
+        "name": b["name"], "arguments": json.dumps(b["input"])}}
+        for b in resp.get("content", []) if b.get("type") == "tool_use"]
+    message = {"role": "assistant", "content": text or None}
+    if calls:
+        message["tool_calls"] = calls
+    usage = resp.get("usage") or {}
+    prompt = sum(usage.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    completion = usage.get("output_tokens", 0)
+    finish = {"tool_use": "tool_calls", "max_tokens": "length"}.get(resp.get("stop_reason"), "stop")
+    return {"id": resp.get("id", "pool-chat"), "object": "chat.completion", "model": resp.get("model", model),
+            "choices": [{"index": 0, "finish_reason": finish, "message": message}],
+            "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}}
+
+
 def _chat_completions(body: dict, route: dict) -> dict:
     model = body.get("model") or resolve_model("openai-codex")
     provider = "anthropic" if str(model).startswith("claude") else "openai-codex"
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+        raise ValueError("messages must be a list of objects")
+    tool_request = "tools" in body or "tool_choice" in body or any(
+        m.get("role") == "tool" or m.get("tool_calls") for m in messages)
+    if tool_request:
+        if provider != "anthropic":
+            raise ValueError("tools are not supported on this route")
+        model = resolve_model(provider, model)
+        try:
+            translated = _chat_tools_to_anthropic(body, model)
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError(f"invalid function tool request: {exc}") from exc
+        return _anthropic_tool_chat_reply(anthropic_messages(translated, route=route), model)
     r = complete(body.get("messages") or [], provider=provider, model=model,
                  max_tokens=body.get("max_tokens") or body.get("max_completion_tokens") or 4096)
     route.update(r["route"])

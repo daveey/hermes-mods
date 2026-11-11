@@ -29,8 +29,18 @@ responses, including thinking-only failures, successful answers and Codex compat
 `serve` lets an unmodified harness use the pool: `ANTHROPIC_BASE_URL=http://127.0.0.1:8765`,
 `OPENAI_BASE_URL=http://127.0.0.1:8765/v1`, any non-empty API key. It serves Anthropic `POST /v1/messages` (Claude
 Code system prefix and `mcp__` tool names added for the OAuth token, tool names restored in the reply) and OpenAI
-`POST /v1/responses` / `POST /v1/chat/completions` on the Codex backend (unsupported keys like `max_output_tokens`
-and `temperature` dropped, `store=false`). `POST /v1/embeddings` is forwarded to OpenRouter (key `OPENROUTER_API_KEY` from Hermes's `.env`; a bare model such
+`POST /v1/responses` on the Codex backend (unsupported keys like `max_output_tokens`
+and `temperature` dropped, `store=false`). `POST /v1/chat/completions` routes `claude*` models to Anthropic
+and other models to Codex. Claude chat requests support function `tools`, `tool_choice` (`auto`, `none`,
+`required`, or a named function), assistant `tool_calls` history, and `role: "tool"` results.
+Replies preserve tool IDs/names, JSON-string `arguments`, text (or null), real token usage including cached
+input, and `tool_calls`/`length`/`stop` finish reasons. Consecutive tool results are grouped into one user
+message; `parallel_tool_calls: false` disables parallel tool use. Tool-chat content supports text only;
+unsupported content or tool types fail explicitly. Codex chat tool requests return HTTP 400
+`tools are not supported on this route` (use native `/v1/responses` for Codex tools).
+Plain chat requests without tool fields/history keep their legacy response shape and behavior.
+This support is on the HTTP serve endpoint, not the text-only `complete()`/`client()` library helpers.
+Regression coverage: `tests/test_chat_tools.py`. `POST /v1/embeddings` is forwarded to OpenRouter (key `OPENROUTER_API_KEY` from Hermes's `.env`; a bare model such
 as `text-embedding-3-large` becomes `openai/text-embedding-3-large` and the reply names the model as asked; upstream
 errors keep their status; the key is never logged). Non-streaming only. Each reply carries an `x-hermes-pool-route` header
 (provider, model, account). Only models the managed routing registry lists as subscription routes are accepted.
