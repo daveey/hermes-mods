@@ -1077,3 +1077,35 @@ test('a revisited chat counts and shows its last-known asks at once, decisions l
     assert.equal(approve().disabled, false, 'the fresh read unlocks it')
   } finally { await show(null); delete window.hermesDesktop }
 })
+
+
+test('warm caches another chat\'s asks (validated) without touching the focused queue; a switch shows them locked', async () => {
+  m.resetCanonicalCacheForTests()
+  host.state.focusedStoredSessionId.value = 'S1'
+  const bgOwner = { ...owner, storedSessionId: 'S9' }
+  const bg = freshRequest({ owner: bgOwner, title: 'Background ask' })
+  const r9 = { connectionId: 'C1', profile: 'default', session: 'S9' }
+  const scope9 = JSON.stringify(['C1', 'default', 'S9'])
+  const call = async path => path.includes('/steps') ? { steps: [] } : { requests: [bg] }
+  assert.equal(await m.warm(r9, call), true)
+  assert.equal(m.openAskCount(), 0, 'focused chat unaffected')
+  assert.equal(m.cachedRequests(scope9).length, 1)
+  m.resetCanonicalCacheForTests()
+  const wrongOwner = async path => path.includes('/steps') ? null : { requests: [{ ...bg, owner }] } // claims S1
+  assert.equal(await m.warm(r9, wrongOwner), false)
+  assert.equal(m.cachedRequests(scope9), null, 'a list for the wrong owner is never cached')
+  assert.equal(await m.warm({ ...r9, session: 'S1' }, call), false, 'the focused chat is never warmed')
+  await m.warm(r9, call)
+  host.state.focusedStoredSessionId.value = 'S9'
+  const pending = []
+  const hang = () => new Promise(res => { pending.push(res) })
+  window.hermesDesktop = { api: hang }
+  try {
+    const read = m.refreshRequests(hang)
+    assert.equal(m.openAskCount(), 1, 'warmed ask counted on the first switch')
+    await show(React.createElement(m.ActionQueue, { key: 'warm-switch' }))
+    assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Approve').disabled, true, 'locked until the live read')
+    await React.act(async () => { pending.forEach(res => res({ requests: [bg] })); await read; await flush() })
+    assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Approve').disabled, false)
+  } finally { await show(null); delete window.hermesDesktop; host.state.focusedStoredSessionId.value = 'S1' }
+})

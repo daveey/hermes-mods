@@ -501,3 +501,42 @@ test('panel: switching chats kicks user-steps (queue and strip) instead of waiti
   await show(React.createElement(m.Panel, { key: 'kick' }))
   assert.deepEqual(kicks.sort(), ['refresh', 'requests'], 'nothing open yet: the panel is hidden but still asked for this chat\'s asks')
 })
+
+
+const setHidden = v => Object.defineProperty(document, 'hidden', { value: v, configurable: true }) // jsdom reports hidden by default
+// [daveey] Recent chats stay warm in the background so the first switch to them paints from a fresh cache.
+test('warmRecent: warms recent chats other than the focused one, once per interval, never while hidden', async () => {
+  window.localStorage.clear()
+  m.resetWarmForTests(); m.resetDoneCacheForTests(); setHidden(false)
+  bridges({ chips: [] })
+  const warmed = []
+  window.__sessionTasks.warm = async r => { warmed.push(['tasks', r.session]); return true }
+  window.__userSteps.warm = async r => { warmed.push(['steps', r.session]); return true }
+  window.hermesDesktop = { api: async ({ path }) => ({ tasks: [{ id: `t_${path.slice(-2)}`, status: 'done', title: 'Shipped', activity_at: 1 }], includes: ['done'] }) }
+  for (const s of ['S3', 'S2', 'S1']) m.noteRecent({ connectionId: 'C1', profile: 'default', session: s }) // S1 = focused, most recent
+  assert.deepEqual(m.readRecent().map(r => r.session), ['S1', 'S2', 'S3'])
+  assert.deepEqual(await m.warmRecent(), [], 'focus just moved: wait for it to settle')
+  const t0 = Date.now() + m.WARM_SETTLE_MS
+  assert.deepEqual((await m.warmRecent({ nowMs: t0 })).map(r => r.session), ['S2', 'S3'])
+  assert.deepEqual(warmed, [['tasks', 'S2'], ['steps', 'S2'], ['tasks', 'S3'], ['steps', 'S3']], 'one chat at a time, focused chat skipped')
+  assert.equal(m.cachedDone(JSON.stringify(['C1', 'default', 'S2'])).length, 1, 'Done rows warmed too')
+  assert.deepEqual(await m.warmRecent({ nowMs: t0 + 1000 }), [], 'not again within the interval')
+  setHidden(true)
+  try { assert.deepEqual(await m.warmRecent({ nowMs: t0 + m.WARM_EVERY_MS + 1 }), [], 'never while the window is hidden') } finally { setHidden(false) }
+  assert.deepEqual((await m.warmRecent({ nowMs: t0 + m.WARM_EVERY_MS + 1 })).map(r => r.session), ['S2', 'S3'])
+  delete document.hidden
+})
+
+test('warmRecent: one failing source never stops the pass; the recent list is capped', async () => {
+  window.localStorage.clear()
+  m.resetWarmForTests(); setHidden(false)
+  bridges({ chips: [] })
+  window.__sessionTasks.warm = async () => { throw new Error('hub down') }
+  window.__userSteps.warm = async () => true
+  window.hermesDesktop = { api: async () => { throw new Error('504') } }
+  for (let i = 0; i < m.WARM_RECENT + 3; i++) m.noteRecent({ connectionId: 'C1', profile: 'default', session: `X${i}` })
+  assert.equal(m.readRecent().length, m.WARM_RECENT)
+  const done = await m.warmRecent({ force: true })
+  assert.equal(done.length, m.WARM_RECENT, 'every recent chat attempted despite failures')
+  delete document.hidden
+})

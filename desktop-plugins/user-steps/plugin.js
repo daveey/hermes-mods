@@ -773,6 +773,39 @@ function ownerFeatures(route, call = api) {
   return entry.promise
 }
 export const clearFeatureCache = () => { pings.clear(); pinged.clear() }
+/** Background warm for a chat that is NOT focused: read its asks and ledger into the per-chat caches only. A cached
+ *  ask is painted stale with every decision control locked until the chat's own read lands, so warming never makes
+ *  anything answerable. Invalid or failed reads leave the caches alone. */
+export async function warm(route, call = api) {
+  if (!route?.connectionId || !route?.session) return false
+  const scope = routeKey(route)
+  if (scope === routeKey(decisionRoute())) return false // the focused chat has its own live reads
+  const [steps, reqs] = await Promise.all([
+    call(`${BASE}/steps?session=${encodeURIComponent(route.session)}`, { ...route, timeoutMs: 6_000 }).catch(() => null),
+    call(`${BASE}/requests?session=${encodeURIComponent(route.session)}&include=withdrawn`, route).catch(() => null)
+  ])
+  let ok = false
+  if (steps && Array.isArray(steps.steps)) {
+    const prev = ledgerCache.get(scope)
+    ledgerCache.delete(scope)
+    ledgerCache.set(scope, { ledger: { connectionId: route.connectionId, steps: steps.steps, card: steps.card || null, own_cards: Array.isArray(steps.own_cards) ? steps.own_cards : [] }, kanban: prev?.kanban || [], issues: prev?.issues || [], ok: true })
+    while (ledgerCache.size > LEDGER_CACHE_MAX) ledgerCache.delete(ledgerCache.keys().next().value)
+    ok = true
+  }
+  if (reqs && Array.isArray(reqs.requests)) {
+    const requests = projectRequests(reqs.requests)
+    const valid = requests.length === new Set(reqs.requests.map(requestKey)).size && requests.every(r => r.owner.storedSessionId === route.session && r.owner.profile === route.profile)
+    if (valid) {
+      canonicalCache.delete(scope)
+      canonicalCache.set(scope, requests)
+      while (canonicalCache.size > CANONICAL_CACHE_MAX) canonicalCache.delete(canonicalCache.keys().next().value)
+      ok = true
+    }
+  }
+  return ok
+}
+export const cachedRequests = scope => canonicalCache.get(scope) || null
+
 export async function refreshRequests(call = api) {
   const generation = ++requestRead
   const route = decisionRoute(), scope = routeKey(route)
@@ -1306,7 +1339,7 @@ export default {
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, ActionQueue, Strip, openAskCount }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, ActionQueue, Strip, openAskCount }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)

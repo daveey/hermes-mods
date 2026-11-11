@@ -658,6 +658,22 @@ export async function archiveGuard({ sessionId, ids, profile, connectionId } = {
   return machineArchiveLines(chips)
 }
 
+/** Background warm for a chat that is NOT focused: read its linked cards and remember them, so switching to it
+ *  paints at once. Touches only the per-chat cache, never the focused snapshot. Remembers only an authoritative
+ *  answer (a failed read leaves the last-known copy alone). Returns true when it refreshed the cache. */
+export async function warm({ connectionId, profile = 'default', session } = {}) {
+  if (!connectionId || !session) return false
+  const ids = await lineageIds(session, connectionId, profile)
+  if (ids.incomplete) return false
+  const keepHub = hubLinkCache // the focused chat's last good hub answer must survive a warm of another chat
+  try {
+    const chips = await loadKanban(ids, { connectionId, profile })
+    if (!chips || chips.some(c => c.kind === 'kanban-status' || c.stale)) return false
+    rememberChips(JSON.stringify([connectionId, profile, session]), chips, undefined)
+    return true
+  } finally { hubLinkCache = keepHub }
+}
+
 function focusScope() {
   const route = focusedRoute()
   return { route, scope: JSON.stringify([route.connectionId || '', route.profile, host.state.focusedStoredSessionId.get()]) }
@@ -1054,7 +1070,7 @@ export default {
     ctx.registerArchiveGuard?.(archiveGuard)
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute }
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       document.getElementById(`${ID}-style`)?.remove()

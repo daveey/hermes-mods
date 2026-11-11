@@ -290,6 +290,70 @@ export async function refreshDone() {
   doneSubs.forEach(fn => fn(done))
 }
 
+// ── background warm of recent chats ────────────────────────────────────────
+// The chats you switch between are kept warm, so the first switch after launch (or after a while away) paints
+// from a fresh cache too. Recent = the last WARM_RECENT chats focused in this window (persisted, so it survives
+// a relaunch). While the window is visible and focus has been still for WARM_SETTLE_MS, each recent chat (not
+// the focused one, which polls live) is re-read at most every WARM_EVERY_MS, one chat at a time.
+const RECENT_KEY = 'hermes.sessionPanel.recent.v1'
+export const WARM_RECENT = 8
+export const WARM_EVERY_MS = 3 * 60_000
+export const WARM_TICK_MS = 30_000
+export const WARM_SETTLE_MS = 10_000
+const warmedAt = new Map() // routeKey -> ms
+let lastFocusMoveAt = 0
+let warming = false
+
+export function readRecent() {
+  try { const v = JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]'); return Array.isArray(v) ? v.filter(r => r?.connectionId && r?.session) : [] } catch { return [] }
+}
+/** Put a focused chat at the head of the recent list (deduped by route, capped). */
+export function noteRecent(route) {
+  if (!route?.connectionId || !route?.session) return
+  lastFocusMoveAt = Date.now()
+  const key = routeKey(route)
+  const next = [{ connectionId: route.connectionId, profile: route.profile || 'default', session: route.session }, ...readRecent().filter(r => routeKey(r) !== key)].slice(0, WARM_RECENT)
+  try { window.localStorage.setItem(RECENT_KEY, JSON.stringify(next)) } catch {}
+}
+
+async function warmDone(route) {
+  const st = window.__sessionTasks, bridge = window.hermesDesktop?.api
+  if (!bridge || typeof st?.lineageIds !== 'function') return false
+  const ids = await st.lineageIds(route.session, route.connectionId, route.profile)
+  if (ids?.incomplete) return false
+  const r = await bridge({ path: `/api/plugins/user-steps/session-cards?ids=${encodeURIComponent([...ids].join(','))}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 15_000 })
+  if (!(Array.isArray(r?.tasks) && Array.isArray(r.includes) && r.includes.includes('done'))) return false
+  rememberDone(routeKey(route), doneRows(r.tasks))
+  return true
+}
+
+/** One warm pass: every recent chat that is not focused and not warmed within WARM_EVERY_MS, sequentially.
+ *  Skips while hidden, while focus moved in the last WARM_SETTLE_MS, or while a pass is running. Exported for tests;
+ *  `force` ignores the settle wait. Returns the routes it warmed. */
+export async function warmRecent({ nowMs = Date.now(), force = false } = {}) {
+  if (warming || (typeof document !== 'undefined' && document.hidden)) return []
+  if (!force && nowMs - lastFocusMoveAt < WARM_SETTLE_MS) return []
+  warming = true
+  const done = []
+  try {
+    const focused = routeKey(panelRoute())
+    for (const route of readRecent()) {
+      const key = routeKey(route)
+      if (key === focused || nowMs - (warmedAt.get(key) || 0) < WARM_EVERY_MS) continue
+      if (typeof document !== 'undefined' && document.hidden) break
+      if (routeKey(panelRoute()) !== focused) break // the user switched: stop, the next pass starts over
+      warmedAt.set(key, nowMs)
+      const safe = p => Promise.resolve(p).catch(e => { log('warm failed', key, e?.message || e); return false })
+      await safe(window.__sessionTasks?.warm?.(route))
+      await safe(window.__userSteps?.warm?.(route))
+      await safe(warmDone(route))
+      done.push(route)
+    }
+  } finally { warming = false }
+  return done
+}
+export const resetWarmForTests = () => { warmedAt.clear(); lastFocusMoveAt = 0; warming = false }
+
 function subscribeDone(fn) {
   doneSubs.add(fn)
   if (!doneTimer) doneTimer = setInterval(() => { if (typeof document === 'undefined' || !document.hidden) void refreshDone() }, DONE_POLL_MS)
@@ -426,6 +490,7 @@ export function Panel() {
   // Kick every source on a switch: user-steps' queue and strip mount only once the panel shows, so a chat whose
   // only open work is an ask used to wait for user-steps' 8 s poll before its panel appeared at all.
   useEffect(() => {
+    noteRecent(route)
     void refreshDone(); void window.__sessionTasks?.refresh?.()
     void window.__userSteps?.refresh?.(); void window.__userSteps?.refreshRequests?.()
   }, [scope])
@@ -500,9 +565,16 @@ export default {
   id: ID,
   name: 'Session Panel',
   register(ctx) {
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, refreshDone }
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, refreshDone, warmRecent }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
+    // First pass shortly after launch (covers the first switch after a relaunch), then every WARM_TICK_MS.
+    const idle = fn => (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function' ? window.requestIdleCallback(fn, { timeout: 5_000 }) : fn())
+    const tick = () => idle(() => void warmRecent())
+    const first = setTimeout(() => idle(() => void warmRecent({ force: true })), 4_000)
+    const warmTimer = setInterval(tick, WARM_TICK_MS)
     return () => {
+      clearTimeout(first)
+      clearInterval(warmTimer)
       if (typeof window !== 'undefined' && window.__sessionPanel?.version === VERSION) delete window.__sessionPanel
       if (doneTimer) clearInterval(doneTimer)
       doneTimer = null

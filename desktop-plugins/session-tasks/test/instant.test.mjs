@@ -292,3 +292,25 @@ test('a hub-scheduled card shows [H] in its status box; a worker card does not',
   assert.match(by.t_pool.title, /runs on a pool worker/)
   assert.doesNotMatch(by.t_none.title, /runs on/)
 })
+
+
+test('warm caches another chat\'s cards without touching the focused snapshot; a failed read caches nothing', async () => {
+  focus.stored = 'chat-focused'
+  host.request = async () => ({})
+  let fail = false
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/sessions/')) return { id: 'chat-bg', parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) { if (fail) throw new Error('504'); return { tasks: [card('t_bg', 'running')] } }
+    return null
+  } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    const before = window.__sessionTasks.snapshot
+    assert.equal(await window.__sessionTasks.warm({ connectionId: 'conn', profile: 'default', session: 'chat-bg' }), true)
+    assert.equal(window.__sessionTasks.snapshot, before, 'focused snapshot untouched')
+    assert.deepEqual(m.cachedChips(scopeOf('chat-bg')).kanban.map(c => c.id), ['t_bg'])
+    fail = true
+    assert.equal(await m.warm({ connectionId: 'conn', profile: 'default', session: 'chat-bg' }), false)
+    assert.deepEqual(m.cachedChips(scopeOf('chat-bg')).kanban.map(c => c.id), ['t_bg'], 'last good copy kept, no warning chip cached')
+  } finally { dispose(); delete globalThis.window; delete host.request }
+})
