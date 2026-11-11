@@ -37,10 +37,32 @@ def boards():
     return [(b, p) for b, p in out if os.path.isfile(p)]
 
 
+def _ro_connect(path, timeout=10):
+    """Read WAL databases even when sidecars need recovery; never create a DB."""
+    from pathlib import Path
+
+    uri = Path(path).resolve().as_uri()
+    c = None
+    try:
+        c = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        if c is not None:
+            c.close()
+    c = sqlite3.connect(f"{uri}?mode=rw", uri=True, timeout=timeout)
+    try:
+        c.execute("PRAGMA query_only=ON")
+        return c
+    except Exception:
+        c.close()
+        raise
+
+
 def cmd_list(_):
     n = 0
     for board, path in boards():
-        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+        c = _ro_connect(path)
         try:
             for tid, status, kind, title, ev in c.execute(RED):
                 n += 1
