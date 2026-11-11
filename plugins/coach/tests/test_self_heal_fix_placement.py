@@ -117,6 +117,44 @@ def test_fix_card_from_the_real_template_is_portable(store):
     assert kp.decide(fix, cfg=POOL_CFG, self_gw="hub").get("placement_policy") == "worker-first-v1"
 
 
+def test_fix_work_text_needs_no_coordination_capabilities(store):
+    kp = placement()
+    try:
+        from hermes_cli.kanban_placement_coordination import requirements
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli.kanban_placement_coordination":
+            raise
+        pytest.skip("core predates coordination placement")
+    b = Board()
+    sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    fix = fields(b.creates()[0])
+    work = fix["title"] + "\n" + kp.without_evidence(kp.without_placement_note(fix["body"]))
+    labels, refusal = requirements(work)
+    assert labels == set(), labels
+    assert refusal is None
+
+
+def test_core_change_is_handed_to_verify_for_shipping(store):
+    b = Board()
+    sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    fix, verify = [fields(a)["body"] for a in b.creates()]
+    assert "Do not ship core from this card" in fix
+    assert '"core_change": "<decided core spec, or empty>"' in fix
+    assert '<hermes-mods and state commit sha>' in fix
+
+
+def test_verify_files_and_waits_for_core_change(store):
+    b = Board()
+    sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    verify = fields(b.creates()[1])["body"]
+    core_step = verify.split("2. ", 1)[1].split("3. ", 1)[0]
+    for text in ("core_change", "kanban_create", 'assignee="default"',
+                 f'idempotency_key="selfheal-core:{FP}"', "hermes-core-wt ship",
+                 "All required checks pass (v2)", "independent exact-head review",
+                 "kanban_link", "parent", "kanban_schedule", "merge sha"):
+        assert text in core_step, text
+
+
 def test_fix_card_work_text_never_tells_a_worker_to_write_the_lane(store):
     b = Board()
     sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)

@@ -1790,13 +1790,15 @@ the evidence you get (it describes where it happened, not where you work).
    comment).
 3. Make the fix from the plan (root level, not just the symptom) and the detection guard. Show the same test
    PASSING, plus the module's existing tests.
-4. Ship it under David's standing merge/deploy approval: hermes-mods commit + push (pre-commit hook, never
-   --no-verify), core changes through a hermes-core-wt worktree + ship, settings through shared-config.json
-   (hermes-mods-repo skill).
+4. Ship only hermes-mods and state changes under David's standing merge/deploy approval: hermes-mods commit +
+   push (pre-commit hook, never --no-verify), settings through shared-config.json (hermes-mods-repo skill).
+   Do not ship core from this card. Put the decided core change (files, behaviour, red test) in metadata
+   `core_change`; the VERIFY child files it where core ships.
 5. If part of the plan can only be done on the gateway host itself (its local settings, scheduled jobs or
    databases), do the repo part and list the rest, exact commands included, in metadata `host_steps`; the verify
    card runs them. Don't block for it.
-6. Complete the card with metadata `{{"fix_shas": ["<every commit sha, core and hermes-mods>"], "red": "<failing
+6. Complete the card with metadata `{{"fix_shas": ["<hermes-mods and state commit sha>"],
+   "core_change": "<decided core spec, or empty>", "red": "<failing
    test output>", "green": "<passing output>", "live_check": "<what the verify card must check, and where>",
    "host_steps": [...], "undo": "<revert command>"}}`. If something irreversible or external blocks the fix,
    kanban_block with the exact ask instead.
@@ -1817,23 +1819,29 @@ You run
 on the host that filed it, because the live check and the lane record need this host's coach store and logs.
 Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
 
-1. Read the fix card's handoff: `kanban_show(task_id="{fix_card}")` (summary, metadata `fix_shas`, `red`, `green`,
-   `live_check`, `host_steps`, `undo`, or `not_defect`).
-2. `not_defect` set? Confirm the cited sha is on the deployed checkout, run
+1. Read the fix card's handoff: `kanban_show(task_id="{fix_card}")` (summary, metadata `fix_shas`, `core_change`,
+   `red`, `green`, `live_check`, `host_steps`, `undo`, or `not_defect`).
+2. `core_change` set? File one core card with `kanban_create`, assignee="default",
+   idempotency_key="selfheal-core:{fp}", body = that decided spec plus "land with `hermes-core-wt ship` after a
+   green 'All required checks pass (v2)' and an independent exact-head review". Use `kanban_link` to make that
+   core card this VERIFY card's parent, then `kanban_schedule` until it lands. On resume, read its handoff and
+   include its merge sha in the deploy check below and the recorded fix shas. Reuse the idempotent card, never
+   file another core owner for this defect.
+3. `not_defect` set? Confirm the cited sha is on the deployed checkout, run
    `{SELF_EVENT} not_defect {fp} --card {fix_card} --note "<its not_defect text>"` and complete. Stop.
-3. Confirm each fix sha is deployed here (`git -C <checkout> merge-base --is-ancestor <sha> HEAD` for the live
+4. Confirm each fix sha is deployed here (`git -C <checkout> merge-base --is-ancestor <sha> HEAD` for the live
    checkout that runs it; a hermes-mods change deploys within 10 min, core through hermes-sync). Not yet deployed
    after 30 min? kanban_schedule a re-check; don't record fixed on undeployed code.
-4. Run every `host_steps` entry. Verify live on the real path (the surface/command/session type where it
+5. Run every `host_steps` entry. Verify live on the real path (the surface/command/session type where it
    happened) as `live_check` says, and capture the proof. A live probe that makes a detector fire on purpose starts
    its first prompt with `[selfheal-probe]` (e.g. `hermes chat -q '[selfheal-probe] ...'`): the lane then logs
    `selfheal_skip why=probe` and files nothing. Check that log line; never delete selfheal_pending rows by hand.
    The live check fails? Comment the evidence, then kanban_block naming what still fails; do not record fixed.
-5. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post`. Write `result.md`
+6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post`. Write `result.md`
    (what changed with commits, the red/green test output from the handoff, your live proof, the undo command) and
    run `{SELF_EVENT} fixed {fp} --card {fix_card} --note "<every fix sha, space-separated>" --result result.md`.
    That stores it under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed.
-6. Complete the card with the live proof in the summary.
+7. Complete the card with the live proof in the summary.
 """
 
 
