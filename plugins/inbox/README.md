@@ -16,6 +16,16 @@ The card ends with the full **Proposed:** prompt, or, when the poster passes `pr
 
 Re-posting with the same `key` updates the open message (new assistant note, title, prompt; marked unread again) instead of adding a duplicate. Once you replied to it (accepted, not archived), a re-post with that key lands in that chat as an unread update instead of opening a second card; after Archive the next post is a new card. At most 20 open messages are kept. Past that, the oldest read ones are archived.
 
+## Social cards (`::social-card`)
+
+A typed card whose fields include `thread` (a JSON list of turns `{author, self, text, url, target}`, oldest first)
+posts its first message as the title plus `::social-card{session="<id>"}`. The Desktop inbox plugin draws the card
+from the item's fields: a chat of the thread (older turns folded), the selected option as a draft bubble, the
+`option_N` texts with their `option_N_angle` labels, an optional one-line `summary`, and `grounding`/`sources`
+under "Why this reply". The full plain text (body, previews, actions line) stays in the same message inside an
+HTML comment, so the card's agent and raw readers still see everything. Cards without a valid `thread` render as
+before. Tests: `tests/test_social_card.py`, `desktop-plugins/inbox/test/social-card.test.mjs`.
+
 ## Producer settlement
 
 A producer reports the terminal result of an **existing** decision without impersonating a

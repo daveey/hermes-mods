@@ -39,6 +39,13 @@
  * the open card step to the next message, and on the last one to the session
  * core's ⌘⇧A would open (`ctx.openNextSession`, fork core; older cores open a
  * fresh draft).
+ *
+ * Social cards: an item whose fields carry `thread` (JSON turns) is posted as
+ * `::social-card{session}`; the directive draws it as a chat (their posts
+ * left, yours right, the answered post outlined, older turns folded), the
+ * selected option as a dashed draft bubble, then the options to pick. Click or
+ * a bare 1…9 (not in an editable) selects; the bar's per-option buttons
+ * collapse into the selected one, and Edit opens prefilled with it.
  */
 import {
   atom,
@@ -47,9 +54,10 @@ import {
   SIDEBAR_SECTIONS_AREA,
   SidebarSection,
   SidebarSectionRow,
+  TRANSCRIPT_DIRECTIVE_AREA,
   useValue
 } from '@hermes/plugin-sdk'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'inbox'
@@ -155,14 +163,14 @@ export function rowActions(item) {
 }
 
 /** The buttons ⌥1…⌥9 run, in bar order: every bar action but Archive (⌘⇧A). */
-export function keyActions(item) {
-  return barActions(item).filter(a => a.kind !== 'archive').slice(0, 9)
+export function keyActions(item, selected) {
+  return socialBarActions(item, selected).filter(a => a.kind !== 'archive').slice(0, 9)
 }
 
 /** Key hint shown on a bar button; '' for buttons without one. */
-export function keyHint(item, action, mac = IS_MAC) {
+export function keyHint(item, action, mac = IS_MAC, selected) {
   if (action.kind === 'archive') return mac ? '⌘⇧A' : 'Ctrl+Shift+A'
-  const n = keyActions(item).indexOf(action) + 1
+  const n = keyActions(item, selected).findIndex(a => a.id === action.id) + 1
   return n ? (mac ? `⌥${n}` : `Alt+${n}`) : ''
 }
 
@@ -206,9 +214,20 @@ const barShown = () =>
   typeof document === 'undefined' || typeof document.querySelector !== 'function' || !!document.querySelector('[data-slot="inbox-bar"]')
 
 /** Initial editor text for an input action: the field it edits, else empty. */
-export function inputDefault(item, action) {
+export function inputDefault(item, action, selected) {
   const f = action && action.input && action.input.field
-  return f ? str(item && item.fields && item.fields[f]) : ''
+  if (f) return str(item && item.fields && item.fields[f])
+  // Edit & post on a social card starts from the selected option.
+  const sel = action && action.input && socialOptions(item).length ? selectedOption(item, selected) : null
+  return sel ? sel.text : ''
+}
+
+/** A bare 1–9 (no modifiers, not typed into an editable): select that option. */
+export function optionKeyDigit(e) {
+  if (!e || e.altKey || e.metaKey || e.ctrlKey || e.shiftKey || e.repeat || e.isComposing) return 0
+  if (isEditable(e.target)) return 0
+  const m = /^Digit([1-9])$/.exec(str(e.code))
+  return m ? Number(m[1]) : 0
 }
 
 /** Length in code points (what the server's len() counts; emoji are 1, not 2). */
@@ -218,6 +237,98 @@ export function counterText(value, max) {
   const n = charCount(value)
   return max ? `${n}/${max}` : `${n}`
 }
+
+// ── social cards (::social-card directive) ──────────────────────────────────
+// Social cards (Bluesky/X replies, drafts, DMs) carry the conversation as a
+// `thread` field (JSON turns, oldest first). The store posts `::social-card`
+// for them and this plugin draws it as a chat: their posts left, yours right,
+// the post being answered outlined, your draft as the next bubble, then the
+// options to pick from. All text is untrusted and rendered as text only.
+
+// Types whose `text` field is the (first) draft; elsewhere `text` is the incoming post.
+const DRAFT_TEXT_TYPES = new Set(['bsky-reply-draft', 'x-reply-draft'])
+const KEEP_SHOWN = 3
+
+/** The card's turns, or null when it has no valid `thread` field. */
+export function parseThread(item) {
+  let turns
+  try {
+    turns = JSON.parse(str(item && item.fields && item.fields.thread))
+  } catch {
+    return null
+  }
+  if (!Array.isArray(turns) || !turns.length || !turns.every(t => t && typeof t === 'object' && typeof t.text === 'string')) return null
+  return turns.map(t => ({ author: str(t.author), self: !!t.self, text: t.text, url: safeUrl(t.url), target: !!t.target }))
+}
+
+/** http(s) URLs only (thread data is untrusted). */
+export function safeUrl(u) {
+  const v = str(u).trim()
+  return /^https?:\/\/[^\s"'<>]+$/i.test(v) ? v : ''
+}
+
+/** Earlier turns fold away once there are more than KEEP_SHOWN + 1. */
+export function foldTurns(turns) {
+  if (turns.length <= KEEP_SHOWN + 1) return { folded: [], shown: turns }
+  return { folded: turns.slice(0, -KEEP_SHOWN), shown: turns.slice(-KEEP_SHOWN) }
+}
+
+/** The option number an action posts (`post` = 1, `post_2`/`choose_2`/`send_2` = 2), else 0. */
+export function optionOfAction(action) {
+  const id = str(action && action.id)
+  if (id === 'post') return 1
+  const m = /^(?:post|choose|send)_([1-9])$/.exec(id)
+  return m ? Number(m[1]) : 0
+}
+
+/** [{n, text, angle, action}] for the card's reply options, in order. */
+export function socialOptions(item) {
+  const f = (item && item.fields) || {}
+  const acts = Array.isArray(item && item.actions) ? item.actions : []
+  const out = []
+  for (let n = 1; n <= 9; n++) {
+    let text = f[`option_${n}`]
+    if (n === 1 && text == null && DRAFT_TEXT_TYPES.has(str(item && item.type))) text = f.text
+    if (typeof text !== 'string' || !text.trim()) continue
+    out.push({ n, text, angle: str(f[`option_${n}_angle`]), action: acts.find(a => optionOfAction(a) === n) || null })
+  }
+  return out
+}
+
+/** The selected option for a card (default the first). */
+export function selectedOption(item, selected) {
+  const opts = socialOptions(item)
+  if (!opts.length) return null
+  const want = selected && item ? selected[item.session_id] : undefined
+  return opts.find(o => o.n === want) || opts[0]
+}
+
+/** Bar buttons with a selection: the per-option buttons collapse into the selected one (primary). */
+export function socialBarActions(item, selected) {
+  const base = barActions(item)
+  const opts = socialOptions(item).filter(o => o.action)
+  if (opts.length < 2) return base
+  const sel = selectedOption(item, selected)
+  const pick = sel && sel.action ? { ...sel.action, style: 'primary' } : null
+  const rest = base.filter(a => !optionOfAction(a))
+  return pick ? [pick, ...rest] : rest
+}
+
+/** Sources field: JSON [{label,url}] or "label: url" lines. */
+export function parseSources(raw) {
+  const v = str(raw).trim()
+  if (!v) return []
+  try {
+    const j = JSON.parse(v)
+    if (Array.isArray(j)) return j.filter(x => x && typeof x === 'object').map(x => ({ label: str(x.label || x.url), url: safeUrl(x.url) })).filter(x => x.label)
+  } catch {}
+  return v.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+    const m = /^(.*?):?\s*(https?:\/\/\S+)$/.exec(l)
+    return m ? { label: m[1] || m[2], url: safeUrl(m[2]) } : { label: l, url: '' }
+  })
+}
+
+const PLATFORM = t => (str(t).startsWith('bsky') ? 'Bluesky' : str(t).startsWith('x-') ? 'X' : '')
 
 // ── hermes-hub replica (hub-sync plugin) ────────────────────────────────────
 // Open cards of gateways whose live /items read failed (unreachable) or that
@@ -292,6 +403,11 @@ export function createStore(ctx) {
   // The inline editor ({sid, action, value}); in the store so the action keys
   // can open it and stay off while it is open.
   const $editing = atom(null)
+  // Social cards: selected option per session id, and items fetched for cards
+  // that are no longer open (accepted/resolved chats still draw their card).
+  const $selected = atom({})
+  const $cards = atom({})
+  const fetching = new Set()
   let inflight = null
   let again = false
 
@@ -518,12 +634,53 @@ export function createStore(ctx) {
 
   // Run (or open the editor for) a bar button.
   const run = (item, action) => {
-    if (action.input) $editing.set({ sid: item.session_id, action, value: inputDefault(item, action) })
+    if (action.input) $editing.set({ sid: item.session_id, action, value: inputDefault(item, action, $selected.get()) })
     else void store.act(item, action)
+  }
+
+  const select = (sid, n) => {
+    if (!sid || !n) return
+    $selected.set({ ...$selected.get(), [sid]: n })
+  }
+
+  // The item behind a ::social-card: the open list, else the fetched copy.
+  const cardItem = sid => itemFor($items.get(), sid) || $cards.get()[sid] || null
+
+  // Fetch a card that is not in the open list: routed gateway first, then the rest.
+  const fetchCard = async sid => {
+    if (!sid || fetching.has(sid) || cardItem(sid)) return cardItem(sid)
+    fetching.add(sid)
+    try {
+      const routed = routedGateway()
+      for (const gateway of gatewayIds()) {
+        try {
+          const r = await ctx.rest(`/items/${encodeURIComponent(sid)}`, gateway === routed ? { timeoutMs: 8000 } : { connectionId: gateway, timeoutMs: 8000 })
+          if (r && r.session_id) {
+            const item = { ...r, gateway, profile: r.profile || 'default' }
+            $cards.set({ ...$cards.get(), [sid]: item })
+            return item
+          }
+        } catch {}
+      }
+      $cards.set({ ...$cards.get(), [sid]: { session_id: sid, missing: true } })
+      return null
+    } finally {
+      fetching.delete(sid)
+    }
   }
 
   // ⌥1…⌥9 on the open card. Returns true when it ran something.
   const onKeyDown = e => {
+    const d = optionKeyDigit(e)
+    if (d && !e.defaultPrevented) {
+      const it = itemFor($items.get(), host.state.focusedStoredSessionId?.get?.())
+      if (it && socialOptions(it).some(o => o.n === d) && !($editing.get() && $editing.get().sid === it.session_id)) {
+        e.preventDefault()
+        select(it.session_id, d)
+        return true
+      }
+      return false
+    }
     const n = actionKeyDigit(e)
     if (!n || !keyTargetAllowed(e) || !keyCharAllowed(e, n)) return false
     const item = itemFor($items.get(), host.state.focusedStoredSessionId?.get?.())
@@ -533,7 +690,7 @@ export function createStore(ctx) {
       e.preventDefault()
       return false
     }
-    const action = keyActions(item)[n - 1]
+    const action = keyActions(item, $selected.get())[n - 1]
     if (!action) return false
     e.preventDefault()
     e.stopImmediatePropagation?.()
@@ -541,7 +698,7 @@ export function createStore(ctx) {
     return true
   }
 
-  const store = { $items, $open, $busy, $editing, refresh, open, markRead, archive, archiveHotkey, accept, act, run, onKeyDown, setOpen }
+  const store = { $items, $open, $busy, $editing, $selected, $cards, refresh, open, markRead, archive, archiveHotkey, accept, act, run, onKeyDown, setOpen, select, cardItem, fetchCard }
   return store
 }
 
@@ -739,6 +896,7 @@ export function Bar({ store }) {
   const busy = useValue(store.$busy)
   const focused = useValue(host.state.focusedStoredSessionId)
   const editing = useValue(store.$editing)
+  const selected = useValue(store.$selected)
   const setEditing = v => store.$editing.set(v)
   const item = itemFor(items, focused)
   if (!item) return null
@@ -770,18 +928,180 @@ export function Bar({ store }) {
         title: item.accept_prompt,
         children: `${label}${item.poster ? ` from ${item.poster}` : ''}`
       }),
-      ...barActions(item).map(action =>
+      ...socialBarActions(item, selected).map(action =>
         jsx(ActionButton, {
           action,
           disabled,
           // Prompt actions show what they will send (the template), so nothing runs unseen.
           title: action.kind === 'accept' || action.id === 'do_it' ? item.accept_prompt : action.kind === 'prompt' || action.kind === 'task' ? str(action.prompt) || action.label : action.label,
-          hint: keyHint(item, action),
+          hint: keyHint(item, action, IS_MAC, selected),
           onClick: () => run(action)
         }, action.id)
       )
     ]
   })
+}
+
+// ── ::social-card ───────────────────────────────────────────────────────────
+
+const C = {
+  muted: 'var(--ui-text-tertiary, var(--muted-foreground))',
+  border: 'var(--border)',
+  accent: 'var(--accent)',
+  target: '#f0b429'
+}
+const SC = {
+  card: { maxWidth: 680, margin: '4px 0 8px', fontSize: '0.875rem', lineHeight: 1.45 },
+  head: { display: 'flex', gap: 6, alignItems: 'baseline', fontSize: '0.75rem', color: C.muted, marginBottom: 8 },
+  kind: { color: 'var(--foreground)', fontWeight: 600 },
+  summary: { margin: '0 0 10px' },
+  label: { fontSize: '0.6875rem', textTransform: 'uppercase', letterSpacing: '0.07em', color: C.muted, marginRight: 8 },
+  chat: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, border: `1px solid ${C.border}`, borderRadius: 12 },
+  fold: { alignSelf: 'center', font: 'inherit', fontSize: '0.75rem', color: C.muted, background: 'none', border: `1px dashed ${C.border}`, borderRadius: 12, padding: '2px 12px', cursor: 'pointer' },
+  row: me => ({ display: 'flex', gap: 8, maxWidth: '84%', alignSelf: me ? 'flex-end' : 'flex-start' }),
+  av: me => ({ flex: 'none', width: 24, height: 24, borderRadius: '50%', display: 'grid', placeItems: 'center', fontSize: '0.6875rem', fontWeight: 700, background: me ? C.accent : 'color-mix(in srgb, var(--foreground) 14%, transparent)', color: me ? 'var(--accent-foreground, white)' : 'var(--foreground)' }),
+  bubble: (me, target, draft) => ({
+    padding: '6px 11px',
+    borderRadius: me ? '14px 14px 4px 14px' : '14px 14px 14px 4px',
+    border: draft ? `1px dashed ${C.accent}` : `1px solid ${target ? C.target : me ? 'color-mix(in srgb, var(--accent) 45%, transparent)' : C.border}`,
+    boxShadow: target ? `inset 0 0 0 1px ${C.target}` : undefined,
+    background: draft ? 'transparent' : me ? 'color-mix(in srgb, var(--accent) 16%, transparent)' : 'color-mix(in srgb, var(--foreground) 5%, transparent)',
+    whiteSpace: 'pre-wrap',
+    overflowWrap: 'anywhere'
+  }),
+  bh: { display: 'flex', gap: 8, alignItems: 'center', fontSize: '0.6875rem', color: C.muted, marginBottom: 2 },
+  link: { marginLeft: 'auto', color: C.muted, textDecoration: 'none' },
+  sec: { margin: '14px 0 6px', fontSize: '0.6875rem', letterSpacing: '0.07em', textTransform: 'uppercase', color: C.muted },
+  opt: on => ({ display: 'flex', width: '100%', gap: 10, alignItems: 'flex-start', textAlign: 'left', font: 'inherit', color: 'inherit', border: `1px solid ${on ? C.accent : C.border}`, background: on ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : 'transparent', borderRadius: 10, padding: '8px 12px', cursor: 'pointer', marginBottom: 6 }),
+  num: on => ({ flex: 'none', width: 20, height: 20, borderRadius: '50%', display: 'grid', placeItems: 'center', fontSize: '0.6875rem', border: `1px solid ${on ? C.accent : C.muted}`, background: on ? C.accent : 'transparent', color: on ? 'var(--accent-foreground, white)' : C.muted }),
+  angle: on => ({ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: on ? C.accent : C.muted }),
+  count: { flex: 'none', fontSize: '0.6875rem', color: C.muted, fontVariantNumeric: 'tabular-nums' },
+  why: { marginTop: 12, borderTop: `1px solid ${C.border}`, paddingTop: 8, fontSize: '0.75rem', color: C.muted }
+}
+
+const initial = a => (str(a).replace(/^@/, '')[0] || '?').toUpperCase()
+const shortHandle = a => str(a).replace(/\.bsky\.social$/, '')
+
+function Turn({ turn, draft }) {
+  const me = turn.self || draft
+  const who = draft ? 'You · draft, not posted' : me ? 'You' : shortHandle(turn.author)
+  return jsxs('div', {
+    'data-slot': draft ? 'social-draft' : 'social-turn',
+    'data-target': turn.target ? 'true' : undefined,
+    style: SC.row(me),
+    children: [
+      me ? null : jsx('span', { style: SC.av(false), 'aria-hidden': true, children: initial(turn.author) }),
+      jsxs('div', {
+        style: SC.bubble(me, turn.target, draft),
+        children: [
+          jsxs('div', {
+            style: SC.bh,
+            children: [
+              jsx('span', { children: who }),
+              turn.target ? jsx('span', { style: { color: C.target }, children: 'replying to this' }) : null,
+              turn.url ? jsx('a', { href: turn.url, target: '_blank', rel: 'noopener noreferrer', style: SC.link, title: 'Open post', children: '↗' }) : null
+            ]
+          }),
+          jsx('div', { 'data-slot': 'social-text', children: turn.text })
+        ]
+      })
+    ]
+  })
+}
+
+export function SocialCardView({ item, selected, onSelect, maxChars }) {
+  const [unfold, setUnfold] = useState(false)
+  const turns = parseThread(item) || []
+  const f = item.fields || {}
+  const { folded, shown } = foldTurns(turns)
+  const opts = socialOptions(item)
+  const sel = selectedOption(item, selected)
+  const specs = item.field_specs || {}
+  const maxFor = n => maxChars || (specs[`option_${n}`] && specs[`option_${n}`].max) || (specs.text && specs.text.max) || 0
+  const sources = parseSources(f.sources)
+  const target = turns.find(t => t.target) || turns[turns.length - 1]
+  const children = [
+    jsxs('div', {
+      style: SC.head,
+      children: [
+        jsx('span', { style: SC.kind, children: [PLATFORM(item.type), item.type_label || ''].filter(Boolean).join(' · ') }),
+        target && !target.self ? jsx('span', { children: `· ${shortHandle(target.author)}` }) : null,
+        jsx('span', { style: { marginLeft: 'auto' }, children: ago(item.created_at) })
+      ]
+    }),
+    f.summary ? jsxs('p', { 'data-slot': 'social-summary', style: SC.summary, children: [jsx('span', { style: SC.label, children: 'Thread' }), f.summary] }) : null,
+    jsxs('div', {
+      style: SC.chat,
+      children: [
+        folded.length
+          ? jsx('button', { type: 'button', 'data-slot': 'social-fold', style: SC.fold, onClick: () => setUnfold(!unfold), children: unfold ? 'Hide earlier posts' : `Show ${folded.length} earlier post${folded.length === 1 ? '' : 's'}` })
+          : null,
+        ...(unfold ? folded : []).map((t, i) => jsx(Turn, { turn: t }, `f${i}`)),
+        ...shown.map((t, i) => jsx(Turn, { turn: t }, `s${i}`)),
+        sel ? jsx(Turn, { turn: { self: true, text: sel.text }, draft: true }, 'draft') : null
+      ]
+    }),
+    opts.length > 1
+      ? jsxs('div', {
+          'data-slot': 'social-options',
+          children: [
+            jsx('div', { style: SC.sec, children: 'Pick a reply' }),
+            ...opts.map(o => {
+              const on = sel && sel.n === o.n
+              return jsxs('button', {
+                type: 'button',
+                'data-slot': 'social-option',
+                'data-option': String(o.n),
+                'aria-pressed': on ? 'true' : 'false',
+                style: SC.opt(on),
+                onClick: () => onSelect && onSelect(o.n),
+                children: [
+                  jsx('span', { style: SC.num(on), children: String(o.n) }),
+                  jsxs('span', { style: { flex: 1 }, children: [o.angle ? jsx('span', { style: SC.angle(on), children: o.angle }) : null, jsx('span', { children: o.text })] }),
+                  jsx('span', { style: SC.count, children: counterText(o.text, maxFor(o.n)) })
+                ]
+              }, o.n)
+            })
+          ]
+        })
+      : null,
+    f.grounding || sources.length
+      ? jsxs('details', {
+          'data-slot': 'social-why',
+          style: SC.why,
+          children: [
+            jsx('summary', { style: { cursor: 'pointer', color: 'var(--foreground)' }, children: 'Why this reply' }),
+            f.grounding ? jsx('p', { style: { margin: '6px 0 0', whiteSpace: 'pre-wrap' }, children: f.grounding }) : null,
+            sources.length
+              ? jsx('p', {
+                  style: { margin: '6px 0 0' },
+                  children: sources.map((x, i) =>
+                    x.url
+                      ? jsx('a', { href: x.url, target: '_blank', rel: 'noopener noreferrer', style: { color: C.accent, marginRight: 12 }, children: x.label }, i)
+                      : jsx('span', { style: { marginRight: 12 }, children: x.label }, i)
+                  )
+                })
+              : null
+          ]
+        })
+      : null
+  ]
+  return jsx('div', { 'data-slot': 'social-card', style: SC.card, children })
+}
+
+export function SocialCard({ store, attrs, sessionId }) {
+  const sid = str(sessionId) || str(attrs && attrs.session)
+  const items = useValue(store.$items)
+  const cards = useValue(store.$cards)
+  const selected = useValue(store.$selected)
+  const item = itemFor(items, sid) || cards[sid] || null
+  useEffect(() => {
+    if (sid && !item) void store.fetchCard(sid)
+  }, [sid, !!item])
+  if (!item || item.missing || !parseThread(item)) {
+    return jsx('div', { 'data-slot': 'social-card-missing', style: { fontSize: '0.75rem', color: C.muted }, children: item && item.missing ? 'Card details unavailable.' : item ? '' : 'Loading card…' })
+  }
+  return jsx(SocialCardView, { item, selected, onSelect: n => store.select(sid, n) })
 }
 
 export default {
@@ -813,6 +1133,9 @@ export default {
     }
     ctx.register({ id: 'section', area: SIDEBAR_SECTIONS_AREA, order: 5, render: () => jsx(Section, { store }) })
     ctx.register({ id: 'bar', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Bar, { store }) })
+    if (TRANSCRIPT_DIRECTIVE_AREA) {
+      ctx.register({ id: 'social-card', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'social-card', render: props => jsx(SocialCard, { store, ...props }) } })
+    }
     log('registered')
   }
 }

@@ -8,9 +8,9 @@ export async function resolve(spec, ctx, next) {
   if (spec === '@hermes/plugin-sdk') return { url: 'data:text/javascript,' + encodeURIComponent(
     'export const host = globalThis.__host = { state: {} };' +
     'export const atom = v => { let x = v; return { get: () => x, set: n => { x = n } } };' +
-    'export const COMPOSER_AREAS = { top: "composer.top" }; export const SIDEBAR_SECTIONS_AREA = "sidebar.sections";' +
+    'export const COMPOSER_AREAS = { top: "composer.top" }; export const SIDEBAR_SECTIONS_AREA = "sidebar.sections"; export const TRANSCRIPT_DIRECTIVE_AREA = "transcript.directives";' +
     'export const SidebarSection = () => null; export const SidebarSectionRow = () => null; export const useValue = a => a.get();'), shortCircuit: true }
-  if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useState=v=>(globalThis.__useState?globalThis.__useState(v):[v,()=>{}]);export const jsx=(type,props,key)=>({type,props,key});export const jsxs=(type,props,key)=>({type,props,key})', shortCircuit: true }
+  if (spec === 'react' || spec === 'react/jsx-runtime') return { url: 'data:text/javascript,export const useState=v=>(globalThis.__useState?globalThis.__useState(v):[v,()=>{}]);export const useEffect=()=>{};export const jsx=(type,props,key)=>({type,props,key});export const jsxs=(type,props,key)=>({type,props,key})', shortCircuit: true }
   return next(spec, ctx)
 }`))
 const m = await import('../plugin.js')

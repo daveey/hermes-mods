@@ -585,7 +585,7 @@ class Inbox:
                 if existing:
                     sid = existing
                     text = (_update_text(body, accept_prompt, now, prompt_label) if legacy
-                            else _typed_update_text(body, snap, fvals, now))
+                            else _typed_update_text(body, snap, fvals, now, sid))
                     db.append_message(sid, "assistant", text)
                     side.execute("UPDATE items SET title=?, poster=COALESCE(?, poster), accept_prompt=?, "
                                  "updated_at=?, type=?, fields_json=?, actions_json=?, ask_json=? WHERE session_id=?",
@@ -598,7 +598,7 @@ class Inbox:
                 talking = self._accepted_by_key(side, db, key) if key and not decision else None
                 if talking:  # the user replied to this card: the follow-up joins that conversation
                     db.append_message(talking, "assistant", _update_text(body, accept_prompt, now, prompt_label)
-                                      if legacy else _typed_update_text(body, snap, fvals, now))
+                                      if legacy else _typed_update_text(body, snap, fvals, now, talking))
                     side.execute("UPDATE items SET updated_at=? WHERE session_id=?", (now, talking))
                     side.commit()
                     db.set_session_read(talking, False)
@@ -630,7 +630,7 @@ class Inbox:
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
                 db.set_session_hidden(sid, True)
                 text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy
-                        else _typed_post_text(title, body, poster, snap, fvals))
+                        else _typed_post_text(title, body, poster, snap, fvals, sid))
                 db.append_message(sid, "assistant", text)
                 _set_title(db, sid, title)
                 db.set_session_read(sid, False)
@@ -794,7 +794,7 @@ class Inbox:
                               json.dumps(fvals), json.dumps(snap), int(cwd is not None),
                               json.dumps(ask) if ask else None))
                 text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy else
-                        _typed_post_text(title, body, poster, snap, fvals))
+                        _typed_post_text(title, body, poster, snap, fvals, sid))
             else:
                 sid = current["session_id"]
                 conn.execute("UPDATE inbox.items SET title=?,poster=COALESCE(?,poster),accept_prompt=?,"
@@ -802,7 +802,7 @@ class Inbox:
                              (title, poster, accept_prompt, now, snap["name"], json.dumps(fvals),
                               json.dumps(snap), json.dumps(ask) if ask else None, sid))
                 text = (_update_text(body, accept_prompt, now, prompt_label) if legacy else
-                        _typed_update_text(body, snap, fvals, now))
+                        _typed_update_text(body, snap, fvals, now, sid))
             db._check_transcript_write_guards(conn, sid, None, reject_active_turn_lease=True)
             type(db).append_message(writer, sid, "assistant", text)
             # Match the legacy title collision fallback without reading outside the transaction.
@@ -1453,20 +1453,49 @@ def _actions_line(snap: dict[str, Any], poster: Optional[str]) -> str:
             f"Actions: {', '.join(labels)}._")
 
 
+def social_thread(fields: dict[str, str]) -> Optional[list]:
+    """The card's structured conversation (``thread`` field: JSON list of turns), or None.
+    A card with one is drawn by the Desktop ``::social-card`` directive."""
+    raw = (fields or {}).get("thread")
+    if not raw:
+        return None
+    try:
+        turns = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(turns, list) or not turns or not all(
+            isinstance(t, dict) and isinstance(t.get("text"), str) for t in turns):
+        return None
+    return turns
+
+
+def _social_card(head: str, rest: list[str], sid: Optional[str]) -> str:
+    """Desktop draws the card from the item's fields; the full plain text stays in the message
+    (inside an HTML comment, hidden by the Desktop renderer) for the card's agent, CLI and raw readers."""
+    attr = f'{{session="{sid}"}}' if sid and re.fullmatch(r"[A-Za-z0-9_.:-]+", sid) else ""
+    plain = "\n\n".join(rest).replace("-->", "-- >").replace("<!--", "< !--")
+    return f"{head}\n\n::social-card{attr}\n\n<!-- social-card:text\n{plain}\n-->"
+
+
 def _typed_post_text(title: str, body: str, poster: Optional[str], snap: dict[str, Any],
-                     fields: dict[str, str]) -> str:
+                     fields: dict[str, str], sid: Optional[str] = None) -> str:
     parts = [f"**{title}**"]
     if body:
         parts.append(body)
     parts += _previews(snap, fields)
     parts.append(_actions_line(snap, poster))
+    if social_thread(fields) is not None:
+        return _social_card(parts[0], parts[1:], sid)
     return "\n\n".join(parts)
 
 
-def _typed_update_text(body: str, snap: dict[str, Any], fields: dict[str, str], now: float) -> str:
+def _typed_update_text(body: str, snap: dict[str, Any], fields: dict[str, str], now: float,
+                       sid: Optional[str] = None) -> str:
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
     parts = [f"**Update {stamp}**"]
     if body:
         parts.append(body)
     parts += _previews(snap, fields)
+    if social_thread(fields) is not None:
+        return _social_card(parts[0], parts[1:], sid)
     return "\n\n".join(parts)
