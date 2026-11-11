@@ -88,7 +88,10 @@ How to run it from an agent:
   (`desktop.auto_continue.enabled: false`); a message you type before the report turn starts; a receipt
   older than 24 h. In those cases the job can still die without a word. So after any update or restart, check
   each wait you promised with `process_manage poll` (or `--once`). If a deploy or a promised report depends
-  on the wait, put that step on a durable Kanban card with a `wake_check`, not a chat-owned chain.
+  on the wait, put that step on a durable Kanban card with a `wake_check`, not a chat-owned chain. The wake_check is
+  a small script around `--once` (fresh `token-broker exec` inside) that maps exits: 0 or 1 → `exit 0` (finished,
+  green or red: wake), 2 → `exit 1` (not yet), else `exit 2`. Passing `--once`'s status through reads a red run as
+  "not yet" and the card never wakes. `--check-every 900` keeps it under the shared GitHub budget.
 - Never pipe the wait through a filter (`| tail -n`, a secret-scrubbing `| grep -v`): the pipeline's exit status is
   the filter's, so a failed or killed wait reports exit code 0 in its background notice, and
   `wait | filter && deploy` deploys after it. If you must filter, start the command with `set -o pipefail`; when
