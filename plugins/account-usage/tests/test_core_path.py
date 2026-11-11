@@ -36,8 +36,13 @@ class RequireCore(unittest.TestCase):
     def test_missing_requested_core_fails_instead_of_skipping(self):
         for var in ('HERMES_TEST_CORE', 'HERMES_CORE_CHECKOUT'):
             with self.subTest(var=var), patch.dict(os.environ, {var: str(self.home / 'missing-core')}):
-                with self.assertRaisesRegex(ImportError, 'Hermes test core not found'):
-                    core_path.require_core()
+                # A SkipTest is no ImportError: raised inside assertRaisesRegex it escapes and the subtest is
+                # reported skipped, so a require_core() that skipped again would leave this test green.
+                try:
+                    with self.assertRaisesRegex(ImportError, 'Hermes test core not found'):
+                        core_path.require_core()
+                except unittest.SkipTest as skipped:
+                    self.fail(f'{var} names a missing core, yet require_core() skipped instead of failing: {skipped}')
 
     def test_found_core_is_returned(self):
         core = self.fake_core(self.home / '.hermes' / 'hermes-agent')
