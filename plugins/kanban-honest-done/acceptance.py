@@ -93,7 +93,19 @@ def state_db(env=None) -> Path:
 
 
 def _ro(path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    uri = path.resolve().as_uri()
+    try:
+        return sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=2)
+    except sqlite3.OperationalError:
+        # WAL sidecars may need creating after the last writer checkpoints.
+        # mode=rw never creates a missing database; query_only forbids writes.
+        conn = sqlite3.connect(f"{uri}?mode=rw", uri=True, timeout=2)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+        except sqlite3.Error:
+            conn.close()
+            raise
+        return conn
 
 
 def lineage(conn: sqlite3.Connection, session_id: str) -> list[str]:
