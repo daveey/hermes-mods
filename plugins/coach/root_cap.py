@@ -1152,23 +1152,49 @@ def human_origin(session_id, db=None):
     return True, ""
 
 
+# A question is not a decision ("Did I authorize ...", "Can I raise ..."), but a negated imperative that merely starts
+# with the same word is ("Do not raise ...", "Can't raise ...").
+_QUESTION_LEAD = re.compile(r"\?|^\s*(?:did|do|does|have|has|had|is|are|was|were|if|what if|should|can|could|may|would|"
+                            r"shall|will|why|how|when|whether)\b(?!['\u2019]|\s+not\b)")
+# Someone else's words withdrawing the decision are not the user's cancellation. Narrower than _REPORTED on purpose:
+# a missed cancellation admits the write, so only a clear third-party attribution disqualifies it ("I said cancel
+# that" and "you told me to cancel it" stay the user's own).
+_REPORTED_CANCEL = re.compile(r"^\s*(>|the (assistant|agent|worker|notice|bot|card)\b)|\baccording to\b|"
+                              r"\b(?!(?:i|we|you)\b)\w+\s+(said|says|wrote|writes|claimed?|claims|asked|asks|told|"
+                              r"suggested|proposed|quote[sd]?|reported|reads?)\b")
+
+
+def _own_speech(text):
+    """The human's own words only: every quoted span (double, curly, single, curly single) is removed; backticks
+    around an identifier are not quotation (`kanban.max_in_progress` is still the user naming the key) and
+    apostrophes inside words ("I'm", "owner's") are not quotation marks."""
+    return _QUOTED_SQ.sub(" ", _QUOTED_DQ.sub(" ", text)).replace("`", "")
+
+
 def _decision(items, rec, new_value):
     """Latest surviving direct human decision for this contract revision, whatever its value; it is returned only when
     it authorizes `new_value`. A later explicit decision for another value (or a cancellation) therefore supersedes an
-    earlier one: the old value is refused, the latest is admitted (None / dict)."""
+    earlier one: the old value is refused, the latest is admitted (None / dict). Every sentence is classified as the
+    user's own speech FIRST (quoted/reported/interrogative text is neither an authorization nor a cancellation),
+    then as cancellation/negation, then as an authorization."""
     leaf = _leaf(rec["key"])
     digest = rec["contract_revision_digest"]
     current = None
     for item in items:
         raw = item["text"]
         text = raw.lower()
-        for s in _sentences(text):
-            if "?" in s or re.match(r"^(if|what if|should i|can i|could i|may i|would you|shall i)\b", s):
+        for s in _sentences(_own_speech(text)):
+            if _QUESTION_LEAD.search(s):
                 continue
-            if _CANCEL.search(s) or (_NEG.search(s) and leaf in s):
-                current = None
+            if _CANCEL.search(s):
+                if not _REPORTED_CANCEL.search(s):
+                    current = None
                 continue
-            bare = _QUOTED.sub(" ", s)
+            if _NEG.search(s) and leaf in s:
+                if not _REPORTED.search(s):
+                    current = None
+                continue
+            bare = s
             if _REPORTED.search(s) or leaf not in bare or not _AUTH.search(bare):
                 continue
             m = re.search(r"\bfrom\s+(\d+)\s+to\s+(\d+)\b", bare)
