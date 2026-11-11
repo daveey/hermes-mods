@@ -234,7 +234,7 @@ workers to stop chasing tests.
      new authorization), and otherwise open a support ticket asking for a billing-lock review.
    - Keep the probe running throughout; it ends the wait the moment any of these clears it.
 5. **When billing can't be fixed soon, move repos to self-hosted runners instead of waiting** (registration,
-   no-sudo workflow edits, dirty-checkout pitfalls, refused PR reruns): `references/self-hosted-runner-migration.md`.
+   no-sudo workflow edits, dirty-checkout pitfalls, refused PR reruns; also moving back to hosted/Blacksmith): `references/self-hosted-runner-migration.md`.
    Before moving a repo, check its `runs-on` and runners: another session may have moved it already.
 6. **Detection:** `~/.hermes/scripts/gh_actions_billing_watch.py` (hourly no_agent hub cron) files verified Kanban cards for refused jobs, spend thresholds, and persistent scan failures. Scan-unavailable errors are operational evidence, not confirmed billing locks: inspect broker vend failure_phase/failure_class, blocked reason, attempts and samples before choosing remediation. Never blindly retry exit75, which also represents quota denial. For read-only live verification, import and call `refused_jobs(now)` and `spend(now)` directly; `main()` and `--force` can create real cards, so tests must isolate the card sink and state.
 
