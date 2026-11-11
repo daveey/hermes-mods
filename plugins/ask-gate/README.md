@@ -575,3 +575,7 @@ Chat-delivery false-positive scan (2026-10-30, every non-dependency/time/transie
 boards: 224 asks): `chat_delivery` matched 3, all real asks to relay text into a Hermes chat (runners
 t_f15d182d, t_01a185154afb4293; default t_a5cc12d9). `tests/test_chat_delivery.py` pins those and the 4 real blocks a
 first draft matched wrongly.
+
+## Dropped resolved_check
+
+When core stops probing an ask's `resolved_check` it stamps `human_request.resolved_check_dropped_at` and `resolved_check_drop_reason` (`resolved_check_broken` / `resolved_check_lost`). The L1 live-state digest and the denied-wait nudge then lead with "Automatic detection stopped ... needs a manual unblock until the ask is re-filed" and show the filed ask under a "historical wording" label (any "I will notice automatically" promise no longer applies). Older cores never write the keys; nothing is imported from core. Tests: `tests/test_dropped_resolved_check.py`.

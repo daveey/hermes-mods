@@ -165,3 +165,7 @@ not an automatic resend on upgrade.
 Unit tests use throwaway SQLite files. Core integration additionally exercises real owner observation, receipt acceptance and projection using isolated owner/replica/origin databases; set `HERMES_CORE_SOURCE` to the fork checkout to enable those cases. Keep worker safety environment pins intact.
 
     HERMES_HOME="$PWD/test-home" HERMES_CORE_SOURCE=/path/to/hermes-agent uv run --with pytest --with pyyaml --with ruamel.yaml python -m pytest -q -p no:cacheprovider plugins/chat-closeout/tests
+
+## Dropped resolved_check
+
+An ask whose `human_request` carries `resolved_check_dropped_at` (core stopped probing it) is relayed with a leading "Automatic detection stopped ... needs a manual unblock until re-filed" warning in the ask notice, close-out notice and both prompts; the filed text follows labelled historical. The ask premise changes, so it is relayed once more. Older cores never set the keys. Tests: `tests/test_dropped_resolved_check.py`.

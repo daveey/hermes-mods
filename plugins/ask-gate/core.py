@@ -378,10 +378,32 @@ def waiting_on_david(cards: list[dict]) -> list[dict]:
             and (x.get("human_request") or (x.get("block_kind") or "") not in _NO_HUMAN_KINDS)]
 
 
+_DROP_CAUSE = {"resolved_check_broken": "its probe kept failing", "resolved_check_lost": "its probe went missing"}
+
+
+def drop_warning(hr: dict) -> str:
+    """Warning head when core stopped probing this ask's resolved_check (``resolved_check_dropped_at`` /
+    ``resolved_check_drop_reason`` on the human_request), else "". Older cores never write the keys, so this is
+    a plain read with no core import; an unknown reason still warns, just without a cause."""
+    if not isinstance(hr, dict) or not hr.get("resolved_check_dropped_at"):
+        return ""
+    cause = _DROP_CAUSE.get(str(hr.get("resolved_check_drop_reason") or ""))
+    return ("Automatic detection stopped" + (f" ({cause})" if cause else "") + ": this ask's resolved_check is no "
+            "longer probed, so the card will NOT resume by itself when the step is done; it needs a manual unblock "
+            "until the ask is re-filed with a working resolved_check.")
+
+
 def card_ask(card: dict, n: int = 160) -> str:
     hr = card.get("human_request") or {}
     ask = " ".join(str(hr.get("action") or "").split())
-    return ask[:n] if ask else "(no ask recorded on the card: kanban_show it)"
+    if not ask:
+        return "(no ask recorded on the card: kanban_show it)"
+    warn = drop_warning(hr)
+    if not warn:
+        return ask[:n]
+    # Filed wording may promise automatic detection; keep it, labelled as history, never as the current state.
+    return (f"{warn} Filed ask, historical wording (any promise to detect it automatically no longer applies): "
+            f"{ask[:n]}")
 
 
 # A reply telling David nothing waits on him (self-heal agent-d9399023fc: "This repair is not waiting for your

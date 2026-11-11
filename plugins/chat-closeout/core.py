@@ -497,7 +497,32 @@ def ask_of(card: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
         return None
     if value["interaction"] not in ASK_INTERACTIONS:
         return None
-    return {f: " ".join(value[f].split()) for f in ASK_FIELDS}
+    ask = {f: " ".join(value[f].split()) for f in ASK_FIELDS}
+    if value.get("resolved_check_dropped_at"):  # core stopped probing resolved_check; older cores never set this
+        ask["dropped"] = _DROP_CAUSE.get(str(value.get("resolved_check_drop_reason") or ""), "")
+        ask["dropped_at"] = value["resolved_check_dropped_at"]
+    return ask
+
+
+_DROP_CAUSE = {"resolved_check_broken": "its probe kept failing", "resolved_check_lost": "its probe went missing"}
+
+
+def drop_warning(ask: Optional[dict[str, Any]]) -> str:
+    """Prominent notice head for an ask whose resolved_check core stopped probing, else ""."""
+    if not ask or "dropped" not in ask:
+        return ""
+    return ("Automatic detection stopped" + (f" ({ask['dropped']})" if ask["dropped"] else "") + ": this ask's "
+            "resolved_check is no longer probed, so the card will NOT resume by itself when the user's step is "
+            "done; it needs a manual unblock until the ask is re-filed with a working resolved_check.")
+
+
+def _action_text(ask: dict[str, Any]) -> str:
+    """The ask's action verbatim; after a drop, the filed wording is labelled historical (it may promise automatic
+    detection that no longer applies) and follows the warning."""
+    if "dropped" not in ask:
+        return ask["action"]
+    return (f"{drop_warning(ask)} Filed ask, historical wording (any promise to detect it automatically no longer "
+            f"applies): {ask['action']}")
 
 
 def _norm(text: Any) -> str:
@@ -511,7 +536,8 @@ def ask_premise(tid: str, card: Optional[dict[str, Any]]) -> Optional[str]:
     if ask is None:
         return None
     basis = json.dumps([card.get("status"), card.get("block_kind") or "", _norm(ask["action"]),
-                        _norm(ask["why_human"]), _norm(ask["scope"])])
+                        _norm(ask["why_human"]), _norm(ask["scope"])]
+                       + (["dropped"] if "dropped" in ask else []))  # new fact for the user: re-relay once
     return f"{tid}@{hashlib.sha1(basis.encode()).hexdigest()[:12]}"
 
 
@@ -1505,7 +1531,7 @@ def _ask_line(c: dict[str, Any], now: Optional[float] = None) -> str:
     if age is not None and age >= ASK_RECHECK_S:
         when += (" -- an old ask: re-verify it still holds (newer comments, the work's skill, the account/repo/page "
                  "it names) before the user sees it; if it doesn't, correct the card instead of asking")
-    return (f"\n  needs the user to: {ask['action']}\n  why only the user: {ask['why_human'][:200]}"
+    return (f"\n  needs the user to: {_action_text(ask)}\n  why only the user: {ask['why_human'][:200]}"
             f" ({ask['interaction']}; scope: {ask['scope'][:160]}){when}")
 
 
@@ -1549,7 +1575,7 @@ def _ask_notice_lines(cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> l
         c = cards.get(tid) or {}
         title = " ".join(str(c.get("title") or tid).split())[:120]
         ask = ask_of(c)
-        lines.append(f"Needs you: {title}: {ask['action']}" if ask
+        lines.append(f"Needs you: {title}: {_action_text(ask)}" if ask
                      else f"Needs you: {title} (the card names no ask; this turn asks the agent to spell it out)")
     return lines
 
