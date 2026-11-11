@@ -59,7 +59,7 @@ test('classify sorts cards, sub-agents and processes into sections', () => {
   assert.match(out.stuck[0].detail, /^running, no progress since \d\d:\d\d \(2 h ago\) · last event: heartbeat$/)
   assert.match(out.waiting[0].detail, /^waiting on a timer since \d\d:\d\d$/)
   assert.match(out.stuck[2].detail, /^sub-agent · no new tool call for 30 min \(3 tool calls, last terminal\)$/)
-  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 3, needsYou: 2, stuck: 3, waiting: 1, queued: 1 },
+  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 3, needsYou: 2, stuck: 3, waiting: 1, ready: 0, queued: 1 },
     'sub-agents and processes count like the rows listed under each section')
 })
 
@@ -429,9 +429,16 @@ test('hub-scheduled running and waiting cards carry an H in their box; worker ca
   ] })
   await show(React.createElement(m.Panel, { key: 'hub' }))
   const pips = [...el().querySelectorAll('[data-pip]')].map(x => [x.dataset.pip, x.hasAttribute('data-pip-hub'), x.textContent])
-  assert.deepEqual(pips, [['running', true, 'H'], ['running', false, ''], ['waiting', true, 'H'], ['queued', true, 'H'], ['queued', false, '']])
-  assert.equal(el().querySelector('[data-progress-pips]').getAttribute('aria-label'), '2 running (1 on hub), 1 waiting (1 on hub), 2 not started (1 on hub)')
-  assert.deepEqual(m.hubCounts(m.classify(window.__sessionTasks.snapshot.chips)), { running: 1, stuck: 0, waiting: 1, queued: 1 })
+  assert.deepEqual(pips, [['running', true, 'H'], ['running', false, ''], ['ready', true, 'H'], ['waiting', true, 'H'], ['queued', false, '']])
+  assert.equal(el().querySelector('[data-progress-pips]').getAttribute('aria-label'), '2 running (1 on hub), 1 ready (1 on hub), 1 waiting (1 on hub), 1 not started')
+  assert.deepEqual(m.hubCounts(m.classify(window.__sessionTasks.snapshot.chips)), { running: 1, stuck: 0, waiting: 1, ready: 1, queued: 0 })
+  const colour = k => window.getComputedStyle(el().querySelector(`[data-pip="${k}"]`))
+  assert.equal(m.C.ready, '#3fb950', 'green = ready')
+  assert.equal(m.C.needsYou, '#f85149', 'red = blocked on me')
+  assert.equal(m.C.done, '#8b949e', 'grey = done')
+  assert.equal(m.C.waiting, '#d29922', 'yellow = not ready'); assert.equal(m.C.queued, '#d29922')
+  assert.ok(/3fb950|63, 185, 80/.test(colour('ready').backgroundColor), 'ready pip is filled green')
+  assert.ok(/d29922|210, 153, 34/.test(colour('queued').borderColor || colour('queued').border), 'not-started pip is yellow')
 })
 
 test('rows lead with their state box, not a dot; hub cards carry the H there too', async () => {

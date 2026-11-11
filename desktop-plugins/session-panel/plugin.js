@@ -3,7 +3,9 @@
  *   is work moving, how much is left, what is waiting on me, and what is stuck.
  *
  *   header       agent replying in this chat / idle since …, then one small box per kanban card and the counts:
- *                needs you · stuck · running · waiting · not started · done
+ *                needs you · stuck · running · ready · waiting · not started · done
+ *                colours: red = needs you, green = ready, yellow = not ready (waiting / not started), grey = done,
+ *                blue = running, orange = stuck
  *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks; a card
  *                no ask covers shows its own human_request as "Do this / Why you / Next" (askView), never its
  *                agent-written title or block reason; without a request it says so and offers Ask agent
@@ -15,7 +17,7 @@
  *   In progress  running and in-review cards, sub-agents, background processes, rented machines
  *   Waiting      parked cards and what they wait on
  *   footer       finished and not-yet-started cards, folded
- *   collapsed    the header line alone (caret + counts, needs-you in amber) plus one line per waiting card (up to 3);
+ * collapsed    the header line alone (caret + counts, needs-you in red) plus one line per waiting card (up to 3);
  *                the header is the composer status stack's own disclosure row (caret, icon, label), so this panel
  *                folds the same way the task list above it does
  *   hidden       when nothing is open (no ask, open card, sub-agent, process, step or issue): finished cards alone
@@ -80,7 +82,7 @@ export function trackSubagents(chips, nowMs, memory) {
 const TERMINAL = new Set(['done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'])
 export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false } = {}) {
   const now = nowMs / 1000
-  const out = { active: [], stuck: [], waiting: [], queued: [], unasked: [], lastActivity: 0 }
+  const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
   for (const c of chips || []) {
     if (!c || !c.key) continue
@@ -120,7 +122,8 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       continue
     }
     if (c.state === 'review') { out.active.push({ ...item(c), detail: `in review${last ? ` · ${ago(last, nowMs)}` : ''}` }); continue }
-    if (['todo', 'ready'].includes(c.state)) { out.queued.push({ ...item(c), detail: c.state === 'ready' ? 'ready to start' : 'not started' }); continue }
+    if (c.state === 'ready') { out.ready.push({ ...item(c), detail: 'ready to start' }); continue }
+    if (c.state === 'todo') { out.queued.push({ ...item(c), detail: 'not started' }); continue }
     out.waiting.push({ ...item(c), detail: on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state) })
   }
   return out
@@ -130,7 +133,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
  *  step or an agent issue. Done/archived cards (and a done list) never count: all green = no panel. */
 export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) {
   const open = list => (list || []).some(i => !(i.kind === 'kanban' && TERMINAL.has(str(i.chip?.state))))
-  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.queued) ||
+  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) ||
     (Array.isArray(steps) && steps.some(s => s?.id && (s.status || 'open') === 'open')) || (Array.isArray(issues) && issues.length))
 }
 
@@ -180,6 +183,7 @@ export function counts(sorted, { asks = 0, done = null } = {}) {
     needsYou: asks + sorted.unasked.length,
     stuck: sorted.stuck.length,
     waiting: sorted.waiting.length,
+    ready: (sorted.ready || []).length,
     queued: sorted.queued.length
   }
 }
@@ -277,25 +281,26 @@ function writeCollapsed(keys) {
 
 // ── UI ──────────────────────────────────────────────────────────────────────
 
-const C = {
-  done: 'var(--success, #3fb950)', running: 'var(--primary, #3b82f6)', needsYou: 'var(--warning, #d29922)',
-  stuck: 'var(--destructive, #f85149)', waiting: 'var(--muted-foreground, #8b949e)', queued: 'color-mix(in srgb, var(--muted-foreground, #8b949e) 45%, transparent)'
+// green = ready, red = blocked on the user, grey = done, yellow = not ready (waiting on something / not started).
+export const C = {
+  needsYou: '#f85149', ready: '#3fb950', done: '#8b949e', waiting: '#d29922', queued: '#d29922',
+  running: '#3b82f6', stuck: '#f0883e'
 }
-const LABEL = { done: 'done', running: 'running', needsYou: 'needs you', stuck: 'stuck', waiting: 'waiting', queued: 'not started' }
+const LABEL = { done: 'done', running: 'running', needsYou: 'needs you', stuck: 'stuck', ready: 'ready', waiting: 'waiting', queued: 'not started' }
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const heading = color => ({ margin: '12px 0 6px', fontSize: 12, fontWeight: 600, color })
 const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12.5, cursor: 'pointer' }
 
 // One small box per card, in the header beside the status: a full-width bar spent a whole row to say "1 waiting".
 // Shape carries state as well as colour: open work is filled, waiting is an outline, not started is dashed.
-const PIP_ORDER = ['needsYou', 'stuck', 'running', 'waiting', 'queued', 'done']
+const PIP_ORDER = ['needsYou', 'stuck', 'running', 'ready', 'waiting', 'queued', 'done']
 export const PIPS_MAX = 24 // boxes drawn before the rest fold into "+N"
 // A hub-scheduled card's box is a little larger and carries an "H" (running and waiting work alike).
 const pipStyle = (k, hub = false) => {
   const base = { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none' }
   const h = hub ? { width: 12, height: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 8.5, fontWeight: 700, lineHeight: 1 } : {}
   if (k === 'waiting') return { ...base, ...h, border: `1.5px solid ${C.waiting}`, color: C.waiting }
-  if (k === 'queued') return { ...base, ...h, border: `1.5px dashed ${C.waiting}`, opacity: 0.7, color: C.waiting }
+  if (k === 'queued') return { ...base, ...h, border: `1.5px dashed ${C.queued}`, color: C.queued }
   return { ...base, ...h, background: C[k], color: 'var(--card, #fff)' }
 }
 
@@ -303,7 +308,7 @@ const pipStyle = (k, hub = false) => {
 const onHub = i => i.kind === 'kanban' && i.chip?.runMachine === 'hub'
 export function hubCounts(sorted) {
   const on = list => (list || []).filter(onHub).length
-  return { running: on(sorted.active), stuck: on(sorted.stuck), waiting: on(sorted.waiting), queued: on(sorted.queued) }
+  return { running: on(sorted.active), stuck: on(sorted.stuck), waiting: on(sorted.waiting), ready: on(sorted.ready), queued: on(sorted.queued) }
 }
 
 export function Pips({ n, hub = {} }) {
@@ -449,7 +454,8 @@ export function Panel() {
       ...sorted.active.map(i => jsx(Row, { i, k: 'running' }, i.key)),
       sorted.waiting.length > 0 && jsx('h3', { 'data-section': 'waiting', style: heading('var(--muted-foreground)'), children: `Waiting · ${sorted.waiting.length}` }),
       ...sorted.waiting.map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
-      (finished?.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
+      (finished?.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
+        jsx(Fold, { label: `Ready · ${sorted.ready.length}`, items: sorted.ready, k: 'ready' }),
         jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),
         jsx(Fold, { label: `Done · ${finished?.length || 0}`, items: (finished || []).map(d => ({ key: d.key, label: d.label, detail: d.at ? `finished ${ago(d.at, now)}` : '' })), k: 'done' })
       ] }) : null
