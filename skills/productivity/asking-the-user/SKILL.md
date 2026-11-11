@@ -67,8 +67,11 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 - `browser_focus` can return `focused: true` with `shown_on_main_display: false` / `app_activated: false`: the
   agent Chrome is on a gateway's virtual display (hub: Xvfb `:99`) and the user sees nothing. Never say "it's in
   front" then; open the private noVNC view on the user's Mac instead (`references/hub-chrome-viewer.md`).
-- If the user says they can't see the window or page, look at the browser (list tabs / screenshot) before you
-  answer. Never repeat the ask unchecked.
+- If the user says they can't see the window or page, or reports a sign-in error without naming the site, look at
+  the browser (`browser_cdp` `Target.getTargets`, then read the tab's text) before you answer. Never ask "which
+  sign-in?" or repeat the ask unchecked. An OAuth callback showing "invalid state" usually means the login page was
+  opened too long ago: decode the callback's `state` (base64 JSON with `exp`), navigate the tab to the app's own URL
+  for a fresh login, and ask them to finish within its validity window.
 - Judge a sign-in as done from the browser (URL past the login host, Access/session cookies present), not from
   the user's "Done" or "don't see it" on an earlier prompt.
 - The browser-focus plugin also focuses automatically for sign-in/sign-up pages and for replies that name the page
