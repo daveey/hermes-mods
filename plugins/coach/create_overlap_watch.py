@@ -26,6 +26,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+
 THRESHOLD = 2
 EVENT = "create_overlap"
 
@@ -109,11 +118,12 @@ def card_key(host: str, now: Optional[float] = None) -> str:
 def card_body(host: str, findings: list) -> str:
     lines = "\n".join(f"- {f['id']} ({f['board']}): {f['title']!r}; overrode {', '.join(f['overrode'])}; "
                       f"reason: {f['reason']!r}" for f in findings)
-    return f"""{len(findings)} kanban_create overlap overrides on {host} in the last 7 days were later archived (the
+    evidence = fence_evidence(f"Seen on {host}.\n{lines}")
+    return f"""{len(findings)} kanban_create overlap overrides in the last 7 days were later archived (the
 override let a duplicate through). Threshold: more than {THRESHOLD}.
 
 ## Evidence (`create_overlap` events, outcome=override, new card archived)
-{lines}
+{evidence}
 
 ## What to do
 1. For each card, read its `create_overlap` event and the card it overrode: was it really a duplicate (archived as
@@ -129,7 +139,7 @@ override let a duplicate through). Threshold: more than {THRESHOLD}.
 def create_argv(host: str, findings: list, now: Optional[float] = None) -> list:
     return ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", card_key(host, now),
             "--created-by", "create-overlap-watch", "--body-file", "-", "--json",
-            f"kanban_create overlap overrides let {len(findings)} duplicates through on {host} this week"]
+            f"kanban_create overlap overrides let {len(findings)} duplicates through this week"]
 
 
 def main(argv=None, runner: Optional[Callable] = None, now: Optional[float] = None) -> int:

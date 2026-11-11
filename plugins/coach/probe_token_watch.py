@@ -38,6 +38,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+except ImportError:  # run as a script, or loaded by path: take the sibling file
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
+    _pe = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pe)
+    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+
 AUTHOR = "probe-token-watch"
 USER_SOURCES = {"desktop", "cli", "tui", "telegram", "discord", "slack", "whatsapp", "signal", "imessage", "sms",
                 "email", "matrix", "mattermost", "webui", "web", "bluebubbles", "homeassistant"}
@@ -150,19 +159,22 @@ def leftover_body(host: str, hits: list) -> str:
     rows = "\n".join(f"- `{h['session']}` ({h['profile']}, {h['source']}, {_pt(h['ts'])}) \"{h['title'][:60]}\": "
                      f"{h['first'][:100]!r}" for h in hits)
     ids = " ".join(h["session"] for h in hits)
-    return f"""Agent test chats were left VISIBLE in the user's sidebar on host {host}: each one's first user turn is a
+    seen = fence_evidence(f"Seen on {host}:\n{rows}")
+    return f"""Agent test chats were left VISIBLE in the user's sidebar: each one's first user turn is a
 probe and nothing deleted it afterwards.
 
-{rows}
+{home_pin_note("the chats live in this gateway's own session store, so only an agent on it can delete them")}
+
+{seen}
 
 An RPC harness creates its test chats with `hidden: true` (gateway_rpc.py, `?client=agent`); a harness that drives a
 real Desktop window (Cmd-N + Enter over the inspector) cannot, so its teardown must delete every chat it created.
 These got neither.
 
 ## Do this
-1. Delete them on {host} (they are test litter, not the user's): `hermes sessions delete --yes <id>` for each of
+1. Delete them on this host (they are test litter, not the user's): `hermes sessions delete --yes <id>` for each of
    `{ids}` (use `-p <profile>` for a non-default profile; `tailnet_exec` for another host).
-2. Find the harness that made them (grep `state.db` tool calls on {host} near the times above for the first-turn
+2. Find the harness that made them (grep `state.db` tool calls on this host near the times above for the first-turn
    text) and fix it at the source with five-whys: create the chat hidden, or delete each created id in the
    harness's own teardown (a `finally`, not the agent's memory). A one-off scratch script gets the rule added to
    the skill it followed instead.
@@ -185,9 +197,9 @@ def file_leftovers(home: Path, hits: list, runner: Callable) -> list:
             by_host.setdefault(h["host"], []).append(h)
     for host, new in by_host.items():
         key = f"leftover-test-chats:{host}:{new[0]['session']}"
-        title = f"agent test chats left visible in the sidebar: {host} ({len(new)})"
+        title = f"agent test chats left visible in the sidebar ({len(new)})"
         r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
-                          "--created-by", AUTHOR, "--body-file", "-", "--json", title], leftover_body(host, new))
+                          "--created-by", AUTHOR, "--body-file", "-", "--json", *HOME_REQUIRES_ARGV, title], leftover_body(host, new))
         if r.returncode != 0:
             out.append({"key": key, "action": "create_failed", "out": ((r.stdout or "") + (r.stderr or ""))[-300:]})
             continue
@@ -268,17 +280,21 @@ def _run(runner: Callable, argv: list, body: Optional[str] = None):
 
 
 def card_body(h: dict) -> str:
-    return f"""A person's chat got an agent's test turn. Session `{h['session']}` ("{h['title'][:80]}", {h['source']},
-host {h['host']}, profile {h['profile']}) has "Reply exactly <TOKEN>" probe turns or a bare-token reply:
+    seen = fence_evidence(f"Seen on {h['host']}: session `{h['session']}` (\"{h['title'][:80]}\", {h['source']}, "
+                          f"profile {h['profile']}) has \"Reply exactly <TOKEN>\" probe turns or a bare-token reply:\n\n"
+                          f"{h['evidence']}")
+    return f"""A person's chat got an agent's test turn.
 
-{h['evidence']}
+{home_pin_note("the sender is found in this gateway's own state.db and Kanban comments, which a worker node does not have")}
+
+{seen}
 
 An agent sent a one-shot `hermes chat --resume <this session> -q ...` (or similar) into the user's real chat, so its
 probe and token reply are what the user sees. The user-chat-probe-guard plugin refuses that command and names
 `hermes sessions branch <id>` (probe a hidden copy); this one got through (self-heal agent-93a55211b1).
 
 ## Do this
-1. Find the sender: grep Kanban comments/cards and `state.db` tool calls on host {h['host']} around
+1. Find the sender: grep Kanban comments/cards and `state.db` tool calls on this host around
    {_pt(h['ts'])} for the token and `--resume {h['session'][-6:]}`.
 2. If every probe turn above predates the guard (hermes-mods 5910070, 2026-10-30 05:11 UTC), it was not a bypass:
    say so and stop at step 3. Otherwise find why the guard did not stop it (plugin not enabled on that host,
@@ -328,9 +344,9 @@ def file_card(home: Path, h: dict, runner: Callable) -> dict:
         return {"key": key, "action": "known"}
     tid = known.get("task_id")
     if not tid:
-        title = f"agent probe turns in a user's chat: {h['host']} {h['session']}"
+        title = f"agent probe turns in a user's chat: {h['session']}"
         r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
-                          "--created-by", AUTHOR, "--body-file", "-", "--json", title], card_body(h))
+                          "--created-by", AUTHOR, "--body-file", "-", "--json", *HOME_REQUIRES_ARGV, title], card_body(h))
         if r.returncode != 0:
             return {"key": key, "action": "create_failed", "out": ((r.stdout or "") + (r.stderr or ""))[-300:]}
         try:
