@@ -10,7 +10,8 @@ Three failure points it watches (all seen in one real incident, see README):
 2. A child the session subscribed to completed with an explicitly undelivered handoff ("minted but NOT sent")
    and nothing has delivered it yet -> a per-turn reminder quoting the recorded authorization, until a follow-up
    card exists or a ``follow-through: SENT`` / ``DELIVERED`` marker comment is recorded on the child.
-   Also covers a completion notice that never reached this chat at all.
+   Also covers a completion notice that never reached this chat at all (not one still in flight to it, nor one
+   for a card it subscribed to only after completion).
 3. A send tool returned success but the readback shows nothing -> the result says delivery is NOT verified.
 """
 from __future__ import annotations
@@ -44,6 +45,10 @@ _UNDELIVERED = re.compile(
     re.I)
 _RESOLVED_MARKER = re.compile(r"follow-through:\s*(?:SENT|DELIVERED|DONE|CANCELLED)\b", re.I)
 FOLLOWUP_KEY_PREFIX = "followup:"
+# A notice the notifier claimed for a chat stays unacked until the chat's running turn ends; core treats a live
+# claim older than this as stuck (hermes_cli/kanban_db_notify.py NOTIFY_CLAIM_STALE_S). Until then it is in flight,
+# not missed.
+NOTICE_CLAIM_STALE_S = 15 * 60
 
 
 def undelivered_handoff(summary: str) -> bool:
@@ -117,6 +122,29 @@ def _seen_in_chat(state_db: Optional[Path], keys: Iterable[str], needle: str) ->
         return True
 
 
+def _tui_subs(conn: sqlite3.Connection, keys: Iterable[str]) -> list:
+    """This chat's TUI notice subscriptions, with the in-flight claim columns (NULL on a board from before them)."""
+    keys = tuple(keys)
+    if not keys:
+        return []
+    where = " FROM kanban_notify_subs WHERE lower(platform)='tui' AND chat_id IN (%s)" % ",".join("?" * len(keys))
+    try:
+        return conn.execute("SELECT task_id, last_event_id, created_at, inflight_from, inflight_at" + where,
+                            keys).fetchall()
+    except sqlite3.OperationalError:
+        return conn.execute("SELECT task_id, last_event_id, created_at, NULL AS inflight_from, NULL AS inflight_at"
+                            + where, keys).fetchall()
+
+
+def _in_flight(sub, ev, now: float) -> bool:
+    """The completion event sits in the sub's unacked claim ``(inflight_from, last_event_id]`` and that claim is
+    younger than NOTICE_CLAIM_STALE_S (a claim from before ``inflight_at`` existed is dated by the event)."""
+    start = sub["inflight_from"]
+    if start is None or not int(start) < ev["id"] <= int(sub["last_event_id"] or 0):
+        return False
+    return now - float(sub["inflight_at"] or ev["created_at"] or 0) < NOTICE_CLAIM_STALE_S
+
+
 def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: Optional[float] = None,
                    max_age_s: float = 7 * 86400) -> list[dict]:
     """Completed child cards this chat subscribed to whose handoff is explicitly undelivered and that nothing
@@ -132,9 +160,7 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
             continue
         with conn:
             try:
-                subs = conn.execute(
-                    "SELECT task_id, last_event_id, created_at FROM kanban_notify_subs WHERE lower(platform)='tui' "
-                    "AND chat_id IN (%s)" % ",".join("?" * len(keys)), tuple(keys)).fetchall() if keys else []
+                subs = _tui_subs(conn, keys)
             except sqlite3.Error:
                 continue
             for sub in subs:
@@ -167,7 +193,10 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
                 # (the chat commented on, or linked, the done card) starts past the completion event, so the
                 # notifier never sends it one: that is not a missed notice.
                 owed_notice = (sub["created_at"] or 0) <= (ev["created_at"] or 0)
-                missed = owed_notice and not _seen_in_chat(state_db, keys, f"Kanban {tid} done")
+                # A notice claimed for this chat and not yet acked is in flight: the backend delivers it when the
+                # chat's current turn ends. It counts as missed only once that claim is stale.
+                missed = owed_notice and not _in_flight(sub, ev, now) and \
+                    not _seen_in_chat(state_db, keys, f"Kanban {tid} done")
                 if resolved or followup or not (undelivered or missed):
                     continue
                 authority = [s.strip() for s in [task["body"] or "", *comments] if kept_obligation(s or "")]

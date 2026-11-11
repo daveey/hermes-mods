@@ -125,6 +125,33 @@ def test_late_subscription_keeps_an_undelivered_handoff_without_the_missed_flag(
     assert item["undelivered"] and not item["missed_notice"]
 
 
+def _claim_in_flight(home, age_s, tid=CHILD):
+    """The notifier claimed the completion for this chat ``age_s`` ago and has not acked it (the chat's turn is still
+    running). The in-flight columns come from current core; kanban_schema.sql predates them, so the other tests also
+    cover a board without them."""
+    with _k(home) as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(kanban_notify_subs)")}
+        for col in ("inflight_from", "inflight_pid", "inflight_start", "inflight_at"):
+            if col not in cols:
+                c.execute(f"ALTER TABLE kanban_notify_subs ADD COLUMN {col} INTEGER")
+        ev = c.execute("SELECT id FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()[0]
+        c.execute("UPDATE kanban_notify_subs SET inflight_from=?, inflight_pid=?, inflight_at=? WHERE task_id=?",
+                  (ev - 1, 4242, int(time.time() - age_s), tid))
+
+
+def test_notice_still_in_flight_to_a_busy_chat_is_not_missed(home):
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    _claim_in_flight(home, age_s=6 * 60)
+    assert _followups(home) == []
+
+
+def test_notice_claim_stuck_past_the_stale_bound_is_missed(home):
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    _claim_in_flight(home, age_s=16 * 60)
+    [item] = _followups(home)
+    assert item["missed_notice"] and not item["undelivered"]
+
+
 def test_running_child_and_other_chats_subscriptions_are_ignored(home):
     _child(home, done=False)
     _child(home, tid="t_2222cccc", sub_chat="some_other_chat")
@@ -263,6 +290,15 @@ def test_announced_undelivered_item_stays_without_the_missed_flag(home):
 def test_pre_llm_call_is_silent_when_nothing_applies(home, monkeypatch):
     monkeypatch.setattr(plugin, "_home", lambda: home)
     assert plugin.pre_llm_call(session_id=CHAT, user_message="name her phone alex-iphone") is None
+
+
+def test_pre_llm_call_is_silent_while_the_notice_waits_for_the_running_turn(home, monkeypatch):
+    # The backend claimed the notice when the card completed and holds it until this chat's turn ends; a turn that
+    # starts in that window (a resumed or long turn) must not be told the notice "never reached this chat".
+    monkeypatch.setattr(plugin, "_home", lambda: home)
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    _claim_in_flight(home, age_s=5 * 60)
+    assert plugin.pre_llm_call(session_id=CHAT, user_message="continue") is None
 
 
 # 6. a successful send with an empty readback is not verified delivery
