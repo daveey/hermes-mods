@@ -120,12 +120,22 @@ def gate(tmp_path, monkeypatch):
     def fresh():
         """What core projects now with no cache anywhere (the reference answer)."""
         saved = list(projections)
-        ksa._reset_cache_for_tests(keep_remote=True)
-        try:
-            with ksa.one_annotation_snapshot():  # pinned: the gate steps aside, core projects itself
-                return plugin.remote_cards()
-        finally:
-            projections[:] = saved
+        # data_version fallback keys include the retained connection's identity.
+        # Resetting the measured reader's connections would invalidate its gate:
+        # give the cold reference reader its own cache, and close only that cache.
+        with monkeypatch.context() as oracle:
+            oracle.setattr(ksa, '_RO_CACHE', {})
+            try:
+                ksa._reset_cache_for_tests(keep_remote=True)
+                with ksa.one_annotation_snapshot():  # pinned: the gate steps aside, core projects itself
+                    return plugin.remote_cards()
+            finally:
+                with ksa._RO_CACHE_LOCK:
+                    held = [entry[0] for entry in ksa._RO_CACHE.values()]
+                    ksa._RO_CACHE.clear()
+                for conn in held:
+                    ksa._close_quietly(conn)
+                projections[:] = saved
 
     world = {'clock': clock, 'publish': publish, 'pull': pull, 'projections': projections, 'fresh': fresh,
              'during': during,
@@ -156,6 +166,21 @@ def test_unchanged_inputs_project_once_and_match_core(gate):
     assert len(gate['projections']) == 1
     assert _norm(second) == _norm(third) == _norm(first) == _norm(gate['fresh']())
     assert [c['status'] for c in first if c.get('via') == 'origin'] == ['running']
+
+
+def test_fresh_reference_preserves_measured_reader_connections(gate):
+    cards = _passes(gate, 1, step=5.0)[0]
+    ksa = gate['ksa']
+    with ksa.cached_ro(gate['local'], busy_budget=0) as measured:
+        before = measured.execute('PRAGMA data_version').fetchone()[0]
+    assert _norm(gate['fresh']()) == _norm(cards)
+    with ksa.cached_ro(gate['local'], busy_budget=0) as after:
+        assert after is measured
+        assert after.execute('PRAGMA data_version').fetchone()[0] == before
+    gate['clock'].now += 30.0
+    gate['pull']()
+    assert _norm(plugin.remote_cards()) == _norm(gate['fresh']())
+    assert gate['projections'] == [T0 + 5.0]
 
 
 def test_hub_pull_restamps_synced_at_without_projecting(gate):
