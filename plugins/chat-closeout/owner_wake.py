@@ -409,9 +409,7 @@ def _names(text: Any, tid: str) -> bool:
 
 
 def _ro(path: Path) -> sqlite3.Connection:
-    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
-    c.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-    return c
+    return _ro_connect(path, timeout=2)
 
 
 def _replica_wait_text(t: dict[str, Any]) -> str:

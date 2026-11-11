@@ -275,6 +275,19 @@ def _ws(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. ``mode=ro`` fails on a WAL db whose -wal/-shm its writer deleted on last close, so fall back to
+    ``mode=rw`` + ``query_only`` (reads the same data, never writes rows; ``mode=rw`` never creates a missing db)."""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        con.execute("pragma query_only = 1")
+        return con
+
+
 def inbox_prompts(db):
     """{session id: the cleaned accept_prompt} of every Inbox card in this profile's Inbox store
     (<home>/inbox/inbox.db next to state.db). Pressing Do it sends that prompt as the user's turn in the card's own
@@ -284,7 +297,7 @@ def inbox_prompts(db):
     if not p.exists():
         return {}
     try:
-        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=10)
+        con = _ro_connect(p)
         try:
             rows = con.execute("select session_id, accept_prompt from items").fetchall()
         finally:

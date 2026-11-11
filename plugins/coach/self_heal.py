@@ -2960,7 +2960,7 @@ def _complaint_reply_text(sid: str, since: float) -> Optional[str]:
     if not sid or not db.is_file():
         return None
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con = _ro_state(db)
         try:
             if not con.execute("SELECT 1 FROM messages WHERE session_id=? LIMIT 1", (sid,)).fetchone():
                 return None
@@ -3355,7 +3355,7 @@ def recovery_holder_card(db: str, home: Path, dbs: list) -> Optional[dict]:
         return None
     for board, kdb in dbs:  # the card's status and board, from whichever readable board holds it
         try:
-            con = sqlite3.connect(f"file:{kdb}?mode=ro", uri=True, timeout=5)
+            con = _ro_state(kdb)
             try:
                 r = con.execute("SELECT id, title, status, created_at FROM tasks WHERE id = ?", (card,)).fetchone()
             finally:

@@ -7,6 +7,7 @@ query_only=ON`` opens fine, reads the same data and never creates a missing db.
 
 Run: ``python -m pytest tests/test_sqlite_ro_guard.py`` or ``python tests/test_sqlite_ro_guard.py``.
 """
+import ast
 import importlib.util
 import os
 import re
@@ -30,8 +31,28 @@ def _tracked(*suffixes):
     return [f for f in out.splitlines() if f.endswith(suffixes) and not f.startswith(EXCLUDE_PREFIX)]
 
 
+def _is_test(rel):
+    parts = rel.split("/")
+    return "tests" in parts[:-1] or parts[-1].startswith(("test_", "tests_")) or parts[-1] == "conftest.py"
+
+
+def _function_offenders(text, hits):
+    """(line, function, source) of each hit inside a function where neither it nor any function around it has the
+    fallback. A file-wide check let a bare open pass in any file whose OTHER function had a fallback helper."""
+    lines = text.splitlines()
+    funcs = [f for f in ast.walk(ast.parse(text)) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    bad = []
+    for n, src in hits:
+        around = [f for f in funcs if f.lineno <= n <= f.end_lineno]
+        if around and not any(FIX in "\n".join(lines[f.lineno - 1:f.end_lineno]) for f in around):
+            bad.append((n, max(around, key=lambda f: f.lineno).name, src))
+    return bad
+
+
 def offenders():
-    """Files with a non-comment line holding the ro URI flag but no fallback (``query_only``) anywhere in the file."""
+    """Non-comment lines holding the ro URI flag with no fallback (``query_only``) to go with them. In plugin and skill
+    code a line inside a function needs the fallback in that function (or one around it); module-level lines, tests
+    (which open ro on purpose) and shell scripts need it somewhere in the file."""
     bad = []
     for rel in _tracked(".py", ".sh"):
         p = ROOT / rel
@@ -40,8 +61,16 @@ def offenders():
         text = p.read_text(errors="replace")
         hits = [(n, ln.strip()) for n, ln in enumerate(text.splitlines(), 1)
                 if URI_FLAG.search(ln) and not ln.lstrip().startswith("#")]
-        if hits and FIX not in text:
+        if not hits:
+            continue
+        if FIX not in text:
             bad.append(f"{rel}:{hits[0][0]}: {hits[0][1][:100]}" + (f"  (+{len(hits) - 1} more)" if len(hits) > 1 else ""))
+        elif rel.endswith(".py") and not _is_test(rel):
+            try:
+                found = _function_offenders(text, hits)
+            except SyntaxError:  # newer syntax than this interpreter parses: the file-wide check above still held
+                continue
+            bad += [f"{rel}:{n} in {func}(): {src[:100]}" for n, func, src in found]
     return bad
 
 

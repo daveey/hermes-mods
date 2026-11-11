@@ -2,6 +2,7 @@
 """Stdlib tests for session_digest.py:  python3 test_session_digest.py"""
 import json, sqlite3, sys, tempfile, time, unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 import session_digest as sd  # noqa: E402
@@ -223,6 +224,35 @@ class DigestSynthetic(unittest.TestCase):
         first, second = dg["user_turns"]
         self.assertIs(first.get("inbox_doit"), True)
         self.assertNotIn("inbox_doit", second)  # David's own words after the card still count
+
+    def test_inbox_prompts_reads_through_the_query_only_fallback(self):
+        """When the read-only open of the Inbox store fails, inbox_prompts still reads it, through a mode=rw
+        connection with query_only on, and writes nothing. A bare ?mode=ro open lost the provenance there ({})."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "inbox").mkdir()
+            store = Path(d) / "inbox" / "inbox.db"
+            con = sqlite3.connect(store)
+            con.execute("create table items (session_id text, accept_prompt text)")
+            con.execute("insert into items values ('s1', 'ask 1')")
+            con.commit(); con.close()
+            real_connect, opened = sqlite3.connect, []
+
+            def connect(target, *args, **kwargs):
+                opened.append(str(target))
+                if "mode=ro" in str(target):
+                    raise sqlite3.OperationalError("unable to open database file")
+                return real_connect(target, *args, **kwargs)
+
+            with mock.patch.object(sd.sqlite3, "connect", connect):
+                self.assertEqual(sd.inbox_prompts(Path(d) / "state.db"), {"s1": "ask 1"})
+                fallback = sd._ro_connect(store)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):  # query_only: the fallback refuses writes
+                    fallback.execute("insert into items values ('s2', 'ask 2')")
+            finally:
+                fallback.close()
+            self.assertTrue(any("mode=rw" in o for o in opened), opened)
+            self.assertEqual(real_connect(store).execute("select count(*) from items").fetchone()[0], 1)
 
     def test_user_turn_after_an_interrupted_model_wait_carries_its_reason(self):
         """Core stamps display_metadata.interrupt on the interrupted row; the next user turn names why the turn
