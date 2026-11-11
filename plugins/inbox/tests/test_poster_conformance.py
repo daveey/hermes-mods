@@ -107,6 +107,40 @@ def test_planted_posterless_calls_are_flagged(tmp_path):
     assert kinds == [("a.py", "argv"), ("b.py", "call"), ("b.py", "payload"), ("c.py", "call"), ("d.py", "call")]
 
 
+@pytest.mark.parametrize("scanner,source", [
+    (poster_scan.scan_missing, "inbox.post('T', 'B', key='k')\n"),
+    (poster_scan.scan, "inbox.post('T', 'B', key='k', poster='planted')\n"),
+])
+def test_state_host_snapshots_are_not_live_producers(tmp_path, scanner, source):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "hermes-sync").write_text("# state sync tool\n")
+    (state / "shared-config.json").write_text("{}")
+    for relative in ("hosts/laptop/job.py", "home/bin/job.py", "home/hosts/service/job.py"):
+        path = state / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    assert [hit["site"] for hit in scanner(state)] == [
+        "home/bin/job.py:1", "home/hosts/service/job.py:1",
+    ]
+    # A normal project's hosts directory is not an archive, even with one marker.
+    live = tmp_path / "pr"
+    path = live / "hosts/service/job.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(source)
+    (live / "shared-config.json").write_text("{}")
+    assert [hit["site"] for hit in scanner(live)] == ["hosts/service/job.py:1"]
+
+
+def test_live_posterless_producer_fails_conformance(tmp_path, monkeypatch):
+    live = tmp_path / "pr" / "project"
+    live.mkdir(parents=True)
+    (live / "notify.py").write_text("inbox.post('T', 'B', key='k')\n")
+    monkeypatch.setattr(sys.modules[__name__], "roots", lambda: [tmp_path / "pr"])
+    with pytest.raises(AssertionError, match=r"project/notify.py:1: call"):
+        test_no_inbox_post_without_a_poster()
+
+
 def test_posterful_calls_are_not_flagged(tmp_path):
     (tmp_path / "a.py").write_text(
         "def alert(run):\n    run(['hermes', 'inbox', 'post', 'T', '--key', 'k:1', '--poster', 'x-post'])\n")
