@@ -64,8 +64,13 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   `browser_focus`, optional arg `match` = a URL/title substring).
 - Say the tab is already in front only when `browser_focus` returned the tab you are asking them to use. A `match`
   that hits no tab returns `focused: false` plus the open tabs: open the page first, then focus it.
+- `browser_focus` can return `focused: true` with `shown_on_main_display: false` / `app_activated: false`: the
+  agent Chrome is on a gateway's virtual display (hub: Xvfb `:99`) and the user sees nothing. Never say "it's in
+  front" then; open the private noVNC view on the user's Mac instead (`references/hub-chrome-viewer.md`).
 - If the user says they can't see the window or page, look at the browser (list tabs / screenshot) before you
   answer. Never repeat the ask unchecked.
+- Judge a sign-in as done from the browser (URL past the login host, Access/session cookies present), not from
+  the user's "Done" or "don't see it" on an earlier prompt.
 - The browser-focus plugin also focuses automatically for sign-in/sign-up pages and for replies that name the page
   they ask the user to use. Don't skip the call on that assumption.
 - When the user is done there, send the window back with `browser_focus` `{hide: true}`. A sign-in tab hides itself
@@ -132,6 +137,6 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   "Decision for you:" header, and is not restated next turn. user-steps drops it, so no For-you request opens and the
   chat is not painted red. A choice that really blocks you gets a direct question instead ("Should I add it? yes/no").
 - [ ] No reply asks the user to paste or run a command; `run_in_user_terminal` was used instead.
-- [ ] Every Chrome ask came after a `browser_focus` that returned that tab.
+- [ ] Every Chrome ask came after a `browser_focus` that returned that tab shown on the user's display (else the noVNC view was opened).
 - [ ] Every other-Mac GUI ask tried `remote_approve_dialog` first (for prompts) and carries a verified `::screenshare` button.
 - [ ] Every Inbox post is a user-only decision with `ask` set; agent-fixable work went to a Kanban card.
