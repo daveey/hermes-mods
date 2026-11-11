@@ -24,6 +24,10 @@ description: Use when a Mac is low on disk. Find, clean, ask first.
    - `~/.cache/huggingface/hub/tmp*`: leftovers from aborted downloads. Check `pgrep -f huggingface` first.
    - Leftovers from retired services: LaunchAgent plists (including `LaunchAgents/disabled/`), their `~/Library/Logs/<label>` dirs and helper scripts. Confirm with `launchctl list` that nothing is loaded.
 5a. **Check for an external drive** (`diskutil list external`, `df -h | grep Volumes`). If one has free space, offer to *move* stale repos and archives there rather than delete them. Find stale repos by last commit date with `git log -1 --format=%cs`.
+   - **Never move CI runners or other live, I/O-heavy state to an external/USB disk.** That includes `~/ci-runner-*`, `actions-runner*`, any runner `_work`, and Docker/OrbStack data. This is David's standing rule (2026-11-11).
+     - Why: moving the mini's `ci-runner-hermes-state` to `/Volumes/External` slowed the required macOS CI job from about 10 min to 34 min. The USB disk did about 150 tps, and checkout went from 10 s to 164–398 s. It had to be moved back.
+     - launchd also can't open log paths there (TCC, EX_CONFIG 78).
+     - Free space elsewhere, or ask about the target instead.
 5. **Ask once before deleting app state, VMs or work dirs.** Use a single multi-select `clarify` question. Each option gives the size and what happens if it's deleted, e.g. 'redownloads when used', 'rebuilt on next CI job', 'old images and volumes lost'. Never touch the user's own project data, source trees or running VM disks without asking.
 6. **Re-run `df`** and report.
 7. **Check Done means** (below), fix at most 2 rounds, then report what still fails.
@@ -55,7 +59,7 @@ A Hermes cron job (`ea9100b0961a`, 04:00 daily, no_agent, deliver=all) runs `~/.
 - **uv lock timeout:** another uv process holds `~/.cache/uv/.lock`. Skip it and tell the user to run it later. Don't kill the other process.
 - **npm EACCES on `~/.npm/_cacache`:** some cache files are owned by root. The fix is `sudo chown -R $(id -u):$(id -g) ~/.npm`. Hand that command to the user, since sudo is usually non-interactive here.
 - **Orphaned Docker Desktop disk:** if `/Applications/Docker.app` is gone and `docker context ls` shows podman as the active context, then `~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw` is leftover. It still needs the user's OK, because old volumes may hold data.
-- **CI runner `_work` dirs:** check `pgrep -f Runner.Worker` first. Deleting a workspace while a job is running breaks that job.
+- **CI runner `_work` dirs:** check `pgrep -f Runner.Worker` first. Deleting a workspace while a job is running breaks that job. Never relocate a runner to an external disk (step 5a).
 - **App update or staging dirs:** delete only entries older than a day (`find ... -mindepth 1 -maxdepth 1 -type d -mtime +1`). The newest one may be in use.
 - **Re-run `df` at the start of every turn.** Free space on this machine moved by 20 GB between turns because of new babybear worktrees and builds, an iPhone IPSW download, and system data. Don't report freed space against an old baseline.
 - **iPhone IPSW** (`~/Library/iTunes/iPhone Software Updates/*.ipsw`, ~6 GB) can be deleted and re-downloads, but skip it while `MobileDeviceUpdater` is running.
