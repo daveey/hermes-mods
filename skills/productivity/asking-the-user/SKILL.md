@@ -36,13 +36,14 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   instructions. When a command needs them (sudo/password, an interactive login or OAuth, a TTY prompt, their
   terminal's macOS permissions, or anything you won't run unattended), call `run_in_user_terminal`. It opens a
   terminal window, shows the command, the user confirms there, it runs, and you get the exit code and output.
-- When an approved worker handoff says “owner-chat-only,” handle it in the authorized owner chat rather than
-  asking the user to find another chat. Read the exact recipe, source pins and latest execution receipts, and
-  coordinate with any existing operator before invoking `run_in_user_terminal` (for an apply, check its lock and
-  receipt dir for a live holder with `fuser <lock>`: another chat may have started the same recipe minutes ago,
-  even after the card's ask was filed); independently verify the result,
-  then resume the existing card. A worker-context refusal does not mean the user must execute it manually:
-  preserve the execution guard, never clear worker markers, and never start a competing execution window.
+- For an approved owner-chat-only handoff, read the recipe, pins and latest receipts, then establish one operator
+  before `run_in_user_terminal`. If coordination delivery is unknown or the target chat is busy, read its transcript:
+  a failed send is not evidence the operation is unclaimed. For an apply, inspect the lock holder (`fuser <lock>`) and
+  receipt directory; do not replay an in-flight or partially executed attempt. Preserve worker markers and guards.
+  Return verified results to the existing card rather than asking the user to relay them.
+- Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
+  still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
+  and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
 - The tool is eager on most hosts. Where it isn't in the tool list, call it through `tool_call` (name
   `run_in_user_terminal`); never fall back to pasting the command.
 - The window and `cwd` belong to the user's Mac, even from a hub chat. For a reviewed script already on the hub,
