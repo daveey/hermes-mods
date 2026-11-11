@@ -38,14 +38,17 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   terminal window, shows the command, the user confirms there, it runs, and you get the exit code and output.
 - When an approved worker handoff says “owner-chat-only,” handle it in the authorized owner chat rather than
   asking the user to find another chat. Read the exact recipe, source pins and latest execution receipts, and
-  coordinate with any existing operator before invoking `run_in_user_terminal`; independently verify the result,
+  coordinate with any existing operator before invoking `run_in_user_terminal` (for an apply, check its lock and
+  receipt dir for a live holder with `fuser <lock>`: another chat may have started the same recipe minutes ago,
+  even after the card's ask was filed); independently verify the result,
   then resume the existing card. A worker-context refusal does not mean the user must execute it manually:
   preserve the execution guard, never clear worker markers, and never start a competing execution window.
 - The tool is eager on most hosts. Where it isn't in the tool list, call it through `tool_call` (name
   `run_in_user_terminal`); never fall back to pasting the command.
 - The window and `cwd` belong to the user's Mac, even from a hub chat. For a reviewed script already on the hub,
-  omit the hub `cwd` and run `ssh <verified-hub> 'cd <checkout> && <clean-tree/exact-SHA guards> && <script>'`
-  through `run_in_user_terminal`; do not copy it to the Mac merely to execute it back on the hub. Stage files with
+  omit the hub `cwd` and run `ssh ubuntu@hermes-hub 'cd <checkout> && <clean-tree/exact-SHA guards> && <script>'`
+  through `run_in_user_terminal` (name the user: the Mac's default login for the bare alias is refused with
+  `Permission denied (publickey)`); do not copy it to the Mac merely to execute it back on the hub. Stage files with
   `tailnet_copy` only when the command actually needs local Mac files. For a hub-held script that must run
   as root on a THIRD host the Mac can reach (e.g. the mini), `tailnet_copy put` it to the Mac's `/tmp`, have the
   window print its sha256 next to the expected one, `ssh <host> 'cat > /tmp/x' < /tmp/x`, then
