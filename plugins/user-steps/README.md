@@ -89,8 +89,9 @@ The browser test uses isolated fake REST, not live approval or execution.
 
 This branch awaits independent review, exact-head CI, deployment and packaged
 Desktop acceptance. Real-core isolated integration now exercises the REST-to-owner
-admission path and card delivery without skipped tests. Cold, busy or rotated owners
-still fail closed; durable admission is not proof that execution completed.
+admission path and card delivery without skipped tests. Unavailable inline TUI owners
+and unrelated rotated targets still fail closed; gateway Local owners can restore
+from their durable policy. Durable admission is not proof that execution completed.
 
 ## Request contract
 
@@ -515,9 +516,14 @@ Paste-control markers or text the core sanitizer would change are rejected with
 never silently rewritten after the user reviews it.
 
 TUI-runtime decisions use `prompt.admission.get`/`prompt.admit` in the already-loaded
-owning serve runtime. Gateway local-platform (`local-*`) decisions instead use the
-published gateway runner's profile-scoped authority and durable automation FIFO;
-`operationId` is the immutable producer request identity. Admission readback verifies
+owning serve runtime. Gateway Local decisions (new `local-*` IDs and adopted legacy
+stored IDs) instead use the published gateway runner's profile-scoped authority and
+durable automation FIFO. A read-only lookup of the current profile authority's
+persisted Local policy selects legacy owners, including unmounted sessions; ID
+shape and transcript source labels alone confer no legacy ownership. No published
+gateway means no ownership claim; unavailable profiles, database errors and corrupt
+receipts never become a TUI fallback. Core admission retains its identity and route
+validation. `operationId` is the immutable producer request identity. Admission readback verifies
 the stored text digest, owner and request identity, including after compression.
 A committed receipt remains readable when the route later rotates; a fresh decision
 cannot target an unrelated replacement conversation. Confirmation means durable
@@ -585,6 +591,43 @@ the card asks (`cards.QualifiedCardDelivery._DECISION_COLUMNS`), never the Board
 turn-end hook). Tests: `tests/test_clarify_early.py`.
 
 ## Tests
+
+### Legacy Local ownership regression
+
+- **Root (happened):** `prompt_delivery.py` selected the gateway only by the
+  `local-*` prefix. Core's `adopt_legacy_session` preserves the historical ID and
+  commits its Local policy, so the decision went to the inline TUI registry, which
+  had no owner. The selector now reads that policy key through the existing
+  profile authority; core still validates and admits the frozen operation.
+- **Root (not caught):** `test_gateway_delivery_core.py` created only new Local
+  sessions. Those all had `local-*` IDs; no adopted-history fixture exercised the
+  selector before admission. The legacy regression failed with `no unique live
+  owner` before the fix and passed afterward for warm/cold and compressed owners.
+- **Recurrence:** extends the TUI-vs-gateway correction in `695a6e85`; its prefix
+  test missed core's preserved legacy identities. Ownership evidence, rather than
+  another historical ID format, now selects the existing path.
+- **Tests:** `test_gateway_delivery_core.py` uses real core adoption, FIFO admission,
+  exact duplicate/readback identity and payload checks, read-only selection without
+  restoration, foreign owner rejection, unavailable ownership and corrupt/read-error
+  refusals, plus genuine inline TUI admission with an unrelated gateway published.
+  `test_prompt_delivery.py` retains injected-RPC coverage. All state is fixture-owned;
+  model scheduling alone is suppressed. No live request or card is modified.
+
+Run from the repository root (an isolated core checkout is required for real-core
+coverage; the normal suite intentionally skips those tests):
+
+```sh
+PATH=/opt/homebrew/opt/nodejs/bin:$PATH \
+  HERMES_MODS_PYTHON="$HOME/Applications/Hermes Python.app/Contents/MacOS/python3.14" \
+  "$HOME/Applications/Hermes Python.app/Contents/MacOS/python3.14" scripts/test-all -k user-steps --hermes-core /path/to/isolated/core
+HERMES_PYTHON=/path/to/core-test-environment/bin/python \
+  bash plugins/user-steps/run-core-integration.sh /path/to/isolated/core -j 2 \
+  -k 'test_gateway_delivery_core or test_runtime_integration'
+```
+
+The first command includes `repo-guards`. The second loads core's home-I/O guards
+and exercises both gateway and inline admission rather than skipping them. Use a
+Node with `node:module.register` support for the standalone Desktop contract test.
 
 `tests/test_desktop_contract.py` runs in `scripts/test-all -k user-steps` and feeds
 real `ActionStore.views()` output to the Desktop plugin's exported `validRequest`

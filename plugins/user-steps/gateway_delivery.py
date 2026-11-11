@@ -32,6 +32,23 @@ def _runtime():
     return runner, authority
 
 
+def owns_session(session_id):
+    """Select persisted Local ownership, without creating or restoring a runtime.
+
+    Legacy adoption keeps the stored ID, so neither its shape nor the transcript's
+    source label identifies its owner. Presence only selects admission's existing
+    validation path; corrupt receipts and unavailable profiles must not fall back.
+    """
+    from hermes_cli import plugins
+    if plugins._published_gateway_message_injector is None:
+        return False
+    _, authority = _runtime()
+    from hermes_state_local import POLICY_PREFIX
+    with authority.db._read_ctx() as conn:
+        return conn.execute('SELECT 1 FROM state_meta WHERE key=?',
+            (POLICY_PREFIX + session_id,)).fetchone() is not None
+
+
 def _receipt(authority, params, row):
     if row is None:
         return {'status': 'absent'}

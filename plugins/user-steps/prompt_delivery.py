@@ -25,15 +25,16 @@ class PromptAdmission:
         if (owner['gatewayId'] != f'install:{get_install_id()}' or
                 owner['profile'] != current_profile_name()):
             raise RuntimeError('Prompt owner differs from authenticated runtime')
-        if owner['storedSessionId'].startswith('local-'):
-            # Gateway-platform chats are not inline TUI runtime sessions. Load the
-            # sibling without importing (and manufacturing) any new core runtime.
-            import importlib.util
-            from pathlib import Path
-            spec = importlib.util.spec_from_file_location('_user_steps_gateway_delivery',
-                Path(__file__).with_name('gateway_delivery.py'))
-            gateway = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(gateway)
+        # Load the selector without importing (and manufacturing) another core
+        # runtime. Adopted Local chats retain legacy IDs, not just local-* IDs.
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location('_user_steps_gateway_delivery',
+            Path(__file__).with_name('gateway_delivery.py'))
+        gateway = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gateway)
+        if (owner['storedSessionId'].startswith('local-')
+                or gateway.owns_session(owner['storedSessionId'])):
             return gateway.call(method, params)
         # Importing server in an agent process would manufacture a new empty runtime.
         # Only the already-loaded serve runtime can admit this operation.
