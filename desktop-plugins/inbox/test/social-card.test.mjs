@@ -245,3 +245,11 @@ test('plugin registers the social-card directive', () => {
   const d = regs.find(r => r.area === 'transcript.directives')
   assert.equal(d.data.name, 'social-card')
 })
+
+test('bar buttons never wrap their label; the bar wraps instead', async () => {
+  const src = (await import('node:fs')).readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+  const btn = /const BTN =\s*'([^']*)'/.exec(src)[1]
+  assert.match(btn, /\bwhitespace-nowrap\b/)
+  assert.match(btn, /\bshrink-0\b/)
+  assert.match(src, /'flex w-full flex-wrap items-center gap-2 px-2 pb-1\.5 pt-1/)
+})

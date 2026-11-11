@@ -808,7 +808,7 @@ function Section({ store }) {
 }
 
 const BTN =
-  'inline-flex h-6 items-center gap-1 rounded-md border border-(--border) px-2 text-[0.75rem] transition-colors hover:bg-(--chrome-action-hover) disabled:opacity-50'
+  'inline-flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-(--border) px-2 text-[0.75rem] transition-colors hover:bg-(--chrome-action-hover) disabled:opacity-50'
 
 const ACCENT = { background: 'var(--accent)', color: 'var(--accent-foreground, white)', borderColor: 'var(--accent)' }
 const DANGER = { color: 'var(--destructive, #e5484d)', borderColor: 'var(--destructive, #e5484d)' }
@@ -929,7 +929,7 @@ export function Bar({ store }) {
   const label = item.type_label && item.type !== 'default' ? item.type_label : 'Inbox proposal'
   return jsxs('div', {
     'data-slot': 'inbox-bar',
-    className: 'flex w-full items-center gap-2 px-2 pb-1.5 pt-1 text-[0.75rem]',
+    className: 'flex w-full flex-wrap items-center gap-2 px-2 pb-1.5 pt-1 text-[0.75rem]',
     children: [
       jsx('span', { className: 'codicon codicon-inbox', style: { color: 'var(--accent)' }, 'aria-hidden': true }),
       jsx('span', {
