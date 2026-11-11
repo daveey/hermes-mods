@@ -150,6 +150,18 @@ class TestAll(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertRegex(r.stdout, r"TIMEOUT\s+plugins/hang")
 
+    def test_fleet_scheduling_is_left_to_its_runner(self):
+        # tests/fleet_scheduling runs only through scripts/run-fleet-scheduling; its conftest fails a plain
+        # collection, so the `tests` suite collecting it turned main red (55a56506, 12ef7807).
+        fleet = self.root / "tests" / "fleet_scheduling"
+        fleet.mkdir(parents=True)
+        (fleet / "test_fleet.py").write_text("def test_fleet():\n    raise SystemExit('runner only')\n")
+        (self.root / "tests" / "test_top.py").write_text("def test_top():\n    pass\n")
+        runner = runpy.run_path(str(RUNNER))
+        suite = next(s for s in runner['discover'](self.root, None, False) if s['name'] == 'tests')
+        self.assertEqual(suite['targets'], [str(self.root / "tests" / "test_top.py")])
+        self.assertIn("--ignore=" + str(fleet), suite['args'])
+
     def test_integration_f3_is_skipped_with_reason_without_a_core_checkout(self):
         f3 = self.root / "tests" / "integration_f3"
         f3.mkdir(parents=True)
