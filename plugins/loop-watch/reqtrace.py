@@ -25,6 +25,15 @@ from collections import Counter
 from functools import lru_cache
 from typing import Any, Callable, Dict, Optional
 
+from pathlib import Path
+try:
+    from . import journal
+except ImportError:  # standalone diagnostic/test loader
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location('loop_watch_journal', Path(__file__).with_name('journal.py'))
+    journal = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(journal)
+
 log = logging.getLogger("loop-watch")
 
 SLOW_S = 2.0
@@ -500,11 +509,7 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
         if rep.get("kind") != "slow_request":
             # Unlike diagnostic reports, counters require an acknowledged write.
             # Propagate errors so flush_stats retains the same delta for retry.
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rep) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            journal.append(path, rep, durable=True)
             return
         chain = rep["awaiting"][0]["chain"] if rep["awaiting"] else []
         top = chain[-3:]
@@ -520,9 +525,7 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
                        rep["method"], rep["path"] + ("?" + rep["query"] if rep.get("query") else ""), rep["total_s"], rep["started"], rep["responded"], rep["samples"],
                        " > ".join(top) or "-", busy)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rep) + "\n")
+            journal.append(path, rep)
         except OSError:
             pass
     return sink

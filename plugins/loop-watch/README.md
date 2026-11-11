@@ -3,6 +3,23 @@
 The stall and slow-request reports are diagnostics, not a request census. Their
 existing thresholds and report caps are unchanged.
 
+## Bounded journal retention
+
+All stall, CPU, slow-request and stats writers share a cross-process sidecar lock
+around rotation and append. `loop-watch.jsonl` is capped at **16 MiB**, with three
+numbered generations (`.1` newest through `.3` oldest); each append opens the current
+file afresh. Stats still flush and fsync, and propagate write failures for retry.
+Records larger than the cap fail without altering retained data. Diagnostics remain
+best-effort. A legacy oversized log becomes `.1` on its first new write, so archive
+it before rollout if that history must be retained; the bound applies to newly
+written generations, not a pre-existing oversized archive.
+
+Readers seeking historical statistics must read all retained generations and dedupe
+record IDs. Rotation bounds retention, not a time interval: missing coverage outside
+those files is unknown, never zero requests. The lock file is permanent and must not
+be removed while writers run. Tests: `tests_rotation.py` covers both sinks, stats error
+propagation, generation bounds, oversized records and concurrent process integrity.
+
 ## Restart-resilient deltas (schema 2)
 
 Production installation starts one independent `loop-watch-stats` daemon per

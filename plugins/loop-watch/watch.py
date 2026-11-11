@@ -24,6 +24,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Callable, Optional
 
+try:
+    from . import journal
+except ImportError:  # standalone diagnostic/test loader
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location('loop_watch_journal', Path(__file__).with_name('journal.py'))
+    journal = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(journal)
+
 log = logging.getLogger("loop-watch")
 
 STALL_S = 1.0
@@ -253,9 +261,7 @@ def default_sink(path: Path) -> Callable[[dict], None]:
 
 def _append(path: Path, rep: dict) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rep) + "\n")
+        journal.append(path, rep)
     except OSError:
         pass
 
