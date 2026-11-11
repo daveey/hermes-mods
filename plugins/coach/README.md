@@ -34,10 +34,10 @@ hardcoded: the freeze exists only as a registered record.
   revision**) that is positive (no negation/withdrawal), names the key and the frozen value, and names the artifact
   revision (digest prefix or file name) or the owner card. The freeze lapses when the owner card is done/archived; an
   unreadable owner, changed artifact digest or two conflicting active revisions refuse only the targeted key.
-  Registration (`register`) stays supported for a freeze whose approval is a native typed message; the approving text must be the user's own first-person approval (a quoted or reported approval, `The assistant wrote: "I approve ..."`, `> I approve ...`, is refused, as is one from a machine-opened chat).
+  Registration (`register`) stays supported for a freeze whose approval is a native typed message; the approving text must be the user's own first-person approval (a quoted or reported approval, `The assistant wrote: "I approve ..."`, `> I approve ...`, is refused, as are a question (`Did I approve ...?`), single-quoted text and one from a machine-opened chat).
 - **Declare** (`python3 root_cap.py declare --target-home <root> --value N --contract-ref <approved artifact>
   --owner-card <card>` plus EITHER `--approval-session/--approval-message` OR an explicit ActionStore operation
-  `--action-db --operation --request --revision --gateway --profile --stored-session --mapping-phrase
+  `--action-db --operation --request --revision --gateway --profile --stored-session --native-message --mapping-phrase
   --mapping-rationale --mapping-reviewed-by`) writes a private task-local descriptor of explicit references to
   `<root>/coach/root_cap_sources.json`. It is verified when declared and **re-verified by the guard at every targeted
   call**, in every profile (the descriptor lives in the root store), so there is no separate registration step to
@@ -47,7 +47,10 @@ hardcoded: the freeze exists only as a registered record.
   execution-authorizing `approve` effect, current unwithdrawn revision whose recorded resolution is that operation,
   frozen intent equal to the stored revision, the reviewed capacity wording (the explicit, reviewed mapping from the
   approved wording to `kanban.max_in_progress`, not a hardcoded value), a matching owner namespace/session, the
-  owner card's `session_id`, and (bound rows) the scope digest; legacy unbound rows pass on those equalities. A
+  owner card's `session_id`, a `scope.sourceRefs` entry naming the owner card, the **canonical native user row**
+  (`--native-message`: a user-role row of the owner session lineage in a human-opened chat whose embedded frozen
+  decision equals the operation intent; an ActionStore record with no such row is not authority) and (bound rows) the
+  scope digest; legacy unbound rows pass on those equalities. A
   withdrawn/superseded approval, unreadable store, edited artifact or unreadable descriptor is a *known but unprovable*
   freeze: only the targeted write is refused, with the exact conflict. A finished owner lapses the freeze.
   The descriptor is an operator/owner step (it holds ids private to a rollout); this plugin never writes one itself.
@@ -55,7 +58,8 @@ hardcoded: the freeze exists only as a registered record.
   `authorize ... max_in_progress from <frozen> to <new>` (or cites the revision digest). The deciding chat must be a
   human-opened session (desktop/tui/cli/local); a Kanban/cron/subagent session's opening prompt is machine content.
   Reported speech (`X said ...`, quotes, `> ...`) is not a decision, and any cancellation ("Cancel that", "Never mind",
-  "Revoke ...") withdraws the earlier decision, key or not. Authority is re-read at every admission. Permanent:
+  "Revoke ...") withdraws the earlier decision, key or not. The LATEST relevant decision wins: a later explicit value
+  (`from 7 to 9`) refuses an earlier authorization of 8 and admits only 9. Authority is re-read at every admission. Permanent:
   provenance (decision hash, native `message_uid`, tool and `tool_call_id`) is kept in `root_cap_exceptions.json` and
   the contract is superseded only after `post_tool_call` reads the new value back, in the same locked transaction.
   Temporary: the same decision must also name an existing open owner card whose run/profile (if named) match the

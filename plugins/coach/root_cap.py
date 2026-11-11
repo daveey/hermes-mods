@@ -358,27 +358,36 @@ def _verify_native_approval(db, session, message_id, artifact, digest, key, valu
     _approval_binds(acc.typed_text(content, kind) or "", key, value, Path(artifact), digest, owner_card)
 
 
+_QUOTED_SQ = re.compile(r"(?<![\w])['‘][^'’\n]{2,}['’](?![\w])")
+_QUESTION = re.compile(r"\?|^\s*(did|do|does|have|has|had|is|are|was|were|if|what if|should|can|could|may|would|"
+                       r"shall|will|why|how|when|whether)\b")
+
+
 def _approval_binds(text, key, value, artifact, digest, owner_card):
-    """The human's own message must be a positive, non-negated approval of THIS rollout: key, frozen value and the
-    artifact revision (digest prefix, artifact file name or the owner card). Naming the key and a number is not
-    approval ('Do not freeze X at 7. This is not approval.')."""
+    """The human's own message must be a positive, non-negated, first-person approval of THIS rollout: key, frozen
+    value and the artifact revision (digest prefix, artifact file name or the owner card). Naming the key and a number
+    is not approval ('Do not freeze X at 7. This is not approval.'); neither are questions ('Did I approve ...?'),
+    reported speech, or text inside quotation marks of any kind."""
     low = text.lower().replace("`", "")
     leaf = _leaf(key)
-    named = [s for s in _sentences(low) if leaf in s and re.search(rf"\b{value}\b", s)]
+    sentences = _sentences(low)
+    named = [s for s in sentences if leaf in s and re.search(rf"\b{value}\b", s)]
     if not named:
         raise RootCapError(f"approval message does not name {key} and the frozen value {value}")
-    if any(_NEG.search(s) or "not approv" in s for s in _sentences(low)):
+    if any(_NEG.search(s) or "not approv" in s for s in sentences):
         raise RootCapError("approval message is negative or withdraws the freeze")
-    # Reported speech is not the human's own approval ('The assistant wrote: "I approve ..."', '> I approve ...'):
-    # same classifier as the override decision. A reported-speech cue anywhere in the sentence disqualifies it, and
-    # the key and value must stand outside quotation marks.
-    own = [s for s in named if not _REPORTED.search(s) and leaf in _QUOTED_DQ.sub(" ", s)
-           and re.search(rf"\b{value}\b", _QUOTED_DQ.sub(" ", s))]
+
+    def bare(s):  # the sentence without any quoted span (double, curly or single quotation marks)
+        return _QUOTED_SQ.sub(" ", _QUOTED_DQ.sub(" ", s))
+
+    # A reported-speech cue anywhere in the sentence, a question, or the key/value/approval appearing only inside
+    # quotation marks disqualifies it. Only a plain statement can be the user's own decision.
+    own = [s for s in named if not _REPORTED.search(s) and not _QUESTION.search(s) and leaf in bare(s)
+           and re.search(rf"\b{value}\b", bare(s))]
     if not own:
-        raise RootCapError("approval message is reported or quoted speech, not the user's own approval")
+        raise RootCapError("approval message is a question, reported or quoted speech, not the user's own approval")
     named = own
-    if not any(re.search(r"\b(approv\w*|authori[sz]\w*|freez\w*|frozen|confirm\w*)\b", _QUOTED_DQ.sub(" ", s))
-               for s in named):
+    if not any(re.search(r"\b(approv\w*|authori[sz]\w*|freez\w*|frozen|confirm\w*)\b", bare(s)) for s in named):
         raise RootCapError("approval message does not approve the freeze")
     refs = (digest[:12], artifact.name.lower(), owner_card.lower())
     if not any(ref and ref in low for ref in refs):
@@ -442,6 +451,9 @@ def _validate_source(rec):
                 raise RootCapError(f"action_operation authority needs {field}")
         if not isinstance(auth.get("revision"), int) or isinstance(auth.get("revision"), bool):
             raise RootCapError("action_operation authority needs an integer revision")
+        if not isinstance(auth.get("native_message_id"), int) or isinstance(auth.get("native_message_id"), bool):
+            raise RootCapError("action_operation authority needs native_message_id (the state.db row that carried the "
+                               "canonical user decision into the owner's chat)")
         owner = auth.get("owner")
         if not isinstance(owner, dict) or not all(isinstance(owner.get(k), str) and owner[k]
                                                   for k in ("gatewayId", "profile", "storedSessionId")):
@@ -531,6 +543,11 @@ def _verify_operation(auth, mapping, owner_card, home):
     scope = stored.get("scope") or {}
     if scope.get("complete") is not True:
         raise RootCapError("approved request scope is incomplete")
+    if not any(isinstance(ref, dict) and ref.get("type") == "kanban" and ref.get("id") == owner_card
+               and ref.get("gatewayId") == owner["gatewayId"] and ref.get("profile") == owner["profile"]
+               for ref in scope.get("sourceRefs") or []):
+        raise RootCapError(f"approved request scope.sourceRefs does not name the owner card {owner_card} "
+                           "(the approval is not tied to this rollout)")
     text = f"{stored.get('title', '')}\n{scope.get('markdown', '')}".lower()
     if mapping["phrase"].lower() not in text:
         raise RootCapError("approved request does not carry the reviewed capacity wording "
@@ -542,6 +559,7 @@ def _verify_operation(auth, mapping, owner_card, home):
             raise RootCapError(f"approval scope digest could not be computed ({type(exc).__name__})")
         if (op["binding"] or {}).get("scopeDigest") != expected:
             raise RootCapError("approval scope digest does not match the approved request")
+    _verify_native_operation_row(auth, op, owner, home)
     try:
         task = owner_task(owner_card, home)
     except RootCapError as exc:
@@ -552,6 +570,54 @@ def _verify_operation(auth, mapping, owner_card, home):
         raise RootCapError("owner card has no session_id to bind the approval to")
     if task["session_id"] != owner["storedSessionId"]:
         raise RootCapError("approval session is not the owner card's session")
+
+
+def _verify_native_operation_row(auth, op, owner, home):
+    """The ActionStore record alone is not authority (any process can call ActionStore.decide). The canonical decision
+    must also exist as the native user row the owning runtime admitted into the owner's chat: a user-role row of the
+    owner's session lineage, in a human-opened chat, whose embedded frozen decision equals this operation's intent
+    (so native request == intent.request == stored revision)."""
+    db = Path(auth["state_db"]) if auth.get("state_db") else Path(home) / "state.db"
+    acc = _acceptance()
+    try:
+        conn = acc._ro_connect(db)
+    except sqlite3.Error as exc:
+        raise RootCapError(f"native decision row unreadable ({type(exc).__name__})")
+    try:
+        try:
+            row = conn.execute("select session_id, role, content from messages where id=?",
+                               (auth.get("native_message_id"),)).fetchone()
+            lineage = acc.lineage(conn, owner["storedSessionId"])
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise RootCapError(f"native decision row unreadable ({type(exc).__name__})")
+    if not row:
+        raise RootCapError(f"native decision message {auth.get('native_message_id')} does not exist")
+    sid, role, content = row
+    if role != "user":
+        raise RootCapError(f"native decision message {auth['native_message_id']} is {role}-authored, not a user row")
+    if sid not in lineage:
+        raise RootCapError(f"native decision message {auth['native_message_id']} is in another chat ({sid}), not the "
+                           "approval's owner session")
+    human, why = human_origin(sid, db)
+    if not human:
+        raise RootCapError(f"native decision message is not human authority: {why}")
+    text = (content or "").lstrip()
+    if not text.startswith("Canonical user decision."):
+        raise RootCapError("native decision message is not a canonical user decision row")
+    embedded = None
+    for line in text.splitlines():
+        if line.startswith("{"):
+            try:
+                embedded = json.loads(line)
+            except ValueError:
+                embedded = None
+            break
+    expected = {"operationId": auth["operation_id"], **(op.get("intent") or {})}
+    if embedded != expected:
+        raise RootCapError("native decision row does not carry this operation's frozen request "
+                           "(native request differs from the stored intent)")
 
 
 def _verify_source_authority(src, digest, home):
@@ -1087,7 +1153,9 @@ def human_origin(session_id, db=None):
 
 
 def _decision(items, rec, new_value):
-    """Latest surviving direct human decision for `new_value` against this contract revision (None / dict)."""
+    """Latest surviving direct human decision for this contract revision, whatever its value; it is returned only when
+    it authorizes `new_value`. A later explicit decision for another value (or a cancellation) therefore supersedes an
+    earlier one: the old value is refused, the latest is admitted (None / dict)."""
     leaf = _leaf(rec["key"])
     digest = rec["contract_revision_digest"]
     current = None
@@ -1111,9 +1179,12 @@ def _decision(items, rec, new_value):
                 target = int(m2.group(1)) if m2 else None
             else:
                 target = None
-            if target is None or target != new_value:
+            if target is None:
                 continue
-            current = {"text": raw, "temporary": "temporar" in text, "sha": _sha(raw), "ref": item["ref"]}
+            current = {"text": raw, "temporary": "temporar" in text, "sha": _sha(raw), "ref": item["ref"],
+                       "target": target}
+    if current is None or current["target"] != new_value:
+        return None
     return current
 
 
@@ -1589,6 +1660,8 @@ def main(argv=None):
     dec.add_argument("--gateway")
     dec.add_argument("--profile")
     dec.add_argument("--stored-session")
+    dec.add_argument("--native-message", type=int, help="state.db id of the canonical user decision row in the owner chat")
+    dec.add_argument("--state-db", help="state.db that holds the native decision row (default: <target-home>/state.db)")
     dec.add_argument("--mapping-phrase")
     dec.add_argument("--mapping-rationale")
     dec.add_argument("--mapping-reviewed-by")
@@ -1607,7 +1680,8 @@ def main(argv=None):
         if ns.action_db:
             authority = {"type": "action_operation", "db": ns.action_db, "operation_id": ns.operation,
                          "request_id": ns.request, "revision": ns.revision,
-                         "owner": {"gatewayId": ns.gateway, "profile": ns.profile, "storedSessionId": ns.stored_session}}
+                         "owner": {"gatewayId": ns.gateway, "profile": ns.profile, "storedSessionId": ns.stored_session},
+                         "native_message_id": ns.native_message, **({"state_db": ns.state_db} if ns.state_db else {})}
             mapping = {"phrase": ns.mapping_phrase, "rationale": ns.mapping_rationale,
                        "reviewed_by": ns.mapping_reviewed_by}
         else:
