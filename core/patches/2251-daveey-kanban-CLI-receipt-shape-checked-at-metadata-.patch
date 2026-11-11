@@ -1,0 +1,138 @@
+From e1f49121e90234b7c4fba9c69ca9c6a1ca22ed2b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:41:15 +0000
+Subject: [PATCH] [daveey] kanban CLI: receipt shape checked at --metadata
+ parse; offset facade
+
+---
+ hermes_cli/kanban.py                          | 31 ++------------
+ hermes_cli/kanban_cli_metadata.py             | 40 +++++++++++++++++++
+ ...est_kanban_complete_receipt_entry_paths.py |  2 +-
+ 3 files changed, 44 insertions(+), 29 deletions(-)
+ create mode 100644 hermes_cli/kanban_cli_metadata.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 947995ffc55..116d2034416 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -37,6 +37,7 @@ from hermes_cli.kanban_output import (
+     _task_to_dict,
+ )
+ from hermes_cli.kanban_boards import _dispatch_boards
++from hermes_cli.kanban_cli_metadata import parse_metadata_flag as _parse_metadata_flag, receipt_refusal
+ from hermes_cli.kanban_cli_park import (
+     _REASON_FLAG_HINT, _REASON_WORDS_HINT, _cli_awaiting, _cli_wake_check, _commented, _guarded_park, _ids_error,
+     _parked_msg,
+@@ -64,19 +65,6 @@ def _none_profile(value: str) -> Optional[str]:
+     return None if value.lower() in {"none", "-", "null"} else value
+ 
+ 
+-def _parse_metadata_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
+-    """Parse ``--metadata`` JSON; returns ``(dict|None, rc)`` with rc=2 on error."""
+-    if not raw:
+-        return None, 0
+-    try:
+-        metadata = json.loads(raw)
+-        if not isinstance(metadata, dict):
+-            raise ValueError("must be a JSON object")
+-    except (ValueError, json.JSONDecodeError) as exc:
+-        return None, _err(f"kanban: --metadata: {exc}", 2)
+-    return metadata, 0
+-
+-
+ def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict[str, str]], int]:
+     """``--state-type``/``--state-name`` must be given together: ``(kwargs, 0)`` or ``(None, 2)``."""
+     st = getattr(args, "state_type", None)
+@@ -1269,12 +1257,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+     metadata, rc = _parse_metadata_flag(raw_meta)
+     if rc:
+         return rc
+-    if isinstance(metadata, dict) and "completion_receipt" in metadata:
+-        from hermes_completion_receipt import validate_completion_receipt
+-        try:  # structural refusal before the goal judge or any write
+-            validate_completion_receipt(metadata["completion_receipt"])
+-        except ValueError as receipt_err:
+-            return _err(f"kanban complete: {receipt_err}", 1)
+     fail_msg: dict[str, str] = {}
+     with kbc.connect_closing() as conn:
+         def op(tid):
+@@ -1305,15 +1287,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
+                                  f"describing what was done (an empty completion is not evidence).")
+                 return False
+-            except kb.ArtifactPreservationError as preserve_err:
+-                # Receipt evidence could not be preserved durably: the completion rolled back.
+-                fail_msg[tid] = f"cannot complete {tid}: {preserve_err}"
+-                return False
+-            except ValueError as receipt_err:
+-                if not str(receipt_err).startswith("completion_receipt"):
+-                    raise
+-                # Malformed receipt or unverified pending owner: admission wrote nothing.
+-                fail_msg[tid] = f"cannot complete {tid}: {receipt_err}"
++            except (kb.ArtifactPreservationError, ValueError) as receipt_err:
++                fail_msg[tid] = receipt_refusal(tid, receipt_err)  # nothing written; re-raises other errors
+                 return False
+             if not done:
+                 # complete_task returns bare False for a dependency refusal too;
+diff --git a/hermes_cli/kanban_cli_metadata.py b/hermes_cli/kanban_cli_metadata.py
+new file mode 100644
+index 00000000000..bf1b6a997b8
+--- /dev/null
++++ b/hermes_cli/kanban_cli_metadata.py
+@@ -0,0 +1,40 @@
++"""``hermes kanban`` handoff-metadata flag parsing and completion-receipt refusals. [daveey]
++
++Split from the ``hermes_cli.kanban`` facade. A ``completion_receipt`` is checked structurally
++when the flag is parsed, so a malformed receipt is refused before any goal judge or write;
++pending-owner admission still runs inside canonical ``complete_task``.
++"""
++from __future__ import annotations
++
++import json
++from typing import Optional
++
++from hermes_cli.kanban_output import _err
++
++
++def parse_metadata_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
++    """Parse ``--metadata`` JSON; returns ``(dict|None, rc)`` with rc=2 on error."""
++    if not raw:
++        return None, 0
++    try:
++        metadata = json.loads(raw)
++        if not isinstance(metadata, dict):
++            raise ValueError("must be a JSON object")
++        if "completion_receipt" in metadata:
++            from hermes_completion_receipt import validate_completion_receipt
++            validate_completion_receipt(metadata["completion_receipt"])
++    except (ValueError, json.JSONDecodeError) as exc:
++        return None, _err(f"kanban: --metadata: {exc}", 2)
++    return metadata, 0
++
++
++def receipt_refusal(tid: str, exc: Exception) -> str:
++    """The CLI line for a receipt admission/preservation refusal (nothing was written).
++
++    Re-raises any other ``ValueError`` so unrelated failures keep their old behavior.
++    """
++    from hermes_cli import kanban_db as kb
++
++    if isinstance(exc, kb.ArtifactPreservationError) or str(exc).startswith("completion_receipt"):
++        return f"cannot complete {tid}: {exc}"
++    raise exc
+diff --git a/tests/tools/test_kanban_complete_receipt_entry_paths.py b/tests/tools/test_kanban_complete_receipt_entry_paths.py
+index c13321f969f..47fdaeee6e4 100644
+--- a/tests/tools/test_kanban_complete_receipt_entry_paths.py
++++ b/tests/tools/test_kanban_complete_receipt_entry_paths.py
+@@ -161,7 +161,7 @@ def _subprocess(tid, value, tmp_path):
+     return subprocess.run(
+         [sys.executable, "-m", "hermes_cli.main", "kanban", "complete", tid,
+          "--summary", "Assessment finished.", "--metadata", json.dumps({"completion_receipt": value})],
+-        cwd=REPO, env=env, capture_output=True, text=True, timeout=240)
++        cwd=REPO, env=env, capture_output=True, text=True, timeout=240, check=False)
+ 
+ 
+ def test_terminal_subprocess_path_rejects_then_admits(board, tmp_path):
+-- 
+2.55.0
+

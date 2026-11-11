@@ -1,0 +1,324 @@
+From a38b9cb79249941eda00eef6d73445706d3a77b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:19:44 +0000
+Subject: [PATCH] fix(ci): tolerate coarse SQLite timestamps and isolate login
+ rc [daveey]
+
+---
+ .github/workflows/blacksmith-diagnostic.yml   | 40 ------------
+ hermes_cli/kanban_activity_revision.py        | 12 +++-
+ hermes_cli/kanban_session_activity_hub.py     | 63 ++++++++++---------
+ .../test_kanban_activity_revision.py          |  7 ++-
+ tests/hermes_cli/test_kanban_coarse_stat.py   | 33 ++++++++++
+ .../test_kanban_session_activity.py           | 14 ++---
+ .../test_process_registry_bg_shell_bash.py    | 23 +++++--
+ 7 files changed, 105 insertions(+), 87 deletions(-)
+ delete mode 100644 .github/workflows/blacksmith-diagnostic.yml
+ create mode 100644 tests/hermes_cli/test_kanban_coarse_stat.py
+
+diff --git a/.github/workflows/blacksmith-diagnostic.yml b/.github/workflows/blacksmith-diagnostic.yml
+deleted file mode 100644
+index 2895c3121e..0000000000
+--- a/.github/workflows/blacksmith-diagnostic.yml
++++ /dev/null
+@@ -1,40 +0,0 @@
+-name: Blacksmith filesystem and login diagnostic
+-on:
+-  push:
+-    branches: [wt/blacksmith-stat-login]
+-permissions:
+-  contents: read
+-jobs:
+-  diagnose:
+-    runs-on: blacksmith-4vcpu-ubuntu-2404
+-    steps:
+-      - name: Inspect login startup and SQLite commit signatures
+-        shell: bash
+-        run: |
+-          python3 - <<'PY'
+-          import os, pathlib, subprocess, tempfile, sqlite3
+-          print('identity', subprocess.check_output(['id'], text=True))
+-          for p in [pathlib.Path('/etc/profile'), pathlib.Path('/etc/bash.bashrc'), *pathlib.Path('/etc/profile.d').glob('*')]:
+-              if p.is_file():
+-                  print('PROFILE', p, p.read_text())
+-          with tempfile.TemporaryDirectory() as d:
+-              home = pathlib.Path(d)
+-              for name in ['.profile', '.bash_profile']:
+-                  (home/name).write_text('export HERMES_LOGIN_MARKER=from-login-rc\n')
+-              for shell in ['/bin/bash', '/bin/sh']:
+-                  r = subprocess.run([shell, '-lic', 'printf "HOME=%s marker=%s\\n" "$HOME" "$HERMES_LOGIN_MARKER"'], env={**os.environ, 'HOME':d}, text=True, capture_output=True)
+-                  print('LOGIN', shell, r.returncode, r.stdout, r.stderr)
+-              p=home/'probe.db'
+-              c=sqlite3.connect(p)
+-              c.execute('CREATE TABLE t(x)'); c.execute('INSERT INTO t VALUES (0)'); c.commit()
+-              same=0
+-              for i in range(100):
+-                  before=p.stat()
+-                  c.execute('UPDATE t SET x=?',(i+1,)); c.commit()
+-                  after=p.stat()
+-                  if (before.st_ino,before.st_size,before.st_mtime_ns)==(after.st_ino,after.st_size,after.st_mtime_ns):
+-                      same+=1
+-                      if same <= 3: print('COLLISION', before.st_mtime_ns, after.st_mtime_ns, before.st_ctime_ns, after.st_ctime_ns)
+-              print('sqlite version',sqlite3.sqlite_version,'same-stat commits',same)
+-              print(subprocess.check_output(['stat','-f',str(p)],text=True))
+-          PY
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 4ab8e52496..f791369c2d 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -13,8 +13,9 @@ that only touch bookkeeping columns (``BOOKKEEPING_COLUMNS``: claim/lease/heartb
+ marks) do not bump it; no activity reader selects those columns.
+ 
+ Readers (``content_key``) only trust the counter when every table they read that exists in the file carries all three
+-of its triggers; otherwise (older writer, dropped trigger, rebuilt file) they fall back to the file's stat, the
+-previous behaviour. The key also carries the file identity and ``schema_version``, so a replaced file or a schema
++of its triggers; otherwise (older writer, dropped trigger, rebuilt file) they fall back to the file's stat plus a
++connection-scoped SQLite data_version. Equal timestamps alone never prove an absence of commits. The key also
++carries the file identity and ``schema_version``, so a replaced file or a schema
+ change always reads afresh.
+ 
+ The update trigger names each read column, so SQLite refuses ``ALTER TABLE ... DROP COLUMN`` of a watched column
+@@ -196,11 +197,16 @@ def content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
+     db = stat[0]
+     try:
+         with open_ro(path) as conn:
++            # data_version is meaningful only on the SAME connection. Retain its identity
++            # too, so an evicted/reopened reader cannot reuse an old version's cache entry.
++            version = conn.execute("PRAGMA data_version").fetchone()[0]
+             revision = _covered_read(conn, path, db, tables)
++            fallback = ("stat", stat, conn, version)
+     except sqlite3.Error:
+         revision = None
++        fallback = ("stat", stat, object())  # unreadable is unknown, never proof of unchanged content
+     if revision is None or db is None:
+-        return ("stat", stat)
++        return fallback
+     return ("revision", db[0], db[1], *revision)
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity_hub.py b/hermes_cli/kanban_session_activity_hub.py
+index 92b08f1be0..8648899236 100644
+--- a/hermes_cli/kanban_session_activity_hub.py
++++ b/hermes_cli/kanban_session_activity_hub.py
+@@ -5,43 +5,48 @@ from __future__ import annotations
+ import sqlite3
+ from pathlib import Path
+ 
++from hermes_cli.kanban_activity_revision import file_stat
++
+ _HUB_SIGNATURE_SQL = ("SELECT coll, COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll IN ('tasks', 'gateway') "
+                       "GROUP BY coll")
+-_hub_signature_memo: tuple | None = None  # ((path, stat key), signature)
++_hub_signature_memo: tuple | None = None
+ 
+ 
+ def _hub_content_signature(hub: Path) -> tuple:
+-    """What the remote-links projection reads from the hub replica (``tasks`` and ``gateway`` rows, ``meta``
+-    gateway), not the file's stat: hub-sync rewrites ~10k ``sessions`` rows continuously, so a stat-keyed
+-    fingerprint changed on nearly every read and every caller re-projected 2.4k cards (~19% of a Desktop
+-    backend's GIL time, 2026-10-27). ``seq`` is the replica's global write sequence, so COUNT + MAX + TOTAL of it
+-    moves on any insert, update or delete of those rows. The query (~10 ms) re-runs only when the file's stat
+-    moves; an unreadable replica falls back to the stat itself. [daveey]"""
++    """Ignore session-only writes, but never mistake an equal stat for no commit.
++
++    SQLite's data_version on a kept read-only connection detects commits even on
++    coarse-mtime filesystems. Include the connection itself: version numbers from
++    different connections are not comparable. Recompute the content projection
++    only after a commit, preserving the cheap unchanged-poll path. [daveey]
++    """
+     global _hub_signature_memo
+-    from hermes_cli import kanban_session_activity as _ksa  # lazy: that module imports this one; tests spy _open_ro
+-    stat_key = []
+-    for path in (hub, Path(str(hub) + "-wal")):
+-        try:
+-            st = path.stat()
+-            stat_key.append((st.st_ino, st.st_size, st.st_mtime_ns))
+-        except FileNotFoundError:
+-            stat_key.append(None)
+-    memo_key = (str(hub), tuple(stat_key))
+-    memo = _hub_signature_memo
+-    if memo is not None and memo[0] == memo_key:
+-        return memo[1]
++    from hermes_cli import kanban_session_activity as _ksa
++
++    stat = file_stat(hub)
+     try:
+-        conn = _ksa._open_ro(hub)
+-        try:
+-            rows = tuple(tuple(r) for r in conn.execute(_HUB_SIGNATURE_SQL).fetchall())
+-            meta = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
+-        finally:
+-            conn.close()
+-        signature = (str(hub), stat_key[0][0] if stat_key[0] else None, rows, meta[0] if meta else None)
++        with _ksa.cached_ro(hub, busy_budget=0) as conn:
++            version = conn.execute("PRAGMA data_version").fetchone()[0]
++            memo_key = (str(hub), stat, conn, version)
++            memo = _hub_signature_memo
++            if memo is not None and memo[0] == memo_key:
++                return memo[1]
++            conn.execute("BEGIN")
++            try:
++                try:
++                    rows = tuple(tuple(r) for r in conn.execute(_HUB_SIGNATURE_SQL).fetchall())
++                    meta = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
++                    signature = (str(hub), stat[0][:2] if stat[0] else None, rows, meta[0] if meta else None)
++                except sqlite3.OperationalError:
++                    # Old replicas lack seq. Every commit must invalidate them.
++                    signature = memo_key
++            finally:
++                conn.execute("ROLLBACK")
++            _hub_signature_memo = (memo_key, signature)
++            return signature
+     except (sqlite3.Error, OSError):
+-        signature = memo_key
+-    _hub_signature_memo = (memo_key, signature)
+-    return signature
++        # An unreadable replica is unknown, not evidence that cached rows are current.
++        return (str(hub), stat, object())
+ 
+ 
+ def reset() -> None:
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index 4254fe8ed6..6b90e08e02 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -121,16 +121,19 @@ def test_claim_and_heartbeat_columns_are_bookkeeping(board):
+     assert ksa._board_content_key(path) != before
+ 
+ 
+-def test_a_missing_trigger_falls_back_to_the_file_stat(board):
++def test_a_missing_trigger_falls_back_to_the_file_stat(board, monkeypatch):
+     kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
+     path = ksa._board_db_paths()[0]
+     assert rev.is_revision(ksa._board_content_key(path))
+     board.execute("DROP TRIGGER kanban_activity_rev_task_events_insert")
+     board.commit()
++    frozen_stat = rev.file_stat(path)
++    monkeypatch.setattr(rev, "file_stat", lambda _path: frozen_stat)
+     key = ksa._board_content_key(path)
+     assert key[0] == "stat"  # the counter no longer vouches for task_events: never trusted
++    assert ksa._board_content_key(path) == key
+     _bookkeeping(board)
+-    assert ksa._board_content_key(path) != key  # back to the old behaviour: any write moves it
++    assert ksa._board_content_key(path) != key  # even when the filesystem tick did not move
+ 
+ 
+ def test_reinstall_after_a_gap_moves_the_key(board, home):
+diff --git a/tests/hermes_cli/test_kanban_coarse_stat.py b/tests/hermes_cli/test_kanban_coarse_stat.py
+new file mode 100644
+index 0000000000..68a82361ea
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_coarse_stat.py
+@@ -0,0 +1,33 @@
++"""SQLite commit invalidation must not depend on timestamp resolution."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_session_activity as ksa
++
++
++@pytest.mark.parametrize("journal", ["DELETE", "WAL"])
++def test_legacy_commit_key_tracks_writes_and_reader_replacement(tmp_path, monkeypatch, journal):
++    path = tmp_path / "legacy.db"
++    ksa._reset_cache_for_tests()
++    writer = sqlite3.connect(path)
++    try:
++        writer.execute(f"PRAGMA journal_mode={journal}")
++        writer.executescript("CREATE TABLE tasks (title TEXT); INSERT INTO tasks VALUES ('one');")
++        frozen = rev.file_stat(path)
++        monkeypatch.setattr(rev, "file_stat", lambda _path: frozen)
++        first = ksa._board_content_key(path)
++        assert ksa._board_content_key(path) == first
++        writer.execute("UPDATE tasks SET title='two'")
++        writer.commit()
++        second = ksa._board_content_key(path)
++        assert second != first
++        assert ksa._board_content_key(path) == second
++        ksa._reset_cache_for_tests()  # new connections can repeat data_version values
++        third = ksa._board_content_key(path)
++        assert third != second
++        assert ksa._board_content_key(path) == third
++    finally:
++        writer.close()
++        ksa._reset_cache_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 60ee758eac..bf39cb2888 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -845,6 +845,11 @@ def test_hub_session_rows_do_not_invalidate_the_remote_links_projection(kanban_r
+     backend's GIL time); a tasks or gateway write still must."""
+     path = _make_replica(kanban_root / "hub-state", "macbook", [
+         {"_gw": "hub", "id": "t_r1", "status": "running", "sessions": [_shep("s_mac")]}])
++    # Model Blacksmith's same-size commits within one mtime/ctime tick.
++    from pathlib import Path
++    original_stat = Path.stat
++    frozen = {p: p.stat() for p in (path, Path(str(path) + '-wal')) if p.exists()}
++    monkeypatch.setattr(Path, 'stat', lambda p, *a, **kw: frozen[p] if p in frozen else original_stat(p, *a, **kw))
+     projections: list[int] = []
+     real = ksa._project_remote_links
+     monkeypatch.setattr(ksa, "_project_remote_links", lambda: projections.append(1) or real())
+@@ -869,13 +874,8 @@ def test_hub_session_rows_do_not_invalidate_the_remote_links_projection(kanban_r
+ def test_hub_signature_is_reused_until_the_file_changes_and_falls_back_on_old_replicas(kanban_root, tmp_path, monkeypatch):
+     path = _make_replica(kanban_root / "hub-state", "macbook", [])
+     queries: list[str] = []
+-    real_open = ksa._open_ro
+-
+-    def _spy_open(p, *a, **k):
+-        queries.append(str(p))
+-        return real_open(p, *a, **k)
+-
+-    monkeypatch.setattr(ksa, "_open_ro", _spy_open)
++    with ksa.cached_ro(path) as conn:
++        conn.set_trace_callback(lambda sql: queries.append(sql) if sql.startswith('SELECT coll,') else None)
+     a = ksa._hub_content_signature(path)
+     b = ksa._hub_content_signature(path)
+     assert a == b and len(queries) == 1  # unchanged file: the memo answers
+diff --git a/tests/tools/test_process_registry_bg_shell_bash.py b/tests/tools/test_process_registry_bg_shell_bash.py
+index a9a0995101..b104e6a38f 100644
+--- a/tests/tools/test_process_registry_bg_shell_bash.py
++++ b/tests/tools/test_process_registry_bg_shell_bash.py
+@@ -2,6 +2,7 @@
+ 
+ import os
+ import shutil
++import shlex
+ import subprocess
+ import time
+ 
+@@ -41,15 +42,25 @@ def test_background_uses_bash_semantics_with_zsh_login_shell(monkeypatch):
+     assert _run(PROBE, monkeypatch, "/bin/zsh").endswith(EXPECT)
+ 
+ 
++@pytest.mark.parametrize("shell", ["bash", "/bin/sh"])
+ @pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+-def test_login_environment_still_loaded_and_bg_var_hidden(tmp_path, monkeypatch):
+-    (tmp_path / ".profile").write_text("export HERMES_LOGIN_MARKER=from-login-rc\n")
+-    (tmp_path / ".bash_profile").write_text("export HERMES_LOGIN_MARKER=from-login-rc\n")
++def test_login_environment_still_loaded_and_bg_var_hidden(tmp_path, monkeypatch, shell):
++    # The host's /etc/profile may reset HOME (Blacksmith does). Keep the real
++    # login invocation, but load our explicit rc instead of trusting host policy.
++    rc = tmp_path / "login.rc"
++    rc.write_text("export HERMES_LOGIN_MARKER=from-login-rc\n")
++    monkeypatch.delenv("HERMES_LOGIN_MARKER", raising=False)
++    login = tmp_path / shell.rsplit("/", 1)[-1]
++    executable = shlex.quote(shutil.which(shell))
++    options = "--noprofile " if shell == "bash" else ""
++    login.write_text(
++        '#!/bin/sh\n[ "$1" = "-lic" ] || exit 97\n'
++        f'exec {executable} {options}-lic {shlex.quote(". " + shlex.quote(str(rc)) + "; ")}"$2"\n'
++    )
++    login.chmod(0o700)
+     out = _run('echo "marker=$HERMES_LOGIN_MARKER bg=${HERMES_BG_COMMAND:-unset}"',
+-               monkeypatch, shutil.which("bash"), home=tmp_path)
++               monkeypatch, str(login), home=tmp_path)
+     assert out.endswith("marker=from-login-rc bg=unset")
+-    out = _run('echo "marker=$HERMES_LOGIN_MARKER"', monkeypatch, "/bin/sh", home=tmp_path)
+-    assert out.endswith("marker=from-login-rc")
+ 
+ 
+ @pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+-- 
+2.55.0
+

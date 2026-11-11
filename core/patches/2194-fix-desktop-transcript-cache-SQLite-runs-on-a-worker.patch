@@ -1,0 +1,1445 @@
+From eadba10050cc34223a0ddd014f732d57f349c23e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:47:10 +0000
+Subject: [PATCH] fix(desktop): transcript cache SQLite runs on a worker
+ thread, off the main loop [daveey]
+
+The mini's Desktop main loop stalled 1764 ms and 1053 ms during a
+tests/hermes_state CI job (2026-11-11 04:24Z / 04:27Z), each logged in
+the same millisecond as a "transcript prefetch: 1 fetched" line.
+
+Cause: TranscriptCacheStore is synchronous node:sqlite and ran on
+Electron's main thread. The entry the first stall wrote
+(macbook/local-b30ebd47..., 614 KB) carries saved_at 20:24:21.897, the
+clock read at the top of write(); the lag line was logged at 23.516. So
+1.62 s of that 1.76 s stall was inside write() (upsert, COMMIT with its
+WAL auto-checkpoint, bounds check), with the host at 89 MB free memory
+and the SSD saturated by the CI job. Replayed on a copy of the same
+cache without that pressure, the whole putLatest takes 38.6 ms at worst
+over all 1000 entries: the code path is cheap, the main thread was
+waiting on the disk.
+
+Fix: the store moves to a worker thread (transcript-cache-worker.ts,
+bundled as dist/electron-transcript-cache-worker.js). The main process
+only awaits it through transcript-cache-client.ts:
+- prefetch: one batched metaMany per pass, awaited putLatest;
+- renderer put/drop/clear/migrate: posted to the worker;
+- renderer sync read: returnValue is set when the worker replies (1.5 s
+  cap, then a cache miss). The renderer blocks on it either way; the
+  main loop no longer does.
+A worker that dies is restarted (3 starts), then the store falls back
+to the main thread and says so in desktop.log. Ops slower than 250 ms
+are logged with the thread they ran on. The lag-warning threshold is
+unchanged.
+
+Tests: a store op that blocks its thread for 1 s leaves the caller's
+event loop turning (and the in-thread control stalls it); a prefetch
+pass with 1 s writes does the same through the host; the real worker
+bundle round-trips through SQLite; restart/fallback/timeout; the
+prefetcher over an asynchronous store; the shipped bundle is emitted
+and runs from its text alone.
+---
+ apps/desktop/electron/main.ts                 |  11 +-
+ .../electron/transcript-cache-client.test.ts  | 424 ++++++++++++++++++
+ .../electron/transcript-cache-client.ts       | 310 +++++++++++++
+ .../electron/transcript-cache-host.test.ts    |   2 +
+ .../desktop/electron/transcript-cache-host.ts | 119 ++++-
+ .../electron/transcript-cache-worker.ts       |  20 +
+ .../electron/transcript-prefetch.test.ts      |  71 +++
+ apps/desktop/electron/transcript-prefetch.ts  |  73 +--
+ apps/desktop/scripts/bundle-electron-main.mjs |   9 +
+ .../scripts/bundle-electron-main.test.mjs     |  44 +-
+ tests-js/desktop-builder.test.mjs             |   1 +
+ 11 files changed, 1025 insertions(+), 59 deletions(-)
+ create mode 100644 apps/desktop/electron/transcript-cache-client.test.ts
+ create mode 100644 apps/desktop/electron/transcript-cache-client.ts
+ create mode 100644 apps/desktop/electron/transcript-cache-worker.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index b7a66b5127..3db83329a5 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -607,7 +607,7 @@ import { installSystemCaTrust } from './system-ca'
+ import { terminalGatewayTarget } from './terminal-gateway-target'
+ import { registerTerminalIpc } from './terminal-ipc'
+ import { applyTitleBarOverlay, isHexColor, nativeOverlayWidth, titleBarOverlayOptions } from './titlebar-overlay-width'
+-import { installTranscriptCache } from './transcript-cache-host'
++import { installTranscriptCache, registrySnapshot } from './transcript-cache-host'
+ import {
+   applyWindowsBackdrop,
+   defaultTranslucencyState,
+@@ -17834,12 +17834,9 @@ app.whenReady().then(() => {
+       getJson: (descriptor, requestPath, opts) => getJsonForBackend(descriptor, requestPath, opts),
+       ipcMain,
+       log: line => rememberLog(`[transcript-cache] ${line}`),
+-      registry: () => {
+-        const registry = readDesktopConnectionsRegistry()
+-
+-        return { connectionIds: registry.connections.map(c => c.id), primary: registry.primary }
+-      },
+-      userDataDir: app.getPath('userData')
++      registry: () => registrySnapshot(readDesktopConnectionsRegistry()),
++      userDataDir: app.getPath('userData'),
++      workerFile: path.join(APP_ROOT, 'dist', 'electron-transcript-cache-worker.js')
+     })
+     setTimeout(() => transcriptCacheHost?.start(), 15_000).unref?.()
+   } catch (error) {
+diff --git a/apps/desktop/electron/transcript-cache-client.test.ts b/apps/desktop/electron/transcript-cache-client.test.ts
+new file mode 100644
+index 0000000000..179220ec75
+--- /dev/null
++++ b/apps/desktop/electron/transcript-cache-client.test.ts
+@@ -0,0 +1,424 @@
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++import { Worker } from 'node:worker_threads'
++
++import { build } from 'esbuild'
++import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
++
++import { TranscriptCacheStore } from './transcript-cache'
++import {
++  inlineClient,
++  MAX_WORKER_STARTS,
++  type StoreWorkerPort,
++  type TranscriptCacheClient,
++  WORKER_READY_LINE,
++  workerClient
++} from './transcript-cache-client'
++import { installTranscriptCache, registrySnapshot } from './transcript-cache-host'
++
++const BLOCK_MS = 1_000
++
++/** A worker that speaks the store protocol but holds its own thread for BLOCK_MS per request (a stuck disk). */
++const BLOCKING_WORKER = `
++const { parentPort } = require('node:worker_threads')
++parentPort.on('message', request => {
++  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${BLOCK_MS})
++  parentPort.postMessage({ id: request.id, ms: ${BLOCK_MS}, ok: true, result: { bytes: 1, sessions: 1 } })
++})
++`
++
++const key = { connectionId: 'mac-mini', profile: 'default', sessionId: 's1' }
++const rows = [{ content: 'hello', id: 1, role: 'user' }]
++
++let root = ''
++let workerSource = ''
++const clients: TranscriptCacheClient[] = []
++const workers: Worker[] = []
++
++beforeAll(async () => {
++  root = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-cache-client-'))
++  const outfile = path.join(root, 'worker.js')
++
++  // The shipped worker bundle's shape (scripts/bundle-electron-main.mjs): one CJS file, node builtins only.
++  await build({
++    bundle: true,
++    entryPoints: [path.join(import.meta.dirname, 'transcript-cache-worker.ts')],
++    format: 'cjs',
++    logLevel: 'silent',
++    outfile,
++    platform: 'node',
++    target: 'node20'
++  })
++  workerSource = fs.readFileSync(outfile, 'utf8')
++})
++
++afterEach(async () => {
++  for (const client of clients.splice(0)) {
++    client.close()
++  }
++
++  await Promise.all(workers.splice(0).map(worker => worker.terminate()))
++})
++
++afterAll(() => {
++  fs.rmSync(root, { force: true, recursive: true })
++})
++
++const spawnSource = (source: string, file = ''): StoreWorkerPort => {
++  const worker = new Worker(source, { eval: true, workerData: { file } })
++  workers.push(worker)
++
++  return worker
++}
++
++const cacheFile = (name: string) => path.join(root, `${name}.sqlite`)
++
++/** Longest gap between two turns of this thread's event loop while `work` is pending. */
++async function longestLoopGap(work: () => Promise<unknown>): Promise<number> {
++  let last = performance.now()
++  let longest = 0
++
++  const timer = setInterval(() => {
++    const now = performance.now()
++    longest = Math.max(longest, now - last)
++    last = now
++  }, 10)
++
++  try {
++    await new Promise(resolve => setTimeout(resolve, 30)) // the interval is running before the work starts
++    await work()
++    await new Promise(resolve => setTimeout(resolve, 30)) // a blocked loop reports its gap on the next turn
++  } finally {
++    clearInterval(timer)
++  }
++
++  return longest
++}
++
++describe('[daveey] transcript cache store off the main thread', () => {
++  it('a store op that blocks for a second on the worker never stalls the calling event loop', async () => {
++    const logs: string[] = []
++
++    const client = workerClient({
++      fallback: () => {
++        throw new Error('no fallback expected')
++      },
++      log: line => logs.push(line),
++      spawn: () => spawnSource(BLOCKING_WORKER)
++    })
++
++    clients.push(client)
++
++    let result: unknown
++    const started = performance.now()
++
++    const gap = await longestLoopGap(async () => {
++      result = await client.call('stats')
++    })
++
++    expect(result).toEqual({ bytes: 1, sessions: 1 })
++    expect(performance.now() - started).toBeGreaterThanOrEqual(BLOCK_MS - 50) // the op really took its second
++    expect(gap).toBeLessThan(BLOCK_MS / 2) // ...and this thread kept turning the whole time
++    expect(logs).toEqual([
++      WORKER_READY_LINE,
++      `slow store op stats: ${BLOCK_MS}ms on the worker thread (main loop not blocked)`
++    ])
++  })
++
++  it('control: the same blocking op through the in-thread client stalls the loop for the whole op', async () => {
++    const logs: string[] = []
++
++    const blockingStore = {
++      close: () => undefined,
++      stats: () => {
++        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, BLOCK_MS)
++
++        return { bytes: 1, sessions: 1 }
++      }
++    } as unknown as TranscriptCacheStore
++
++    const client = inlineClient(blockingStore, line => logs.push(line))
++    const gap = await longestLoopGap(() => client.call('stats'))
++
++    expect(gap).toBeGreaterThanOrEqual(BLOCK_MS - 50)
++    expect(logs).toHaveLength(1)
++    expect(logs[0]).toMatch(/^slow store op stats: \d+ms ON the main thread \(no worker\)$/)
++  })
++
++  it('the real worker bundle owns the SQLite file: writes, reads and batched meta round-trip through it', async () => {
++    const file = cacheFile('real')
++
++    const client = workerClient({
++      fallback: () => {
++        throw new Error('no fallback expected')
++      },
++      log: () => undefined,
++      spawn: () => spawnSource(workerSource, file)
++    })
++
++    clients.push(client)
++
++    expect(await client.call('putLatest', [key, rows, { activity: 5, messageCount: 1 }])).toBe(true)
++    expect(await client.call('read', [key])).toMatchObject({ activity: 5, messageCount: 1, messages: rows })
++    expect(await client.call('metaMany', [[key, { ...key, sessionId: 'absent' }]])).toEqual([
++      expect.objectContaining({ activity: 5, messageCount: 1 }),
++      null
++    ])
++    expect(await client.call('stats')).toMatchObject({ sessions: 1 })
++    await client.call('setMeta', ['hub-gateway:mini', 'mac-mini'])
++    expect(await client.call('getMeta', ['hub-gateway:mini'])).toBe('mac-mini')
++    await expect(client.call('nope' as never)).rejects.toThrow(/unknown transcript cache op/)
++    expect(client.mode).toBe('worker')
++
++    // Persisted by the worker: a fresh in-thread store over the same file sees the entry.
++    client.close()
++    await Promise.all(workers.splice(0).map(worker => worker.terminate()))
++    const reopened = new TranscriptCacheStore(file)
++    expect(reopened.read(key)?.messages).toEqual(rows)
++    reopened.close()
++  })
++
++  it('a call past its timeout rejects instead of waiting on a busy worker', async () => {
++    const client = workerClient({
++      fallback: () => {
++        throw new Error('no fallback expected')
++      },
++      log: () => undefined,
++      spawn: () => spawnSource(BLOCKING_WORKER)
++    })
++
++    clients.push(client)
++
++    await expect(client.call('read', [key], { timeoutMs: 50 })).rejects.toThrow(/read timed out after 50ms/)
++  })
++
++  it(`a worker that keeps dying is restarted ${MAX_WORKER_STARTS} times, then the in-thread store takes over`, async () => {
++    const logs: string[] = []
++    const file = cacheFile('dying')
++    let spawned = 0
++
++    const client = workerClient({
++      fallback: () => inlineClient(new TranscriptCacheStore(file)),
++      log: line => logs.push(line),
++      spawn: () => {
++        spawned += 1
++
++        return spawnSource(
++          `require('node:worker_threads').parentPort.on('message', () => { throw new Error('boom ${spawned}') })`
++        )
++      }
++    })
++
++    clients.push(client)
++
++    for (let attempt = 1; attempt <= MAX_WORKER_STARTS; attempt += 1) {
++      await expect(client.call('stats')).rejects.toThrow(/worker lost \(boom/)
++      expect(spawned).toBe(attempt)
++    }
++
++    // No fourth worker: the cache keeps working, in this thread.
++    expect(await client.call('putLatest', [key, rows])).toBe(true)
++    expect(await client.call('read', [key])).toMatchObject({ messages: rows })
++    expect(spawned).toBe(MAX_WORKER_STARTS)
++    expect(client.mode).toBe('inline')
++    expect(logs.at(-1)).toBe('store worker unavailable: the cache runs on the main thread for the rest of this run')
++  })
++
++  it('a spawn that throws (no worker file) falls back at once, without retrying', async () => {
++    const logs: string[] = []
++    let attempts = 0
++
++    const client = workerClient({
++      fallback: () => inlineClient(new TranscriptCacheStore(cacheFile('nospawn'))),
++      log: line => logs.push(line),
++      spawn: () => {
++        attempts += 1
++
++        throw new Error('no worker file')
++      }
++    })
++
++    clients.push(client)
++
++    expect(await client.call('stats')).toEqual({ bytes: 0, sessions: 0 })
++    expect(await client.call('stats')).toEqual({ bytes: 0, sessions: 0 })
++    expect(attempts).toBe(1)
++    expect(client.mode).toBe('inline')
++    expect(logs).toEqual([
++      'store worker failed to start: no worker file',
++      'store worker unavailable: the cache runs on the main thread for the rest of this run'
++    ])
++  })
++})
++
++describe('[daveey] transcript cache host with a store worker', () => {
++  function install(spawnWorker: (file: string) => StoreWorkerPort) {
++    const dir = fs.mkdtempSync(path.join(root, 'host-'))
++    const on = new Map<string, (event: any, payload?: any) => void>()
++    const handle = new Map<string, () => unknown>()
++    const logs: string[] = []
++
++    const getJson = async (descriptor: any, requestPath: string) => {
++      if (requestPath.startsWith('/api/plugins/hub-sync/sessions')) {
++        return {
++          sessions: [
++            { activity: 2, gateway: 'mini', id: 'm1', message_count: 3, profile: 'default' },
++            { activity: 1, gateway: 'macbook', id: 'l1', message_count: 3, profile: 'default' }
++          ]
++        }
++      }
++
++      if (requestPath === '/api/plugins/hub-sync/status') {
++        return { gateway: descriptor.connectionId === 'local' ? 'macbook' : 'mini' }
++      }
++
++      return { messages: [{ content: `row of ${descriptor.connectionId}`, id: 1, role: 'user' }] }
++    }
++
++    const host = installTranscriptCache({
++      backendFor: async (connectionId: string) => ({ connectionId }),
++      getJson,
++      ipcMain: {
++        handle: (channel: string, fn: () => unknown) => handle.set(channel, fn),
++        on: (channel: string, fn: any) => on.set(channel, fn)
++      } as never,
++      log: line => logs.push(line),
++      registry: () => ({ connectionIds: ['local', 'mac-mini'], primary: 'local' }),
++      spawnWorker,
++      userDataDir: dir
++    })
++
++    clients.push(host.client)
++
++    return { dir, handle, host, logs, on }
++  }
++
++  /** A sync-IPC event: resolves when the handler sets returnValue. */
++  const syncEvent = () => {
++    let settle: (value: unknown) => void = () => undefined
++    const replied = new Promise(resolve => (settle = resolve))
++    let sets = 0
++
++    const event = {
++      get sets() {
++        return sets
++      },
++      set returnValue(value: unknown) {
++        sets += 1
++        settle(value)
++      }
++    }
++
++    return { event, replied }
++  }
++
++  it('prefetch, renderer writes and the sync read all go through the worker; this thread never opens the file', async () => {
++    const { handle, host, on } = install(file => spawnSource(workerSource, file))
++
++    expect(host.store).toBeNull() // no in-thread SQLite handle exists
++    expect(await host.prefetcher.tick()).toMatchObject({ failed: 0, fetched: 2 })
++    expect(await host.prefetcher.tick()).toMatchObject({ fetched: 0, skipped: 2 }) // freshness read back from the worker
++
++    const read = syncEvent()
++    on.get('hermes:transcript-cache:read')!(read.event, { connectionId: '', profile: '', sessionId: 'l1' })
++    expect(read.event.sets).toBe(0) // answered when the worker replies, not inside the listener
++    expect(await read.replied).toMatchObject({ messages: [{ content: 'row of local', id: 1, role: 'user' }] })
++    expect(read.event.sets).toBe(1)
++
++    on.get('hermes:transcript-cache:put')!({}, { key, kind: 'latest', messages: rows })
++    const after = syncEvent()
++    on.get('hermes:transcript-cache:read')!(after.event, key) // queued behind the put on the worker
++    expect(await after.replied).toMatchObject({ messages: rows })
++    expect(await handle.get('hermes:transcript-cache:stats')!()).toMatchObject({ sessions: 3 })
++    expect(host.store).toBeNull()
++    expect(host.client.mode).toBe('worker')
++    host.stop()
++  })
++
++  it('a prefetch pass whose cache writes each take a second leaves this event loop turning', async () => {
++    // The stall this guards: on the main thread, one prefetch write that waited on the disk froze the app 1-1.8 s.
++    const slowWrites = `require('node:worker_threads').parentPort.on('message', request => {
++      if (request.op === 'putLatest') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${BLOCK_MS})
++    })\n`
++
++    const { host, logs } = install(file => spawnSource(slowWrites + workerSource, file))
++    let result: unknown
++    const started = performance.now()
++
++    const gap = await longestLoopGap(async () => {
++      result = await host.prefetcher.tick()
++    })
++
++    expect(result).toMatchObject({ failed: 0, fetched: 2 })
++    expect(performance.now() - started).toBeGreaterThanOrEqual(BLOCK_MS - 50) // the writes really were slow
++    expect(gap).toBeLessThan(BLOCK_MS / 2)
++    expect(logs).toEqual([WORKER_READY_LINE, 'transcript prefetch: 2 fetched, 0 failed, 0 current of 2'])
++    host.stop()
++  })
++
++  it('given the built worker file (what main.ts passes), the host starts the worker itself', async () => {
++    const dir = fs.mkdtempSync(path.join(root, 'host-file-'))
++    const logs: string[] = []
++
++    const host = installTranscriptCache({
++      backendFor: async (connectionId: string) => ({ connectionId }),
++      getJson: async () => ({}),
++      ipcMain: { handle: () => undefined, on: () => undefined } as never,
++      log: line => logs.push(line),
++      registry: () => registrySnapshot({ connections: [{ id: 'local' }], primary: 'local' }),
++      userDataDir: dir,
++      workerFile: path.join(root, 'worker.js')
++    })
++
++    clients.push(host.client)
++
++    expect(await host.client.call('putLatest', [key, rows])).toBe(true)
++    expect(await host.client.call('stats')).toMatchObject({ sessions: 1 })
++    expect(host.client.mode).toBe('worker')
++    expect(host.store).toBeNull()
++    expect(logs).toEqual([WORKER_READY_LINE])
++    host.stop()
++  })
++
++  it('a missing worker file costs the worker, not the cache: the store runs in this thread and says so', async () => {
++    const dir = fs.mkdtempSync(path.join(root, 'host-nofile-'))
++    const logs: string[] = []
++
++    const host = installTranscriptCache({
++      backendFor: async (connectionId: string) => ({ connectionId }),
++      getJson: async () => ({}),
++      ipcMain: { handle: () => undefined, on: () => undefined } as never,
++      log: line => logs.push(line),
++      registry: () => ({ connectionIds: ['local'], primary: 'local' }),
++      userDataDir: dir,
++      workerFile: path.join(root, 'absent.js')
++    })
++
++    clients.push(host.client)
++
++    expect(await host.client.call('putLatest', [key, rows])).toBe(true)
++    expect(host.client.mode).toBe('inline')
++    expect(host.store?.read(key)?.messages).toEqual(rows)
++    expect(logs[0]).toMatch(/^store worker failed to start: ENOENT/)
++    expect(logs[1]).toBe('store worker unavailable: the cache runs on the main thread for the rest of this run')
++    host.stop()
++  })
++
++  it('the sync read always answers: null for a bad key, a miss, and a worker that cannot reply', async () => {
++    const { host, logs, on } = install(() =>
++      spawnSource(`require('node:worker_threads').parentPort.on('message', () => { throw new Error('disk gone') })`)
++    )
++
++    const bad = syncEvent()
++    on.get('hermes:transcript-cache:read')!(bad.event, { sessionId: '' })
++    expect(await bad.replied).toBeNull()
++
++    const failed = syncEvent()
++    on.get('hermes:transcript-cache:read')!(failed.event, key)
++    expect(await failed.replied).toBeNull()
++    expect(failed.event.sets).toBe(1)
++    expect(logs.some(line => /transcript cache read failed: .*worker lost \(disk gone\)/.test(line))).toBe(true)
++    host.stop()
++  })
++})
+diff --git a/apps/desktop/electron/transcript-cache-client.ts b/apps/desktop/electron/transcript-cache-client.ts
+new file mode 100644
+index 0000000000..c1fcf3aaf8
+--- /dev/null
++++ b/apps/desktop/electron/transcript-cache-client.ts
+@@ -0,0 +1,310 @@
++/**
++ * [daveey] Off-main-thread access to the transcript cache store.
++ *
++ * TranscriptCacheStore is synchronous SQLite. Run on Electron's main thread, one prefetch
++ * write that waited on the disk (a WAL checkpoint fsync, cold pages under memory pressure
++ * while a CI job saturated the SSD) froze the main loop for 1-1.8 s: measured on the mini,
++ * the row's own `saved_at` put 1.6 s of a 1.76 s stall inside `write()`. Desktop therefore
++ * runs the store on a worker thread and the main process only awaits it. Keep every store
++ * call behind this client; never open the cache file on the main thread while a worker owns it.
++ *
++ * `inlineClient` is the same interface over an in-thread store: tests, and the fallback when
++ * the worker cannot start (the cache then works as before, stalls included, and says so).
++ */
++import fs from 'node:fs'
++import { Worker } from 'node:worker_threads'
++
++import type { TranscriptCacheStore } from './transcript-cache'
++
++export const STORE_OPS = [
++  'clear',
++  'drop',
++  'dropEverywhere',
++  'getMeta',
++  'meta',
++  'metaMany',
++  'migrateProfile',
++  'putLatest',
++  'putOlder',
++  'read',
++  'setMeta',
++  'stats'
++] as const
++
++export type StoreOp = (typeof STORE_OPS)[number]
++
++export interface StoreRequest {
++  args: unknown[]
++  id: number
++  op: StoreOp
++}
++
++export interface StoreReply {
++  error?: string
++  id: number
++  /** Wall time the op took in the thread that ran it. */
++  ms: number
++  ok: boolean
++  result?: unknown
++}
++
++export interface TranscriptCacheClient {
++  call<T = unknown>(op: StoreOp, args?: unknown[], opts?: { timeoutMs?: number }): Promise<T>
++  close(): void
++  readonly mode: 'inline' | 'worker'
++}
++
++/** The slice of node:worker_threads' Worker the client uses (tests pass their own). */
++export interface StoreWorkerPort {
++  on(event: 'error' | 'exit' | 'message', listener: (value: any) => void): unknown
++  postMessage(message: StoreRequest): void
++  terminate(): unknown
++}
++
++/**
++ * Start the built worker script over one cache file. Its text is read and eval'd rather than
++ * loaded by path, so it starts the same from the source tree, an asar and its unpacked dir.
++ */
++export function spawnStoreWorker(workerFile: string, cacheFile: string): StoreWorkerPort {
++  const worker = new Worker(fs.readFileSync(workerFile, 'utf8'), {
++    eval: true,
++    name: 'transcript-cache',
++    workerData: { file: cacheFile }
++  })
++
++  worker.unref() // never holds the app open at quit
++
++  return worker
++}
++
++export const WORKER_READY_LINE = 'store worker answering: cache I/O runs off the main thread'
++
++/** A store op slower than this is logged with where it ran. */
++export const SLOW_STORE_OP_MS = 250
++/** Worker (re)starts before the client gives up on it for the rest of the run. */
++export const MAX_WORKER_STARTS = 3
++
++/** Run one op against a store: the single dispatch both the worker and the inline client use. */
++export function runStoreOp(store: TranscriptCacheStore, op: StoreOp, args: readonly unknown[]): unknown {
++  if (!STORE_OPS.includes(op)) {
++    throw new Error(`unknown transcript cache op: ${String(op)}`)
++  }
++
++  if (op === 'metaMany') {
++    return (args[0] as Parameters<TranscriptCacheStore['meta']>[0][]).map(key => store.meta(key))
++  }
++
++  return (store[op] as (...rest: unknown[]) => unknown)(...args)
++}
++
++/** Answer one request (worker side): never throws. */
++export function answerStoreRequest(store: TranscriptCacheStore, request: StoreRequest): StoreReply {
++  const started = performance.now()
++
++  try {
++    const result = runStoreOp(store, request.op, request.args ?? [])
++
++    return { id: request.id, ms: performance.now() - started, ok: true, result }
++  } catch (error) {
++    return {
++      error: (error as Error)?.message || String(error),
++      id: request.id,
++      ms: performance.now() - started,
++      ok: false
++    }
++  }
++}
++
++const slowLine = (op: StoreOp, ms: number, where: string) => `slow store op ${op}: ${Math.round(ms)}ms ${where}`
++
++export function inlineClient(
++  store: TranscriptCacheStore,
++  log: (line: string) => void = () => undefined
++): TranscriptCacheClient {
++  let closed = false
++
++  return {
++    call: async <T>(op: StoreOp, args: unknown[] = []) => {
++      const reply = answerStoreRequest(store, { args, id: 0, op })
++
++      if (reply.ms >= SLOW_STORE_OP_MS) {
++        log(slowLine(op, reply.ms, 'ON the main thread (no worker)'))
++      }
++
++      if (!reply.ok) {
++        throw new Error(reply.error)
++      }
++
++      return reply.result as T
++    },
++    close: () => {
++      if (!closed) {
++        closed = true
++        store.close()
++      }
++    },
++    mode: 'inline'
++  }
++}
++
++interface Pending {
++  op: StoreOp
++  reject: (error: Error) => void
++  resolve: (value: any) => void
++  timer: null | ReturnType<typeof setTimeout>
++}
++
++/**
++ * Client over a worker thread that owns the store. A worker that dies is restarted on the
++ * next call, MAX_WORKER_STARTS times in all; after that, or when a start throws, `fallback()`
++ * (an inline client) takes over, so a broken worker costs smoothness, never the cache.
++ */
++export function workerClient(deps: {
++  fallback: () => TranscriptCacheClient
++  log: (line: string) => void
++  spawn: () => StoreWorkerPort
++}): TranscriptCacheClient {
++  const pending = new Map<number, Pending>()
++  let port: null | StoreWorkerPort = null
++  let starts = 0
++  let nextId = 1
++  let closed = false
++  let inline: null | TranscriptCacheClient = null
++  let announced = false
++
++  const settle = (id: number): Pending | undefined => {
++    const entry = pending.get(id)
++
++    if (entry) {
++      pending.delete(id)
++
++      if (entry.timer) {
++        clearTimeout(entry.timer)
++      }
++    }
++
++    return entry
++  }
++
++  const lost = (from: StoreWorkerPort, why: string) => {
++    if (port !== from) {
++      return // an old worker's late exit
++    }
++
++    port = null
++
++    if (!closed) {
++      deps.log(
++        `store worker lost (${why}); ${starts < MAX_WORKER_STARTS ? 'restarting on the next call' : 'falling back to the main thread'}`
++      )
++    }
++
++    for (const id of [...pending.keys()]) {
++      settle(id)?.reject(new Error(`transcript cache worker lost (${why})`))
++    }
++  }
++
++  const ensurePort = (): null | StoreWorkerPort => {
++    if (port) {
++      return port
++    }
++
++    if (starts >= MAX_WORKER_STARTS) {
++      return null
++    }
++
++    starts += 1
++
++    try {
++      const created = deps.spawn()
++
++      created.on('message', (reply: StoreReply) => {
++        const entry = settle(reply?.id)
++
++        if (!entry) {
++          return
++        }
++
++        if (!announced) {
++          announced = true
++          deps.log(WORKER_READY_LINE) // once per run: desktop.log shows which thread owns the cache
++        }
++
++        if (reply.ms >= SLOW_STORE_OP_MS) {
++          deps.log(slowLine(entry.op, reply.ms, 'on the worker thread (main loop not blocked)'))
++        }
++
++        if (reply.ok) {
++          entry.resolve(reply.result)
++        } else {
++          entry.reject(new Error(reply.error || 'transcript cache op failed'))
++        }
++      })
++      created.on('error', (error: unknown) => lost(created, (error as Error)?.message || String(error)))
++      created.on('exit', (code: unknown) => lost(created, `exit ${String(code)}`))
++      port = created
++    } catch (error) {
++      deps.log(`store worker failed to start: ${(error as Error)?.message || error}`)
++    }
++
++    return port
++  }
++
++  return {
++    call: <T>(op: StoreOp, args: unknown[] = [], opts: { timeoutMs?: number } = {}): Promise<T> => {
++      if (closed) {
++        return Promise.reject(new Error('transcript cache closed'))
++      }
++
++      const target = inline ? null : ensurePort()
++
++      // No worker: a start that threw (no retry: a missing worker file stays missing) or MAX_WORKER_STARTS deaths.
++      if (!target) {
++        if (!inline) {
++          deps.log('store worker unavailable: the cache runs on the main thread for the rest of this run')
++          inline = deps.fallback()
++        }
++
++        return inline.call<T>(op, args, opts)
++      }
++
++      return new Promise<T>((resolve, reject) => {
++        const id = nextId++
++
++        const timer = opts.timeoutMs
++          ? setTimeout(() => {
++              settle(id)?.reject(new Error(`transcript cache ${op} timed out after ${opts.timeoutMs}ms`))
++            }, opts.timeoutMs)
++          : null
++
++        timer?.unref?.()
++        pending.set(id, { op, reject, resolve, timer })
++
++        try {
++          target.postMessage({ args, id, op })
++        } catch (error) {
++          settle(id)?.reject(error as Error) // e.g. an uncloneable argument
++        }
++      })
++    },
++    close: () => {
++      if (closed) {
++        return
++      }
++
++      closed = true
++
++      for (const id of [...pending.keys()]) {
++        settle(id)?.reject(new Error('transcript cache closed'))
++      }
++
++      // A write in flight is one SQLite transaction: terminating mid-way rolls it back.
++      void port?.terminate()
++      port = null
++      inline?.close()
++    },
++    get mode() {
++      return inline ? ('inline' as const) : ('worker' as const)
++    }
++  }
++}
+diff --git a/apps/desktop/electron/transcript-cache-host.test.ts b/apps/desktop/electron/transcript-cache-host.test.ts
+index 8beb3e18a9..10d07b1c62 100644
+--- a/apps/desktop/electron/transcript-cache-host.test.ts
++++ b/apps/desktop/electron/transcript-cache-host.test.ts
+@@ -73,6 +73,8 @@ describe('transcript cache host', () => {
+ 
+     const event: { returnValue?: any } = {}
+     on.get('hermes:transcript-cache:read')!(event, { connectionId: '', profile: '', sessionId: 'l1' })
++    // The store is awaited (it runs on a worker thread in the app), so the reply lands after the listener returns.
++    await vi.waitFor(() => expect(event.returnValue).toBeDefined())
+     expect(event.returnValue?.messages).toEqual([{ content: 'row of local', id: 1, role: 'user' }])
+     host.stop()
+   })
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index 318ea9e739..977da0949b 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -4,6 +4,11 @@
+  * prefetcher against every registry gateway. main.ts injects its backend routing
+  * (ensureRegistryBackend + getJsonForBackend) so this module never dials on its own.
+  *
++ * The store itself runs on a worker thread (`spawnWorker`, transcript-cache-client.ts): its
++ * SQLite calls are synchronous, and on the main thread a write that waited on the disk froze
++ * the whole app for 1-1.8 s. Everything here awaits the client; the renderer's sync read is
++ * answered when the worker replies (the renderer blocks on it either way, the main loop does not).
++ *
+  * IPC (preload exposes it as `hermesDesktop.transcriptCache`):
+  *   hermes:transcript-cache:read             sendSync  {connectionId, profile, sessionId} -> entry | null
+  *   hermes:transcript-cache:put              send      {key, messages, kind: 'latest' | 'older'}
+@@ -18,6 +23,14 @@ import path from 'node:path'
+ import type { IpcMain } from 'electron'
+ 
+ import { type TranscriptCacheKey, TranscriptCacheStore } from './transcript-cache'
++import {
++  inlineClient,
++  spawnStoreWorker,
++  type StoreOp,
++  type StoreWorkerPort,
++  type TranscriptCacheClient,
++  workerClient
++} from './transcript-cache-client'
+ import { type HubSessionRecord, TranscriptPrefetcher } from './transcript-prefetch'
+ 
+ export interface TranscriptCacheHostDeps {
+@@ -28,9 +41,25 @@ export interface TranscriptCacheHostDeps {
+   log: (line: string) => void
+   /** Registry snapshot: the primary id ('' connection ids mean it) and every connection id. */
+   registry: () => { connectionIds: string[]; primary: string }
++  /** Tests: start the store worker themselves. The app passes `workerFile` instead. */
++  spawnWorker?: (file: string) => StoreWorkerPort
+   userDataDir: string
++  /**
++   * The built worker script (dist/electron-transcript-cache-worker.js) that owns the cache file.
++   * Omitted (tests) or unusable: the store runs in this thread.
++   */
++  workerFile?: string
+ }
+ 
++/** The registry as this module reads it (main.ts keeps the registry file's own shape). */
++export const registrySnapshot = (registry: { connections: readonly { id: string }[]; primary: string }) => ({
++  connectionIds: registry.connections.map(connection => connection.id),
++  primary: registry.primary
++})
++
++/** The renderer's sync read gives up (a cache miss: it falls back to REST) after this long. */
++export const READ_TIMEOUT_MS = 1_500
++
+ const GATEWAY_NAME_PREFIX = 'hub-gateway:'
+ const HUB_LIST_LIMIT = 2000
+ 
+@@ -90,7 +119,21 @@ export function markInboxSessions(records: HubSessionRecord[], inbox: readonly O
+ }
+ 
+ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+-  const store = new TranscriptCacheStore(path.join(deps.userDataDir, 'transcript-cache.sqlite'))
++  const file = path.join(deps.userDataDir, 'transcript-cache.sqlite')
++  let inlineStore: null | TranscriptCacheStore = null
++
++  const openInline = (): TranscriptCacheClient => {
++    inlineStore = new TranscriptCacheStore(file)
++
++    return inlineClient(inlineStore, deps.log)
++  }
++
++  const { workerFile } = deps
++  const spawnWorker = deps.spawnWorker ?? (workerFile ? (cache: string) => spawnStoreWorker(workerFile, cache) : null)
++
++  const client: TranscriptCacheClient = spawnWorker
++    ? workerClient({ fallback: openInline, log: deps.log, spawn: () => spawnWorker(file) })
++    : openInline()
+ 
+   const normalizeKey = (raw: any): TranscriptCacheKey | null => {
+     const sessionId = String(raw?.sessionId ?? '').trim()
+@@ -113,19 +156,38 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     passive: connectionId !== (deps.registry().primary || 'local')
+   })
+ 
+-  const guarded = <T>(label: string, fn: () => T, fallback: T): T => {
+-    try {
+-      return fn()
+-    } catch (error) {
++  /** Fire-and-forget store call: a failure is logged, never thrown out of an IPC listener. */
++  const send = (label: string, op: StoreOp, args: unknown[]) => {
++    void client.call(op, args).catch(error => {
+       deps.log(`transcript cache ${label} failed: ${(error as Error)?.message || error}`)
+-
+-      return fallback
+-    }
++    })
+   }
+ 
+   deps.ipcMain.on('hermes:transcript-cache:read', (event, raw) => {
+     const key = normalizeKey(raw)
+-    event.returnValue = key ? guarded('read', () => store.read(key), null) : null
++
++    // Sync IPC: the renderer stays blocked until returnValue is set, so every path sets it once.
++    const reply = (value: unknown) => {
++      try {
++        event.returnValue = value
++      } catch {
++        // the window went away while the read was in flight
++      }
++    }
++
++    if (!key) {
++      reply(null)
++
++      return
++    }
++
++    client.call('read', [key], { timeoutMs: READ_TIMEOUT_MS }).then(
++      entry => reply(entry ?? null),
++      error => {
++        deps.log(`transcript cache read failed: ${(error as Error)?.message || error}`)
++        reply(null)
++      }
++    )
+   })
+ 
+   deps.ipcMain.on('hermes:transcript-cache:put', (_event, payload) => {
+@@ -135,11 +197,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+       return
+     }
+ 
+-    guarded(
+-      'put',
+-      () => (payload.kind === 'older' ? store.putOlder(key, payload.messages) : store.putLatest(key, payload.messages)),
+-      false
+-    )
++    send('put', payload.kind === 'older' ? 'putOlder' : 'putLatest', [key, payload.messages])
+   })
+ 
+   deps.ipcMain.on('hermes:transcript-cache:drop', (_event, payload) => {
+@@ -147,7 +205,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+       const sessionId = String(payload.sessionId ?? '').trim()
+ 
+       if (sessionId) {
+-        guarded('drop', () => store.dropEverywhere(sessionId), undefined)
++        send('drop', 'dropEverywhere', [sessionId])
+       }
+ 
+       return
+@@ -156,7 +214,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     const key = normalizeKey(payload?.key)
+ 
+     if (key) {
+-      guarded('drop', () => store.drop(key), undefined)
++      send('drop', 'drop', [key])
+     }
+   })
+ 
+@@ -165,14 +223,14 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     const from = String(payload?.from ?? '').trim() || 'default'
+     const to = String(payload?.to ?? '').trim() || 'default'
+ 
+-    guarded('migrate', () => store.migrateProfile(connectionId, from, to), undefined)
++    send('migrate', 'migrateProfile', [connectionId, from, to])
+   })
+ 
+   deps.ipcMain.on('hermes:transcript-cache:clear', () => {
+-    guarded('clear', () => store.clear(), undefined)
++    send('clear', 'clear', [])
+   })
+ 
+-  deps.ipcMain.handle('hermes:transcript-cache:stats', () => store.stats())
++  deps.ipcMain.handle('hermes:transcript-cache:stats', () => client.call('stats'))
+ 
+   // Hub gateway name -> registry connection id, learned from each connection's own
+   // hub-sync status and remembered in the cache file so it survives restarts.
+@@ -180,7 +238,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+ 
+   const connectionForGateway = async (gateway: string): Promise<string | undefined> => {
+     const { connectionIds } = deps.registry()
+-    const remembered = store.getMeta(GATEWAY_NAME_PREFIX + gateway)
++    const remembered = await client.call<null | string>('getMeta', [GATEWAY_NAME_PREFIX + gateway])
+ 
+     if (remembered && connectionIds.includes(remembered)) {
+       return remembered
+@@ -199,7 +257,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+         const name = typeof status?.gateway === 'string' ? status.gateway.trim() : ''
+ 
+         if (name) {
+-          store.setMeta(GATEWAY_NAME_PREFIX + name, connectionId)
++          await client.call('setMeta', [GATEWAY_NAME_PREFIX + name, connectionId])
+ 
+           if (name === gateway) {
+             return connectionId
+@@ -267,7 +325,11 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+       }
+     },
+     log: deps.log,
+-    store
++    store: {
++      meta: key => client.call('meta', [key]),
++      metaMany: keys => client.call('metaMany', [keys]),
++      putLatest: (key, latest, meta) => client.call<boolean>('putLatest', [key, latest, meta])
++    }
+   })
+ 
+   // [daveey] An `@session` ref chip rendered/hovered: warm that session so its first click paints from cache.
+@@ -280,12 +342,21 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+   })
+ 
+   return {
++    client,
+     prefetcher,
+     start: () => prefetcher.start(),
+     stop: () => {
+       prefetcher.stop()
+-      guarded('close', () => store.close(), undefined)
++
++      try {
++        client.close()
++      } catch (error) {
++        deps.log(`transcript cache close failed: ${(error as Error)?.message || error}`)
++      }
+     },
+-    store
++    /** The in-thread store, or null while a worker thread owns the file. */
++    get store() {
++      return inlineStore
++    }
+   }
+ }
+diff --git a/apps/desktop/electron/transcript-cache-worker.ts b/apps/desktop/electron/transcript-cache-worker.ts
+new file mode 100644
+index 0000000000..147bc3dd13
+--- /dev/null
++++ b/apps/desktop/electron/transcript-cache-worker.ts
+@@ -0,0 +1,20 @@
++/**
++ * [daveey] Worker-thread entry that owns the transcript cache's SQLite file, so its
++ * synchronous I/O never runs on Electron's main thread (see transcript-cache-client.ts).
++ * Bundled on its own as dist/electron-transcript-cache-worker.js; no Electron imports.
++ */
++import { parentPort, workerData } from 'node:worker_threads'
++
++import { TranscriptCacheStore } from './transcript-cache'
++import { answerStoreRequest, type StoreRequest } from './transcript-cache-client'
++
++if (!parentPort) {
++  throw new Error('transcript-cache-worker must run as a worker thread')
++}
++
++const store = new TranscriptCacheStore(String((workerData as { file?: unknown })?.file ?? ''))
++const port = parentPort
++
++port.on('message', (request: StoreRequest) => {
++  port.postMessage(answerStoreRequest(store, request))
++})
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index d2b5129f5e..476132890a 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -379,3 +379,74 @@ function deferredRows() {
+ 
+   return { promise, resolve }
+ }
++
++describe('[daveey] prefetch over an asynchronous store (the worker-thread cache)', () => {
++  function harness(records: HubSessionRecord[]) {
++    const clock = 1_000_000
++    const inner = new TranscriptCacheStore(':memory:', { now: () => clock })
++    const later = <T>(value: () => T) => new Promise<T>(resolve => setTimeout(() => resolve(value()), 1))
++
++    const store = {
++      meta: vi.fn((key: TranscriptCacheKey) => later(() => inner.meta(key))),
++      metaMany: vi.fn((keys: readonly TranscriptCacheKey[]) => later(() => keys.map(key => inner.meta(key)))),
++      putLatest: vi.fn((key: TranscriptCacheKey, latest: readonly unknown[], meta?: object) =>
++        later(() => inner.putLatest(key, latest, meta))
++      )
++    }
++
++    const fetchLatest = vi.fn(async (key: TranscriptCacheKey) => [{ content: key.sessionId, id: 1 }])
++
++    const prefetcher = new TranscriptPrefetcher({
++      connectionForGateway: gateway => CONNECTIONS[gateway],
++      fetchLatest,
++      listHubSessions: async () => records,
++      now: () => clock,
++      store
++    })
++
++    return { fetchLatest, inner, prefetcher, store }
++  }
++
++  it('checks a whole pass in one batched meta read and awaits each write before counting it', async () => {
++    const h = harness([record('mini', 'a', 1), record('mini', 'b', 2), record('hub', 'c', 3)])
++
++    expect(await h.prefetcher.tick()).toMatchObject({ failed: 0, fetched: 3, targets: 3 })
++    expect(h.store.metaMany).toHaveBeenCalledTimes(1)
++    expect(h.store.meta).not.toHaveBeenCalled()
++    expect(h.inner.stats().sessions).toBe(3)
++
++    expect(await h.prefetcher.tick()).toMatchObject({ fetched: 0, skipped: 3 })
++    expect(h.fetchLatest).toHaveBeenCalledTimes(3)
++  })
++
++  it('a write the store refuses (resolves false) is not counted as fetched', async () => {
++    const h = harness([record('mini', 'a', 1)])
++    h.store.putLatest.mockResolvedValue(false)
++
++    expect(await h.prefetcher.tick()).toMatchObject({ fetched: 0, skipped: 1 })
++  })
++
++  it('asks for one key while its freshness check is still in flight share that check: one fetch', async () => {
++    const h = harness([])
++    const key = { connectionId: 'mac-mini', profile: 'default', sessionId: 'ref' }
++    const asks = [h.prefetcher.prefetchKey(key), h.prefetcher.prefetchKey(key), h.prefetcher.prefetchKey(key)]
++
++    expect(await Promise.all(asks)).toEqual(['fetched', 'queued', 'queued'])
++    expect(h.store.meta).toHaveBeenCalledTimes(1)
++    expect(h.fetchLatest).toHaveBeenCalledTimes(1)
++    await expect(h.prefetcher.prefetchKey(key)).resolves.toBe('current')
++  })
++
++  it('a store that fails the freshness check reports failed and leaves the key askable again', async () => {
++    const h = harness([])
++    const key = { connectionId: 'mac-mini', profile: 'default', sessionId: 'ref' }
++    h.store.meta.mockRejectedValueOnce(new Error('transcript cache worker lost (exit 1)'))
++
++    expect(await Promise.all([h.prefetcher.prefetchKey(key), h.prefetcher.prefetchKey(key)])).toEqual([
++      'failed',
++      'failed'
++    ])
++    expect(h.fetchLatest).not.toHaveBeenCalled()
++    await expect(h.prefetcher.prefetchKey(key)).resolves.toBe('fetched')
++  })
++})
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index c4af2c8621..219f7821af 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -46,9 +46,18 @@ export interface PrefetchTarget {
+   meta: { activity: null | number; messageCount: null | number }
+ }
+ 
++type CachedMeta = { activity: null | number; messageCount: null | number; savedAt: number } | null
++type MaybePromise<T> = Promise<T> | T
++
++/**
++ * The cache as the prefetcher sees it. Every call may be asynchronous: Desktop runs the SQLite store on a worker
++ * thread (transcript-cache-client.ts), because a write that waits on the disk froze Electron's main loop for
++ * 1-1.8 s. `metaMany` answers a whole pass's freshness checks in one round trip.
++ */
+ export interface PrefetchStore {
+-  meta(key: TranscriptCacheKey): { activity: null | number; messageCount: null | number; savedAt: number } | null
+-  putLatest(key: TranscriptCacheKey, latest: readonly unknown[], meta?: TranscriptCacheMeta): boolean
++  meta(key: TranscriptCacheKey): MaybePromise<CachedMeta>
++  metaMany?(keys: readonly TranscriptCacheKey[]): MaybePromise<CachedMeta[]>
++  putLatest(key: TranscriptCacheKey, latest: readonly unknown[], meta?: TranscriptCacheMeta): MaybePromise<boolean>
+ }
+ 
+ export interface PrefetchDeps {
+@@ -141,11 +150,7 @@ export function selectPrefetchTargets(
+ }
+ 
+ /** Whether a cached entry is behind the hub's view of the session. */
+-export function needsRefresh(
+-  cached: { activity: null | number; messageCount: null | number; savedAt: number } | null,
+-  target: PrefetchTarget,
+-  now: number
+-): boolean {
++export function needsRefresh(cached: CachedMeta, target: PrefetchTarget, now: number): boolean {
+   if (!cached) {
+     return true
+   }
+@@ -173,6 +178,8 @@ export class TranscriptPrefetcher {
+   private readonly demandWaiters = new Map<string, ((outcome: PrefetchKeyOutcome) => void)[]>()
+   private readonly demandQueues = new Map<string, TranscriptCacheKey[]>()
+   private readonly demandActive = new Map<string, number>()
++  /** Keys whose freshness check is in flight (the store answers asynchronously): later asks share its answer. */
++  private readonly demandChecks = new Map<string, Promise<boolean>>()
+   /** [daveey] On-demand keys whose fetch stored nothing (404, empty): not retried within MIN_REFETCH_MS. */
+   private readonly demandMissed = new Map<
+     string,
+@@ -206,17 +213,15 @@ export class TranscriptPrefetcher {
+    * DEMAND_CONCURRENCY fetches per gateway at a time and DEMAND_QUEUE_MAX queued behind them.
+    */
+   prefetchKey(raw: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
+-    try {
+-      return this.enqueueDemand(raw)
+-    } catch (error) {
+-      // A store read can throw (closed at quit, SQLITE_BUSY): never out of an IPC listener.
++    return this.enqueueDemand(raw).catch(error => {
++      // A store read can fail (closed at quit, SQLITE_BUSY, worker gone): never out of an IPC listener.
+       this.deps.log?.(`transcript prefetch (ref) skipped: ${(error as Error)?.message || error}`)
+ 
+-      return Promise.resolve('failed')
+-    }
++      return 'failed' as const
++    })
+   }
+ 
+-  private enqueueDemand(raw: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
++  private async enqueueDemand(raw: TranscriptCacheKey): Promise<PrefetchKeyOutcome> {
+     const key: TranscriptCacheKey = {
+       connectionId: String(raw?.connectionId ?? '').trim(),
+       profile: profileOf(raw?.profile),
+@@ -227,25 +232,37 @@ export class TranscriptPrefetcher {
+     const now = this.deps.now?.() ?? Date.now()
+ 
+     if (!key.connectionId || !key.sessionId) {
+-      return Promise.resolve('invalid')
++      return 'invalid'
+     }
+ 
+     if (this.demandWaiters.has(id)) {
+-      return Promise.resolve('queued')
++      return 'queued'
+     }
+ 
+     if ((this.downUntil.get(key.connectionId) ?? 0) > now) {
+-      return Promise.resolve('backoff')
++      return 'backoff'
+     }
+ 
+-    if (!this.demandDue(key, now)) {
+-      return Promise.resolve('current')
++    const checking = this.demandChecks.get(id)
++
++    if (checking) {
++      return (await checking) ? 'queued' : 'current'
++    }
++
++    const check = Promise.resolve()
++      .then(() => this.demandDue(key, now))
++      .finally(() => this.demandChecks.delete(id))
++
++    this.demandChecks.set(id, check)
++
++    if (!(await check)) {
++      return 'current'
+     }
+ 
+     const queue = this.demandQueues.get(key.connectionId) ?? []
+ 
+     if (queue.length >= DEMAND_QUEUE_MAX) {
+-      return Promise.resolve('dropped')
++      return 'dropped'
+     }
+ 
+     return new Promise<PrefetchKeyOutcome>(resolve => {
+@@ -256,9 +273,9 @@ export class TranscriptPrefetcher {
+     })
+   }
+ 
+-  private demandDue(key: TranscriptCacheKey, now: number): boolean {
++  private async demandDue(key: TranscriptCacheKey, now: number): Promise<boolean> {
+     const id = keyString(key)
+-    const cached = this.deps.store.meta(key) ?? this.unstored.get(id) ?? this.demandMissed.get(id) ?? null
++    const cached = (await this.deps.store.meta(key)) ?? this.unstored.get(id) ?? this.demandMissed.get(id) ?? null
+     const listed = this.listed.get(id)
+ 
+     if (!cached) {
+@@ -321,7 +338,7 @@ export class TranscriptPrefetcher {
+     try {
+       const rows = await this.deps.fetchLatest(key, LATEST_ROWS)
+ 
+-      if (rows.length > 0 && this.deps.store.putLatest(key, rows, meta)) {
++      if (rows.length > 0 && (await this.deps.store.putLatest(key, rows, meta))) {
+         this.demandMissed.delete(id)
+         this.deps.log?.(`transcript prefetch (ref): cached ${key.connectionId}/${key.profile}/${key.sessionId}`)
+ 
+@@ -426,8 +443,12 @@ export class TranscriptPrefetcher {
+       }
+     }
+ 
+-    const due = targets.filter(target =>
+-      needsRefresh(this.deps.store.meta(target.key) ?? this.unstored.get(keyOf(target)) ?? null, target, now)
++    const keys = targets.map(target => target.key)
++    const { store } = this.deps
++    const cached = store.metaMany ? await store.metaMany(keys) : await Promise.all(keys.map(key => store.meta(key)))
++
++    const due = targets.filter((target, index) =>
++      needsRefresh(cached[index] ?? this.unstored.get(keyOf(target)) ?? null, target, now)
+     )
+ 
+     result.skipped = targets.length - due.length
+@@ -458,7 +479,7 @@ export class TranscriptPrefetcher {
+             try {
+               const rows = await this.deps.fetchLatest(target.key, LATEST_ROWS)
+ 
+-              if (rows.length > 0 && this.deps.store.putLatest(target.key, rows, target.meta)) {
++              if (rows.length > 0 && (await this.deps.store.putLatest(target.key, rows, target.meta))) {
+                 this.unstored.delete(keyOf(target))
+                 result.fetched += 1
+               } else {
+diff --git a/apps/desktop/scripts/bundle-electron-main.mjs b/apps/desktop/scripts/bundle-electron-main.mjs
+index b6d7cd6998..5d7338e3bd 100644
+--- a/apps/desktop/scripts/bundle-electron-main.mjs
++++ b/apps/desktop/scripts/bundle-electron-main.mjs
+@@ -30,6 +30,8 @@ function productIdentity(source, stamp) {
+ /** Every file bundleElectronMain writes: the only outputs that bake the install stamp. */
+ export const electronOutputs = Object.freeze({
+   main: 'electron-main.mjs', preload: 'electron-preload.js', previewGuestPreload: 'preview-guest-preload.js',
++  // [daveey] Worker thread owning the transcript cache's SQLite file (electron/transcript-cache-worker.ts).
++  transcriptCacheWorker: 'electron-transcript-cache-worker.js',
+ })
+ 
+ /** Bundle main/preload using only the prepared workspace's compiler. */
+@@ -86,6 +88,13 @@ export async function bundleElectronMain({ source, out, stamp, dev = false }) {
+     format: 'cjs',
+     outfile: join(out, electronOutputs.previewGuestPreload),
+   })
++  // Self-contained (node builtins only): main.ts evals this file's text in a worker thread.
++  await build({
++    ...common,
++    entryPoints: [join(source, 'apps/desktop/electron/transcript-cache-worker.ts')],
++    format: 'cjs',
++    outfile: join(out, electronOutputs.transcriptCacheWorker),
++  })
+   return { stampClock: bakedStamp }
+ }
+ 
+diff --git a/apps/desktop/scripts/bundle-electron-main.test.mjs b/apps/desktop/scripts/bundle-electron-main.test.mjs
+index 10865b6a45..9ade5d5c60 100644
+--- a/apps/desktop/scripts/bundle-electron-main.test.mjs
++++ b/apps/desktop/scripts/bundle-electron-main.test.mjs
+@@ -1,12 +1,13 @@
+ import { execFileSync } from 'node:child_process'
+-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import { join, resolve } from 'node:path'
+ import { pathToFileURL } from 'node:url'
++import { Worker } from 'node:worker_threads'
+ 
+ import { afterAll, beforeAll, expect, test } from 'vitest'
+ 
+-import { bundleElectronMain } from './bundle-electron-main.mjs'
++import { bundleElectronMain, electronOutputs } from './bundle-electron-main.mjs'
+ 
+ const repo = resolve(import.meta.dirname, '../../..')
+ let root
+@@ -133,3 +134,42 @@ test('the bundled entry reads desktop.electron_flags from the parent of a profil
+     })
+   ).toEqual({ relaunched: ['.', '--ozone-platform=x11'] })
+ })
++
++// [daveey] main.ts evals this file's text in a worker thread, so the cache's SQLite I/O stays off
++// Electron's main loop. It must be emitted, need nothing but node builtins, and answer the store protocol.
++test('the transcript cache worker bundle runs from its text alone in a worker thread', async () => {
++  const file = join(root, 'dist', electronOutputs.transcriptCacheWorker)
++
++  expect(electronOutputs.transcriptCacheWorker).toBe('electron-transcript-cache-worker.js')
++  expect(existsSync(file)).toBe(true)
++
++  const source = readFileSync(file, 'utf8')
++  const required = [...source.matchAll(/require\("([^"]+)"\)/g)].map(match => match[1])
++  expect(required.filter(name => !name.startsWith('node:'))).toEqual([])
++
++  const worker = new Worker(source, { eval: true, workerData: { file: join(root, 'worker-cache.sqlite') } })
++
++  const ask = (id, op, args) =>
++    new Promise((done, fail) => {
++      worker.once('message', done)
++      worker.once('error', fail)
++      worker.postMessage({ args, id, op })
++    })
++
++  const key = { connectionId: 'mini', profile: 'default', sessionId: 's1' }
++
++  try {
++    expect(await ask(1, 'putLatest', [key, [{ content: 'hi', id: 1, role: 'user' }], { activity: 3 }])).toMatchObject({
++      id: 1,
++      ok: true,
++      result: true
++    })
++    expect(await ask(2, 'read', [key])).toMatchObject({
++      id: 2,
++      ok: true,
++      result: { activity: 3, messages: [{ content: 'hi', id: 1, role: 'user' }] }
++    })
++  } finally {
++    await worker.terminate()
++  }
++})
+diff --git a/tests-js/desktop-builder.test.mjs b/tests-js/desktop-builder.test.mjs
+index 83e03a6794..29d1682974 100644
+--- a/tests-js/desktop-builder.test.mjs
++++ b/tests-js/desktop-builder.test.mjs
+@@ -62,6 +62,7 @@ function fixture() {
+   put(join(app, 'electron/main.ts'), 'console.log(JSON.stringify({ stamp: __HERMES_INSTALL_STAMP__, identity: __HERMES_PRODUCT_IDENTITY__ }))')
+   put(join(app, 'electron/preload.ts'), 'globalThis.fixturePreload = "compiled preload"')
+   put(join(app, 'electron/preview-guest-preload-entry.ts'), 'globalThis.fixtureGuestPreload = "compiled guest preload"')
++  put(join(app, 'electron/transcript-cache-worker.ts'), 'globalThis.fixtureCacheWorker = "compiled cache worker"')
+   cpSync(join(repo, 'apps/desktop/product-identity.cjs'), join(app, 'product-identity.cjs'))
+   cpSync(join(repo, 'apps/desktop/electron/native'), join(app, 'electron/native'), { recursive: true })
+   // product-identity.cjs resolves the channel request through the in-tree
+-- 
+2.55.0
+

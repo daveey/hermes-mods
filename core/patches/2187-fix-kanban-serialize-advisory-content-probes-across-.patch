@@ -1,0 +1,235 @@
+From 70ea1c8ca5189ffa449f2af23b3fc573c5333968 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:49:53 +0000
+Subject: [PATCH] fix(kanban): serialize advisory content probes across readers
+ [daveey]
+
+---
+ hermes_cli/kanban_activity_revision.py        |  17 +++
+ hermes_cli/kanban_session_activity_hub.py     |   9 +-
+ .../test_kanban_content_key_busy_budget.py    |   5 +-
+ .../test_kanban_content_key_concurrency.py    | 111 ++++++++++++++++++
+ .../test_kanban_poll_cache_guarantees.py      |  10 +-
+ 5 files changed, 148 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_content_key_concurrency.py
+
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index f791369c2d..d3433b6cf6 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -186,7 +186,24 @@ def _covered_read(conn: sqlite3.Connection, path: Path, db: tuple | None, tables
+     return revision
+ 
+ 
++# Zero-budget SQLite probes must not race each other's reader lifecycle opens.
++# The reader cache is shared, not thread-local: serialize probes before entering
++# it, so concurrent healthy readers compare the SAME connection's data_version
++# rather than turning local lock contention into unrelated unknown keys. Stripes
++# bound lock storage without retaining paths/connections indefinitely.
++_PROBE_LOCKS = tuple(threading.RLock() for _ in range(64))
++
++
++def probe_lock(path: Path):
++    return _PROBE_LOCKS[hash(str(path)) % len(_PROBE_LOCKS)]
++
++
+ def content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
++    with probe_lock(path):
++        return _content_key(path, tables, open_ro)
++
++
++def _content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple:
+     """A key that changes whenever any row of ``tables`` that the readers read changes in ``path`` (and on file
+     replacement or schema change), but not on bookkeeping-only writes. ``open_ro(path)`` is a context manager
+     yielding a read-only connection (a kept one: the read is one indexed row plus the schema table). Falls back to
+diff --git a/hermes_cli/kanban_session_activity_hub.py b/hermes_cli/kanban_session_activity_hub.py
+index 8648899236..f29d8b2097 100644
+--- a/hermes_cli/kanban_session_activity_hub.py
++++ b/hermes_cli/kanban_session_activity_hub.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import sqlite3
+ from pathlib import Path
+ 
+-from hermes_cli.kanban_activity_revision import file_stat
++from hermes_cli.kanban_activity_revision import file_stat, probe_lock
+ 
+ _HUB_SIGNATURE_SQL = ("SELECT coll, COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll IN ('tasks', 'gateway') "
+                       "GROUP BY coll")
+@@ -13,6 +13,13 @@ _hub_signature_memo: tuple | None = None
+ 
+ 
+ def _hub_content_signature(hub: Path) -> tuple:
++    # Share the board-key probe lock: the zero-budget lifecycle open and memo
++    # lookup/publish are one operation, not eight contending advisory probes.
++    with probe_lock(hub):
++        return _read_hub_content_signature(hub)
++
++
++def _read_hub_content_signature(hub: Path) -> tuple:
+     """Ignore session-only writes, but never mistake an equal stat for no commit.
+ 
+     SQLite's data_version on a kept read-only connection detects commits even on
+diff --git a/tests/hermes_cli/test_kanban_content_key_busy_budget.py b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+index 4d0b0c167a..59fe425dcb 100644
+--- a/tests/hermes_cli/test_kanban_content_key_busy_budget.py
++++ b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+@@ -62,7 +62,10 @@ def test_content_key_on_busy_board_falls_back_without_waiting(busy_board, monkey
+ 
+     monkeypatch.setattr(kanban_generation.time, "sleep", lambda s: sleeps.append(s))
+     blocker.execute("BEGIN EXCLUSIVE")
+-    assert activity._board_content_key(board) == stat_key
++    first = activity._board_content_key(board)
++    second = activity._board_content_key(board)
++    assert first[:2] == second[:2] == stat_key
++    assert first != second  # a busy read is unknown, not proof of unchanged content
+     assert sleeps == []  # no open retry loop behind a busy board
+     assert not has_live_connection(board)
+ 
+diff --git a/tests/hermes_cli/test_kanban_content_key_concurrency.py b/tests/hermes_cli/test_kanban_content_key_concurrency.py
+new file mode 100644
+index 0000000000..c7b677ef02
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_content_key_concurrency.py
+@@ -0,0 +1,111 @@
++"""Commit keys are comparable across readers, including a cold concurrent open."""
++import concurrent.futures
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_session_activity as activity
++
++
++@pytest.mark.parametrize("journal", ["DELETE", "WAL"])
++def test_concurrent_legacy_keys_share_commit_observer(tmp_path, monkeypatch, journal):
++    path = tmp_path / "legacy.db"
++    activity._reset_cache_for_tests()
++    writer = sqlite3.connect(path)
++    try:
++        writer.execute(f"PRAGMA journal_mode={journal}")
++        writer.executescript("CREATE TABLE tasks (title TEXT); INSERT INTO tasks VALUES ('one');")
++        frozen = rev.file_stat(path)
++        monkeypatch.setattr(rev, "file_stat", lambda _: frozen)
++
++        def batch():
++            barrier = threading.Barrier(8)
++
++            def read():
++                barrier.wait(timeout=5)
++                return activity._board_content_key(path)
++
++            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++                keys = list(pool.map(lambda _: read(), range(8)))
++            assert all(key == keys[0] for key in keys), keys
++            return keys[0]
++
++        first = batch()
++        writer.execute("UPDATE tasks SET title='two'")
++        writer.commit()
++        second = batch()
++        assert first != second
++        assert batch() == second
++        # Reopen only the reader; keep content caches and the frozen stat intact.
++        # A new connection can start at the same data_version as its predecessor.
++        from hermes_cli.kanban_generation import evict_readers
++        evict_readers(str(path))
++        writer.execute("UPDATE tasks SET title='new'")
++        writer.commit()
++        third = batch()
++        assert third != second
++        assert third != first  # reopened data_version can equal the first batch's
++        assert batch() == third
++    finally:
++        writer.close()
++        activity._reset_cache_for_tests()
++
++
++@pytest.mark.parametrize("legacy", [False, True])
++def test_concurrent_hub_signatures_share_one_memo(tmp_path, monkeypatch, legacy):
++    from hermes_cli import kanban_session_activity_hub as hub
++    from hermes_cli.kanban_generation import evict_readers
++
++    path = tmp_path / "hub.db"
++    activity._reset_cache_for_tests()
++    writer = sqlite3.connect(path)
++    try:
++        writer.execute("PRAGMA journal_mode=WAL")
++        writer.execute("CREATE TABLE meta (k TEXT, v TEXT)")
++        writer.execute("CREATE TABLE replica (coll TEXT, seq INTEGER)" if not legacy
++                       else "CREATE TABLE replica (coll TEXT)")
++        writer.commit()
++        frozen = hub.file_stat(path)
++        monkeypatch.setattr(hub, "file_stat", lambda _: frozen)
++        queries = []
++        with activity.cached_ro(path) as conn:
++            conn.set_trace_callback(lambda sql: queries.append(sql) if sql.startswith("SELECT coll,") else None)
++
++        def batch():
++            barrier = threading.Barrier(8)
++
++            def read(_):
++                barrier.wait(timeout=5)
++                return activity._hub_content_signature(path)
++
++            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++                signatures = list(pool.map(read, range(8)))
++            assert all(sig == signatures[0] for sig in signatures), signatures
++            return signatures[0]
++
++        first = batch()
++        assert batch() == first
++        # SQLite does not trace statements which fail to prepare (old schema).
++        if not legacy:
++            assert len(queries) == 1
++        writer.execute("INSERT INTO replica VALUES ('tasks', 1)" if not legacy
++                       else "INSERT INTO replica VALUES ('tasks')")
++        writer.commit()
++        second = batch()
++        assert second != first
++        assert batch() == second
++        if not legacy:
++            assert len(queries) == 2
++        evict_readers(str(path))  # memo survives a reader replacement
++        writer.execute("INSERT INTO replica VALUES ('tasks', 2)" if not legacy
++                       else "INSERT INTO replica VALUES ('tasks')")
++        writer.commit()
++        third = batch()
++        assert third != second
++        assert third != first  # reopened data_version can equal the first batch's
++        assert batch() == third
++    finally:
++        writer.close()
++        activity._reset_cache_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_poll_cache_guarantees.py b/tests/hermes_cli/test_kanban_poll_cache_guarantees.py
+index 19d4f0a609..03e6077cd8 100644
+--- a/tests/hermes_cli/test_kanban_poll_cache_guarantees.py
++++ b/tests/hermes_cli/test_kanban_poll_cache_guarantees.py
+@@ -20,7 +20,10 @@ def test_recent_stat_board_same_tick_write_is_read_after_ttl(clock, spies, tmp_p
+         before = ksa._activity_fingerprint()
+         conn.execute("UPDATE tasks SET status = 'archived'")
+         os.utime(path, ns=(recent, recent))
+-        assert ksa._activity_fingerprint() == before
++        # Equal file stats no longer hide commits or replacement reader identities.
++        after = ksa._activity_fingerprint()
++        assert after[0][1][1] == before[0][1][1]  # same filesystem stat
++        assert after != before
+         helpers._advance(clock, ksa._CACHE_TTL_S + 0.5)
+         assert "kanban_active" not in helpers._poll()
+         assert spies["recompute"] == 2
+@@ -43,7 +46,10 @@ def test_replaced_reader_cannot_reuse_same_stat_board_row(clock, spies, tmp_path
+         conn.execute("UPDATE tasks SET status = 'archived'")
+         os.utime(path, ns=(recent, recent))
+         ksa.evict_readers(os.path.realpath(path))
+-        assert ksa._activity_fingerprint() == before
++        # Equal file stats no longer hide commits or replacement reader identities.
++        after = ksa._activity_fingerprint()
++        assert after[0][1][1] == before[0][1][1]  # same filesystem stat
++        assert after != before
+         with ksa.cached_ro(path) as reader:
+             assert reader is not evicted
+         helpers._advance(clock, ksa._CACHE_TTL_S + 0.5)
+-- 
+2.55.0
+

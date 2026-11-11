@@ -1,0 +1,355 @@
+From 73cdd0514beba410ab6e0a375679333136ee33be Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:57:54 +0000
+Subject: [PATCH] fix(kanban): scope same-host producer waits to their board
+ [daveey]
+
+---
+ hermes_cli/kanban_awaiting.py                 |  62 +++++------
+ hermes_cli/kanban_awaiting_board.py           |  83 ++++++++++++++
+ hermes_cli/kanban_wait_check.py               |   7 +-
+ hermes_cli/kanban_wake_check.py               |   4 +-
+ .../test_kanban_awaiting_cross_board.py       | 101 ++++++++++++++++++
+ 5 files changed, 219 insertions(+), 38 deletions(-)
+ create mode 100644 hermes_cli/kanban_awaiting_board.py
+ create mode 100644 tests/hermes_cli/test_kanban_awaiting_cross_board.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 5c2c6ee8bb9..d44004aaeda 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -269,41 +269,21 @@ def dependency_cycle_reason(conn: sqlite3.Connection, task_id: str, ref: str) ->
+     if ref in _descendant_ids(conn, task_id):
+         return (f"{ref} is a descendant of {task_id}; a card must not wait on its own child "
+                 "(the child cannot finish until this card does, so the wait never ends)")
+-    seen: set[str] = set()
+-    stack = [ref]
+-    while stack and len(seen) < 32:
+-        node = stack.pop()
+-        if node == task_id:
+-            return f"waiting on {ref} cycles back to {task_id}"
+-        if not node or node in seen:
+-            continue
+-        seen.add(node)
+-        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (node,)).fetchone()
+-        if row is None:
+-            continue
+-        status = row[0]
+-        if status == "todo":
+-            stack.extend(parent for (parent,) in conn.execute(
+-                "SELECT parent_id FROM task_links WHERE child_id = ?", (node,)))
+-        elif status == "scheduled":
+-            awaiting, _reason = _latest_park(conn, node)
+-            if isinstance(awaiting, dict) and awaiting.get("kind") == "card" and not awaiting.get("gateway"):
+-                pref = awaiting.get("ref") or ""
+-                if _TASK_ID.fullmatch(pref):
+-                    stack.append(pref)
+-            stack.extend(_scheduled_probe_ids(conn, node))
+-    return None
++    from hermes_cli.kanban_awaiting_board import cross_board_cycle
++    return cross_board_cycle(conn, task_id, {"kind": "card", "ref": ref})
+ 
+ 
+ def park_cycle_error(conn: sqlite3.Connection, task_id: str, record: Optional[dict],
+                      wake_check: Optional[str]) -> Optional[str]:
+     """Refusal text when this park's producer or wake probe would cycle, else None."""
++    from hermes_cli.kanban_awaiting_board import other_board_path
+     refs: list[str] = []
+-    if isinstance(record, dict) and record.get("kind") == "card" and not record.get("gateway"):
++    foreign_ref = record.get("ref") if record and other_board_path(conn, record) else None
++    if isinstance(record, dict) and record.get("kind") == "card" and not record.get("gateway") and not foreign_ref:
+         ref = record.get("ref") or ""
+         if _TASK_ID.fullmatch(ref):
+             refs.append(ref)
+-    refs.extend(_TASK_ID.findall(wake_check or ""))
++    refs.extend(ref for ref in _TASK_ID.findall(wake_check or "") if ref != foreign_ref)
+     for ref in dict.fromkeys(refs):
+         if ref == task_id:
+             continue
+@@ -328,7 +308,12 @@ def card_orphan_reason(conn: sqlite3.Connection, task_id: str, *, _depth: int =
+     if status == "scheduled":
+         awaiting, reason = _latest_park(conn, task_id)
+         if awaiting and awaiting.get("kind") == "card" and not awaiting.get("gateway") and _depth < 4:
+-            inner = card_orphan_reason(conn, awaiting.get("ref", ""), _depth=_depth + 1)
++            from hermes_cli.kanban_awaiting_board import producer_connection
++            try:
++                with producer_connection(conn, awaiting) as owner:
++                    inner = card_orphan_reason(owner, awaiting.get("ref", ""), _depth=_depth + 1)
++            except (AwaitingError, sqlite3.Error) as exc:
++                return f"{task_id} waits on an unreadable producer board: {exc}"
+             return f"{task_id} waits on {awaiting.get('ref')}, and {inner}" if inner else None
+         if not awaiting or awaiting.get("inferred"):
+             wall = text_wall(reason)
+@@ -393,10 +378,16 @@ def _check_card(conn: sqlite3.Connection, task_id: str, awaiting: dict, text: st
+         return
+     if not _TASK_ID.fullmatch(ref):
+         raise AwaitingError(INVALID_AWAITING, f"awaiting kind='card' needs ref=<task id> (got {ref!r})")
+-    if ref == task_id:
++    from hermes_cli.kanban_awaiting_board import other_board_path, producer_connection, cross_board_cycle
++    other_board = other_board_path(conn, awaiting)
++    if other_board:
++        why = cross_board_cycle(conn, task_id, awaiting)
++        if why:
++            raise AwaitingError(INVALID_AWAITING, why)
++    if ref == task_id and not other_board:
+         raise AwaitingError(INVALID_AWAITING, "a card cannot wait on itself")
+     gateway = awaiting.get("gateway")
+-    if not gateway:
++    if not gateway and not other_board:
+         why = dependency_cycle_reason(conn, task_id, ref)
+         if why:
+             raise AwaitingError(INVALID_AWAITING, why)
+@@ -408,12 +399,13 @@ def _check_card(conn: sqlite3.Connection, task_id: str, awaiting: dict, text: st
+                 "or `hermes kanban schedule --awaiting`, which confirm it with `hermes kanban wait-check`."))
+         awaiting["observed"] = seen[1]
+         return
+-    why = card_orphan_reason(conn, ref)
+-    if why:
+-        raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {why}. {_REMEDY}")
+-    done = _completed_at(conn, ref)
+-    if done:
+-        raise producer_done_error(ref, done)
++    with producer_connection(conn, awaiting) as owner:
++        why = card_orphan_reason(owner, ref)
++        if why:
++            raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {why}. {_REMEDY}")
++        done = _completed_at(owner, ref)
++        if done:
++            raise producer_done_error(ref, done)
+ 
+ 
+ def _check_run(conn, task_id, awaiting, text) -> None:
+diff --git a/hermes_cli/kanban_awaiting_board.py b/hermes_cli/kanban_awaiting_board.py
+new file mode 100644
+index 00000000000..0fdd72e8dce
+--- /dev/null
++++ b/hermes_cli/kanban_awaiting_board.py
+@@ -0,0 +1,83 @@
++"""Read-only board-qualified producer lookup, separate from the waiter's write pin."""
++from contextlib import contextmanager
++from pathlib import Path
++import sqlite3
++
++
++def other_board_path(conn, awaiting):
++    if not awaiting or awaiting.get("kind", "card") != "card" or awaiting.get("gateway") or not awaiting.get("board"):
++        return None
++    from hermes_cli.kanban_db import board_own_db_path, _normalize_board_slug
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++    from hermes_cli.kanban_awaiting import AwaitingError, INVALID_AWAITING
++    try:
++        path = board_own_db_path(awaiting["board"])
++    except ValueError as exc:
++        raise AwaitingError(INVALID_AWAITING, str(exc)) from exc
++    current = _main_db_file(conn)
++    if current and _normalize_board_slug(awaiting["board"]) == board_slug_for_path(current):
++        return None
++    return path
++
++
++@contextmanager
++def producer_connection(conn, awaiting):
++    path = other_board_path(conn, awaiting)
++    if path is None:
++        yield conn
++        return
++    from hermes_cli.kanban_session_activity import _open_ro
++    from hermes_cli.kanban_awaiting import AwaitingError, INVALID_AWAITING
++    try:
++        owner = _open_ro(Path(path))
++    except (OSError, sqlite3.Error) as exc:
++        raise AwaitingError(INVALID_AWAITING, f"cannot read producer board {awaiting['board']}: {exc}") from exc
++    try:
++        yield owner
++    finally:
++        owner.close()
++
++
++def cross_board_cycle(conn, task_id, awaiting):
++    """Follow qualified producer/parent edges; board-local IDs are not global identities."""
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_awaiting import _latest_park, _scheduled_probe_ids
++    def identity(owner, ref):
++        path = _main_db_file(owner)
++        return (str(Path(path).resolve()) if path else str(id(owner)), ref)
++
++    origin = identity(conn, task_id)
++    seen = set()
++
++    def visit(owner, ref):
++        key = identity(owner, ref)
++        if key == origin:
++            return f"waiting on {awaiting['ref']} cycles back to {task_id}"
++        if key in seen:
++            return None
++        if len(seen) >= 32:
++            return "producer dependency graph exceeds the bounded cycle check"
++        seen.add(key)
++        row = owner.execute("SELECT status FROM tasks WHERE id=?", (ref,)).fetchone()
++        if not row:
++            return None
++        edges = []
++        if row[0] == "todo":
++            edges = [{"ref": p[0]} for p in owner.execute(
++                "SELECT parent_id FROM task_links WHERE child_id=?", (ref,))]
++        elif row[0] == "scheduled":
++            record, _ = _latest_park(owner, ref)
++            if record and record.get("kind") == "card" and not record.get("gateway"):
++                edges.append(record)
++            edges.extend({"ref": p} for p in _scheduled_probe_ids(owner, ref)
++                         if not record or p != record.get("ref"))
++        for edge in edges:
++            with producer_connection(owner, edge) as next_owner:
++                why = visit(next_owner, edge.get("ref", ""))
++            if why:
++                return why
++        return None
++
++    with producer_connection(conn, awaiting) as owner:
++        return visit(owner, awaiting["ref"])
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index fd11a168889..b4959639971 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -37,10 +37,13 @@ SSH_TIMEOUT = 25
+ 
+ 
+ def _db(board: Optional[str]) -> Path:
++    if board is not None:
++        from hermes_cli.kanban_db import board_own_db_path
++        return board_own_db_path(board)
+     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+-    if os.environ.get("HERMES_KANBAN_DB") and board in (None, "default"):
++    if os.environ.get("HERMES_KANBAN_DB"):
+         return Path(os.environ["HERMES_KANBAN_DB"])
+-    return home / "kanban.db" if board in (None, "default") else home / "kanban" / "boards" / board / "kanban.db"
++    return home / "kanban.db"
+ 
+ 
+ def _query(path: Path, sql: str, args=()):
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 699e94a48d6..186c7def4b2 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -743,7 +743,9 @@ def finished_producer(conn: sqlite3.Connection, task_id: str, cmd: str) -> Optio
+             status = words[1] if len(words) >= 2 and words[0] == ref else ""
+             completed = _remote_completed_at(str(gateway), ref, board) if status in _FINISHED_STATUSES else None
+         else:
+-            row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (ref,)).fetchone()
++            from hermes_cli.kanban_awaiting_board import producer_connection
++            with producer_connection(conn, awaiting) as owner:
++                row = owner.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (ref,)).fetchone()
+             if row is None:
+                 return None
+             status, completed = row[0], row[1]
+diff --git a/tests/hermes_cli/test_kanban_awaiting_cross_board.py b/tests/hermes_cli/test_kanban_awaiting_cross_board.py
+new file mode 100644
+index 00000000000..fc8bc6f199d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_awaiting_cross_board.py
+@@ -0,0 +1,101 @@
++"""A qualified producer is read on its board without switching the waiter's write scope."""
++import pytest
++
++from hermes_cli import kanban_awaiting as kaw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def boards(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    paths = [kb.board_own_db_path(b) for b in ("default", "runners")]
++    for path in paths:
++        kb.init_db(db_path=path)
++    return paths
++
++
++@pytest.mark.parametrize("source", [0, 1], ids=["default-to-runners", "runners-to-default"])
++def test_schedule_reads_only_qualified_producer(boards, monkeypatch, source):
++    target = 1 - source
++    with kbc.connect_closing(db_path=boards[target]) as owner:
++        producer = kb.create_task(owner, title="Original authentication owner", assignee="worker")
++        assert kb.block_task(owner, producer, reason="Existing authentication", kind="needs_input", human_request={
++            "action": "Authenticate. Unblock = retry; archive = abandon.", "why_human": "OS authentication",
++            "interaction": "user_terminal", "scope": "fixture", "evidence": "fixture"})
++        before = kb.get_task(owner, producer)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(boards[source]))
++    with kbc.connect_closing(db_path=boards[source]) as conn:
++        waiter = kb.create_task(conn, title="Release waiter", assignee="worker")
++        board = ("default", "runners")[target]
++        record = {"kind": "card", "ref": producer, "board": board}
++        assert kb.schedule_task(conn, waiter, reason="Wait for original owner", awaiting=record,
++                                wake_check=f"hermes kanban wait-check task {producer} --board {board} --from blocked")
++        assert kb.get_task(conn, waiter).status == "scheduled"
++        assert kb.get_task(conn, producer) is None
++        event = [e for e in kb.list_events(conn, waiter) if e.kind == "scheduled"][-1]
++        assert event.payload["awaiting"]["board"] == board
++        assert kaw.card_orphan_reason(conn, waiter) is None
++    from hermes_cli import kanban_wait_check as wait
++    assert wait.check_local("task", producer, board=board, since=("blocked",))[0] == 1
++    with kbc.connect_closing(db_path=boards[target]) as owner:
++        after = kb.get_task(owner, producer)
++        assert (after.status, after.human_request) == (before.status, before.human_request)
++
++
++def test_missing_board_is_not_created_or_replaced_by_local_producer(boards):
++    with kbc.connect_closing(db_path=boards[0]) as conn:
++        waiter = kb.create_task(conn, title="Waiter", assignee="worker")
++        producer = kb.create_task(conn, title="Wrong board producer", assignee="worker")
++        with pytest.raises(kaw.AwaitingError):
++            kb.schedule_task(conn, waiter, awaiting={"kind": "card", "ref": producer, "board": "missing"})
++        assert not kb.board_own_db_path("missing").exists()
++        assert kb.get_task(conn, waiter).status != "scheduled"
++
++
++def test_cross_board_cycle_is_refused_and_missing_owner_read_is_safe(boards):
++    with kbc.connect_closing(db_path=boards[0]) as left, kbc.connect_closing(db_path=boards[1]) as right:
++        a = kb.create_task(left, title="A", assignee="worker")
++        b = kb.create_task(right, title="B", assignee="worker")
++        assert kb.schedule_task(left, a, awaiting={"kind": "card", "ref": b, "board": "runners"})
++        event = [e for e in kb.list_events(left, a) if e.kind == "scheduled"][-1]
++        assert event.payload["wake_check"] == f"hermes kanban wait-check task {b} --board runners"
++        with pytest.raises(kaw.AwaitingError, match="cycles back"):
++            kb.schedule_task(right, b, awaiting={"kind": "card", "ref": a, "board": "default"})
++    boards[1].unlink()
++    with kbc.connect_closing(db_path=boards[0]) as left:
++        assert "unreadable producer board" in kaw.card_orphan_reason(left, a)
++
++
++def test_finished_producer_is_read_on_its_board(boards):
++    from hermes_cli.kanban_wake_check import finished_producer
++    with kbc.connect_closing(db_path=boards[0]) as left, kbc.connect_closing(db_path=boards[1]) as right:
++        a = kb.create_task(left, title="A", assignee="worker")
++        b = kb.create_task(right, title="B", assignee="worker")
++        assert kb.schedule_task(left, a, awaiting={"kind": "card", "ref": b, "board": "runners"})
++        assert kb.archive_task(right, b)
++        hit = finished_producer(left, a, "false")
++        assert hit["producer_status"] == "archived"
++        assert hit["board"] == "runners"
++
++
++def test_cross_board_cycle_cannot_close_through_local_edge(boards):
++    with kbc.connect_closing(db_path=boards[0]) as left, kbc.connect_closing(db_path=boards[1]) as right:
++        a = kb.create_task(left, title="A", assignee="worker")
++        b = kb.create_task(left, title="B", assignee="worker")
++        c = kb.create_task(right, title="C", assignee="worker")
++        assert kb.schedule_task(right, c, awaiting={"kind": "card", "ref": a, "board": "default"})
++        assert kb.schedule_task(left, b, awaiting={"kind": "card", "ref": c, "board": "runners"})
++        with pytest.raises(kaw.AwaitingError, match="cycles back"):
++            kb.schedule_task(left, a, awaiting={"kind": "card", "ref": b})
++
++
++def test_same_board_qualifier_keeps_descendant_guard(boards):
++    with kbc.connect_closing(db_path=boards[0]) as conn:
++        parent = kb.create_task(conn, title="Parent", assignee="worker")
++        child = kb.create_task(conn, title="Child", assignee="worker", parents=[parent])
++        with pytest.raises(kaw.AwaitingError, match="descendant"):
++            kb.schedule_task(conn, parent, awaiting={"kind": "card", "ref": child, "board": "Default"})
+-- 
+2.55.0
+

@@ -1,0 +1,432 @@
+From c20d8a565fd5ec8a41f00f83df045d944a26696e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:51:48 +0000
+Subject: [PATCH] fix(desktop): "+ Create project" moves the row into the new
+ project at once [daveey]
+
+Follow-up to 05e04c066a (instant move-to-project). createProjectAndMoveSession
+(Cmd-Shift-P "+ Create project") still waited for projects.list + mkdir +
+projects.create + session.workspace.move + a 2-5 s tree refetch, because the
+destination project was not in $projectTree yet, so the optimistic move had
+no node to file the row under.
+
+Now it reuses a same-named node when the tree has one, else inserts a
+provisional node (id provisional:<name>) and files the row there before any
+RPC. Tree payloads keep the provisional node until the backend lists a
+project of that name, then retarget the pending move to the real node. A
+failed create/move removes the node and restores the old owner.
+
+renameProjectSessions moved to store/projects-rename-sessions.ts to offset
+projects.ts growth under its line ratchet.
+
+Tests: projects-move-optimistic.test.ts (row owned by the provisional node
+while projects.create is pending, survives a stale refresh, ends on the real
+node; failure removes the node and restores p_src). Both fail without the
+change.
+---
+ .../store/projects-move-optimistic.test.ts    | 102 +++++++++++++++++-
+ .../src/store/projects-move-optimistic.ts     |  68 +++++++++++-
+ .../src/store/projects-rename-sessions.ts     |  58 ++++++++++
+ apps/desktop/src/store/projects.ts            |  82 ++++----------
+ 4 files changed, 245 insertions(+), 65 deletions(-)
+ create mode 100644 apps/desktop/src/store/projects-rename-sessions.ts
+
+diff --git a/apps/desktop/src/store/projects-move-optimistic.test.ts b/apps/desktop/src/store/projects-move-optimistic.test.ts
+index 2a5eb02291..1bc6c5b828 100644
+--- a/apps/desktop/src/store/projects-move-optimistic.test.ts
++++ b/apps/desktop/src/store/projects-move-optimistic.test.ts
+@@ -7,7 +7,13 @@ import { $activeGatewayProfile, setShowAllProfiles } from '@/store/profile'
+ import { $sessions, setSessions } from '@/store/session'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-import { $projectOwnerBySessionId, $projectTree, moveSessionToProject, refreshProjectTree } from './projects'
++import {
++  $projectOwnerBySessionId,
++  $projectTree,
++  createProjectAndMoveSession,
++  moveSessionToProject,
++  refreshProjectTree
++} from './projects'
+ import { reassignTreeSession } from './projects-move-optimistic'
+ 
+ vi.mock('@/i18n', () => ({ translateNow: (key: string) => key }))
+@@ -170,3 +176,97 @@ describe('reassignTreeSession', () => {
+     expect(reassignTreeSession(tree, 's1', 'p_nope', null, matches)).toBe(tree)
+   })
+ })
++
++describe('createProjectAndMoveSession shows the row in the new project at once', () => {
++  let releaseCreate: (() => void) | undefined
++  let created: boolean
++  let failCreate: boolean
++
++  const withNew = (): SidebarProjectTree[] => [
++    { ...treeWith('p_src')[0], previewSessions: [], sessionCount: 0, sessionIds: [] },
++    {
++      id: 'p_new',
++      label: 'Fresh Idea',
++      path: '/home/u/code/fresh-idea',
++      previewSessions: [row('s1', '/home/u/code/fresh-idea')],
++      repos: [],
++      sessionCount: 1,
++      sessionIds: ['s1']
++    }
++  ]
++
++  beforeEach(() => {
++    vi.clearAllMocks()
++    setShowAllProfiles(false)
++    $activeGatewayProfile.set('default')
++    created = false
++    failCreate = false
++    releaseCreate = undefined
++    $projectTree.set(treeWith('p_src'))
++    setSessions(() => [row('s1', '/repos/src')])
++
++    const request = vi.fn(async (method: string) => {
++      if (method === 'projects.tree') {
++        return { active_id: null, projects: created ? withNew() : treeWith('p_src'), scoped_session_ids: ['s1'] }
++      }
++
++      if (method === 'shell.exec') {
++        return { code: 0, stderr: '', stdout: '' }
++      }
++
++      if (method === 'projects.create') {
++        await new Promise<void>(resolve => (releaseCreate = resolve))
++
++        if (failCreate) {
++          throw new Error('create failed')
++        }
++
++        return { project: { folders: [], id: 'p_new', name: 'Fresh Idea', primary_path: '/home/u/code/fresh-idea' } }
++      }
++
++      if (method === 'session.workspace.move') {
++        created = true
++
++        return { branch: null, cwd: '/home/u/code/fresh-idea', git_repo_root: null }
++      }
++
++      return { active_id: null, projects: [] }
++    })
++
++    vi.mocked(activeGateway).mockReturnValue({ connectionState: 'open', request } as never)
++  })
++
++  it('files the row under a provisional node before projects.create returns, then the real one', async () => {
++    const done = createProjectAndMoveSession('s1', 'Fresh Idea')
++    const owner = $projectOwnerBySessionId.get().get('s1')
++
++    expect(owner).toMatch(/^provisional:/)
++    expect($projectTree.get().find(n => n.id === owner)?.label).toBe('Fresh Idea')
++
++    // A refresh before the create landed keeps the provisional node and the row in it.
++    await refreshProjectTree()
++    expect($projectOwnerBySessionId.get().get('s1')).toBe(owner)
++
++    await vi.waitFor(() => expect(releaseCreate).toBeTypeOf('function'))
++    releaseCreate?.()
++    await done
++    await refreshProjectTree()
++
++    expect($projectOwnerBySessionId.get().get('s1')).toBe('p_new')
++    expect($projectTree.get().some(n => n.id.startsWith('provisional:'))).toBe(false)
++  })
++
++  it('removes the provisional node and restores the old owner when the create fails', async () => {
++    failCreate = true
++    const done = createProjectAndMoveSession('s1', 'Fresh Idea')
++
++    expect($projectOwnerBySessionId.get().get('s1')).toMatch(/^provisional:/)
++    await vi.waitFor(() => expect(releaseCreate).toBeTypeOf('function'))
++    releaseCreate?.()
++    await expect(done).rejects.toThrow('create failed')
++    await refreshProjectTree()
++
++    expect($projectOwnerBySessionId.get().get('s1')).toBe('p_src')
++    expect($projectTree.get().some(n => n.id.startsWith('provisional:'))).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/store/projects-move-optimistic.ts b/apps/desktop/src/store/projects-move-optimistic.ts
+index a8ee35f150..725ebd1953 100644
+--- a/apps/desktop/src/store/projects-move-optimistic.ts
++++ b/apps/desktop/src/store/projects-move-optimistic.ts
+@@ -10,6 +10,7 @@ import { $sessions, sessionMatchesStoredId, setSessions } from '@/store/session'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+ import { $projectTree } from './project-tree'
++import { labelKey } from './projects-move-paths'
+ 
+ type Matcher = (session: SessionInfo, storedSessionId: string) => boolean
+ 
+@@ -124,13 +125,16 @@ function backendAgrees(tree: SidebarProjectTree[], sessionId: string, projectId:
+ /**
+  * Re-apply moves still pending to a freshly built tree. A move ends once a
+  * payload agrees with it (the backend has the row there now) or after the TTL.
++ * A provisional project (one "+ Create project" is still creating) stays in
++ * the tree until the backend lists a project of that name; its moves then
++ * retarget to the real node.
+  */
+ export function applyPendingMoves(tree: SidebarProjectTree[], matches: Matcher): SidebarProjectTree[] {
+   const now = Date.now()
+-  let out = tree
++  let out = withProvisionalProjects(tree, now)
+ 
+   for (const [sessionId, move] of pendingMoves) {
+-    if (now - move.at > PENDING_MOVE_TTL_MS || backendAgrees(tree, sessionId, move.projectId)) {
++    if (now - move.at > PENDING_MOVE_TTL_MS || backendAgrees(out, sessionId, move.projectId)) {
+       pendingMoves.delete(sessionId)
+ 
+       continue
+@@ -142,6 +146,66 @@ export function applyPendingMoves(tree: SidebarProjectTree[], matches: Matcher):
+   return out
+ }
+ 
++// ── Provisional projects ("+ Create project") ─────────────────────────────────
++const PROVISIONAL_PREFIX = 'provisional:'
++const provisionalProjects = new Map<string, { at: number; node: SidebarProjectTree }>()
++
++export const isProvisionalProjectId = (id: string): boolean => id.startsWith(PROVISIONAL_PREFIX)
++
++const sameNamed = (tree: readonly SidebarProjectTree[], label: string, except = ''): SidebarProjectTree | undefined =>
++  tree.find(node => node.id !== except && !node.isNoProject && !node.archived && labelKey(node.label) === labelKey(label))
++
++function withProvisionalProjects(tree: SidebarProjectTree[], now: number): SidebarProjectTree[] {
++  let out = tree
++
++  for (const [id, { at, node }] of provisionalProjects) {
++    const real = sameNamed(tree, node.label, id)
++
++    if (real || now - at > PENDING_MOVE_TTL_MS) {
++      provisionalProjects.delete(id)
++
++      for (const move of pendingMoves.values()) {
++        if (move.projectId === id && real) {
++          move.projectId = real.id
++        }
++      }
++
++      continue
++    }
++
++    if (!out.some(n => n.id === id)) {
++      out = [node, ...out]
++    }
++  }
++
++  return out
++}
++
++/**
++ * "+ Create project" paints at once: the row moves into the same-named project
++ * the tree already has, else into a provisional node named `label`. Returns the
++ * undo for a failed create/move (the caller then refetches the tree).
++ */
++export function showCreatedAtOnce(sessionId: string, label: string): () => void {
++  const existing = sameNamed($projectTree.get(), label)
++
++  if (existing) {
++    return showMovedAtOnce(sessionId, existing.id, '')
++  }
++
++  const id = `${PROVISIONAL_PREFIX}${labelKey(label)}`
++  const node: SidebarProjectTree = { id, label, path: null, repos: [], sessionCount: 0, sessionIds: [] }
++  provisionalProjects.set(id, { at: Date.now(), node })
++  $projectTree.set([node, ...$projectTree.get().filter(n => n.id !== id)])
++  const undoMove = showMovedAtOnce(sessionId, id, '')
++
++  return () => {
++    undoMove()
++    provisionalProjects.delete(id)
++    $projectTree.set($projectTree.get().filter(n => n.id !== id))
++  }
++}
++
+ /** Every session row the cached tree carries (previews and lanes). */
+ export function treeSessionRows(): SessionInfo[] {
+   return $projectTree
+diff --git a/apps/desktop/src/store/projects-rename-sessions.ts b/apps/desktop/src/store/projects-rename-sessions.ts
+new file mode 100644
+index 0000000000..98df322c8b
+--- /dev/null
++++ b/apps/desktop/src/store/projects-rename-sessions.ts
+@@ -0,0 +1,58 @@
++// Pure helper for applyRenamedSessionTitle (store/projects.ts), split out to keep that file under its line ratchet.
++
++import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
++import { sessionMatchesStoredId } from '@/store/session'
++import type { SessionInfo } from '@/types/hermes'
++
++/** Patch every cached copy of the renamed conversation inside one project
++ *  node (lane rows + overview previews), keeping the node's reference when
++ *  nothing matched — the tree keeps unchanged nodes by reference so the
++ *  drill-in doesn't refetch on a no-op (#77591). */
++export function renameProjectSessions(
++  project: SidebarProjectTree,
++  sessionId: string,
++  next: string | null
++): SidebarProjectTree {
++  let changed = false
++
++  const rename = (sessions: SessionInfo[]): SessionInfo[] =>
++    sessions.map(session => {
++      if (!sessionMatchesStoredId(session, sessionId) || session.title === next) {
++        return session
++      }
++
++      changed = true
++
++      return { ...session, title: next }
++    })
++
++  const repos = project.repos.map(repo => {
++    let repoChanged = false
++
++    const groups = repo.groups.map(group => {
++      const sessions = rename(group.sessions)
++
++      if (sessions === group.sessions) {
++        return group
++      }
++
++      repoChanged = true
++
++      return { ...group, sessions }
++    })
++
++    if (!repoChanged) {
++      return repo
++    }
++
++    return { ...repo, groups, sessionCount: groups.reduce((n, g) => n + g.sessions.length, 0) }
++  })
++
++  const previewSessions = project.previewSessions ? rename(project.previewSessions) : project.previewSessions
++
++  if (!changed) {
++    return project
++  }
++
++  return { ...project, previewSessions, repos, sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0) }
++}
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index 5109cd93b2..cabedf59d0 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -74,6 +74,7 @@ import { fetchRemoteProjectTree, type ProjectTreePayload } from './project-tree-
+ import {
+   applyPendingMoves,
+   consumeMoveFollowSuppression,
++  showCreatedAtOnce,
+   showMovedAtOnce,
+   suppressMoveFollow,
+   treeSessionRows
+@@ -87,6 +88,7 @@ import {
+   shellPath,
+   type ShellResult
+ } from './projects-move-paths'
++import { renameProjectSessions } from './projects-rename-sessions'
+ import { repoDiscoveryPolicyFromConfig, repoDiscoveryPolicySignature } from './projects-repo-discovery'
+ 
+ export {
+@@ -916,59 +918,6 @@ export function applyRenamedSessionTitle(sessionId: string, title: string | null
+   void refreshProjectTree()
+ }
+ 
+-/** Patch every cached copy of the renamed conversation inside one project
+- *  node (lane rows + overview previews), keeping the node's reference when
+- *  nothing matched — the tree keeps unchanged nodes by reference so the
+- *  drill-in doesn't refetch on a no-op (#77591). */
+-function renameProjectSessions(
+-  project: SidebarProjectTree,
+-  sessionId: string,
+-  next: string | null
+-): SidebarProjectTree {
+-  let changed = false
+-
+-  const rename = (sessions: SessionInfo[]): SessionInfo[] =>
+-    sessions.map(session => {
+-      if (!sessionMatchesStoredId(session, sessionId) || session.title === next) {
+-        return session
+-      }
+-
+-      changed = true
+-
+-      return { ...session, title: next }
+-    })
+-
+-  const repos = project.repos.map(repo => {
+-    let repoChanged = false
+-
+-    const groups = repo.groups.map(group => {
+-      const sessions = rename(group.sessions)
+-
+-      if (sessions === group.sessions) {
+-        return group
+-      }
+-
+-      repoChanged = true
+-
+-      return { ...group, sessions }
+-    })
+-
+-    if (!repoChanged) {
+-      return repo
+-    }
+-
+-    return { ...repo, groups, sessionCount: groups.reduce((n, g) => n + g.sessions.length, 0) }
+-  })
+-
+-  const previewSessions = project.previewSessions ? rename(project.previewSessions) : project.previewSessions
+-
+-  if (!changed) {
+-    return project
+-  }
+-
+-  return { ...project, previewSessions, repos, sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0) }
+-}
+-
+ interface WorkspaceMovePayload {
+   branch?: null | string
+   cwd?: string
+@@ -1223,18 +1172,27 @@ export async function createProjectAndMoveSession(
+ 
+   const target = moveTargetGateway(sessionId, profile, connectionId)
+   const projectProfile = target.profile || (target.remote ? 'default' : writableProjectProfile())
+-  const listed = await moveTargetRequest<ProjectsPayload>(target, 'projects.list', { profile: projectProfile })
++  const undo = showCreatedAtOnce(sessionId, label)
+ 
+-  const existing = (listed.projects ?? []).find(
+-    p => !p.archived && (labelKey(p.name) === labelKey(label) || labelKey(p.slug) === labelKey(label))
+-  )
++  try {
++    const listed = await moveTargetRequest<ProjectsPayload>(target, 'projects.list', { profile: projectProfile })
+ 
+-  const cwd =
+-    existing?.primary_path ||
+-    existing?.folders?.[0]?.path ||
+-    (await createProjectFolderOn(target, label, newProjectFolder(label), projectProfile))
++    const existing = (listed.projects ?? []).find(
++      p => !p.archived && (labelKey(p.name) === labelKey(label) || labelKey(p.slug) === labelKey(label))
++    )
++
++    const cwd =
++      existing?.primary_path ||
++      existing?.folders?.[0]?.path ||
++      (await createProjectFolderOn(target, label, newProjectFolder(label), projectProfile))
+ 
+-  await moveSessionToCwd(target, sessionId, cwd)
++    await moveSessionToCwd(target, sessionId, cwd)
++  } catch (error) {
++    undo()
++    void refreshProjectTree()
++
++    throw error
++  }
+ }
+ 
+ async function moveSessionToCwd(target: MoveTarget, sessionId: string, cwd: string): Promise<void> {
+-- 
+2.55.0
+

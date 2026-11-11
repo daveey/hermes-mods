@@ -1,0 +1,1178 @@
+From c5813edab92d5d503ba10b651d34f88edb44d618 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:46:44 +0000
+Subject: [PATCH] fix(kanban): a managed run continues across its owner
+ gateway's restart [daveey]
+
+A gateway restart (hermes update) ended every in-flight managed Kanban turn: the owner booked it as a
+restart loss, the worker exited 76 and the sweep requeued it reclaimed/owner_restart_lost into a new run
+that copied the transcript (133 runs on hermes-hub in 7 days). Now the same run continues.
+
+- Owner (gateway/session_kanban_restart.py): a turn the restart/shutdown Stop ended cleanly is booked as a
+  checkpoint: the uncounted owner-restart worker_result gains continuable + a one-time checkpoint token,
+  and a restart_checkpoint event (reason core_update_pause) names the stopped admission. A lost child
+  (no clean result) keeps today's plain booking.
+- Worker (hermes_cli/kanban_worker_client.py): on a terminal receipt whose result is an unconsumed
+  checkpoint, it keeps its pid and claim, waits up to CONTINUE_WAIT_S (300 s) for the next owner and asks
+  kanban.run for the same attempt again (at most MAX_CONTINUATIONS times). An owner that refuses the
+  continuation ends it on the same booking: exit 76, today's uncounted requeue.
+- Next owner (gateway/session_kanban_continue.py + session_kanban.kanban_run): on a saved attempt with a
+  checkpoint newer than its last admission it proves the continuation safe (same session, stopped
+  admission settled interrupted, session readable/non-empty/not rotated, task/run/claim/checkpoint still
+  current), answers each tool call the stop left open with "[interrupted by Hermes update at <UTC>:
+  re-run if still needed]", records the continuation as the run's newest owner_admitted plus a
+  restart_continued event, and submits one continuation admission (<request>#continue:<token>, so a
+  retried ask returns the same receipt) to the same session. The managed child runs it with the session
+  history and a continuation note as the prompt. Unsafe = kanban_continuation_unsafe, logged and booked
+  restart_continue_refused, then the fallback above (next run copies the transcript).
+- GATEWAY_RESTART_SAFE stays True; its comment now describes continuation.
+
+Proof
+- New tests/gateway/test_kanban_restart_continuation.py (20; 19 exact-anchor mutants of the new conditions all killed). The real probe drives the actual dispatcher
+  argv against two gateway.run owners on one scratch home: SIGTERM the first mid-turn, start the second.
+  GREEN: same run 1, claim and worker pid through the gap; worker clean_exit 0; task done; runs
+  [[1, completed, done]]; events have restart_checkpoint + restart_continued and no reclaimed/crashed/
+  owner_restart_lost; one session, admissions [interrupted, completed (#continue:)].
+  RED on 0e63306fa5e: checkpointed False, client_exit [owner_restart, 76], events end
+  worker_result, worker_result, owner_restart_lost; fake-owner worker test: assert 76 == 0.
+- Fallback: owner refusing kanban_continuation_unsafe -> exit 76 -> reclaimed, owner_restart_lost x1,
+  consecutive_failures 0 (passes on both, as intended).
+- 26 kanban/worker/gateway test files: 1427 passed, 1 skipped.
+---
+ gateway/session_kanban.py                     |  55 ++-
+ gateway/session_kanban_continue.py            | 206 +++++++++
+ gateway/session_kanban_restart.py             |  62 ++-
+ gateway/session_managed_worker.py             |   5 +-
+ hermes_cli/kanban_worker_client.py            |  68 ++-
+ .../fixtures/kanban_restart_continue_probe.py | 169 ++++++++
+ .../test_kanban_restart_continuation.py       | 391 ++++++++++++++++++
+ 7 files changed, 917 insertions(+), 39 deletions(-)
+ create mode 100644 gateway/session_kanban_continue.py
+ create mode 100644 tests/gateway/fixtures/kanban_restart_continue_probe.py
+ create mode 100644 tests/gateway/test_kanban_restart_continuation.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 3ea1802ecb..33b6dffac3 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -160,6 +160,14 @@ async def run_task(connection, params):
+                     record_resume_event(conn, task.id, task.current_run_id, resume_plan, copied)
+     from gateway.session_runtime_workers import tracked_write
+     await tracked_write(authority, admit_claim)
++    target = request_id
++    if saved:  # [daveey] a turn checkpointed at the last owner's restart continues here (session_kanban_continue)
++        from functools import partial
++        from gateway import session_kanban_continue as cont
++        target, checkpoint = await asyncio.to_thread(cont.pending_admission, context['db'], params, request_id)
++        if checkpoint is not None:
++            await tracked_write(authority, partial(cont.prepare, authority, principal_id=connection.actor.subject,
++                session_id=ref.session_id, context=context, checkpoint=checkpoint, request_id=target, owner_db=owner_db))
+     await connection.resume(ref, {})
+     # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a
+     # card (approvals.single_query_mode applies). Never unattended: that is `-z`'s auto-approval.
+@@ -177,7 +185,11 @@ async def run_task(connection, params):
+     card = None
+     if committed is None or 'kanban_card_v1' in committed['payload']:
+         card = {'board': context.get('board'), 'task_id': params['task_id'], 'run_id': params['run_id']}
+-    receipt = await authority.submit(connection.actor, Submission(request_id, ref, payload, 'queue'),
++    if target != request_id:
++        from gateway.session_kanban_continue import CONTINUE_TEXT
++        payload = {'text': CONTINUE_TEXT, 'finite': True}
++        card = {'board': context.get('board'), 'task_id': params['task_id'], 'run_id': params['run_id']}
++    receipt = await authority.submit(connection.actor, Submission(target, ref, payload, 'queue'),
+                                      _kanban_card=card)
+     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
+ 
+@@ -484,21 +496,13 @@ KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'i
+ 
+ 
+ def _run_task_turns(agent, frame, history, context):
+-    from agent.skill_commands import build_preloaded_skills_prompt
+-    skills, _loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
+-    # Pins were validated when the card was created; a later removal must reach the worker,
+-    # not crash it before it can report or recover the stale prerequisite.
+-    from hermes_cli.kanban_skill_check import unavailable_pin_note
+-    warning = unavailable_pin_note(missing)
+-    if warning:
+-        import logging
+-        logging.getLogger(__name__).warning('%s', warning)
+-    from gateway.session_kanban_resume import compact_resumed_history
+-    from gateway.session_kanban_capsule import capsule_prompt_context
+-    # [daveey] An over-headroom resumed transcript is compacted before the first model call (or dropped).
+-    history = compact_resumed_history(agent, context, history)
+-    card = capsule_prompt_context(context, history)  # [daveey] resumed after an owner restart, or the tail
+-    prompt = '\n\n'.join(p for p in (skills, warning, card, frame['text']) if p)
++    from gateway.session_kanban_continue import is_continuation
++    if is_continuation(frame.get('text')) and history:
++        # [daveey] The turn checkpointed at the last owner's restart continues: its skills and card
++        # context are already in the session's history, so only the continuation note is new.
++        prompt = frame['text']
++    else:
++        prompt, history = _first_turn_prompt(agent, frame, history, context)
+     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
+ 
+     def recover(nudge):
+@@ -543,3 +547,22 @@ def _run_task_turns(agent, frame, history, context):
+         first_response=result.get('final_response', ''), unachievable_fn=unachievable)
+     # A broken loop exits non-zero; a parked or dispatcher-owned stop keeps the settled result (rc 0).
+     return kanban_goal_loop_turn_result(result, loop)
++
++
++def _first_turn_prompt(agent, frame, history, context):
++    """``(prompt, history)`` of an attempt's first turn: pinned skills, the card context and the frame text."""
++    from agent.skill_commands import build_preloaded_skills_prompt
++    skills, _loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
++    # Pins were validated when the card was created; a later removal must reach the worker,
++    # not crash it before it can report or recover the stale prerequisite.
++    from hermes_cli.kanban_skill_check import unavailable_pin_note
++    warning = unavailable_pin_note(missing)
++    if warning:
++        import logging
++        logging.getLogger(__name__).warning('%s', warning)
++    from gateway.session_kanban_resume import compact_resumed_history
++    from gateway.session_kanban_capsule import capsule_prompt_context
++    # [daveey] An over-headroom resumed transcript is compacted before the first model call (or dropped).
++    history = compact_resumed_history(agent, context, history)
++    card = capsule_prompt_context(context, history)  # [daveey] resumed after an owner restart, or the tail
++    return '\n\n'.join(p for p in (skills, warning, card, frame['text']) if p), history
+diff --git a/gateway/session_kanban_continue.py b/gateway/session_kanban_continue.py
+new file mode 100644
+index 0000000000..4e59d5c0bd
+--- /dev/null
++++ b/gateway/session_kanban_continue.py
+@@ -0,0 +1,206 @@
++"""[daveey] A managed Kanban turn checkpointed at its owner's restart continues in the next owner.
++
++The old owner books a clean restart Stop as a checkpoint (``gateway.session_kanban_restart``: a
++``restart_checkpoint`` event naming the stopped admission, and a ``continuable`` owner-restart
++``worker_result``). The run's submitter (``hermes_cli.kanban_worker_client``) keeps its claim and pid,
++waits for the next owner and asks ``kanban.run`` for the same attempt again. That owner restores the
++attempt's session and, finding a checkpoint newer than the attempt's last admission, submits ONE
++continuation admission to the same session (request id ``<attempt request>#continue:<checkpoint>``, so a
++retried ask returns the same receipt) and records it as the run's newest ``owner_admitted``. The
++continued turn's outcome is the attempt's outcome: same run id, claim, submitter and session.
++
++Before the continuation, each tool call the stop left without a result gets
++``[interrupted by Hermes update at <UTC>: re-run if still needed]`` (the Desktop update pause's text).
++
++Continuation is refused (``kanban_continuation_unsafe``; the submitter then exits with the uncounted
++owner-restart booking, and the next run copies this transcript, ``gateway.session_kanban_resume``)
++when it cannot be proven safe: the checkpoint names another session or admission, the stopped admission is
++not settled ``interrupted``, the session is unreadable, empty or rotated by compaction, or the attempt was
++superseded (task/run/claim moved). Each refusal is logged and booked as ``restart_continue_refused``.
++"""
++from __future__ import annotations
++
++from contextlib import closing
++import json
++import logging
++import os
++from pathlib import Path
++import sqlite3
++import time
++from typing import NoReturn
++
++from hermes_state_runtime import RuntimeStoreError
++
++logger = logging.getLogger(__name__)
++
++UNSAFE = 'kanban_continuation_unsafe'
++CONTINUE_PREFIX = '[Kanban run continued after a gateway restart]'
++CONTINUE_TEXT = (CONTINUE_PREFIX + ' The gateway restarted (a Hermes update) while this turn was running; '
++                 'this is the same run, claim and session. Continue the task from where the conversation above '
++                 'stops. A tool call the restart interrupted may or may not have taken effect: check the current '
++                 'state before repeating any side effect.')
++INTERRUPTED_RESULT = '[interrupted by Hermes update at {at}: re-run if still needed]'
++CONTINUED_EVENT = 'restart_continued'
++REFUSED_EVENT = 'restart_continue_refused'
++
++
++def interrupted_result(at) -> str:
++    """Card A's mid-tool cancel text, at the checkpoint's UTC time (ISO-8601, seconds, ``Z``)."""
++    try:
++        stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(float(at)))
++    except (TypeError, ValueError, OverflowError, OSError):
++        stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
++    return INTERRUPTED_RESULT.format(at=stamp)
++
++
++def is_continuation(text) -> bool:
++    return isinstance(text, str) and text.startswith(CONTINUE_PREFIX)
++
++
++def _latest(conn, task_id, run_id, kind):
++    row = conn.execute('SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
++                       'ORDER BY id DESC LIMIT 1', (task_id, run_id, kind)).fetchone()
++    if row is None:
++        return None, {}
++    try:
++        payload = json.loads(row[1] or '{}')
++    except (TypeError, ValueError):
++        payload = {}
++    return int(row[0]), payload if isinstance(payload, dict) else {}
++
++
++def continuation_request_id(base_request_id: str, token: str) -> str:
++    return f'{base_request_id}#continue:{token}'
++
++
++def pending_admission(db_path, params, base_request_id):
++    """``(request_id, checkpoint)`` this ask must submit: the attempt's newest admission (``checkpoint`` None:
++    a retried ask, same receipt), or a new continuation of the checkpoint newer than it. Read-only."""
++    uri = Path(db_path).resolve().as_uri() + '?mode=ro'
++    with closing(sqlite3.connect(uri, uri=True, timeout=30)) as conn:
++        admitted_id, admitted = _latest(conn, params['task_id'], params['run_id'], 'owner_admitted')
++        checkpoint_id, checkpoint = _latest(conn, params['task_id'], params['run_id'], 'restart_checkpoint')
++    current = admitted.get('request_id') if isinstance(admitted.get('request_id'), str) else None
++    if current is None or not (current == base_request_id or current.startswith(base_request_id + '#continue:')):
++        current = base_request_id
++    if checkpoint_id is None or admitted_id is None or checkpoint_id < admitted_id:
++        return current, None
++    if checkpoint.get('request_id') != current or not isinstance(checkpoint.get('checkpoint'), str):
++        return current, {'unsafe': 'checkpoint_admission_mismatch', **checkpoint}
++    return continuation_request_id(base_request_id, checkpoint['checkpoint']), checkpoint
++
++
++def _refuse(context, checkpoint, reason) -> NoReturn:
++    logger.warning('Kanban restart continuation refused for %s run %s: %s; the run is requeued uncounted '
++                   'and its next run resumes this transcript', context.get('task_id'), context.get('run_id'), reason)
++    try:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_db_connect import connect_closing
++        with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
++            kb._append_event(conn, context['task_id'], REFUSED_EVENT,
++                             {'reason': reason, 'checkpoint': (checkpoint or {}).get('checkpoint')},
++                             run_id=context['run_id'])
++    except Exception:  # health: allow BLE001 -- the refusal itself must reach the submitter
++        logger.warning('Kanban restart continuation: recording the refusal failed', exc_info=True)
++    raise RuntimeStoreError(UNSAFE)
++
++
++def _unanswered(history):
++    from gateway.session_kanban_resume import _unanswered_tool_calls
++    return _unanswered_tool_calls(history)
++
++
++def _answer_interrupted_calls(session_db, session_id, at) -> int:
++    """Append the interrupted-by-update result for each trailing tool call left without one."""
++    history = session_db.get_messages_as_conversation(session_id)
++    calls = _unanswered(history)
++    if not calls:
++        return 0
++    text = interrupted_result(at)
++    from agent.message_metadata import TOOL_CALL_UID, tool_call_uid_from_history
++    rows = []
++    for call in calls:
++        msg = {'role': 'tool', 'tool_call_id': call['id'], 'content': text}
++        if call.get('name'):
++            msg['tool_name'] = call['name']
++        uid = tool_call_uid_from_history([*history, *rows, msg], len(history) + len(rows), {})
++        if uid:
++            msg[TOOL_CALL_UID] = uid
++        rows.append(msg)
++
++    def write(conn):
++        added, _ = session_db._insert_message_rows(conn, session_id, rows)
++        conn.execute('UPDATE sessions SET message_count=message_count+? WHERE id=?', (added, session_id))
++        return added
++    return int(session_db._execute_write(write))
++
++
++def prepare(authority, *, principal_id, session_id, context, checkpoint, request_id, owner_db) -> dict:
++    """Prove the checkpointed turn can continue in ``session_id``, answer its interrupted tool calls and
++    record the continuation as the run's newest ``owner_admitted``. Off the owner loop; raises
++    ``RuntimeStoreError(UNSAFE)`` (booked, logged) when continuation cannot be proven safe."""
++    if checkpoint.get('unsafe'):
++        _refuse(context, checkpoint, checkpoint['unsafe'])
++    if checkpoint.get('session_id') != session_id:
++        _refuse(context, checkpoint, 'session_mismatch')
++    db = authority.db
++    from hermes_state_runtime import find_session_admission
++    try:
++        prior = find_session_admission(db, principal_id=principal_id, session_id=session_id,
++                                       request_id=checkpoint.get('request_id') or '')
++    except (sqlite3.Error, OSError, ValueError):
++        prior = None
++    if not prior or prior.get('status') != 'terminal' or prior.get('outcome') != 'interrupted' or (
++            checkpoint.get('admission_id') and prior.get('admission_id') != checkpoint['admission_id']):
++        _refuse(context, checkpoint, 'admission_not_interrupted')
++    try:
++        session = db.get_session(session_id)
++        history = db.get_messages_as_conversation(session_id)
++    except Exception:  # health: allow BLE001 -- an unreadable transcript is a fallback, never a crash
++        logger.warning('Kanban restart continuation: session %s unreadable', session_id, exc_info=True)
++        session, history = None, None
++    if session is None or history is None:
++        _refuse(context, checkpoint, 'session_unreadable')
++    if (session.get('end_reason') if isinstance(session, dict) else None) == 'compression':
++        _refuse(context, checkpoint, 'session_rotated')
++    if not history:
++        _refuse(context, checkpoint, 'session_empty')
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    import psutil
++    from hermes_cli.process_identity import worker_birth
++
++    def current(conn):
++        """``(admitted payload, task)`` when this attempt still owns the run and ``checkpoint`` is its newest."""
++        task = kb.get_task(conn, context['task_id'])
++        _, latest_checkpoint = _latest(conn, context['task_id'], context['run_id'], 'restart_checkpoint')
++        _, admitted = _latest(conn, context['task_id'], context['run_id'], 'owner_admitted')
++        if not (task and task.status == 'running' and task.current_run_id == context['run_id']
++                and task.claim_lock == context['claim_lock']
++                and latest_checkpoint.get('checkpoint') == checkpoint.get('checkpoint')
++                and admitted.get('request_id') in (request_id, checkpoint.get('request_id'))):
++            return None, None
++        return admitted, task
++    # Read-only first: a superseded attempt never gets a synthetic tool result in its session.
++    with connect_closing(Path(context['db'])) as conn:
++        if current(conn)[1] is None:
++            _refuse(context, checkpoint, 'attempt_superseded')
++    answered = _answer_interrupted_calls(db, session_id, checkpoint.get('at'))
++    with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
++        admitted, task = current(conn)
++        if task is not None and (admitted or {}).get('request_id') != request_id:
++            kb._append_event(conn, task.id, 'owner_admitted', {
++                'db': owner_db, 'session_id': session_id, 'request_id': request_id, 'pid': os.getpid(),
++                'birth': worker_birth(psutil.Process()), 'continues': checkpoint.get('request_id'),
++                'checkpoint': checkpoint.get('checkpoint')}, run_id=task.current_run_id)
++            kb._append_event(conn, task.id, CONTINUED_EVENT, {
++                'checkpoint': checkpoint.get('checkpoint'), 'session_id': session_id,
++                'request_id': request_id, 'prior_admission_id': prior.get('admission_id'),
++                'interrupted_calls': answered,
++                'paused_seconds': max(0, int(time.time()) - int(checkpoint.get('at') or time.time()))},
++                run_id=task.current_run_id)
++    if task is None:
++        _refuse(context, checkpoint, 'attempt_superseded')
++    logger.info('Kanban restart: continuing %s run %s in session %s (%d interrupted tool call(s) answered)',
++                context['task_id'], context['run_id'], session_id, answered)
++    return {'request_id': request_id, 'answered': answered}
+diff --git a/gateway/session_kanban_restart.py b/gateway/session_kanban_restart.py
+index 99ee4b92c7..8b568bcb4f 100644
+--- a/gateway/session_kanban_restart.py
++++ b/gateway/session_kanban_restart.py
+@@ -1,38 +1,63 @@
+-"""Owner-side disposition of a Kanban turn interrupted by a runtime Stop."""
++"""Owner-side disposition of a Kanban turn interrupted by a runtime Stop.
++
++[daveey] A turn the restart Stop ended cleanly (the managed child returned its interrupted result, so
++its transcript and tool results are persisted) is a *checkpoint*, not a loss: the run keeps its id,
++claim, submitter and session, and the next owner continues it (``gateway.session_kanban_continue``).
++The booking is still the uncounted owner-restart exit, now marked ``continuable`` with a one-time
++``checkpoint`` token, plus a ``restart_checkpoint`` event (``reason: core_update_pause``) naming the
++admission that stopped. A submitter that cannot continue (an old client, no owner within its wait, an
++owner refusing the continuation) exits on that same booking: today's uncounted requeue.
++A lost child (no clean result: the admission settles ``unknown``) is never continued: its booking
++carries no checkpoint, so the run is requeued as before.
++"""
+ import asyncio
+ from functools import partial
+ import json
+ import logging
+ from pathlib import Path
++import time
++import uuid
+ 
+ logger = logging.getLogger(__name__)
+ 
++CHECKPOINT_EVENT = 'restart_checkpoint'
++CHECKPOINT_REASON = 'core_update_pause'  # the Desktop update pause's marker reason (tui_gateway.update_pause)
++
++
++def _restart_stop(cause) -> bool:
++    from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
++    return cause in (_INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN)
++
+ 
+ async def close_and_book_restart_loss(authority, policy, worker):
+     """Return final cleanup; a restart-lost child is closed and booked before unknown publishes.
+ 
+     Closing first prevents its late130 from overwriting76. Other losses retain ordinary cleanup.
+-    The returned no-op means the caller's finally never closes that same child twice.
++    The returned no-op means the caller's finally never closes that same child twice. The child was
++    lost (no clean result), so this booking is never a continuation checkpoint.
+     """
+-    from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+-    if (not policy.kanban_json or worker.stop_cause not in
+-            (_INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN)):
++    if not policy.kanban_json or not _restart_stop(worker.stop_cause):
+         return worker.close
+     await asyncio.to_thread(worker.close)
++    logger.info('Kanban restart: not checkpointing the turn (managed worker lost before its result); '
++                'the run is requeued uncounted')
+     await book_restart_interruption(authority, policy)
+     return lambda: None
+ 
+ 
+-async def book_restart_interruption(authority, policy):
+-    """Best-effort booking: a failed board write must never skip settlement of the admission."""
++async def book_restart_interruption(authority, policy, checkpoint=None):
++    """Best-effort booking: a failed board write must never skip settlement of the admission.
++
++    ``checkpoint`` (``{'session_id', 'request_id', 'admission_id', 'cause'}``) marks a turn that stopped
++    cleanly at the restart: the booking is then continuable by the next owner."""
+     from gateway.session_runtime_workers import tracked_write
+     try:
+-        await tracked_write(authority, partial(record_restart_interruption, policy))
++        await tracked_write(authority, partial(record_restart_interruption, policy, checkpoint=checkpoint))
+     except Exception:
+         logger.warning('Kanban restart-loss booking failed; settling without it', exc_info=True)
+ 
+ 
+-def record_restart_interruption(policy):
++def record_restart_interruption(policy, checkpoint=None):
+     """Supersede the child's interrupted exit with an uncounted owner-restart exit.
+ 
+     Called before admission settlement, including a Stop before worker bootstrap. Fence on
+@@ -51,7 +76,18 @@ def record_restart_interruption(policy):
+                 or task.claim_lock != context['claim_lock'] or run is None
+                 or tuple(run) != ('running', context['claim_lock'], context['task_id'])):
+             return
+-        kb._append_event(conn, task.id, 'worker_result', {
+-            'pid': task.worker_pid, 'claim_lock': context['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
+-            'last_output': 'Kanban attempt interrupted by gateway restart/shutdown; requeued uncounted.',
+-            'owner_restart': True}, run_id=context['run_id'])
++        payload = {'pid': task.worker_pid, 'claim_lock': context['claim_lock'],
++                   'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
++                   'last_output': 'Kanban attempt interrupted by gateway restart/shutdown; requeued uncounted.',
++                   'owner_restart': True}
++        if checkpoint:
++            token = uuid.uuid4().hex
++            payload.update(continuable=True, checkpoint=token, last_output=(
++                'Kanban turn checkpointed at a gateway restart/shutdown; the next owner continues it '
++                '(requeued uncounted if it cannot).'))
++            kb._append_event(conn, task.id, CHECKPOINT_EVENT, {
++                'reason': CHECKPOINT_REASON, 'checkpoint': token, 'at': int(time.time()),
++                'claim_lock': context['claim_lock'],
++                **{k: checkpoint.get(k) for k in ('session_id', 'request_id', 'admission_id', 'cause')}},
++                run_id=context['run_id'])
++        kb._append_event(conn, task.id, 'worker_result', payload, run_id=context['run_id'])
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index bec67a4726..53bbb4ec8c 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -640,8 +640,11 @@ async def admit_managed(authority, ref, row, policy):
+             (_INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN)):
+         # The child booked exit 130 (or never bootstrapped). Supersede it BEFORE the
+         # receipt becomes terminal: a runtime Stop must not spend the card's retries.
++        # [daveey] A clean stop is a checkpoint the next owner continues (session_kanban_continue).
+         from gateway.session_kanban_restart import book_restart_interruption
+-        await book_restart_interruption(authority, policy)
++        await book_restart_interruption(authority, policy, checkpoint={
++            'session_id': ref.session_id, 'request_id': row.get('request_id'),
++            'admission_id': row.get('admission_id'), 'cause': pending.get('runtime_stop_cause')})
+     return reply
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index dcb24691e8..63c945d97d 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -18,11 +18,15 @@ from typing import Optional
+ from hermes_cli.gateway_client import GatewayClientError as _GatewayClientError
+ 
+ # [daveey] The promise hermes-sync's ``kanban_workers_restart_safe`` asks of this core: a gateway restart
+-# (the one in ``hermes update``) neither fails nor strands a running Kanban run. The run carries on, or
+-# it is requeued without a failure counted. #266 keeps it: a draining owner's refusals refresh this
+-# worker's silence budget up to the owner's own after-turn cap (``_Claim.note_refusal``); an admitted
+-# turn the restart ends raises ``OwnerRestartLost`` and exits ``KANBAN_OWNER_RESTART_EXIT_CODE``; and the
+-# dead-worker sweep requeues that exit as ``reclaimed`` with no failure counted. hermes-sync reads this
++# (the one in ``hermes update``) neither fails nor strands a running Kanban run. The run CONTINUES: the
++# old owner checkpoints the turn its restart Stop ends (``gateway.session_kanban_restart``), this worker
++# keeps its pid and claim, waits up to ``CONTINUE_WAIT_S`` for the next owner and asks ``kanban.run`` for
++# the same attempt again, and that owner continues the turn in the same session
++# (``gateway.session_kanban_continue``), so no reclaim, crash or failure is booked. A draining owner's
++# refusals refresh the silence budget up to its own after-turn cap (``_Claim.note_refusal``). Only when
++# continuation cannot be proven safe (no checkpoint, the owner refuses it, or no owner within the wait)
++# does the worker raise ``OwnerRestartLost`` and exit ``KANBAN_OWNER_RESTART_EXIT_CODE``, which the
++# dead-worker sweep requeues as ``reclaimed`` with no failure counted. hermes-sync reads this
+ # file's text with the regex ``^GATEWAY_RESTART_SAFE\s*(?::\s*bool\s*)?=\s*True\b``: without a match every
+ # core-update drain holds new Kanban claims for up to 20 min. Pinned by
+ # tests/hermes_cli/test_kanban_worker_owner_restart.py.
+@@ -35,6 +39,11 @@ GATEWAY_RESTART_SAFE = True
+ # ``OWNER_WAIT_S`` is the longest the owner may stay silent between answers before the worker
+ # gives up (the first ``kanban.run`` answer has its own wait, ``admission_answer_budget``).
+ OWNER_WAIT_S = 180.0
++# [daveey] After the owner checkpointed this attempt's turn for its restart, the silence the worker waits
++# out for the next owner: the old owner's exit, ``hermes update``'s tree move and the new owner's start.
++CONTINUE_WAIT_S = 300.0
++# A restart storm never loops one attempt forever: past this many checkpoints it is requeued uncounted.
++MAX_CONTINUATIONS = 8
+ _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
+ # In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
+ # retired authority's successor holds the admission the next connection reads.
+@@ -101,6 +110,18 @@ class _Claim:
+     waiting: Optional[float] = None  # monotonic time the owner's current restart wait was first seen
+     alive: float = float('-inf')  # monotonic time the owner last refused us from inside that wait
+     restarted: bool = False  # the owner restarted (or began to) during this attempt
++    continuing: bool = False  # the owner checkpointed the turn: the next ``kanban.run`` asks to continue it
++    checkpoints: tuple = ()  # checkpoint tokens already continued (each is continued at most once)
++
++    def silence_budget(self):
++        return CONTINUE_WAIT_S if self.continuing else OWNER_WAIT_S
++
++    def continue_after(self, token):
++        """The owner checkpointed this attempt's turn: ask the next owner to continue it. [daveey]"""
++        self.checkpoints = (*self.checkpoints, token)
++        self.continuing = self.restarted = True
++        self.admission_id = None
++        self.answered = time.monotonic()
+ 
+     def silent_for(self):
+         return time.monotonic() - max(self.answered, self.alive)
+@@ -120,7 +141,7 @@ class _Claim:
+             draining = exc.reason_code != 'idle_exit'
+         else:
+             return
+-        self.restarted = self.admission_id is not None
++        self.restarted = self.restarted or self.continuing or self.admission_id is not None
+         if not draining:
+             return
+         now = time.monotonic()
+@@ -175,9 +196,13 @@ async def run(params, board_db):
+                 raise
+             host_refusal = _host_refusal(exc, claim)
+             if not (host_refusal or _restartable(exc)):
++                if claim.continuing:
++                    # The next owner would not continue the checkpointed turn (``kanban_continuation_unsafe``,
++                    # a moved claim): today's uncounted requeue, which resumes this transcript. [daveey]
++                    raise OwnerRestartLost(f'Kanban owner did not continue the checkpointed turn: {exc}') from exc
+                 raise
+             claim.note_refusal(exc)
+-            if claim.silent_for() >= OWNER_WAIT_S:
++            if claim.silent_for() >= claim.silence_budget():
+                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
+                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
+@@ -198,6 +223,15 @@ async def run(params, board_db):
+                 error.host_refusal = str(exc) if host_refusal else None
+                 raise error from exc
+         else:
++            token = None if receipt['status'] != 'terminal' else await asyncio.to_thread(
++                _checkpoint, params, board_db, claim)
++            if token is not None:
++                print('Kanban owner restarting: turn checkpointed; waiting for the next owner to continue it',
++                      file=sys.stderr, flush=True)
++                claim.continue_after(token)
++                failures = 0
++                await asyncio.sleep(jittered_backoff(1, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
++                continue
+             if receipt['status'] == 'unknown' and claim.restarted:
+                 raise OwnerRestartLost('Kanban execution unknown after an owner restart; retained by owner')
+             return _exit_code(receipt, params, board_db)
+@@ -207,6 +241,22 @@ async def run(params, board_db):
+         await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
+ 
+ 
++def _checkpoint(params, board_db, claim):
++    """The token of a turn checkpoint the owner booked as this attempt's result (``continuable``) that this
++    worker has not continued yet, or None (the result is final). [daveey]"""
++    import sqlite3
++    from gateway.session_kanban import worker_result
++    try:
++        result = worker_result(board_db, params)
++    except (OSError, sqlite3.Error, ValueError, KeyError):
++        return None
++    token = result.get('checkpoint')
++    if (result.get('continuable') is not True or not isinstance(token, str) or not token
++            or token in claim.checkpoints or len(claim.checkpoints) >= MAX_CONTINUATIONS):
++        return None
++    return token
++
++
+ def _restartable(exc):
+     """False when *exc* is the owner's own final answer; True for a restarting owner or a lost transport."""
+     from hermes_cli.gateway_client import GatewayRPCError, GatewayUnavailableError
+@@ -221,7 +271,7 @@ def _owner_down(exc, claim):
+     """True for a persistent pre-admission service state (``kanban_owner_down.PERSISTENT_CODES``). [daveey]"""
+     from hermes_cli.gateway_client import GatewayUnavailableError
+     from hermes_cli.kanban_owner_down import persistent
+-    return (claim.admission_id is None and isinstance(exc, GatewayUnavailableError)
++    return (claim.admission_id is None and not claim.continuing and isinstance(exc, GatewayUnavailableError)
+             and persistent(exc.reason_code))
+ 
+ 
+@@ -229,7 +279,7 @@ def _host_refusal(exc, claim):
+     """True for an owner refusal that is the host's condition (``_HOST_REFUSAL_REASONS``) while no
+     admission exists: nothing ran, so asking again is safe. [daveey]"""
+     from hermes_cli.gateway_client import GatewayRPCError
+-    return (claim.admission_id is None and isinstance(exc, GatewayRPCError)
++    return (claim.admission_id is None and not claim.continuing and isinstance(exc, GatewayRPCError)
+             and str(exc) in _HOST_REFUSAL_REASONS)
+ 
+ 
+diff --git a/tests/gateway/fixtures/kanban_restart_continue_probe.py b/tests/gateway/fixtures/kanban_restart_continue_probe.py
+new file mode 100644
+index 0000000000..f934a9e036
+--- /dev/null
++++ b/tests/gateway/fixtures/kanban_restart_continue_probe.py
+@@ -0,0 +1,169 @@
++"""A managed Kanban run continues across its owner gateway's restart. [daveey]
++
++Actual dispatcher argv, real ``gateway.run`` owners on one disposable home, loopback model. The first
++owner is stopped (SIGTERM: the runtime Stop of a gateway shutdown/restart) while the card's turn waits
++on the model; a second owner then starts on the same home. The run's submitter (the real
++``hermes_cli.kanban_worker_client``) must survive the gap and the second owner must continue the same
++turn in the same session: one run, one claim, one worker pid, no reclaim/crash/failure.
++"""
++from contextlib import closing
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++import json
++import os
++from pathlib import Path
++import sqlite3
++import subprocess
++import sys
++import threading
++import time
++
++from local_recovery_probe import daemon
++
++CONTINUE_PREFIX = '[Kanban run continued after a gateway restart]'
++
++
++class Model(BaseHTTPRequestHandler):
++    def log_message(self, *args):
++        pass
++
++    def do_POST(self):
++        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
++        messages = body.get('messages', [])
++        if messages:
++            self.server.requests.append(body)
++        users = [m for m in messages if m['role'] == 'user']
++        continued = any(isinstance(m.get('content'), str) and m['content'].startswith(CONTINUE_PREFIX) for m in users)
++        if messages and body.get('tools') and not continued and not self.server.blocked.is_set():
++            self.server.blocked.set()  # the first turn waits here until its owner is stopped
++            self.server.release.wait(120)
++        message = {'role': 'assistant', 'content': 'CONTINUED_COMPLETE'}
++        finish = 'stop'
++        if continued and body.get('tools') and messages[-1]['role'] == 'user':
++            message = {'role': 'assistant', 'content': None, 'tool_calls': [{'index': 0, 'id': 'continued-complete',
++                'type': 'function', 'function': {'name': 'kanban_complete',
++                                                 'arguments': json.dumps({'summary': 'Continued after restart'})}}]}
++            finish = 'tool_calls'
++        payload = json.dumps({'id': 'cont', 'choices': [{'index': 0, 'message': message, 'finish_reason': finish}],
++            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}}).encode()
++        kind = 'application/json'
++        if body.get('stream'):
++            payload = ('data: ' + json.dumps({'id': 'cont', 'choices': [{'index': 0, 'delta': message, 'finish_reason': finish}]})
++                       + '\n\ndata: [DONE]\n\n').encode()
++            kind = 'text/event-stream'
++        try:
++            self.send_response(200)
++            self.send_header('Content-Type', kind)
++            self.send_header('Content-Length', str(len(payload)))
++            self.end_headers()
++            self.wfile.write(payload)
++        except (BrokenPipeError, ConnectionResetError):
++            pass
++
++
++def _wait(predicate, timeout, what):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        value = predicate()
++        if value:
++            return value
++        time.sleep(.1)
++    raise AssertionError(f'deadline: {what}')
++
++
++def main():
++    root = Path(__file__).resolve().parents[3]
++    home = Path(os.environ['HERMES_HOME'])
++    home.mkdir(parents=True, exist_ok=True)
++    Path(os.environ['HOME']).mkdir(parents=True, exist_ok=True)
++    os.environ['HERMES_KANBAN_HOME'] = str(home)
++    peer = ThreadingHTTPServer(('127.0.0.1', 0), Model)
++    peer.requests = []
++    peer.blocked, peer.release = threading.Event(), threading.Event()
++    threading.Thread(target=peer.serve_forever, daemon=True).start()
++    url = f'http://127.0.0.1:{peer.server_port}/v1'
++    os.environ.update(OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
++    workspace = home / 'workspace'
++    workspace.mkdir(exist_ok=True)
++    cfg = {'gateway': {'multiplex_profiles': False}, 'model': {'provider': 'custom', 'default': 'loop-model', 'base_url': url},
++           'auxiliary': {'title_generation': {'enabled': False}}, 'platform_toolsets': {'cli': ['terminal', 'file']},
++           'terminal': {'backend': 'local'}, 'agent': {'api_max_retries': 1}, 'kanban': {'dispatch_in_gateway': False}}
++    (home / 'config.yaml').write_text(json.dumps(cfg), encoding='utf-8')
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++    from hermes_cli import kanban_db_dispatch as dispatch
++    dispatch._resolve_hermes_argv = lambda: [sys.executable, '-m', 'hermes_cli.main']
++    os.environ['HERMES_KANBAN_CRASH_GRACE_SECONDS'] = '0'
++    kb.create_board('owned')
++    with closing(connect(board='owned')) as conn:
++        tid = kb.create_task(conn, title='RESTART_CONTINUE_SENTINEL', body='Acceptance: finish across a restart',
++                             assignee='default', workspace_kind='dir', workspace_path=str(workspace))
++    env = dict(os.environ)
++    receipt, clients = {'task_id': tid}, []
++    original_popen = subprocess.Popen
++
++    def spawn(*args, **kwargs):
++        child = original_popen(*args, **kwargs)
++        if 'hermes_cli.kanban_worker_client' in args[0]:
++            clients.append(child)
++        return child
++
++    def kinds(conn):
++        return [r[0] for r in conn.execute('SELECT kind FROM task_events WHERE task_id=? ORDER BY id', (tid,))]
++
++    def spawned(conn):
++        launched = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
++        return launched if launched.spawned else None
++    try:
++        subprocess.Popen = spawn
++        with closing(connect(board='owned')) as conn:
++            with daemon(root, home, env, barrier=False) as (proc, _desc):
++                receipt['owner_pids'] = [proc.pid]
++                launched = _wait(lambda: spawned(conn), 60, 'dispatcher claim and spawn')
++                assert [s[0] for s in launched.spawned] == [tid], launched
++                task = kb.get_task(conn, tid)
++                receipt.update(run_id=task.current_run_id, claim_lock=task.claim_lock)
++                assert peer.blocked.wait(90), 'model never reached'
++                receipt['worker_pid'] = kb.get_task(conn, tid).worker_pid
++                proc.terminate()  # the runtime Stop of a gateway shutdown/restart, mid-turn
++                proc.wait(60)
++            peer.release.set()
++            mid = kb.get_task(conn, tid)
++            receipt.update(checkpointed='restart_checkpoint' in kinds(conn), client_alive_in_gap=clients[0].poll() is None,
++                           gap_status=mid.status, gap_run=mid.current_run_id, gap_claim=mid.claim_lock,
++                           gap_worker_pid=mid.worker_pid)
++            # The dispatcher ticks during the gap: its stale/dead sweeps must leave the live run alone.
++            dispatch.dispatch_once(conn, board='owned', max_spawn=0)
++            with daemon(root, home, env, barrier=False) as (proc, _desc):
++                receipt['owner_pids'].append(proc.pid)
++                _wait(lambda: clients[0].poll() is not None, 300, 'worker exit after continuation')
++            dispatch.reap_worker_zombies()
++            receipt['client_exit'] = list(dispatch._classify_worker_exit(clients[0].pid) or ())
++            dispatch._recent_worker_exits.clear()
++            dispatch.dispatch_once(conn, board='owned', max_spawn=0)
++            task = kb.get_task(conn, tid)
++            runs = [list(r) for r in conn.execute('SELECT id, outcome, status FROM task_runs WHERE task_id=?', (tid,))]
++            receipt.update(task_status=task.status, failures=task.consecutive_failures, runs=runs, kinds=kinds(conn),
++                           clients=len(clients))
++        with closing(sqlite3.connect((home / 'state.db').as_uri() + '?mode=ro', uri=True)) as db:
++            receipt['admissions'] = [list(r) for r in db.execute(
++                'SELECT target_session_id, request_id, status, outcome FROM session_admissions ORDER BY seq')]
++        turns = [[m.get('content') for m in r['messages'] if m['role'] == 'user'] for r in peer.requests if r.get('tools')]
++        receipt['continued_in_history'] = any(
++            any(isinstance(t, str) and 'RESTART_CONTINUE_SENTINEL' in t for t in turn)
++            and any(isinstance(t, str) and t.startswith(CONTINUE_PREFIX) for t in turn) for turn in turns)
++    finally:
++        subprocess.Popen = original_popen
++        peer.release.set()
++        for child in clients:
++            if child.poll() is None:
++                child.kill()
++            child.wait(timeout=10)
++        peer.shutdown()
++        peer.server_close()
++        (home / 'model-requests.json').write_text(json.dumps(peer.requests, indent=2), encoding='utf-8')
++        (home / 'receipt.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
++        print(json.dumps(receipt))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/gateway/test_kanban_restart_continuation.py b/tests/gateway/test_kanban_restart_continuation.py
+new file mode 100644
+index 0000000000..ee03b6082b
+--- /dev/null
++++ b/tests/gateway/test_kanban_restart_continuation.py
+@@ -0,0 +1,391 @@
++"""A managed Kanban run continues across its owner gateway's restart: no reclaim. [daveey]
++
++120 runs in 7 days on hermes-hub ended at a gateway restart (``hermes update``): the owner booked the
++turn as a restart loss, the worker exited 76 and the sweep requeued it ``reclaimed``/``owner_restart_lost``
++into a fresh run that copied the transcript. Now the stopping owner checkpoints the turn, the worker
++keeps its claim and waits for the next owner, and that owner continues the same turn in the same session.
++"""
++import asyncio
++from contextlib import asynccontextmanager, closing
++import json
++from pathlib import Path
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import gateway_client, kanban_worker_client
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
++
++_FORBIDDEN = {'reclaimed', 'crashed', 'owner_restart_lost', 'gave_up', 'timed_out'}
++
++
++# --- real owners: dispatcher argv, two gateway.run processes on one disposable home ---------------
++
++def test_a_real_owner_restart_mid_turn_continues_the_same_run(tmp_path):
++    import subprocess
++    import sys
++    repo = Path(__file__).resolve().parents[2]
++    from tests.gateway.fixtures.local_recovery_probe import child_env
++    env = child_env()
++    env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'),
++               PYTHONPATH=f"{repo}{__import__('os').pathsep}{repo / 'tests' / 'gateway' / 'fixtures'}")
++    result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_restart_continue_probe.py')],
++                            env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=420,
++                            check=False)
++    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
++    receipt = json.loads((tmp_path / 'state' / 'receipt.json').read_text())
++    print(json.dumps(receipt))
++    assert receipt['owner_pids'][0] != receipt['owner_pids'][1]
++    # The gap: the stopped owner checkpointed the turn and the run kept its claim and worker.
++    assert receipt['checkpointed'] and receipt['client_alive_in_gap'], receipt
++    assert (receipt['gap_status'], receipt['gap_run'], receipt['gap_claim'], receipt['gap_worker_pid']) == (
++        'running', receipt['run_id'], receipt['claim_lock'], receipt['worker_pid']), receipt
++    # The next owner continued it: same run, one worker, exit 0, no reclaim/crash/failure.
++    assert receipt['client_exit'] == ['clean_exit', 0] and receipt['clients'] == 1, receipt
++    assert receipt['task_status'] == 'done' and receipt['failures'] == 0, receipt
++    assert receipt['runs'] == [[receipt['run_id'], 'completed', 'done']], receipt
++    assert not _FORBIDDEN & set(receipt['kinds']), receipt['kinds']
++    assert 'restart_continued' in receipt['kinds'], receipt['kinds']
++    # One session: the stopped admission settled interrupted and its continuation completed there.
++    sessions = {row[0] for row in receipt['admissions']}
++    assert len(sessions) == 1 and [row[2:] for row in receipt['admissions']] == [
++        ['terminal', 'interrupted'], ['terminal', 'completed']], receipt['admissions']
++    assert receipt['admissions'][1][1].startswith(receipt['admissions'][0][1] + '#continue:')
++    assert receipt['continued_in_history'], 'the continued turn did not carry the first turn as history'
++
++
++# --- the worker: a fake owner that restarts mid-turn -------------------------------------------
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.delenv('HERMES_TUI_GATEWAY_URL', raising=False)
++    monkeypatch.setenv('HERMES_RESTART_AFTER_TURN_TIMEOUT', '1800')
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    monkeypatch.setattr(kbd, '_worker_final_output', lambda *a, **kw: '')
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='card mid-turn at the restart', assignee='default')
++        host = kb._claimer_id().split(':', 1)[0]
++        kb.claim_task(conn, tid, claimer=f'{host}:w81001')
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?', (81001, int(time.time()) - 600, tid))
++        task = kb.get_task(conn, tid)
++        assert task is not None
++        params = dict(board='default', task_id=tid, run_id=task.current_run_id, claim_lock=task.claim_lock)
++        request = 'kanban:' + json.dumps(['default', tid, task.current_run_id], separators=(',', ':'))
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'owner_admitted', {'session_id': 's1', 'request_id': request},
++                             run_id=task.current_run_id)
++    return SimpleNamespace(db=str(tmp_path / 'kanban.db'), params=params, request=request, home=tmp_path)
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [0.0]
++    monkeypatch.setattr(kanban_worker_client, 'time', SimpleNamespace(monotonic=lambda: now[0]))
++
++    async def _sleep(seconds):
++        now[0] += seconds
++    monkeypatch.setattr(kanban_worker_client.asyncio, 'sleep', _sleep)
++    return now
++
++
++def _book(board, payload, kind='worker_result'):
++    with kbc.connect() as conn, kb.write_txn(conn):
++        kb._append_event(conn, board.params['task_id'], kind, payload, run_id=board.params['run_id'])
++
++
++def _checkpoint(board, request_id):
++    """What the stopping owner books (gateway.session_kanban_restart, checkpoint form)."""
++    _book(board, {'reason': 'core_update_pause', 'checkpoint': 'tok1', 'session_id': 's1', 'request_id': request_id,
++                  'admission_id': 'a1', 'claim_lock': board.params['claim_lock']}, kind='restart_checkpoint')
++    _book(board, {'claim_lock': board.params['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
++                  'owner_restart': True, 'continuable': True, 'checkpoint': 'tok1',
++                  'last_output': 'Kanban turn checkpointed at a gateway restart/shutdown'})
++
++
++class _RestartingOwner:
++    """Dial 1: the old owner admits the turn (a1), then its restart Stop checkpoints it and cuts the socket.
++    Dials until ``gap``: refused (the owner is down). After: the new owner reports a1 ``terminal`` and,
++    asked ``kanban.run`` again, continues the turn (a2) to ``final`` (or refuses with ``refusal``)."""
++
++    def __init__(self, board, clock, *, gap=90.0, refusal=None):
++        self.board, self.clock, self.gap, self.refusal = board, clock, gap, refusal
++        self.runs, self.dials = [], 0
++
++    def connect(self):
++        owner = self
++
++        @asynccontextmanager
++        async def _connect(*_, **__):
++            owner.dials += 1
++            first = owner.dials == 1
++            if not first and owner.clock[0] < owner.gap:
++                raise ConnectionRefusedError('owner gone')
++
++            class _Client:
++                events = asyncio.Queue()
++
++                async def rpc(self, method, **params):
++                    if method == 'kanban.run':
++                        owner.runs.append(params)
++                        if first:
++                            return {'session_id': 's1', 'receipt': {'status': 'started', 'admission_id': 'a1'}}
++                        if owner.refusal:
++                            raise gateway_client.GatewayRPCError(owner.refusal)
++                        from gateway.session_kanban_continue import pending_admission
++                        target, checkpoint = pending_admission(owner.board.db, owner.board.params, owner.board.request)
++                        assert checkpoint is not None and target == owner.board.request + '#continue:tok1'
++                        _book(owner.board, {'session_id': 's1', 'request_id': target}, kind='owner_admitted')
++                        # The continued turn finishes the card's work: the child books its own result.
++                        _book(owner.board, {'claim_lock': owner.board.params['claim_lock'], 'exit_code': 0,
++                                            'last_output': 'CONTINUED_DONE'})
++                        return {'session_id': 's1', 'receipt': {'status': 'terminal', 'admission_id': 'a2'}}
++                    if first:
++                        _checkpoint(owner.board, owner.board.request)
++                        raise gateway_client.GatewayClientError('Gateway disconnected; turn outcome is unknown')
++                    assert params['admission_id'] == 'a1'
++                    return {'status': 'terminal', 'outcome': 'interrupted'}
++
++            yield _Client()
++
++        return _connect
++
++
++def _env(monkeypatch, board):
++    for key, value in {'HERMES_KANBAN_BOARD': 'default', 'HERMES_KANBAN_TASK': board.params['task_id'],
++                       'HERMES_KANBAN_RUN_ID': str(board.params['run_id']),
++                       'HERMES_KANBAN_CLAIM_LOCK': board.params['claim_lock'], 'HERMES_KANBAN_DB': board.db}.items():
++        monkeypatch.setenv(key, value)
++
++
++def _sweep(monkeypatch, rc):
++    """The dispatcher books the worker's exit the way it would after reaping it."""
++    monkeypatch.setattr(kb, '_pid_alive', lambda pid: False)
++    # The owner-reclaim pause is the old owner's admission evidence (a real pid/bound interpreter this
++    # fixture does not fake); test_kanban_worker_owner_restart covers it. Here: the exit's booking.
++    from hermes_cli import kanban_owner_recovery
++    monkeypatch.setattr(kanban_owner_recovery, 'owner_reclaim_blocked', lambda *a, **k: False)
++    monkeypatch.setattr(kbd, '_recent_worker_exits', {81001: ((rc & 0xFF) << 8, time.time())})
++    with kbc.connect() as conn:
++        kbd.detect_crashed_workers(conn)
++
++
++def test_a_worker_whose_owner_restarts_mid_turn_continues_the_same_run(board, clock, monkeypatch, capsys):
++    owner = _RestartingOwner(board, clock)
++    monkeypatch.setattr(gateway_client, 'connect_gateway', owner.connect())
++    _env(monkeypatch, board)
++
++    rc = kanban_worker_client.main()
++
++    assert rc == 0, capsys.readouterr().err
++    assert 'CONTINUED_DONE' in capsys.readouterr().out
++    assert len(owner.runs) == 2  # the same attempt asked again, never a new one
++    assert owner.runs[0]['run_id'] == owner.runs[1]['run_id'] == board.params['run_id']
++    assert owner.runs[1]['claim_lock'] == board.params['claim_lock']
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, board.params['task_id'])
++        assert task is not None
++        # Through the gap the run kept its claim: a live worker is never reclaimed.
++        assert (task.status, task.current_run_id, task.claim_lock, task.consecutive_failures) == (
++            'running', board.params['run_id'], board.params['claim_lock'], 0)
++        kinds = [r[0] for r in conn.execute('SELECT kind FROM task_events WHERE task_id=?', (task.id,))]
++    assert not _FORBIDDEN & set(kinds), kinds
++
++
++def test_the_continued_turn_waits_out_a_restart_longer_than_owner_wait(board, clock, monkeypatch):
++    # The worker learned of the checkpoint (a1 terminal) before the owner went away: the gap may last
++    # up to CONTINUE_WAIT_S (> OWNER_WAIT_S), covering the old owner's exit and the new one's start.
++    owner = _RestartingOwner(board, clock, gap=kanban_worker_client.OWNER_WAIT_S + 60)
++    monkeypatch.setattr(gateway_client, 'connect_gateway', owner.connect())
++    _checkpoint(board, board.request)
++
++    async def _first(client, params, board_db, claim):
++        claim.session_id, claim.admission_id = 's1', 'a1'
++        return {'status': 'terminal'}
++    real = kanban_worker_client._await_receipt
++    calls = []
++
++    async def _await(client, params, board_db, claim):
++        calls.append(1)
++        return await (_first if len(calls) == 1 else real)(client, params, board_db, claim)
++    monkeypatch.setattr(kanban_worker_client, '_await_receipt', _await)
++    assert kanban_worker_client.CONTINUE_WAIT_S <= 300
++    assert asyncio.run(kanban_worker_client.run(board.params, board.db)) == 0
++    assert clock[0] >= kanban_worker_client.OWNER_WAIT_S
++
++
++def test_an_owner_that_will_not_continue_falls_back_to_the_uncounted_requeue(board, clock, monkeypatch, capsys):
++    owner = _RestartingOwner(board, clock, refusal='kanban_continuation_unsafe')
++    monkeypatch.setattr(gateway_client, 'connect_gateway', owner.connect())
++    _env(monkeypatch, board)
++
++    rc = kanban_worker_client.main()
++
++    assert rc == KANBAN_OWNER_RESTART_EXIT_CODE, capsys.readouterr().err
++    _sweep(monkeypatch, rc)
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, board.params['task_id'])
++        assert task is not None
++        assert (task.status, task.consecutive_failures) == ('ready', 0)
++        outcome = conn.execute('SELECT outcome FROM task_runs WHERE id=?', (board.params['run_id'],)).fetchone()[0]
++        assert outcome == 'reclaimed'
++        kinds = [r[0] for r in conn.execute('SELECT kind FROM task_events WHERE task_id=?', (task.id,))]
++    assert kinds.count('owner_restart_lost') == 1 and 'crashed' not in kinds and 'gave_up' not in kinds
++
++
++def test_a_checkpoint_is_continued_at_most_once(board, clock, monkeypatch):
++    # The same token again (the new owner never booked a newer result) is the final result: exit 76.
++    claim = kanban_worker_client._Claim(answered=0.0)
++    _checkpoint(board, board.request)
++    assert kanban_worker_client._checkpoint(board.params, board.db, claim) == 'tok1'
++    claim.continue_after('tok1')
++    assert kanban_worker_client._checkpoint(board.params, board.db, claim) is None
++
++
++def test_a_checkpoint_token_without_continuable_is_final(board):
++    _book(board, {'claim_lock': board.params['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
++                  'owner_restart': True, 'checkpoint': 'tok1'})
++    assert kanban_worker_client._checkpoint(board.params, board.db, kanban_worker_client._Claim(answered=0.0)) is None
++
++
++def test_a_restart_storm_stops_continuing_after_max_continuations(board):
++    # Each restart books a new token; past MAX_CONTINUATIONS the run is requeued uncounted instead.
++    claim = kanban_worker_client._Claim(answered=0.0)
++    for i in range(kanban_worker_client.MAX_CONTINUATIONS):
++        claim.continue_after(f'old{i}')
++    _checkpoint(board, board.request)
++    assert kanban_worker_client._checkpoint(board.params, board.db, claim) is None
++    claim.checkpoints = claim.checkpoints[1:]
++    assert kanban_worker_client._checkpoint(board.params, board.db, claim) == 'tok1'
++
++
++def test_a_lost_turn_is_not_a_checkpoint(board):
++    # The ordinary restart-loss booking (no clean result: the child was lost) carries no checkpoint.
++    _book(board, {'claim_lock': board.params['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
++                  'owner_restart': True})
++    claim = kanban_worker_client._Claim(answered=0.0)
++    assert kanban_worker_client._checkpoint(board.params, board.db, claim) is None
++
++
++# --- the owners: checkpoint booking, then the continuation's safety checks ----------------------
++
++def _policy(board):
++    return SimpleNamespace(kanban_json=json.dumps({'db': board.db, **board.params}))
++
++
++def test_the_stopping_owner_books_a_continuable_checkpoint(board):
++    from gateway.session_kanban_restart import record_restart_interruption
++    record_restart_interruption(_policy(board), checkpoint={'session_id': 's1', 'request_id': board.request,
++                                                            'admission_id': 'a1', 'cause': 'restart'})
++    from gateway.session_kanban import worker_result
++    result = worker_result(board.db, board.params)
++    assert result['exit_code'] == KANBAN_OWNER_RESTART_EXIT_CODE and result['continuable'] is True
++    from gateway.session_kanban_continue import pending_admission
++    target, checkpoint = pending_admission(board.db, board.params, board.request)
++    assert checkpoint is not None and target == board.request + '#continue:' + result['checkpoint']
++    assert checkpoint['reason'] == 'core_update_pause' and checkpoint['session_id'] == 's1'
++    # A retried ask after the continuation was admitted resubmits that same continuation.
++    _book(board, {'session_id': 's1', 'request_id': target}, kind='owner_admitted')
++    assert pending_admission(board.db, board.params, board.request) == (target, None)
++
++
++def test_a_lost_child_is_booked_without_a_checkpoint(board):
++    from gateway.session_kanban_restart import record_restart_interruption
++    record_restart_interruption(_policy(board))
++    from gateway.session_kanban import worker_result
++    assert 'continuable' not in worker_result(board.db, board.params)
++    from gateway.session_kanban_continue import pending_admission
++    assert pending_admission(board.db, board.params, board.request) == (board.request, None)
++
++
++def _session_db(tmp_path, history):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    db.create_session('s1', 'kanban')
++    for message in history:
++        db.append_message('s1', **message)
++    return db
++
++
++def _prepare(board, db, checkpoint, monkeypatch, admission=None):
++    import hermes_state_runtime
++    from gateway import session_kanban_continue as cont
++    admission = admission or {'status': 'terminal', 'outcome': 'interrupted', 'admission_id': 'a1'}
++    monkeypatch.setattr(hermes_state_runtime, 'find_session_admission', lambda *a, **k: admission)
++    target = cont.continuation_request_id(board.request, checkpoint['checkpoint'])
++    return cont.prepare(SimpleNamespace(db=db), principal_id='p', session_id='s1', context={'db': board.db, **board.params},
++                        checkpoint=checkpoint, request_id=target, owner_db=str(board.home / 'state.db'))
++
++
++_MID_TOOL = [{'role': 'user', 'content': 'work kanban task'},
++             {'role': 'assistant', 'content': None, 'tool_calls': [
++                 {'id': 'call-1', 'type': 'function', 'function': {'name': 'terminal', 'arguments': '{}'}}]}]
++
++
++def test_the_new_owner_answers_the_interrupted_tool_call_and_records_the_continuation(board, tmp_path, monkeypatch):
++    from gateway.session_kanban_restart import record_restart_interruption
++    record_restart_interruption(_policy(board), checkpoint={'session_id': 's1', 'request_id': board.request,
++                                                            'admission_id': 'a1', 'cause': 'restart'})
++    from gateway.session_kanban_continue import pending_admission
++    _target, checkpoint = pending_admission(board.db, board.params, board.request)
++    db = _session_db(tmp_path, [{'role': m['role'], 'content': m['content'], 'tool_calls': m.get('tool_calls')}
++                                for m in _MID_TOOL])
++    assert _prepare(board, db, checkpoint, monkeypatch)['answered'] == 1
++    history = db.get_messages_as_conversation('s1')
++    tool = history[-1]
++    assert tool['role'] == 'tool' and tool['tool_call_id'] == 'call-1'
++    import re
++    assert re.fullmatch(r'\[interrupted by Hermes update at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ: re-run if still needed\]',
++                        tool['content'])
++    with closing(__import__('sqlite3').connect(board.db)) as conn:
++        kinds = [r[0] for r in conn.execute('SELECT kind FROM task_events WHERE task_id=?', (board.params['task_id'],))]
++    assert kinds[-2:] == ['owner_admitted', 'restart_continued'], kinds
++    # Proven continuations only once: the same checkpoint again is a retry, not a second continuation.
++    assert pending_admission(board.db, board.params, board.request)[1] is None
++
++
++@pytest.mark.parametrize('case', ['session_mismatch', 'admission_not_interrupted', 'session_empty', 'attempt_superseded',
++                                  'checkpoint_admission_mismatch', 'session_rotated'])
++def test_an_unsafe_continuation_is_refused_and_booked(board, tmp_path, monkeypatch, case):
++    from gateway import session_kanban_continue as cont
++    from hermes_state_runtime import RuntimeStoreError
++    from gateway.session_kanban_restart import record_restart_interruption
++    record_restart_interruption(_policy(board), checkpoint={
++        'session_id': 'other' if case == 'session_mismatch' else 's1',
++        'request_id': 'kanban:foreign' if case == 'checkpoint_admission_mismatch' else board.request,
++        'admission_id': 'a1', 'cause': 'restart'})
++    _target, checkpoint = cont.pending_admission(board.db, board.params, board.request)
++    assert checkpoint is not None
++    # The superseded case leaves a tool call open: a refused continuation must not answer it.
++    db = _session_db(tmp_path, [] if case == 'session_empty' else [
++        {'role': m['role'], 'content': m['content'], 'tool_calls': m.get('tool_calls')} for m in _MID_TOOL])
++    if case == 'session_rotated':
++        db.end_session('s1', 'compression')  # a compression split moved the transcript to a child session
++    admission = {'status': 'terminal', 'outcome': 'completed', 'admission_id': 'a1'} \
++        if case == 'admission_not_interrupted' else None
++    if case == 'attempt_superseded':
++        with kbc.connect() as conn, kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET claim_lock=? WHERE id=?', ('newer:1', board.params['task_id']))
++    with pytest.raises(RuntimeStoreError, match=cont.UNSAFE):
++        _prepare(board, db, checkpoint, monkeypatch, admission)
++    with closing(__import__('sqlite3').connect(board.db)) as conn:
++        refused = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                               (board.params['task_id'], cont.REFUSED_EVENT)).fetchall()
++        admitted = conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'",
++                                (board.params['task_id'],)).fetchone()[0]
++    assert [json.loads(r[0])['reason'] for r in refused] == [case]
++    assert admitted == 1  # nothing was admitted for the refused continuation
++    # Nothing was written to the session either.
++    assert all(m['role'] != 'tool' for m in db.get_messages_as_conversation('s1'))
++
++
++def test_the_restart_safe_comment_describes_continuation():
++    source = Path(kanban_worker_client.__file__).read_text(encoding='utf-8')
++    head = source[source.index('# [daveey] The promise hermes-sync'):source.index('GATEWAY_RESTART_SAFE = True')]
++    assert 'CONTINUES' in head and 'session_kanban_continue' in head
++    assert kanban_worker_client.GATEWAY_RESTART_SAFE is True
+-- 
+2.55.0
+

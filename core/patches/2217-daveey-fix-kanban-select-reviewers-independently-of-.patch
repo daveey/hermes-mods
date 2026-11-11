@@ -1,0 +1,566 @@
+From dd4166411566b6d3fdff73afb4af2e6642eb9322 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:54:34 +0000
+Subject: [PATCH] [daveey] fix(kanban): select reviewers independently of
+ author pins
+
+Resolve review handoff overrides before generic implementation pins; otherwise choose a distinct strong/deep reviewer with worker eligibility. Persist implementer_model and fail closed before spawn on missing reviewer receipts. Preserve ready/retry pins and retry budget on admission failure.
+
+Proof: initial regression RED (5 failed, 2 controls passed); focused baseline 42 passed, 15/15 routing and safety mutants killed; integration selection 158 passed; scripts/check 16 checks OK. Read-only replay: 37 board/shadow paths, 13899 rows, 679 review candidates, 214 changed copies / 148 unique cards; all changed inputs inspected. Live deployment proof pending.
+---
+ hermes_cli/kanban_db_dispatch.py              |  11 +-
+ hermes_cli/kanban_model_tier.py               |  36 ++-
+ hermes_cli/kanban_quota_episode.py            |   2 +-
+ hermes_cli/kanban_review_model.py             |  69 +++++
+ tests/hermes_cli/test_kanban_class_routing.py |  10 +-
+ tests/hermes_cli/test_kanban_review_model.py  | 258 ++++++++++++++++++
+ .../hermes_cli/test_kanban_shared_blockers.py |   2 +-
+ tests/hermes_cli/test_kanban_strong_tier.py   |   3 +-
+ 8 files changed, 374 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/kanban_review_model.py
+ create mode 100644 tests/hermes_cli/test_kanban_review_model.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 69abb3e6b20..977262abcf0 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2135,11 +2135,10 @@ def _dispatch_lane_task(
+         # Force-load sdlc-review; the kanban lifecycle is already in every
+         # worker's system prompt via KANBAN_GUIDANCE.
+         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+-    # Default model tier (kanban.default_model): pins a cheaper model on the in-memory task unless the card is
+-    # pinned, a review, a retry after a failure or matches a keep pattern. Never raises. [daveey]
++    # Apply inside spawn accounting: an unavailable independent reviewer fails closed.
+     from hermes_cli.kanban_model_tier import apply_model_tier
+-    apply_model_tier(conn, claimed, lane=lane)
+     try:
++        apply_model_tier(conn, claimed, lane=lane)
+         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+         if pid:
+             _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+@@ -2153,10 +2152,10 @@ def _dispatch_lane_task(
+         return True
+     except Exception as exc:
+         from tools.process_registry import RestartSafeScopeUnavailable
++        from hermes_cli.kanban_review_model import ReviewModelUnavailable
+ 
+-        # The host refused the spawn (no restart-safe scope): nothing about the
+-        # card ran, so it must not spend the card's retry budget (#114720).
+-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
++        # Admission failed before any worker ran; preserve its retry budget.
++        infrastructure = isinstance(exc, (RestartSafeScopeUnavailable, ReviewModelUnavailable))
+         if infrastructure:
+             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+         if _record_task_failure(
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index fe45a9cc718..17b12f7974f 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -5,7 +5,7 @@ When ``kanban.default_model`` is set, the dispatcher runs a card that has no pin
+ task only (``model_override``/``provider_override`` on the claimed ``Task``), so the card row never changes
+ and a later run re-decides. Cards keep the profile's model when:
+ 
+-* the card pins ``model`` itself (``kanban_create(model=...)`` / ``hermes kanban create --model``);
++* the card pins ``model`` itself, except review runs choose an independent reviewer;
+ * it runs in the review lane (``sdlc-review`` loaded — claimed from the review column);
+ * an earlier run on the card failed (``crashed``/``timed_out``/``gave_up``/``failed``) or a reviewer asked for
+   changes: the second attempt after a failed fix gets the stronger model;
+@@ -15,10 +15,10 @@ and a later run re-decides. Cards keep the profile's model when:
+ ``kanban.strong_model`` (+ optional ``kanban.strong_provider``, else inferred from the model) names the model
+ those review/retry/keep-pattern cards run on instead of the profile's model; unset keeps the old behaviour.
+ 
+-Unset ``kanban.default_model`` (the default) = upstream behaviour: every card runs on its profile's model.
+-With a class default, review/retry/keep-pattern work explicitly requests ``class:deep`` rather than
+-inheriting a potentially weaker profile default. Explicit card pins and out-of-scope profiles are unchanged.
+-Each decision is recorded as a ``model_tier`` task event on the run so tier effects can be measured later.
++Unset ``kanban.default_model`` retains profile routing except for explicit review pins/overrides.
++Review handoff metadata ``review_model`` (optional ``review_provider``) wins; otherwise concrete author pins
++choose a distinct strong/deep model. Ready/retry pins and unpinned out-of-scope profiles are unchanged.
++Each decision is recorded as a ``model_tier`` event, with ``implementer_model`` on review decisions.
+ """
+ 
+ from __future__ import annotations
+@@ -86,6 +86,11 @@ def resolve_model_tier(
+     would have run on anyway (its own pin or the profile's model); ``reason`` names the rule that decided."""
+     cfg = load_tier_config() if cfg is None else cfg
+     default_model = _str(cfg.get("default_model"))
++    if lane == "review" or REVIEW_SKILL in (getattr(task, "skills", None) or []):
++        from hermes_cli.kanban_review_model import resolve_review_model
++        review = resolve_review_model(conn, task, cfg)
++        if review is not None:
++            return review
+     if _str(getattr(task, "model_override", None)):
+         return None, None, "pinned"
+     if not default_model:
+@@ -209,6 +214,12 @@ def owner_model_pin(conn: sqlite3.Connection, task: Any) -> tuple[Optional[str],
+             payload = json.loads(row[0]) if row else {}
+         except (TypeError, ValueError):
+             payload = {}
++        from hermes_cli import kanban_db as _kb
++        review = REVIEW_SKILL in (getattr(task, "skills", None) or []) or (
++            _kb._retry_status_for_run(conn, task.id, run_id) == "review")
++        if review and model and (not isinstance(payload, dict) or not _str(payload.get("model"))):
++            from hermes_cli.kanban_review_model import ReviewModelUnavailable
++            raise ReviewModelUnavailable("Review owner requires a current-run model_tier receipt")
+         if isinstance(payload, dict) and _str(payload.get("model")):
+             model, provider = _str(payload["model"]), _str(payload.get("provider")) or None
+     if not model:
+@@ -281,7 +292,7 @@ def record_run_route(conn: sqlite3.Connection, task: Any, *, lane: str, reason:
+ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
+     """Pin the tier's model on the in-memory ``task`` (never the DB row) and record a ``model_tier`` event,
+     plus the run's resolved ``run_route`` receipt (every spawn, tier off included).
+-    Returns the reason. Never raises: a failure leaves the task on its profile's model."""
++    Returns the reason. Review resolution/receipt failures refuse admission rather than reusing an author pin."""
+     reason = _apply_model_tier(conn, task, lane=lane, cfg=cfg)
+     record_run_route(conn, task, lane=lane, reason=reason)
+     return reason
+@@ -324,9 +335,14 @@ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+ 
+ 
+ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
++    implementer_model = _str(getattr(task, "model_override", None)) or None
++    is_review = lane == "review" or REVIEW_SKILL in (getattr(task, "skills", None) or [])
+     try:
+         model, provider, reason = resolve_dispatch_tier(conn, task, lane=lane, cfg=cfg)
+     except Exception as exc:
++        if is_review:
++            from hermes_cli.kanban_review_model import ReviewModelUnavailable
++            raise ReviewModelUnavailable(f"Review model resolution failed: {exc}") from exc
+         logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc,
+                        exc_info=True)
+         return "error"
+@@ -345,6 +361,9 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+         from agent.model_routing import is_class_selector
+         why = class_unroutable_reason(model) if is_class_selector(model) else None
+         if why:
++            if is_review and (implementer_model or reason == "review_override"):
++                from hermes_cli.kanban_review_model import ReviewModelUnavailable
++                raise ReviewModelUnavailable(f"Review model {model} is unroutable: {why}")
+             # A tier-chosen class this host cannot route would crash the worker at startup ("No eligible
+             # standard routes under billing/capability policy", 2026-10-27: shared config switched
+             # kanban.default_model to class:standard before the host's route registry landed). Keep the
+@@ -364,6 +383,8 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+             payload = {"reason": reason, "model": model or _str(getattr(task, "model_override", None)) or None,
+                        "provider": provider or _str(getattr(task, "provider_override", None)) or None,
+                        "lane": lane}
++            if is_review:
++                payload["implementer_model"] = implementer_model
+             with _kb.write_txn(conn):
+                 _kb._append_event(conn, task.id, "model_tier", payload, run_id=getattr(task, "current_run_id", None))
+                 if repinned:
+@@ -371,6 +392,9 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+                     from hermes_cli.kanban_pin_reroute import record
+                     record(conn, task, (_str(origin[0]), _str(origin[1]).lower()), (_str(model), _str(provider)))
+         except Exception as exc:
++            if is_review:
++                from hermes_cli.kanban_review_model import ReviewModelUnavailable
++                raise ReviewModelUnavailable("Cannot persist review model receipt") from exc
+             if repinned:
+                 # Never an unrecorded reroute: the run goes back to its pin (and its wall).
+                 logger.warning("kanban model tier: pin reroute record failed for %s; keeping the pin (%s)",
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 2c28f66a985..02a8f8ce3f5 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -199,7 +199,7 @@ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+     except Exception:
+         logger.warning('kanban quota: route resolve failed for %s; holding', task.id, exc_info=True)
+         return held, None
+-    if lane == 'review' or unknown:
++    if lane == 'review' or base[2] in ('review_unpinned', 'review_override') or unknown:
+         # An unrecorded wall may be any provider: no route can be proven to avoid it.
+         return held, None
+     try:
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+new file mode 100644
+index 00000000000..614426d8a05
+--- /dev/null
++++ b/hermes_cli/kanban_review_model.py
+@@ -0,0 +1,69 @@
++"""Review-only model selection; implementation pins are not reviewer pins. [daveey]"""
++from __future__ import annotations
++
++import json
++
++from agent.model_routing import ModelRoutingError, eligible_routes, is_class_selector, validate_policy
++
++
++class ReviewModelUnavailable(ModelRoutingError):
++    """No independent reviewer is configured; do not spawn the implementer's model."""
++
++
++def _override(conn, task):
++    # Metadata belongs to the handoff run, not to the Task row. Read only the
++    # latest handoff so a subsequent review can deliberately remove an override.
++    row = conn.execute(
++        "SELECT metadata FROM task_runs WHERE task_id=? AND outcome='review_requested' "
++        "ORDER BY id DESC LIMIT 1", (task.id,),
++    ).fetchone()
++    metadata = json.loads(row[0]) if row and row[0] else {}
++    if not isinstance(metadata, dict):
++        raise ReviewModelUnavailable("Review handoff metadata must be a mapping")
++    model = metadata.get("review_model")
++    if model is None:
++        return None
++    if not isinstance(model, str) or not model.strip():
++        raise ReviewModelUnavailable("review_model must be a nonempty model identifier")
++    from hermes_cli.kanban_model_tier import infer_provider
++    provider = metadata.get("review_provider")
++    if provider is not None and (not isinstance(provider, str) or not provider.strip()):
++        raise ReviewModelUnavailable("review_provider must be a nonempty provider identifier")
++    model = model.strip()
++    provider = (provider or ("auto" if is_class_selector(model) else infer_provider(model)))
++    if is_class_selector(model) and provider != "auto":
++        raise ReviewModelUnavailable("A review class requires provider auto")
++    return model, provider, "review_override"
++
++
++def _distinct_deep(pin, assignee):
++    from agent.model_routing_agent import class_requirements
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from hermes_cli.config import is_provider_enabled
++    config = _assignee_config(assignee) or {}
++    policy = config.get("model_routing") or {}
++    validate_policy(policy)
++    providers = config.get("providers") or {}
++    routes = eligible_routes(policy, "deep", class_requirements(config), eligible=lambda route: is_provider_enabled(
++        providers.get(route["provider"], {}))) if policy.get("enabled", False) else []
++    for route in routes:
++        if route["model"] != pin:
++            return route["model"], route["provider"], "review_unpinned"
++    raise ReviewModelUnavailable(f"No eligible deep review model distinct from {pin!r}")
++
++
++def resolve_review_model(conn, task, cfg):
++    """Return a review override/distinct route, or None for legacy unpinned reviews."""
++    override = _override(conn, task)
++    if override is not None:
++        return override
++    pin = str(getattr(task, "model_override", None) or "").strip()
++    if not pin:
++        return None
++    if is_class_selector(pin):
++        raise ReviewModelUnavailable("A class pin does not identify the implementer; set review_model in the handoff")
++    strong = str(cfg.get("strong_model") or "").strip()
++    if strong and strong != pin and not is_class_selector(strong):
++        from hermes_cli.kanban_model_tier import infer_provider
++        return strong, str(cfg.get("strong_provider") or "").strip() or infer_provider(strong), "review_unpinned"
++    return _distinct_deep(pin, getattr(task, "assignee", None))
+diff --git a/tests/hermes_cli/test_kanban_class_routing.py b/tests/hermes_cli/test_kanban_class_routing.py
+index 29b80fb87ba..0dbbe439f9a 100644
+--- a/tests/hermes_cli/test_kanban_class_routing.py
++++ b/tests/hermes_cli/test_kanban_class_routing.py
+@@ -90,11 +90,17 @@ def test_dispatch_tick_reads_class_default_and_keeps_review_deep(board, routable
+         assert pins[tid] == (model, "auto")
+ 
+ 
+-def test_explicit_pin_survives_review_class_default(board, monkeypatch):
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_explicit_lane_pin_survives_class_default(board, monkeypatch, lane):
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title="review", assignee="default",
+                             model_override="unknown-exact-model", provider_override="custom"))
+-        tier.apply_model_tier(conn, task, lane="review", cfg={"default_model": "class:standard"})
++        if lane == "review":
++            kb.claim_task(conn, task.id)
++            kb.request_review(conn, task.id, metadata={"review_model": "unknown-exact-model",
++                                                       "review_provider": "custom"})
++            task = kb.claim_review_task(conn, task.id)
++        tier.apply_model_tier(conn, task, lane=lane, cfg={"default_model": "class:standard"})
+         assert owner_pin(task, conn) == ("unknown-exact-model", "custom")
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_model.py b/tests/hermes_cli/test_kanban_review_model.py
+new file mode 100644
+index 00000000000..e3a0c0e408d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_model.py
+@@ -0,0 +1,258 @@
++"""Pinned implementation models must not silently choose their own reviewer."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_model_tier as tier
++from tests.hermes_cli import test_kanban_strong_tier as helpers
++
++board = helpers.board
++SONNET, OPUS, FABLE = helpers.SONNET, helpers.OPUS, "claude-fable-5-2"
++
++
++def config(board, *, strong=OPUS, routes=None):
++    route_models = [OPUS, FABLE] if routes is None else routes
++    cfg = {"kanban": {"default_model": SONNET, "strong_model": strong},
++           "model_routing": {"enabled": True, "routes": {"deep": [
++               {"model": model, "provider": "anthropic", "weight": 1,
++                "billing": "subscription", "eligible": True, "funding_verified": True,
++                "capabilities": {"tools": True, "streaming": True}} for model in route_models]}}}
++    board.joinpath("config.yaml").write_text(json.dumps(cfg), encoding="utf-8")
++    return cfg["kanban"]
++
++
++def task(conn, model=SONNET):
++    return kb.get_task(conn, kb.create_task(conn, title="review fixture", assignee="default",
++                                          model_override=model, provider_override="anthropic"))
++
++
++@pytest.mark.parametrize("lane,skills", [("review", []), ("ready", ["sdlc-review"])])
++def test_pinned_review_uses_strong(board, lane, skills):
++    cfg = config(board)
++    with kbc.connect() as conn:
++        t = task(conn)
++        t.skills = skills
++        assert tier.resolve_model_tier(conn, t, lane=lane, cfg=cfg) == (OPUS, "anthropic", "review_unpinned")
++
++
++def test_strong_pin_uses_distinct_deep_route(board):
++    cfg = config(board)
++    with kbc.connect() as conn:
++        assert tier.resolve_model_tier(conn, task(conn, OPUS), lane="review", cfg=cfg) == (
++            FABLE, "anthropic", "review_unpinned")
++
++
++@pytest.mark.parametrize("failed", [False, True])
++def test_ready_and_retry_preserve_pin(board, failed):
++    cfg = config(board)
++    with kbc.connect() as conn:
++        t = task(conn)
++        if failed:
++            helpers._fail_once(conn, t.id)
++            t = kb.get_task(conn, t.id)
++        assert tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg) == (None, None, "pinned")
++
++
++def test_review_handoff_override_wins(board):
++    cfg = config(board)
++    with kbc.connect() as conn:
++        t = task(conn)
++        kb.claim_task(conn, t.id)
++        assert kb.request_review(conn, t.id, metadata={"review_model": FABLE})
++        t = kb.get_task(conn, t.id)
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg=cfg) == (
++            FABLE, "anthropic", "review_override")
++
++
++def test_dispatch_receipt_and_owner_use_review_model_without_changing_row(board):
++    config(board)
++    seen = {}
++    with kbc.connect() as conn:
++        t = task(conn)
++        kb.claim_task(conn, t.id)
++        kb.request_review(conn, t.id, summary="fixture ready")
++        dispatch.dispatch_once(conn, dry_run=False,
++                               spawn_fn=lambda item, ws: seen.update(model=item.model_override))
++        stored = kb.get_task(conn, t.id)
++        events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == "model_tier"]
++        assert seen["model"] == OPUS
++        assert stored.model_override == SONNET
++        assert tier.owner_model_pin(conn, stored) == (OPUS, "anthropic")
++        assert events[-1] == {"model": OPUS, "provider": "anthropic", "reason": "review_unpinned",
++                              "lane": "review", "implementer_model": SONNET}
++
++
++@pytest.mark.parametrize("failure", ["no_route", "receipt_write", "bad_metadata", "class_pin"])
++def test_review_admission_failure_never_spawns_or_spends_retry(board, monkeypatch, failure):
++    import sqlite3
++    config(board, strong=OPUS, routes=[OPUS])
++    seen = []
++    with kbc.connect() as conn:
++        t = task(conn, OPUS)
++        kb.claim_task(conn, t.id)
++        kb.request_review(conn, t.id, metadata={"review_model": []} if failure == "bad_metadata" else None)
++        if failure == "receipt_write":
++            config(board, strong=FABLE)
++            original = kb._append_event
++
++            def append(conn, task_id, kind, *args, **kwargs):
++                if kind == "model_tier":
++                    raise sqlite3.OperationalError("fixture write failure")
++                return original(conn, task_id, kind, *args, **kwargs)
++
++            monkeypatch.setattr(kb, "_append_event", append)
++        if failure == "class_pin":
++            conn.execute("UPDATE tasks SET model_override='class:deep', provider_override='auto' WHERE id=?", (t.id,))
++            conn.commit()
++        dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: seen.append(args))
++        stored = kb.get_task(conn, t.id)
++        assert seen == []
++        assert stored.status == "review"
++        assert stored.consecutive_failures == 0
++        assert stored.claim_lock is None
++        events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == "spawn_failed"]
++        assert events[-1]["infrastructure"] is True
++
++
++@pytest.mark.parametrize("receipt", [None, "{", "[]", '{"model": ""}', "wrong_run"])
++def test_owner_rejects_missing_or_invalid_current_review_receipt(board, receipt):
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable
++    config(board)
++    with kbc.connect() as conn:
++        t = task(conn)
++        kb.claim_task(conn, t.id)
++        kb.request_review(conn, t.id)
++        dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: None)
++        t = kb.get_task(conn, t.id)
++        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='model_tier'", (t.id,))
++        if receipt is not None:
++            kb._append_event(conn, t.id, "model_tier", {"model": OPUS},
++                             run_id=t.current_run_id if receipt != "wrong_run" else None)
++            if receipt != "wrong_run":
++                conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='model_tier'", (receipt, t.id))
++            conn.commit()
++        with pytest.raises(ReviewModelUnavailable):
++            tier.owner_model_pin(conn, t)
++
++
++@pytest.mark.parametrize("key,value", [
++    ("eligible", False), ("funding_verified", False), ("billing", "metered"),
++    ("provider", "openai-codex"), ("tools", False), ("streaming", False), ("context_tokens", 100),
++])
++def test_deep_route_uses_worker_eligibility(board, monkeypatch, key, value):
++    from hermes_cli import kanban_model_assignment as assignment
++    cfg = config(board, routes=[OPUS, "claude-ineligible", FABLE])
++    data = json.loads(board.joinpath("config.yaml").read_text(encoding="utf-8"))
++    bad = data["model_routing"]["routes"]["deep"][1]
++    data["model"] = {"context_length": 10000}
++    data["providers"] = {"openai-codex": {"enabled": False}}
++    for route in data["model_routing"]["routes"]["deep"]:
++        route["capabilities"]["context_tokens"] = 20000
++    target = bad["capabilities"] if key in ("tools", "streaming", "context_tokens") else bad
++    target[key] = value
++    seen = []
++    with kbc.connect() as conn:
++        t = task(conn, OPUS)
++        monkeypatch.setattr(assignment, "_assignee_config", lambda assignee: seen.append(assignee) or data)
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg=cfg) == (
++            FABLE, "anthropic", "review_unpinned")
++    assert seen == ["default"]
++
++
++@pytest.mark.parametrize("cfg", [{}, {"default_model_profiles": ["other"]}])
++def test_pinned_review_not_gated_by_default_tier(board, cfg):
++    config(board)
++    with kbc.connect() as conn:
++        assert tier.resolve_model_tier(conn, task(conn), lane="review", cfg=cfg) == (
++            OPUS, "anthropic", "review_unpinned")
++
++
++@pytest.mark.parametrize("metadata,expected", [
++    ({"review_model": SONNET}, (SONNET, "anthropic", "review_override")),
++    ({"review_model": "custom", "review_provider": "custom-provider"},
++     ("custom", "custom-provider", "review_override")),
++    ({"review_model": "class:deep"}, ("class:deep", "auto", "review_override")),
++])
++def test_explicit_review_override_wins_even_over_independence(board, metadata, expected):
++    cfg = config(board)
++    with kbc.connect() as conn:
++        t = task(conn)
++        kb.claim_task(conn, t.id)
++        kb.request_review(conn, t.id, metadata=metadata)
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg=cfg) == expected
++        assert tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg) == (None, None, "pinned")
++
++
++@pytest.mark.parametrize("metadata", [
++    {"review_model": ""}, {"review_model": 7}, {"review_model": OPUS, "review_provider": []},
++    {"review_model": "class:deep", "review_provider": "anthropic"},
++])
++def test_bad_override_fails_closed(board, metadata):
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable
++    cfg = config(board)
++    with kbc.connect() as conn:
++        t = task(conn)
++        kb.claim_task(conn, t.id)
++        kb.request_review(conn, t.id, metadata=metadata)
++        with pytest.raises(ReviewModelUnavailable):
++            tier.apply_model_tier(conn, t, lane="review", cfg=cfg)
++
++
++def test_disabled_routing_cannot_choose_deep_model(board):
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable
++    cfg = config(board)
++    data = json.loads(board.joinpath("config.yaml").read_text(encoding="utf-8"))
++    data["model_routing"]["enabled"] = False
++    board.joinpath("config.yaml").write_text(json.dumps(data), encoding="utf-8")
++    with kbc.connect() as conn:
++        with pytest.raises(ReviewModelUnavailable):
++            tier.resolve_model_tier(conn, task(conn, OPUS), lane="review", cfg=cfg)
++
++
++def test_unroutable_override_does_not_restore_pin(board, monkeypatch):
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable
++    cfg = config(board)
++    monkeypatch.setattr(tier, "class_unroutable_reason", lambda model: "routing_disabled")
++    with kbc.connect() as conn:
++        t = task(conn)
++        kb.claim_task(conn, t.id)
++        kb.request_review(conn, t.id, metadata={"review_model": "class:deep"})
++        with pytest.raises(ReviewModelUnavailable):
++            tier.apply_model_tier(conn, t, lane="review", cfg=cfg)
++
++
++def test_latest_handoff_can_remove_old_override(board):
++    cfg = config(board)
++    with kbc.connect() as conn:
++        t = task(conn)
++        kb.claim_task(conn, t.id)
++        kb.request_review(conn, t.id, metadata={"review_model": FABLE})
++        dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: None)
++        assert kb.request_changes(conn, t.id, reason="fixture rework")
++        kb.claim_task(conn, t.id)
++        assert kb.request_review(conn, t.id, metadata={})
++        assert tier.resolve_model_tier(conn, kb.get_task(conn, t.id), lane="review", cfg=cfg) == (
++            OPUS, "anthropic", "review_unpinned")
++
++
++@pytest.mark.parametrize("override", [False, True])
++def test_skill_review_quota_hold_never_reroutes_back_to_author(board, monkeypatch, override):
++    from hermes_cli import kanban_quota_episode as quota
++    cfg = config(board)
++    wall = {"until": 200, "hinted": True}
++    monkeypatch.setattr(quota, "episode", lambda *a: wall)
++    monkeypatch.setattr(quota, "_outstanding", lambda *a: [wall])
++    monkeypatch.setattr(quota, "_providers", lambda *a: ["anthropic"])
++    monkeypatch.setattr(quota, "alternate_route", lambda *a: (SONNET, "anthropic"))
++    with kbc.connect() as conn:
++        t = task(conn)
++        if override:
++            kb.claim_task(conn, t.id)
++            kb.request_review(conn, t.id, metadata={"review_model": FABLE})
++        t.skills = ["sdlc-review"]
++        base = tier.resolve_model_tier(conn, t, lane="ready", cfg=cfg)
++        assert quota.decision(conn, t, lane="ready", cfg=cfg, base=base, now=100) == (
++            "subscription_quota_reset", None)
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index fddbfac3070..82a853015ad 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -256,7 +256,7 @@ def test_historical_route_not_replaced_by_current_pin(kanban_home, scoped_routin
+         _route_run(conn, tid, "openai-codex")
+         with kb.write_txn(conn):
+             kb._end_run(conn, tid, outcome="review_requested")
+-            conn.execute("UPDATE tasks SET status='review', model_override='claude-opus-4', "
++            conn.execute("UPDATE tasks SET status='review', model_override='claude-sonnet-4', "
+                          "provider_override='anthropic' WHERE id=?", (tid,))
+         st = ksb.blocker_states(conn)[BID]
+         assert st.is_open and not st.probe_starts
+diff --git a/tests/hermes_cli/test_kanban_strong_tier.py b/tests/hermes_cli/test_kanban_strong_tier.py
+index a575196372a..af5a3de5927 100644
+--- a/tests/hermes_cli/test_kanban_strong_tier.py
++++ b/tests/hermes_cli/test_kanban_strong_tier.py
+@@ -87,7 +87,8 @@ def test_pins_and_out_of_scope_profiles_ignore_strong_model(board):
+         pinned = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default", model_override=SONNET,
+                                                       provider_override="anthropic"))
+         other = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="bb-dev"))
+-        assert tier.resolve_model_tier(conn, pinned, lane="review", cfg=cfg) == (None, None, "pinned")
++        assert tier.resolve_model_tier(conn, pinned, lane="ready", cfg=cfg) == (None, None, "pinned")
++        assert tier.resolve_model_tier(conn, pinned, lane="review", cfg=cfg) == (OPUS, "anthropic", "review_unpinned")
+         assert tier.resolve_model_tier(conn, other, lane="review", cfg=cfg) == (None, None, "profile_out_of_scope")
+ 
+ 
+-- 
+2.55.0
+

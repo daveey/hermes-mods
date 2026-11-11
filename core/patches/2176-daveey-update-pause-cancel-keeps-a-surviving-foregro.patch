@@ -1,0 +1,143 @@
+From 3baa45b8e39d3ed87b115f68e8ab3de615d08bb8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:28:42 +0000
+Subject: [PATCH] [daveey] update-pause cancel keeps a surviving foreground
+ job's result
+
+With terminal.update_survivable_processes on, card A's mid-tool update cancel no longer kills a long
+foreground command: it becomes a background job whose result ends in 'process continues as <id>'.
+update_pause_cancel.committed() replaced that result with the '[interrupted by Hermes update ...:
+re-run if still needed]' stamp, hiding the running job from the resumed turn (a re-run duplicates it).
+committed() now keeps a terminal 'continues_in_background' result (still reported as cancelled, so
+the boundary pause runs unchanged); any other result is stamped as before.
+RED (fix reverted): 2 failed (unit + real-systemd integration). GREEN: 61 passed.
+---
+ agent/update_pause_cancel.py                  | 18 +++++++++-
+ .../tools/test_update_survivable_processes.py | 33 +++++++++++++++++++
+ .../tui_gateway/test_update_pause_mid_tool.py | 27 +++++++++++++++
+ 3 files changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/agent/update_pause_cancel.py b/agent/update_pause_cancel.py
+index f14eff3645..aba0137f3d 100644
+--- a/agent/update_pause_cancel.py
++++ b/agent/update_pause_cancel.py
+@@ -14,6 +14,7 @@ pause does (marker kept with ``reason: core_update_pause``, reservation released
+ 
+ from __future__ import annotations
+ 
++import json
+ import time
+ from typing import Any
+ 
+@@ -73,10 +74,25 @@ def committed(agent: Any, call_id: str, result: Any) -> tuple[Any, bool]:
+     finished(agent, call_id)
+     record = _slots(agent).get(_CANCEL)
+     if record and call_id in record["calls"] and interrupt_issuer(agent) == _ISSUER:
+-        return record["text"], True
++        # A survivable foreground command (terminal.update_survivable_processes) was not killed: it became a
++        # background job, and its result names it (``process continues as <id>``). Stamping "re-run if still
++        # needed" over it would hide a still-running job from the resumed turn and invite a duplicate run.
++        return (result, True) if _continues_in_background(result) else (record["text"], True)
+     return result, False
+ 
+ 
++def _continues_in_background(result: Any) -> bool:
++    """``result`` is the terminal tool's JSON for a foreground command handed to the background."""
++    if not isinstance(result, str) or '"continues_in_background"' not in result:
++        return False
++    try:
++        parsed = json.loads(result)
++    except ValueError:
++        return False
++    return isinstance(parsed, dict) and parsed.get("status") == "continues_in_background" \
++        and bool(parsed.get("session_id"))
++
++
+ def take_pending(agent: Any) -> bool:
+     """Consume the cancel record; True when the pending interrupt is still this cancel's (no Stop since)."""
+     record = _slots(agent).pop(_CANCEL, None)
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+index 0d3cb51c28..4159a5b68e 100644
+--- a/tests/tools/test_update_survivable_processes.py
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -423,6 +423,39 @@ def test_long_foreground_command_outlives_a_shutdown_interrupt(tmp_path, monkeyp
+         _cleanup(pid)
+ 
+ 
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++def test_update_pause_cancel_keeps_the_surviving_jobs_result(tmp_path, monkeypatch):
++    """Card A's mid-tool update cancel commits the cancelled call's result: for a survivable foreground
++    command it is the real ``process continues as <id>`` result, not the "re-run if still needed" stamp."""
++    from agent import update_pause_cancel
++
++    result = _run_owner(tmp_path, monkeypatch, {"command": "sleep 8; echo fg-done", "timeout": 120},
++                        key_on=True, reason=update_pause_cancel.CANCEL_TOOL_REASON)
++    pid = result.get("pid") or 0
++    try:
++        sid = result["session_id"]
++        assert result["status"] == "continues_in_background"
++        assert _alive(pid), "the update-paused foreground command did not survive its owner's stop"
++
++        class _Agent:
++            _interrupt_requested = False
++
++            def interrupt(self, message=None, *, tool_reason=None, **_kw):
++                self._interrupt_requested, self._tool_interrupt_reason = True, tool_reason
++
++        agent = _Agent()
++        update_pause_cancel.started(agent, "c1")
++        assert update_pause_cancel.cancel(agent, "[interrupted by Hermes update: re-run if still needed]") == ["c1"]
++        tool_text = json.dumps(result, ensure_ascii=False)
++        committed, cancelled = update_pause_cancel.committed(agent, "c1", tool_text)
++        assert cancelled is True
++        assert json.loads(committed)["output"].splitlines()[-1] == f"process continues as {sid}"
++    finally:
++        _cleanup(pid)
++
++
+ @pytest.mark.live_system_guard_bypass
+ @pytest.mark.platforms("linux")
+ @pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
+diff --git a/tests/tui_gateway/test_update_pause_mid_tool.py b/tests/tui_gateway/test_update_pause_mid_tool.py
+index f1fd026577..002c22864f 100644
+--- a/tests/tui_gateway/test_update_pause_mid_tool.py
++++ b/tests/tui_gateway/test_update_pause_mid_tool.py
+@@ -443,6 +443,33 @@ def test_the_cancel_is_not_a_user_intervention(tmp_path):
+     assert update_pause_cancel.committed(agent, "c1", "partial") == ("stamp", True)
+ 
+ 
++def test_a_foreground_command_handed_to_the_background_keeps_its_result(tmp_path):
++    """terminal.update_survivable_processes: the cancel did not kill the command, it became a job. Its result
++    (``process continues as <id>``) is kept, so the resumed turn sees the job instead of "re-run"."""
++    import json
++
++    agent = _make_agent(tmp_path, "long_job")
++    update_pause_cancel.started(agent, "c1")
++    assert update_pause_cancel.cancel(agent, "stamp") == ["c1"]
++    survived = json.dumps({"output": "[interrupted by hermes update pause]\nprocess continues as proc_1",
++                           "exit_code": None, "status": "continues_in_background", "session_id": "proc_1"})
++    assert update_pause_cancel.committed(agent, "c1", survived) == (survived, True)
++
++
++@pytest.mark.parametrize("result", [
++    None, {"status": "continues_in_background", "session_id": "proc_1"},  # not the tool's JSON text
++    'output mentions "continues_in_background" but is not JSON',
++    '{"status": "completed", "note": "continues_in_background"}',
++    '["continues_in_background"]',
++    '{"status": "continues_in_background", "session_id": ""}',
++])
++def test_any_other_result_of_a_cancelled_call_is_stamped(tmp_path, result):
++    agent = _make_agent(tmp_path, "long_job")
++    update_pause_cancel.started(agent, "c1")
++    assert update_pause_cancel.cancel(agent, "stamp") == ["c1"]
++    assert update_pause_cancel.committed(agent, "c1", result) == ("stamp", True)
++
++
+ def test_a_later_request_in_the_same_turn_cancels_again(home, monkeypatch):
+     monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 30.0)
+     record_turn_start(home, "session-key", "p")
+-- 
+2.55.0
+

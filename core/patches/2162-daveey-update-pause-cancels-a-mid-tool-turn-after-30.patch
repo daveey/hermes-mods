@@ -1,0 +1,1027 @@
+From f021646c08fa4998b85f34fdf0bda23cabb09fc9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:42:40 +0000
+Subject: [PATCH] [daveey] update pause cancels a mid-tool turn after 30 s and
+ keeps it resumable
+
+A Desktop/TUI turn inside a long tool call (a foreground `sleep 600`) never reached a step
+boundary, so the core-update pause could not land and the turn held the update for the whole
+window (t_01a1c7cf6f171e47, part A of t_01a1c7c587142bb7).
+
+Now a per-turn watcher (update_pause.start_mid_tool_cancel, started next to the boundary hook in
+prompt_turn._invoke_agent) polls the pause request. MID_TOOL_GRACE_S = 30 s after the later of
+the request's first sighting and the newest running call's start, a still-running call of an auto-continuable
+turn (not_resumable_reason is None) is cancelled through agent.interrupt, the user-Stop path
+(terminal foreground kill, process-group interrupt, abandoned sequential worker). The executor
+persists `[interrupted by Hermes update at <UTC>Z: re-run if still needed]` as each cancelled
+call's result; finished calls of a parallel step keep their real results. The next step boundary
+(turn_iteration_prep.begin_iteration) consumes the cancel and runs the normal boundary pause, so
+the turn ends exactly as a between-step pause (marker kept with reason core_update_pause, pause
+counted, reservation released, announce_pause) and startup_resume continues it with pause_note.
+The cancel never relabels a pending interrupt (a user Stop or redirect wins; interrupt_control
+_REASON_UPDATE_PAUSE carve-out) and is not a user intervention; a Stop that wins keeps the call's
+own result. A committed call leaves the in-flight set even when its worker was abandoned on a
+timeout, so a later request cannot cut a model call. The stamp carries no subdirectory hint. A
+request withdrawn before the boundary clears the cancel's own interrupt (clear_interrupt
+only_reason, under the publish lock, so a Stop that landed during the hook still ends the turn)
+and the turn continues; a
+later request in the same turn may cancel again. Non-resumable turns are never cancelled.
+
+Capability flag for hermes-sync's text grep: MID_TOOL_CANCEL = True.
+
+The watcher uses _thread.start_new_thread, not threading.Thread: harnesses that run turn threads
+inline patch threading.Thread, and an inline watcher hung three gateway suites for 300 s.
+
+Proof:
+- tests/tui_gateway/test_update_pause_mid_tool.py (28 tests): real AIAgent turn, real executor
+  (sequential + concurrent), real SessionDB, real hook + watcher, startup_resume sweep in a
+  fresh backend. GREEN 28/28. RED on main: collection ImportError (agent.update_pause_cancel,
+  start_mid_tool_cancel absent); behavioural RED with the executor/boundary hooks reverted:
+  the end-to-end tests fail (call runs to its own end, no stamp, no pause).
+- 28 exact-anchor mutants of every added condition: all killed.
+- Independent review (claude-opus-5-5) of the first head: 2 should-fix (Stop relabel race,
+  stale in-flight after a timeout abandon) and 3 nits, all fixed here with tests;
+  its exact-head re-review found one more (a Stop during the boundary hook was cleared) and a
+  grace nit (oldest call), both fixed with tests.
+- 305 affected test files (every file naming _run_prompt_submit, prompt.submit,
+  _invoke_agent, tool_executor or turn_iteration_prep, incl. update_pause*, startup_resume,
+  turn_marker): 4435 passed, 0 failed.
+- scripts/check --only health: 0 blocking.
+---
+ agent/conversation_loop.py                    |   2 +
+ agent/interrupt_control.py                    |  19 +-
+ agent/tool_executor.py                        |   7 +-
+ agent/turn_iteration_prep.py                  |  12 +-
+ agent/update_pause_cancel.py                  |  94 +++
+ .../tui_gateway/test_update_pause_mid_tool.py | 578 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |   6 +-
+ tui_gateway/update_pause.py                   |  65 ++
+ 8 files changed, 775 insertions(+), 8 deletions(-)
+ create mode 100644 agent/update_pause_cancel.py
+ create mode 100644 tests/tui_gateway/test_update_pause_mid_tool.py
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index cf29c35757..5458744b6e 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -40,6 +40,7 @@ from hermes_cli.observability.shared_metrics_efficiency import record_cache_brea
+ from hermes_cli.plugins_dispatch import held_stream_transforms
+ from agent.turn_retry_state import TurnRetryState
+ from agent.turn_scripted_prelude import Prelude, play_prelude
++from agent.update_pause_cancel import reset as update_pause_cancel_reset
+ # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
+ # skewed phase mid-turn.
+ from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+@@ -1839,6 +1840,7 @@ def run_conversation(
+     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
+     agent._turn_user_intervened = False
+     vars(agent).pop("_step_boundary_paused", None)  # [daveey] per-turn core-update pause verdict
++    update_pause_cancel_reset(agent)  # [daveey] and its mid-tool cancel (agent/update_pause_cancel.py)
+     # Per-provider-response context accounting starts empty every turn (agent/context_usage.py).
+     begin_turn_context_usage(agent)
+     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
+diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+index 1591e1fa65..58a49a4381 100644
+--- a/agent/interrupt_control.py
++++ b/agent/interrupt_control.py
+@@ -24,6 +24,9 @@ _REASON_USER_INTERRUPT = "user interrupt"
+ USER_INTERRUPT_REASONS = frozenset({_REASON_HARD_STOP, _REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT})
+ # ``tool_reason`` the gateway's restart/shutdown stop passes (gateway.run._INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN).
+ _REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
++# [daveey] ``tool_reason`` of the core-update pause's mid-tool cancel (agent/update_pause_cancel.py). It never
++# relabels any interrupt already pending (a Stop or a redirect wins) and is not a user intervention.
++_REASON_UPDATE_PAUSE = "hermes update pause"
+ 
+ 
+ def interrupt_issuer(agent) -> Optional[str]:
+@@ -224,12 +227,15 @@ class InterruptControlMixin:
+             # A shutdown stop never relabels a user Stop already pending (the user's Stop wins): the turn
+             # records the first cause, so it is not announced as interrupted by the restart. A pending
+             # redirect (a mid-request correction) is not a Stop: the restart drops it and is the cause.
+-            if not (tool_reason == _REASON_GATEWAY_SHUTDOWN and getattr(self, "_interrupt_requested", False)
++            _pending = getattr(self, "_interrupt_requested", False)
++            if not (_pending and tool_reason == _REASON_UPDATE_PAUSE) and not (
++                    tool_reason == _REASON_GATEWAY_SHUTDOWN and _pending
+                     and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS):
+                 self._interrupt_message = message
+                 self._tool_interrupt_reason = tool_interrupt_reason
+             self._interrupt_requested = True
+-            self._turn_user_intervened = True
++            if tool_reason != _REASON_UPDATE_PAUSE:
++                self._turn_user_intervened = True
+             # The turn record and the log must agree on WHO asked for the stop (#112647).
+             logger.info("Interrupt requested (%s): %s", "hard" if hard_cancel else "soft", tool_interrupt_reason)
+             _hard_event = getattr(self, "_hard_interrupt_requested", None) if hard_cancel else None
+@@ -306,7 +312,8 @@ class InterruptControlMixin:
+         override interrupt(message=None) without hard_cancel."""
+         InterruptControlMixin.interrupt(self, message, hard_cancel=True, tool_reason=tool_reason)
+ 
+-    def clear_interrupt(self, *, preserve_redirect: bool = False, hard_cancel: bool = False) -> bool:
++    def clear_interrupt(self, *, preserve_redirect: bool = False, hard_cancel: bool = False,
++                        only_reason: str | None = None) -> bool:
+         """Clear the interrupt request and per-thread tool signal. ``preserve_redirect`` is only for the
+         conversation loop rebuilding the same logical turn after cancelling a model request.
+         ``hard_cancel`` also drops an unconsumed pending steer: the aborted turn's next tool iteration
+@@ -314,10 +321,14 @@ class InterruptControlMixin:
+         user. Every other caller (redirect rebuild, error recovery, turn-boundary hygiene) continues
+         this session, so the already-accepted steer must survive: it stays buffered for the existing
+         drains — the pre-API inject, the post-batch append, or the finalizer's leftover handoff —
+-        instead of silently vanishing after the surface was told it was delivered."""
++        instead of silently vanishing after the surface was told it was delivered.
++        [daveey] ``only_reason`` clears only while the pending interrupt still carries that ``tool_reason``,
++        checked under the lock ``interrupt`` publishes under, so a Stop that relabelled it is never wiped."""
+         with _ic_lock(self, "_pending_redirect_lock"):
+             if preserve_redirect and not _ic_slot(self, "_pending_redirect_lock", "_pending_redirect"):
+                 return False
++            if only_reason is not None and getattr(self, "_tool_interrupt_reason", None) != only_reason:
++                return False
+             self._interrupt_requested = False
+             self._interrupt_message = self._tool_interrupt_reason = None
+             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index e5beee3e0f..ca6192491c 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -43,7 +43,7 @@ except ImportError:  # mid-update: an older process cached agent.interrupt_contr
+ from agent.message_sanitization import coalesce_tool_call_id
+ from agent.observation_seam import terminal as _observe_terminal, terminal_commit as _observe_terminal_commit
+ from agent.onboarding import observe_tool_result as observe_onboarding_result
+-from agent import plugin_live_notes
++from agent import plugin_live_notes, update_pause_cancel as _update_cancel
+ from agent.lsp import deferred as lsp_deferred
+ from agent.prompt_cache_scope import conversation_id
+ from agent.inline_tool_executors import (
+@@ -758,6 +758,7 @@ def _dispatch_authorized_once(
+             return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+         finally:
+             state.data_use = frozenset(data_use)
++            _update_cancel.finished(agent, ref.call_id)
+ 
+ 
+ def _run_agent_tool_execution_middleware(
+@@ -1026,6 +1027,7 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
+             print(f"  📞 {prefix}: {function_name}({list(function_args.keys())}) - {_preview(json.dumps(display_args, ensure_ascii=False), agent.log_prefix_chars)}")
+ 
+     agent._current_tool = function_name
++    _update_cancel.started(agent, tool_call_id)  # [daveey] in flight for the mid-tool core-update cancel
+     agent._touch_activity(f"executing tool: {function_name}")
+     _set_worker_activity_callback(agent)
+ 
+@@ -1124,6 +1126,7 @@ def _commit_tool_result(
+             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
+ 
+     agent._current_tool = None
++    function_result, _upd_cancelled = _update_cancel.committed(agent, tool_call_id, function_result)  # [daveey] update
+     _status_suffix = " (error)" if is_error else ""
+     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
+ 
+@@ -1143,7 +1146,7 @@ def _commit_tool_result(
+     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
+     note_tool_result(agent, function_name, tool_call_id, function_result, persisted_result)
+ 
+-    subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
++    subdir_hints = not _upd_cancelled and agent._subdirectory_hints.check_tool_call(function_name, function_args)
+     if subdir_hints:
+         if _is_multimodal_tool_result(persisted_result):
+             # Hint goes on the text summary part so the model still sees it; image blocks untouched.
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index 0ef1ec8f83..1126b0e602 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -16,6 +16,7 @@ from contextlib import suppress
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Tuple
+ 
++from agent import update_pause_cancel
+ from agent.display import KawaiiSpinner
+ from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
+ from agent.turn_context_compaction import _reanchor
+@@ -395,6 +396,15 @@ def begin_iteration(
+     # Reset per-turn checkpoint dedup so each iteration can take one snapshot.
+     agent._checkpoint_mgr.new_turn()
+ 
++    # [daveey] A tool call the core-update pause cancelled mid-run (agent/update_pause_cancel.py): its stamped
++    # result is persisted, so pause here as at any step boundary. Declined (the request ended meanwhile): clear
++    # the cancel's interrupt and carry on; the model sees the stamped result and re-runs the call if needed.
++    # Only the cancel's own: a Stop that landed during the hook relabelled it and must end the turn below.
++    _pause = None
++    if update_pause_cancel.take_pending(agent):
++        _pause = _step_boundary_pause(agent, messages, api_call_count)
++        agent.clear_interrupt(only_reason=update_pause_cancel.CANCEL_TOOL_REASON)
++
+     if agent._interrupt_requested:
+         interrupted = True
+         _issuer = interrupt_issuer(agent)
+@@ -407,7 +417,7 @@ def begin_iteration(
+     # result of the previous step is appended and before the next model call. The Desktop/TUI gateway
+     # installs ``step_boundary_pause`` per turn; a reason ends the turn as an interrupt it auto-continues
+     # on the updated backend. Persist first, so the next backend sees every finished tool result.
+-    _pause = _step_boundary_pause(agent, messages, api_call_count)
++    _pause = _pause or _step_boundary_pause(agent, messages, api_call_count)
+     if _pause:
+         agent._persist_session(messages, conversation_history)
+         agent._step_boundary_paused = _pause
+diff --git a/agent/update_pause_cancel.py b/agent/update_pause_cancel.py
+new file mode 100644
+index 0000000000..f14eff3645
+--- /dev/null
++++ b/agent/update_pause_cancel.py
+@@ -0,0 +1,94 @@
++"""[daveey] Mid-tool core-update cancel (t_01a1c7cf6f171e47): the agent side of ``tui_gateway.update_pause``'s
++``MID_TOOL_CANCEL``.
++
++A turn inside a long tool call never reaches a step boundary, so the core-update pause could not land. The
++gateway's per-turn watcher (``update_pause.start_mid_tool_cancel``) reads which calls are running from here,
++and once the grace has passed calls ``cancel``: every running call is recorded with the stamped result and
++the turn is interrupted through the same path a user Stop takes (``agent.interrupt``: terminal foreground
++kill, process-group interrupt, abandoned sequential worker), with a fixed ``tool_reason``. The executor
++persists that stamped text as each cancelled call's result (``committed``); calls that had already finished
++keep their real results. At the next step boundary ``turn_iteration_prep.begin_iteration`` takes the pending
++cancel (``take_pending``) and runs the normal boundary pause hook, so the turn ends exactly as a boundary
++pause does (marker kept with ``reason: core_update_pause``, reservation released, the pause announced).
++"""
++
++from __future__ import annotations
++
++import time
++from typing import Any
++
++from agent.interrupt_control import _REASON_UPDATE_PAUSE, interrupt_issuer
++
++# A fixed system category (interrupt_issuer slugs it to ``hermes_update_pause``): it never relabels a pending
++# Stop, a later user Stop overrides it, and the turn then ends as that Stop instead of a pause.
++CANCEL_TOOL_REASON = _REASON_UPDATE_PAUSE
++_ISSUER = CANCEL_TOOL_REASON.replace(" ", "_")
++_IN_FLIGHT = "_update_pause_in_flight"
++_CANCEL = "_update_pause_cancel"
++
++
++def _slots(agent: Any) -> dict:
++    try:
++        return vars(agent)
++    except TypeError:
++        return {}
++
++
++def started(agent: Any, call_id: str) -> None:
++    """A tool call began executing (after its pre-tool policy): it is in flight from now."""
++    if call_id:
++        _slots(agent).setdefault(_IN_FLIGHT, {})[call_id] = time.monotonic()
++
++
++def finished(agent: Any, call_id: str) -> None:
++    """The call's execution returned or raised: it keeps its real result from here on."""
++    in_flight = _slots(agent).get(_IN_FLIGHT)
++    if in_flight is not None:
++        in_flight.pop(call_id, None)
++
++
++def in_flight(agent: Any) -> dict:
++    """``{tool_call_id: monotonic start}`` of the calls executing now (a copy)."""
++    return dict(_slots(agent).get(_IN_FLIGHT) or {})
++
++
++def cancel(agent: Any, text: str) -> list[str] | None:
++    """Cancel every running call of this turn with ``text`` as its result; the sorted call ids, or None when
++    nothing runs or an interrupt (a user Stop, a shutdown) is already pending, which then wins."""
++    if getattr(agent, "_interrupt_requested", False):
++        return None
++    running = in_flight(agent)
++    if not running:
++        return None
++    # Recorded before the interrupt: the interrupted tool commits its result only after the interrupt lands.
++    _slots(agent)[_CANCEL] = {"calls": frozenset(running), "text": text}
++    agent.interrupt(tool_reason=CANCEL_TOOL_REASON)
++    return sorted(running)
++
++
++def committed(agent: Any, call_id: str, result: Any) -> tuple[Any, bool]:
++    """The call's result is being committed (it no longer runs for this turn, even when its worker was
++    abandoned on a timeout). ``(stamped text, True)`` for a call this cancel interrupted while the pending
++    interrupt is still the update's, else ``(result, False)``: a Stop that won keeps the call's own result."""
++    finished(agent, call_id)
++    record = _slots(agent).get(_CANCEL)
++    if record and call_id in record["calls"] and interrupt_issuer(agent) == _ISSUER:
++        return record["text"], True
++    return result, False
++
++
++def take_pending(agent: Any) -> bool:
++    """Consume the cancel record; True when the pending interrupt is still this cancel's (no Stop since)."""
++    record = _slots(agent).pop(_CANCEL, None)
++    if record is None:
++        return False
++    for call_id in record["calls"]:  # an abandoned worker never reports finished: it no longer runs for us
++        finished(agent, call_id)
++    return bool(getattr(agent, "_interrupt_requested", False)) and interrupt_issuer(agent) == _ISSUER
++
++
++def reset(agent: Any) -> None:
++    """Turn start: no call of an earlier turn (an abandoned worker) is in flight, and no cancel is pending."""
++    slots = _slots(agent)
++    slots.pop(_IN_FLIGHT, None)
++    slots.pop(_CANCEL, None)
+diff --git a/tests/tui_gateway/test_update_pause_mid_tool.py b/tests/tui_gateway/test_update_pause_mid_tool.py
+new file mode 100644
+index 0000000000..f1fd026577
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_mid_tool.py
+@@ -0,0 +1,578 @@
++"""[daveey] t_01a1c7cf6f171e47: a core-update pause no longer waits out a long tool call.
++
++``MID_TOOL_GRACE_S`` after the later of the pause request's first sighting and the call's start, a still-running
++call of an auto-continuable turn is cancelled through the user-Stop interrupt path. Its result is persisted as
++``[interrupted by Hermes update at <UTC>: re-run if still needed]`` and the turn pauses at the step boundary
++right after it, exactly as a between-step pause: marker kept with ``reason: core_update_pause``, then the next
++backend's startup sweep continues it with ``pause_note``. Finished calls of a parallel step keep their real
++results; turns ``not_resumable_reason`` rejects are never cancelled.
++
++These drive a real ``AIAgent`` turn through the real tool executor (sequential and concurrent), a real
++SessionDB, and the gateway's real hook and watcher; only the model and the tool bodies are fakes.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++import tempfile
++import threading
++import time
++import types
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent import update_pause_cancel
++from hermes_cli import admission_fence as af
++from hermes_state import SessionDB
++from run_agent import AIAgent
++from tools.interrupt import is_interrupted
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++STAMP = re.compile(r"^\[interrupted by Hermes update at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ: re-run if still needed\]$")
++TOOL_CAP_S = 8.0  # a fake call left alone runs this long, then returns its own result
++
++
++@pytest.fixture(autouse=True)
++def _quiet(monkeypatch):
++    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *a, **k: None)
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.3)
++    monkeypatch.setattr(up, "MID_TOOL_POLL_S", 0.05)
++    return tmp_path
++
++
++def _defs(*names):
++    return [{"type": "function", "function": {"name": n, "description": n, "parameters": {
++        "type": "object", "properties": {}}}} for n in names]
++
++
++def _make_agent(tmp_path: Path, *names: str) -> AIAgent:
++    hermes_home = Path(tempfile.mkdtemp(prefix="hermes-test-home-", dir=tmp_path))
++    (hermes_home / "logs").mkdir(parents=True, exist_ok=True)
++    with (
++        patch("model_tools.get_tool_definitions", return_value=_defs(*names)),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++        patch("run_agent._hermes_home", hermes_home),
++        patch("agent.model_metadata.fetch_model_metadata", return_value={}),
++    ):
++        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
++                        skip_context_files=True, skip_memory=True)
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.compression_enabled = False
++    agent.save_trajectories = False
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session(session_id="session-key", source="tui", model="test/model")
++    agent._session_db, agent._session_db_created, agent.session_id = db, True, "session-key"
++    agent._last_flushed_db_idx, agent._flushed_db_message_ids = 0, set()
++    agent._flushed_db_message_session_id, agent._persist_disabled = None, False
++    return agent
++
++
++def _call(name, call_id):
++    return types.SimpleNamespace(id=call_id, type="function",
++                                 function=types.SimpleNamespace(name=name, arguments="{}"))
++
++
++def _response(*calls):
++    message = types.SimpleNamespace(content=None if calls else "done", reasoning_content=None, reasoning=None,
++                                    tool_calls=list(calls) or None)
++    return types.SimpleNamespace(choices=[types.SimpleNamespace(
++        message=message, finish_reason="tool_calls" if calls else "stop")], model="test/model", usage=None)
++
++
++def _long_call(started: threading.Event | None = None) -> str:
++    """Like a foreground terminal command: runs until interrupted (or its own cap)."""
++    if started is not None:
++        started.set()
++    deadline = time.monotonic() + TOOL_CAP_S
++    while time.monotonic() < deadline:
++        if is_interrupted():
++            return json.dumps({"output": "partial", "exit_code": 130, "error": "interrupted"})
++        time.sleep(0.02)
++    return "finished on its own"
++
++
++def _session(agent, home):
++    return {"agent": agent, "session_key": "session-key", "profile_home": str(home),
++            "history_lock": threading.RLock()}
++
++
++def _run_turn(agent, session, responses):
++    """The gateway's per-turn wiring (prompt_turn._invoke_agent): hook + watcher around run_conversation."""
++    agent.client.chat.completions.create.side_effect = responses
++    hook = up.boundary_pause_hook(session, "session-key")
++    calls = session.setdefault("_test_hook_calls", [])
++    agent.step_boundary_pause = lambda: calls.append(1) or hook()
++    stop = up.start_mid_tool_cancel(session, "session-key", agent)
++    try:
++        return agent.run_conversation("run the long job")
++    finally:
++        stop()
++        agent.step_boundary_pause = None
++
++
++def _durable_tools(home):
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        return {m["tool_call_id"]: m["content"] for m in db.get_messages_as_conversation("session-key")
++                if m["role"] == "tool"}
++    finally:
++        db.close()
++
++
++def _request_pause(root):
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 120)
++
++
++def test_capability_flag_is_text_greppable():
++    text = Path(up.__file__).read_text(encoding="utf-8")
++    assert re.search(r"^MID_TOOL_CANCEL = True$", text, re.MULTILINE)
++    assert re.search(r"^MID_TOOL_GRACE_S = 30\.0$", text, re.MULTILINE)
++
++
++def test_stamp_format():
++    assert up.interrupted_tool_result(0) == "[interrupted by Hermes update at 1970-01-01T00:00:00Z: re-run if still needed]"
++
++
++def test_long_tool_call_is_cancelled_after_the_grace_and_the_turn_pauses_resumably(home, tmp_path, monkeypatch):
++    record_turn_start(home, "session-key", "run the long job")
++    agent = _make_agent(tmp_path, "long_job")
++    session = _session(agent, home)
++    _request_pause(home)
++    monkeypatch.setattr("model_tools.handle_function_call", lambda name, *a, **k: _long_call())
++    monkeypatch.setattr(agent._subdirectory_hints, "check_tool_call", lambda *a, **k: "\n[hint: AGENTS.md here]")
++
++    started = time.monotonic()
++    result = _run_turn(agent, session, [_response(_call("long_job", "call_1")), _response(), _response()])
++    took = time.monotonic() - started
++
++    assert took < TOOL_CAP_S / 2  # cancelled after the grace, not run to its own end
++    assert agent.client.chat.completions.create.call_count == 1  # no model call after the cancel
++    assert result["interrupted"] is True and result["paused_for_update"] == up.PAUSE_REASON
++    assert STAMP.match(_durable_tools(home)["call_1"])  # persisted exactly, in the canonical store
++    assert session["_test_hook_calls"] == [1]  # one boundary pause: the marker is written and jobs stopped once
++    marker = read_turn_marker(home, "session-key")
++    assert marker["reason"] == "core_update_pause" and marker["pauses"] == 1 and marker["attempts"] == 0
++    assert session["_update_pause_marker_key"] == "session-key"  # the turn end keeps the marker
++    server._retire_turn_marker(session, "session-key")
++    assert read_turn_marker(home, "session-key") is not None
++    assert not agent._interrupt_requested  # the cancel's interrupt does not leak into the next turn
++
++    # A fresh backend after the update: the startup sweep picks it up and continues with the pause note.
++    from tui_gateway import startup_resume as sr
++    path = home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries["session-key"]["writer_pid"] = 2 ** 22 - 3  # the pre-update backend has exited
++    entries["session-key"].pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++    assert [r["session_key"] for r in sr.pending_resumes(home, CFG)] == ["session-key"]
++    submitted = []
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda sid, s: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda s, rid, timeout=30.0: None)
++    monkeypatch.setattr(server, "_run_prompt_submit", lambda rid, sid, s, text, **kw: submitted.append(text))
++    fresh = {"agent": types.SimpleNamespace(), "session_key": "session-key", "history": [],
++             "history_lock": threading.RLock(), "running": False}
++    assert server._maybe_schedule_auto_continue("sid", fresh, "session-key") is not None
++    assert submitted == [up.pause_note("run the long job")]
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++def test_parallel_step_cancels_only_the_running_calls(home, tmp_path, monkeypatch):
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "session_search", "skills_list")
++    _request_pause(home)
++
++    def _invoke(name, args, task_id, call_id, **_kw):
++        return _long_call() if name == "session_search" else "the real listing"
++
++    monkeypatch.setattr(agent, "_invoke_tool", _invoke)
++    result = _run_turn(agent, _session(agent, home), [
++        _response(_call("session_search", "slow"), _call("skills_list", "fast")), _response()])
++
++    assert result["paused_for_update"] == up.PAUSE_REASON
++    tools = _durable_tools(home)
++    assert STAMP.match(tools["slow"])
++    assert tools["fast"] == "the real listing"
++
++
++def test_a_call_that_ignores_interrupts_is_abandoned_with_the_stamp(home, tmp_path, monkeypatch):
++    """A tool that never polls the interrupt bit is abandoned by the sequential runner (the Stop path)."""
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "long_job")
++    _request_pause(home)
++    release = threading.Event()
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: release.wait(TOOL_CAP_S) and "late")
++    try:
++        result = _run_turn(agent, _session(agent, home), [_response(_call("long_job", "call_1")), _response()])
++    finally:
++        release.set()
++    assert result["paused_for_update"] == up.PAUSE_REASON
++    assert STAMP.match(_durable_tools(home)["call_1"])
++
++
++def test_request_withdrawn_before_the_boundary_lets_the_turn_continue(home, tmp_path, monkeypatch):
++    """The cancel landed but the window ended before the boundary: the boundary hook declines, the cancel's
++    interrupt is cleared and the turn goes on (the model sees the stamped result and may re-run the call)."""
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "long_job")
++    _request_pause(home)
++
++    def _withdrawn_on_cancel(*_a, **_k):
++        out = _long_call()
++        af.clear_pause_request(home)  # the drain window ends while the cancelled call unwinds
++        return out
++
++    monkeypatch.setattr("model_tools.handle_function_call", _withdrawn_on_cancel)
++    result = _run_turn(agent, _session(agent, home), [_response(_call("long_job", "call_1")), _response()])
++    assert STAMP.match(_durable_tools(home)["call_1"])
++    assert agent.client.chat.completions.create.call_count == 2
++    assert result["completed"] is True and not result.get("paused_for_update")
++    assert "reason" not in read_turn_marker(home, "session-key")
++
++
++def test_turn_start_drops_an_earlier_turns_in_flight_calls(home, tmp_path):
++    """An abandoned worker of an earlier turn never reports finished: a new turn must not count it as running
++    (the watcher would cancel the new turn's model call)."""
++    agent = _make_agent(tmp_path, "long_job")
++    vars(agent)["_update_pause_in_flight"] = {"old": 0.0}
++    agent.client.chat.completions.create.side_effect = [_response()]
++    assert agent.run_conversation("hi")["completed"] is True
++    assert update_pause_cancel.in_flight(agent) == {}
++
++
++def test_no_tool_in_flight_still_pauses_at_the_boundary_with_real_results(home, tmp_path, monkeypatch):
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "quick")
++    _request_pause(home)
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: "quick result")
++    result = _run_turn(agent, _session(agent, home), [_response(_call("quick", "call_1")), _response()])
++    assert result["paused_for_update"] == up.PAUSE_REASON
++    assert _durable_tools(home)["call_1"] == "quick result"
++    assert agent.client.chat.completions.create.call_count == 1
++
++
++def test_non_resumable_turn_keeps_its_running_call(home, tmp_path, monkeypatch):
++    cfg = {"desktop": {"auto_continue": dict(CFG["desktop"]["auto_continue"], resume_on_startup=False)}}
++    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.05)
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "long_job")
++    _request_pause(home)
++
++    def _one_second(*_a, **_k):
++        deadline = time.monotonic() + 1.0
++        while time.monotonic() < deadline:
++            if is_interrupted():
++                return "interrupted"
++            time.sleep(0.02)
++        return "ran to the end"
++
++    monkeypatch.setattr("model_tools.handle_function_call", _one_second)
++    result = _run_turn(agent, _session(agent, home), [_response(_call("long_job", "call_1")), _response()])
++    assert _durable_tools(home)["call_1"] == "ran to the end"
++    assert not result.get("paused_for_update") and result["completed"] is True
++    assert "reason" not in read_turn_marker(home, "session-key")
++
++
++# ── The watcher's poll, unit by unit ─────────────────────────────────────────────────────────────────
++
++
++class _Agent:
++    def __init__(self):
++        self._interrupt_requested = False
++        self.interrupts = []
++
++    def interrupt(self, message=None, *, tool_reason=None, **_kw):
++        self.interrupts.append(tool_reason)
++        self._interrupt_requested = True
++
++
++def _step(home, agent, state, monkeypatch, now):
++    monkeypatch.setattr(up, "_mono", lambda: now)
++    return up.mid_tool_cancel_step(_session(agent, home), "session-key", agent, state)
++
++
++def test_grace_counts_from_the_later_of_sighting_and_call_start(home, monkeypatch):
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 30.0)
++    record_turn_start(home, "session-key", "p")
++    agent, state = _Agent(), {}
++    vars(agent)["_update_pause_in_flight"] = {"c1": 100.0}
++    assert _step(home, agent, state, monkeypatch, 150.0) is None  # no request yet
++    _request_pause(home)
++    assert _step(home, agent, state, monkeypatch, 160.0) is None  # first sighting at 160
++    assert _step(home, agent, state, monkeypatch, 189.9) is None
++    assert _step(home, agent, state, monkeypatch, 190.0) == ["c1"]
++    assert agent.interrupts == [update_pause_cancel.CANCEL_TOOL_REASON]
++
++    agent2, state2 = _Agent(), {}
++    vars(agent2)["_update_pause_in_flight"] = {"c2": 200.0}
++    assert _step(home, agent2, state2, monkeypatch, 150.0) is None  # sighted before the call began
++    assert _step(home, agent2, state2, monkeypatch, 229.9) is None
++    assert _step(home, agent2, state2, monkeypatch, 230.0) == ["c2"]
++
++
++def test_withdrawn_request_restarts_the_grace(home, monkeypatch):
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 30.0)
++    record_turn_start(home, "session-key", "p")
++    agent, state = _Agent(), {}
++    vars(agent)["_update_pause_in_flight"] = {"c1": 0.0}
++    _request_pause(home)
++    assert _step(home, agent, state, monkeypatch, 10.0) is None
++    af.clear_pause_request(home)
++    assert _step(home, agent, state, monkeypatch, 20.0) is None
++    _request_pause(home)
++    assert _step(home, agent, state, monkeypatch, 45.0) is None  # sighted again at 45
++    assert _step(home, agent, state, monkeypatch, 75.0) == ["c1"]
++
++
++def test_poll_never_cancels_without_a_running_call_or_over_a_pending_stop(home, monkeypatch):
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.0)
++    record_turn_start(home, "session-key", "p")
++    _request_pause(home)
++    idle = _Agent()
++    assert _step(home, idle, {}, monkeypatch, 1e6) is None and idle.interrupts == []
++    stopped = _Agent()
++    stopped._interrupt_requested = True  # a user Stop is already pending: it wins
++    vars(stopped)["_update_pause_in_flight"] = {"c1": 0.0}
++    assert _step(home, stopped, {}, monkeypatch, 1e6) is None and stopped.interrupts == []
++    assert "_update_pause_cancel" not in vars(stopped)
++
++
++def test_watcher_cancels_once_per_request_and_stops_on_request(home, monkeypatch):
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.0)
++    record_turn_start(home, "session-key", "p")
++    _request_pause(home)
++    agent = _Agent()
++    update_pause_cancel.started(agent, "c1")
++    stop = up.start_mid_tool_cancel(_session(agent, home), "session-key", agent)
++    try:
++        deadline = time.monotonic() + 5
++        while not agent.interrupts and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert agent.interrupts == [update_pause_cancel.CANCEL_TOOL_REASON]
++        agent._interrupt_requested = False  # the boundary consumed it; the call still looks in flight
++        time.sleep(0.3)  # health: allow HX013 -- six polls must pass without a second cancel
++        assert len(agent.interrupts) == 1  # one cancel per request
++    finally:
++        stop()
++    idle = _Agent()
++    update_pause_cancel.started(idle, "c1")
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.2)
++    up.start_mid_tool_cancel(_session(idle, home), "session-key", idle)()  # stopped at once (turn ended)
++    time.sleep(0.4)  # health: allow HX013 -- a stopped watcher must stay silent past its grace
++    assert idle.interrupts == []
++
++
++def test_watcher_never_runs_on_the_turn_thread(home, monkeypatch):
++    """Harnesses run turn threads inline by patching threading.Thread; the watcher must still run apart
++    (an inline watcher loops on the turn's own thread until the turn ends, which it then never does)."""
++    monkeypatch.setattr("threading.Thread", _InlineThread)
++    agent = _Agent()
++    started = time.monotonic()
++    stop = up.start_mid_tool_cancel(_session(agent, home), "session-key", agent)
++    stop()
++    assert time.monotonic() - started < 1.0
++
++
++def test_a_committed_call_no_longer_counts_as_running():
++    """A worker abandoned on a timeout never reports finished; once its result is committed the watcher
++    must not see it as running, or a later request would cut the turn's model call instead."""
++    agent = _Agent()
++    update_pause_cancel.started(agent, "stuck")
++    assert update_pause_cancel.committed(agent, "stuck", "timed out") == ("timed out", False)
++    assert update_pause_cancel.in_flight(agent) == {}
++    assert update_pause_cancel.cancel(agent, "x") is None and agent.interrupts == []
++
++
++def test_a_user_stop_is_never_relabelled_by_the_cancel(tmp_path):
++    from agent.interrupt_control import interrupt_issuer
++    agent = _make_agent(tmp_path, "long_job")
++    agent._turn_user_intervened = False
++    agent.interrupt()  # the user's Stop lands first (between cancel's check and its interrupt)
++    agent.interrupt(tool_reason=update_pause_cancel.CANCEL_TOOL_REASON)
++    assert interrupt_issuer(agent) != "hermes_update_pause"
++    vars(agent)["_update_pause_cancel"] = {"calls": frozenset({"c1"}), "text": "stamp"}
++    assert update_pause_cancel.committed(agent, "c1", "own result") == ("own result", False)  # Stop's result
++    assert update_pause_cancel.take_pending(agent) is False  # ends as the Stop, not a pause
++    agent.clear_interrupt()
++    agent.interrupt("actually, do X instead")  # a pending redirect keeps its message too
++    agent.interrupt(tool_reason=update_pause_cancel.CANCEL_TOOL_REASON)
++    assert agent._interrupt_message == "actually, do X instead"
++
++
++def test_the_cancel_is_not_a_user_intervention(tmp_path):
++    from agent.interrupt_control import interrupt_issuer
++    agent = _make_agent(tmp_path, "long_job")
++    agent._turn_user_intervened = False
++    update_pause_cancel.started(agent, "c1")
++    assert update_pause_cancel.cancel(agent, "stamp") == ["c1"]
++    assert interrupt_issuer(agent) == "hermes_update_pause"
++    assert agent._turn_user_intervened is False
++    assert update_pause_cancel.committed(agent, "c1", "partial") == ("stamp", True)
++
++
++def test_a_later_request_in_the_same_turn_cancels_again(home, monkeypatch):
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 30.0)
++    record_turn_start(home, "session-key", "p")
++    agent, state = _Agent(), {}
++    update_pause_cancel.started(agent, "c1")
++    vars(agent)["_update_pause_in_flight"]["c1"] = 0.0
++    _request_pause(home)
++    assert _step(home, agent, state, monkeypatch, 10.0) is None
++    assert _step(home, agent, state, monkeypatch, 40.0) == ["c1"]
++    agent._interrupt_requested = False  # the boundary consumed the cancel and declined: the turn goes on
++    update_pause_cancel.take_pending(agent)
++    assert _step(home, agent, state, monkeypatch, 41.0) is None  # same request: no second cancel
++    af.clear_pause_request(home)
++    assert _step(home, agent, state, monkeypatch, 50.0) is None
++    update_pause_cancel.started(agent, "c2")
++    vars(agent)["_update_pause_in_flight"]["c2"] = 55.0
++    _request_pause(home)
++    assert _step(home, agent, state, monkeypatch, 60.0) is None  # sighted at 60
++    assert _step(home, agent, state, monkeypatch, 90.0) == ["c2"]
++
++
++def test_a_stop_during_the_boundary_hook_ends_the_turn(home, tmp_path, monkeypatch):
++    """The cancel's pause is declined because a user Stop landed while the hook ran: only the cancel's own
++    interrupt may be cleared, so the turn ends as that Stop instead of calling the model again."""
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "long_job")
++    session = _session(agent, home)
++    _request_pause(home)
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: _long_call())
++    agent.client.chat.completions.create.side_effect = [_response(_call("long_job", "call_1")), _response()]
++
++    def _hook():  # declines (returns None) after the user's Stop is published while it runs
++        agent.interrupt()
++
++    agent.step_boundary_pause = _hook
++    stop = up.start_mid_tool_cancel(session, "session-key", agent)
++    try:
++        result = agent.run_conversation("run the long job")
++    finally:
++        stop()
++    assert agent.client.chat.completions.create.call_count == 1
++    assert result["interrupted"] is True and not result.get("paused_for_update")
++
++
++def test_clear_interrupt_only_reason_spares_a_relabelled_interrupt(tmp_path):
++    agent = _make_agent(tmp_path, "long_job")
++    agent.interrupt(tool_reason=update_pause_cancel.CANCEL_TOOL_REASON)
++    agent.interrupt()  # a Stop relabels it
++    assert agent.clear_interrupt(only_reason=update_pause_cancel.CANCEL_TOOL_REASON) is False
++    assert agent._interrupt_requested is True
++    agent.clear_interrupt()
++    agent.interrupt(tool_reason=update_pause_cancel.CANCEL_TOOL_REASON)
++    assert agent.clear_interrupt(only_reason=update_pause_cancel.CANCEL_TOOL_REASON) is True
++    assert agent._interrupt_requested is False
++
++
++def test_grace_counts_from_the_newest_running_call(home, monkeypatch):
++    """Parallel calls: one cancel ends them all, so it waits until the newest one has had its grace."""
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 30.0)
++    record_turn_start(home, "session-key", "p")
++    _request_pause(home)
++    agent, state = _Agent(), {}
++    vars(agent)["_update_pause_in_flight"] = {"c1": 100.0, "c2": 120.0}
++    assert _step(home, agent, state, monkeypatch, 100.0) is None
++    assert _step(home, agent, state, monkeypatch, 149.9) is None
++    assert _step(home, agent, state, monkeypatch, 150.0) == ["c1", "c2"]
++
++
++def test_cancel_with_nothing_running_does_not_interrupt():
++    """``cancel`` itself refuses an idle turn: an interrupt then would cut the model call instead."""
++    agent = _Agent()
++    assert update_pause_cancel.cancel(agent, "x") is None
++    assert agent.interrupts == [] and "_update_pause_cancel" not in vars(agent)
++    update_pause_cancel.started(agent, "c1")
++    update_pause_cancel.finished(agent, "c1")
++    assert update_pause_cancel.cancel(agent, "x") is None and agent.interrupts == []
++
++
++@pytest.mark.parametrize("case", ["resume_on_startup_off", "bot_room", "opted_out", "no_marker"])
++def test_poll_leaves_a_non_resumable_turn_alone(home, monkeypatch, case):
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.0)
++    cfg = {"desktop": {"auto_continue": dict(CFG["desktop"]["auto_continue"])}}
++    if case == "resume_on_startup_off":
++        cfg["desktop"]["auto_continue"]["resume_on_startup"] = False
++    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
++    if case != "no_marker":
++        record_turn_start(home, "session-key", "p", auto_continue=case != "opted_out")
++    _request_pause(home)
++    agent = _Agent()
++    vars(agent)["_update_pause_in_flight"] = {"c1": 0.0}
++    session = dict(_session(agent, home), **({"source": "bot_room"} if case == "bot_room" else {}))
++    monkeypatch.setattr(up, "_mono", lambda: 1e6)
++    assert up.mid_tool_cancel_step(session, "session-key", agent, {}) is None
++    assert agent.interrupts == []
++
++
++def test_a_stop_after_the_cancel_ends_the_turn_as_that_stop(home):
++    """The cancel's record is consumed at the boundary; a later user Stop relabels the interrupt and wins."""
++    agent = types.SimpleNamespace(_interrupt_requested=True, _tool_interrupt_reason="explicit stop requested")
++    vars(agent)["_update_pause_cancel"] = {"calls": frozenset({"c1"}), "text": "x"}
++    vars(agent)["_update_pause_in_flight"] = {"c1": 0.0, "c2": 1.0}
++    assert update_pause_cancel.take_pending(agent) is False
++    assert update_pause_cancel.in_flight(agent) == {"c2": 1.0}  # the abandoned cancelled call is dropped
++
++
++def test_gateway_turn_starts_and_stops_the_watcher(monkeypatch, home):
++    """prompt_turn._invoke_agent installs the watcher next to the boundary hook and stops it at turn end."""
++    calls = []
++
++    def _start(session, key, agent):
++        calls.append(("start", key))
++        return lambda: calls.append(("stop", key))
++
++    monkeypatch.setattr(up, "start_mid_tool_cancel", _start)
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    for name, value in {"_emit": lambda *a, **k: None, "_wire_callbacks": lambda sid: None,
++                        "_sync_agent_model_with_config": lambda sid, s: None,
++                        "_session_cwd": lambda s: str(home), "_register_session_cwd": lambda s: None,
++                        "_tts_stream_begin": lambda: None, "_sync_session_key_after_compress": lambda *a, **k: None,
++                        "_get_usage": lambda a: {}}.items():
++        monkeypatch.setattr(server, name, value)
++
++    def _run(message, **kwargs):
++        calls.append(("run",))
++        return {"final_response": "done", "messages": []}
++
++    agent = types.SimpleNamespace(session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None)
++    session = {"agent": agent, "session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++               "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
++               "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++               "profile_home": str(home)}
++    server._run_prompt_submit("rid", "ui-sid", session, "go")
++    assert calls == [("start", "session-key"), ("run",), ("stop", "session-key")]
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 21400e666a..638a54b548 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1011,10 +1011,12 @@ def _invoke_agent(
+         "session.title", sid, {"session_id": _k, "title": t})
+     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+     # [daveey] Core-update pause: consulted by the agent loop at each step boundary of this turn only.
+-    from tui_gateway.update_pause import boundary_pause_hook, install_clarify_pause_provider
++    from tui_gateway.update_pause import boundary_pause_hook, install_clarify_pause_provider, start_mid_tool_cancel
+     agent.step_boundary_pause = boundary_pause_hook(session, st.marker_key) if st.marker_key else None
++    _mid_tool_stop = None
+     if st.marker_key:
+         install_clarify_pause_provider()  # a blocked clarify is withdrawn so the pause can land
++        _mid_tool_stop = start_mid_tool_cancel(session, st.marker_key, agent)  # so is a long tool call, after a grace
+     try:
+         from agent.notification_presentation import notification_turn, event_presentation_muted
+         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
+@@ -1030,6 +1032,8 @@ def _invoke_agent(
+                 agent._pending_cli_user_message = None
+     finally:
+         agent.step_boundary_pause = None
++        if _mid_tool_stop is not None:
++            _mid_tool_stop()
+         # Stop AND join before anything emits: a tick surviving past message.complete would
+         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
+         _usage_stop.set()
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 9d7681f7f3..087c2f97a9 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -31,6 +31,7 @@ prepares or commits, the turn is left to the successor's startup sweep.
+ from __future__ import annotations
+ 
+ import logging
++import _thread
+ import threading
+ import time
+ from pathlib import Path
+@@ -51,6 +52,16 @@ UPDATE_MARGIN_S = 600.0
+ # of a live turn restarts the auto-continue freshness clock at ``paused_at`` (turn_marker.freshness_since),
+ # so ``not_resumable_reason`` no longer rejects a live turn for the age of its ``started_at``.
+ PAUSE_RESTARTS_FRESHNESS = True
++# [daveey] t_01a1c7cf6f171e47: capability flag hermes-sync reads from this file's text (never imports it): a
++# turn inside a long tool call no longer holds the update until the call ends. ``MID_TOOL_GRACE_S`` after the
++# later of the request's first sighting and the newest running call's start (so no call is cut before its
++# own grace), a still-running call of an auto-continuable turn
++# is cancelled through the user-Stop interrupt path (``start_mid_tool_cancel``), its result is persisted as
++# ``interrupted_tool_result`` and the turn pauses at the step boundary right after it, as ``boundary_pause_hook``
++# does. Turns ``not_resumable_reason`` rejects are never cancelled.
++MID_TOOL_CANCEL = True
++MID_TOOL_GRACE_S = 30.0
++MID_TOOL_POLL_S = 1.0
+ WATCH_POLL_S = 5.0
+ WATCH_MAX_S = 6 * 3600.0
+ # A skewed backend normally retires once idle and its successor continues the turn. One that is still
+@@ -268,6 +279,60 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+     return hook
+ 
+ 
++def interrupted_tool_result(at: float | None = None) -> str:
++    """The persisted result of a tool call the update cancelled (UTC, whole seconds)."""
++    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now() if at is None else at))
++    return f"[interrupted by Hermes update at {stamp}: re-run if still needed]"
++
++
++def mid_tool_cancel_step(session: dict, marker_key: str, agent: Any, state: dict) -> list[str] | None:
++    """One poll of ``start_mid_tool_cancel``: the cancelled call ids once the grace ran out, else None.
++    ``state`` carries the request's first sighting (and the last decline logged) between polls."""
++    from agent import update_pause_cancel
++    if not pause_requested(session):
++        state.clear()  # a later request starts its own grace (and may cancel again)
++        return None
++    if state.get("cancelled"):
++        return None  # one cancel per request: the turn pauses at the next boundary
++    now = _mono()
++    seen = state.setdefault("seen", now)
++    running = update_pause_cancel.in_flight(agent)
++    if not running or now - max(seen, max(running.values())) < MID_TOOL_GRACE_S:
++        return None
++    why = not_resumable_reason(session, marker_key)
++    if why:
++        if state.get("declined") != why:
++            state["declined"] = why
++            logger.info("core-update pause: session %s keeps its running tool call (%s)", marker_key, why)
++        return None
++    cancelled = update_pause_cancel.cancel(agent, interrupted_tool_result())
++    if cancelled:
++        state["cancelled"] = True
++        logger.info("core-update pause: session %s cancelled %d running tool call(s) after %.0fs for a Hermes "
++                    "update: %s", marker_key, len(cancelled), MID_TOOL_GRACE_S, ", ".join(cancelled))
++    return cancelled
++
++
++def start_mid_tool_cancel(session: dict, marker_key: str, agent: Any) -> Callable[[], None]:
++    """Per-turn daemon (one stat per ``MID_TOOL_POLL_S`` while no pause is requested); returns its stop. After
++    a cancel the turn pauses at the next step boundary (turn_iteration_prep), which ends the turn and this
++    watcher; if the request was withdrawn by then the turn goes on, and a later request may cancel again."""
++    stop = threading.Event()
++
++    def run() -> None:
++        state: dict = {}
++        while not stop.wait(MID_TOOL_POLL_S):
++            try:
++                mid_tool_cancel_step(session, marker_key, agent, state)
++            except Exception:
++                logger.debug("core-update mid-tool cancel poll for %s failed", marker_key, exc_info=True)
++
++    # The low-level primitive, not threading.Thread: harnesses that run turn threads inline patch that class,
++    # and an inline watcher would block the turn forever. A _thread thread never holds interpreter exit.
++    _thread.start_new_thread(run, ())
++    return stop.set
++
++
+ # [daveey] t_01a18ac84e3491a9: a turn parked in a blocking clarify never reaches a step boundary, so the
+ # drainer's pause budget runs out and the update cuts it (hub 2026-10-30 05:37: a clarify waited 41 min, the
+ # turn crash-resumed). While a pause is requested and the turn's boundary hook would pause it, the clarify is
+-- 
+2.55.0
+

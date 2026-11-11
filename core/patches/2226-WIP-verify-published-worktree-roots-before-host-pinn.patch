@@ -1,0 +1,244 @@
+From caad5aa44619d232651609ea6e6577049e69b602 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:55:39 +0000
+Subject: [PATCH] WIP: verify published worktree roots before host pinning
+ [daveey]
+
+---
+ hermes_cli/kanban_placement.py                |   8 +-
+ hermes_cli/kanban_published_worktree.py       |  85 +++++++++++++++
+ .../test_kanban_published_worktree.py         | 102 ++++++++++++++++++
+ 3 files changed, 194 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_published_worktree.py
+ create mode 100644 tests/hermes_cli/test_kanban_published_worktree.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index d803735f6e6..c8686f5b18a 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -435,16 +435,22 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     if _local_marker(title, body, args.get("skills"), c):
+         return "local marker"
+     from hermes_cli.kanban_carried_evidence import without_carried_inputs
++    from hermes_cli.kanban_published_worktree import without_published_worktrees
+ 
+     full = without_carried_inputs(f"{title}\n{body}", c.raw)
+     extra = c.raw.get("extra_home_markers")
+-    pats = list(HOME_GATEWAY_MARKERS) + (list(extra) if isinstance(extra, list) else [])
++    pats = [p for p in HOME_GATEWAY_MARKERS if p != HOST_WORKTREE_PATH]
++    pats += list(extra) if isinstance(extra, list) else []
+     for p in pats:
+         try:
+             if re.search(p, full, re.IGNORECASE):
+                 return "home gateway marker"
+         except re.error:
+             continue
++    # Avoid filesystem/network probes when a cheap marker already pins the card.
++    if re.search(HOST_WORKTREE_PATH, full, re.IGNORECASE):
++        if re.search(HOST_WORKTREE_PATH, without_published_worktrees(full), re.IGNORECASE):
++            return "home gateway marker"
+     return None
+ 
+ 
+diff --git a/hermes_cli/kanban_published_worktree.py b/hermes_cli/kanban_published_worktree.py
+new file mode 100644
+index 00000000000..d0a064180a2
+--- /dev/null
++++ b/hermes_cli/kanban_published_worktree.py
+@@ -0,0 +1,85 @@
++"""Narrow worktree-path exemption for clean wt/* heads published to origin.
++
++Only routing text is filtered: workspace requirements and all other host markers
++remain authoritative. No fetch, checkout, push, or local ref mutation is performed.
++"""
++from __future__ import annotations
++
++import re
++import subprocess
++import time
++from pathlib import Path
++
++from tools.environments.local import build_subprocess_env
++
++# Only whole roots, never subpaths (which may name ignored local artifacts).
++_PATH = re.compile(r"(?:~|/home/[^/\s]+)/code/_wt(?:-[\w-]+)?/[\w-]+(?=$|[\s`'\",:;)]|\.(?=\s|$))")
++_ORIGIN = re.compile(r'(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?$')
++
++
++def without_published_worktrees(text: str) -> str:
++    """Remove only verified roots, within one shared three-second probe budget.
++
++    Missing paths (including another host's paths), dirty trees, unpublished or
++    detached heads and unavailable origins retain the conservative host marker.
++    The card must already name the GitHub source URL, branch and full commit SHA
++    so its receiving agent can reconstruct the checkout. Subpaths remain local:
++    they may reference ignored files not contained in the published commit.
++    Credential-scrubbed origins that cannot be read also remain local.
++    Results are deliberately not cached across placement calls.
++    """
++    deadline = time.monotonic() + 3
++    checked: dict[str, bool] = {}
++
++    def replace(match: re.Match) -> str:
++        raw = match.group(0)
++        if raw not in checked:
++            checked[raw] = _published(Path(raw).expanduser(), deadline, text)
++        return '<published-worktree>' if checked[raw] else raw
++
++    return _PATH.sub(replace, text)
++
++
++def _published(path: Path, deadline: float, text: str) -> bool:
++    if not (path / '.git').is_file() or (path / '.gitmodules').exists():
++        return False
++    env = build_subprocess_env(extra={
++        'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
++        'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes -o ConnectTimeout=2',
++        'SSH_ASKPASS_REQUIRE': 'never',
++    })
++
++    def git(*args: str) -> str:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            raise subprocess.TimeoutExpired('git', 3)
++        return subprocess.check_output(
++            ['git', '-C', str(path), *args], env=env, timeout=remaining,
++            stderr=subprocess.DEVNULL, text=True, encoding='utf-8',
++        ).strip()
++
++    try:
++        branch = git('symbolic-ref', '--quiet', '--short', 'HEAD')
++        if not branch.startswith('wt/'):
++            return False
++        head = git('rev-parse', 'HEAD')
++        raw_origin = git('config', '--get', 'remote.origin.url')
++        origin = _ORIGIN.fullmatch(raw_origin)
++        if git('ls-remote', '--get-url', 'origin') != raw_origin:
++            return False
++        # The receiving agent must have a source and exact checkout identity,
++        # not merely an origin-host pathname. Never infer these from the slug.
++        if not origin or any(value not in text for value in (
++                f'https://github.com/{origin[1]}', branch, head)):
++            return False
++        if git('status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'):
++            return False
++        ref = f'refs/heads/{branch}'
++        if git('ls-remote', '--exit-code', 'origin', ref).split() != [head, ref]:
++            return False
++        # Revalidate local state after the network observation.
++        return (git('symbolic-ref', '--quiet', '--short', 'HEAD') == branch
++                and git('rev-parse', 'HEAD') == head
++                and not git('status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'))
++    except (OSError, subprocess.SubprocessError, UnicodeError):
++        return False
+diff --git a/tests/hermes_cli/test_kanban_published_worktree.py b/tests/hermes_cli/test_kanban_published_worktree.py
+new file mode 100644
+index 00000000000..16c947d4165
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_published_worktree.py
+@@ -0,0 +1,102 @@
++"""Published clean worktrees are reconstructible, not host-only state."""
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++
++
++def git(path, *args):
++    return subprocess.check_output(['git', '-C', str(path), *args], text=True).strip()
++
++
++@pytest.fixture
++def published(tmp_path, monkeypatch):
++    monkeypatch.setenv('HOME', str(tmp_path))
++    origin = tmp_path / 'origin.git'
++    repo = tmp_path / 'repo'
++    subprocess.run(['git', 'init', '--bare', str(origin)], check=True, capture_output=True)
++    subprocess.run(['git', 'init', str(repo)], check=True, capture_output=True)
++    git(repo, 'config', 'user.email', 'test@example.com')
++    git(repo, 'config', 'user.name', 'Test')
++    git(repo, 'commit', '--allow-empty', '-m', 'base')
++    git(repo, 'remote', 'add', 'origin', 'https://github.com/example/project.git')
++    git(repo, 'config', f'url.{origin}.insteadOf', 'https://github.com/example/project.git')
++    wt = tmp_path / 'code' / '_wt' / 'fix'
++    git(repo, 'worktree', 'add', '-b', 'wt/fix', str(wt))
++    git(wt, 'push', 'origin', 'HEAD:refs/heads/wt/fix')
++    git(repo, 'config', '--unset', f'url.{origin}.insteadOf')
++    # Real local Git state and remote protocol; only substitute transport target.
++    check_output = subprocess.check_output
++
++    def transport(argv, **kw):
++        if argv[-4:] == ['ls-remote', '--exit-code', 'origin', 'refs/heads/wt/fix']:
++            argv = [*argv[:-2], str(origin), argv[-1]]
++        return check_output(argv, **kw)
++
++    monkeypatch.setattr(subprocess, 'check_output', transport)
++    return wt, origin
++
++
++def reason(body, **extra):
++    head = git(Path.home() / 'code' / '_wt' / 'fix', 'rev-parse', 'HEAD')
++    body += f'\nFetch https://github.com/example/project branch wt/fix and check out {head}.'
++    return kp.portable_reason({'title': 'Fix parser', 'body': body, **extra}, {})
++
++
++def test_clean_published_worktree_is_portable(published):
++    assert reason('Continue in `~/code/_wt/fix`.') is None
++
++
++@pytest.mark.parametrize('change', ['dirty', 'untracked', 'ahead', 'deleted', 'detached'])
++def test_unreconstructible_worktree_stays_local(published, change):
++    wt, origin = published
++    if change in ('dirty', 'untracked'):
++        (wt / 'local.txt').write_text('only here')
++        if change == 'dirty':
++            git(wt, 'add', 'local.txt')
++    elif change == 'ahead':
++        git(wt, 'commit', '--allow-empty', '-m', 'not pushed')
++    elif change == 'deleted':
++        git(origin, 'update-ref', '-d', 'refs/heads/wt/fix')
++    else:
++        git(wt, 'checkout', '--detach')
++    assert reason('Continue in `~/code/_wt/fix`.') == 'home gateway marker'
++
++
++@pytest.mark.parametrize('suffix', [' and ~/code/_wt/missing', ' and ~/code/_wt/fix-other', ' and kanban.db'])
++def test_one_published_path_does_not_exempt_other_needs(published, suffix):
++    assert reason('Continue in ~/code/_wt/fix' + suffix) == 'home gateway marker'
++
++
++@pytest.mark.parametrize('suffix', ['.bak/x', '/../../secrets', '/.env', '/dist/local'])
++def test_subpaths_and_dotted_siblings_stay_local(published, suffix):
++    assert reason('Continue in ~/code/_wt/fix' + suffix) == 'home gateway marker'
++
++
++def test_local_origin_is_not_portable(published):
++    wt, origin = published
++    git(wt, 'remote', 'set-url', 'origin', str(origin))
++    assert reason('~/code/_wt/fix') == 'home gateway marker'
++
++
++def test_rewritten_origin_stays_local(published):
++    wt, origin = published
++    git(wt, 'config', f'url.{origin}.insteadOf', 'https://github.com/example/project.git')
++    assert reason('~/code/_wt/fix') == 'home gateway marker'
++
++
++def test_missing_checkout_identity_stays_local(published):
++    assert kp.portable_reason({'title': 'Fix parser', 'body': '~/code/_wt/fix'}, {}) == 'home gateway marker'
++
++
++def test_other_marker_skips_git_probes(published, monkeypatch):
++    from hermes_cli import kanban_published_worktree as pw
++    monkeypatch.setattr(pw, '_published', lambda *a: pytest.fail('unnecessary probe'))
++    assert reason('~/code/_wt/fix and kanban.db') == 'home gateway marker'
++
++
++def test_structural_host_requirements_stay_local(published):
++    assert reason('~/code/_wt/fix', workspace_kind='dir') == 'host workspace'
++    assert reason('~/code/_wt/fix', requires=['host_repo']) == 'uncarried requirement'
+-- 
+2.55.0
+

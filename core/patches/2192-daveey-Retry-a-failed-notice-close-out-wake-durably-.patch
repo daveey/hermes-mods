@@ -1,0 +1,267 @@
+From 8709d2462e993d534892c8656536c7b25672d39b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:26:27 -0800
+Subject: [PATCH] [daveey] Retry a failed notice close-out wake durably after
+ its quota reset
+
+A close-out wake whose agent build failed (quota wall, refused store write)
+was stamped closeout.state=error and never offered again; the only retry was
+the in-process automation replay, whose timer dies with its backend and whose
+own failure gives up. Two hub chats (20261016_123957_6212f7,
+20261017_114040_587d59) stayed unresolved{notice_tail} after an
+openai-codex quota wall during a state.db corruption window.
+
+Now a failed wake stamps closeout={state: deferred, retry_at, attempts}; the
+row is a candidate again once retry_at (failure_resets_at + 600 s, after the
+replay) passes, at most MAX_ATTEMPTS=3 wakes per row, the last failure stamps
+error. refused/busy/missing verdicts stay final.
+---
+ tests/tui_gateway/test_notice_guarantee.py | 68 +++++++++++++++++++++-
+ tui_gateway/notice_guarantee.py            | 67 ++++++++++++++++++---
+ tui_gateway/session_notifications.py       |  5 +-
+ 3 files changed, 128 insertions(+), 12 deletions(-)
+
+diff --git a/tests/tui_gateway/test_notice_guarantee.py b/tests/tui_gateway/test_notice_guarantee.py
+index 9586806995..385691dbc9 100644
+--- a/tests/tui_gateway/test_notice_guarantee.py
++++ b/tests/tui_gateway/test_notice_guarantee.py
+@@ -43,7 +43,7 @@ def _notice(db, text, *, age=600.0, **meta):
+     return row
+ 
+ 
+-def _run(db, verdict="started"):
++def _run(db, verdict="started", now=None):
+     calls = []
+ 
+     def wake(sid, msg_id):
+@@ -54,7 +54,7 @@ def _run(db, verdict="started"):
+     def opener(chat_id):
+         yield db, db.get_compression_tip(chat_id) or chat_id
+ 
+-    out = ng.guarantee_pass(stores=lambda: iter([db]), holders=list, session_db=opener, wake=wake,
++    out = ng.guarantee_pass(now=now, stores=lambda: iter([db]), holders=list, session_db=opener, wake=wake,
+                             spawn=lambda job: job())
+     return out, calls
+ 
+@@ -89,6 +89,70 @@ def test_a_refused_wake_leaves_the_outcome_notice_tail(db):
+     assert (stored["kind"], stored["reason"]) == ("unresolved", "notice_tail")
+ 
+ 
++def _closeout_meta(db, row):
++    return db._read_one("SELECT json_extract(display_metadata, '$.closeout.state'), "
++                        "json_extract(display_metadata, '$.closeout.retry_at'), "
++                        "json_extract(display_metadata, '$.closeout.attempts') FROM messages WHERE id = ?", (row,))
++
++
++def test_a_failed_wake_is_deferred_and_offered_again_after_retry_at(db, monkeypatch):
++    # Two hub chats (2026-11-10): the close-out's agent build hit a quota wall, the row was stamped "error" and the
++    # quota reset never brought it back. A failed wake is now retried durably at the reset.
++    now = time.time()
++    monkeypatch.setattr(ng, "_retry_at", lambda sid, t: now + 3600, raising=False)
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++
++    out, calls = _run(db, verdict="error", now=now)
++
++    assert calls == [(CHAT, row)] and [o["result"] for o in out] == ["dispatched"]
++    state, retry_at, attempts = _closeout_meta(db, row)
++    assert (state, retry_at, attempts) == ("deferred", now + 3600, 1)
++    stored = so.get_outcome(CHAT, db=db)
++    assert (stored["kind"], stored["reason"]) == ("unresolved", "notice_tail")
++    assert _run(db, now=now + 3599) == ([], [])  # not before retry_at
++
++    out, calls = _run(db, verdict="started", now=now + 3601)
++
++    assert calls == [(CHAT, row)] and [o["result"] for o in out] == ["dispatched"]
++    state, _retry, attempts = _closeout_meta(db, row)
++    assert (state, attempts) == ("started", 2)
++    assert _run(db, now=now + 99999) == ([], [])  # started: never woken again
++
++
++def test_failed_wakes_stop_after_max_attempts(db, monkeypatch):
++    now = time.time()
++    monkeypatch.setattr(ng, "_retry_at", lambda sid, t: t + 60, raising=False)
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    wakes = 0
++    for n in range(ng.MAX_ATTEMPTS + 2):
++        _out, calls = _run(db, verdict="error", now=now + n * 1000)
++        wakes += len(calls)
++
++    assert wakes == ng.MAX_ATTEMPTS
++    state, _retry, attempts = _closeout_meta(db, row)
++    assert (state, attempts) == ("error", ng.MAX_ATTEMPTS)
++
++
++@pytest.mark.parametrize("verdict", ["refused", "busy", "missing"])
++def test_only_a_failed_wake_is_deferred(db, verdict):
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    _run(db, verdict=verdict)
++    assert _closeout(db, row) == verdict
++    assert _run(db, now=time.time() + 99999) == ([], [])
++
++
++def test_retry_at_follows_the_build_failures_quota_reset(monkeypatch):
++    from tui_gateway import automation_replay, server
++    now = 1_000_000.0
++    reset = now + 7200
++    monkeypatch.setattr(server, "_find_live_session_by_key",
++                        lambda key: (key, {"agent_failure": {"failure_resets_at": reset}}))
++    assert ng._retry_at(CHAT, now) == reset + ng.DEFER_SLACK_S
++
++    monkeypatch.setattr(server, "_find_live_session_by_key", lambda key: None)
++    assert ng._retry_at(CHAT, now) == now + automation_replay.REPLAY_MIN_DELAY_S + ng.DEFER_SLACK_S
++
++
+ def test_a_spent_budget_refreshes_instead_of_waking(db):
+     for n in range(ng.WAKES_PER_HOUR):
+         _notice(db, f"earlier close-out {n}", closeout={"state": "started", "at": time.time() - 600})
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index a83595da1b..0a54c8252e 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -15,6 +15,13 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+   verdict;
+ - a chat whose close-out budget (``WAKES_PER_HOUR`` started close-outs in its lineage) is spent, or whose wake did
+   not start, gets a refresh instead, which stores ``unresolved{notice_tail}``. The auditor repairs those.
++- a wake that failed (``"error"``: the agent build hit a quota wall, the store refused a write) is not final: the row
++  is stamped ``closeout = {state: "deferred", retry_at, attempts}`` and offered again once ``retry_at`` passes (the
++  build failure's recorded ``failure_resets_at`` plus ``DEFER_SLACK_S``, so the in-process automation replay at the
++  reset goes first), at most ``MAX_ATTEMPTS`` wakes per row; the last failure stamps ``error``. The replay's timer
++  dies with its backend and its own failure gives up, so before this a close-out refused by a quota window that a
++  restart (or a still-broken store) outlived was never offered again (two hub chats, 2026-11-10). A deferred row
++  is durable: any backend's pass picks it up. [daveey]
+ 
+ Ownership follows the unloaded sweeper's: a chat another live backend holds is that backend's (its own pass
+ handles it); a chat with a live turn is skipped. The close-out prompt row is itself a notice, stamped as claimed,
+@@ -45,6 +52,10 @@ logger = logging.getLogger(__name__)
+ 
+ GRACE_S = 300.0
+ WAKES_PER_HOUR = 2
++# A failed close-out wake is offered again (see module doc): at most this many wakes per notice row, the next one
++# no sooner than the failure's quota/route reset (or the automation replay's floor) plus this slack.
++MAX_ATTEMPTS = 3
++DEFER_SLACK_S = 600.0
+ LOOKBACK_S = 3 * 86400.0
+ MAX_PARALLEL_WAKES = 2
+ CLOSEOUT_TEXT = (
+@@ -95,28 +106,44 @@ def candidates(db: Any, now: float) -> list[dict]:
+         if row["timestamp"] > now - GRACE_S:
+             continue
+         meta = _decode(row["display_metadata"])
+-        if "closeout" not in meta:
++        if "closeout" not in meta or _deferred_due(meta, now):
+             out.append({"sid": str(row["sid"]), "msg_id": int(row["msg_id"]), "content": str(row["content"] or ""),
+                         "meta": meta, "raw_meta": row["display_metadata"]})
+     return out
+ 
+ 
++def _deferred_due(meta: dict, now: float) -> bool:
++    """A row whose failed close-out was deferred (``closeout.state == "deferred"``) and whose ``retry_at`` passed."""
++    closeout = meta.get("closeout")
++    if not isinstance(closeout, dict) or closeout.get("state") != "deferred":
++        return False
++    retry_at = closeout.get("retry_at")
++    return isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and retry_at <= now
++
++
++def _attempts(meta: Any) -> int:
++    closeout = meta.get("closeout") if isinstance(meta, dict) else None
++    n = closeout.get("attempts") if isinstance(closeout, dict) else None
++    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else 0
++
++
+ def started_last_hour(db: Any, sid: str, now: float) -> int:
+     from hermes_state_sessions import _LINEAGE_CTE_SQL
+     return int(db._read_one(_LINEAGE_CTE_SQL + _STARTED_SQL, (sid, sid, now - 3600.0))[0])
+ 
+ 
+ def _claim(db: Any, cand: dict, now: float) -> bool:
+-    meta = {**cand["meta"], "closeout": {"state": "claimed", "at": now, "pid": os.getpid()}}
++    meta = {**cand["meta"], "closeout": {"state": "claimed", "at": now, "pid": os.getpid(),
++                                         "attempts": _attempts(cand["meta"]) + 1}}
+     return db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+                               (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) == 1
+ 
+ 
+-def _stamp(db: Any, msg_id: int, verdict: str) -> None:
++def _stamp(db: Any, msg_id: int, verdict: str, **extra: Any) -> None:
+     from tui_gateway.notice_fanout import _decode
+     row = db._read_one("SELECT display_metadata FROM messages WHERE id = ?", (msg_id,))
+     meta = _decode(row["display_metadata"] if row else None)
+-    meta["closeout"] = {**(meta.get("closeout") or {}), "state": verdict}
++    meta["closeout"] = {**(meta.get("closeout") or {}), **extra, "state": verdict}
+     db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ?",
+                        (json.dumps(meta, ensure_ascii=False), msg_id))
+ 
+@@ -222,17 +249,40 @@ def _refresh(db: Any, sid: str) -> bool:
+     return _outcome.refresh_outcomes_quietly([sid], "notice", db=db) > 0
+ 
+ 
+-def _closeout_job(session_db, wake, sid: str, msg_id: int) -> str:
+-    """Worker: the wake, then the verdict on the claimed row; a wake that did not start refreshes the outcome."""
++def _retry_at(sid: str, now: float) -> float:
++    """When a failed close-out of ``sid`` may be offered again: the automation replay's due time for the chat's
++    recorded build failure (its ``failure_resets_at`` when it is a typed quota/route wall) plus ``DEFER_SLACK_S``."""
++    from tui_gateway import automation_replay
++    resets_at = None
++    with contextlib.suppress(Exception):
++        from tui_gateway import server
++        live = server._find_live_session_by_key(sid)
++        failure = live[1].get("agent_failure") if live else None
++        resets_at = failure.get("failure_resets_at") if isinstance(failure, dict) else None
++    return automation_replay.replay_due(now, resets_at) + DEFER_SLACK_S
++
++
++def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
++                  retry_at: Optional[Callable[[str, float], float]] = None) -> str:
++    """Worker: the wake, then the verdict on the claimed row; a wake that did not start refreshes the outcome.
++    A failed wake (``"error"``) with attempts left is stamped ``deferred`` for a later pass (module doc)."""
+     try:
+         try:
+             verdict = str(wake(sid, msg_id) or "error")
+         except Exception:
+             logger.warning("notice close-out wake of %s failed", sid, exc_info=True)
+             verdict = "error"
++        extra: dict = {}
++        if verdict == "error" and attempts < MAX_ATTEMPTS:
++            now = time.time()
++            try:
++                extra = {"retry_at": float((retry_at or _retry_at)(sid, now)), "attempts": attempts}
++                verdict = "deferred"
++            except Exception:
++                logger.warning("notice close-out of %s: no retry time; stamped error", sid, exc_info=True)
+         with session_db(sid) as (db, tip):
+             if db is not None:
+-                _stamp(db, msg_id, verdict)
++                _stamp(db, msg_id, verdict, **extra)
+                 if verdict != "started":
+                     _refresh(db, tip or sid)
+         logger.info("notice close-out of %s: %s", sid, verdict)
+@@ -297,7 +347,8 @@ def _handle(db, cand: dict, now: float, *, holders, session_db, wake, spawn, see
+         _wake_slots.release()
+         return "skipped:claimed"
+     try:
+-        spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"]))
++        attempts = _attempts(cand["meta"]) + 1
++        spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"], attempts=attempts))
+     except Exception:
+         _wake_slots.release()
+         _stamp(db, cand["msg_id"], "error")
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index b505a2b98e..42335235ed 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1679,8 +1679,9 @@ def _replay_failed_wake(key: str, text: str, session: dict, display_kind: str |
+     could start (agent build): ONE delayed replay, at the build failure's recorded quota/route reset when it has one
+     (``agent_failure.failure_resets_at``), else ``REPLAY_MIN_DELAY_S``. The delivery is not in the transcript, so a
+     later successful turn does not cancel it. A replay's own failure gives up. A chat close-out wake is included:
+-    ``notice_guarantee`` stamps its row ``closeout.state = "error"`` and never offers it again, and the replay
+-    keeps the close-out's own ``closeout`` metadata, so it cannot start another close-out."""
++    ``notice_guarantee`` stamps its row ``closeout.state = "deferred"`` with a ``retry_at`` after this replay's due
++    time (the durable fallback when this in-process timer dies with its backend), and the replay keeps the
++    close-out's own ``closeout`` metadata, so it cannot start another close-out."""
+     from tui_gateway import automation_replay
+     meta = display_metadata if isinstance(display_metadata, dict) else {}
+     if not automation_replay.is_automation(display_kind):
+-- 
+2.55.0
+

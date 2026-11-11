@@ -1,0 +1,193 @@
+From ccc81f48e5b2f219232b58bca0c5a959fd3a1f10 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:51:33 +0000
+Subject: [PATCH] fix(update): pinned-gateway recovery uses the inventoried
+ PID, and migration resume cannot fold a pinned gateway [daveey]
+
+---
+ hermes_cli/gateway_migrate.py                 |  8 ++++
+ hermes_cli/update_cmd_fleet.py                |  6 ++-
+ hermes_cli/update_fleet_scope.py              | 25 +++++++----
+ .../test_gateway_migrate_multiplex.py         | 45 +++++++++++++++++++
+ .../test_update_pause_pinned_runtime.py       | 34 ++++++++++++++
+ 5 files changed, 108 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/gateway_migrate.py b/hermes_cli/gateway_migrate.py
+index bc412998c0a..bb30bc047d2 100644
+--- a/hermes_cli/gateway_migrate.py
++++ b/hermes_cli/gateway_migrate.py
+@@ -1041,6 +1041,14 @@ def apply_migration(plan: MigrationPlan, *, served_wait: float = _SERVED_WAIT_SE
+     target, run_as_user = _resume_target(plan)
+     manifest = plan.manifest
+     if manifest is not None:
++        # A resume skips the plan's blockers, but not the foreign-code boundary: folding a gateway
++        # pinned to its own checkout into this one silently drops the pin. [daveey]
++        from hermes_cli.gateway_migrate_guards import _guard_code_root
++        pinned = list(dict.fromkeys(f for p in plan.standalone_secondaries if (f := _guard_code_root(plan, p))))
++        if pinned:
++            _print(["✗ Migration resume refused before changing anything:", *[f"  • {b}" for b in pinned],
++                    f"  Re-run {MIGRATE_COMMAND} once those gateways run this checkout (or restore from the manifest)."])
++            return False
+         # A manifest on disk means an earlier apply got past its first destructive step: it either
+         # died mid-way (``interrupted``) or its compensator did not finish. Either way the manifest
+         # is the ONLY record of the units that existed, so resume from it and never overwrite it.
+diff --git a/hermes_cli/update_cmd_fleet.py b/hermes_cli/update_cmd_fleet.py
+index a128f205e4b..62d643de8d7 100644
+--- a/hermes_cli/update_cmd_fleet.py
++++ b/hermes_cli/update_cmd_fleet.py
+@@ -1087,7 +1087,11 @@ def _gateway_recovery_partition(plan, *, skip_profiles: set[str] | None = None)
+     candidates: dict[str, str] = {}
+     skipped: list[dict] = []
+     from hermes_cli.update_fleet_scope import profiles_on_another_checkout  # loaded before the checkout moved
+-    pinned = profiles_on_another_checkout()  # recovery would only bounce these onto their pin [daveey]
++    # Recovery would only bounce these onto their pin; the inventory's live PIDs outrank status files [daveey]
++    live_pids = {r.profile: r.pid for r in getattr(plan, "runtimes", ()) or ()
++                 if getattr(r, "kind", None) == "gateway" and isinstance(getattr(r, "profile", None), str)
++                 and isinstance(getattr(r, "pid", None), int) and r.pid > 0}
++    pinned = profiles_on_another_checkout(live_pids)
+     with _best_effort('Could not prepare fresh gateway restart profiles: %s'):
+         for runtime in getattr(plan, "runtimes", ()) or ():
+             kind = getattr(runtime, "kind", None)
+diff --git a/hermes_cli/update_fleet_scope.py b/hermes_cli/update_fleet_scope.py
+index 7e8ba1e7c22..7bf590b88c7 100644
+--- a/hermes_cli/update_fleet_scope.py
++++ b/hermes_cli/update_fleet_scope.py
+@@ -179,10 +179,12 @@ def gateway_foreign_code_root(pid: int, home) -> Path | None:
+     return None
+ 
+ 
+-def profiles_on_another_checkout() -> dict[str, Path]:
+-    """Profile → the other checkout its live gateway runs, read fresh from each profile's own
+-    status record. Restart-abort recovery asks this itself: it can run before the restart phase
+-    looked at any unit, so nothing an earlier pass remembered is there to rely on.
++def profiles_on_another_checkout(live_pids: dict[str, int] | None = None) -> dict[str, Path]:
++    """Profile → the other checkout its live gateway runs. A live PID is resolved in the order the
++    inventory itself discovers gateways: *live_pids* (the pre-update inventory's PID per profile),
++    then the profile's control socket, then its ``gateway_state.json`` record. A gateway found only
++    through the socket or a PID file has no status record, so the record alone missed it.
++    Restart-abort recovery asks this itself: it can run before the restart phase looked at any unit.
+ 
+     Total by contract: recovery runs in the pre-update interpreter over the replaced checkout,
+     where a first import can fail in any way; every failure reads as "no pinned profile"."""
+@@ -191,13 +193,18 @@ def profiles_on_another_checkout() -> dict[str, Path]:
+         import json
+ 
+         import psutil
+-        from hermes_cli.update_receipt import _profile_homes
++        from hermes_cli.update_receipt import _profile_homes, _socket_identity
+         for profile, home in _profile_homes():
+             with suppress(Exception):
+-                pid = int(json.loads((home / "gateway_state.json").read_text(encoding="utf-8-sig")).get("pid") or 0)
+-                # A crashed gateway's recorded PID may belong to anything by now.
+-                if pid <= 0 or "gateway" not in psutil.Process(pid).cmdline():
+-                    continue
++                pid = int((live_pids or {}).get(profile) or 0)
++                if pid <= 0:
++                    sock = _socket_identity(home)
++                    pid = int(sock[0]) if sock else 0
++                if pid <= 0:
++                    pid = int(json.loads((home / "gateway_state.json").read_text(encoding="utf-8-sig")).get("pid") or 0)
++                    # A crashed gateway's recorded PID may belong to anything by now.
++                    if pid <= 0 or "gateway" not in psutil.Process(pid).cmdline():
++                        continue
+                 root = gateway_foreign_code_root(pid, home)
+                 if root is not None:
+                     pinned[profile] = root
+diff --git a/tests/hermes_cli/test_gateway_migrate_multiplex.py b/tests/hermes_cli/test_gateway_migrate_multiplex.py
+index e5937a86126..da3a345c22a 100644
+--- a/tests/hermes_cli/test_gateway_migrate_multiplex.py
++++ b/tests/hermes_cli/test_gateway_migrate_multiplex.py
+@@ -1002,3 +1002,48 @@ def test_standalone_profile_is_listed_left_alone_and_not_a_fold_target(fleet):
+     assert payload["standalone_by_config"] == list(plan.standalone_by_config)
+     assert "ops" not in [p["profile"] for p in payload["profiles"]]
+     assert any("ops" in line for line in gm.format_plan(plan, dry_run=True))
++
++
++def _pin_coder(monkeypatch, fleet):
++    """``coder``'s live gateway runs another checkout (an Ask Eve pinned owner)."""
++    from pathlib import Path as _P
++    pinned_pid = fleet.pids["coder"]
++    monkeypatch.setattr("hermes_cli.update_fleet_scope.gateway_foreign_code_root",
++                        lambda pid, home: _P("/pinned/core-d426474bc63b") if pid == pinned_pid else None)
++
++
++def _write_unfinished_manifest(fleet):
++    gm._write_manifest(fleet.root, {
++        "version": 1, "flag_was": False, "default": {"service": None},
++        "secondaries": [{"profile": n, "home": str(fleet.root / "profiles" / n), "pid": fleet.pids[n],
++                         "service": {"kind": "systemd", "system": False}} for n in ("coder", "ops")]})
++
++
++def test_update_hook_resume_never_folds_a_pinned_gateway(fleet, monkeypatch, capsys):
++    """A manifest turns the update hook into a resume that skips blockers; the foreign-code boundary
++    is the exception: the pinned secondary stays installed and running, the manifest stays."""
++    _pin_coder(monkeypatch, fleet)
++    _write_unfinished_manifest(fleet)
++    gm.maybe_auto_migrate_after_update()
++    out = capsys.readouterr().out
++    assert [op for op in fleet.ops if op[0] == "coder"] == [], "the pinned gateway was touched"
++    assert "coder" in fleet.services and "coder" in fleet.pids
++    assert _config_flag(fleet.root) is None, "the multiplex flag was flipped over a pinned gateway"
++    assert "/pinned/core-d426474bc63b" in out
++    assert (fleet.root / gm.MANIFEST_NAME).exists()
++
++
++def test_explicit_resume_never_folds_a_pinned_gateway(fleet, monkeypatch, capsys):
++    """Same boundary through ``apply_migration`` itself (the explicit command's resume)."""
++    _pin_coder(monkeypatch, fleet)
++    _write_unfinished_manifest(fleet)
++    assert gm.apply_migration(gm.build_migration_plan(), served_wait=0.1) is False
++    assert fleet.ops == [] and "coder" in fleet.services and "coder" in fleet.pids
++    assert "/pinned/core-d426474bc63b" in capsys.readouterr().out
++    assert (fleet.root / gm.MANIFEST_NAME).exists()
++
++
++def test_resume_still_proceeds_when_nothing_is_pinned(fleet, capsys):
++    """Control: other resume semantics are unchanged (blockers other than the code root are ignored)."""
++    _write_unfinished_manifest(fleet)
++    assert gm.apply_migration(gm.build_migration_plan(), served_wait=5.0) is True
+diff --git a/tests/hermes_cli/test_update_pause_pinned_runtime.py b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+index f4e40dda6bd..ffce383d476 100644
+--- a/tests/hermes_cli/test_update_pause_pinned_runtime.py
++++ b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+@@ -243,3 +243,37 @@ def test_auto_migration_does_not_fold_a_pinned_gateway(host):
+     (host["home"] / "gateway_state.json").unlink()
+     profile.pid = _run_on_checkout(host)
+     assert _guard_code_root(None, profile) is None
++
++
++def test_recovery_classifies_an_inventoried_pinned_gateway_without_a_status_record(host):
++    """A pinned gateway found through the control socket / PID file has no ``gateway_state.json``;
++    the inventory already holds its live PID, so recovery must not pick it as a restart candidate
++    (``gateway restart --interrupt --detach`` would bounce it onto its pin)."""
++    from types import SimpleNamespace
++    pid = _run_pinned(host, status_record=False)
++    assert not (host["home"] / "gateway_state.json").exists(), "premise: no status record"
++    plan = SimpleNamespace(runtimes=[
++        SimpleNamespace(kind="gateway", profile="askeve-builder", supervisor="systemd", pid=pid)])
++
++    candidates, skipped = fleet._gateway_recovery_partition(plan)
++
++    assert candidates == {}, f"a pinned gateway was selected for restart recovery: {candidates}"
++    assert [s["profile"] for s in skipped] == ["askeve-builder"] and skipped[0]["pinned"] is True
++    assert str(host["core"]) in skipped[0]["reason"]
++
++
++def test_recovery_reads_a_socket_declared_pin_and_keeps_a_checkout_gateway_restartable(host, monkeypatch):
++    """With no inventoried PID the control socket is asked next; the same profile on this checkout
++    (control) is still a restart candidate, and an unreadable pid fails safe to the old behaviour."""
++    from types import SimpleNamespace
++    plan = SimpleNamespace(runtimes=[SimpleNamespace(kind="gateway", profile="askeve-builder", supervisor="systemd")])
++    pinned = _run_pinned(host, status_record=False)
++    monkeypatch.setattr("hermes_cli.update_receipt._socket_identity", lambda home: (pinned, {}))
++    candidates, skipped = fleet._gateway_recovery_partition(plan)
++    assert candidates == {} and skipped[0]["pinned"] is True
++
++    control = _run_on_checkout(host)
++    monkeypatch.setattr("hermes_cli.update_receipt._socket_identity", lambda home: (control, {}))
++    assert fleet._gateway_recovery_partition(plan) == ({"askeve-builder": "systemd"}, [])
++    plan.runtimes[0].pid = control
++    assert fleet._gateway_recovery_partition(plan) == ({"askeve-builder": "systemd"}, [])
+-- 
+2.55.0
+

@@ -1,0 +1,175 @@
+From e32a61f4293d311932b7f407b082350946d2d665 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:18:01 +0000
+Subject: [PATCH] fix(kanban): continuation review fixes: update-gap wait, one
+ prepare per session [daveey]
+
+- Worker: a refusal gap past OWNER_WAIT_S checks the board for this attempt's unconsumed checkpoint; the
+  hermes update path (restart wait refuses, then the tree moves) never shows a terminal receipt first,
+  so without this the worker gave up at OWNER_WAIT_S and the run was reclaimed anyway.
+- Owner: prepare() is serialized per session, so a retried kanban.run racing the first cannot append a
+  second synthetic result for the same interrupted tool call.
+- Drop the _require_admission_open pre-check before prepare (the admission submit already refuses on a
+  draining owner; the pre-check only refused earlier with a different error).
+- test_core_update_kanban_wait pins the checkpoint the managed Stop booking passes.
+
+Proof: new tests killed by mutants R1 (no board check -> update-gap test fails), R2 (no per-session lock
+-> race test writes two tool results), R3 (checkpoint kwargs dropped -> booking test fails).
+---
+ gateway/session_kanban_continue.py            | 14 ++++-
+ hermes_cli/kanban_worker_client.py            |  5 ++
+ tests/gateway/test_core_update_kanban_wait.py |  6 ++-
+ .../test_kanban_restart_continuation.py       | 54 +++++++++++++++++++
+ 4 files changed, 77 insertions(+), 2 deletions(-)
+
+diff --git a/gateway/session_kanban_continue.py b/gateway/session_kanban_continue.py
+index 4e59d5c0bd..1cbecd2c8f 100644
+--- a/gateway/session_kanban_continue.py
++++ b/gateway/session_kanban_continue.py
+@@ -26,6 +26,7 @@ import logging
+ import os
+ from pathlib import Path
+ import sqlite3
++import threading
+ import time
+ from typing import NoReturn
+ 
+@@ -42,6 +43,10 @@ CONTINUE_TEXT = (CONTINUE_PREFIX + ' The gateway restarted (a Hermes update) whi
+ INTERRUPTED_RESULT = '[interrupted by Hermes update at {at}: re-run if still needed]'
+ CONTINUED_EVENT = 'restart_continued'
+ REFUSED_EVENT = 'restart_continue_refused'
++# One continuation prepare per session at a time: a retried ``kanban.run`` racing the first must not
++# append a second synthetic result for the same interrupted tool call (prepare runs off the owner loop).
++_PREPARING: dict[str, threading.Lock] = {}
++_PREPARING_GUARD = threading.Lock()
+ 
+ 
+ def interrupted_result(at) -> str:
+@@ -135,10 +140,17 @@ def _answer_interrupted_calls(session_db, session_id, at) -> int:
+     return int(session_db._execute_write(write))
+ 
+ 
+-def prepare(authority, *, principal_id, session_id, context, checkpoint, request_id, owner_db) -> dict:
++def prepare(authority, *, session_id, **kwargs) -> dict:
+     """Prove the checkpointed turn can continue in ``session_id``, answer its interrupted tool calls and
+     record the continuation as the run's newest ``owner_admitted``. Off the owner loop; raises
+     ``RuntimeStoreError(UNSAFE)`` (booked, logged) when continuation cannot be proven safe."""
++    with _PREPARING_GUARD:
++        lock = _PREPARING.setdefault(session_id, threading.Lock())
++    with lock:
++        return _prepare(authority, session_id=session_id, **kwargs)
++
++
++def _prepare(authority, *, principal_id, session_id, context, checkpoint, request_id, owner_db) -> dict:
+     if checkpoint.get('unsafe'):
+         _refuse(context, checkpoint, checkpoint['unsafe'])
+     if checkpoint.get('session_id') != session_id:
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index 63c945d97d..ce5213c479 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -202,6 +202,11 @@ async def run(params, board_db):
+                     raise OwnerRestartLost(f'Kanban owner did not continue the checkpointed turn: {exc}') from exc
+                 raise
+             claim.note_refusal(exc)
++            if (claim.silent_for() >= OWNER_WAIT_S and not claim.continuing
++                    and await asyncio.to_thread(_checkpoint, params, board_db, claim) is not None):
++                # [daveey] The stopping owner checkpointed this attempt's turn before the gap (a ``hermes
++                # update`` refuses us in its restart wait, then the tree moves): wait out the restart.
++                claim.continuing = claim.restarted = True
+             if claim.silent_for() >= claim.silence_budget():
+                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
+                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
+diff --git a/tests/gateway/test_core_update_kanban_wait.py b/tests/gateway/test_core_update_kanban_wait.py
+index 59b45c60a8..a935debb29 100644
+--- a/tests/gateway/test_core_update_kanban_wait.py
++++ b/tests/gateway/test_core_update_kanban_wait.py
+@@ -127,8 +127,12 @@ async def test_cooperative_stop_booking_before_admission_settlement(monkeypatch,
+     monkeypatch.setattr('gateway.session_policy.workspace_ready', lambda _: True)
+     recorded = MagicMock()
+     monkeypatch.setattr(booking, 'record_restart_interruption', recorded)
+-    assert await managed.admit_managed(authority, None, row, policy) == 'reply'
++    assert await managed.admit_managed(authority, SimpleNamespace(session_id='s'), row, policy) == 'reply'
+     assert recorded.call_count == int(expected)
++    if expected:
++        # [daveey] A clean restart/shutdown Stop is a continuation checkpoint (session_kanban_continue).
++        assert recorded.call_args.kwargs['checkpoint'] == {'session_id': 's', 'request_id': None,
++                                                           'admission_id': 'a', 'cause': cause}
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/gateway/test_kanban_restart_continuation.py b/tests/gateway/test_kanban_restart_continuation.py
+index ee03b6082b..4ba07e6243 100644
+--- a/tests/gateway/test_kanban_restart_continuation.py
++++ b/tests/gateway/test_kanban_restart_continuation.py
+@@ -219,6 +219,26 @@ def test_the_continued_turn_waits_out_a_restart_longer_than_owner_wait(board, cl
+     assert clock[0] >= kanban_worker_client.OWNER_WAIT_S
+ 
+ 
++def test_an_update_gap_longer_than_owner_wait_still_continues(board, clock, monkeypatch, capsys):
++    # ``hermes update``: the old owner checkpoints the turn but its restart wait refuses us, then it exits
++    # and the tree moves. No terminal receipt is ever seen before the gap; the board shows the checkpoint.
++    owner = _RestartingOwner(board, clock, gap=kanban_worker_client.OWNER_WAIT_S + 90)
++    monkeypatch.setattr(gateway_client, 'connect_gateway', owner.connect())
++    assert asyncio.run(kanban_worker_client.run(board.params, board.db)) == 0
++    assert clock[0] >= kanban_worker_client.OWNER_WAIT_S + 90
++    assert len(owner.runs) == 2
++
++
++def test_an_owner_gap_with_no_checkpoint_still_fails_at_owner_wait(board, clock, monkeypatch):
++    # Without a checkpoint on the board the old bound holds: silence past OWNER_WAIT_S ends the worker.
++    owner = _RestartingOwner(board, clock, gap=kanban_worker_client.OWNER_WAIT_S + 90)
++    monkeypatch.setattr(kanban_worker_client, '_checkpoint', lambda *a: None)
++    monkeypatch.setattr(gateway_client, 'connect_gateway', owner.connect())
++    with pytest.raises(gateway_client.GatewayClientError, match='silent'):
++        asyncio.run(kanban_worker_client.run(board.params, board.db))
++    assert clock[0] < kanban_worker_client.OWNER_WAIT_S + 30
++
++
+ def test_an_owner_that_will_not_continue_falls_back_to_the_uncounted_requeue(board, clock, monkeypatch, capsys):
+     owner = _RestartingOwner(board, clock, refusal='kanban_continuation_unsafe')
+     monkeypatch.setattr(gateway_client, 'connect_gateway', owner.connect())
+@@ -349,6 +369,40 @@ def test_the_new_owner_answers_the_interrupted_tool_call_and_records_the_continu
+     assert pending_admission(board.db, board.params, board.request)[1] is None
+ 
+ 
++def test_a_retried_ask_racing_the_first_writes_one_interrupted_result(board, tmp_path, monkeypatch):
++    import threading
++    from gateway import session_kanban_continue as cont
++    from gateway.session_kanban_restart import record_restart_interruption
++    record_restart_interruption(_policy(board), checkpoint={'session_id': 's1', 'request_id': board.request,
++                                                            'admission_id': 'a1', 'cause': 'restart'})
++    _target, checkpoint = cont.pending_admission(board.db, board.params, board.request)
++    assert checkpoint is not None
++    db = _session_db(tmp_path, [{'role': m['role'], 'content': m['content'], 'tool_calls': m.get('tool_calls')}
++                                for m in _MID_TOOL])
++    real, both = cont._unanswered, threading.Barrier(2)
++
++    def unanswered(history):
++        calls = real(history)
++        try:
++            both.wait(timeout=1.5)  # both read the history before either writes, unless serialized
++        except threading.BrokenBarrierError:
++            pass
++        return calls
++    monkeypatch.setattr(cont, '_unanswered', unanswered)
++    import hermes_state_runtime
++    monkeypatch.setattr(hermes_state_runtime, 'find_session_admission',
++                        lambda *a, **k: {'status': 'terminal', 'outcome': 'interrupted', 'admission_id': 'a1'})
++    target = cont.continuation_request_id(board.request, checkpoint['checkpoint'])
++    kwargs = dict(principal_id='p', session_id='s1', context={'db': board.db, **board.params}, checkpoint=checkpoint,
++                  request_id=target, owner_db=str(board.home / 'state.db'))
++    threads = [threading.Thread(target=cont.prepare, args=(SimpleNamespace(db=db),), kwargs=kwargs) for _ in range(2)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join(30)
++    assert [m['tool_call_id'] for m in db.get_messages_as_conversation('s1') if m['role'] == 'tool'] == ['call-1']
++
++
+ @pytest.mark.parametrize('case', ['session_mismatch', 'admission_not_interrupted', 'session_empty', 'attempt_superseded',
+                                   'checkpoint_admission_mismatch', 'session_rotated'])
+ def test_an_unsafe_continuation_is_refused_and_booked(board, tmp_path, monkeypatch, case):
+-- 
+2.55.0
+

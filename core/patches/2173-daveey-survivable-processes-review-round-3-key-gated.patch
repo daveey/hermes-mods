@@ -1,0 +1,176 @@
+From 45424e200fab848bc640024cbe7d62a2aa577b30 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:13:12 +0000
+Subject: [PATCH] [daveey] survivable processes: review round 3 (key-gated
+ scope spare, Stop wins turn-wide, narrow hold-back)
+
+- gateway_shutdown spares a scoped persisted job only with the key on (key off: origin/main's rule,
+  only detached jobs are spared).
+- a pending user Stop keeps both the turn's and the tool threads' reason against every survivable
+  reason, so a later re-signal of the turn's reason (tool_executor) cannot revive a handoff, and
+  the turn record and the log agree.
+- the log reader holds back only a tail that could still become a wrapper marker line, so a
+  progress line without a newline shows on the first read.
+RED (fixes reverted, tests kept): 3 failed; GREEN: 25 passed.
+---
+ agent/interrupt_control.py                    | 21 ++++++++---------
+ .../tools/test_update_survivable_processes.py | 23 ++++++++++++++++++-
+ tools/process_registry.py                     |  4 ++--
+ tools/process_registry_output_log.py          | 12 ++++++----
+ 4 files changed, 41 insertions(+), 19 deletions(-)
+
+diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+index f969869e2c..ade478194f 100644
+--- a/agent/interrupt_control.py
++++ b/agent/interrupt_control.py
+@@ -23,8 +23,6 @@ _REASON_HARD_STOP = "explicit stop requested"
+ _REASON_NEW_MESSAGE = "user sent a new message"
+ _REASON_USER_INTERRUPT = "user interrupt"
+ USER_INTERRUPT_REASONS = frozenset({_REASON_HARD_STOP, _REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT})
+-# ``tool_reason`` the gateway's restart/shutdown stop passes (gateway.run._INTERRUPT_TOOL_REASON_GATEWAY_SHUTDOWN).
+-_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
+ # [daveey] ``tool_reason`` of the core-update pause's mid-tool cancel (agent/update_pause_cancel.py). It never
+ # relabels any interrupt already pending (a Stop or a redirect wins) and is not a user intervention.
+ _REASON_UPDATE_PAUSE = "hermes update pause"
+@@ -226,19 +224,18 @@ class InterruptControlMixin:
+ 
+         def _publish_interrupt_state() -> None:
+             nonlocal tool_interrupt_reason
+-            _pending = getattr(self, "_interrupt_requested", False)
+-            stop_pending = _pending and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS
+-            stop_reason = getattr(self, "_tool_interrupt_reason", None)
+-            # A shutdown stop never relabels a user Stop already pending (the user's Stop wins): the turn
+-            # records the first cause, so it is not announced as interrupted by the restart. A pending
++            # A shutdown/backend-exit/update stop never relabels a user Stop already pending (the user's Stop
++            # wins): the turn and its tool threads keep the first cause, so the turn is not announced as
++            # interrupted by the restart and a survivable terminal command still dies [daveey]. A pending
+             # redirect (a mid-request correction) is not a Stop: the restart drops it and is the cause.
+-            if not (_pending and tool_reason == _REASON_UPDATE_PAUSE) and not (
+-                    tool_reason == _REASON_GATEWAY_SHUTDOWN and stop_pending):
++            # The update pause's mid-tool cancel relabels no pending interrupt at all (a redirect wins too).
++            _pending = getattr(self, "_interrupt_requested", False)
++            if (tool_reason in SURVIVABLE_INTERRUPT_REASONS and _pending
++                    and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS):
++                tool_interrupt_reason = self._tool_interrupt_reason
++            elif not (_pending and tool_reason == _REASON_UPDATE_PAUSE):
+                 self._interrupt_message = message
+                 self._tool_interrupt_reason = tool_interrupt_reason
+-            if stop_pending and tool_reason in SURVIVABLE_INTERRUPT_REASONS:
+-                # Tool threads keep the Stop's reason: a survivable terminal command must still die. [daveey]
+-                tool_interrupt_reason = stop_reason
+             self._interrupt_requested = True
+             if tool_reason != _REASON_UPDATE_PAUSE:
+                 self._turn_user_intervened = True
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+index e1527968f0..787d3c8475 100644
+--- a/tests/tools/test_update_survivable_processes.py
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -126,11 +126,14 @@ def test_log_tail_drops_only_this_sessions_wrapper_markers():
+ 
+ @pytest.mark.parametrize("split", [1, 5, 9, 20, 40, 60, 75])
+ def test_log_reader_drops_a_marker_trailer_split_across_reads(tmp_path, monkeypatch, split):
++    _read_split_log(tmp_path, monkeypatch, split)
++
++
++def _read_split_log(tmp_path, monkeypatch, split, body="x" * 100 + "\nfg-done\n"):
+     """The reader reads 64 KiB at a time: a trailer straddling two reads must still go."""
+     import tools.process_registry_output_log as olog
+ 
+     pipe, cwd = "__HERMES_PIPE_181265ba766b__", "__HERMES_CWD_181265ba766b__"
+-    body = "x" * 100 + "\nfg-done\n"
+     data = (body + f"\n{pipe}0{pipe}\n\n{cwd}/home/u{cwd}\n").encode()
+     reads = [data[:len(body) + split], data[len(body) + split:]]
+     log = tmp_path / "proc_split.log"
+@@ -158,9 +161,20 @@ def test_log_reader_drops_a_marker_trailer_split_across_reads(tmp_path, monkeypa
+     session._reader_finish_requested.set()
+     finished = []
+     monkeypatch.setattr(registry, "_finish_exited", lambda s, code, **k: finished.append(code))
++    seen = []
++    real_ingest = registry._ingest_output
++    monkeypatch.setattr(registry, "_ingest_output", lambda s, text: seen.append(text) or real_ingest(s, text))
+     registry._log_reader_loop(session)
+     assert session.output_buffer == body
+     assert finished == [0]
++    return seen
++
++
++def test_log_reader_holds_back_only_a_possible_marker_start(tmp_path, monkeypatch):
++    """A progress line with no newline yet is shown from the first read, not held until the next newline."""
++    body = "start\nDownloading... 10%\rDownloading... 50%\nok\n"
++    seen = _read_split_log(tmp_path, monkeypatch, -(len("50%\nok\n")), body=body)
++    assert seen[0] == "start\nDownloading... 10%\rDownloading... "
+ 
+ 
+ def test_tee_wrapper_records_the_commands_own_exit_status(tmp_path):
+@@ -197,8 +211,11 @@ def test_a_shutdown_after_a_user_stop_keeps_the_stop_reason_on_the_tool_thread()
+         for later in sorted(surv.SURVIVABLE_INTERRUPT_REASONS):
+             stopped = agent()
+             request_hard_interrupt(stopped)  # the user's Stop
++            stop_reason = stopped._tool_interrupt_reason
+             request_hard_interrupt(stopped, "restart", tool_reason=later)
+             assert surv.survivable_interrupt_reason(tid) is None, later
++            # The turn keeps it too, so a later re-signal of the turn's reason (tool_executor) cannot revive it.
++            assert stopped._tool_interrupt_reason == stop_reason, later
+             set_interrupt(False, tid)
+         request_hard_interrupt(agent(), "restart", tool_reason="gateway shutdown")
+         assert surv.survivable_interrupt_reason(tid) == "gateway shutdown"
+@@ -220,6 +237,10 @@ def test_shutdown_sweep_spares_only_persisted_jobs_that_left_the_unit(tmp_path,
+         registry._running[s.id] = s
+     registry.kill_all(source="gateway_shutdown")
+     assert killed == [plain.id]
++    key["on"] = False  # key off: today's rule, a scoped (non-detached) persisted job is killed too
++    killed.clear()
++    registry.kill_all(source="gateway_shutdown")
++    assert sorted(killed) == sorted([plain.id, scoped.id])
+ 
+ 
+ def test_held_foreground_command_is_checkpointed_until_released(tmp_path, monkeypatch):
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 905f6180bb..3a197e0489 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -36,7 +36,7 @@ from tools.process_registry_notifications import (
+ from tools.process_registry_checkpoint import ProcessCheckpointMixin
+ from tools.process_registry_readopt import ProcessReadoptMixin
+ from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, spawn_output_log
+-from tools.process_registry_survivable import ProcessForegroundHoldMixin
++from tools.process_registry_survivable import ProcessForegroundHoldMixin, enabled as survivable_enabled
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+@@ -2452,7 +2452,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+                 s for s in (*self._running.values(), *self._finished.values())
+                 if (task_id is None or s.owner_task_id == task_id)
+                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+-                and not (s.persist_on_release and (lifecycle or (host_exit and (s.detached or s.systemd_unit))))
++                and not (s.persist_on_release and (lifecycle or (host_exit and (s.detached or (s.systemd_unit and survivable_enabled())))))
+             ]
+         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
+         return sum(
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index f201a4ef7a..0d06ab3000 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -120,11 +120,15 @@ class ProcessOutputLogMixin:
+         def ingest(text: str, final: bool = False) -> None:
+             nonlocal head_noise, held
+             if session.shell_markers:
+-                # A wrapper marker line (``\n<m>...<m>\n``) can straddle two reads: hold back from the last
+-                # newline, which an unfinished marker line always starts at, until the next read. [daveey]
++                # A wrapper marker line (``\n<m>...<m>\n``) can straddle two reads: an unfinished one is the
++                # text from the last newline, so hold that back while it could still become one. [daveey]
+                 text = strip_shell_markers(held + text, session.shell_markers)
+-                cut = len(text) if final else max(text.rfind("\n"), 0)
+-                text, held = text[:cut], text[cut:]
++                cut = text.rfind("\n")
++                tail = text[cut + 1:] if cut >= 0 and not final else None
++                if tail is not None and any(m.startswith(tail) or tail.startswith(m) for m in session.shell_markers):
++                    text, held = text[:cut], text[cut:]
++                else:
++                    held = ""
+             if not text:
+                 return
+             if head_noise:  # ``bash -lic`` startup warnings, as the pipe reader strips them
+-- 
+2.55.0
+

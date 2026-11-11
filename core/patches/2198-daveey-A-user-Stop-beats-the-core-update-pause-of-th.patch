@@ -1,0 +1,487 @@
+From d050ea9b63d1596418a803eae2da20f2b6210d6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:02:12 +0000
+Subject: [PATCH] [daveey] A user Stop beats the core-update pause of the turn
+ it stops
+
+A Stop that landed while the update-pause hook ran (or right after it returned)
+ended the turn as stopped, but the hook had stamped the interrupted-turn marker
+`core_update_pause` and told the session to keep it, so the restarted backend's
+startup sweep (and the in-place watcher) continued a turn the user had stopped.
+At a step boundary the turn was even announced "Paused for a Hermes update;
+continues automatically". Both ways a pause lands were affected: the boundary
+pause and the mid-tool cancel.
+
+Now the Stop wins atomically, all in the update_pause modules:
+- boundary_pause_hook declines (under history_lock) when a user interrupt is
+  pending on the agent; a backend exit's or lease takeover's interrupt is not one.
+- session.interrupt drops the running turn's paid pause (user_stop_wins, same
+  lock) before it retires the marker, so the marker retires like any stopped turn's.
+- the agent loop ends the turn as interrupted, without another model call, when
+  a user Stop is pending after the hook.
+- the turn's end announces/keeps the pause only while it still stands
+  (pause_stands); a turn whose hook paused it but which ended stopped drops it.
+
+Unchanged: a pause with no Stop resumes; an idle Stop after the turn ended
+paused keeps the paused request; a backend exit keeps the pause marker.
+
+Kanban: t_01a1c895eb0596b2 (follow-up of #1054)
+---
+ agent/turn_iteration_prep.py                  |   4 +
+ agent/update_pause_cancel.py                  |   6 +
+ .../test_update_pause_user_stop.py            | 297 ++++++++++++++++++
+ tui_gateway/methods_session_interrupt.py      |   2 +
+ tui_gateway/prompt_turn.py                    |   7 +-
+ tui_gateway/update_pause.py                   |  44 +++
+ 6 files changed, 356 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_user_stop.py
+
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index 1126b0e602..e5d3f2d306 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -418,6 +418,10 @@ def begin_iteration(
+     # installs ``step_boundary_pause`` per turn; a reason ends the turn as an interrupt it auto-continues
+     # on the updated backend. Persist first, so the next backend sees every finished tool result.
+     _pause = _pause or _step_boundary_pause(agent, messages, api_call_count)
++    if update_pause_cancel.user_stop_pending(agent):
++        interrupted = True  # a Stop landed while (or right after) the hook ran: it wins, the turn ends stopped
++        _turn_exit_reason = "interrupted_by_user"
++        return _verdict("break")
+     if _pause:
+         agent._persist_session(messages, conversation_history)
+         agent._step_boundary_paused = _pause
+diff --git a/agent/update_pause_cancel.py b/agent/update_pause_cancel.py
+index aba0137f3d..25380d45f7 100644
+--- a/agent/update_pause_cancel.py
++++ b/agent/update_pause_cancel.py
+@@ -103,6 +103,12 @@ def take_pending(agent: Any) -> bool:
+     return bool(getattr(agent, "_interrupt_requested", False)) and interrupt_issuer(agent) == _ISSUER
+ 
+ 
++def user_stop_pending(agent: Any) -> bool:
++    """A user's interrupt (Stop, or a new message) is pending on the agent. It beats a core-update pause of the
++    turn it stops: that turn ends stopped and nothing continues it after the update (t_01a1c895eb0596b2)."""
++    return bool(getattr(agent, "_interrupt_requested", False)) and interrupt_issuer(agent) is None
++
++
+ def reset(agent: Any) -> None:
+     """Turn start: no call of an earlier turn (an abandoned worker) is in flight, and no cancel is pending."""
+     slots = _slots(agent)
+diff --git a/tests/tui_gateway/test_update_pause_user_stop.py b/tests/tui_gateway/test_update_pause_user_stop.py
+new file mode 100644
+index 0000000000..ea33c89b23
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_user_stop.py
+@@ -0,0 +1,297 @@
++"""[daveey] t_01a1c895eb0596b2: a user Stop beats the core-update pause of the turn it stops.
++
++A Stop that landed while the pause hook ran (and succeeded) ended the turn as stopped, but the hook had
++already stamped the interrupted-turn marker ``reason: core_update_pause`` and told the session to keep it,
++so the restarted backend's startup sweep continued a turn the user had stopped. The same held for a Stop
++right after the hook returned, and for both ways a pause lands: at a step boundary and after a mid-tool
++cancel.
++
++These drive the gateway's real turn (``_run_prompt_submit`` on its own run thread) with a real ``AIAgent``,
++the real hook and mid-tool watcher, and the real ``session.interrupt`` RPC as the Stop; only the model and
++the tool bodies are fakes. The fresh backend is the real startup sweep over the marker file.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tests.tui_gateway import test_update_pause_mid_tool as mt
++from tui_gateway import server
++from tui_gateway import startup_resume as sr
++from tui_gateway import update_pause as up
++from tui_gateway.contracts.registry import check_payload
++from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker, record_turn_start
++
++CFG = mt.CFG
++SID = "ui-sid"
++KEY = "session-key"
++home = mt.home
++_quiet = mt._quiet
++
++
++@pytest.fixture()
++def env(monkeypatch, tmp_path, home):
++    frames: list = []
++    watchers: list = []
++
++    def _emit(event, sid, payload=None, *a, **k):
++        check_payload(event, payload)
++        frames.append((event, payload))
++
++    for name, value in {"_emit": _emit, "_wire_callbacks": lambda sid: None,
++                        "_sync_agent_model_with_config": lambda sid, s: None,
++                        "_session_cwd": lambda s: str(tmp_path), "_register_session_cwd": lambda s: None,
++                        "_tts_stream_begin": lambda: None, "_sync_session_key_after_compress": lambda *a, **k: None,
++                        "_get_usage": lambda a: {}}.items():
++        monkeypatch.setattr(server, name, value)
++    monkeypatch.setattr(up, "start_in_place_watcher", lambda sid, session, key: watchers.append((sid, key)))
++    yield types.SimpleNamespace(frames=frames, watchers=watchers, home=home, tmp_path=tmp_path)
++    server._sessions.pop(SID, None)
++
++
++def _user_stop():
++    """The Desktop's Stop button: the real ``session.interrupt`` RPC."""
++    reply = server._methods["session.interrupt"]("rid-stop", {"session_id": SID, "origin": "stop_button"})
++    assert reply.get("result", {}).get("status") == "interrupted", reply
++
++
++def _stop_while_the_hook_runs(monkeypatch):
++    """The Stop lands inside the hook, after its last marker write and before it returns its verdict."""
++    real, fired = up._drainer_lock, []
++
++    def _drainer_lock(session):
++        if not fired:
++            fired.append(1)
++            _user_stop()
++        return real(session)
++
++    monkeypatch.setattr(up, "_drainer_lock", _drainer_lock)
++    return fired
++
++
++def _stop_right_after_the_hook(monkeypatch):
++    """The Stop lands after the hook returned its pause verdict, before the agent loop acts on it."""
++    real, fired = up.boundary_pause_hook, []
++
++    def _boundary_pause_hook(session, marker_key):
++        hook = real(session, marker_key)
++
++        def _hook():
++            verdict = hook()
++            if verdict and not fired:
++                fired.append(verdict)
++                _user_stop()
++            return verdict
++
++        return _hook
++
++    monkeypatch.setattr(up, "boundary_pause_hook", _boundary_pause_hook)
++    return fired
++
++
++STOPS = {"during_hook": _stop_while_the_hook_runs, "after_hook": _stop_right_after_the_hook}
++
++
++def _turn(env, monkeypatch, path):
++    """One gateway turn that meets a pause request: ``boundary`` (a quick tool call, the pause lands at the
++    step boundary after it) or ``mid_tool`` (a long call the watcher cancels after the grace)."""
++    agent = mt._make_agent(env.tmp_path, "job")
++
++    def _tool(name, *a, **k):
++        mt._request_pause(env.home)  # the drain window asks while the turn is mid-step (admission is past)
++        return mt._long_call() if path == "mid_tool" else "quick result"
++
++    monkeypatch.setattr("model_tools.handle_function_call", _tool)
++    agent.client.chat.completions.create.side_effect = [mt._response(mt._call("job", "call_1")), mt._response(),
++                                                        mt._response()]
++    session = {"agent": agent, "session_key": KEY, "history": [], "history_lock": threading.RLock(),
++               "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
++               "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++               "profile_home": str(env.home)}
++    server._sessions[SID] = session
++    server._run_prompt_submit("rid", SID, session, "run the long job")
++    thread = session.get("_run_thread")
++    if thread is not None:
++        thread.join(60)
++        assert not thread.is_alive()
++    return session, agent
++
++
++def _backend_exits(home):
++    """The update restarts the backend: the marker's writer is gone."""
++    path = home / "desktop" / "interrupted_turns.json"
++    if not path.exists():
++        return
++    entries = json.loads(path.read_text())
++    for entry in entries.values():
++        entry["writer_pid"] = 2 ** 22 - 3
++        entry.pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++
++
++def _fresh_backend_continues(env, monkeypatch) -> list[str]:
++    """What a fresh backend's startup sweep submits for the session."""
++    _backend_exits(env.home)
++    af.clear_pause_request(env.home)
++    af.clear_hold(env.home)
++    pending = [r["session_key"] for r in sr.pending_resumes(env.home, CFG)]
++    submitted: list[str] = []
++    monkeypatch.setattr(server.threading, "Thread", mt._InlineThread)
++    monkeypatch.setattr(server, "_start_agent_build", lambda sid, s: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda s, rid, timeout=30.0: None)
++    monkeypatch.setattr(server, "_run_prompt_submit", lambda rid, sid, s, text, **kw: submitted.append(text))
++    fresh = {"agent": types.SimpleNamespace(), "session_key": KEY, "history": [],
++             "history_lock": threading.RLock(), "running": False}
++    scheduled = server._maybe_schedule_auto_continue("fresh-sid", fresh, KEY)
++    assert (scheduled is not None) == bool(submitted) == bool(pending)
++    return submitted
++
++
++def _complete(env) -> dict:
++    (payload,) = [p for e, p in env.frames if e == "message.complete"]
++    return payload
++
++
++@pytest.mark.parametrize("stop", sorted(STOPS))
++@pytest.mark.parametrize("path", ["boundary", "mid_tool"])
++def test_a_user_stop_around_a_successful_pause_hook_is_not_continued_after_the_restart(env, monkeypatch, path, stop):
++    fired = STOPS[stop](monkeypatch)
++    session, agent = _turn(env, monkeypatch, path)
++
++    assert fired  # the Stop really landed around a pause hook that had stamped the marker
++    assert agent.client.chat.completions.create.call_count == 1  # the stopped turn never calls the model again
++    complete = _complete(env)
++    assert complete["status"] == "interrupted" and not complete.get("paused_for_update")
++    assert up.PAUSE_STATUS_TEXT not in (complete.get("text") or "")  # never announced as "continues automatically"
++    assert env.watchers == []  # nothing is left to continue it in place either
++    assert not session.get("_update_pause_marker_key")
++    assert read_turn_marker(env.home, KEY) is None
++    assert _fresh_backend_continues(env, monkeypatch) == []
++
++
++@pytest.mark.parametrize("path", ["boundary", "mid_tool"])
++def test_a_pause_with_no_stop_still_resumes_after_the_restart(env, monkeypatch, path):
++    session, agent = _turn(env, monkeypatch, path)
++
++    assert agent.client.chat.completions.create.call_count == 1
++    complete = _complete(env)
++    assert complete.get("paused_for_update") is True and up.PAUSE_STATUS_TEXT in complete["text"]
++    assert env.watchers == [(SID, KEY)]
++    assert session["_update_pause_marker_key"] == KEY
++    marker = read_turn_marker(env.home, KEY)
++    assert marker["reason"] == up.PAUSE_REASON and marker["pauses"] == 1 and marker["attempts"] == 0
++    assert _fresh_backend_continues(env, monkeypatch) == [up.pause_note("run the long job")]
++
++
++def test_an_idle_stop_after_the_pause_keeps_the_paused_turn(env, monkeypatch):
++    """Unchanged: once the turn has ended as paused, a Stop on the idle chat stops nothing and the paused
++    request still continues (only a Stop of the running turn beats its pause)."""
++    session, _agent = _turn(env, monkeypatch, "boundary")
++    assert session["running"] is False
++    _user_stop()
++    assert session["_update_pause_marker_key"] == KEY
++    assert _fresh_backend_continues(env, monkeypatch) == [up.pause_note("run the long job")]
++
++
++# ── The pieces, one condition each ───────────────────────────────────────────────────────────────────
++
++
++class _Agent:
++    def __init__(self, reason=None):
++        self._interrupt_requested = reason is not None
++        self._tool_interrupt_reason = reason
++
++
++def _paused_session(home, agent=None, **extra):
++    record_turn_start(home, KEY, "p")
++    assert mark_turn_paused(home, KEY, up.PAUSE_REASON)
++    return {"agent": agent or _Agent(), "session_key": KEY, "profile_home": str(home),
++            "history_lock": threading.RLock(), "_update_pause_marker_key": KEY, "_active_turn_marker_key": KEY,
++            **extra}
++
++
++@pytest.mark.parametrize("reason, stopped", [
++    ("explicit stop requested", True), ("user interrupt", True), ("user sent a new message", True),
++    (None, False), ("hermes update pause", False), ("backend exit", False), ("lease takeover", False)])
++def test_only_a_pending_user_interrupt_counts_as_a_stop(reason, stopped):
++    assert up.user_stop_pending({"agent": _Agent(reason)}) is stopped
++    assert up.user_stop_pending({}) is False
++
++
++@pytest.mark.parametrize("reason, paused", [("explicit stop requested", None), ("backend exit", up.PAUSE_REASON),
++                                            (None, up.PAUSE_REASON)])
++def test_the_hook_declines_only_for_a_user_stop(home, reason, paused):
++    """A backend exit's interrupt (or none) leaves the pause standing: that turn is still continued."""
++    record_turn_start(home, KEY, "p")
++    mt._request_pause(home)
++    session = {"agent": _Agent(reason), "session_key": KEY, "profile_home": str(home),
++               "history_lock": threading.RLock()}
++    assert up.boundary_pause_hook(session, KEY)() == paused
++    assert session.get("_update_pause_marker_key") == (KEY if paused else None)
++
++
++def test_a_stop_pending_before_the_hook_stamps_nothing_and_stops_no_job(home, monkeypatch):
++    record_turn_start(home, KEY, "p")
++    mt._request_pause(home)
++    monkeypatch.setattr(up, "stop_owned_jobs_for_update_pause", lambda *a, **k: pytest.fail("stopped a job"))
++    session = {"agent": _Agent("explicit stop requested"), "session_key": KEY, "profile_home": str(home),
++               "history_lock": threading.RLock()}
++    assert up.boundary_pause_hook(session, KEY)() is None
++    marker = read_turn_marker(home, KEY)
++    assert marker.get("reason") != up.PAUSE_REASON and not marker.get("pauses")
++
++
++def test_a_stop_of_the_running_turn_drops_its_pause(home):
++    session = _paused_session(home, running=True)
++    assert up.user_stop_wins(session) is True
++    assert "_update_pause_marker_key" not in session
++    server._retire_turn_marker(session, KEY)  # what the Stop (or the turn's end) does next
++    assert read_turn_marker(home, KEY) is None
++
++
++def test_a_stop_never_drops_another_turns_pause(home):
++    """The paused turn ended and a synthesized turn (no marker of its own) runs over its marker: stopping
++    that turn must not drop the paused request."""
++    session = _paused_session(home, running=True)
++    session.pop("_active_turn_marker_key")
++    assert up.user_stop_wins(session) is False
++    assert session["_update_pause_marker_key"] == KEY
++    server._retire_turn_marker(session, KEY)
++    assert read_turn_marker(home, KEY)["reason"] == up.PAUSE_REASON
++
++
++def test_pause_stands_only_while_the_session_keeps_this_turns_marker(home):
++    paused = {"paused_for_update": up.PAUSE_REASON}
++    session = _paused_session(home)
++    assert up.pause_stands(session, KEY, paused) is True
++    assert up.pause_stands(session, "other-key", paused) is False
++    assert session["_update_pause_marker_key"] == KEY
++    assert up.pause_stands(_paused_session(home), KEY, {"interrupted": True}) is False
++    assert up.pause_stands(_paused_session(home), KEY, None) is False
++    session.pop("_update_pause_marker_key")  # a Stop that won dropped it
++    assert up.pause_stands(session, KEY, paused) is False
++
++
++def test_a_backend_exit_keeps_the_pause_of_a_turn_it_interrupted(home):
++    """Unchanged: the exit's own interrupt is not a Stop, so the paused turn is still continued."""
++    session = _paused_session(home, _exit_keeps_turn_marker=True)
++    assert up.pause_stands(session, KEY, {"interrupted": True}) is False
++    assert session["_update_pause_marker_key"] == KEY
++    server._retire_turn_marker(session, KEY)
++    assert read_turn_marker(home, KEY)["reason"] == up.PAUSE_REASON
++
++
++def test_a_turn_that_did_not_end_paused_does_not_keep_the_pause_marker(home):
++    """The hook paid out but the turn ended otherwise (a Stop won in the agent loop): the turn's end drops
++    the session's claim so its marker retires like any stopped turn's."""
++    session = _paused_session(home)
++    assert up.pause_stands(session, KEY, {"interrupted": True}) is False
++    assert "_update_pause_marker_key" not in session
++    other = _paused_session(home, _update_pause_marker_key="earlier-turn")
++    assert up.pause_stands(other, KEY, {"interrupted": True}) is False
++    assert other["_update_pause_marker_key"] == "earlier-turn"  # not this turn's claim to drop
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index e84650bbfe..f18390316c 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -220,6 +220,8 @@ def _(rid, params: dict) -> dict:
+         # Retire the crash-recovery marker NOW: until the run thread's finally, a backend exit looks like a crash
+         # and session.resume auto-continues the turn the user just stopped (the extra key covers compression
+         # rotating session_key mid-turn).
++        from tui_gateway.update_pause import user_stop_wins
++        user_stop_wins(session)  # [daveey] a Stop of the running turn beats the update pause its hook already paid
+         with session["history_lock"]:
+             active_marker_key = str(session.pop("_active_turn_marker_key", "") or "")
+         _retire_turn_marker(session, active_marker_key)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 638a54b548..aa2c4a3037 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1431,13 +1431,13 @@ def _run_admitted_prompt(
+                 display_metadata, turn_author, text)
+             status_note = _absorb_turn_result(
+                 sid, session, st, text, display_kind, display_metadata)
++            from tui_gateway import update_pause  # [daveey] before the marker is retired: a user Stop beats the pause
++            paused_for_update = update_pause.pause_stands(session, st.marker_key, st.result)
+             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
+             if status == "error":  # [daveey] module calls: harnesses rebind this body with minimal globals
+                 automation_replay.plan_for_turn(st, st.result)
+-            paused_for_update = isinstance(st.result, dict) and bool(st.result.get("paused_for_update"))
+             if paused_for_update:
+-                from tui_gateway.update_pause import announce_pause
+-                announce_pause(sid, payload)
++                update_pause.announce_pause(sid, payload)
+             # [daveey] A client Stop ended this turn: persist "Stopped by <login>" so the chat says why it
+             # went quiet (methods_session_interrupt._record_stop_notice; a no-op for any other ending).
+             _record_stop_notice(session, status)
+@@ -1453,7 +1453,6 @@ def _run_admitted_prompt(
+             automation_replay.schedule_for_turn(session, st)
+             if paused_for_update:
+                 # The new backend continues it; if no update replaces this one, continue it here.
+-                from tui_gateway import update_pause
+                 update_pause.start_in_place_watcher(sid, session, st.marker_key)
+             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+             if status == "complete":
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 087c2f97a9..629d493d90 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -241,6 +241,8 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+     def hook() -> str | None:
+         if not marker_key or not pause_requested(session):
+             return None
++        if user_stop_pending(session):  # before the marker is stamped or any job stopped; rechecked below
++            return None
+         why = not_resumable_reason(session, marker_key)
+         if why:
+             if not declined:
+@@ -270,6 +272,9 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+             return None
+         drainer_lock = _drainer_lock(session)  # request disappears when the window ends
+         with session["history_lock"]:
++            if user_stop_pending(session):  # under the lock user_stop_wins takes: one of the two sees the other
++                logger.info("core-update pause: session %s was stopped by the user; not pausing it", marker_key)
++                return None
+             session["_update_pause_marker_key"] = marker_key
+             session["_update_pause_drainer_lock"] = drainer_lock
+             session.pop("_update_pause_parked_stamp", None)  # a new pause starts unparked
+@@ -279,6 +284,45 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+     return hook
+ 
+ 
++def user_stop_pending(session: dict) -> bool:
++    """A user's Stop is pending on the session's agent (never a backend exit's or a lease takeover's interrupt)."""
++    from agent.update_pause_cancel import user_stop_pending as pending
++    return pending(session.get("agent"))
++
++
++def _drop_pause(session: dict) -> None:
++    """Under ``history_lock``: the session no longer keeps its turn's marker for a continuation."""
++    session.pop("_update_pause_marker_key", None)
++    session.pop("_update_pause_drainer_lock", None)
++
++
++def user_stop_wins(session: dict) -> bool:
++    """[daveey] t_01a1c895eb0596b2: a user Stop of the RUNNING turn drops the pause its hook already paid, so
++    the marker (stamped ``core_update_pause``) retires like any stopped turn's and neither the next backend nor
++    the in-place watcher continues what the user stopped. Call after the interrupt reached the agent and before
++    the Stop retires the marker. Only that turn's own pause: a pause whose turn already ended, or an earlier
++    turn's under a synthesized turn, is kept. True when a pause was dropped."""
++    with session["history_lock"]:
++        key = session.get("_update_pause_marker_key")
++        if not key or not session.get("running") or key != session.get("_active_turn_marker_key"):
++            return False
++        _drop_pause(session)
++    logger.info("core-update pause: session %s was stopped by the user; its pause is dropped", key)
++    return True
++
++
++def pause_stands(session: dict, marker_key: str, result: Any) -> bool:
++    """The turn's end: it ended paused for the update AND the session still keeps this turn's marker (a Stop
++    that won dropped it). A turn whose hook paused it but which did not end paused (the Stop won in the agent
++    loop) drops the session's keep here, before its marker is retired."""
++    with session["history_lock"]:
++        mine = bool(marker_key) and session.get("_update_pause_marker_key") == marker_key
++        stands = mine and isinstance(result, dict) and bool(result.get("paused_for_update"))
++        if mine and not stands and not session.get("_exit_keeps_turn_marker"):
++            _drop_pause(session)
++    return stands
++
++
+ def interrupted_tool_result(at: float | None = None) -> str:
+     """The persisted result of a tool call the update cancelled (UTC, whole seconds)."""
+     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now() if at is None else at))
+-- 
+2.55.0
+

@@ -1,0 +1,980 @@
+From 8c50b583a33c8b1063aec9c8fa9635671b69a9d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:18:19 +0000
+Subject: [PATCH] [daveey] terminal processes survive a gateway restart in
+ their own scope and reattach
+
+t_01a1c7d04d9046d2 (part C of t_01a1c7c587142bb7). A hub core update restarts the gateway/backend
+unit (KillMode=control-group): every terminal child in its cgroup died with it, e.g. a background
+quick_check on 2026-11-10. persist_on_release jobs already left the unit and were re-attached;
+ordinary background jobs and long foreground commands were not.
+
+New config key terminal.update_survivable_processes (default false; Linux with a usable
+systemd-run --user --scope only):
+- background=true jobs default to persist_on_release (explicit false wins; pty=true jobs keep their
+  PTY): own scope, file-backed log + exit file, re-attached by pid + start time by the next
+  backend, completion delivered once.
+- foreground commands with an effective timeout > 60 s run in their own scope with output teed to
+  such a log, held in processes.json while the tool waits. An interrupt with tool_reason
+  "hermes update pause" / "gateway shutdown" / "backend exit" converts the command into a
+  registered background job (notify on exit) and the result ends with
+  "process continues as <session_id>". A user Stop, timeout or any other interrupt kills it as
+  before; a yield-to-background reuses the same scope/log.
+- key on without a scope: today's behaviour, one WARNING.
+
+Proof (hermes-hub, real transient user service stopped like the gateway):
+tests/tools/test_update_survivable_processes.py 13/13 GREEN; with the wiring reverted 6 FAIL
+(background job dead after the owner stop, foreground command killed). Key-off neighbours
+(persist/readopt/registry/terminal/interrupt/yield suites) 232 passed.
+---
+ hermes_cli/config_defaults.py                 |   4 +-
+ .../tools/test_update_survivable_processes.py | 312 ++++++++++++++++++
+ tools/environments/base.py                    |  38 ++-
+ tools/environments/local.py                   |   7 +-
+ tools/interrupt.py                            |   6 +
+ tools/process_registry.py                     |   5 +-
+ tools/process_registry_checkpoint.py          |   7 +-
+ tools/process_registry_output_log.py          |  11 +
+ tools/process_registry_survivable.py          | 263 +++++++++++++++
+ tools/terminal_tool.py                        |  41 ++-
+ website/docs/user-guide/configuration.md      |  15 +
+ 11 files changed, 689 insertions(+), 20 deletions(-)
+ create mode 100644 tests/tools/test_update_survivable_processes.py
+ create mode 100644 tools/process_registry_survivable.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index e4bd90742b..06403059c4 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -311,9 +311,9 @@ DEFAULT_CONFIG = {
+         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.
+         "font_family": "",
+         "timeout": 180,
+-        # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons). 0
+-        # = SIGTERM only.
++        # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons); 0 = SIGTERM only.
+         "daemon_term_grace_seconds": 2.0,
++        "update_survivable_processes": False,  # survive a restart (tools/process_registry_survivable.py)
+         # Max seconds a one-shot CLI run (-q/-Q/-z) lingers for tracked notify_on_complete
+         # background processes to finish. The dying parent owns their stdout pipes, so exiting
+         # immediately kills the delivery (e.g. Bot Mode handoff replies via message_agent /
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+new file mode 100644
+index 0000000000..0f6b560fd0
+--- /dev/null
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -0,0 +1,312 @@
++"""terminal.update_survivable_processes: terminal processes outlive a gateway/backend restart. [daveey]
++
++t_01a1c7d04d9046d2. A hub core update restarts the gateway/backend unit (KillMode=control-group), which killed
++every terminal child in it (a background quick_check, 2026-11-10). With the key on, a background job and a long
++foreground command run in their own transient scope; the next backend re-attaches them and delivers the
++completion to the owning session once. Integration tests run an owner in a real transient user service and stop
++it the way systemd stops the gateway (SIGTERM to the whole cgroup).
++"""
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++import time
++import uuid
++from pathlib import Path
++
++import pytest
++
++import tools.process_registry as pr
++import tools.process_registry_survivable as surv
++from tests.waiting import wait_until
++from tools.interrupt import set_interrupt
++from tools.process_registry import ProcessRegistry
++
++REPO = str(Path(pr.__file__).resolve().parents[1])
++
++
++# ── unit ─────────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture
++def key(monkeypatch):
++    """Set the config key (and pretend Linux + a usable scope) without touching config.yaml."""
++    state = {"on": True, "scope": True}
++    monkeypatch.setattr(pr, "_IS_LINUX", True)
++    monkeypatch.setattr(pr.ProcessRegistry, "_config_value",
++                        staticmethod(lambda section, k, fallback: state["on"] if k == surv.CONFIG_KEY else fallback))
++    monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: state["scope"])
++    monkeypatch.setattr(surv.shutil, "which", lambda name: f"/usr/bin/{name}")
++    monkeypatch.setattr(surv, "_warned", False)
++    return state
++
++
++def test_background_jobs_default_to_persist_only_with_the_key_on(key):
++    assert surv.default_persist(None, "local") is True
++    assert surv.default_persist(False, "local") is False, "an explicit persist_on_release=false must win"
++    assert surv.default_persist(True, "local") is True
++    assert surv.default_persist(None, "local", pty=True) is False, "a PTY job keeps its PTY"
++    assert surv.default_persist(None, "docker") is False
++    key["on"] = False
++    assert surv.default_persist(None, "local") is False
++    assert surv.default_persist(True, "local") is True
++
++
++def test_key_on_without_a_scope_keeps_todays_behaviour_and_warns_once(key, caplog):
++    key["scope"] = False
++    with caplog.at_level("WARNING", logger="tools.process_registry"):
++        assert surv.default_persist(None, "local") is False
++        assert surv.usable() is False
++    warnings = [r for r in caplog.records if surv.CONFIG_KEY in r.getMessage()]
++    assert len(warnings) == 1
++
++
++def test_key_off_or_non_linux_is_disabled(key, monkeypatch):
++    key["on"] = "false"
++    assert surv.enabled() is False
++    key["on"] = "true"
++    assert surv.enabled() is True
++    monkeypatch.setattr(pr, "_IS_LINUX", False)
++    assert surv.enabled() is False
++
++
++def test_foreground_eligibility_needs_local_env_and_a_timeout_above_60s(key):
++    from tools.environments.local import LocalEnvironment
++
++    env = LocalEnvironment.__new__(LocalEnvironment)
++    assert surv.foreground_eligible(env, "local", 61)
++    assert not surv.foreground_eligible(env, "local", 60)
++    assert not surv.foreground_eligible(env, "local", "x")
++    assert not surv.foreground_eligible(object(), "local", 600)
++    assert not surv.foreground_eligible(env, "docker", 600)
++    key["on"] = False
++    assert not surv.foreground_eligible(env, "local", 600)
++
++
++def test_only_update_and_shutdown_interrupts_are_survivable():
++    import threading
++
++    tid = threading.get_ident()
++    try:
++        for reason in ("hermes update pause", "gateway shutdown", "backend exit"):
++            set_interrupt(True, tid, reason=reason)
++            assert surv.survivable_interrupt_reason(None, tid) == reason
++        for reason in ("user interrupt", "new message", "gateway inactivity watchdog", None):
++            set_interrupt(False, tid)
++            set_interrupt(True, tid, reason=reason)
++            assert surv.survivable_interrupt_reason(tid) is None, reason
++    finally:
++        set_interrupt(False, tid)
++
++
++def test_log_tail_drops_the_foreground_wrappers_markers():
++    from tools.process_registry_output_log import strip_shell_markers
++
++    text = ("fg-done\n\n__HERMES_PIPE_181265ba766b__0__HERMES_PIPE_181265ba766b__\n\n"
++            "__HERMES_CWD_181265ba766b__/home/u__HERMES_CWD_181265ba766b__\n")
++    assert strip_shell_markers(text) == "fg-done\n"
++    assert strip_shell_markers("plain __HERMES_ text\n") == "plain __HERMES_ text\n"
++
++
++def test_tee_wrapper_records_the_commands_own_exit_status(tmp_path):
++    log = tmp_path / "proc_x.log"
++    script = surv.tee_wrapped("echo out; echo err >&2; exit 7", log)
++    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, check=False)
++    assert proc.returncode == 7
++    assert proc.stdout == "out\nerr\n"
++    assert log.read_text() == "out\nerr\n"
++    assert (tmp_path / "proc_x.exit").read_text().strip() == "7"
++
++
++def test_held_foreground_command_is_checkpointed_until_released(tmp_path, monkeypatch):
++    """A crash mid-wait must leave the command to the next owner: it is in processes.json while held."""
++    monkeypatch.setattr(pr, "_checkpoint_path", lambda: tmp_path / "processes.json")
++    registry = ProcessRegistry()
++    proc = subprocess.Popen(["sleep", "30"])
++    try:
++        session = registry._new_session("sleep 30", "t", "t", "k", str(tmp_path), persist_on_release=True)
++        session.pid, session.host_start_time = proc.pid, registry._safe_host_start_time(proc.pid)
++        session.output_log = str(tmp_path / f"{session.id}.log")
++        registry.hold_foreground(session)
++        entries = json.loads((tmp_path / "processes.json").read_text())
++        assert [e["session_id"] for e in entries] == [session.id]
++        assert registry.get(session.id) is None, "a held command is not a listed background job"
++        registry.release_foreground(session.id)
++        assert json.loads((tmp_path / "processes.json").read_text()) == []
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++# ── integration (real transient user service, stopped like the gateway) ──────
++
++
++def _user_systemd() -> bool:
++    return bool(pr._IS_LINUX and shutil.which("systemd-run") and pr._systemd_run_user_scope_available())
++
++
++OWNER = """
++import json, os, sys, threading, time
++sys.path.insert(0, {repo!r})
++from tools.interrupt import set_interrupt
++from tools.terminal_tool import _handle_terminal
++args, reason, out = json.loads({args!r}), {reason!r}, {out!r}
++box = {{}}
++def run():
++    box["result"] = json.loads(_handle_terminal(args, task_id="survive-task"))
++t = threading.Thread(target=run)
++t.start()
++if not args.get("background"):
++    time.sleep(3)
++    set_interrupt(True, t.ident, reason=reason)
++t.join(90)
++open(out + ".tmp", "w").write(json.dumps(box.get("result")))
++os.replace(out + ".tmp", out)
++time.sleep(600)
++"""
++
++
++def _alive(pid: int) -> bool:
++    try:
++        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
++    except OSError:
++        return False
++    return state != "Z"
++
++
++def _run_owner(tmp_path, monkeypatch, args: dict, *, key_on: bool, reason=None) -> dict:
++    """Start the terminal tool in a transient user service (as the gateway runs), get its tool result, then
++    stop the service (SIGTERM to its whole cgroup, KillMode=control-group). Returns the tool result."""
++    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
++    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_PROBED_AT", 0.0)
++    home = tmp_path / "home"
++    home.mkdir()
++    (home / "config.yaml").write_text(f"terminal:\n  update_survivable_processes: {str(key_on).lower()}\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    out = tmp_path / "result.json"
++    script = tmp_path / "owner.py"
++    script.write_text(OWNER.format(repo=REPO, args=json.dumps(args), reason=reason, out=str(out)))
++    unit = f"hermes-test-survive-owner-{uuid.uuid4().hex[:8]}.service"
++    env = pr.systemd_user_bus_env() or dict(os.environ)
++    subprocess.run(["systemd-run", "--user", "--quiet", "--collect", "--unit", unit,
++                    "--property", "KillMode=control-group", f"--setenv=HERMES_HOME={home}",
++                    "--setenv=HERMES_SESSION_KEY=20261111_000000_survive",
++                    f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
++                    sys.executable, str(script)], check=True, timeout=15, env=env)
++    try:
++        wait_until(out.exists, timeout=90, what="the owner's tool result")
++        result = json.loads(out.read_text())
++    finally:
++        # ``stop`` returns once systemd has SIGTERMed (then SIGKILLed) the unit's whole cgroup.
++        subprocess.run(["systemctl", "--user", "stop", unit], check=False, timeout=60, env=env)
++    return result
++
++
++def _cleanup(pid):
++    if pid and _alive(pid):
++        os.killpg(pid, 9) if os.getpgid(pid) == pid else os.kill(pid, 9)
++
++
++def _completions(registry: ProcessRegistry, *, settle: float) -> list:
++    """Drain the completion queue until one event arrived, then for ``settle`` more seconds (exactly-once)."""
++    import queue
++
++    events: list = [registry.completion_queue.get(timeout=60)]
++    end = time.monotonic() + settle
++    while (left := end - time.monotonic()) > 0:
++        try:
++            events.append(registry.completion_queue.get(timeout=left))
++        except queue.Empty:
++            break
++    return [e for e in events if e.get("type", "completion") == "completion"]
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++def test_background_job_survives_owner_stop_and_reattaches_with_one_completion(tmp_path, monkeypatch):
++    result = _run_owner(tmp_path, monkeypatch, {"command": "sleep 6; echo survived-done", "background": True,
++                                                "notify": True}, key_on=True)
++    pid = result["pid"]
++    try:
++        assert result.get("persist_on_release") is True
++        assert _alive(pid), "stopping the owner's unit killed its background job"
++        registry = ProcessRegistry()
++        assert registry.recover_from_checkpoint() == 1
++        sid = result["session_id"]
++        assert registry.poll(sid)["status"] == "running"
++        events = _completions(registry, settle=8)
++        assert [(e["session_id"], e["exit_code"]) for e in events] == [(sid, 0)]
++        assert "survived-done" in events[0]["output"]
++        assert "survived-done" in registry.read_log(sid)["output"]
++    finally:
++        _cleanup(pid)
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++def test_reattached_job_can_be_killed(tmp_path, monkeypatch):
++    result = _run_owner(tmp_path, monkeypatch, {"command": "sleep 300", "background": True, "notify": True},
++                        key_on=True)
++    pid = result["pid"]
++    try:
++        assert _alive(pid)
++        registry = ProcessRegistry()
++        assert registry.recover_from_checkpoint() == 1
++        assert registry.kill_process(result["session_id"])["status"] in ("killed", "already_exited")
++        wait_until(lambda: not _alive(pid), timeout=20, what="the killed job to exit")
++    finally:
++        _cleanup(pid)
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++def test_key_off_background_job_dies_with_its_owner(tmp_path, monkeypatch):
++    result = _run_owner(tmp_path, monkeypatch, {"command": "sleep 60", "background": True, "notify": True},
++                        key_on=False)
++    pid = result["pid"]
++    try:
++        assert "persist_on_release" not in result
++        wait_until(lambda: not _alive(pid), timeout=20, what="the job to die with its owner (unchanged)")
++    finally:
++        _cleanup(pid)
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++def test_long_foreground_command_outlives_a_shutdown_interrupt(tmp_path, monkeypatch):
++    result = _run_owner(tmp_path, monkeypatch, {"command": "sleep 8; echo fg-done", "timeout": 120},
++                        key_on=True, reason="gateway shutdown")
++    pid = result.get("pid") or 0
++    try:
++        sid = result["session_id"]
++        assert result["status"] == "continues_in_background"
++        assert result["output"].splitlines()[-1] == f"process continues as {sid}"
++        assert _alive(pid), "the interrupted foreground command did not survive its owner's stop"
++        registry = ProcessRegistry()
++        assert registry.recover_from_checkpoint() == 1
++        events = _completions(registry, settle=5)
++        assert [(e["session_id"], e["exit_code"]) for e in events] == [(sid, 0)]
++        assert events[0]["output"].strip() == "fg-done"
++    finally:
++        _cleanup(pid)
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++def test_user_stop_still_kills_a_long_foreground_command(tmp_path, monkeypatch):
++    marker = tmp_path / "ran-past-stop"
++    result = _run_owner(tmp_path, monkeypatch, {"command": f"sleep 8; touch {marker}", "timeout": 120},
++                        key_on=True, reason=None)
++    assert result["exit_code"] == 130
++    assert "session_id" not in result
++    registry = ProcessRegistry()
++    assert registry.recover_from_checkpoint() == 0
++    with pytest.raises(AssertionError):  # the command would have touched it ~5 s after the stop
++        wait_until(marker.exists, timeout=8, what="a command a user Stop should have killed")
+diff --git a/tools/environments/base.py b/tools/environments/base.py
+index 441e69396f..c726aff7ce 100644
+--- a/tools/environments/base.py
++++ b/tools/environments/base.py
+@@ -17,7 +17,7 @@ import time
+ import uuid
+ from abc import ABC, abstractmethod
+ from pathlib import Path
+-from typing import Callable, Iterable
++from typing import Any, Callable, Iterable
+ 
+ from hermes_constants import get_hermes_home
+ from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
+@@ -577,6 +577,9 @@ class BaseEnvironment(ABC):
+                 trace.iterations += 1
+                 if is_interrupted() or is_thread_interrupted(watch_interrupt_tid):
+                     trace.interrupted()
++                    if (handed := self._survive_interrupt(proc, output, drain_thread, drain_stop,
++                                                          watch_interrupt_tid)) is not None:
++                        return handed
+                     _kill_and_join()
+                     return {**self._finalize_wait_result(output, output.render(suffix="\n[Command interrupted]"), 130),
+                             "hermes_interrupted": True}
+@@ -638,6 +641,30 @@ class BaseEnvironment(ABC):
+ 
+     _finalize_wait_result = staticmethod(_finalize_wait_result)
+ 
++    @staticmethod
++    def _survive_interrupt(proc, output, drain_thread, drain_stop, watch_interrupt_tid) -> dict | None:
++        """A survivable command (``terminal.update_survivable_processes``) interrupted by a Hermes update
++        or shutdown keeps running as a background job: its handoff result, else None (kill as usual).
++        [daveey] t_01a1c7d04d9046d2"""
++        survivable = getattr(proc, "_hermes_survivable", None)
++        if survivable is None or drain_stop is None:
++            return None
++        from tools.process_registry_survivable import survivable_interrupt_reason
++
++        reason = survivable_interrupt_reason(threading.current_thread().ident, watch_interrupt_tid)
++        if reason is None:
++            return None
++        drain_stop.set()
++        drain_thread.join(timeout=1)
++        try:
++            handed = survivable.handoff(proc, output.render(), reason=reason)
++        except Exception:
++            logger.warning("survivable command handoff failed; killing it as before", exc_info=True)
++            return None
++        if handed is not None:
++            output.close_spill()
++        return handed
++
+     def _kill_process(self, proc: ProcessHandle):
+         """Terminate a process. Subclasses may override for process-group kill."""
+         try:
+@@ -702,8 +729,10 @@ class BaseEnvironment(ABC):
+         stdin_data: str | None = None,
+         rewrite_compound_background: bool = True,
+         bounded_capture: bool = False,
+-        yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
+-        """Execute a command, return {"output": str, "returncode": int}. ``bounded_capture=True``
++        yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
++        survivable: Any = None) -> dict:
++        """Execute a command, return {"output": str, "returncode": int}. ``survivable`` (local backend
++        only): a ``process_registry_survivable.SurvivableForeground`` spawning the command in its own scope. ``bounded_capture=True``
+         caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
+         tool may set it — internal full-fidelity consumers (file-op ``cat`` reads feeding the
+         patch engine, RPC reads, log reads) MUST leave it False or data is corrupted. The wait is
+@@ -751,7 +780,8 @@ class BaseEnvironment(ABC):
+                 return {"output": "[host is exiting: command not started]", "returncode": 130}
+             spawned = None
+             try:
+-                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
++                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin,
++                                         **({"survivable": survivable} if survivable is not None else {}))
+             finally:
+                 fenced = _leave_foreground_spawn(self, spawned)
+             proc_holder.append(spawned)
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 2d8fc83a7b..f4acdacdab 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1153,7 +1153,7 @@ class LocalEnvironment(BaseEnvironment):
+         self.cwd = safe_cwd
+ 
+     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
+-                  stdin_data: str | None = None) -> subprocess.Popen:
++                  stdin_data: str | None = None, survivable=None) -> subprocess.Popen:
+         bash = _find_bash()
+         run_env = _make_run_env(self.env)
+         # Login invocations (init_session's env snapshot) source the user's rc /
+@@ -1164,6 +1164,11 @@ class LocalEnvironment(BaseEnvironment):
+             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
+         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+         self._recover_cwd()
++        # [daveey] terminal.update_survivable_processes: own scope, not owned by this process.
++        if survivable is not None and (proc := survivable.spawn(args, run_env, self.cwd, stdin_data)) is not None:
++            if stdin_data is not None:
++                _pipe_stdin(proc, stdin_data)
++            return proc
+         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
+         # its group to the owner-death supervisor and _wait_for_process releases it.
+         proc = subprocess.Popen(
+diff --git a/tools/interrupt.py b/tools/interrupt.py
+index 4a4624604f..f9f52d6014 100644
+--- a/tools/interrupt.py
++++ b/tools/interrupt.py
+@@ -120,6 +120,12 @@ def get_interrupt_reason() -> str | None:
+         return _interrupt_reasons.get(threading.current_thread().ident)
+ 
+ 
++def thread_interrupt_reason(thread_id: int | None) -> str | None:
++    """The pending interrupt cause of *thread_id*, if one was given. [daveey]"""
++    with _lock:
++        return _interrupt_reasons.get(thread_id) if thread_id is not None else None
++
++
+ def clear_current_thread_interrupt() -> None:
+     """Clear any interrupt bit on the CURRENT thread: gives a user-approved command a clean
+     slate right before it spawns its child, so a stale bit that landed during the blocking
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 9acd0fc421..f8c695429d 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -30,14 +30,13 @@ from tools.environments.local import _append_dropped_path_entries, _resolve_safe
+ from hermes_cli._subprocess_compat import windows_hide_flags
+ from dataclasses import MISSING, dataclass, field
+ from typing import Any, Dict, List, Literal, NamedTuple, Optional
+-
+ from hermes_cli.config import get_hermes_home
+-
+ from tools.process_registry_notifications import (
+     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
+ from tools.process_registry_checkpoint import ProcessCheckpointMixin
+ from tools.process_registry_readopt import ProcessReadoptMixin
+ from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, spawn_output_log
++from tools.process_registry_survivable import ProcessForegroundHoldMixin
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+@@ -684,7 +683,7 @@ _WSL_CHAIN_NOTE = (
+ )
+ 
+ 
+-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessReadoptMixin, ProcessOutputLogMixin, ProcessOwnershipMixin):
++class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessReadoptMixin, ProcessOutputLogMixin, ProcessOwnershipMixin, ProcessForegroundHoldMixin):
+     """In-memory registry of running and finished background processes.
+     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
+     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index 9a6fa66d8b..196864a07a 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -154,9 +154,12 @@ class ProcessCheckpointMixin:
+         writer = self._writer_identity()
+         scope = scope_profile()
+         with self._lock:
+-            own_ids = set(self._running) | set(self._finished) | set(drop_ids)
++            # Survivable foreground commands the tool is waiting on are checkpointed too: a crash
++            # mid-wait leaves them to the next owner (process_registry_survivable). [daveey]
++            held = list(vars(self).get("_foreground_holds", {}).values())
++            own_ids = set(self._running) | set(self._finished) | set(drop_ids) | {s.id for s in held}
+             entries = []
+-            for s in self._running.values():
++            for s in (*self._running.values(), *held):
+                 if s.exited:
+                     continue
+                 # One registry serves every profile of a multiplexed gateway: a job goes only in its own
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index b6bb12fae2..98de24521f 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -11,6 +11,7 @@ import codecs
+ from contextlib import suppress
+ import logging
+ import os
++import re
+ from pathlib import Path
+ import time
+ from typing import Optional
+@@ -86,6 +87,15 @@ def record_exit_command(log: Path, command: str) -> str:
+     return f"__hermes_exit_file={target}; trap 'printf \"%s\\n\" \"$?\" > \"$__hermes_exit_file\"' EXIT\n{command}"
+ 
+ 
++# The foreground wrapper's own trailer (PIPESTATUS and cwd markers, base_session_env): a survivable foreground
++# command handed to the background tees it into its log after the user's output. [daveey]
++_SHELL_MARKER_RE = re.compile(r"\n?__HERMES_(?:PIPE|CWD)_\w+?__[^\n]*?__HERMES_(?:PIPE|CWD)_\w+?__\n?")
++
++
++def strip_shell_markers(text: str) -> str:
++    return _SHELL_MARKER_RE.sub("", text) if "__HERMES_" in text else text
++
++
+ def recorded_exit_code(log) -> Optional[int]:
+     try:
+         return int(_exit_path(log).read_text(encoding="utf-8-sig").strip())
+@@ -109,6 +119,7 @@ class ProcessOutputLogMixin:
+ 
+         def ingest(text: str) -> None:
+             nonlocal head_noise
++            text = strip_shell_markers(text)
+             if head_noise:  # ``bash -lic`` startup warnings, as the pipe reader strips them
+                 text = self._clean_shell_noise(text)
+                 head_noise = not text.strip()
+diff --git a/tools/process_registry_survivable.py b/tools/process_registry_survivable.py
+new file mode 100644
+index 0000000000..86b909e141
+--- /dev/null
++++ b/tools/process_registry_survivable.py
+@@ -0,0 +1,263 @@
++"""[daveey] Terminal processes that survive a Hermes update (t_01a1c7d04d9046d2).
++
++A gateway/backend restart (every hub core update) stopped the unit the terminal tool's children ran in,
++so a background job or a long foreground command died with it. ``terminal.update_survivable_processes:
++true`` (default off; Linux with a usable ``systemd-run --user --scope`` only) changes that:
++
++- every ``background=true`` job defaults to ``persist_on_release`` (an explicit ``false`` still wins), so
++  it runs in its own transient scope with a file-backed log and exit file, and the next backend re-attaches
++  it from ``processes.json`` (``recover_from_checkpoint``) and delivers its completion;
++- a foreground command whose effective timeout is above ``FOREGROUND_MIN_TIMEOUT_S`` runs in its own scope
++  too, its output teed to such a log, and is held in the registry's checkpoint while the tool waits on it
++  (``ProcessForegroundHoldMixin``). When a Hermes update pause, a gateway shutdown or a backend exit
++  interrupts the call (``SURVIVABLE_INTERRUPT_REASONS``) the process is not killed: it becomes a
++  registered background job of the session, notified on exit, and the tool result says
++  ``process continues as <session_id>``. A user Stop (or any other interrupt, or the timeout) kills it
++  as before.
++
++The key on with no usable scope keeps today's behaviour and logs one WARNING.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import shlex
++import shutil
++import subprocess
++import threading
++from contextlib import suppress
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger("tools.process_registry")
++
++CONFIG_KEY = "update_survivable_processes"
++FOREGROUND_MIN_TIMEOUT_S = 60
++# ``tool_reason`` slugs of the interrupts a survivable foreground command outlives: card A's update pause
++# (agent.update_pause_cancel.CANCEL_TOOL_REASON), the gateway's restart/shutdown stop and a TUI/Desktop
++# backend exit (session_reaper's ``backend_exit``). A user Stop, a new message, a timeout and every
++# watchdog are not in it: those still kill the command.
++SURVIVABLE_INTERRUPT_REASONS = frozenset({"hermes update pause", "gateway shutdown", "backend exit"})
++CONTINUES_LINE = "process continues as {session_id}"
++
++_warn_lock = threading.Lock()
++_warned = False
++
++
++def enabled() -> bool:
++    """``terminal.update_survivable_processes`` is on and this is Linux (no scope probe)."""
++    from tools import process_registry as pr
++
++    if not pr._IS_LINUX:
++        return False
++    try:
++        value = pr.ProcessRegistry._config_value("terminal", CONFIG_KEY, False)
++    except Exception:  # an unreadable config.yaml keeps today's behaviour
++        logger.debug("terminal.%s unreadable; treated as off", CONFIG_KEY, exc_info=True)
++        return False
++    return value is True or (isinstance(value, str) and value.strip().lower() in ("true", "1", "yes", "on"))
++
++
++def usable() -> bool:
++    """The key is on and a transient user scope can be created. The key on without one logs a single
++    WARNING per process and keeps today's behaviour."""
++    global _warned
++    if not enabled():
++        return False
++    from tools import process_registry as pr
++
++    if shutil.which("systemd-run") and pr._systemd_run_user_scope_available():
++        return True
++    with _warn_lock:
++        if not _warned:
++            _warned = True
++            logger.warning(
++                "terminal.update_survivable_processes is on but systemd-run --user --scope is unusable here "
++                "(no systemd-run or no reachable user D-Bus session): terminal processes keep dying with "
++                "the backend on a restart")
++    return False
++
++
++def default_persist(requested: Optional[bool], env_type: str, pty: bool = False) -> bool:
++    """``persist_on_release`` for a ``background=true`` spawn: the caller's explicit value, else on for
++    a local pipe job while survivable processes are usable. A ``pty=true`` job keeps its PTY (a persisted
++    job runs on a log file instead, which would break the interactive CLI it drives) and today's fate."""
++    if requested is not None:
++        return bool(requested)
++    return env_type == "local" and not pty and usable()
++
++
++def foreground_eligible(env: Any, env_type: str, effective_timeout: Any) -> bool:
++    """A foreground call that runs scoped and survivable (local backend, timeout above the floor)."""
++    try:
++        long_enough = float(effective_timeout) > FOREGROUND_MIN_TIMEOUT_S
++    except (TypeError, ValueError):
++        return False
++    if env_type != "local" or not long_enough:
++        return False
++    from tools.environments.local import LocalEnvironment
++
++    return isinstance(env, LocalEnvironment) and usable()
++
++
++def survivable_interrupt_reason(*thread_ids: Optional[int]) -> Optional[str]:
++    """The pending interrupt of ``thread_ids`` (the waiter, the tool thread it acts for) when it is one a
++    survivable command outlives; None for any other interrupt (a user Stop kills the command)."""
++    from tools.interrupt import thread_interrupt_reason
++
++    for tid in thread_ids:
++        if tid and (reason := thread_interrupt_reason(tid)) in SURVIVABLE_INTERRUPT_REASONS:
++            return reason
++    return None
++
++
++def tee_wrapped(cmd_string: str, log: Path) -> str:
++    """``cmd_string`` with its stdout+stderr teed into ``log`` and its exit status written beside it.
++    ``tee -p`` ignores a closed pipe: once the waiting backend is gone the command keeps writing its log
++    instead of dying of SIGPIPE, and the next backend tails that log."""
++    from tools.process_registry_output_log import _exit_path
++
++    exit_file = shlex.quote(_exit_path(log).as_posix())
++    return (f"{{ {cmd_string}\n}} 2>&1 | tee -p -a {shlex.quote(str(log))}\n"
++            f"__hermes_rc=${{PIPESTATUS[0]}}; printf '%s\\n' \"$__hermes_rc\" > {exit_file}; exit \"$__hermes_rc\"")
++
++
++class SurvivableForeground:
++    """One survivable foreground spawn: ``LocalEnvironment._run_bash`` calls ``spawn``, the wait calls
++    ``handoff`` on a survivable interrupt, and the terminal tool calls ``release`` once the wait returned."""
++
++    def __init__(self, *, command: str, task_id: str, owner_task_id: str, session_key: str):
++        self.command, self.task_id, self.owner_task_id, self.session_key = command, task_id, owner_task_id, session_key
++        self.session = None
++        self.converted = False
++
++    def spawn(self, args: list[str], run_env: dict, cwd: str, stdin_data: Optional[str]) -> Optional[subprocess.Popen]:
++        """Start ``args`` (``[bash, ..., "-c", script]``) in its own scope, held in the registry; None when
++        no scope can be had any more (the caller spawns as usual)."""
++        from tools.process_registry import process_registry, systemd_user_bus_env
++        from tools.process_registry_output_log import worker_output_log
++        from tools.process_registry_persist_scope import persisted_job_scope_argv
++
++        session = process_registry._new_session(self.command, self.task_id, self.owner_task_id, self.session_key,
++                                                cwd, persist_on_release=True)
++        log = worker_output_log(session.id, persist=True)
++        if log is None:
++            return None
++        shell = [*args[:-1], tee_wrapped(args[-1], log)]
++        argv = persisted_job_scope_argv(session, shell, session.id)
++        if argv is shell:
++            return None
++        from gateway.session_context import async_delivery_supported, get_session_env
++
++        proc = subprocess.Popen(  # noqa: subprocess-stdin — stdin is DEVNULL or the caller's piped data
++            argv, text=True, env=systemd_user_bus_env(run_env), encoding="utf-8", errors="replace",
++            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
++            # detached-spawn: ok — survives its owner on purpose; a kill/timeout/Stop reaps its group and scope
++            start_new_session=True, cwd=cwd)
++        with suppress(ProcessLookupError):
++            proc._hermes_pgid = os.getpgid(proc.pid)
++            from gateway.status import get_process_start_time
++            proc._hermes_pgid_start = get_process_start_time(proc.pid)
++        proc._hermes_survivable = self
++        session.process, session.pid, session.output_log = proc, proc.pid, str(log)
++        session.host_start_time = process_registry._safe_host_start_time(proc.pid)
++        # A crash of this backend mid-call leaves the job to the next one, which notifies the session.
++        session.notify_on_complete = async_delivery_supported()
++        if session.notify_on_complete:
++            from tools.terminal_tool_background import _stamp_gateway_routing
++            _stamp_gateway_routing(session, get_session_env)
++        self.session = session
++        process_registry.hold_foreground(session)
++        return proc
++
++    def handoff(self, proc: subprocess.Popen, output_so_far: str, *, yielded: bool = False,
++                reason: Optional[str] = None) -> Optional[dict]:
++        """Keep the process as a background job of the session: the wait was interrupted by an
++        update/shutdown, or (``yielded``) a user message asked the command to yield to background, which
++        for a survivable command reuses its scope and log instead of adopting the pipe."""
++        from tools.process_registry import process_registry
++
++        session = self.session
++        if session is None:
++            return None
++        # Our pipe end closes: tee keeps writing the log, which the registry's reader tails from here on.
++        with suppress(Exception):
++            proc.stdout.close()
++        process_registry.convert_foreground(session)
++        self.converted = True
++        if session.notify_on_complete and session.watcher_platform:
++            from tools.terminal_tool_background import _register_completion_watcher
++            _register_completion_watcher(process_registry, session, self.session_key)
++        logger.info("survivable foreground command kept running as %s (pid %s): %s", session.id, session.pid,
++                    "yielded to background" if yielded else "update/shutdown interrupt")
++        key = "yielded_session_id" if yielded else "survived_session_id"
++        return {"output": output_so_far, "returncode": None, key: session.id, "pid": session.pid,
++                "notify_on_complete": session.notify_on_complete, "interrupt_reason": reason}
++
++    def release(self, result: Optional[dict]) -> None:
++        """The wait returned without a handoff: drop the hold and the files; a killed command's scope is
++        stopped so a survivor in it is reaped too."""
++        from tools.process_registry import _stop_systemd_unit, process_registry
++        from tools.process_registry_output_log import _exit_path
++
++        session = self.session
++        if session is None or self.converted:
++            return
++        process_registry.release_foreground(session.id)
++        killed = not result or result.get("hermes_interrupted") or result.get("hermes_timed_out")
++        if killed and session.systemd_unit:
++            _stop_systemd_unit(session.systemd_unit)
++        for path in (Path(session.output_log), _exit_path(session.output_log)):
++            with suppress(OSError):
++                path.unlink()
++
++
++def survived_result_json(result: dict) -> str:
++    """The tool result of a foreground command handed to the background by an update/shutdown: its output,
++    then ``process continues as <session_id>`` as the line after the interrupt stamp."""
++    sid, reason = result["survived_session_id"], result.get("interrupt_reason") or "a Hermes restart"
++    output = (result.get("output") or "").rstrip("\n")
++    stamp = f"[interrupted by {reason}]\n{CONTINUES_LINE.format(session_id=sid)}"
++    return json.dumps({
++        "output": f"{output}\n{stamp}" if output else stamp, "exit_code": None, "error": None,
++        "status": "continues_in_background", "session_id": sid, "pid": result.get("pid"),
++        "notify_on_complete": bool(result.get("notify_on_complete")),
++    }, ensure_ascii=False)
++
++
++class ProcessForegroundHoldMixin:
++    """Survivable foreground commands while the terminal tool waits on them: checkpointed (so a crash of
++    this process leaves them to the next owner) but not listed, polled or swept as background jobs."""
++
++    _lock: Any
++    _running: dict
++
++    def _holds(self) -> dict:
++        holds = vars(self).get("_foreground_holds")
++        if holds is None:
++            holds = self._foreground_holds = {}
++        return holds
++
++    def held_foreground(self) -> list:
++        with self._lock:
++            return list(self._holds().values())
++
++    def hold_foreground(self, session) -> None:
++        with self._lock:
++            self._holds()[session.id] = session
++        self._write_checkpoint()
++
++    def release_foreground(self, session_id: str) -> None:
++        with self._lock:
++            dropped = self._holds().pop(session_id, None)
++        if dropped is not None:
++            self._write_checkpoint(settled_id=session_id)
++
++    def convert_foreground(self, session) -> None:
++        """Track a held command as a running background job, tailing its log (the pipe is closed)."""
++        with self._lock:
++            self._holds().pop(session.id, None)
++        self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index cefc6853d6..d9f4c6d2a6 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -19,6 +19,7 @@ import/patch target): ``terminal_tool_config`` (TERMINAL_* reads, ``_quiet``),
+ ``terminal_tool_result`` (foreground result post-processing).
+ """
+ 
++import functools
+ import json
+ import logging
+ import os
+@@ -961,6 +962,7 @@ from tools.terminal_tool_guards import (
+     trailing_amp_background_command,
+ )
+ from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
++from tools.process_registry_survivable import default_persist
+ from tools.terminal_tool_result import finalize_foreground_result
+ 
+ 
+@@ -1358,6 +1360,17 @@ def _yield_kwargs(command: str, **ctx) -> dict:
+     return {"yield_handler": handler} if handler is not None else {}
+ 
+ 
++def _survivable_foreground(command: str, env: Any, plan: _ExecPlan, *, task_id: Optional[str], session_key: str):
++    """A ``SurvivableForeground`` for a long local foreground call under
++    ``terminal.update_survivable_processes``, else None. [daveey] t_01a1c7d04d9046d2"""
++    from tools.process_registry_survivable import SurvivableForeground, foreground_eligible
++
++    if not foreground_eligible(env, plan.env_type, plan.effective_timeout):
++        return None
++    eff = plan.effective_task_id
++    return SurvivableForeground(command=command, task_id=eff, owner_task_id=task_id or eff, session_key=session_key)
++
++
+ def _run_foreground(
+     command: str, env: Any, plan: _ExecPlan, *,
+     task_id: Optional[str], session_id: Optional[str], session_key: str,
+@@ -1389,11 +1402,18 @@ def _run_foreground(
+             # bounded_capture: model-facing output keeps a head/tail window
+             # while streaming so a verbose command can't OOM the gateway;
+             # internal env.execute() consumers stay unbounded.
+-            result = env.execute(
+-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+-                                task_id=task_id, session_key=session_key),
+-            )
++            exec_kwargs = _yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
++                                        task_id=task_id, session_key=session_key)
++            survivable = _survivable_foreground(command, env, plan, task_id=task_id, session_key=session_key)
++            if survivable is not None:
++                exec_kwargs.update(survivable=survivable, yield_handler=functools.partial(survivable.handoff, yielded=True))
++            result = None
++            try:
++                result = env.execute(command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
++                                     **exec_kwargs)
++            finally:
++                if survivable is not None:
++                    survivable.release(result)
+             break
+         except Exception as e:
+             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
+@@ -1411,6 +1431,9 @@ def _run_foreground(
+                          max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
+             return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
+ 
++    if result.get("survived_session_id"):  # a Hermes update/shutdown left it running: no exit status yet
++        from tools.process_registry_survivable import survived_result_json
++        return survived_result_json(result)
+     if result.get("yielded_session_id"):  # handed to the background: no exit status yet
+         return json.dumps({
+             "output": result.get("output", ""), "exit_code": None, "error": None,
+@@ -1502,7 +1525,7 @@ def terminal_tool(
+     _host_local: bool = False,
+     _completion_output_chars: int = 0,
+     heartbeat: int = 0,
+-    persist_on_release: bool = False,
++    persist_on_release: Optional[bool] = None,
+     http_readback: bool = False,
+ ) -> str:
+     """Execute *command* in the configured terminal environment; returns a JSON string.
+@@ -1619,7 +1642,7 @@ def terminal_tool(
+                     pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
+                     completion_output_chars=_completion_output_chars,
+                     heartbeat_seconds=heartbeat,
+-                    persist_on_release=persist_on_release,
++                    persist_on_release=default_persist(persist_on_release, env_type, pty and not pty_disabled),
+                     auto_backgrounded=auto_bg is not None and plan.promoted_from_foreground_timeout is None,
+                 )
+                 if plan.promoted_from_foreground_timeout is not None:
+@@ -1739,7 +1762,9 @@ def _handle_terminal(args, **kw):
+     notify_on_complete = args.get("notify_on_complete", False)
+     watch_patterns = args.get("watch_patterns")
+     heartbeat = args.get("heartbeat") or 0
+-    persist_on_release = bool(args.get("persist_on_release", False))
++    # None = not given: terminal.update_survivable_processes may default it on for a background job.
++    persist_on_release = args.get("persist_on_release")
++    persist_on_release = None if persist_on_release is None else bool(persist_on_release)
+     if not isinstance(heartbeat, int) or isinstance(heartbeat, bool) or heartbeat < 0:
+         return tool_error("heartbeat must be a whole number of seconds (0 disables; positive values are clamped to min 60).")
+     if not args.get("background", False):
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index a7c8848dea..ba68385bf2 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -383,6 +383,21 @@ real_home = Path(os.environ.get("HERMES_REAL_HOME", os.environ["HOME"]))
+ The agent has the same filesystem access as your user account. Use `hermes tools` to disable tools you don't want, or switch to Docker for sandboxing.
+ :::
+ 
++#### `terminal.update_survivable_processes`
++
++Default `false`. On Linux with a usable `systemd-run --user --scope`, setting it to `true` lets terminal
++processes outlive a gateway or backend restart (for example a Hermes update):
++
++- every `terminal(background=true)` job runs in its own transient scope with a file-backed log, as if it
++  had `persist_on_release=true` (an explicit `persist_on_release=false` still wins; `pty=true` jobs keep
++  their PTY and are not covered). The next backend re-attaches it by PID and start time, `process_manage`
++  works on it, and its completion notice reaches the owning chat or Kanban run once;
++- a foreground command whose timeout is above 60 seconds runs in its own scope too. If an update pause, a
++  gateway shutdown or a backend exit interrupts it, it keeps running as a background job of the session and
++  the result ends with `process continues as <session_id>`. A user Stop still kills it.
++
++Without a usable scope the setting logs one warning and nothing changes.
++
+ ### Docker Backend
+ 
+ Runs commands inside a Docker container with security hardening (all capabilities dropped, no privilege escalation, PID limits).
+-- 
+2.55.0
+

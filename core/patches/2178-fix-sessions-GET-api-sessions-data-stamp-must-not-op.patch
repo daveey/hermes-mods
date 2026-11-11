@@ -1,0 +1,107 @@
+From a332e272cc7f2ee90d949da4cc4e333d1e596df5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:56:56 -0800
+Subject: [PATCH] fix(sessions): GET /api/sessions data stamp must not
+ open()/close() state.db-shm [daveey]
+
+data_stamp() read the WAL-index header with open("<db>-shm") + close on every session-list call.
+POSIX cancels every lock a process holds on a file when it closes any descriptor for it, and SQLite
+keeps its WAL locks (writer lock included) on -shm. A list call landing inside a write transaction of
+the same process therefore released that transaction's writer lock and a second process could write
+the same WAL: hermes-hub state.db corruption 2026-11-11 (duplicate state_meta rows, index/table
+mismatches, freelist damage), first incident 11 h after 92e3135eddb shipped.
+
+Read the header through sqlite_safe_read.pread_lock_safe (cached fd, never closed). The new test holds
+a real write transaction, calls data_stamp(), and checks a second process is still locked out; on the
+old code that process acquires the writer lock.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/session_list_flight.py            | 11 +++++--
+ tests/hermes_cli/test_session_list_flight.py | 33 ++++++++++++++++++++
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/session_list_flight.py b/hermes_cli/session_list_flight.py
+index 3f30c52e30..49750813c3 100644
+--- a/hermes_cli/session_list_flight.py
++++ b/hermes_cli/session_list_flight.py
+@@ -28,6 +28,8 @@ from collections import OrderedDict
+ from pathlib import Path
+ from typing import Any, Callable, Hashable, Optional
+ 
++from hermes_cli.sqlite_safe_read import pread_lock_safe
++
+ TTL_S = 2.0
+ MAX_ENTRIES = 64
+ # A follower never waits longer than this on a leader; then it computes itself.
+@@ -38,9 +40,14 @@ _SHM_HEADER = 48  # one WalIndexHdr copy; the second copy follows at offset 48
+ def data_stamp(db_path: os.PathLike | str) -> Optional[tuple]:
+     """Fingerprint that changes with every committed write to *db_path* (WAL mode), else ``None``."""
+     db = Path(db_path)
++    # Never open()/close() the -shm here: SQLite keeps its WAL locks (the writer lock included) as POSIX
++    # locks on that file, and close() on ANY descriptor for it cancels them all for this process. A list
++    # call landing inside a write transaction then let a second process write the same WAL: hermes-hub
++    # index corruption 2026-11-04..11. The lock-safe reader preads from a cached fd it never closes.
++    head = pread_lock_safe(f"{db}-shm", 0, 2 * _SHM_HEADER)
++    if head is None:
++        return None
+     try:
+-        with open(f"{db}-shm", "rb") as f:
+-            head = f.read(2 * _SHM_HEADER)
+         st_db = os.stat(db)
+         st_wal = os.stat(f"{db}-wal")
+     except OSError:
+diff --git a/tests/hermes_cli/test_session_list_flight.py b/tests/hermes_cli/test_session_list_flight.py
+index 4526ccb15e..0ca3614bb6 100644
+--- a/tests/hermes_cli/test_session_list_flight.py
++++ b/tests/hermes_cli/test_session_list_flight.py
+@@ -6,6 +6,8 @@ state.db must invalidate the cached result.
+ """
+ 
+ import sqlite3
++import subprocess
++import sys
+ import threading
+ 
+ import pytest
+@@ -42,6 +44,37 @@ def test_data_stamp_is_stable_across_reads_and_changes_on_every_write(tmp_path):
+     assert slf.data_stamp(path) not in (before, after_write)
+ 
+ 
++@pytest.mark.platforms("linux", "macos")
++def test_data_stamp_keeps_this_process_wal_locks(tmp_path):
++    """hermes-hub 2026-11-11: data_stamp() did open()/close() on -shm, and POSIX drops every lock a process
++    holds on a file when it closes any descriptor for it. SQLite's WAL writer lock lives on -shm, so a
++    GET /api/sessions during a write transaction let another process write concurrently (corrupt indexes).
++    A real write transaction is held here; a second process must still be locked out after data_stamp()."""
++    path, conn = _wal_db(tmp_path)
++    conn.execute("BEGIN IMMEDIATE")
++    conn.execute("UPDATE sessions SET title = 'held' WHERE id = 'a'")
++    probe = (
++        "import sqlite3, sys\n"
++        "c = sqlite3.connect(sys.argv[1], timeout=0)\n"
++        "try:\n"
++        "    c.execute('BEGIN IMMEDIATE')\n"
++        "except sqlite3.OperationalError as e:\n"
++        "    print('locked' if 'locked' in str(e) else 'error:' + str(e))\n"
++        "else:\n"
++        "    print('acquired')\n"
++    )
++
++    def other_process_writer():
++        return subprocess.run([sys.executable, "-I", "-c", probe, str(path)], capture_output=True, text=True,
++                              timeout=60, check=True).stdout.strip()
++
++    assert other_process_writer() == "locked"  # the transaction above really holds the writer lock
++    for _ in range(3):
++        assert slf.data_stamp(path) is not None
++    assert other_process_writer() == "locked"
++    conn.rollback()
++
++
+ def test_no_wal_means_no_stamp_and_no_caching(tmp_path):
+     path = tmp_path / "plain.db"
+     sqlite3.connect(path).execute("CREATE TABLE t (x)").connection.commit()
+-- 
+2.55.0
+

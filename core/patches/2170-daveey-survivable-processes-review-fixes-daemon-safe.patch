@@ -1,0 +1,364 @@
+From 9ddfb9e651d9420285dfeebc3e5f17d69d32bf1e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:36:45 +0000
+Subject: [PATCH] [daveey] survivable processes: review fixes (daemon-safe tee,
+ exact markers, shutdown sweep, Stop precedence, unit check)
+
+- tee runs in a process substitution bash waits for at most ~1 s: a command leaving a daemon on
+  its stdout (server &) returns when bash exits instead of hanging to its timeout.
+- the log tail strips only the session's own PIPE/CWD markers (checkpointed shell_markers).
+- with the key on, the gateway's shutdown kill_all spares persisted jobs it spawned (they were
+  SIGKILLed by the sweep before the unit stop could spare them).
+- a shutdown interrupt after a pending user Stop keeps the Stop reason on the tool thread too.
+- usable() requires a systemd user unit, matching persisted_job_scope_argv's scope decision.
+---
+ agent/interrupt_control.py                    |  3 +
+ .../tools/test_update_survivable_processes.py | 89 ++++++++++++++++---
+ tools/environments/local.py                   |  3 +-
+ tools/process_registry.py                     |  7 +-
+ tools/process_registry_output_log.py          | 16 ++--
+ tools/process_registry_survivable.py          | 30 +++++--
+ 6 files changed, 118 insertions(+), 30 deletions(-)
+
+diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+index 58a49a4381..4da9f7663d 100644
+--- a/agent/interrupt_control.py
++++ b/agent/interrupt_control.py
+@@ -224,6 +224,7 @@ class InterruptControlMixin:
+         )
+ 
+         def _publish_interrupt_state() -> None:
++            nonlocal tool_interrupt_reason
+             # A shutdown stop never relabels a user Stop already pending (the user's Stop wins): the turn
+             # records the first cause, so it is not announced as interrupted by the restart. A pending
+             # redirect (a mid-request correction) is not a Stop: the restart drops it and is the cause.
+@@ -233,6 +234,8 @@ class InterruptControlMixin:
+                     and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS):
+                 self._interrupt_message = message
+                 self._tool_interrupt_reason = tool_interrupt_reason
++            else:  # tool threads keep the Stop's reason too: a survivable command must still die [daveey]
++                tool_interrupt_reason = self._tool_interrupt_reason
+             self._interrupt_requested = True
+             if tool_reason != _REASON_UPDATE_PAUSE:
+                 self._turn_user_intervened = True
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+index 0f6b560fd0..111345e744 100644
+--- a/tests/tools/test_update_survivable_processes.py
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -33,8 +33,11 @@ REPO = str(Path(pr.__file__).resolve().parents[1])
+ @pytest.fixture
+ def key(monkeypatch):
+     """Set the config key (and pretend Linux + a usable scope) without touching config.yaml."""
+-    state = {"on": True, "scope": True}
++    state = {"on": True, "scope": True, "unit": True}
+     monkeypatch.setattr(pr, "_IS_LINUX", True)
++    monkeypatch.setattr("tools.process_registry_persist_scope.kanban_run_scope_cgroup", lambda: None)
++    monkeypatch.setattr("tools.process_registry_persist_scope.user_unit_cgroup",
++                        lambda: Path("/sys/fs/cgroup/app.slice/x.service") if state["unit"] else None)
+     monkeypatch.setattr(pr.ProcessRegistry, "_config_value",
+                         staticmethod(lambda section, k, fallback: state["on"] if k == surv.CONFIG_KEY else fallback))
+     monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: state["scope"])
+@@ -63,6 +66,15 @@ def test_key_on_without_a_scope_keeps_todays_behaviour_and_warns_once(key, caplo
+     assert len(warnings) == 1
+ 
+ 
++def test_key_on_outside_any_user_unit_gets_no_scope_so_keeps_todays_behaviour(key, caplog):
++    """persisted_job_scope_argv makes no scope for a process in no user unit (login scope, tmux): the key
++    must not then flip jobs to persisted log jobs that still die with their owner."""
++    key["unit"] = False
++    with caplog.at_level("WARNING", logger="tools.process_registry"):
++        assert surv.default_persist(None, "local") is False
++    assert any(surv.CONFIG_KEY in r.getMessage() for r in caplog.records)
++
++
+ def test_key_off_or_non_linux_is_disabled(key, monkeypatch):
+     key["on"] = "false"
+     assert surv.enabled() is False
+@@ -101,13 +113,15 @@ def test_only_update_and_shutdown_interrupts_are_survivable():
+         set_interrupt(False, tid)
+ 
+ 
+-def test_log_tail_drops_the_foreground_wrappers_markers():
++def test_log_tail_drops_only_this_sessions_wrapper_markers():
+     from tools.process_registry_output_log import strip_shell_markers
+ 
+-    text = ("fg-done\n\n__HERMES_PIPE_181265ba766b__0__HERMES_PIPE_181265ba766b__\n\n"
+-            "__HERMES_CWD_181265ba766b__/home/u__HERMES_CWD_181265ba766b__\n")
+-    assert strip_shell_markers(text) == "fg-done\n"
+-    assert strip_shell_markers("plain __HERMES_ text\n") == "plain __HERMES_ text\n"
++    pipe, cwd = "__HERMES_PIPE_181265ba766b__", "__HERMES_CWD_181265ba766b__"
++    text = f"fg-done\n\n{pipe}0{pipe}\n\n{cwd}/home/u{cwd}\n"
++    assert strip_shell_markers(text, [pipe, cwd]) == "fg-done\n"
++    assert strip_shell_markers(text, []) == text, "a session without markers keeps its output verbatim"
++    other = "line1\n__HERMES_CWD_a1__/p__HERMES_CWD_a1__\nline3\n"  # e.g. a grep of this very file
++    assert strip_shell_markers(other, [pipe, cwd]) == other
+ 
+ 
+ def test_tee_wrapper_records_the_commands_own_exit_status(tmp_path):
+@@ -120,6 +134,38 @@ def test_tee_wrapper_records_the_commands_own_exit_status(tmp_path):
+     assert (tmp_path / "proc_x.exit").read_text().strip() == "7"
+ 
+ 
++def test_a_shutdown_after_a_user_stop_keeps_the_stop_reason_on_the_tool_thread():
++    """A user Stop followed by the restart's shutdown interrupt must still kill a survivable command: the tool
++    thread's reason stays the Stop's, as the agent's does."""
++    import threading
++
++    from agent.interrupt_compat import request_hard_interrupt
++    from run_agent import AIAgent
++
++    def agent():
++        a = AIAgent.__new__(AIAgent)
++        a._interrupt_requested = False
++        a._interrupt_message = a._tool_interrupt_reason = None
++        a._hard_interrupt_requested = threading.Event()
++        a._execution_thread_id = threading.get_ident()
++        a._interrupt_thread_signal_pending = False
++        a._active_children, a._active_children_lock = [], threading.Lock()
++        a.quiet_mode = True
++        return a
++
++    tid = threading.get_ident()
++    try:
++        stopped = agent()
++        request_hard_interrupt(stopped)  # the user's Stop
++        request_hard_interrupt(stopped, "restart", tool_reason="gateway shutdown")
++        assert surv.survivable_interrupt_reason(tid) is None
++        set_interrupt(False, tid)
++        request_hard_interrupt(agent(), "restart", tool_reason="gateway shutdown")
++        assert surv.survivable_interrupt_reason(tid) == "gateway shutdown"
++    finally:
++        set_interrupt(False, tid)
++
++
+ def test_held_foreground_command_is_checkpointed_until_released(tmp_path, monkeypatch):
+     """A crash mid-wait must leave the command to the next owner: it is in processes.json while held."""
+     monkeypatch.setattr(pr, "_checkpoint_path", lambda: tmp_path / "processes.json")
+@@ -152,16 +198,19 @@ import json, os, sys, threading, time
+ sys.path.insert(0, {repo!r})
+ from tools.interrupt import set_interrupt
+ from tools.terminal_tool import _handle_terminal
+-args, reason, out = json.loads({args!r}), {reason!r}, {out!r}
++args, reason, out, interrupt = json.loads({args!r}), {reason!r}, {out!r}, {interrupt!r}
+ box = {{}}
+ def run():
+     box["result"] = json.loads(_handle_terminal(args, task_id="survive-task"))
+ t = threading.Thread(target=run)
+ t.start()
+-if not args.get("background"):
++if interrupt:
+     time.sleep(3)
+     set_interrupt(True, t.ident, reason=reason)
+ t.join(90)
++# What a gateway stop does next (gateway/run_shutdown.py): sweep the registry before exiting.
++from tools.process_registry import process_registry
++process_registry.kill_all(source="gateway_shutdown")
+ open(out + ".tmp", "w").write(json.dumps(box.get("result")))
+ os.replace(out + ".tmp", out)
+ time.sleep(600)
+@@ -176,7 +225,7 @@ def _alive(pid: int) -> bool:
+     return state != "Z"
+ 
+ 
+-def _run_owner(tmp_path, monkeypatch, args: dict, *, key_on: bool, reason=None) -> dict:
++def _run_owner(tmp_path, monkeypatch, args: dict, *, key_on: bool, reason=None, interrupt=None) -> dict:
+     """Start the terminal tool in a transient user service (as the gateway runs), get its tool result, then
+     stop the service (SIGTERM to its whole cgroup, KillMode=control-group). Returns the tool result."""
+     monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+@@ -187,7 +236,8 @@ def _run_owner(tmp_path, monkeypatch, args: dict, *, key_on: bool, reason=None)
+     monkeypatch.setenv("HERMES_HOME", str(home))
+     out = tmp_path / "result.json"
+     script = tmp_path / "owner.py"
+-    script.write_text(OWNER.format(repo=REPO, args=json.dumps(args), reason=reason, out=str(out)))
++    interrupt = not args.get("background") if interrupt is None else interrupt
++    script.write_text(OWNER.format(repo=REPO, args=json.dumps(args), reason=reason, out=str(out), interrupt=interrupt))
+     unit = f"hermes-test-survive-owner-{uuid.uuid4().hex[:8]}.service"
+     env = pr.systemd_user_bus_env() or dict(os.environ)
+     subprocess.run(["systemd-run", "--user", "--quiet", "--collect", "--unit", unit,
+@@ -310,3 +360,22 @@ def test_user_stop_still_kills_a_long_foreground_command(tmp_path, monkeypatch):
+     assert registry.recover_from_checkpoint() == 0
+     with pytest.raises(AssertionError):  # the command would have touched it ~5 s after the stop
+         wait_until(marker.exists, timeout=8, what="a command a user Stop should have killed")
++
++
++@pytest.mark.live_system_guard_bypass
++@pytest.mark.platforms("linux")
++@pytest.mark.skipif(not _user_systemd(), reason="needs a user systemd bus")
++def test_long_foreground_command_leaving_a_daemon_returns_promptly_and_keeps_it(tmp_path, monkeypatch):
++    """`server &` in a scoped foreground call returns when bash exits (not at the timeout), and the daemon is
++    left running as without the key."""
++    pidfile = tmp_path / "daemon.pid"
++    started = time.monotonic()
++    result = _run_owner(tmp_path, monkeypatch, {"command": f"sleep 120 & echo $! > {pidfile}; echo started",
++                                                "timeout": 65}, key_on=True, interrupt=False)
++    daemon = int(pidfile.read_text())
++    try:
++        assert result["exit_code"] == 0 and result["output"].strip() == "started", result
++        assert time.monotonic() - started < 40, "the call waited for the daemon instead of returning"
++        assert _alive(daemon)
++    finally:
++        _cleanup(daemon)
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index f4acdacdab..72a491d9b6 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1165,7 +1165,8 @@ class LocalEnvironment(BaseEnvironment):
+         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+         self._recover_cwd()
+         # [daveey] terminal.update_survivable_processes: own scope, not owned by this process.
+-        if survivable is not None and (proc := survivable.spawn(args, run_env, self.cwd, stdin_data)) is not None:
++        if survivable is not None and (proc := survivable.spawn(args, run_env, self.cwd, stdin_data,
++                                                                  (self._pipe_marker, self._cwd_marker))) is not None:
+             if stdin_data is not None:
+                 _pipe_stdin(proc, stdin_data)
+             return proc
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index f8c695429d..5a82775c27 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -36,7 +36,7 @@ from tools.process_registry_notifications import (
+ from tools.process_registry_checkpoint import ProcessCheckpointMixin
+ from tools.process_registry_readopt import ProcessReadoptMixin
+ from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, spawn_output_log
+-from tools.process_registry_survivable import ProcessForegroundHoldMixin
++from tools.process_registry_survivable import ProcessForegroundHoldMixin, enabled as survivable_enabled
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+@@ -566,6 +566,7 @@ class ProcessSession:
+                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
+     output_log: str = ""                        # file the process writes to (worker spawns; no pipe to lose)
+     pty_fallback: str = ""                      # why a pty=true local spawn runs in pipe mode instead
++    shell_markers: list = field(default_factory=list)  # foreground wrapper trailer markers its log carries [daveey]
+     # Sandbox spawns: how a later process re-opens the sandbox (``env.reattach_handle()``) and where the
+     # wrapper's hermes_bg_<id>.{log,pid,exit} files live, so a restart can re-attach the watcher. [daveey]
+     sandbox_handle: dict = field(default_factory=dict)
+@@ -667,7 +668,7 @@ _CHECKPOINT_FIELDS = (
+     "started_at", "task_id", "owner_task_id", "session_key",
+     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+-    "heartbeat_seconds", "persist_on_release", "output_log", "sandbox_handle", "sandbox_temp_dir")
++    "heartbeat_seconds", "persist_on_release", "output_log", "sandbox_handle", "sandbox_temp_dir", "shell_markers")
+ _CHECKPOINT_DEFAULTS = {
+     f.name: (f.default if f.default is not MISSING
+              else f.default_factory() if f.default_factory is not MISSING else MISSING)  # type: ignore[misc]
+@@ -2451,7 +2452,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+                 s for s in (*self._running.values(), *self._finished.values())
+                 if (task_id is None or s.owner_task_id == task_id)
+                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+-                and not (s.persist_on_release and (lifecycle or (host_exit and s.detached)))
++                and not (s.persist_on_release and (lifecycle or (host_exit and (s.detached or survivable_enabled()))))
+             ]
+         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
+         return sum(
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index 98de24521f..ccb0316e81 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -87,13 +87,13 @@ def record_exit_command(log: Path, command: str) -> str:
+     return f"__hermes_exit_file={target}; trap 'printf \"%s\\n\" \"$?\" > \"$__hermes_exit_file\"' EXIT\n{command}"
+ 
+ 
+-# The foreground wrapper's own trailer (PIPESTATUS and cwd markers, base_session_env): a survivable foreground
+-# command handed to the background tees it into its log after the user's output. [daveey]
+-_SHELL_MARKER_RE = re.compile(r"\n?__HERMES_(?:PIPE|CWD)_\w+?__[^\n]*?__HERMES_(?:PIPE|CWD)_\w+?__\n?")
+-
+-
+-def strip_shell_markers(text: str) -> str:
+-    return _SHELL_MARKER_RE.sub("", text) if "__HERMES_" in text else text
++def strip_shell_markers(text: str, markers) -> str:
++    """Drop the foreground wrapper's own trailer lines (``printf '\\n<m>...<m>\\n'``, base_session_env) for
++    exactly ``markers``: a survivable foreground command handed to the background tees them into its log. [daveey]"""
++    for marker in markers or ():
++        if marker and marker in text:
++            text = re.sub(rf"\n{re.escape(marker)}[^\n]*?{re.escape(marker)}\n", "", text)
++    return text
+ 
+ 
+ def recorded_exit_code(log) -> Optional[int]:
+@@ -119,7 +119,7 @@ class ProcessOutputLogMixin:
+ 
+         def ingest(text: str) -> None:
+             nonlocal head_noise
+-            text = strip_shell_markers(text)
++            text = strip_shell_markers(text, session.shell_markers)
+             if head_noise:  # ``bash -lic`` startup warnings, as the pipe reader strips them
+                 text = self._clean_shell_noise(text)
+                 head_noise = not text.strip()
+diff --git a/tools/process_registry_survivable.py b/tools/process_registry_survivable.py
+index 86b909e141..44fdcb5b90 100644
+--- a/tools/process_registry_survivable.py
++++ b/tools/process_registry_survivable.py
+@@ -68,15 +68,19 @@ def usable() -> bool:
+         return False
+     from tools import process_registry as pr
+ 
+-    if shutil.which("systemd-run") and pr._systemd_run_user_scope_available():
++    from tools.process_registry_persist_scope import kanban_run_scope_cgroup, user_unit_cgroup
++
++    # The same decision persisted_job_scope_argv makes: a process in no user unit gets no scope.
++    in_unit = kanban_run_scope_cgroup() is not None or user_unit_cgroup() is not None
++    if in_unit and shutil.which("systemd-run") and pr._systemd_run_user_scope_available():
+         return True
+     with _warn_lock:
+         if not _warned:
+             _warned = True
+             logger.warning(
+                 "terminal.update_survivable_processes is on but systemd-run --user --scope is unusable here "
+-                "(no systemd-run or no reachable user D-Bus session): terminal processes keep dying with "
+-                "the backend on a restart")
++                "(no systemd-run, no reachable user D-Bus session, or this process runs in no systemd user "
++                "unit): terminal processes keep dying with the backend on a restart")
+     return False
+ 
+ 
+@@ -113,15 +117,24 @@ def survivable_interrupt_reason(*thread_ids: Optional[int]) -> Optional[str]:
+     return None
+ 
+ 
++TEE_DRAIN_WAIT_TICKS = 10  # x 0.1 s: tee normally drains in milliseconds; a daemon holding stdout keeps it open
++
++
+ def tee_wrapped(cmd_string: str, log: Path) -> str:
+     """``cmd_string`` with its stdout+stderr teed into ``log`` and its exit status written beside it.
+     ``tee -p`` ignores a closed pipe: once the waiting backend is gone the command keeps writing its log
+-    instead of dying of SIGPIPE, and the next backend tails that log."""
++    instead of dying of SIGPIPE, and the next backend tails that log. bash does not wait for the tee (a
++    process substitution) beyond a short drain: a command that leaves a daemon holding its stdout
++    (``server &``) returns when bash exits, as without the tee, instead of waiting out the timeout."""
+     from tools.process_registry_output_log import _exit_path
+ 
+     exit_file = shlex.quote(_exit_path(log).as_posix())
+-    return (f"{{ {cmd_string}\n}} 2>&1 | tee -p -a {shlex.quote(str(log))}\n"
+-            f"__hermes_rc=${{PIPESTATUS[0]}}; printf '%s\\n' \"$__hermes_rc\" > {exit_file}; exit \"$__hermes_rc\"")
++    return "\n".join((
++        f"exec 3> >(exec tee -p -a {shlex.quote(str(log))}); __hermes_tee=$!",
++        f"( {cmd_string}\n) >&3 2>&3 3>&-",  # a subshell: the wrapper script ends in its own ``exit``
++        "__hermes_rc=$?; exec 3>&-",
++        f"for _ in $(seq {TEE_DRAIN_WAIT_TICKS}); do kill -0 \"$__hermes_tee\" 2>/dev/null || break; sleep 0.1; done",
++        f"printf '%s\\n' \"$__hermes_rc\" > {exit_file}; exit \"$__hermes_rc\""))
+ 
+ 
+ class SurvivableForeground:
+@@ -133,7 +146,8 @@ class SurvivableForeground:
+         self.session = None
+         self.converted = False
+ 
+-    def spawn(self, args: list[str], run_env: dict, cwd: str, stdin_data: Optional[str]) -> Optional[subprocess.Popen]:
++    def spawn(self, args: list[str], run_env: dict, cwd: str, stdin_data: Optional[str],
++              markers: tuple = ()) -> Optional[subprocess.Popen]:
+         """Start ``args`` (``[bash, ..., "-c", script]``) in its own scope, held in the registry; None when
+         no scope can be had any more (the caller spawns as usual)."""
+         from tools.process_registry import process_registry, systemd_user_bus_env
+@@ -141,7 +155,7 @@ class SurvivableForeground:
+         from tools.process_registry_persist_scope import persisted_job_scope_argv
+ 
+         session = process_registry._new_session(self.command, self.task_id, self.owner_task_id, self.session_key,
+-                                                cwd, persist_on_release=True)
++                                                cwd, persist_on_release=True, shell_markers=[m for m in markers if m])
+         log = worker_output_log(session.id, persist=True)
+         if log is None:
+             return None
+-- 
+2.55.0
+

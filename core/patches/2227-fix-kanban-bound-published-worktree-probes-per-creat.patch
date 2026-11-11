@@ -1,0 +1,258 @@
+From ea7ed799d0a7e7afc5e232678f9d611a1ba00a5d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:02:09 +0000
+Subject: [PATCH] fix(kanban): bound published worktree probes per creation
+ [daveey]
+
+---
+ hermes_cli/kanban.py                          |  3 +
+ hermes_cli/kanban_db.py                       |  3 +
+ hermes_cli/kanban_placement.py                |  3 +-
+ hermes_cli/kanban_published_worktree.py       | 38 +++++++++-
+ .../test_kanban_published_worktree.py         | 74 +++++++++++++++++++
+ tools/kanban_tools.py                         |  3 +
+ 6 files changed, 119 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 73f7ad54422..aa12d5c6042 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -9,6 +9,8 @@ from __future__ import annotations
+ import argparse
+ import contextlib
+ import json
++
++from hermes_cli.kanban_published_worktree import publication_scope
+ import logging
+ import os
+ import re
+@@ -428,6 +430,7 @@ def _print_overlap_refusal(args: argparse.Namespace, refused: str) -> int:
+     return 2
+ 
+ 
++@publication_scope
+ def _cmd_create(args: argparse.Namespace) -> int:
+     from agent.delegation_context import is_dispatcher_owned_worker_context
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 960f66613d9..8479bb1ff62 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -16,6 +16,8 @@ from __future__ import annotations
+ 
+ import contextlib
+ import json
++
++from hermes_cli.kanban_published_worktree import publication_scope
+ import os
+ import re
+ import secrets
+@@ -1210,6 +1212,7 @@ def _default_ready_assignee() -> str:
+     return name or "default"
+ 
+ 
++@publication_scope
+ def create_task(
+     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
+     assignee: Optional[str] = None, created_by: Optional[str] = None,
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index c8686f5b18a..b231594fd03 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -352,7 +352,8 @@ def _heavy_marker(title: str, body: str, cfg: _Cfg) -> Optional[str]:
+ # and the Board CLI name ``hermes-hub`` kept ~3 of every 4 ready hub cards off the worker pool, so the hub's
+ # local execution cap throttled the whole queue. What stays local: an existing worktree on this host
+ # (``~/code/_wt/<slug>``, ``~/code/_wt-remote/<slug>``, ``<repo>/.claude/worktrees/<x>``,
+-# ``~/code/<repo>/.worktrees/<x>``, ``~/.hermes/hermes-agent/.worktrees/<x>`` hold unpushed work), Hermes
++# ``~/code/<repo>/.worktrees/<x>``, ``~/.hermes/hermes-agent/.worktrees/<x>`` may hold unpushed work).
++# Clean _wt roots with exact origin publication and explicit checkout identity are exempt. Hermes
+ # state under ``~/.hermes`` other than the code checkout (``~/.hermes/skills`` is host state: curator ledger,
+ # usage counts, live-patched skills), a
+ # ``hermes-hub <subcommand>`` run (it acts with this gateway's key and replica), and a card that declares
+diff --git a/hermes_cli/kanban_published_worktree.py b/hermes_cli/kanban_published_worktree.py
+index d0a064180a2..8da5ec46449 100644
+--- a/hermes_cli/kanban_published_worktree.py
++++ b/hermes_cli/kanban_published_worktree.py
+@@ -6,6 +6,8 @@ remain authoritative. No fetch, checkout, push, or local ref mutation is perform
+ from __future__ import annotations
+ 
+ import re
++from contextvars import ContextVar
++from functools import wraps
+ import subprocess
+ import time
+ from pathlib import Path
+@@ -17,6 +19,23 @@ _PATH = re.compile(r"(?:~|/home/[^/\s]+)/code/_wt(?:-[\w-]+)?/[\w-]+(?=$|[\s`'\"
+ _ORIGIN = re.compile(r'(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?$')
+ 
+ 
++_observation: ContextVar[dict | None] = ContextVar('published_worktrees', default=None)
++
++
++def publication_scope(fn):
++    """Share one bounded observation per synchronous create, including nested entrypoints."""
++    @wraps(fn)
++    def wrapped(*args, **kwargs):
++        if _observation.get() is not None:
++            return fn(*args, **kwargs)
++        token = _observation.set({'deadline': None, 'texts': {}})
++        try:
++            return fn(*args, **kwargs)
++        finally:
++            _observation.reset(token)
++    return wrapped
++
++
+ def without_published_worktrees(text: str) -> str:
+     """Remove only verified roots, within one shared three-second probe budget.
+ 
+@@ -26,9 +45,17 @@ def without_published_worktrees(text: str) -> str:
+     so its receiving agent can reconstruct the checkout. Subpaths remain local:
+     they may reference ignored files not contained in the published commit.
+     Credential-scrubbed origins that cannot be read also remain local.
+-    Results are deliberately not cached across placement calls.
++    Results are reused only inside one create's decision/audit observation.
+     """
+-    deadline = time.monotonic() + 3
++    observation = _observation.get()
++    if observation is not None:
++        if text in observation['texts']:
++            return observation['texts'][text]
++        if observation['deadline'] is None:
++            observation['deadline'] = time.monotonic() + 3
++        deadline = observation['deadline']
++    else:
++        deadline = time.monotonic() + 3
+     checked: dict[str, bool] = {}
+ 
+     def replace(match: re.Match) -> str:
+@@ -37,7 +64,10 @@ def without_published_worktrees(text: str) -> str:
+             checked[raw] = _published(Path(raw).expanduser(), deadline, text)
+         return '<published-worktree>' if checked[raw] else raw
+ 
+-    return _PATH.sub(replace, text)
++    result = _PATH.sub(replace, text)
++    if observation is not None:
++        observation['texts'][text] = result
++    return result
+ 
+ 
+ def _published(path: Path, deadline: float, text: str) -> bool:
+@@ -54,7 +84,7 @@ def _published(path: Path, deadline: float, text: str) -> bool:
+         if remaining <= 0:
+             raise subprocess.TimeoutExpired('git', 3)
+         return subprocess.check_output(
+-            ['git', '-C', str(path), *args], env=env, timeout=remaining,
++            ['git', '-c', 'core.fsmonitor=false', '-C', str(path), *args], env=env, timeout=remaining,
+             stderr=subprocess.DEVNULL, text=True, encoding='utf-8',
+         ).strip()
+ 
+diff --git a/tests/hermes_cli/test_kanban_published_worktree.py b/tests/hermes_cli/test_kanban_published_worktree.py
+index 16c947d4165..f641be7ffdd 100644
+--- a/tests/hermes_cli/test_kanban_published_worktree.py
++++ b/tests/hermes_cli/test_kanban_published_worktree.py
+@@ -97,6 +97,80 @@ def test_other_marker_skips_git_probes(published, monkeypatch):
+     assert reason('~/code/_wt/fix and kanban.db') == 'home gateway marker'
+ 
+ 
++@pytest.mark.parametrize('change', ['non-wt', 'submodules', 'timeout', 'head-race', 'branch-race', 'dirty-race'])
++def test_defensive_publication_fences(published, monkeypatch, change):
++    wt, _ = published
++    original = subprocess.check_output
++    if change == 'non-wt':
++        git(wt, 'branch', '-m', 'feature/fix')
++    elif change == 'submodules':
++        (wt / '.gitmodules').write_text('')
++    else:
++        def intercept(argv, **kw):
++            result = original(argv, **kw)
++            if 'ls-remote' in argv and '--exit-code' in argv:
++                if change == 'timeout':
++                    raise subprocess.TimeoutExpired(argv, 3)
++                if change == 'head-race':
++                    git(wt, 'commit', '--allow-empty', '-m', 'race')
++                elif change == 'branch-race':
++                    git(wt, 'branch', '-m', 'wt/other')
++                elif change == 'dirty-race':
++                    (wt / 'race').write_text('unpublished')
++            return result
++        monkeypatch.setattr(subprocess, 'check_output', intercept)
++    assert reason('~/code/_wt/fix') == 'home gateway marker'
++
++
++def test_request_scope_reuses_observation_and_resets(published, monkeypatch):
++    from hermes_cli import kanban_published_worktree as pw
++    calls = []
++    original = pw._published
++
++    def probe(*args):
++        calls.append(args[1])
++        return original(*args)
++
++    monkeypatch.setattr(pw, '_published', probe)
++
++    @pw.publication_scope
++    def nested():
++        assert reason('~/code/_wt/fix') is None
++
++    @pw.publication_scope
++    def create():
++        nested()
++        nested()
++        assert len(calls) == 1
++        raise ValueError('test scope cleanup')
++
++    with pytest.raises(ValueError, match='scope cleanup'):
++        create()
++    nested()
++    assert len(calls) == 2
++    assert pw._observation.get() is None
++
++
++def test_scope_shares_deadline_across_different_texts(published, monkeypatch):
++    from hermes_cli import kanban_published_worktree as pw
++    deadlines = []
++    monkeypatch.setattr(pw, '_published', lambda path, deadline, text: deadlines.append(deadline) or False)
++
++    @pw.publication_scope
++    def create():
++        reason('~/code/_wt/fix')
++        reason('another ~/code/_wt/fix')
++
++    create()
++    assert len(deadlines) == 2
++    assert deadlines[0] == deadlines[1]
++
++
++def test_expired_budget_fails_closed(published):
++    from hermes_cli import kanban_published_worktree as pw
++    assert not pw._published(published[0], 0, 'unused')
++
++
+ def test_structural_host_requirements_stay_local(published):
+     assert reason('~/code/_wt/fix', workspace_kind='dir') == 'host workspace'
+     assert reason('~/code/_wt/fix', requires=['host_repo']) == 'uncarried requirement'
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 2f04d3a642f..ac7378d1525 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -9,6 +9,8 @@ from __future__ import annotations
+ 
+ import functools
+ import json
++
++from hermes_cli.kanban_published_worktree import publication_scope
+ import logging
+ import os
+ import time
+@@ -1563,6 +1565,7 @@ def _creation_audit(args: dict, **effective) -> Optional[dict]:
+ 
+ 
+ @_kanban_handler("kanban_create")
++@publication_scope
+ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+     # Only an explicitly local create is board-scoped: any other placement or an origin binding can write a
+-- 
+2.55.0
+

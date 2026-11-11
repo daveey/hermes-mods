@@ -1,0 +1,456 @@
+From 91fca02958a218836fc31def1f538645e30e30f5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:56:54 +0000
+Subject: [PATCH] [daveey] perf(desktop): remember a backend that refuses
+ prompt.submit's submission_id
+
+hermes serve's tui_gateway contract has no submission_id and refuses it
+pre-admission (4000). Desktop downgraded per submission, so EVERY message to
+the hub paid a refused request plus the identityless resend: an extra
+Mac->hub round trip (renderer trace: 6/6 test chats). Remember the refusal
+per submission destination (connection + profile) for 10 min, and send
+identityless straight away. An accepted identity clears it, and the entry
+expires so an upgraded backend gets identity back. The safety rules are
+unchanged: only a pre-admission refusal downgrades, and a lost identityless
+ACK is never auto-retried.
+
+Retained (explicit-retry) entries always offer their identity again: one may already
+be admitted with identity, and dropping it would bypass dedupe. The memo is valid only in the
+gateway activation epoch it was recorded in (a route/source swap can land on a capable
+backend under the same key).
+
+A refusal is stamped with the activation epoch its request was SENT under and dropped
+if a swap happened while it was in flight.
+
+Tests: new submission-identity-support unit tests. The legacy-identity tests
+moved to their own file (index.test.tsx is over its line cap). The new
+'remembers the refusal' test fails without the fix. The lost-ACK test's
+count drops from 4 requests to 3, because the third send no longer pays the
+refused request. A global afterEach resets the memo. Full use-prompt-actions
++ use-session-actions suites: 944/944. tsc: 0 desktop errors.
+---
+ .../hooks/use-prompt-actions/index.test.tsx   |  30 +---
+ .../submission-identity-support.test.ts       |  61 +++++++++
+ .../submission-identity-support.ts            |  56 ++++++++
+ .../submit-legacy-identity.test.tsx           | 129 ++++++++++++++++++
+ .../hooks/use-prompt-actions/submit.ts        |  53 +++++--
+ apps/desktop/vitest.setup.ts                  |   4 +
+ 6 files changed, 293 insertions(+), 40 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.test.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+index ff94e62397..e73843dbb6 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+@@ -194,32 +194,6 @@ describe('durable submit acknowledgement', () => {
+       expect.any(Number)
+     )
+   })
+-
+-  it('a legacy backend refusing submission_id as version skew (4000) gets one identityless retry', async () => {
+-    // `hermes serve` validates params against a strict contract: an unknown key is refused
+-    // as 4000 before any handler ran (surfaced by the remote-topology E2E as "Session unavailable").
+-    const submits: Array<Record<string, unknown>> = []
+-
+-    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+-      if (method !== 'prompt.submit') {return {} as never}
+-      submits.push(params!)
+-
+-      if ('submission_id' in params!) {
+-        throw Object.assign(new Error('invalid params for prompt.submit: submission_id: Extra inputs are not permitted — the client and the Hermes backend are out of sync (different versions)'), { code: 4000 })
+-      }
+-
+-      return { status: 'streaming' } as never
+-    })
+-
+-    let handle: HarnessHandle | null = null
+-    await actRender(
+-      <Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />
+-    )
+-    expect(await handle!.submitText('hi remote')).toBe(true)
+-    expect(submits).toHaveLength(2)
+-    expect(submits[1]).not.toHaveProperty('submission_id')
+-    expect(submits[1]).toMatchObject({ text: 'hi remote' })
+-  })
+ })
+ 
+ describe('submit timeout admission fences', () => {
+@@ -279,7 +253,9 @@ describe('submit timeout admission fences', () => {
+     const shown = $notifications.get().map(n => n.message)
+     // The restored draft keeps its identity; pressing Enter again after the notice sends it.
+     expect(await handle!.submitText('hello there', { submission_id: 'legacy-lost' })).toBe(true)
+-    expect(submits).toHaveLength(4)
++    // One request, not a refused identified one plus the resend: this backend's refusal is remembered.
++    expect(submits).toHaveLength(3)
++    expect(submits[2]).not.toHaveProperty('submission_id')
+     expect(shown).toContain(en.promptNotices.legacySendUnconfirmed)
+   })
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.test.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.test.ts
+new file mode 100644
+index 0000000000..9933ba5927
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.test.ts
+@@ -0,0 +1,61 @@
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { $gatewayActivationEpoch } from '@/store/gateway-activation-epoch'
++
++import {
++  backendRefusesSubmissionId,
++  noteSubmissionIdAccepted,
++  noteSubmissionIdRefused,
++  resetSubmissionIdSupportForTests,
++  SUBMISSION_ID_REFUSAL_TTL_MS,
++  submissionIdentityEpoch
++} from './submission-identity-support'
++
++afterEach(() => {
++  resetSubmissionIdSupportForTests()
++  $gatewayActivationEpoch.set(0)
++})
++
++describe('submission identity support memo', () => {
++  it('remembers a refusal per destination only', () => {
++    noteSubmissionIdRefused('["hub","default"]', submissionIdentityEpoch(), 1000)
++
++    expect(backendRefusesSubmissionId('["hub","default"]', 1001)).toBe(true)
++    expect(backendRefusesSubmissionId('["hub","alpha"]', 1001)).toBe(false)
++  })
++
++  it('expires so an upgraded backend gets identity back', () => {
++    noteSubmissionIdRefused('k', submissionIdentityEpoch(), 0)
++
++    expect(backendRefusesSubmissionId('k', SUBMISSION_ID_REFUSAL_TTL_MS - 1)).toBe(true)
++    expect(backendRefusesSubmissionId('k', SUBMISSION_ID_REFUSAL_TTL_MS)).toBe(false)
++  })
++
++  it('an accepted identity clears the refusal', () => {
++    noteSubmissionIdRefused('k', submissionIdentityEpoch(), 0)
++    noteSubmissionIdAccepted('k')
++
++    expect(backendRefusesSubmissionId('k', 1)).toBe(false)
++  })
++
++  it('a gateway activation (route/source swap) invalidates the refusal', () => {
++    $gatewayActivationEpoch.set(4)
++    noteSubmissionIdRefused('k', submissionIdentityEpoch(), 0)
++
++    expect(backendRefusesSubmissionId('k', 1)).toBe(true)
++
++    $gatewayActivationEpoch.set(5)
++
++    expect(backendRefusesSubmissionId('k', 2)).toBe(false)
++  })
++
++  it('a refusal answered after a swap is not stamped on the new backend', () => {
++    $gatewayActivationEpoch.set(4)
++    const sentUnder = submissionIdentityEpoch()
++
++    $gatewayActivationEpoch.set(5)
++    noteSubmissionIdRefused('k', sentUnder, 0)
++
++    expect(backendRefusesSubmissionId('k', 1)).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.ts
+new file mode 100644
+index 0000000000..bd3d6b4dcf
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-identity-support.ts
+@@ -0,0 +1,56 @@
++/** Per-destination memo of a backend that refused `prompt.submit`'s `submission_id` before
++ * admission (`hermes serve`'s tui_gateway contract has no such field and answers 4000).
++ * Without it every send paid a refused request plus the identityless resend: one extra
++ * round trip on each message. Keyed by the submission destination's scopeKey (connection +
++ * profile). The key carries no backend identity, so an entry is only valid inside the gateway
++ * activation epoch it was recorded in (a route/source swap may land on an identity-capable
++ * backend under the same key), and it expires so an in-place upgrade gets identity back. */
++
++import { $gatewayActivationEpoch } from '@/store/gateway-activation-epoch'
++
++export const SUBMISSION_ID_REFUSAL_TTL_MS = 10 * 60_000
++
++const refusals = new Map<string, { at: number; epoch: number }>()
++
++const currentEpoch = () => {
++  const epoch = $gatewayActivationEpoch.get()
++
++  return Number.isFinite(epoch) ? epoch : 0
++}
++
++/** Capture before sending an identified request; pass to noteSubmissionIdRefused. */
++export const submissionIdentityEpoch = currentEpoch
++
++export function backendRefusesSubmissionId(scopeKey: string, now = Date.now()): boolean {
++  const refusal = refusals.get(scopeKey)
++
++  if (refusal === undefined) {
++    return false
++  }
++
++  if (now - refusal.at >= SUBMISSION_ID_REFUSAL_TTL_MS || refusal.epoch !== currentEpoch()) {
++    refusals.delete(scopeKey)
++
++    return false
++  }
++
++  return true
++}
++
++/** `requestEpoch` is the activation the refused request was SENT under. A refusal that arrives
++ * after a swap describes the previous backend, so it is dropped rather than stamped on the new one. */
++export function noteSubmissionIdRefused(scopeKey: string, requestEpoch: number, now = Date.now()): void {
++  if (requestEpoch !== currentEpoch()) {
++    return
++  }
++
++  refusals.set(scopeKey, { at: now, epoch: requestEpoch })
++}
++
++export function noteSubmissionIdAccepted(scopeKey: string): void {
++  refusals.delete(scopeKey)
++}
++
++export function resetSubmissionIdSupportForTests(): void {
++  refusals.clear()
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+new file mode 100644
+index 0000000000..d3e3ed5ab8
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+@@ -0,0 +1,129 @@
++import { cleanup } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { getLatestSessionMessages } from '@/hermes'
++
++import { actRender, Harness, type HarnessHandle } from './index-test-utils'
++import { clearStoredJournal } from './prepared-submissions-test-utils'
++import { clearSingleFlightSessionResumeState } from './single-flight-resume'
++import { resetSubmissionIdSupportForTests } from './submission-identity-support'
++
++vi.mock('@/hermes', () => ({
++  getApiRequestConnection: () => null,
++  getApiRequestProfile: () => null,
++  getLatestSessionMessages: vi.fn(async () => ({ messages: [], session_id: 'session' })),
++  getProfiles: vi.fn(async () => ({ profiles: [] })),
++  getSession: vi.fn(),
++  PROMPT_SUBMIT_REQUEST_TIMEOUT_MS: 1_800_000,
++  setApiRequestProfile: vi.fn(),
++  transcribeAudio: vi.fn()
++}))
++
++vi.mock('@/store/gateway', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  requestGatewayForAgent: vi.fn()
++}))
++
++beforeEach(() => {
++  clearSingleFlightSessionResumeState()
++  clearStoredJournal()
++  resetSubmissionIdSupportForTests()
++  vi.mocked(getLatestSessionMessages).mockImplementation(async () => ({ messages: [], session_id: 'session' }))
++})
++
++afterEach(() => {
++  cleanup()
++  vi.restoreAllMocks()
++  resetSubmissionIdSupportForTests()
++})
++
++describe('a backend that refuses submission_id', () => {
++  it('a legacy backend refusing submission_id as version skew (4000) gets one identityless retry', async () => {
++    // `hermes serve` validates params against a strict contract: an unknown key is refused
++    // as 4000 before any handler ran (surfaced by the remote-topology E2E as "Session unavailable").
++    const submits: Array<Record<string, unknown>> = []
++
++    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
++      if (method !== 'prompt.submit') {return {} as never}
++      submits.push(params!)
++
++      if ('submission_id' in params!) {
++        throw Object.assign(new Error('invalid params for prompt.submit: submission_id: Extra inputs are not permitted — the client and the Hermes backend are out of sync (different versions)'), { code: 4000 })
++      }
++
++      return { status: 'streaming' } as never
++    })
++
++    let handle: HarnessHandle | null = null
++    await actRender(
++      <Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />
++    )
++    expect(await handle!.submitText('hi remote')).toBe(true)
++    expect(submits).toHaveLength(2)
++    expect(submits[1]).not.toHaveProperty('submission_id')
++    expect(submits[1]).toMatchObject({ text: 'hi remote' })
++  })
++
++  it('remembers the refusal: the next send on that backend goes identityless in ONE request', async () => {
++    const submits: Array<Record<string, unknown>> = []
++
++    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
++      if (method !== 'prompt.submit') {return {} as never}
++      submits.push(params!)
++
++      if ('submission_id' in params!) {
++        throw Object.assign(new Error('invalid params for prompt.submit: submission_id: Extra inputs are not permitted — the client and the Hermes backend are out of sync (different versions)'), { code: 4000 })
++      }
++
++      return { status: 'streaming' } as never
++    })
++
++    let handle: HarnessHandle | null = null
++    await actRender(
++      <Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />
++    )
++
++    expect(await handle!.submitText('first')).toBe(true)
++    expect(submits).toHaveLength(2)
++
++    expect(await handle!.submitText('second')).toBe(true)
++    expect(submits).toHaveLength(3)
++    expect(submits[2]).not.toHaveProperty('submission_id')
++    expect(submits[2]).toMatchObject({ text: 'second' })
++  })
++
++  it('an explicit retry of an uncertain IDENTIFIED send keeps its identity even after a refusal was remembered', async () => {
++    // The first send may have been admitted with identity (an ambiguous failure, not a refusal).
++    // Retrying it identityless would bypass the backend's dedupe and could admit the turn twice.
++    const submits: Array<Record<string, unknown>> = []
++    let phase: 'uncertain' | 'legacy' | 'retry' = 'uncertain'
++
++    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
++      if (method !== 'prompt.submit') {return {} as never}
++      submits.push(params!)
++
++      if (phase === 'uncertain') {throw new Error('socket closed before acknowledgement')}
++
++      if (phase === 'legacy' && 'submission_id' in params!) {
++        throw Object.assign(new Error('invalid params for prompt.submit: submission_id: Extra inputs are not permitted'), { code: 4000 })
++      }
++
++      return { admission_id: params?.submission_id, status: 'started' } as never
++    })
++
++    let handle: HarnessHandle | null = null
++    await actRender(
++      <Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />
++    )
++
++    expect(await handle!.submitText('maybe admitted', { submission_id: 'uncertain-1' })).toBe(false)
++    phase = 'legacy'
++    expect(await handle!.submitText('unrelated new turn')).toBe(true)
++    expect(submits.at(-1)).not.toHaveProperty('submission_id')
++
++    phase = 'retry'
++    const before = submits.length
++    expect(await handle!.submitText('maybe admitted', { submission_id: 'uncertain-1' })).toBe(true)
++    expect(submits[before]).toMatchObject({ submission_id: 'uncertain-1', text: 'maybe admitted' })
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index 4b9c3d441c..1a31fddd53 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -62,6 +62,12 @@ import {
+ } from './prepared-submissions'
+ import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
+ import { captureSubmissionDestination, destinationAfterCreate, sameAuthorityPublishedOwner } from './submission-destination'
++import {
++  backendRefusesSubmissionId,
++  noteSubmissionIdAccepted,
++  noteSubmissionIdRefused,
++  submissionIdentityEpoch
++} from './submission-identity-support'
+ import {
+   acquireSubmitInFlight,
+   type GatewayRequest,
+@@ -1180,8 +1186,39 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+ 
+                 const params: Record<string, unknown> = { ...prepared.params, session_id: liveId }
+ 
++                const sendIdentityless = async () => {
++                  prepared.legacyAttempted = true
++                  await writePreparedSubmission(retryKey, prepared)
++                  const { submission_id: _id, ...legacyParams } = params
++
++                  const result = await requestGateway<SubmitReceipt>(
++                    'prompt.submit',
++                    legacyParams,
++                    PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
++                  )
++
++                  legacyAccepted = true
++
++                  return result
++                }
++
++                // This destination already refused `submission_id` pre-admission: skip the
++                // refused request instead of paying a round trip on every send. Fresh sends only:
++                // a retained entry may already have been admitted WITH identity on a capable
++                // backend, so its retry must offer that identity again (dedupe), never drop it.
++                if (!retained && backendRefusesSubmissionId(destination.scopeKey)) {
++                  return await sendIdentityless()
++                }
++
++                // The activation this request went out under: a refusal answered after a
++                // route/source swap describes the old backend and must not mark the new one.
++                const identityEpoch = submissionIdentityEpoch()
++
+                 try {
+-                  return await requestGateway<SubmitReceipt>('prompt.submit', params, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
++                  const receipt = await requestGateway<SubmitReceipt>('prompt.submit', params, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
++                  noteSubmissionIdAccepted(destination.scopeKey)
++
++                  return receipt
+                 } catch (error) {
+                   // A retry whose payload no longer matches its admitted original (an attachment send
+                   // offered back as text) is that original: settled as the dedupe it is, no new turn.
+@@ -1198,19 +1235,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+                     throw error
+                   }
+ 
+-                  prepared.legacyAttempted = true
+-                  await writePreparedSubmission(retryKey, prepared)
+-                  const { submission_id: _id, ...legacyParams } = params
+-
+-                  const result = await requestGateway<SubmitReceipt>(
+-                    'prompt.submit',
+-                    legacyParams,
+-                    PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+-                  )
+-
+-                  legacyAccepted = true
++                  noteSubmissionIdRefused(destination.scopeKey, identityEpoch)
+ 
+-                  return result
++                  return await sendIdentityless()
+                 }
+               }),
+             {
+diff --git a/apps/desktop/vitest.setup.ts b/apps/desktop/vitest.setup.ts
+index 7effdc7211..2cde53beb9 100644
+--- a/apps/desktop/vitest.setup.ts
++++ b/apps/desktop/vitest.setup.ts
+@@ -1,6 +1,7 @@
+ import { configure } from '@testing-library/react'
+ import { afterAll, afterEach } from 'vitest'
+ 
++import { resetSubmissionIdSupportForTests } from './src/app/session/hooks/use-prompt-actions/submission-identity-support'
+ import { clearPlaybackSourceCache } from './src/lib/playback-source-cache'
+ import { InertResizeObserver } from './src/test/jsdom'
+ 
+@@ -91,3 +92,6 @@ configure({ asyncUtilTimeout: 12_000 })
+ afterAll(() => new Promise<void>(resolve => setTimeout(resolve, 0)))
+ // Resolved media URLs must not leak between tests.
+ afterEach(() => clearPlaybackSourceCache())
++// Module-global per-backend memo: a test whose backend refuses submission_id must not make the next
++// test's send skip identity.
++afterEach(() => resetSubmissionIdSupportForTests())
+-- 
+2.55.0
+

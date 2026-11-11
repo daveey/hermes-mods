@@ -1,0 +1,173 @@
+From 9041bebb4760de7c1cf6e33f512762bdb51a0295 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:32:53 +0000
+Subject: [PATCH] fix(update): pinned-profile lookup can never break abort
+ recovery, and a pinned profile is not owed [daveey]
+
+Third review of this branch:
+
+- restart-abort recovery runs in the pre-update interpreter over the replaced checkout. The
+  pinned-profile lookup imported there outside any guard, so a skewed module could escape
+  the abort handler. profiles_on_another_checkout is now total: any failure, SystemExit
+  included, reads as "no pinned profile" and recovery proceeds as before.
+- a profile recovery left on its own checkout stayed "planned but not covered", and its
+  live PID counted as a surviving stale gateway, so the abort verdict was always
+  incomplete on a host with a pinned gateway. It now counts as covered and is dropped
+  from the survivors.
+- the lookup trusted a recorded PID that merely existed; it now requires a gateway
+  command line.
+
+Not exercised end to end: a forced exception in the middle of the restart phase (tested:
+the partition, the survivor probe and the lookup's failure modes, each directly).
+---
+ hermes_cli/update_cmd_fleet.py                | 13 ++++++----
+ hermes_cli/update_fleet_scope.py              | 24 ++++++++++++-------
+ .../test_update_pause_pinned_runtime.py       | 21 ++++++++++++++--
+ 3 files changed, 44 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/update_cmd_fleet.py b/hermes_cli/update_cmd_fleet.py
+index 307bdf74476..a128f205e4b 100644
+--- a/hermes_cli/update_cmd_fleet.py
++++ b/hermes_cli/update_cmd_fleet.py
+@@ -1038,7 +1038,10 @@ def _surviving_gateway_pids_after_failed_restart():
+     """
+     try:
+         from hermes_cli.gateway import find_gateway_pids
+-        return _scoped_manual_gateway_pids(find_gateway_pids(all_profiles=True), quiet=True)
++        from hermes_cli.update_fleet_scope import drop_gateways_on_another_checkout
++        # A gateway on another checkout survives by design: it is not stale. [daveey]
++        return _scoped_manual_gateway_pids(
++            drop_gateways_on_another_checkout(find_gateway_pids(all_profiles=True), quiet=True), quiet=True)
+     except Exception as exc:  # pragma: no cover - defensive
+         logger.debug("Could not probe for surviving gateways after update: %s", exc)
+         return None
+@@ -1083,7 +1086,7 @@ def _gateway_recovery_partition(plan, *, skip_profiles: set[str] | None = None)
+     skip_profiles = skip_profiles or set()
+     candidates: dict[str, str] = {}
+     skipped: list[dict] = []
+-    from hermes_cli.update_fleet_scope import profiles_on_another_checkout
++    from hermes_cli.update_fleet_scope import profiles_on_another_checkout  # loaded before the checkout moved
+     pinned = profiles_on_another_checkout()  # recovery would only bounce these onto their pin [daveey]
+     with _best_effort('Could not prepare fresh gateway restart profiles: %s'):
+         for runtime in getattr(plan, "runtimes", ()) or ():
+@@ -1096,7 +1099,7 @@ def _gateway_recovery_partition(plan, *, skip_profiles: set[str] | None = None)
+                 if profile in skip_profiles:
+                     continue
+                 if profile in pinned:
+-                    skipped.append({"profile": profile, "kind": "gateway", "supervisor": str(supervisor),
++                    skipped.append({"profile": profile, "kind": "gateway", "supervisor": str(supervisor), "pinned": True,
+                                     "reason": f"runs its own checkout ({pinned[profile]}), which this update does not change"})
+                     continue
+                 if supervisor in _FRESH_RESTART_SUPERVISORS:
+@@ -1715,7 +1718,9 @@ def _recover_after_restart_phase_abort(
+     )
+     if _abort_recovery_is_complete(
+         planned_gateway_profiles=_planned_gateway_profiles,
+-        covered_gateway_profiles=_already_restarted_profiles | _recovery_verified,
++        # A profile recovery left on its own checkout is settled, not owed. [daveey]
++        covered_gateway_profiles=_already_restarted_profiles | _recovery_verified | {
++            row.get("profile") for row in _recovery_result.get("skipped") or () if row.get("pinned")},
+         recovery_result=_recovery_result,
+         stale_runtime_rows=_stale_runtime_rows,
+     ):
+diff --git a/hermes_cli/update_fleet_scope.py b/hermes_cli/update_fleet_scope.py
+index 6b3629392dd..7e8ba1e7c22 100644
+--- a/hermes_cli/update_fleet_scope.py
++++ b/hermes_cli/update_fleet_scope.py
+@@ -182,23 +182,31 @@ def gateway_foreign_code_root(pid: int, home) -> Path | None:
+ def profiles_on_another_checkout() -> dict[str, Path]:
+     """Profile → the other checkout its live gateway runs, read fresh from each profile's own
+     status record. Restart-abort recovery asks this itself: it can run before the restart phase
+-    looked at any unit, so nothing an earlier pass remembered is there to rely on."""
+-    import json
++    looked at any unit, so nothing an earlier pass remembered is there to rely on.
+ 
+-    import psutil
+-    from hermes_cli.update_receipt import _profile_homes
++    Total by contract: recovery runs in the pre-update interpreter over the replaced checkout,
++    where a first import can fail in any way; every failure reads as "no pinned profile"."""
+     pinned: dict[str, Path] = {}
+-    with suppress(Exception):
++    try:
++        import json
++
++        import psutil
++        from hermes_cli.update_receipt import _profile_homes
+         for profile, home in _profile_homes():
+             with suppress(Exception):
+                 pid = int(json.loads((home / "gateway_state.json").read_text(encoding="utf-8-sig")).get("pid") or 0)
+-                root = gateway_foreign_code_root(pid, home) if pid > 0 and psutil.pid_exists(pid) else None
++                # A crashed gateway's recorded PID may belong to anything by now.
++                if pid <= 0 or "gateway" not in psutil.Process(pid).cmdline():
++                    continue
++                root = gateway_foreign_code_root(pid, home)
+                 if root is not None:
+                     pinned[profile] = root
++    except (Exception, SystemExit):  # health: allow BLE001 -- see "Total by contract" above
++        return {}
+     return pinned
+ 
+ 
+-def drop_gateways_on_another_checkout(pids) -> list[int]:
++def drop_gateways_on_another_checkout(pids, *, quiet: bool = False) -> list[int]:
+     """*pids* minus the gateway processes that provably run another checkout (each named once).
+ 
+     The manual sweep stops every gateway process of this home that no supervisor claims; a pinned
+@@ -212,7 +220,7 @@ def drop_gateways_on_another_checkout(pids) -> list[int]:
+         root = gateway_foreign_code_root(pid, home)
+         if root is None:
+             kept.append(pid)
+-        else:
++        elif not quiet:
+             announce_skipped_runtime("gateway process", f"PID {pid}", home, code_root=root)
+     return kept
+ 
+diff --git a/tests/hermes_cli/test_update_pause_pinned_runtime.py b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+index 66f2adacb55..f4e40dda6bd 100644
+--- a/tests/hermes_cli/test_update_pause_pinned_runtime.py
++++ b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+@@ -183,7 +183,7 @@ def test_best_effort_restart_skips_a_pinned_unit(host):
+     assert failed == [] and host["writes"] == []
+ 
+ 
+-def test_recovery_and_manual_sweeps_honour_the_same_verdict(host):
++def test_recovery_and_manual_sweeps_honour_the_same_verdict(host, monkeypatch):
+     """Restart-abort recovery (which may run before any unit was looked at) and the manual-process
+     sweep (reached when the unit PID lookup fails) both leave the pinned gateway alone."""
+     from types import SimpleNamespace
+@@ -194,14 +194,31 @@ def test_recovery_and_manual_sweeps_honour_the_same_verdict(host):
+ 
+     candidates, skipped = fleet._gateway_recovery_partition(plan)
+     assert candidates == {} and [s["profile"] for s in skipped] == ["askeve-builder"]
+-    assert str(host["core"]) in skipped[0]["reason"]
++    assert skipped[0]["pinned"] is True and str(host["core"]) in skipped[0]["reason"]
++    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **k: [pinned])
++    assert fleet._surviving_gateway_pids_after_failed_restart() == [], "a pinned gateway was reported stale"
+ 
+     control = _run_on_checkout(host)
+     assert drop_gateways_on_another_checkout([pinned, control]) == [control]
++    # A recorded PID that is no gateway (reused after a crash), or no pin at all: recovery restarts it.
+     (host["home"] / "gateway_state.json").write_text(json.dumps({"pid": control, "argv": ["-c"]}))
+     assert fleet._gateway_recovery_partition(plan) == ({"askeve-builder": "systemd"}, [])
+ 
+ 
++@pytest.mark.parametrize("failure", [ImportError("skewed module"), SystemExit(2)], ids=["import-error", "system-exit"])
++def test_a_pin_lookup_that_fails_never_breaks_recovery(host, monkeypatch, failure):
++    """Recovery runs in the pre-update interpreter over the replaced checkout: a lookup that cannot
++    even import must read as "no pinned profile", never escape the abort handler."""
++    from types import SimpleNamespace
++    plan = SimpleNamespace(runtimes=[SimpleNamespace(kind="gateway", profile="askeve-builder", supervisor="systemd")])
++    _run_pinned(host, status_record=True)
++
++    def boom():
++        raise failure
++    monkeypatch.setattr("hermes_cli.update_receipt._profile_homes", boom)
++    assert fleet._gateway_recovery_partition(plan) == ({"askeve-builder": "systemd"}, [])
++
++
+ def test_working_directory_outranks_pythonpath_without_safe_path(host):
+     """``python -m`` puts the working directory ahead of PYTHONPATH: a gateway started in checkout A
+     with PYTHONPATH naming B runs A, and must not be read as pinned to B."""
+-- 
+2.55.0
+

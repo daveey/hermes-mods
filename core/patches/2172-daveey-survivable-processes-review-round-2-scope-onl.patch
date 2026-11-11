@@ -1,0 +1,267 @@
+From 087b9aab046a2656d226c2a30e77a458ca9c85f7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:59:04 +0000
+Subject: [PATCH] [daveey] survivable processes: review round 2 (scope-only
+ shutdown spare, Stop vs every survivable reason, split markers)
+
+- gateway_shutdown spares a persisted job only once it left the unit (detached or its own systemd
+  scope), not whenever the key is on: an unscoped persisted job (no usable scope) is killed as today.
+- a pending user Stop keeps the tool thread's reason against any survivable reason (backend exit,
+  update pause), not only gateway shutdown; the reason set moves to tools/interrupt.py.
+- the log reader holds back from the last newline while a session has wrapper markers, so a marker
+  trailer straddling two 64 KiB reads is still stripped.
+RED (fixes reverted, tests kept): 9 failed; GREEN: 24 passed.
+---
+ agent/interrupt_control.py                    | 13 ++--
+ .../tools/test_update_survivable_processes.py | 66 +++++++++++++++++--
+ tools/interrupt.py                            |  5 ++
+ tools/process_registry.py                     |  8 +--
+ tools/process_registry_output_log.py          | 20 ++++--
+ tools/process_registry_survivable.py          | 10 +--
+ 6 files changed, 96 insertions(+), 26 deletions(-)
+
+diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+index 4da9f7663d..f969869e2c 100644
+--- a/agent/interrupt_control.py
++++ b/agent/interrupt_control.py
+@@ -10,6 +10,7 @@ from typing import Optional
+ 
+ from agent.interrupt_compat import request_hard_interrupt
+ from tools.interrupt import request_yield as _request_yield
++from tools.interrupt import SURVIVABLE_INTERRUPT_REASONS
+ from tools.interrupt import set_interrupt as _set_interrupt
+ 
+ # Same logger name as the origin module so log records / caplog filters are unchanged.
+@@ -225,17 +226,19 @@ class InterruptControlMixin:
+ 
+         def _publish_interrupt_state() -> None:
+             nonlocal tool_interrupt_reason
++            _pending = getattr(self, "_interrupt_requested", False)
++            stop_pending = _pending and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS
++            stop_reason = getattr(self, "_tool_interrupt_reason", None)
+             # A shutdown stop never relabels a user Stop already pending (the user's Stop wins): the turn
+             # records the first cause, so it is not announced as interrupted by the restart. A pending
+             # redirect (a mid-request correction) is not a Stop: the restart drops it and is the cause.
+-            _pending = getattr(self, "_interrupt_requested", False)
+             if not (_pending and tool_reason == _REASON_UPDATE_PAUSE) and not (
+-                    tool_reason == _REASON_GATEWAY_SHUTDOWN and _pending
+-                    and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS):
++                    tool_reason == _REASON_GATEWAY_SHUTDOWN and stop_pending):
+                 self._interrupt_message = message
+                 self._tool_interrupt_reason = tool_interrupt_reason
+-            else:  # tool threads keep the Stop's reason too: a survivable command must still die [daveey]
+-                tool_interrupt_reason = self._tool_interrupt_reason
++            if stop_pending and tool_reason in SURVIVABLE_INTERRUPT_REASONS:
++                # Tool threads keep the Stop's reason: a survivable terminal command must still die. [daveey]
++                tool_interrupt_reason = stop_reason
+             self._interrupt_requested = True
+             if tool_reason != _REASON_UPDATE_PAUSE:
+                 self._turn_user_intervened = True
+diff --git a/tests/tools/test_update_survivable_processes.py b/tests/tools/test_update_survivable_processes.py
+index 73eecf0a35..e1527968f0 100644
+--- a/tests/tools/test_update_survivable_processes.py
++++ b/tests/tools/test_update_survivable_processes.py
+@@ -124,6 +124,45 @@ def test_log_tail_drops_only_this_sessions_wrapper_markers():
+     assert strip_shell_markers(other, [pipe, cwd]) == other
+ 
+ 
++@pytest.mark.parametrize("split", [1, 5, 9, 20, 40, 60, 75])
++def test_log_reader_drops_a_marker_trailer_split_across_reads(tmp_path, monkeypatch, split):
++    """The reader reads 64 KiB at a time: a trailer straddling two reads must still go."""
++    import tools.process_registry_output_log as olog
++
++    pipe, cwd = "__HERMES_PIPE_181265ba766b__", "__HERMES_CWD_181265ba766b__"
++    body = "x" * 100 + "\nfg-done\n"
++    data = (body + f"\n{pipe}0{pipe}\n\n{cwd}/home/u{cwd}\n").encode()
++    reads = [data[:len(body) + split], data[len(body) + split:]]
++    log = tmp_path / "proc_split.log"
++    log.write_bytes(data)
++    (tmp_path / "proc_split.exit").write_text("0\n")
++
++    class Stream:
++        def __init__(self, *a, **k):
++            self.parts = list(reads)
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++        def read(self, n):
++            return self.parts.pop(0) if self.parts else b""
++
++    monkeypatch.setattr(olog, "open", Stream, raising=False)
++    registry = ProcessRegistry()
++    session = registry._new_session("c", "t", "t", "k", str(tmp_path), persist_on_release=True,
++                                    shell_markers=[pipe, cwd])
++    session.output_log = str(log)
++    session._reader_finish_requested.set()
++    finished = []
++    monkeypatch.setattr(registry, "_finish_exited", lambda s, code, **k: finished.append(code))
++    registry._log_reader_loop(session)
++    assert session.output_buffer == body
++    assert finished == [0]
++
++
+ def test_tee_wrapper_records_the_commands_own_exit_status(tmp_path):
+     log = tmp_path / "proc_x.log"
+     script = surv.tee_wrapped("echo out; echo err >&2; exit 7", log)
+@@ -155,17 +194,34 @@ def test_a_shutdown_after_a_user_stop_keeps_the_stop_reason_on_the_tool_thread()
+ 
+     tid = threading.get_ident()
+     try:
+-        stopped = agent()
+-        request_hard_interrupt(stopped)  # the user's Stop
+-        request_hard_interrupt(stopped, "restart", tool_reason="gateway shutdown")
+-        assert surv.survivable_interrupt_reason(tid) is None
+-        set_interrupt(False, tid)
++        for later in sorted(surv.SURVIVABLE_INTERRUPT_REASONS):
++            stopped = agent()
++            request_hard_interrupt(stopped)  # the user's Stop
++            request_hard_interrupt(stopped, "restart", tool_reason=later)
++            assert surv.survivable_interrupt_reason(tid) is None, later
++            set_interrupt(False, tid)
+         request_hard_interrupt(agent(), "restart", tool_reason="gateway shutdown")
+         assert surv.survivable_interrupt_reason(tid) == "gateway shutdown"
+     finally:
+         set_interrupt(False, tid)
+ 
+ 
++def test_shutdown_sweep_spares_only_persisted_jobs_that_left_the_unit(tmp_path, key):
++    """With the key on, gateway shutdown spares a persisted job in its own scope; an unscoped persisted job
++    (no usable scope: today's behaviour) is still killed, as with the key off."""
++    registry = ProcessRegistry()
++    killed = []
++    registry.kill_process = lambda sid, **k: killed.append(sid) or {"status": "killed"}
++    scoped = registry._new_session("a", "t", "t", "k", str(tmp_path), persist_on_release=True)
++    scoped.systemd_unit = "hermes-proc-a.scope"
++    plain = registry._new_session("b", "t", "t", "k", str(tmp_path), persist_on_release=True)
++    for s in (scoped, plain):
++        s.pid = 10**7
++        registry._running[s.id] = s
++    registry.kill_all(source="gateway_shutdown")
++    assert killed == [plain.id]
++
++
+ def test_held_foreground_command_is_checkpointed_until_released(tmp_path, monkeypatch):
+     """A crash mid-wait must leave the command to the next owner: it is in processes.json while held."""
+     monkeypatch.setattr(pr, "_checkpoint_path", lambda: tmp_path / "processes.json")
+diff --git a/tools/interrupt.py b/tools/interrupt.py
+index f9f52d6014..f25c65d25c 100644
+--- a/tools/interrupt.py
++++ b/tools/interrupt.py
+@@ -120,6 +120,11 @@ def get_interrupt_reason() -> str | None:
+         return _interrupt_reasons.get(threading.current_thread().ident)
+ 
+ 
++# Interrupts a long terminal command outlives under terminal.update_survivable_processes: an update pause,
++# a gateway shutdown, a backend exit. A user Stop is never one of them. [daveey]
++SURVIVABLE_INTERRUPT_REASONS = frozenset({"hermes update pause", "gateway shutdown", "backend exit"})
++
++
+ def thread_interrupt_reason(thread_id: int | None) -> str | None:
+     """The pending interrupt cause of *thread_id*, if one was given. [daveey]"""
+     with _lock:
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 5a82775c27..905f6180bb 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -36,7 +36,7 @@ from tools.process_registry_notifications import (
+ from tools.process_registry_checkpoint import ProcessCheckpointMixin
+ from tools.process_registry_readopt import ProcessReadoptMixin
+ from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, spawn_output_log
+-from tools.process_registry_survivable import ProcessForegroundHoldMixin, enabled as survivable_enabled
++from tools.process_registry_survivable import ProcessForegroundHoldMixin
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+@@ -2442,8 +2442,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+         Sessions with ``persist_on_release=True`` are skipped when ``source`` is an
+         agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
+         timeout, ``agent_close``, a gateway restart): an explicitly persisted background job must survive
+-        session end / compression / error recovery / restart (#41225). ``gateway_shutdown`` reaches only the
+-        persisted jobs it spawned, never one it adopted (a Kanban worker's) [daveey]. An explicit operator stop
++        session end / compression / error recovery / restart (#41225). ``gateway_shutdown`` spares one only
++        once it left the unit (detached, or its own scope: terminal.update_survivable_processes) [daveey]. An explicit operator stop
+         (``process.kill`` via process_manage, CLI /stop) passes its own source and still
+         reaches them, so the user can always stop a persisted process on purpose."""
+         lifecycle, host_exit = source in self._LIFECYCLE_KILL_SOURCES, source == "gateway_shutdown"
+@@ -2452,7 +2452,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+                 s for s in (*self._running.values(), *self._finished.values())
+                 if (task_id is None or s.owner_task_id == task_id)
+                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
+-                and not (s.persist_on_release and (lifecycle or (host_exit and (s.detached or survivable_enabled()))))
++                and not (s.persist_on_release and (lifecycle or (host_exit and (s.detached or s.systemd_unit))))
+             ]
+         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
+         return sum(
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index ccb0316e81..f201a4ef7a 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -115,11 +115,18 @@ class ProcessOutputLogMixin:
+         # poll()/wait() reconcile asks this reader to finish instead of reading a pipe itself.
+         session._reader_selectable = True
+ 
+-        head_noise = True
+-
+-        def ingest(text: str) -> None:
+-            nonlocal head_noise
+-            text = strip_shell_markers(text, session.shell_markers)
++        head_noise, held = True, ""
++
++        def ingest(text: str, final: bool = False) -> None:
++            nonlocal head_noise, held
++            if session.shell_markers:
++                # A wrapper marker line (``\n<m>...<m>\n``) can straddle two reads: hold back from the last
++                # newline, which an unfinished marker line always starts at, until the next read. [daveey]
++                text = strip_shell_markers(held + text, session.shell_markers)
++                cut = len(text) if final else max(text.rfind("\n"), 0)
++                text, held = text[:cut], text[cut:]
++            if not text:
++                return
+             if head_noise:  # ``bash -lic`` startup warnings, as the pipe reader strips them
+                 text = self._clean_shell_noise(text)
+                 head_noise = not text.strip()
+@@ -149,11 +156,10 @@ class ProcessOutputLogMixin:
+                     time.sleep(_TAIL_SECONDS)
+         except OSError as exc:
+             logger.warning("Process output log %s unreadable: %s", session.output_log, exc)
++        ingest(decoder.decode(b"", final=True), final=True)
+         if proc is not None:
+             self._finish_reader(session, decoder, ingest, "Log", proc.wait, lambda: proc.returncode)
+             return
+-        if tail := decoder.decode(b"", final=True):
+-            ingest(tail)
+         code = recorded_exit_code(session.output_log)
+         if code is None:
+             # SIGKILL / exec past the trap: the spawner is gone and no status was recorded.
+diff --git a/tools/process_registry_survivable.py b/tools/process_registry_survivable.py
+index 8c03dc0eb9..49eebce760 100644
+--- a/tools/process_registry_survivable.py
++++ b/tools/process_registry_survivable.py
+@@ -31,15 +31,15 @@ from contextlib import suppress
+ from pathlib import Path
+ from typing import Any, Optional
+ 
++# ``tool_reason`` slugs a survivable foreground command outlives: card A's update pause, the gateway's
++# restart/shutdown stop and a TUI/Desktop backend exit (session_reaper's ``backend_exit``). A user Stop, a
++# new message, a timeout and every watchdog are not in it: those still kill the command.
++from tools.interrupt import SURVIVABLE_INTERRUPT_REASONS
++
+ logger = logging.getLogger("tools.process_registry")
+ 
+ CONFIG_KEY = "update_survivable_processes"
+ FOREGROUND_MIN_TIMEOUT_S = 60
+-# ``tool_reason`` slugs of the interrupts a survivable foreground command outlives: card A's update pause
+-# (agent.update_pause_cancel.CANCEL_TOOL_REASON), the gateway's restart/shutdown stop and a TUI/Desktop
+-# backend exit (session_reaper's ``backend_exit``). A user Stop, a new message, a timeout and every
+-# watchdog are not in it: those still kill the command.
+-SURVIVABLE_INTERRUPT_REASONS = frozenset({"hermes update pause", "gateway shutdown", "backend exit"})
+ CONTINUES_LINE = "process continues as {session_id}"
+ 
+ _warn_lock = threading.Lock()
+-- 
+2.55.0
+

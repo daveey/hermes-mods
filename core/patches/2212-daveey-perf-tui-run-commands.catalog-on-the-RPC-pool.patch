@@ -1,0 +1,96 @@
+From 8101869c2f0da95507bbcc470b63f15153c276bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:16:30 +0000
+Subject: [PATCH] [daveey] perf(tui): run commands.catalog on the RPC pool so a
+ new chat's first prompt is not held behind it
+
+Desktop sends commands.catalog in the burst right after session.create and
+prompt.submit a moment later on the same socket. The catalog (skill, plugin and
+quick-command walk for the session's profile and workspace) ran inline on the
+socket's ordered request lane: 1.9 s cold, 0.6 s warm, 5.5 s measured under
+load, and the first prompt.submit's ack waited behind it (renderer trace: ack
+landed the same millisecond as the catalog reply). complete.slash already runs
+on the pool for the same work. Live A/B on a fresh session: prompt.submit ack
+876 ms (catalog 728 ms ahead of it) -> 219 ms with the catalog still running.
+---
+ .../test_commands_catalog_off_reader.py       | 53 +++++++++++++++++++
+ tui_gateway/server.py                         |  3 ++
+ 2 files changed, 56 insertions(+)
+ create mode 100644 tests/tui_gateway/test_commands_catalog_off_reader.py
+
+diff --git a/tests/tui_gateway/test_commands_catalog_off_reader.py b/tests/tui_gateway/test_commands_catalog_off_reader.py
+new file mode 100644
+index 0000000000..6d6a65bdb4
+--- /dev/null
++++ b/tests/tui_gateway/test_commands_catalog_off_reader.py
+@@ -0,0 +1,53 @@
++"""``commands.catalog`` runs on the RPC pool, never inline on the socket's ordered request lane.
++
++Desktop sends it in the burst right after ``session.create`` and sends ``prompt.submit`` a moment
++later on the same socket. The catalog walks skills, plugins and quick commands for the session's
++profile and workspace (measured 1.9 s on a fresh session, 0.6 s warm, 5.5 s under load), so run
++inline it held the new chat's first ``prompt.submit`` behind it for that long."""
++
++import queue
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++
++
++class _Transport:
++    def __init__(self):
++        self.frames = queue.Queue()
++
++    def write(self, frame):
++        self.frames.put(frame)
++        return True
++
++
++def test_commands_catalog_is_a_long_handler():
++    from tui_gateway import server
++
++    assert "commands.catalog" in server._LONG_HANDLERS
++
++
++def test_slow_commands_catalog_does_not_hold_the_request_after_it(monkeypatch):
++    from tui_gateway import command_discovery, server
++
++    release = threading.Event()
++
++    def slow_catalog(**_kwargs):
++        release.wait(10)
++        return {"pairs": [], "sub": {}, "canon": {}, "categories": []}
++
++    monkeypatch.setattr(command_discovery, "command_catalog", slow_catalog)
++    transport = _Transport()
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        monkeypatch.setattr(server, "_pool", pool)
++        started = time.monotonic()
++        assert server.dispatch({"id": "cat", "method": "commands.catalog", "params": {}}, transport) is None
++        # The next request on the same lane answers while the catalog is still running.
++        follow = server.dispatch({"id": "ping", "method": "gateway.ping", "params": {}}, transport)
++        assert time.monotonic() - started < 2
++        assert follow is not None and follow.get("id") == "ping"
++        assert transport.frames.empty()
++        release.set()
++        reply = transport.frames.get(timeout=10)
++
++    assert reply["id"] == "cat"
++    assert "result" in reply
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9ab5026e4c..61e3a6a119 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -202,6 +202,9 @@ _LONG_HANDLERS = frozenset({
+     "onboarding.start", "onboarding.state", "subagent.roster",
+     "session.take_over",  # take_over waits for the old owner's ack
+     "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
++    # Skill/plugin/quick-command walk for the session's profile + workspace (1.9 s cold, 5.5 s under
++    # load). Desktop sends it right after session.create, so inline it held the first prompt.submit.
++    "commands.catalog",
+     "shared_metrics.set",  # consent reconcile waits on the metrics store's write lock
+     "session.title.suggest",  # aux-model call (⌘⇧N rename pre-fill)
+ })
+-- 
+2.55.0
+

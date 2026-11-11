@@ -1,0 +1,256 @@
+From 4c8c146c7af456f312ff9a842c10cc0ae2888600 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 16:47:22 -0800
+Subject: [PATCH] fix(web): admit session scan bursts before HTTP workers
+ [daveey]
+
+---
+ hermes_cli/web_routers/profiles.py            |  36 +++++-
+ hermes_cli/web_routers/sessions.py            |  10 +-
+ .../test_profile_scan_http_admission.py       | 110 ++++++++++++++++++
+ 3 files changed, 150 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_profile_scan_http_admission.py
+
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index d1f6110a4e..4155bfa194 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -428,8 +428,8 @@ def _sidebar_singleflight_cache(func):
+         if cached is not miss:
+             return cached
+ 
+-        # A plain Lock is intentional: FastAPI executes this sync handler in the AnyIO
+-        # worker pool, so contenders sleep without holding the GIL.
++        # Direct synchronous callers still share the refresh lock. HTTP contenders
++        # are admitted asynchronously below, before consuming a worker slot.
+         with refresh_lock:
+             cached = _lookup(key)
+             if cached is not miss:
+@@ -452,6 +452,20 @@ def _sidebar_singleflight_cache(func):
+                     cache.popitem(last=False)
+             return result
+ 
++    admitted = coalesced_read(wrapped, thread_runner=lambda func: run_in_threadpool(func))
++
++    @functools.wraps(admitted)
++    async def http_endpoint(*args, **kwargs):
++        # Fresh hits must not queue behind an unrelated slow cache miss.
++        if _SIDEBAR_CACHE_TTL_SECONDS > 0:
++            bound = signature.bind(*args, **kwargs)
++            bound.apply_defaults()
++            cached = await run_in_threadpool(_lookup, tuple(bound.arguments.items()))
++            if cached is not miss:
++                return cached
++        return await admitted(*args, **kwargs)
++
++    wrapped.http_endpoint = http_endpoint
+     return wrapped
+ 
+ 
+@@ -471,7 +485,6 @@ def _read_serial_profile_db(name, home, errors, read, cache_key):
+             home, cache_key, lambda: _read_profile_db(name, home, errors, read))
+ 
+ 
+-@sessions_router.get("/api/profiles/sessions")
+ def get_profiles_sessions(
+     # ``le=500`` caps the page size — this endpoint fans out across EVERY profile's state.db.
+     # 500 (not 100) because desktop callers use limit=200 and the electron remote-merge
+@@ -557,6 +570,15 @@ def get_profiles_sessions(
+ _SESSION_STAMP_COLUMNS = ("cwd", "git_branch", "git_repo_root", "outcome", "muted")
+ 
+ 
++# Admit scan contenders on the event loop, before they consume AnyIO slots.
++# Keep the synchronous entry point and cross-loop DB lock for direct callers.
++sessions_router.add_api_route(
++    "/api/profiles/sessions",
++    coalesced_read(get_profiles_sessions, thread_runner=lambda func: run_in_threadpool(func)),
++    methods=["GET"],
++)
++
++
+ @sessions_router.get("/api/profiles/sessions/stamps")
+ def get_profiles_session_stamps(ids: str = Query(..., max_length=8000), profile: str = "default"):
+     """[daveey] Activity stamps (kanban_*, goal/cron/background/turn/review, outcome, cwd) of the named sessions of
+@@ -592,7 +614,6 @@ def get_profiles_session_stamps(ids: str = Query(..., max_length=8000), profile:
+     return {"sessions": out}
+ 
+ 
+-@sessions_router.get("/api/profiles/sessions/sidebar")
+ @_sidebar_singleflight_cache
+ def get_profiles_sessions_sidebar(
+     recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str | None = None,
+@@ -816,7 +837,6 @@ def profile_project_trees(
+     return out
+ 
+ 
+-@sessions_router.get("/api/profiles/projects/tree")
+ @_sidebar_singleflight_cache
+ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000, profile: Optional[str] = None):
+     """Project tree for every profile at once, for the all-profiles sidebar.
+@@ -847,6 +867,12 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
+             "errors": errors}
+ 
+ 
++sessions_router.add_api_route(
++    "/api/profiles/sessions/sidebar", get_profiles_sessions_sidebar.http_endpoint, methods=["GET"])
++sessions_router.add_api_route(
++    "/api/profiles/projects/tree", get_profiles_projects_tree.http_endpoint, methods=["GET"])
++
++
+ # `gh pr create` prints the PR url and nothing else, so a tool result whose whole output IS a
+ # PR url means this session opened that PR; a url inside prose is a session TALKING about one.
+ _PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)/?$")
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index eb58e23c54..972d72c1c6 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
+ from hermes_cli.session_listing import stamp_automated, subagent_listing_scope
+ from hermes_cli.session_list_flight import SESSION_LIST_CACHE, data_stamp
+ from hermes_cli.web_deps import late
++from hermes_cli.web_read_coalescing import coalesced_read
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+@@ -201,7 +202,6 @@ def get_session_kanban_tasks(ids: str = Query(..., max_length=4000)):
+ 
+ # ``le=100`` on limit: an unbounded limit lets one request drag every session
+ # row (plus correlated-subquery preview work) out of SQLite in a single hit.
+-@list_router.get("/api/sessions")
+ def get_sessions(
+     limit: int = Query(20, ge=0, le=100), offset: int = Query(0, ge=0), min_messages: int = 0,
+     archived: str = "exclude", order: str = "created", source: str | None = None, sources: str | None = None,
+@@ -229,6 +229,14 @@ def get_sessions(
+         (str(db_path),) + args, data_stamp(db_path), lambda: _list_sessions_payload(*args))
+ 
+ 
++# Queue expensive list contenders before consuming the shared HTTP worker pool.
++list_router.add_api_route(
++    "/api/sessions",
++    coalesced_read(get_sessions, admission_key=lambda args: args["profile"], max_concurrent=2),
++    methods=["GET"],
++)
++
++
+ def _list_sessions_payload(
+     limit, offset, min_messages, archived, order, source, sources, exclude_sources, cwd_prefix, full, profile,
+ ) -> dict:
+diff --git a/tests/hermes_cli/test_profile_scan_http_admission.py b/tests/hermes_cli/test_profile_scan_http_admission.py
+new file mode 100644
+index 0000000000..dfcd020ec9
+--- /dev/null
++++ b/tests/hermes_cli/test_profile_scan_http_admission.py
+@@ -0,0 +1,110 @@
++"""Profile scan contenders must queue before occupying shared HTTP workers."""
++import asyncio
++import threading
++
++import pytest
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('route,param', [
++    ('/api/profiles/sessions', 'limit'),
++    ('/api/profiles/sessions/sidebar', 'recents_limit'),
++    ('/api/profiles/projects/tree', 'preview_limit'),
++    ('/api/sessions', 'limit'),
++])
++async def test_profile_scan_burst_keeps_status_responsive(monkeypatch, tmp_path, route, param):
++    import anyio.to_thread
++    import httpx
++    from fastapi import FastAPI
++    from hermes_cli.web_routers import profiles
++
++    release = threading.Event()
++    entered = threading.Event()
++    calls = []
++
++    def read(name, home, errors, callback):
++        calls.append(name)
++        entered.set()
++        assert release.wait(5)
++        if route.endswith('/sidebar'):
++            return {'recents': [], 'cron': [], 'messaging': [], 'usage': {}}
++        return []
++
++    from hermes_cli.web_routers import sessions
++
++    def projects(*args, **kwargs):
++        read('default', None, [], None)
++        return []
++
++    def payload(*args):
++        if args[-1] != 'other':
++            read('default', None, [], None)
++        return {'sessions': [], 'limit': args[0]}
++
++    db_path = tmp_path / 'state.db'
++    db_path.touch()
++    monkeypatch.setattr(sessions, '_session_db_path_for_profile', lambda profile: db_path)
++    monkeypatch.setattr(sessions, '_list_sessions_payload', payload)
++    monkeypatch.setattr(profiles, 'profile_project_trees', projects)
++    monkeypatch.setattr(profiles, '_profile_state_db', lambda home: db_path)
++    monkeypatch.setattr(profiles, 'subagent_listing_scope', lambda *a, **kw: (False, None))
++    monkeypatch.setattr(profiles, '_sidebar_profile_cache_get', lambda key: None)
++    monkeypatch.setattr(profiles, 'automated_session_sources', lambda home: set())
++    monkeypatch.setattr(profiles, '_profile_targets', lambda label: [('default', None)])
++    monkeypatch.setattr(profiles, '_read_profile_db', read)
++    monkeypatch.setattr(profiles, '_corrupt_profile_stores', lambda targets: {})
++    for name in ('kanban', 'goal', 'cron', 'background', 'turn'):
++        monkeypatch.setattr(profiles, f'annotate_{name}_activity', lambda rows: rows)
++    monkeypatch.setattr(profiles, 'annotate_review_wait', lambda rows: rows)
++    app = FastAPI()
++    app.include_router(profiles.sessions_router)
++    app.include_router(sessions.list_router)
++
++    @app.get('/api/status')
++    def status():
++        return {'ok': True}
++
++    limiter = anyio.to_thread.current_default_thread_limiter()
++    previous = limiter.total_tokens
++    limiter.total_tokens = 2
++    try:
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
++            cached_route = param != 'limit'
++            if cached_route:
++                release.set()
++                warm = await client.get(route, params={param: 99})
++                assert warm.status_code == 200
++                release.clear()
++                entered.clear()
++                calls.clear()
++            tasks = [asyncio.create_task(client.get(route, params={param: n}))
++                     for n in range(1, 13)]
++            try:
++                from tests.waiting import async_wait_until
++                await async_wait_until(entered.is_set, timeout=3)
++                for _ in range(50):
++                    await asyncio.sleep(0)
++                response = await asyncio.wait_for(client.get('/api/status'), 0.5)
++                assert response.status_code == 200
++                assert response.json() == {'ok': True}
++                assert limiter.borrowed_tokens == 1
++                if route == '/api/sessions':
++                    other = await asyncio.wait_for(client.get(route, params={'profile': 'other'}), 0.5)
++                    assert other.status_code == 200
++                if cached_route:
++                    hit = await asyncio.wait_for(client.get(route, params={param: 99}), 0.5)
++                    assert hit.json() == warm.json()
++                    assert len(calls) == 1
++            finally:
++                release.set()
++                responses = await asyncio.gather(*tasks)
++            assert [r.status_code for r in responses] == [200] * 12
++            if param == 'limit':
++                assert [r.json()['limit'] for r in responses] == list(range(1, 13))
++            assert len(calls) == 12
++            if param == 'limit':
++                cap = 501 if route.startswith('/api/profiles') else 101
++                assert (await client.get(route, params={'limit': cap})).status_code == 422
++            assert (await client.get('/api/profiles/sessions?archived=bogus')).status_code == 400
++    finally:
++        limiter.total_tokens = previous
+-- 
+2.55.0
+

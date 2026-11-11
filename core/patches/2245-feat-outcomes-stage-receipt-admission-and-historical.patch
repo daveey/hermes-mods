@@ -1,0 +1,799 @@
+From 6048ae364224a7cf402b16b6a6754cb3abe13b51 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:41:14 +0000
+Subject: [PATCH] feat(outcomes): stage receipt admission and historical
+ provenance [daveey]
+
+---
+ hermes_cli/kanban_completion_receipt.py       | 173 ++++++++++++++++++
+ .../kanban_completion_receipt_projection.py   |  45 +++++
+ hermes_cli/kanban_db.py                       |  12 +-
+ hermes_cli/kanban_metadata_files.py           |  10 +
+ hermes_completion_receipt.py                  |  21 +++
+ hermes_state_outcome.py                       |  21 +++
+ .../test_kanban_completion_receipt.py         |  97 ++++++++++
+ .../test_kanban_completion_receipt_owners.py  | 152 +++++++++++++++
+ ...st_kanban_completion_receipt_projection.py |  67 +++++++
+ tests/hermes_state/test_completion_receipt.py |  61 ++++++
+ 10 files changed, 651 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_completion_receipt.py
+ create mode 100644 hermes_cli/kanban_completion_receipt_projection.py
+ create mode 100644 tests/hermes_cli/test_kanban_completion_receipt.py
+ create mode 100644 tests/hermes_cli/test_kanban_completion_receipt_owners.py
+ create mode 100644 tests/hermes_cli/test_kanban_completion_receipt_projection.py
+
+diff --git a/hermes_cli/kanban_completion_receipt.py b/hermes_cli/kanban_completion_receipt.py
+new file mode 100644
+index 00000000000..cb8f7d65c10
+--- /dev/null
++++ b/hermes_cli/kanban_completion_receipt.py
+@@ -0,0 +1,173 @@
++"""Admission of additive receipts at the canonical card writer.
++
++No receipt waives acceptance. Remote observations are bounded reads made before
++our transaction; only same-board ownership can be rechecked under its lock.
++Historical reads must never run admission again.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++from hermes_completion_receipt import validate_completion_receipt
++
++OPEN = frozenset(("todo", "ready", "running", "scheduled", "review", "blocked", "triage"))
++
++
++def pending_owners(receipt):
++    return tuple(dict.fromkeys(r["owner"] for item in receipt["items"]
++                              for r in item["remaining"] if r["state"] == "pending"))
++
++
++def owner_parts(ref):
++    kind, rest = ref[1:].split(":", 1)
++    scope, rest = rest.split("@", 1)
++    gateway, identity = rest.split("/", 1)
++    return kind, scope, gateway, identity
++
++
++def refusal(ref, why):
++    return ValueError(f"completion_receipt: pending owner {ref}: {why}")
++
++
++def board_scope(conn):
++    from hermes_cli.kanban_db_sync import _db_key, board_slug_for_path
++    from hermes_cli.kanban_origin import gateway_names
++    return board_slug_for_path(_db_key(conn) or ""), gateway_names()[0]
++
++
++def _local_link(conn, task_id, owner_id):
++    from hermes_cli.kanban_archive_scope import _creator_task_id
++    if task_id == owner_id:
++        return False
++    return bool(conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
++                             (task_id, owner_id)).fetchone() or _creator_task_id(conn, owner_id) == task_id)
++
++
++def _remote_link(conn, task_id, scope, gateway, identity):
++    from hermes_cli.kanban_awaiting import _latest_park
++    awaited, _ = _latest_park(conn, task_id)
++    return bool(isinstance(awaited, dict) and awaited.get("kind") == "card"
++                and (awaited.get("gateway"), awaited.get("board") or "default", awaited.get("ref")) == (
++                    gateway, scope, identity))
++
++
++def _local_authority(conn, row):
++    # A synced worker can execute a foreign card without owning its namespace.
++    created_on = row["created_on"] if "created_on" in row.keys() else None
++    if not created_on:
++        return True
++    from hermes_cli.kanban_db_sync import _state
++    state = _state(conn)
++    own = state["gateway_id"] if state else None
++    return created_on == (own or board_scope(conn)[1])
++
++
++def _check_local(conn, task_id, ref):
++    _, _, _, identity = owner_parts(ref)
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (identity,)).fetchone()
++    if (row is None or row["status"] not in OPEN or not _local_authority(conn, row)
++            or not _local_link(conn, task_id, identity)):
++        raise refusal(ref, "must be an open locally owned linked child or created follow-up, not the completing card")
++
++
++def _check_external(conn, task_id, ref):
++    kind, scope, gateway, identity = owner_parts(ref)
++    if kind == "session":
++        raise refusal(ref, "a requester/shepherd link is not acceptance of the pending obligation")
++    if not _remote_link(conn, task_id, scope, gateway, identity):
++        raise refusal(ref, "no existing qualified wait link")
++    from hermes_cli.kanban_wait_replica import read_task
++    try:
++        row = read_task(gateway, identity, scope)
++    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as exc:
++        raise refusal(ref, f"fresh owner observation unavailable: {exc}") from exc
++    if row.get("status") not in OPEN:
++        raise refusal(ref, "owner is not open")
++
++
++def prepare(conn, task_id, metadata):
++    """Return copied metadata and locally recheckable owners; reject before any write.
++
++    Legacy metadata is untouched. Refusing unknown ownership is intentional: a
++    plausible reference, stale replica, or new created_cards claim is not a link.
++    """
++    if not isinstance(metadata, dict) or "completion_receipt" not in metadata:
++        return metadata, ()
++    receipt = validate_completion_receipt(metadata["completion_receipt"])
++    checks = []
++    owners = pending_owners(receipt)
++    if owners:
++        board, gateway = board_scope(conn)
++        if not gateway:
++            raise ValueError("completion_receipt: local gateway identity unavailable")
++        for ref in owners:
++            kind, scope, target_gateway, _ = owner_parts(ref)
++            if kind == "task" and (scope, target_gateway) == (board, gateway):
++                _check_local(conn, task_id, ref)
++                checks.append((ref, True))
++            else:
++                _check_external(conn, task_id, ref)
++                checks.append((ref, False))
++    return {**metadata, "completion_receipt": receipt}, tuple(checks)
++
++
++def check_session_declaration(receipt, lineage):
++    """Resolve pending card owners from existing session ownership links.
++
++    No session-to-session wait store exists. A session reference alone is not
++    such a link (and the declaring session cannot own its own pending closeout).
++    Unknown/stale observations fail closed; refresh of history never calls this.
++    """
++    owners = pending_owners(receipt)
++    if not owners:
++        return
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.kanban_session_activity import session_tasks
++    from hermes_cli.kanban_wait_replica import read_task
++    gateway = gateway_names()[0]
++    if not gateway:
++        raise ValueError("completion_receipt: local gateway identity unavailable")
++    try:
++        rows = session_tasks(lineage)
++    except (OSError, sqlite3.Error, ValueError) as exc:
++        raise ValueError("completion_receipt: session ownership inventory unavailable") from exc
++    for ref in owners:
++        kind, scope, target_gateway, identity = owner_parts(ref)
++        if kind != "task":
++            raise refusal(ref, "no existing session-to-session ownership link")
++        matches = [r for r in rows if (r.get("board"), r.get("gateway") or gateway, r.get("id")) == (
++            scope, target_gateway, identity)]
++        if len(matches) != 1 or matches[0].get("stale") or matches[0].get("status") not in OPEN:
++            raise refusal(ref, "no unique fresh open card linked to this session")
++        if target_gateway == gateway:
++            _check_session_local(scope, identity, ref)
++        else:
++            try:
++                observed = read_task(target_gateway, identity, scope)
++            except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as exc:
++                raise refusal(ref, "fresh owner observation unavailable") from exc
++            if observed.get("status") not in OPEN:
++                raise refusal(ref, "owner is not open")
++
++
++def _check_session_local(board, identity, ref):
++    from hermes_cli import kanban_session_activity as activity
++    paths = [p for p in activity._board_db_paths() if activity._board_slug(p) == board]
++    if len(paths) != 1:
++        raise refusal(ref, "local board authority is ambiguous or unavailable")
++    with activity.cached_ro(paths[0]) as conn:
++        conn.row_factory = sqlite3.Row
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (identity,)).fetchone()
++        if row is None or row["status"] not in OPEN or not _local_authority(conn, row):
++            raise refusal(ref, "not an open locally owned card")
++
++
++def recheck(conn, task_id, owners):
++    """Recheck under the completion transaction, before any event/terminal write."""
++    for ref, local in owners:
++        if local:
++            _check_local(conn, task_id, ref)
++        else:
++            _, scope, gateway, identity = owner_parts(ref)
++            if not _remote_link(conn, task_id, scope, gateway, identity):
++                raise refusal(ref, "ownership link changed during admission")
+diff --git a/hermes_cli/kanban_completion_receipt_projection.py b/hermes_cli/kanban_completion_receipt_projection.py
+new file mode 100644
+index 00000000000..64adc8f3e3b
+--- /dev/null
++++ b/hermes_cli/kanban_completion_receipt_projection.py
+@@ -0,0 +1,45 @@
++"""Read the canonical completed-run receipt without re-admitting historical facts.
++
++A newer review/blocked run is not a completion. A legacy latest completion has
++unspecified artifact acceptance, even if an older run carried a receipt.
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_completion_receipt import validate_completion_receipt
++
++
++def read_completed(conn, task_id, *, gateway, board):
++    """Return receipt plus source-qualified provenance, or None (legacy/invalid).
++
++    Caller supplies the authoritative source namespace, not the observing host.
++    Source event/run UIDs survive replica integer remapping; integer fallbacks
++    are explicitly store-local. This is a projection, never a second writer.
++    """
++    if not gateway or not board:
++        raise ValueError("completion_receipt: projection requires the source gateway and board")
++    run_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
++    run_uid = "r.uid" if "uid" in run_columns else "NULL"
++    row = conn.execute(
++        f"SELECT e.*, r.metadata AS receipt_metadata, r.outcome AS receipt_outcome, "
++        f"{run_uid} AS receipt_run_uid FROM task_events e "
++        "LEFT JOIN task_runs r ON r.id=e.run_id AND r.task_id=e.task_id "
++        "WHERE e.task_id=? AND e.kind='completed' ORDER BY e.created_at DESC,e.id DESC LIMIT 1",
++        (task_id,)).fetchone()
++    if row is None or row["receipt_outcome"] != "completed":
++        return None
++    try:
++        metadata = json.loads(row["receipt_metadata"] or "{}")
++        if not isinstance(metadata, dict) or "completion_receipt" not in metadata:
++            return None
++        receipt = validate_completion_receipt(metadata["completion_receipt"])
++    except (ValueError, TypeError):
++        return None
++    event_uid = row["uid"] if "uid" in row.keys() else None
++    return {"completion_receipt": receipt, "completion_receipt_source": {
++        "kind": "task_run", "ref": f"@task:{board}@{gateway}/{task_id}",
++        "event_id": row["id"], "event_uid": event_uid,
++        "run_id": row["run_id"], "run_uid": row["receipt_run_uid"],
++        "completed_at": row["created_at"],
++    }}
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 70876848e73..942ea8ec061 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2628,6 +2628,8 @@ def complete_task(
+     whitespace-only evidence raises :class:`EmptyCompletionError` after an
+     auditable event. Approving a card out of ``review`` stays exempt.
+     """
++    from hermes_cli import kanban_completion_receipt as receipt_admission
++    metadata, receipt_owners = receipt_admission.prepare(conn, task_id, metadata)
+     now = int(time.time())
+     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
+     if not _parents_satisfied(conn, task_id):
+@@ -2647,6 +2649,7 @@ def complete_task(
+         # reopened while this task waited.
+         if not _parents_satisfied(conn, task_id):
+             return False
++        receipt_admission.recheck(conn, task_id, receipt_owners)
+         from hermes_cli.kanban_assignment_routing import validate_repair_completion
+         validate_repair_completion(conn, task_id)
+         from hermes_cli.kanban_goal_receipt import record as record_goal
+@@ -2769,14 +2772,7 @@ from hermes_cli.kanban_completion_evidence import gate_empty_completion as _gate
+ from hermes_cli.kanban_metadata_files import stage_completion_artifacts as _stage_completion_artifacts
+ 
+ 
+-def _cleaned_artifact_paths(metadata: Any) -> list[str]:
+-    """Non-blank string paths declared in ``metadata["artifacts"]``."""
+-    if not isinstance(metadata, dict):
+-        return []
+-    raw = metadata.get("artifacts")
+-    if not isinstance(raw, (list, tuple)):
+-        return []
+-    return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
++from hermes_cli.kanban_metadata_files import cleaned_artifact_paths as _cleaned_artifact_paths
+ 
+ 
+ def _flag_phantom_prose_refs(
+diff --git a/hermes_cli/kanban_metadata_files.py b/hermes_cli/kanban_metadata_files.py
+index a1692ee660a..9e403a328e2 100644
+--- a/hermes_cli/kanban_metadata_files.py
++++ b/hermes_cli/kanban_metadata_files.py
+@@ -37,6 +37,16 @@ _SKIP_KEYS = frozenset({"artifacts", "_staged_artifacts", ATTACHED_KEY, SKIPPED_
+ _TRAILING_PUNCT = ".,;:!?)]}"
+ 
+ 
++def cleaned_artifact_paths(metadata: Any) -> list[str]:
++    """Non-blank string paths declared in ``metadata[\"artifacts\"]``."""
++    if not isinstance(metadata, dict):
++        return []
++    raw = metadata.get("artifacts")
++    if not isinstance(raw, (list, tuple)):
++        return []
++    return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
++
++
+ def _iter_strings(value: Any, top: bool = True) -> Iterator[str]:
+     if isinstance(value, str):
+         yield value
+diff --git a/hermes_completion_receipt.py b/hermes_completion_receipt.py
+index ca3201a8a06..2df02acff13 100644
+--- a/hermes_completion_receipt.py
++++ b/hermes_completion_receipt.py
+@@ -86,6 +86,27 @@ def _item(value: Any) -> dict:
+     return out
+ 
+ 
++def historical_fields(outcome):
++    """The last receipt and its original provenance, independent of current kind.
++
++    This retains one historical declaration in the existing outcome object; it
++    does not infer acceptance for later work or turn a refresh into verification.
++    """
++    if not isinstance(outcome, dict):
++        return {}
++    candidate = outcome if "completion_receipt" in outcome else outcome.get("declared")
++    if not isinstance(candidate, dict) or "completion_receipt" not in candidate:
++        return {}
++    try:
++        receipt = validate_completion_receipt(candidate["completion_receipt"])
++    except ValueError:
++        return {}
++    source = candidate.get("completion_receipt_source")
++    if not isinstance(source, dict):
++        source = {"kind": "session_declaration", "declared_at": candidate.get("at")}
++    return {"completion_receipt": receipt, "completion_receipt_source": dict(source)}
++
++
+ def validate_completion_receipt(value: Any) -> dict:
+     """Validate the entire v1 value before any write; return an independent copy.
+ 
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 1c00c8819a2..cec6c6e93fb 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -564,6 +564,14 @@ def _live_work(db: Any, sid: str, ids: list[str]) -> tuple[list[dict], list[dict
+ 
+ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+             pending_reply: Optional[str] = None) -> dict[str, Any]:
++    from hermes_completion_receipt import historical_fields
++    historical = historical_fields(_parse((_row(db, sid) or {}).get("outcome_json")))
++    current = _derive_current(db, sid, ignore_live_turn=ignore_live_turn, pending_reply=pending_reply)
++    return {**historical, **current}
++
++
++def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
++                    pending_reply: Optional[str] = None) -> dict[str, Any]:
+     now = time.time()
+     row = _row(db, sid) or {}
+     stored = _parse(row.get("outcome_json"))
+@@ -643,6 +651,19 @@ def declare_outcome(sid: str, outcome: dict, *, db: Any = None) -> dict[str, Any
+         tip = _tip(handle, sid)
+         if _row(handle, tip) is None:
+             raise ValueError(f"unknown session {sid}")
++        if "completion_receipt" in declared:
++            from hermes_cli.kanban_completion_receipt import check_session_declaration
++            check_session_declaration(declared["completion_receipt"], _lineage_ids(handle, tip))
++            from hermes_cli.kanban_origin import gateway_names
++            from hermes_cli.profiles import get_active_profile_name
++            declared["completion_receipt_source"] = {
++                "kind": "session_declaration", "session_id": tip,
++                "profile": get_active_profile_name(), "gateway": gateway_names()[0] or None,
++                "declared_at": declared["at"],
++            }
++        else:
++            from hermes_completion_receipt import historical_fields
++            declared.update(historical_fields(_parse((_row(handle, tip) or {}).get("outcome_json"))))
+         # Persist intent before touching the separate cron store. A failed DB
+         # write must never release ownership without a completion receipt.
+         _write(handle, tip, declared)
+diff --git a/tests/hermes_cli/test_kanban_completion_receipt.py b/tests/hermes_cli/test_kanban_completion_receipt.py
+new file mode 100644
+index 00000000000..e62580e3e90
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_completion_receipt.py
+@@ -0,0 +1,97 @@
++"""Canonical completion receipt admission, independent of tool wrappers."""
++from copy import deepcopy
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_origin
++from tests.hermes_state.test_completion_receipt import receipt
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    home = tmp_path / "board-home"
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
++    path = kb.kanban_db_path(board="default")
++    assert path.is_relative_to(home)
++    with kbc.connect_closing(path) as connection:
++        yield connection
++
++
++def task(conn, **kwargs):
++    return kb.create_task(conn, title="Bounded assessment", assignee="coder", **kwargs)
++
++
++def pending(owner):
++    value = receipt("contained")
++    value["items"][0]["remaining"] = [{"scope": "cause investigation", "state": "pending",
++                                       "owner": owner, "reason": "Separate scoped owner"}]
++    return value
++
++
++def snapshot(conn):
++    return {table: [tuple(r) for r in conn.execute(f"SELECT * FROM {table}")]
++            for table in ("tasks", "task_runs", "task_events")}
++
++
++def test_malformed_receipt_rejects_before_side_effecting_gates(conn):
++    tid = task(conn)
++    before = snapshot(conn)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(conn, tid, summary="Assessment complete", created_cards=["t_missing"],
++                         metadata={"completion_receipt": {"version": 1, "items": []}})
++    assert snapshot(conn) == before
++
++
++@pytest.mark.parametrize("disposition", ["delivered", "superseded", "contained", "rejected"])
++def test_receipt_stored_on_canonical_completed_run(conn, disposition):
++    tid = task(conn)
++    value = receipt(disposition)
++    before = deepcopy(value)
++    assert kb.complete_task(conn, tid, summary="Assessment complete", metadata={"completion_receipt": value})
++    event = conn.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()
++    row = conn.execute("SELECT metadata FROM task_runs WHERE id=?", (event[0],)).fetchone()
++    assert json.loads(row[0])["completion_receipt"] == before
++    assert value == before
++
++
++@pytest.mark.parametrize("which", ["missing", "unrelated", "closed", "wrong_gateway", "wrong_board", "self"])
++def test_pending_owner_must_be_open_related_and_fully_qualified(conn, which):
++    tid = task(conn)
++    owner = task(conn, parents=[tid]) if which not in ("unrelated", "self") else task(conn)
++    if which == "missing":
++        owner = "t_missing"
++    if which == "self":
++        owner = tid
++    if which == "closed":
++        # Fixture state only: cannot complete a child before its parent through normal admission.
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (owner,))
++        conn.commit()
++    gateway = "away" if which == "wrong_gateway" else "here"
++    board = "other" if which == "wrong_board" else "default"
++    before = snapshot(conn)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(conn, tid, summary="Containment complete", metadata={
++            "completion_receipt": pending(f"@task:{board}@{gateway}/{owner}")})
++    assert snapshot(conn) == before
++
++
++def test_open_linked_owner_admitted_without_changing_receipt(conn):
++    tid = task(conn)
++    owner = task(conn, parents=[tid])
++    value = pending(f"@task:default@here/{owner}")
++    assert kb.complete_task(conn, tid, summary="Containment complete", metadata={"completion_receipt": value})
++    assert kb.get_task(conn, owner).status == "ready"
++
++
++def test_deferred_scope_needs_no_owner_and_grants_no_authority(conn):
++    tid = task(conn)
++    value = receipt()
++    value["items"][0]["remaining"] = [{"scope": "enforcement", "state": "deferred", "owner": None,
++                                       "reason": "User deferred; execution not authorized"}]
++    assert kb.complete_task(conn, tid, summary="Report delivered", metadata={"completion_receipt": value})
++    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_completion_receipt_owners.py b/tests/hermes_cli/test_kanban_completion_receipt_owners.py
+new file mode 100644
+index 00000000000..616c1639c6f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_completion_receipt_owners.py
+@@ -0,0 +1,152 @@
++"""Real replica freshness/qualification and in-transaction link races."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_pr_acceptance_store as acceptance
++from tests.hermes_cli import test_kanban_completion_receipt as fixtures
++
++conn = fixtures.conn
++
++
++@pytest.fixture
++def replica(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path))
++    db = sqlite3.connect(tmp_path / "hub.db")
++    db.execute("CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++    try:
++        yield db
++    finally:
++        db.close()
++
++
++def publish(replica, *, age=0, gateway="away", board="default", status="running"):
++    task = {"id": "t_owner", "board": board, "gateway": gateway, "profile": "default",
++            "owner_profile": "default", "status": status}
++    scope = {"task_scopes": [{"board": board, "profile": "default", "state": "ok",
++                               "observed_at": time.time() - age}]}
++    replica.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (
++        gateway, "tasks", f"default/{board}/t_owner", json.dumps(task), 1))
++    replica.execute("INSERT INTO replica VALUES(?,?,?,?,?)", (gateway, "gateway", gateway, json.dumps(scope), 1))
++    replica.commit()
++
++
++def link(conn, tid):
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "scheduled", {"awaiting": {
++            "kind": "card", "gateway": "away", "board": "default", "ref": "t_owner"}})
++
++
++@pytest.mark.parametrize("variant", ["fresh", "stale", "wrong_board", "wrong_gateway", "closed"])
++def test_remote_qualified_link_requires_fresh_exact_owner(conn, replica, variant):
++    tid = fixtures.task(conn)
++    link(conn, tid)
++    publish(replica, age=2000 if variant == "stale" else 0,
++            board="other" if variant == "wrong_board" else "default",
++            gateway="elsewhere" if variant == "wrong_gateway" else "away",
++            status="done" if variant == "closed" else "running")
++    value = fixtures.pending("@task:default@away/t_owner")
++    metadata = {"completion_receipt": value}
++    before = fixtures.snapshot(conn)
++    if variant == "fresh":
++        assert kb.complete_task(conn, tid, summary="Containment complete", metadata=metadata)
++        row = conn.execute("SELECT metadata FROM task_runs WHERE task_id=?", (tid,)).fetchone()
++        assert json.loads(row[0])["completion_receipt"] == value
++    else:
++        with pytest.raises(ValueError, match="completion_receipt"):
++            kb.complete_task(conn, tid, summary="Containment complete", metadata=metadata)
++        assert fixtures.snapshot(conn) == before
++
++
++@pytest.mark.parametrize("change", ["close", "unlink"])
++def test_local_owner_rechecked_inside_transaction(conn, monkeypatch, change):
++    tid = fixtures.task(conn)
++    owner = fixtures.task(conn, parents=[tid])
++    real = acceptance.prepare_acceptance
++
++    def raced(*args, **kwargs):
++        answer = real(*args, **kwargs)
++        with kb.write_txn(conn):
++            if change == "close":
++                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (owner,))
++            else:
++                conn.execute("DELETE FROM task_links WHERE child_id=?", (owner,))
++        return answer
++
++    monkeypatch.setattr(acceptance, "prepare_acceptance", raced)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(conn, tid, summary="Containment complete", metadata={
++            "completion_receipt": fixtures.pending(f"@task:default@here/{owner}")})
++    assert kb.get_task(conn, tid).status != "done"
++    assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()
++
++
++def sync_schema(conn, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(sync, "sync_enabled", lambda: True)
++    monkeypatch.setattr(sync, "board_selected", lambda *_: True)
++    sync.install_or_remove(conn, sync._db_key(conn))
++    sync.set_identity(conn, "fixture-board", "here")
++    sync.set_mode(conn, "off")
++
++
++def test_foreign_pickup_cannot_be_named_as_local_owner(conn, monkeypatch):
++    tid = fixtures.task(conn)
++    owner = fixtures.task(conn, parents=[tid])
++    sync_schema(conn, monkeypatch)
++    conn.execute("UPDATE tasks SET created_on='away' WHERE id=?", (owner,))
++    conn.commit()
++    before = fixtures.snapshot(conn)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(conn, tid, summary="Containment complete", metadata={
++            "completion_receipt": fixtures.pending(f"@task:default@here/{owner}")})
++    assert fixtures.snapshot(conn) == before
++
++
++def test_forwarded_same_work_cannot_own_pending_followup(conn, replica):
++    tid = fixtures.task(conn)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "placement_deferred", {"target": "away"})
++        kb._append_event(conn, tid, "placement_forwarded", {"remote_task_id": "t_owner", "request_id": "r1"})
++    publish(replica)
++    before = fixtures.snapshot(conn)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        kb.complete_task(conn, tid, summary="Containment complete", force=True, metadata={
++            "completion_receipt": fixtures.pending("@task:default@away/t_owner")})
++    assert fixtures.snapshot(conn) == before
++
++
++def test_requester_session_is_not_pending_work_acceptance(conn, monkeypatch):
++    tid = fixtures.task(conn)
++    sync_schema(conn, monkeypatch)
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_chat_links "
++                     "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                     "VALUES ('link',?,'here','default','chat','created',0,1)", (tid,))
++    before = fixtures.snapshot(conn)
++    with pytest.raises(ValueError, match="requester/shepherd"):
++        kb.complete_task(conn, tid, summary="Containment complete", metadata={
++            "completion_receipt": fixtures.pending("@session:default@here/chat")})
++    assert fixtures.snapshot(conn) == before
++
++
++def test_remote_link_rechecked_without_second_network_read(conn, replica, monkeypatch):
++    tid = fixtures.task(conn)
++    link(conn, tid)
++    publish(replica)
++    real = acceptance.prepare_acceptance
++
++    def raced(*args, **kwargs):
++        answer = real(*args, **kwargs)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "scheduled", {"awaiting": {"kind": "clock"}})
++        return answer
++
++    monkeypatch.setattr(acceptance, "prepare_acceptance", raced)
++    with pytest.raises(ValueError, match="ownership link changed"):
++        kb.complete_task(conn, tid, summary="Containment complete", metadata={
++            "completion_receipt": fixtures.pending("@task:default@away/t_owner")})
++    assert kb.get_task(conn, tid).status != "done"
+diff --git a/tests/hermes_cli/test_kanban_completion_receipt_projection.py b/tests/hermes_cli/test_kanban_completion_receipt_projection.py
+new file mode 100644
+index 00000000000..0677dff4235
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_completion_receipt_projection.py
+@@ -0,0 +1,67 @@
++"""Historical projections bind to completed events, never latest arbitrary runs."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_completion_receipt_projection import read_completed
++from tests.hermes_cli import test_kanban_completion_receipt as fixtures
++from tests.hermes_state.test_completion_receipt import receipt
++
++conn = fixtures.conn
++
++
++def read(conn, tid):
++    return read_completed(conn, tid, gateway="here", board="default")
++
++
++def test_projection_preserves_exact_receipt_and_source(conn):
++    tid = fixtures.task(conn)
++    value = receipt("rejected")
++    assert kb.complete_task(conn, tid, summary="Assessment finished, artifact rejected", metadata={"completion_receipt": value})
++    out = read(conn, tid)
++    assert out["completion_receipt"] == value
++    source = out["completion_receipt_source"]
++    assert source["ref"] == f"@task:default@here/{tid}"
++    event = conn.execute("SELECT * FROM task_events WHERE id=?", (source["event_id"],)).fetchone()
++    assert source["run_id"] == event["run_id"]
++    assert source["completed_at"] == event["created_at"]
++    # Returned dictionaries cannot mutate the canonical handoff.
++    out["completion_receipt"]["items"][0]["disposition"] = "delivered"
++    assert read(conn, tid)["completion_receipt"] == value
++
++
++def test_later_noncompleted_run_never_replaces_historical_receipt(conn):
++    tid = fixtures.task(conn)
++    assert kb.complete_task(conn, tid, summary="Assessment complete", metadata={"completion_receipt": receipt("rejected")})
++    before = read(conn, tid)
++    with kb.write_txn(conn):
++        kb._synthesize_ended_run(conn, tid, outcome="review", summary="Not acceptance",
++                                metadata={"completion_receipt": receipt("delivered")})
++    assert read(conn, tid) == before
++
++
++def test_review_receipt_alone_is_not_delivery(conn):
++    tid = fixtures.task(conn)
++    assert kb.request_review(conn, tid, summary="Review requested", metadata={"completion_receipt": receipt()})
++    assert read(conn, tid) is None
++
++
++def test_legacy_completion_has_unspecified_acceptance(conn):
++    tid = fixtures.task(conn)
++    assert kb.complete_task(conn, tid, summary="Legacy finished")
++    assert read(conn, tid) is None
++
++
++def test_no_source_gateway_is_not_silently_local(conn):
++    tid = fixtures.task(conn)
++    with pytest.raises(ValueError, match="source gateway"):
++        read_completed(conn, tid, gateway="", board="default")
++
++
++def test_cross_task_run_mismatch_never_projects_foreign_receipt(conn):
++    tid = fixtures.task(conn)
++    other = fixtures.task(conn)
++    assert kb.complete_task(conn, other, summary="Other assessment", metadata={"completion_receipt": receipt()})
++    run_id = conn.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind='completed'", (other,)).fetchone()[0]
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "completed", {}, run_id=run_id)
++    assert read(conn, tid) is None
+diff --git a/tests/hermes_state/test_completion_receipt.py b/tests/hermes_state/test_completion_receipt.py
+index 39644ffa88a..7c0f29a5c6e 100644
+--- a/tests/hermes_state/test_completion_receipt.py
++++ b/tests/hermes_state/test_completion_receipt.py
+@@ -30,6 +30,30 @@ def test_persisted_receipt_survives_refresh_and_reopen(db, monkeypatch):
+         reopened.close()
+ 
+ 
++@pytest.mark.parametrize("next_state", ["new_turn", "running", "muted", "decision"])
++def test_historical_receipt_survives_new_current_state(db, monkeypatch, next_state):
++    import hermes_state_outcome as so
++
++    fixtures.turn(db)
++    value = receipt("rejected")
++    declared = so.declare_outcome("chat", {"kind": "done", "summary": "Assessment complete",
++                                         "completion_receipt": value}, db=db)
++    if next_state == "decision":
++        so.declare_outcome("chat", {"kind": "decision", "items": [{"question": "Next?", "choices": ["yes", "no"]}]}, db=db)
++    else:
++        fixtures.say(db, "user", "New unrelated work")
++    monkeypatch.setattr(so, "_live_turn", lambda *_: next_state == "running")
++    if next_state == "muted":
++        out = so.set_muted("chat", True, db=db)
++    else:
++        out = so.refresh_outcome("chat", "manual", db=db)
++    if next_state != "decision":
++        assert out["kind"] != "done"
++    assert out.get("completion_receipt") == value
++    assert out["completion_receipt_source"]["declared_at"] == declared["at"]
++    assert so.get_outcome("chat", db=db)["completion_receipt"] == value
++
++
+ def test_malformed_declaration_leaves_existing_outcome_unchanged(db):
+     import hermes_state_outcome as so
+ 
+@@ -42,6 +66,43 @@ def test_malformed_declaration_leaves_existing_outcome_unchanged(db):
+     assert so.get_outcome("chat", db=db) == before
+ 
+ 
++@pytest.mark.parametrize("rows", [[], [{"id": "t_owner", "board": "default", "gateway": "away",
++                                      "status": "running", "stale": True}],
++                                  [{"id": "t_owner", "board": "other", "gateway": "away", "status": "running"}],
++                                  [{"id": "t_owner", "board": "default", "gateway": "here", "status": "running"}]])
++def test_declaration_rejects_unverified_pending_owner_without_write(db, monkeypatch, rows):
++    import hermes_state_outcome as so
++    from hermes_cli import kanban_origin, kanban_session_activity
++
++    fixtures.turn(db)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
++    monkeypatch.setattr(kanban_session_activity, "session_tasks", lambda *_args, **_kw: rows)
++    value = receipt("contained")
++    value["items"][0]["remaining"] = [{"scope": "cause", "state": "pending",
++                                       "owner": "@task:default@away/t_owner", "reason": "follow-up"}]
++    before = so.get_outcome("chat", db=db)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        so.declare_outcome("chat", {"kind": "done", "summary": "Containment complete",
++                                   "completion_receipt": value}, db=db)
++    assert so.get_outcome("chat", db=db) == before
++
++
++def test_declaration_accepts_existing_linked_local_owner(db, board, monkeypatch):
++    import hermes_state_outcome as so
++    from hermes_cli import kanban_origin
++
++    fixtures.turn(db)
++    fixtures.add_card(board, "t_owner", "chat", "running")
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here"}))
++    value = receipt("contained")
++    value["items"][0]["remaining"] = [{"scope": "cause", "state": "pending",
++                                       "owner": "@task:default@here/t_owner", "reason": "follow-up"}]
++    out = so.declare_outcome("chat", {"kind": "done", "summary": "Containment complete",
++                                    "completion_receipt": value}, db=db)
++    assert out["completion_receipt"] == value
++    assert so.get_outcome("chat", db=db)["completion_receipt"] == value
++
++
+ def receipt(disposition="delivered"):
+     item = {
+         "scope": "bounded assessment artifact",
+-- 
+2.55.0
+

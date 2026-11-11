@@ -17,7 +17,7 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 
-2156 patches, one entry per non-merge source commit through `e5c02292e40506da22ab96b09215ca1c1d56ebb2`.
+2253 patches, one entry per non-merge source commit through `9bc6ed6b6df403e0c80529753b9814d3ec119cba`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -26,11 +26,56 @@ follows 1281 although it sorts at position 1259 by date. Each patch is identifie
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `8471f614b4879144d36e8919fb4e1f3c430d2100`; current merge-base: `b3746e35ddd32079697728e2df57a9d78f1e9e32`.
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; there are no merges in the 2132–2156 append. The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Current snapshot: [mirror-replay-2156.json](mirror-replay-2156.json), [mirror-policy-2156.json](mirror-policy-2156.json), and [executed proof](mirror-2156-verification.md). Previous snapshot: [mirror-2131-verification.md](mirror-2131-verification.md). The following links retain historical verification:
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; there are no merges in the 2157–2253 append. The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Current snapshot: [mirror-replay-2253.json](mirror-replay-2253.json), [mirror-policy-2253.json](mirror-policy-2253.json), and [executed proof](mirror-2253-verification.md). Previous snapshot: [mirror-2156-verification.md](mirror-2156-verification.md). The following links retain historical verification:
 Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 2157–2253
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Session scan admission and lock-safe stamps](session-scan-admission-and-lock-safe-stamps-2215.md) | 2157–2158, 2178 | Queue HTTP scan bursts before worker admission, bypass scans for fresh cache hits, and preserve SQLite WAL locks during stamp reads. |
+| [No-progress dispatch budget](kanban-no-progress-budget-2215.md) | 2159 | Bound repeated waiting runs; re-park behind a usable condition or create episode-specific agent repair ownership. |
+| [Atomic archive choices](kanban-atomic-archive-choice-2215.md) | 2160–2161 | Commit archive precondition, choice comment and receipt atomically; re-export the core implementation. |
+| [Mid-tool update pause](update-pause-mid-tool-cancel-2215.md) | 2162, 2176 | Cancel resumable tool waits after a grace period and preserve surviving foreground job handoff results. |
+| [Check-hook interpreter selection](check-hook-interpreter-selection-2215.md) | 2163 | Use the launcher or a supported PATH Python when no checkout virtualenv exists. |
+| [Review result entry-path coverage](kanban-review-result-entry-coverage-2215.md) | 2164–2166 | Test result-only review artifacts and worker-session stamps across worker and non-worker tool callers. |
+| [Bounded cron restart rerun](cron-restart-rerun-2215.md) | 2167–2168 | Rerun eligible interrupted attempts once at startup while preserving schedules, operator edits and provider recovery boundaries. |
+| [Update-survivable terminal jobs](terminal-update-survival-2215.md) | 2169–2175 | Optional scoped persistence, foreground handoff, Stop precedence, output handling and integration-test synchronization. |
+| [Missing-parent repair ownership](kanban-missing-parent-repair-2215.md) | 2177 | Admit agent-owned investigation atomically with an expired missing-parent block; retain required dependencies. |
+| [Desktop "+ Create project" files the row at once](desktop-create-project-instant-2215.md) | 2179 | Create-project moves the row immediately via a provisional node and rolls back on failure. |
+| [CI Linux jobs on Blacksmith runners](ci-blacksmith-runner-routing-2215.md) | 2180–2183 | Linux CI moves from self-hosted lanes to Blacksmith (4/2 vCPU), with bubblewrap and userns fixes. |
+| [detect-changes falls back to the merge commit git diff](ci-detect-changes-git-fallback-2215.md) | 2189 | detect-changes uses the merge commit's git diff when the compare API is rate-limited. |
+| [Kanban commit keys on coarse-timestamp filesystems, and CI test flakes](kanban-commit-key-coarse-stat-and-ci-flake-fixes-2215.md) | 2185–2188 | Kanban activity keys survive coarse mtimes; serialized probes; port-race test fix. |
+| [Desktop remembers a backend that refuses submission_id](desktop-prompt-submission-identity-memo-2215.md) | 2184 | Desktop skips the refused submission_id round trip on legacy backends. |
+| [Kanban placement treats an explicit running initial status as default](kanban-portable-running-initial-status-2215.md) | 2190 | Explicit running initial status no longer blocks worker-first placement. |
+| [Kanban block notices name the calling agent](kanban-cli-block-actor-attribution-2215.md) | 2191 | CLI block notices name the calling agent instead of `user`. |
+| [Durable retry of a failed notice close-out wake](notice-closeout-durable-retry-2215.md) | 2192–2193 | Failed close-out wakes retry durably after the quota reset, including long resets. |
+| [Desktop transcript cache SQLite on a worker thread](desktop-transcript-cache-worker-thread-2215.md) | 2194–2196 | Transcript cache SQLite runs off the Desktop main thread; client never throws. |
+| [Far quota wall reroutes a non-mandatory model pin](kanban-pin-quota-reroute-2215.md) | 2197 | A far quota wall moves a non-mandatory pin to a same-class peer for one run. |
+| [A user Stop beats the core-update pause](update-pause-user-stop-wins-2215.md) | 2198 | A user Stop wins over the core-update pause so stopped turns are not resumed. |
+| [Kanban final admission gate excludes the claim's own grant echo](kanban-admission-own-grant-echo-2215.md) | 2199 | Final cap gate excludes only the claim's own unused Board grant echo. |
+| [Managed-run restart continuation](kanban-restart-continuation-2215.md) | 2200–2204 | Keep the run, claim and session across clean owner restarts; bound waits, repair interrupted tool results, and requeue pre-bootstrap or unsafe stops uncounted. |
+| [Tool worker gate extraction](tool-worker-gates-2215.md) | 2205 | Move authorization/start-order and interrupt helpers into a re-exported module without changing executor imports or logger identity. |
+| [Verified carried inputs](kanban-carried-evidence-2215.md) | 2206–2208 | Exempt only hash-pinned files covered by fresh carriage receipts; accept UTF-8 BOM and retain fail-closed placement fixtures. |
+| [Stable Desktop system-cache layout](desktop-system-cache-2215.md) | 2209–2210 | Replace the early-round spare-slot heuristic with a pinned full-system marker for attended Desktop, retaining tools and rolling endpoints. |
+| [Replica shutdown checkpoints](kanban-sync-shutdown-2215.md) | 2211 | Stop feed/snapshot pagination at cooperative shutdown boundaries without applying a page fetched after stopping. |
+| [Pooled command discovery](commands-catalog-rpc-pool-2215.md) | 2212 | Run commands.catalog on the RPC pool rather than blocking the socket's ordered request lane. |
+| [Durable failed-build model picks](agentless-model-intent-2215.md) | 2213–2214 | Commit ordered intent under the stored session key before retry, bound build diagnostics, and exercise real profile intent storage. |
+| [Exact-question early clarify answers](clarify-early-answer.md) | 2215 | Require matching toolCallId and full displayed-question digest for decision-bearing early answers; preserve legacy withdrawals and provider-owned full-question coverage. |
+| [Dispatch core-update hold](kanban-dispatch-update-hold-2253.md) | 2216 | Shared tick and claim-time hold gates; CLI/dashboard coverage and CLI reporting. |
+| [Independent review routing](kanban-independent-review-routing-2253.md) | 2217–2218 | Review handoff overrides, distinct reviewer selection, current-run receipts and quota controls. |
+| [Writer provenance and WAL scanning](state-writer-provenance-wal-scan-2253.md) | 2219–2220, 2230 | Value-free slow-write attribution and bounded GIL-held Linux descriptor scans. |
+| [Refused-send notices](kanban-refused-send-notice-only-2253.md) | 2221 | Notice delivery without waiting ownership, child inheritance or shepherd links. |
+| [Pinned pickup repair](kanban-pinned-pickup-repair-2253.md) | 2222 | Bounded local skip evidence and deduplicated agent-owned stall repairs. |
+| [Board-qualified producer waits](kanban-board-qualified-waits-2253.md) | 2223–2225 | Read-only producer-board lookup, bounded cycle checks and qualified wake guidance. |
+| [Published-worktree observation budget](kanban-published-worktree-budget-2253.md) | 2226–2229 | Historical empty entry, shared creation probe budget, cold-import safety and CLI line-budget cleanup. |
+| [Durable CI audit receipts](kanban-ci-audit-receipts-2253.md) | 2231–2232 | Persist CI timestamps/URLs in acceptance evidence; contribution attribution metadata. |
+| [Pinned-checkout update recovery](update-pinned-checkout-recovery-2253.md) | 2233–2238 | Preserve foreign code roots across pause/restart/recovery/migration; repair repeat deferrals. |
+| [Protected checkpoint floor](checkpoint-protected-floor-health-2253.md) | 2239–2243 | Successful-floor receipts, independent health thresholds, busy-lock deferral and strict receipt validation. |
+| [Completion receipts](completion-receipts-2253.md) | 2244–2253 | Add bounded, additive `completion_receipt` v1 so workflow done is distinct from artifact disposition; admit pending owners at the canonical writer, keep historical provenance apart from current state, and project it through remote inventories and the Desktop outcome tooltip. |
 
 ## Mirror follow-ups 2132–2156
 
@@ -1269,16 +1314,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **2156-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-one bridges and three ancestry-only markers from `mirror-replay-2156.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **2253-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-one bridges and three ancestry-only markers from `mirror-replay-2253.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip e5c02292e40506da22ab96b09215ca1c1d56ebb2 \
+  --source-tip 9bc6ed6b6df403e0c80529753b9814d3ec119cba \
   --base 8471f614b4879144d36e8919fb4e1f3c430d2100 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2156.json" \
-  --replay-plan "$MODS/core/mirror-replay-2156.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2253.json" \
+  --replay-plan "$MODS/core/mirror-replay-2253.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1410,7 +1455,7 @@ git commit -m 'Explicit upstream integration bridge before 2083'
 git am -3 --empty=keep "${patches[@]:2082:4}"
 git apply --index --3way "$MODS/core/bridges/upstream-before-2087.diff"
 git commit -m 'Explicit upstream integration bridge before 2087'
-git am -3 --empty=keep "${patches[@]:2086:70}"
+git am -3 --empty=keep "${patches[@]:2086:167}"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

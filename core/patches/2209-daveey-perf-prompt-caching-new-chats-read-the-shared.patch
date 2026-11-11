@@ -1,0 +1,95 @@
+From 912f53197bf5ea9b116227111819032d35c3a07a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:54:33 +0000
+Subject: [PATCH] [daveey] perf(prompt-caching): new chats read the shared
+ system prompt from cache on their first request
+
+The direct-native tool-cache layout spent the system-suffix breakpoint on the
+tools array, so the end of the system prompt was never a cache entry. Every new
+Desktop chat re-wrote ~15k tokens (project context, skills index, memory) before
+its first token (68% hit on turn 1). With fewer than two transaction endpoints a
+slot is spare: mark the suffix too. Live A/B on the hub serve path: second fresh
+chat 68% -> 100% cached (write 14953 -> 85 tokens).
+---
+ agent/prompt_caching.py            | 11 +++++----
+ tests/agent/test_prompt_caching.py | 36 +++++++++++++++++++++++++++++-
+ 2 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/agent/prompt_caching.py b/agent/prompt_caching.py
+index 1612ef56ab..2b790bbd41 100644
+--- a/agent/prompt_caching.py
++++ b/agent/prompt_caching.py
+@@ -327,14 +327,17 @@ def build_prompt_cache_plan(
+ 
+     messages = _strip_prior_decoration(list(api_messages or []))
+     marker = _build_marker(cache_ttl)
++    endpoints = _completed_transaction_endpoint_indexes(messages, native_anthropic=True)[-2:]
+     if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+-        # Tool-cache layout: only the static prefix carries a system-side marker; the
+-        # volatile suffix's budget is spent on the tools array.
++        # Tool-cache layout: the tools array takes the suffix's usual slot. With fewer than two
++        # endpoints (a new session's first requests) a slot is spare: mark the suffix too, so
++        # the next new chat reads the whole shared system prompt instead of re-writing it.
+         messages[0] = copy.deepcopy(messages[0])
+         _apply_system_cache_markers(messages[0], marker, static_system_prefix,
+-                                    native_anthropic=True, mark_suffix=False, fallback_to_whole=False)
++                                    native_anthropic=True, mark_suffix=len(endpoints) < 2,
++                                    fallback_to_whole=False)
+     planned_tools[-1]["cache_control"] = dict(marker)
+-    for endpoint in _completed_transaction_endpoint_indexes(messages, native_anthropic=True)[-2:]:
++    for endpoint in endpoints:
+         messages[endpoint] = copy.deepcopy(messages[endpoint])
+         _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
+     _split_unmarked_scaffolds(messages)
+diff --git a/tests/agent/test_prompt_caching.py b/tests/agent/test_prompt_caching.py
+index f4179ac5be..3d0cf92f27 100644
+--- a/tests/agent/test_prompt_caching.py
++++ b/tests/agent/test_prompt_caching.py
+@@ -183,9 +183,43 @@ class TestPromptCachePlan:
+             direct_native_tool_cache=True,
+         )
+ 
+-        assert _count_cache_markers(plan.messages, plan.tools) == 2
++        # tools + static prefix + system suffix (spare budget); the pending endpoint takes none.
++        assert _count_cache_markers(plan.messages, plan.tools) == 3
+         assert "cache_control" not in plan.messages[-1]
+ 
++    def test_first_turn_marks_the_system_suffix_with_spare_budget(self):
++        """A new session's first request has one endpoint, so a slot is free: spend it on the
++        end of the system prompt. Every new chat shares that prefix (project context, skills
++        index, memory), so the next new chat reads it from cache instead of re-writing ~15k
++        tokens before its first token."""
++        messages = [
++            {"role": "system", "content": "stable prefix\nvolatile suffix"},
++            {"role": "user", "content": "first request"},
++        ]
++        plan = build_prompt_cache_plan(
++            messages, _tool_heavy_native_tools(), native_anthropic=True,
++            static_system_prefix="stable prefix", direct_native_tool_cache=True,
++        )
++
++        system = plan.messages[0]["content"]
++        assert [part["text"] for part in system] == ["stable prefix", "\nvolatile suffix"]
++        assert all(part.get("cache_control") == MARKER for part in system)
++        assert plan.tools[-1]["cache_control"] == MARKER
++        assert "cache_control" in plan.messages[-1]["content"][-1]
++        assert _count_cache_markers(plan.messages, plan.tools) == 4
++
++    def test_two_endpoints_keep_the_suffix_unmarked(self):
++        """Once two transaction endpoints exist they own the budget; the suffix rides unmarked."""
++        plan = build_prompt_cache_plan(
++            _tool_heavy_native_history(), _tool_heavy_native_tools(), native_anthropic=True,
++            static_system_prefix="stable prefix", direct_native_tool_cache=True,
++        )
++
++        system = plan.messages[0]["content"]
++        assert system[0].get("cache_control") == MARKER
++        assert "cache_control" not in system[1]
++        assert _count_cache_markers(plan.messages, plan.tools) == 4
++
+     def test_static_prefix_equal_to_whole_prompt_emits_no_empty_block(self):
+         """Empty volatile suffix must not produce an empty text block.
+ 
+-- 
+2.55.0
+

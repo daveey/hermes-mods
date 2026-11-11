@@ -5,6 +5,8 @@ Patch:
 - `patches/0814-feat-clarify-a-decision-recorded-in-the-For-you-queu.patch`: `tools/clarify_early.py`,
   `tools/clarify_tool.py`, `agent/inline_tool_executors.py`, `tui_gateway/agent_callbacks.py`,
   `tui_gateway/server_requests.py`.
+- `patches/2215-feat-clarify-bind-early-answers-to-the-exact-display.patch`: exact displayed-question
+  binding in `tools/clarify_early.py`, plus bound-provider source regressions.
 
 What you see: a chat asks you a question with `clarify`, but you already answered the same thing in the user-steps
 "For you" queue. Before, the chat sat on the question until the clarify timed out (an hour), because the queue's
@@ -39,8 +41,29 @@ queued decision within a couple of seconds.
   has a session id and the callback has `cancel_early`; otherwise it calls it inline as before.
 - The inline executor passes `agent.session_id` and the call's `tool_call_id` to `clarify_tool`.
 - Provider exceptions are swallowed (debug log): a broken store never blocks a question.
+- Patch 2215 computes a schema-version-1 descriptor once per `ask`: `questions` is the entire ordered
+  displayed batch, each entry containing its question text and ordered choice labels. Canonical JSON uses
+  sorted keys, compact separators and Unicode text; SHA-256 covers that full list, not the tool-call id.
+  `toolCallId` is therefore checked separately along with `questionDigest`. Both the pre-display check and
+  blocked polling use this same descriptor. Rejected bindings do not commit delivery.
+- `accepts_question` must be exactly `True` to receive the keyword descriptor. Without a descriptor,
+  direct legacy `poll(session_id, tool_call_id)` retains its two-argument contract. With a descriptor,
+  a withdrawal without non-empty `decisions` remains usable without binding.
+- Full-question coverage is a provider responsibility: binding an answer to the batch does not make a
+  partial decision a valid answer to all displayed questions. The provider must resolve every question
+  before returning a decision-bearing early answer; core 2215 checks the echoed batch identity, not
+  semantic coverage of each decision. Keep the plugin's coverage checks when adopting this contract.
+
+## Code
+
+- `tools/clarify_early.py`: `question_descriptor`, `bound_to`, question-aware provider dispatch, and
+  pre-display/blocked-poll integration.
+- Existing surface wiring remains in `tools/clarify_tool.py`, `agent/inline_tool_executors.py`,
+  `tui_gateway/agent_callbacks.py` and `tui_gateway/server_requests.py`; 2215 does not modify those files.
 
 ## Tests
+
+The following describe supplied source coverage, **not tests executed by this documentation/mirror task**.
 
 - `tests/tools/test_clarify_early_answer.py`: check before asking (callback never runs); decision recorded while
   blocked ends the clarify and commits; a provider answering only for another session leaves the clarify waiting;
@@ -51,8 +74,15 @@ queued decision within a couple of seconds.
   unbound decision, legacy decision answer and foreign tool-call echo leave it waiting; update-pause withdrawal works.
 - Plugin side (hermes-mods `plugins/user-steps/tests/test_clarify_early.py`): store, receipt, lineage, guard and an
   end-to-end run against this core.
+- Patch 2215 updates the earlier early-answer fixtures to use question-aware bound providers. Its bound
+  suite also checks direct polling without a descriptor. Its descriptor test exercises choice order and
+  tool-call-independent digest identity; it does not supply a multi-question semantic-coverage regression.
+  Full-batch decision coverage must remain tested on the plugin side, not inferred from the digest alone.
 
 ## Applying
+
+Use only the complete ordered replay recipe in [README.md](README.md), including its bridges and verification;
+0814 and 2215 are not an independent apply set. Provider integration remains:
 
 Core plus the `user-steps` plugin from the same hermes-mods commit; no config. Older cores simply lack the module and
 the plugin registers nothing. Takes effect in a backend after it restarts on the new core.
@@ -61,3 +91,12 @@ the plugin registers nothing. Takes effect in a backend after it restarts on the
 
 - Busy refusals no longer count toward the plugin's retry cap (plugin change, not core).
 - Cancelling discards any partially locked batch answers of that clarify.
+- A matching session or digest alone is insufficient: both `toolCallId` and `questionDigest` must match.
+  Echoing a digest is not proof that the provider actually resolved every question.
+
+## plugin?
+
+The decision store and full-question matching belong in a provider plugin such as `user-steps`.
+Core supplies the descriptor, binding gate, polling and surface cancellation; 2215 does not replace
+or remove the plugin's receipt, lineage, guard or delivery behavior. A legacy two-argument decision
+provider needs the question-aware contract before it can end a bound clarify with decisions.

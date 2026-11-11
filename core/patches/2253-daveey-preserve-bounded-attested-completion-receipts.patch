@@ -1,0 +1,442 @@
+From 9bc6ed6b6df403e0c80529753b9814d3ec119cba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 10:29:47 +0000
+Subject: [PATCH] [daveey] preserve bounded attested completion receipts in
+ remote projections
+
+---
+ .../kanban_completion_receipt_projection.py   |  90 ++++++++
+ hermes_cli/kanban_origin_ledger.py            |   2 +
+ hermes_cli/kanban_session_activity.py         |   4 +
+ .../test_kanban_receipt_source_bounds.py      |  71 +++++++
+ .../test_kanban_remote_completion_receipt.py  | 195 ++++++++++++++++++
+ 5 files changed, 362 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_receipt_source_bounds.py
+ create mode 100644 tests/hermes_cli/test_kanban_remote_completion_receipt.py
+
+diff --git a/hermes_cli/kanban_completion_receipt_projection.py b/hermes_cli/kanban_completion_receipt_projection.py
+index d6c3c4cfba1..9fbbc01d735 100644
+--- a/hermes_cli/kanban_completion_receipt_projection.py
++++ b/hermes_cli/kanban_completion_receipt_projection.py
+@@ -6,9 +6,69 @@ unspecified artifact acceptance, even if an older run carried a receipt.
+ from __future__ import annotations
+ 
+ import json
++import math
++import re
+ 
+ from hermes_completion_receipt import validate_completion_receipt
+ 
++MAX_SOURCE_UID = 256
++MAX_RELOCATIONS = 32
++MAX_SOURCE_TEXT = 2048
++MAX_SOURCE_BYTES = 16384
++_SOURCE_REF = re.compile(r"@task:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+/[^\s/@]+\Z")
++
++
++def validate_receipt_source(value, receipt, *, expected_ref=None):
++    """Normalize bounded task-run provenance, not its truth or current acceptance.
++
++    Receipt must already be canonical. Outer qualification/attestation remains
++    the caller's job; expected_ref binds the source to that qualified record.
++    """
++    required = {'kind', 'ref', 'event_id', 'run_id', 'completed_at'}
++    optional = {'event_uid', 'run_uid', 'attached_from_workspace'}
++    if (not isinstance(value, dict) or not required <= value.keys()
++            or value.keys() - required - optional):
++        raise ValueError('completion_receipt_source: missing or unknown fields')
++
++    def text(raw, limit):
++        if (not isinstance(raw, str) or not raw.strip() or len(raw) > limit
++                or any(ord(c) < 32 for c in raw)):
++            raise ValueError('completion_receipt_source: invalid or oversized text')
++        return raw
++
++    ref = text(value['ref'], MAX_SOURCE_TEXT)
++    if (value['kind'] != 'task_run' or not _SOURCE_REF.fullmatch(ref)
++            or (expected_ref is not None and ref != expected_ref)):
++        raise ValueError('completion_receipt_source: wrong task source')
++    out: dict = {'kind': 'task_run', 'ref': ref}
++    for key in ('event_id', 'run_id'):
++        if type(value[key]) is not int or not 0 < value[key] <= 2**63 - 1:
++            raise ValueError('completion_receipt_source: invalid store-local ID')
++        out[key] = value[key]
++    for key in ('event_uid', 'run_uid'):
++        if key in value:
++            out[key] = None if value[key] is None else text(value[key], MAX_SOURCE_UID)
++    stamp = value['completed_at']
++    if (type(stamp) not in (int, float) or stamp < 0 or stamp > 1e308
++            or not math.isfinite(stamp)):
++        raise ValueError('completion_receipt_source: invalid completion timestamp')
++    out['completed_at'] = stamp
++    if 'attached_from_workspace' in value:
++        relocations = value['attached_from_workspace']
++        refs = {e['ref'] for item in receipt['items'] for e in item['evidence']}
++        refs.update(item['superseded_by'] for item in receipt['items'] if 'superseded_by' in item)
++        if (not isinstance(relocations, dict) or len(relocations) > MAX_RELOCATIONS
++                or any(ref not in refs for ref in relocations)):
++            raise ValueError('completion_receipt_source: invalid relocation references')
++        out['attached_from_workspace'] = {
++            text(ref, MAX_SOURCE_TEXT): text(dest, MAX_SOURCE_TEXT)
++            for ref, dest in relocations.items()}
++    if len(json.dumps(out, ensure_ascii=True)) > MAX_SOURCE_BYTES:
++        raise ValueError('completion_receipt_source: provenance exceeds budget')
++    return {key: out[key] for key in ('kind', 'ref', 'event_id', 'event_uid',
++                                     'run_id', 'run_uid', 'completed_at',
++                                     'attached_from_workspace') if key in out}
++
+ 
+ def read_completed(conn, task_id, *, gateway, board):
+     """Return receipt plus source-qualified provenance, or None (legacy/invalid).
+@@ -54,9 +114,39 @@ def read_completed(conn, task_id, *, gateway, board):
+         refs.update(item["superseded_by"] for item in receipt["items"] if "superseded_by" in item)
+         source["attached_from_workspace"] = {ref: dest for ref, dest in relocations.items()
+                                              if ref in refs and isinstance(dest, str)}
++    try:
++        source = validate_receipt_source(source, receipt,
++                                         expected_ref=f'@task:{board}@{gateway}/{task_id}')
++    except (ValueError, TypeError):
++        return None
+     return {"completion_receipt": receipt, "completion_receipt_source": source}
+ 
+ 
++def remote_fields(task, *, gateway, profile, board, task_id):
++    """Transport admitted historical facts, never a fresh completion verdict.
++
++    The enclosing owner observation must bind these exact bytes. Qualification
++    comes from the record/binding, not a receipt's claimed ref or observer host.
++    Callers retain their existing current/released/stale gates independently.
++    """
++    from hermes_cli.kanban_origin_ledger import _owner_evidence
++
++    source = task.get('completion_receipt_source')
++    if not isinstance(source, dict):
++        return {}
++    if (not profile or any(task.get(k) != v for k, v in (
++            ('gateway', gateway), ('profile', profile), ('board', board), ('id', task_id)))
++            or not _owner_evidence(task)):
++        return {}
++    try:
++        receipt = validate_completion_receipt(task.get('completion_receipt'))
++        source = validate_receipt_source(source, receipt,
++                                         expected_ref=f'@task:{board}@{gateway}/{task_id}')
++    except (ValueError, TypeError):
++        return {}
++    return {'completion_receipt': receipt, 'completion_receipt_source': source}
++
++
+ def read_inventory(conn, task_id, *, board, gateway=None):
+     """Optional projection for existing inventories, including older board schemas.
+ 
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 8704248ea66..97428aa67a4 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -494,7 +494,9 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                 closed = bool(current and status == 'archived' and not released and _owner_evidence(task))
+                 if not current or not known or (status in ('done', 'archived') and not released and not closed):
+                     status = 'unknown'
++                from hermes_cli.kanban_completion_receipt_projection import remote_fields
+                 result.append({
++                    **remote_fields(task, **owner),
+                     **{k: task.get(k) for k in ('title', 'assignee', 'block_kind', 'created_at', 'started_at', 'priority')},
+                     **owner, 'id': owner['task_id'],
+                     'key': '/'.join(owner[k] for k in ('gateway', 'profile', 'board', 'task_id')),
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index ef363e64906..4a5b7199e97 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -830,8 +830,12 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         closed = (gw, owner_profile, board, tid) in released
+         prefix = f'{gw}/{owner_profile}/{board}' if owner_profile is not None else f'{gw}/{board}'
+         ref = f'{prefix}/{tid}'
++        from hermes_cli.kanban_completion_receipt_projection import remote_fields
++        historical = remote_fields(raw[(gw, owner_profile, board, tid)], gateway=gw,
++                                   profile=owner_profile, board=board, task_id=tid)
+         for sid in sids:
+             found[(sid, ref)] = {
++                **historical,
+                 **{f: t.get(f) for f in _REMOTE_FIELDS},
+                 "id": tid, "board": board, "gateway": gw, "key": ref, "session": sid,
+                 "via": "shepherd", "root": ref, "remote": True,
+diff --git a/tests/hermes_cli/test_kanban_receipt_source_bounds.py b/tests/hermes_cli/test_kanban_receipt_source_bounds.py
+new file mode 100644
+index 00000000000..01ccc934e5c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_receipt_source_bounds.py
+@@ -0,0 +1,71 @@
++"""Projection bounds apply equally to local DB bytes and attested replicas."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_completion_receipt_projection import read_completed, validate_receipt_source
++from tests.hermes_cli.test_kanban_remote_completion_receipt import publication
++
++
++def source_and_receipt():
++    task = publication({'owner': {'task_id': 't_one'}})
++    return task['completion_receipt_source'], task['completion_receipt']
++
++
++@pytest.mark.parametrize('field,value', [
++    ('event_uid', 'X' * 50000), ('run_uid', ''), ('event_id', -1),
++    ('run_id', 0), ('completed_at', 'not-a-time'),
++    ('attached_from_workspace', {'https://example.com/review/1': 'X' * 50000}),
++])
++def test_local_completed_projection_omits_malformed_provenance(field, value):
++    source, receipt = source_and_receipt()
++    source[field] = value
++    metadata = {'completion_receipt': receipt}
++    if 'attached_from_workspace' in source:
++        metadata['attached_from_workspace'] = source['attached_from_workspace']
++    with sqlite3.connect(':memory:') as db:
++        db.row_factory = sqlite3.Row
++        db.executescript('''
++            CREATE TABLE task_events(id INTEGER, task_id TEXT, kind TEXT, run_id INTEGER,
++                                     created_at, uid TEXT, payload TEXT);
++            CREATE TABLE task_runs(id INTEGER, task_id TEXT, outcome TEXT, metadata TEXT, uid TEXT);
++        ''')
++        db.execute('INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?, ?)',
++                   (source['event_id'], 't_one', 'completed', source['run_id'], source['completed_at'],
++                    source['event_uid'], json.dumps({'completion_receipt_admission': 1})))
++        db.execute('INSERT INTO task_runs VALUES (?, ?, ?, ?, ?)',
++                   (source['run_id'], 't_one', 'completed', json.dumps(metadata), source['run_uid']))
++        assert read_completed(db, 't_one', gateway='owner', board='build') is None
++
++
++def test_provenance_is_normalized_copy_and_nullable_uids_are_valid():
++    source, receipt = source_and_receipt()
++    source['event_uid'] = source['run_uid'] = None
++    copied = validate_receipt_source(source, receipt, expected_ref='@task:build@owner/t_one')
++    assert copied == source
++    copied['attached_from_workspace'].clear()
++    assert source['attached_from_workspace']
++
++
++@pytest.mark.parametrize('fault', ['count', 'aggregate', 'profile_syntax', 'mismatch'])
++def test_source_limits_and_exact_reference(fault):
++    source, receipt = source_and_receipt()
++    if fault in ('count', 'aggregate'):
++        count = 33 if fault == 'count' else 10
++        refs = ['artifact:' + str(i) for i in range(count)]
++        receipt['items'][0]['evidence'] = [{'ref': ref} for ref in refs]
++        source['attached_from_workspace'] = {ref: 'D' * 2048 for ref in refs}
++    elif fault == 'profile_syntax':
++        source['ref'] = '@task:work/build@owner/t_one'
++    else:
++        source['ref'] = '@task:build@other/t_one'
++    with pytest.raises(ValueError):
++        validate_receipt_source(source, receipt, expected_ref='@task:build@owner/t_one')
++
++
++def test_superseded_reference_can_carry_existing_relocation():
++    source, receipt = source_and_receipt()
++    receipt['items'][0].update(disposition='superseded', superseded_by='artifact:successor')
++    source['attached_from_workspace'] = {'artifact:successor': '/attached/successor'}
++    assert validate_receipt_source(source, receipt) == source
+diff --git a/tests/hermes_cli/test_kanban_remote_completion_receipt.py b/tests/hermes_cli/test_kanban_remote_completion_receipt.py
+new file mode 100644
+index 00000000000..384106f799d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_completion_receipt.py
+@@ -0,0 +1,195 @@
++"""Synthetic owner publications through the real remote inventory producers."""
++import hashlib
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli import test_kanban_origin_ledger as fixtures
++from tests.hermes_state.test_completion_receipt import receipt
++
++world = fixtures.world
++
++
++def publication(binding):
++    owner = binding['owner']
++    return {**owner, 'id': owner['task_id'], 'status': 'done', 'title': 'Assessment',
++            'origin_bindings': [binding],
++            'sessions': [{'gw': 'origin', 'profile': 'default', 'session': 's_current', 'rel': 'shepherd'}],
++            'completion_receipt': receipt('rejected'),
++            'completion_receipt_source': {
++                'kind': 'task_run', 'ref': '@task:build@owner/t_one',
++                'event_id': 7, 'event_uid': 'event-original', 'run_id': 4,
++                'run_uid': 'run-original', 'completed_at': 990,
++                'attached_from_workspace': {'https://example.com/review/1': '/attachments/review'}},
++            }
++
++
++def attest(task, *, verified=True):
++    task['origin_observation'] = {'schema': 1, 'verified': verified, 'observed_at': 1000,
++                                  'task_hash': hashlib.sha256(ledger._json(task).encode()).hexdigest()}
++
++
++def project(world, monkeypatch, producer, task, *, now=1001):
++    path, replica, binding = world
++    with sqlite3.connect(replica) as db:
++        db.execute('ALTER TABLE replica ADD COLUMN updated_at INTEGER DEFAULT 1000000')
++        db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++        db.executemany('INSERT INTO meta VALUES (?, ?)', [('last_ok', '1000'), ('gateway', 'origin')])
++        db.execute("INSERT INTO replica (gw,coll,key,version,data) VALUES ('owner','tasks',?,3,?)",
++                   (binding['task_record_key'], json.dumps(task)))
++        info = {'gateway': 'owner', 'task_scopes': [{'profile': 'work', 'board': 'build',
++                'state': 'ok', 'observed_at': 1000}]}
++        db.execute("INSERT INTO replica (gw,coll,key,version,data) VALUES ('owner','gateway','info',3,?)", (json.dumps(info),))
++    if producer == 'ledger':
++        fixtures.accept(world)
++        return ledger.project(path, replica=replica, gateway='origin', profile='default', now=now)[0]
++    monkeypatch.setattr(activity, '_self_gateway', lambda _: 'origin')
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    return activity._read_remote_links(replica, now=now)[0]
++
++
++@pytest.mark.parametrize('producer', ['ledger', 'activity'])
++def test_remote_producer_preserves_source_receipt_without_upgrading_evidence(world, monkeypatch, producer):
++    task = publication(world[2])
++    attest(task)
++    row = project(world, monkeypatch, producer, task)
++    assert row.get('completion_receipt') == task['completion_receipt']
++    assert row.get('completion_receipt_source') == task['completion_receipt_source']
++    assert row['stale'] is False
++    assert row['unfinished'] is False
++    assert row['completion_receipt']['items'][0]['evidence'][0]['verification'] == 'reported'
++
++
++@pytest.mark.parametrize('field', ['gateway', 'profile', 'board'])
++def test_activity_owner_collision_cannot_borrow_another_qualified_receipt(world, monkeypatch, field):
++    task = publication(world[2])
++    task[field] = 'collision'
++    attest(task)
++    row = project(world, monkeypatch, 'activity', task)
++    assert 'completion_receipt' not in row
++    assert 'completion_receipt_source' not in row
++    assert row['unfinished'] is True
++    assert row['status'] == 'unknown'
++
++
++@pytest.mark.parametrize('field', ['gateway', 'profile', 'board'])
++def test_ledger_owner_collision_cannot_borrow_another_qualified_receipt(world, monkeypatch, field):
++    task = publication(world[2])
++    # Accept a real owner publication first, then replace its inventory row.
++    valid = publication(world[2])
++    attest(valid)
++    row = project(world, monkeypatch, 'ledger', valid)
++    assert 'completion_receipt' in row
++    task[field] = 'collision'
++    task['completion_receipt'] = receipt('delivered')
++    task['completion_receipt_source']['event_uid'] = 'collision-event'
++    attest(task)
++    with sqlite3.connect(world[1]) as db:
++        db.execute("UPDATE replica SET version=4,data=? WHERE coll='tasks'", (json.dumps(task),))
++    row = ledger.project(world[0], replica=world[1], gateway='origin', profile='default', now=1002)[0]
++    # The durable previously admitted historical receipt survives. A collision
++    # must neither borrow the new receipt nor preserve current settlement.
++    assert row['completion_receipt'] == valid['completion_receipt']
++    assert row['completion_receipt_source'] == valid['completion_receipt_source']
++    assert row['unfinished'] is True
++
++
++@pytest.mark.parametrize('verified', [True, False])
++def test_self_owner_ledger_projects_local_receipt_without_upgrading_completion(world, monkeypatch, verified):
++    from hermes_cli import kanban_origin_local
++    binding = world[2]
++    binding['owner'].update(gateway='origin', profile='default')
++    binding['task_record_key'] = 'default/build/t_one'
++    task = publication(binding)
++    task['completion_receipt_source']['ref'] = '@task:build@origin/t_one'
++    attest(task, verified=verified)
++    fixtures.publish(world[1], binding)
++    fixtures.accept(world, sender='gw:origin')
++    monkeypatch.setattr(kanban_origin_local, 'observe_local_binding', lambda *a, **kw: task)
++    row = ledger.project(world[0], replica=None, gateway='origin', profile='default', now=1001)[0]
++    assert row['completion_receipt_source'] == task['completion_receipt_source']
++    assert row['completion_receipt'] == task['completion_receipt']
++    assert row['unfinished'] is (not verified)
++    assert row['status'] == ('done' if verified else 'unknown')
++
++
++@pytest.mark.parametrize('producer', ['ledger', 'activity'])
++def test_stale_receipt_is_historical_not_current_delivery(world, monkeypatch, producer):
++    task = publication(world[2])
++    task['completion_receipt'] = receipt('delivered')
++    attest(task)
++    row = project(world, monkeypatch, producer, task, now=2000)
++    assert row.get('completion_receipt') == task['completion_receipt']
++    assert row.get('completion_receipt_source') == task['completion_receipt_source']
++    assert row['stale'] is True
++    assert row['unfinished'] is True
++    assert row['status'] == 'unknown'
++    assert row.get('released', False) is False
++
++
++@pytest.mark.parametrize('producer', ['ledger', 'activity'])
++@pytest.mark.parametrize('fault', ['legacy', 'unattested', 'tampered', 'source_gateway',
++                                  'source_board', 'source_task', 'source_kind', 'malformed',
++                                  'missing_source', 'missing_event', 'invalid_run'])
++def test_remote_producers_do_not_invent_or_misattribute_receipts(world, monkeypatch, producer, fault):
++    task = publication(world[2])
++    if fault == 'legacy':
++        del task['completion_receipt']
++        del task['completion_receipt_source']
++    elif fault.startswith('source_'):
++        field = fault.removeprefix('source_')
++        task['completion_receipt_source']['kind' if field == 'kind' else 'ref'] = {
++            'gateway': '@task:build@collision/t_one', 'board': '@task:other@owner/t_one',
++            'task': '@task:build@owner/t_collision', 'kind': 'session_declaration'}[field]
++    elif fault == 'missing_source':
++        del task['completion_receipt_source']
++    elif fault == 'missing_event':
++        del task['completion_receipt_source']['event_id']
++    elif fault == 'invalid_run':
++        task['completion_receipt_source']['run_id'] = True
++    elif fault == 'malformed':
++        task['completion_receipt']['items'] = []
++    if fault != 'unattested':
++        attest(task)
++    if fault == 'tampered':
++        task['completion_receipt']['items'][0]['disposition'] = 'delivered'
++    row = project(world, monkeypatch, producer, task)
++    assert 'completion_receipt' not in row
++    assert 'completion_receipt_source' not in row
++    if fault in ('unattested', 'tampered'):
++        assert row['unfinished'] is True
++        assert row['status'] == 'unknown'
++
++
++@pytest.mark.parametrize('producer', ['ledger', 'activity'])
++@pytest.mark.parametrize('field,value', [
++    ('extra', 'X' * 100000), ('event_uid', {'payload': 'X' * 50000}),
++    ('run_uid', 'X' * 50000), ('event_uid', ''), ('completed_at', '990'),
++    ('completed_at', float('inf')), ('completed_at', -1), ('completed_at', True),
++    ('attached_from_workspace', {'unknown:ref': '/attachment'}),
++    ('attached_from_workspace', {'https://example.com/review/1': 'X' * 50000}),
++])
++def test_attested_malformed_provenance_is_not_transported(world, monkeypatch, producer, field, value):
++    task = publication(world[2])
++    task['completion_receipt_source'][field] = value
++    attest(task)
++    row = project(world, monkeypatch, producer, task)
++    assert 'completion_receipt_source' not in row
++    assert 'completion_receipt' not in row
++    assert row['unfinished'] is False  # provenance refusal must not change workflow gates
++
++
++@pytest.mark.parametrize('producer', ['ledger', 'activity'])
++def test_receipt_does_not_override_unverified_owner_completion(world, monkeypatch, producer):
++    task = publication(world[2])
++    task['completion_receipt'] = receipt('delivered')
++    attest(task, verified=False)
++    row = project(world, monkeypatch, producer, task)
++    assert row['unfinished'] is True
++    assert row['status'] == 'unknown'
++    assert row.get('released', False) is False
++    assert row['completion_receipt']['items'][0]['evidence'][0]['verification'] == 'reported'
+-- 
+2.55.0
+

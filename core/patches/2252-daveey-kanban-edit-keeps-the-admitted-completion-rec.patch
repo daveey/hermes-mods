@@ -1,0 +1,159 @@
+From 6dd23781973e064e73fd71df1fd519383aecec5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:41:15 +0000
+Subject: [PATCH] [daveey] kanban edit keeps the admitted completion receipt
+
+An edited completed run kept the completed event's admission marker, so a
+swapped receipt was projected as admitted with unchecked owners. edit now
+keeps the admitted receipt and refuses a different one.
+---
+ hermes_cli/kanban.py                          |  4 +-
+ hermes_cli/kanban_cli_metadata.py             |  3 ++
+ hermes_cli/kanban_completion_receipt.py       | 31 ++++++++++++++
+ hermes_cli/kanban_db_edit.py                  |  3 ++
+ .../test_kanban_completion_receipt_edit.py    | 42 +++++++++++++++++++
+ 5 files changed, 81 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_completion_receipt_edit.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 116d2034416..c6016f91237 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -37,7 +37,7 @@ from hermes_cli.kanban_output import (
+     _task_to_dict,
+ )
+ from hermes_cli.kanban_boards import _dispatch_boards
+-from hermes_cli.kanban_cli_metadata import parse_metadata_flag as _parse_metadata_flag, receipt_refusal
++from hermes_cli.kanban_cli_metadata import ReceiptEditRefused, parse_metadata_flag as _parse_metadata_flag, receipt_refusal
+ from hermes_cli.kanban_cli_park import (
+     _REASON_FLAG_HINT, _REASON_WORDS_HINT, _cli_awaiting, _cli_wake_check, _commented, _guarded_park, _ids_error,
+     _parked_msg,
+@@ -1362,7 +1362,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+                     result=result, summary=summary, metadata=metadata,
+                     priority_reason=reason, require_lower_reason=True,
+                 )
+-            except kb.PriorityLowerRefused as exc:
++            except (kb.PriorityLowerRefused, ReceiptEditRefused) as exc:
+                 return _err(f"kanban edit: {exc}")
+             if not ok:
+                 return _err(f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)")
+diff --git a/hermes_cli/kanban_cli_metadata.py b/hermes_cli/kanban_cli_metadata.py
+index bf1b6a997b8..f3251609bb2 100644
+--- a/hermes_cli/kanban_cli_metadata.py
++++ b/hermes_cli/kanban_cli_metadata.py
+@@ -9,8 +9,11 @@ from __future__ import annotations
+ import json
+ from typing import Optional
+ 
++from hermes_cli.kanban_completion_receipt import ReceiptEditRefused
+ from hermes_cli.kanban_output import _err
+ 
++__all__ = ["ReceiptEditRefused", "parse_metadata_flag", "receipt_refusal"]
++
+ 
+ def parse_metadata_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
+     """Parse ``--metadata`` JSON; returns ``(dict|None, rc)`` with rc=2 on error."""
+diff --git a/hermes_cli/kanban_completion_receipt.py b/hermes_cli/kanban_completion_receipt.py
+index cb8f7d65c10..1f7688baf13 100644
+--- a/hermes_cli/kanban_completion_receipt.py
++++ b/hermes_cli/kanban_completion_receipt.py
+@@ -171,3 +171,34 @@ def recheck(conn, task_id, owners):
+             _, scope, gateway, identity = owner_parts(ref)
+             if not _remote_link(conn, task_id, scope, gateway, identity):
+                 raise refusal(ref, "ownership link changed during admission")
++
++
++class ReceiptEditRefused(ValueError):
++    """``kanban edit`` tried to change a completion receipt; only completion admits one."""
++
++
++def keep_admitted_receipt(conn, run_id, metadata):
++    """Edited handoff metadata for ``run_id`` with the run's admitted receipt kept verbatim.
++
++    A completed-run receipt is admitted once, by ``complete_task`` (owners checked, admission
++    marker on the completed event). An edit may rewrite other handoff fields, but a different
++    ``completion_receipt`` would ride the original admission marker unchecked, so it is refused;
++    omitting it keeps the admitted one. ``run_id=None`` (no completed run) has none admitted.
++    """
++    import json
++
++    prior = None
++    if run_id is not None:
++        row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++        try:
++            stored = json.loads(row[0]) if row and row[0] else {}
++        except (TypeError, ValueError):
++            stored = {}
++        prior = stored.get("completion_receipt") if isinstance(stored, dict) else None
++    if "completion_receipt" in metadata and metadata["completion_receipt"] != prior:
++        raise ReceiptEditRefused("completion_receipt: only kanban complete admits a receipt; "
++                                 "edit keeps the admitted one (omit completion_receipt)")
++    edited = {k: v for k, v in metadata.items() if k != "completion_receipt"}
++    if prior is not None:
++        edited["completion_receipt"] = prior
++    return edited
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index 21c90bb6ca0..5cbc6927cae 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -88,6 +88,9 @@ def edit_task(
+             """,
+             (task_id,),
+         ).fetchone()
++            if metadata is not None:
++                from hermes_cli.kanban_completion_receipt import keep_admitted_receipt
++                metadata = keep_admitted_receipt(conn, None if run is None else int(run["id"]), metadata)
+             if run is None:
+                 run_id = _kb._synthesize_ended_run(
+                     conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata,
+diff --git a/tests/hermes_cli/test_kanban_completion_receipt_edit.py b/tests/hermes_cli/test_kanban_completion_receipt_edit.py
+new file mode 100644
+index 00000000000..173cf57b937
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_completion_receipt_edit.py
+@@ -0,0 +1,42 @@
++"""`kanban edit` can rewrite a completed handoff but never its admitted receipt.
++
++The receipt rides the completed event's admission marker; an edit that swapped it would be
++projected as admitted without its owners ever being checked. Anonymous synthetic fixtures.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_completion_receipt import ReceiptEditRefused
++from tests.hermes_cli import test_kanban_completion_receipt as fixtures
++from tests.hermes_cli.test_kanban_completion_receipt_projection import read
++from tests.hermes_state.test_completion_receipt import receipt
++
++conn = fixtures.conn
++
++
++def _forged():
++    value = receipt("delivered")
++    value["items"][0]["remaining"] = [{"scope": "rollout", "state": "pending",
++                                       "owner": "@task:default@nowhere/t_fake", "reason": "Unchecked."}]
++    return value
++
++
++def test_edit_cannot_swap_an_admitted_receipt(conn):
++    tid = fixtures.task(conn)
++    admitted = receipt("rejected")
++    assert kb.complete_task(conn, tid, summary="done", metadata={"completion_receipt": admitted})
++    with pytest.raises(ReceiptEditRefused):
++        kb.edit_task(conn, tid, result="edited", metadata={"completion_receipt": _forged()})
++    assert read(conn, tid)["completion_receipt"] == admitted
++
++
++def test_edit_without_receipt_keeps_the_admitted_one(conn):
++    tid = fixtures.task(conn)
++    admitted = receipt("contained")
++    assert kb.complete_task(conn, tid, summary="done", metadata={"completion_receipt": admitted})
++    assert kb.edit_task(conn, tid, result="edited", metadata={"note": "backfilled"})
++    assert read(conn, tid)["completion_receipt"] == admitted
++    assert kb.edit_task(conn, tid, result="again", metadata={"completion_receipt": admitted})
++    assert read(conn, tid)["completion_receipt"] == admitted
+-- 
+2.55.0
+

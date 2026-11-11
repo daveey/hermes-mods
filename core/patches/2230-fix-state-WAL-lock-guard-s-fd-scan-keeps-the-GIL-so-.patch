@@ -1,0 +1,331 @@
+From 30b2b7262a98edbaff850dfe6f2ea2629149b462 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 10:01:06 +0000
+Subject: [PATCH] fix(state): WAL lock guard's fd scan keeps the GIL, so a busy
+ thread can't stall every board open
+
+hold() fstat-ed every process fd via os.listdir + os.fstat; each call released and re-took the GIL,
+so with one CPU-bound thread a 620-fd scan took ~1.2 s instead of 0.8 ms. Kanban board opens run it
+under the board lifecycle lock, so hub readers failed 'board busy' in bursts on all boards. Sweep
+0..FDSize-1 with libc fstat via ctypes.PyDLL (GIL held, self-checked against os.fstat, Linux
+x86_64/aarch64 only; else the old path). Worst case now ~6 ms with busy threads. [daveey]
+---
+ hermes_state_lockguard.py                     |  21 ++-
+ hermes_state_lockguard_fdscan.py              | 137 ++++++++++++++++++
+ .../test_lockguard_fd_scan_gil.py             | 114 +++++++++++++++
+ 3 files changed, 265 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_state_lockguard_fdscan.py
+ create mode 100644 tests/hermes_state/test_lockguard_fd_scan_gil.py
+
+diff --git a/hermes_state_lockguard.py b/hermes_state_lockguard.py
+index 688b9600bff..3b029ab2b03 100644
+--- a/hermes_state_lockguard.py
++++ b/hermes_state_lockguard.py
+@@ -32,6 +32,9 @@ import sys
+ import threading
+ from typing import Dict, Optional, Set, Tuple
+ 
++# Imported at load, never lazily under a lock: building its ctypes path makes releasing syscalls.
++from hermes_state_lockguard_fdscan import identity as _fd_identity, open_fd_identities
++
+ logger = logging.getLogger("hermes_state")
+ 
+ # SQLite's unix VFS lock geometry (os_unix.c): the SHARED range on the main file and the
+@@ -115,7 +118,15 @@ def _identity(path: str) -> Optional[Identity]:
+ 
+ def _own_fds_for(identities: set[Identity]):
+     """Yield ``(fd, identity)`` for every descriptor of this process on one of *identities*
+-    (SQLite's own connection descriptors; the cached header-probe fd too, harmless)."""
++    (SQLite's own connection descriptors; the cached header-probe fd too, harmless). The per-fd
++    ``fstat`` keeps the GIL (``hermes_state_lockguard_fdscan``): a GIL hand-off per descriptor made
++    this scan take seconds whenever another thread was busy."""
++    swept = open_fd_identities()
++    if swept is not None:
++        for fd, ident in swept:
++            if ident in identities:
++                yield fd, ident
++        return
+     for fd_dir in ("/proc/self/fd", "/dev/fd"):
+         try:
+             names = os.listdir(fd_dir)
+@@ -125,12 +136,8 @@ def _own_fds_for(identities: set[Identity]):
+             if not name.isdigit():
+                 continue
+             fd = int(name)
+-            try:
+-                st = os.fstat(fd)
+-            except OSError:
+-                continue
+-            ident = (st.st_dev, st.st_ino)
+-            if ident in identities:
++            ident = _fd_identity(fd)
++            if ident is not None and ident in identities:
+                 yield fd, ident
+         return
+ 
+diff --git a/hermes_state_lockguard_fdscan.py b/hermes_state_lockguard_fdscan.py
+new file mode 100644
+index 00000000000..b264da386cd
+--- /dev/null
++++ b/hermes_state_lockguard_fdscan.py
+@@ -0,0 +1,137 @@
++"""``fstat`` of many descriptors without a GIL hand-off per descriptor. [daveey]
++
++``hermes_state_lockguard.hold`` runs on every guarded SQLite open and checks every descriptor the
++process has open (hundreds in a long-lived dashboard). ``os.fstat`` releases and re-takes the GIL
++around each call. With even one CPU-bound thread in the process, every re-take waits on the
++interpreter's switch interval, so a scan that takes 0.8 ms idle took ~1.2 s. Kanban board opens hold
++the board's lifecycle lock across that scan, which made every reader on the hub time out as
++"board lifecycle is busy" in bursts across all boards.
++
++``identity(fd)`` calls libc's ``fstat`` through ``ctypes.PyDLL``, which keeps the GIL for the call,
++and reads ``(st_dev, st_ino)``, the first two 64-bit fields of glibc's ``struct stat`` on x86_64 and
++aarch64. It is armed only on Linux with those architectures, and only after it agrees with
++``os.fstat`` at import. Anywhere else, or if anything about the ctypes path fails, it is ``os.fstat``.
++"""
++
++from __future__ import annotations
++
++import os
++import platform
++import struct
++import sys
++from typing import Callable, Optional
++
++Identity = tuple[int, int]
++
++_UNPACK = struct.Struct("=QQ").unpack_from
++
++
++def _os_identity(fd: int) -> Optional[Identity]:
++    try:
++        st = os.fstat(fd)
++    except OSError:
++        return None
++    return (st.st_dev, st.st_ino)
++
++
++def _build_native() -> Optional[tuple[Callable[[int], Optional[Identity]], Callable[[], Optional[bytes]]]]:
++    if not sys.platform.startswith("linux") or platform.machine() not in ("x86_64", "aarch64"):
++        return None
++    try:
++        import ctypes
++
++        libc = ctypes.PyDLL(None)  # PyDLL: calls never release the GIL
++        fstat = libc.fstat  # glibc >= 2.33 exports fstat itself
++        fstat.argtypes = [ctypes.c_int, ctypes.c_void_p]
++        fstat.restype = ctypes.c_int
++        c_open, c_read, c_close = libc.open, libc.read, libc.close
++        c_open.argtypes, c_open.restype = [ctypes.c_char_p, ctypes.c_int], ctypes.c_int
++        c_read.argtypes, c_read.restype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t], ctypes.c_ssize_t
++        c_close.argtypes, c_close.restype = [ctypes.c_int], ctypes.c_int
++        buf = ctypes.create_string_buffer(256)  # sizeof(struct stat) is 144 (x86_64) / 128 (aarch64)
++        status_buf = ctypes.create_string_buffer(16384)
++    except (ImportError, OSError, AttributeError):  # no ctypes, no libc handle, or no fstat symbol
++        return None
++
++    def native(fd: int) -> Optional[Identity]:
++        # One shared buffer: every caller holds hermes_state_lockguard._LOCK, and fstat() plus the
++        # unpack is a single expression evaluation, so no other user of the buffer can interleave.
++        if fstat(fd, buf) != 0:
++            return None
++        return _UNPACK(buf.raw[:16])
++
++    def read_status() -> Optional[bytes]:
++        fd = c_open(b"/proc/self/status", os.O_RDONLY | os.O_CLOEXEC)
++        if fd < 0:
++            return None
++        try:
++            n = c_read(fd, status_buf, len(status_buf))  # procfs serves status in one read
++        finally:
++            c_close(fd)
++        return status_buf.raw[:n] if n > 0 else None
++
++    # Prove the struct layout on this exact runtime before trusting it.
++    probe = os.open(os.devnull, os.O_RDONLY)
++    try:
++        if native(probe) != _os_identity(probe) or native(-1) is not None or b"FDSize:" not in (read_status() or b""):
++            return None
++    except (OSError, ValueError, TypeError, struct.error, ctypes.ArgumentError):  # wrong ABI: disarm
++        return None
++    finally:
++        os.close(probe)
++    return native, read_status
++
++
++_built = _build_native()
++_native = _built[0] if _built else None
++_read_status = _built[1] if _built else None
++
++
++def identity(fd: int) -> Optional[Identity]:
++    """``(st_dev, st_ino)`` of ``fd``, or ``None`` when it is not open."""
++    if _native is not None:
++        return _native(fd)
++    return _os_identity(fd)
++
++
++def native_enabled() -> bool:
++    return _native is not None
++
++
++# Above this fd-table size a full native sweep would hold the GIL too long; use the listing instead.
++MAX_NATIVE_SWEEP = 8192
++
++
++def _fd_table_size() -> Optional[int]:
++    """``FDSize`` from ``/proc/self/status``: the fd table's allocated size, > every open fd. Read
++    through libc with the GIL held: Python's buffered ``open()`` makes several releasing syscalls."""
++    status = _read_status() if _read_status is not None else None
++    if not status:
++        return None
++    try:
++        for line in status.splitlines():
++            if line.startswith(b"FDSize:"):
++                return int(line.split()[1])
++    except (ValueError, IndexError):
++        return None
++    return None
++
++
++def open_fd_identities() -> Optional[list[tuple[int, Identity]]]:
++    """Every open ``(fd, identity)`` of this process from one GIL-held sweep, or ``None`` when that
++    is unavailable (the caller lists ``/proc/self/fd`` instead). ``os.listdir`` releases the GIL on
++    every directory entry, which cost 100+ ms for 600 descriptors with one busy thread; this sweep
++    reads ``/proc/self/status`` once, then fstats each fd number below ``FDSize`` without releasing
++    the GIL (a closed number fails at once with EBADF)."""
++    if _native is None:
++        return None
++    size = _fd_table_size()
++    if size is None or size <= 0 or size > MAX_NATIVE_SWEEP:
++        return None
++    native = _native
++    out = []
++    for fd in range(size):
++        ident = native(fd)
++        if ident is not None:
++            out.append((fd, ident))
++    return out
+diff --git a/tests/hermes_state/test_lockguard_fd_scan_gil.py b/tests/hermes_state/test_lockguard_fd_scan_gil.py
+new file mode 100644
+index 00000000000..57a8c0edd5c
+--- /dev/null
++++ b/tests/hermes_state/test_lockguard_fd_scan_gil.py
+@@ -0,0 +1,114 @@
++"""The WAL lock guard's descriptor scan never hands the GIL off per descriptor. [daveey]
++
++``hold()`` runs on every guarded SQLite open and fstat-ed every descriptor in the process. With
++``os.fstat`` each call released and re-took the GIL, so any CPU-bound thread made the scan wait out
++the switch interval once per descriptor. On the hub (628 fds, 134 threads) one Kanban board open
++held the board's lifecycle lock for over 500 ms, and readers on every board failed with "board
++lifecycle is busy" in bursts.
++"""
++
++import os
++import sys
++import threading
++import time
++
++import pytest
++
++import hermes_state_lockguard as guard
++import hermes_state_lockguard_fdscan as fdscan
++
++linux_native = pytest.mark.skipif(not fdscan.native_enabled(), reason="native fstat only on Linux x86_64/aarch64")
++
++
++@linux_native
++def test_native_identity_matches_os_fstat(tmp_path):
++    p = tmp_path / "f"
++    p.write_bytes(b"x")
++    fds = [os.open(p, os.O_RDONLY), os.open(os.devnull, os.O_RDONLY), os.open(tmp_path, os.O_RDONLY)]
++    try:
++        for fd in fds:
++            st = os.fstat(fd)
++            assert fdscan.identity(fd) == (st.st_dev, st.st_ino)
++    finally:
++        for fd in fds:
++            os.close(fd)
++    closed = os.open(os.devnull, os.O_RDONLY)
++    os.close(closed)
++    assert fdscan.identity(closed) is None
++    assert fdscan.identity(-1) is None
++
++
++def test_fallback_identity_when_native_is_off(monkeypatch, tmp_path):
++    monkeypatch.setattr(fdscan, "_native", None)
++    fd = os.open(os.devnull, os.O_RDONLY)
++    try:
++        st = os.fstat(fd)
++        assert fdscan.identity(fd) == (st.st_dev, st.st_ino)
++    finally:
++        os.close(fd)
++    assert fdscan.identity(fd) is None
++
++
++@linux_native
++def test_sweep_finds_exactly_the_listed_descriptors(tmp_path):
++    extra = [os.open(os.devnull, os.O_RDONLY) for _ in range(50)]
++    try:
++        listed = {}
++        for name in os.listdir("/proc/self/fd"):
++            ident = fdscan._os_identity(int(name))
++            if ident is not None:  # listdir's own directory fd is already closed here
++                listed[int(name)] = ident
++        swept = dict(fdscan.open_fd_identities() or [])
++        assert swept == listed
++        assert set(extra) <= set(swept)
++    finally:
++        for fd in extra:
++            os.close(fd)
++
++
++def test_oversized_fd_table_falls_back_to_the_listing(monkeypatch):
++    monkeypatch.setattr(fdscan, "_fd_table_size", lambda: fdscan.MAX_NATIVE_SWEEP + 1)
++    assert fdscan.open_fd_identities() is None
++    fd = os.open(os.devnull, os.O_RDONLY)
++    try:
++        st = os.fstat(fd)
++        assert (fd, (st.st_dev, st.st_ino)) in list(guard._own_fds_for({(st.st_dev, st.st_ino)}))
++    finally:
++        os.close(fd)
++
++
++@linux_native
++def test_own_fds_scan_stays_fast_while_another_thread_is_cpu_bound(tmp_path):
++    """Hundreds of descriptors plus one spinning thread: the scan must not wait once per fd."""
++    if (fdscan._fd_table_size() or 0) > fdscan.MAX_NATIVE_SWEEP:
++        pytest.skip("fd table already above the native sweep cap in this process")
++    target = tmp_path / "board.db"
++    target.write_bytes(b"x")
++    mine = os.open(target, os.O_RDONLY)
++    filler = [os.open(os.devnull, os.O_RDONLY) for _ in range(600)]
++    st = os.fstat(mine)
++    stop = threading.Event()
++
++    def spin():
++        while not stop.is_set():
++            sum(range(1000))
++
++    spinner = threading.Thread(target=spin, daemon=True)
++    spinner.start()
++    old = sys.getswitchinterval()
++    sys.setswitchinterval(0.005)  # CPython's default; pinned so the bound means the same everywhere
++    try:
++        worst = 0.0
++        for _ in range(3):
++            t = time.perf_counter()
++            found = list(guard._own_fds_for({(st.st_dev, st.st_ino)}))
++            worst = max(worst, time.perf_counter() - t)
++            assert (mine, (st.st_dev, st.st_ino)) in found
++    finally:
++        sys.setswitchinterval(old)
++        stop.set()
++        spinner.join(5)
++        for fd in (mine, *filler):
++            os.close(fd)
++    # Per-fd hand-off: ~600 x 5 ms = seconds. GIL-held sweep: a few switch intervals at most.
++    assert worst < 0.1, f"scan took {worst:.3f}s with one busy thread"
+-- 
+2.55.0
+

@@ -1,0 +1,343 @@
+From d993970e7ad8002d0b5afe329304e57bb153481f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:15:55 -0800
+Subject: [PATCH] fix(kanban): attribute CLI block notices to the calling agent
+ [daveey]
+
+---
+ gateway/kanban_watchers_notifier.py          |   2 +-
+ hermes_cli/kanban.py                         |   6 +-
+ hermes_cli/kanban_block_notice.py            |  15 ++-
+ hermes_cli/kanban_cli_actor.py               |  15 +++
+ hermes_cli/kanban_db.py                      |   6 +-
+ hermes_cli/kanban_human_request_migration.py |   3 +-
+ hermes_cli/kanban_origin_ledger.py           |   3 +
+ tests/hermes_cli/test_kanban_cli_actor.py    | 112 +++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py         |   2 +-
+ tui_gateway/session_notifications.py         |   2 +-
+ 10 files changed, 154 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_cli_actor.py
+ create mode 100644 tests/hermes_cli/test_kanban_cli_actor.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 421c6e7c80..2ccb859a71 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -469,7 +469,7 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
+ 
+ def _fmt_blocked(ev, n) -> tuple:
+     from hermes_cli.kanban_block_notice import block_notice
+-    body = block_notice(n.task, n.task_id, n.board_slug, reason=str(_payload(ev, "reason") or ""))
++    body = block_notice(n.task, n.task_id, n.board_slug, reason=str(_payload(ev, "reason") or ""), actor=str(_payload(ev, "actor") or ""))
+     return f"⏸ {n.head} {body}", body, None
+ 
+ 
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index ebcd5722c1..0ff11d3a07 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1392,6 +1392,7 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
+ 
+ 
+ def _cmd_block(args: argparse.Namespace) -> int:
++    from hermes_cli.kanban_cli_actor import cli_actor
+     reason = _joined_words(args.reason)
+     kind = getattr(args, "kind", None)
+     routed = _cli_route_needs("block", args, reason)
+@@ -1453,7 +1454,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
+         op = _guarded_park(conn, "block", wake, refused, _commented(
+             reason, author, "BLOCKED", lambda tid, comment: kb.block_task(
+                 conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+-                human_request=request, awaiting=awaiting, comment=comment,
++                human_request=request, awaiting=awaiting, comment=comment, actor=cli_actor(),
+                 wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
+             awaiting=awaiting, reason=reason, kind=kind)
+         return _bulk_apply(ids, op, ok_msg, lambda tid: refused.get(tid) or f"cannot block {tid}")
+@@ -1489,6 +1490,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+ 
+ 
+ def _cmd_unblock(args: argparse.Namespace) -> int:
++    from hermes_cli.kanban_cli_actor import cli_actor
+     if os.environ.get("HERMES_KANBAN_TASK"):
+         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
+     ids, rc = _require_ids(args, _REASON_FLAG_HINT)
+@@ -1501,7 +1503,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
+         rc = _ids_error(ids, _REASON_FLAG_HINT, conn)
+         if rc:
+             return rc
+-        op = _commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(conn, tid, comment=comment))
++        op = _commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(conn, tid, comment=comment, event_extra={"actor": cli_actor()}))
+         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
+                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+ 
+diff --git a/hermes_cli/kanban_block_notice.py b/hermes_cli/kanban_block_notice.py
+index 27515b6144..8414a86a31 100644
+--- a/hermes_cli/kanban_block_notice.py
++++ b/hermes_cli/kanban_block_notice.py
+@@ -4,7 +4,16 @@ import json
+ from hermes_cli.kanban_human_request import needs_human
+ 
+ 
+-def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: str = "") -> str:
++def blocked_actor_fields(conn, task_id: str) -> dict:
++    """Publish audit provenance with a remote blocked card, not its human action owner."""
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
++                       (task_id,)).fetchone()
++    payload = json.loads(row[0] or "{}") if row else {}
++    actor = payload.get("actor")
++    return {"block_actor": actor} if isinstance(actor, str) and actor else {}
++
++
++def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: str = "", actor: str = "") -> str:
+     """Use current card evidence, never event prose, to assign a human action.
+ 
+     Links open the existing task flow; this function grants no authority and
+@@ -24,13 +33,13 @@ def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: s
+         except ValueError:
+             request = None
+     if status in {"blocked", "triage"} and isinstance(request, dict) and needs_human(request, kind=get("block_kind")):
+-        lines = ["blocked — actor: user", f"Next action for the user: {request['action']}",
++        lines = [f"blocked — actor: {actor or 'user'}", f"Next action for the user: {request['action']}",
+                  f"Why only the user: {request['why_human']}", f"Scope: {request['scope']}",
+                  f"Open task: {link}"]
+         if request["interaction"] == "user_terminal":
+             lines.append("Use the owner Desktop session's user-terminal flow; opening this task or unblocking it does not execute a command or grant terminal authority.")
+         return "\n".join(lines)
+     owner = get("assignee") or "assigned agent"
+-    return (f"blocked — actor: agent ({owner}); no actionable human request recorded.\n"
++    return (f"blocked — actor: {actor or f'agent ({owner})'}; no actionable human request recorded.\n"
+             "Next action: the agent must resolve the execution/dependency failure or prepare a concrete human action with evidence.\n"
+             f"Reason: {reason or get('block_kind') or 'block details missing'}\nOpen task: {link}")
+diff --git a/hermes_cli/kanban_cli_actor.py b/hermes_cli/kanban_cli_actor.py
+new file mode 100644
+index 0000000000..43bf8ed867
+--- /dev/null
++++ b/hermes_cli/kanban_cli_actor.py
+@@ -0,0 +1,15 @@
++"""Audit-only identity for CLI lifecycle calls; never an authorization signal."""
++import os
++
++
++def cli_actor() -> str:
++    """Distinguish a tool subprocess from a human shell without guessing from profile."""
++    from hermes_cli import kanban
++
++    session = (os.environ.get("HERMES_SESSION_KEY") or os.environ.get("HERMES_SESSION_ID") or "").strip()
++    if session:
++        return f"agent (chat {session})"
++    worker = os.environ.get("HERMES_KANBAN_WORKER_TASK") or os.environ.get("HERMES_KANBAN_TASK")
++    if worker:
++        return f"agent (task {worker})"
++    return "agent" if kanban._agent_invoked() else "user"
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e8deee76b7..df9ea040ef 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3004,7 +3004,7 @@ def block_task(
+     human_request: Optional[dict] = None, awaiting: Any = None, clear_blocker: bool = False,
+     comment: Optional[tuple[str, str]] = None, goal_rejection=None,
+     blocker_provider: Optional[str] = None, blocker_model: Optional[str] = None,
+-    blocker_lane: Optional[str] = None,
++    blocker_lane: Optional[str] = None, actor: Optional[str] = None,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+     :func:`kanban_block_routing.route_block`). A wait on time -- ``kind='time'``, a ``dependency``
+@@ -3096,7 +3096,7 @@ def block_task(
+                 return False
+             sync_row(conn, task_id)
+             payload = {"kind": kind, "reason": reason, "classified_in_place": True,
+-                       "human_request": human_request, **filing_fields(conn, human_request), **run_meta}
++                       "human_request": human_request, **filing_fields(conn, human_request), **run_meta, **({"actor": actor} if actor else {})}
+             if requested_kind == "assignment":
+                 payload.update(requested_kind=requested_kind, rekind_reason=rekind_reason)
+             if kind == "assignment":
+@@ -3171,7 +3171,7 @@ def block_task(
+         ):
+             return False
+         store_request(conn, task_id, human_request)
+-        payload.update(human_request=human_request, **(filing_fields(conn, human_request) if new_status == "blocked" else {}))
++        payload.update(human_request=human_request, **({"actor": actor} if actor else {}), **(filing_fields(conn, human_request) if new_status == "blocked" else {}))
+         from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
+         payload.update(run_meta)
+         if clear_blocker:
+diff --git a/hermes_cli/kanban_human_request_migration.py b/hermes_cli/kanban_human_request_migration.py
+index d7250c12dd..683beb0f46 100644
+--- a/hermes_cli/kanban_human_request_migration.py
++++ b/hermes_cli/kanban_human_request_migration.py
+@@ -45,6 +45,7 @@ def classify_parked_request(conn, task_id: str, *, human_request: dict | None,
+ def classify_cli_request(args, request, reason):
+     """Explicit CLI metadata-only mode, separate from the block lifecycle."""
+     from hermes_cli import kanban as cli
++    from hermes_cli.kanban_cli_actor import cli_actor
+ 
+     if not hasattr(args, "human_request") or not reason:
+         raise ValueError("metadata-only requires --human-request and a reason")
+@@ -54,6 +55,6 @@ def classify_cli_request(args, request, reason):
+         return cli._bulk_apply(
+             cli._bulk_ids(args),
+             lambda tid: classify_parked_request(conn, tid, human_request=request,
+-                                               actor=cli._profile_author(), reason=reason),
++                                               actor=cli_actor(), reason=reason),
+             lambda tid: f"Classified {tid} (metadata only; remains parked)",
+             lambda tid: f"cannot classify {tid} (requires parked card without a current run)")
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 6a716ca12a..8704248ea6 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -221,6 +221,9 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+             legacy = bool(legacy and contract_ok)
+             verified = legacy
+     payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    if row[0] == 'blocked':
++        from hermes_cli.kanban_block_notice import blocked_actor_fields
++        payload.update(blocked_actor_fields(conn, task['id']))
+     # Only post-rollout events opt in: do not replay the replica's historical done-card inventory.
+     if terminal and event and json.loads(event[3] or '{}').get('notice_version') == 1:
+         payload['completion_notice'] = {'event_id': event[0], 'created_at': event[2],
+diff --git a/tests/hermes_cli/test_kanban_cli_actor.py b/tests/hermes_cli/test_kanban_cli_actor.py
+new file mode 100644
+index 0000000000..7852c319d1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_cli_actor.py
+@@ -0,0 +1,112 @@
++"""CLI audit actor is the caller, not the recipient of a human request."""
++import argparse
++import json
++import os
++
++import pytest
++
++from hermes_cli import kanban, kanban_db as db
++from hermes_cli.kanban_db_connect import connect_closing
++from hermes_cli.kanban_parser import build_parser
++from tui_gateway.session_notifications import _format_kanban_event_text
++
++REQUEST = dict(action="Choose A. Unblock = proceed; archive = abandon.",
++               why_human="Owner decision", interaction="reply", scope="Fixture", evidence="Fixture decision")
++
++
++def cli(*args):
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    return kanban.kanban_command(parser.parse_args(["kanban", *args]))
++
++
++@pytest.fixture(autouse=True)
++def isolated_actor(monkeypatch):
++    for key in (*kanban._AGENT_ENV_MARKERS, "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(key, raising=False)
++    assert not os.environ.get("HERMES_KANBAN_TASK")
++
++
++@pytest.mark.parametrize("marker", [None, "HERMES_SESSION_ID", "HERMES_SESSION_KEY", "HERMES_KANBAN_WORKER_TASK",
++                                    "HERMES_RPC_SOCKET", "HERMES_KERNEL_SENTINEL", "HERMES_SESSION_SOURCE"])
++@pytest.mark.parametrize("metadata_only", [False, True])
++def test_cli_block_actor_and_notice(monkeypatch, marker, metadata_only):
++    if marker:
++        monkeypatch.setenv(marker, "fixture-chat-123")
++    with connect_closing() as conn:
++        tid = db.create_task(conn, title="Actor fixture", assignee="owner",
++                             initial_status="blocked" if metadata_only else "running", lint_blocked=False)
++    flags = ["--metadata-only"] if metadata_only else ["--kind", "needs_input"]
++    assert cli("block", tid, "Fixture decision", *flags, "--human-request", json.dumps(REQUEST)) == 0
++    with connect_closing() as conn:
++        event = db.list_events(conn, tid)[-1]
++        task = db.get_task(conn, tid)
++    actor = event.payload["actor"]
++    assert actor.startswith("agent") if marker else actor == "user"
++    if marker in {"HERMES_SESSION_ID", "HERMES_SESSION_KEY"}:
++        assert "chat fixture-chat-123" in actor
++    text = _format_kanban_event_text({"task_id": tid}, task, event, "default")
++    assert f"actor: {actor}" in text
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++    from tui_gateway.kanban_remote_notices import format_notice
++    with connect_closing() as conn, db.write_txn(conn):
++        projected = observe_owner_task(conn, {"id": tid, "status": "blocked", "human_request": REQUEST}, now=0)
++    remote = format_notice("other-host", "default/" + tid, projected)
++    assert f"actor: {actor}" in remote
++    assert "Next action for the user:" in text
++    if marker:
++        assert "actor: user" not in text
++    assert cli("unblock", tid) == 0
++    with connect_closing() as conn:
++        assert db.list_events(conn, tid)[-1].payload["actor"] == actor
++
++
++def test_human_cli_notice_control():
++    """This existing behavior also passes on the unpatched baseline."""
++    with connect_closing() as conn:
++        tid = db.create_task(conn, title="Human fixture", assignee="owner")
++    assert cli("block", tid, "Fixture", "--kind", "needs_input", "--human-request", json.dumps(REQUEST)) == 0
++    with connect_closing() as conn:
++        text = _format_kanban_event_text({"task_id": tid}, db.get_task(conn, tid), db.list_events(conn, tid)[-1], "default")
++    assert "actor: user" in text
++
++
++def test_untyped_classification_and_gateway_actor(monkeypatch):
++    from types import SimpleNamespace
++    from gateway.kanban_watchers_notifier import _fmt_blocked
++    monkeypatch.setenv("HERMES_SESSION_ID", "actor-chat")
++    with connect_closing() as conn:
++        tid = db.create_task(conn, title="Untyped fixture", assignee="owner", initial_status="blocked", lint_blocked=False)
++    assert cli("block", tid, "Fixture", "--kind", "needs_input", "--human-request", json.dumps(REQUEST)) == 0
++    with connect_closing() as conn:
++        event = db.list_events(conn, tid)[-1]
++        task = db.get_task(conn, tid)
++    assert event.payload["actor"] == "agent (chat actor-chat)"
++    text, wake, _ = _fmt_blocked(event, SimpleNamespace(task=task, task_id=tid, board_slug="default", head=tid))
++    assert "actor: agent (chat actor-chat)" in text
++    assert "actor: agent (chat actor-chat)" in wake
++
++
++def test_actor_session_precedence_and_worker_marker(monkeypatch):
++    from hermes_cli.kanban_cli_actor import cli_actor
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "assigned-task")
++    assert cli_actor() == "agent (task assigned-task)"
++    monkeypatch.setenv("HERMES_SESSION_ID", "fallback-chat")
++    assert cli_actor() == "agent (chat fallback-chat)"
++    monkeypatch.setenv("HERMES_SESSION_KEY", "desktop-chat")
++    assert cli_actor() == "agent (chat desktop-chat)"
++
++
++@pytest.mark.parametrize("actor", [None, "", 123, "user", "agent (chat test)"])
++def test_remote_actor_is_optional_audit_field(actor):
++    from hermes_cli.kanban_block_notice import blocked_actor_fields, block_notice
++    with connect_closing() as conn:
++        tid = db.create_task(conn, title="Audit fixture", assignee="owner")
++        assert blocked_actor_fields(conn, tid) == {}
++        db._append_event(conn, tid, "blocked", {"actor": actor})
++        fields = blocked_actor_fields(conn, tid)
++    assert fields == ({"block_actor": actor} if isinstance(actor, str) and actor else {})
++    if isinstance(actor, str) and actor:
++        text = block_notice({"status": "blocked", "assignee": "owner"}, tid, "default", actor=actor)
++        assert f"actor: {actor}" in text
++        assert "Next action: the agent" in text
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 1ced02137b..75910b65e1 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -221,7 +221,7 @@ def format_notice(gw: str, key: str, task: dict) -> str:
+         return f"✔ {prefix}Kanban {tid} done — {title}{handoff}\n(ran on {gw}; read it with cross_task @task:{board}@{gw}/{tid})"
+     reason = run.get("summary") or task.get("block_kind") or ""
+     from hermes_cli.kanban_block_notice import block_notice
+-    return f"⏸ {prefix}Kanban {tid} " + block_notice(task, tid, board, gateway=gw, reason=str(reason))
++    return f"⏸ {prefix}Kanban {tid} " + block_notice(task, tid, board, gateway=gw, reason=str(reason), actor=str(task.get("block_actor") or ""))
+ 
+ 
+ def _event_key(owner: str, key: str, notice: dict) -> str:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index e17a205854..b505a2b98e 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -645,7 +645,7 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
+     payload = getattr(ev, "payload", None) or {}
+     if getattr(ev, "kind", "") == "blocked":
+         from hermes_cli.kanban_block_notice import block_notice
+-        return f"{prefix}Kanban {task_id} " + block_notice(task, task_id, board_slug, reason=str(payload.get("reason") or ""))
++        return f"{prefix}Kanban {task_id} " + block_notice(task, task_id, board_slug, reason=str(payload.get("reason") or ""), actor=str(payload.get("actor") or ""))
+     if getattr(ev, "kind", "") == "completed":
+         # A worker refused a send into this chat put its message in the summary as a FINAL SEND line. [daveey]
+         from hermes_cli.kanban_final_send import final_send_for_chat
+-- 
+2.55.0
+

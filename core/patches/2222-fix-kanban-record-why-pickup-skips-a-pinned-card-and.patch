@@ -1,0 +1,1002 @@
+From 642cde75fa10757d5fcc3fd2a83b034a27a6e891 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:33:29 +0000
+Subject: [PATCH] fix(kanban): record why pickup skips a pinned card and open
+ repair work when it stalls [daveey]
+
+A ready card pinned runs_on=[machine:<host>] that the host never imported raised no
+alert and left no evidence of why (t_01a1c81a5323b6d1 waited 23 min on the hub,
+2026-11-11; cause undetermined, t_01a1c9097f6a94bc).
+
+Evidence: pickup() now records, for every candidate pinned to this machine that a
+pass does not import, the reason (budget_exhausted, profile_ineligible,
+capability_missing, parents_incomplete, hold, other) with first/last time and a pass
+count, one row per (card, reason) in the machine-local kanban_pickup_skips table
+(refreshed at most every 60 s unless the reason changes; pruned after 7 d, capped
+at 2000 rows). A tick with no spawn slot, where pickup never ran, records why
+through the new worker_pickup_capped seam. budget_exhausted is recorded only for
+cards a slot would start, so a refusal is never hidden behind a full queue.
+kanban_show of the replica card returns pickup_skip; `hermes kanban show` names it
+on not-found.
+
+Detector (kanban_pickup_stall.sweep, every non-dry tick before the spawn cap via
+the parent-unclaimed sweep): a card ready in the full replica, pinned to this
+machine, created elsewhere, unleased, not imported, ready longer than
+kanban.sync.pickup_stall_seconds (default 600) gets ONE agent repair card on this
+host carrying the last skip reason; an open one, or one closed under an hour ago,
+is reused. Host-wide causes (budget_exhausted, a registry hold, an unreadable
+registry) share ONE per-host card naming the oldest, at priority -1 so it never
+takes the slot the cards wait for; none while dispatch is paused (a drain writes
+no fresh evidence). No Inbox post, no human_request.
+
+Proof: tests/hermes_cli/test_kanban_pickup_stall.py (27). RED before the fix: the
+601 s case files 0 repair cards (ValueError: expected 1, got 0). Neighbouring
+suites (68 files, 1050 tests) green. Mutants on the live-import check, capped
+reason split, open-repair filter and record dedupe each fail a test.
+---
+ hermes_cli/kanban.py                         |  15 +-
+ hermes_cli/kanban_cli_triage_lines.py        |  12 +
+ hermes_cli/kanban_db_dispatch.py             |   2 +-
+ hermes_cli/kanban_db_sync.py                 |  13 +
+ hermes_cli/kanban_parent_unclaimed.py        |   2 +
+ hermes_cli/kanban_pickup_stall.py            | 286 ++++++++++++++++
+ hermes_cli/kanban_worker_node.py             | 153 +++++++--
+ tests/hermes_cli/test_kanban_pickup_stall.py | 343 +++++++++++++++++++
+ tools/kanban_show.py                         |   3 +
+ 9 files changed, 783 insertions(+), 46 deletions(-)
+ create mode 100644 hermes_cli/kanban_cli_triage_lines.py
+ create mode 100644 hermes_cli/kanban_pickup_stall.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_stall.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index ec00b034cfd..73f7ad54422 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -28,6 +28,7 @@ from hermes_cli import kanban_swarm as ks
+ from hermes_cli import kanban_workflow
+ from hermes_cli import kanban_contract_cli as _contract_cli
+ from hermes_cli import kanban_foreign_card as _foreign_card
++from hermes_cli.kanban_cli_triage_lines import _decompose_ok_line, _retitled_suffix
+ from hermes_cli.kanban_output import (
+     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
+     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
+@@ -756,7 +757,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+     with kbc.connect_closing() as conn:
+         task = kb.get_task(conn, args.task_id)
+         if not task:
+-            return _err(f"no such task: {args.task_id}")
++            from hermes_cli.kanban_pickup_stall import not_here_note
++            return _err(f"no such task: {args.task_id}{not_here_note(conn, args.task_id)}")
+         comments = kb.list_comments(conn, args.task_id)
+         events = kb.list_events(conn, args.task_id)
+         parents = kb.parent_ids(conn, args.task_id)
+@@ -1836,10 +1838,6 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
+     return 0 if (ok_count > 0 or not ids) else 1
+ 
+ 
+-def _retitled_suffix(outcome) -> str:
+-    return f" — retitled: {outcome.new_title!r}" if outcome.new_title else ""
+-
+-
+ def _cmd_specify(args: argparse.Namespace) -> int:
+     """Spec a triage task (or all) via the auxiliary LLM, promote to todo."""
+     from hermes_cli import kanban_specify as spec
+@@ -1849,13 +1847,6 @@ def _cmd_specify(args: argparse.Namespace) -> int:
+                              lambda o: f"Specified {o.task_id} → todo{_retitled_suffix(o)}")
+ 
+ 
+-def _decompose_ok_line(o) -> str:
+-    if o.fanout and o.child_ids:
+-        return (f"Decomposed {o.task_id} → {len(o.child_ids)} "
+-                f"children ({', '.join(o.child_ids)}); root promoted to todo")
+-    return f"Specified {o.task_id} → todo (no fanout){_retitled_suffix(o)}"
+-
+-
+ def _cmd_decompose(args: argparse.Namespace) -> int:
+     """Fan a triage task (or all) out into child tasks via the auxiliary LLM."""
+     from hermes_cli import kanban_decompose as decomp
+diff --git a/hermes_cli/kanban_cli_triage_lines.py b/hermes_cli/kanban_cli_triage_lines.py
+new file mode 100644
+index 00000000000..7e93b85ce15
+--- /dev/null
++++ b/hermes_cli/kanban_cli_triage_lines.py
+@@ -0,0 +1,12 @@
++"""Result-line formatters for `kanban specify` / `kanban decompose` (moved out of the facade)."""
++
++
++def _retitled_suffix(outcome) -> str:
++    return f" — retitled: {outcome.new_title!r}" if outcome.new_title else ""
++
++
++def _decompose_ok_line(o) -> str:
++    if o.fanout and o.child_ids:
++        return (f"Decomposed {o.task_id} → {len(o.child_ids)} "
++                f"children ({', '.join(o.child_ids)}); root promoted to todo")
++    return f"Specified {o.task_id} → todo (no fanout){_retitled_suffix(o)}"
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 977262abcf0..9d0cf68c292 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2427,7 +2427,7 @@ def _dispatch_once_locked(
+     may_spawn, spawn_budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
+                                                  board=board)
+     if not may_spawn:
+-        return result
++        return _kb._sync.worker_pickup_capped(conn, result, dry_run, _profile_exists_fn)  # record why cards wait
+ 
+     result.scheduling_admitted = not dry_run
+     if not dry_run:
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 421b867ce01..ed728981cae 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1053,6 +1053,19 @@ def worker_pickup(conn: sqlite3.Connection, budget: Optional[int], dry_run: bool
+         _log.warning("kanban: worker-node pickup failed", exc_info=True)
+ 
+ 
++def worker_pickup_capped(conn: sqlite3.Connection, result: Any, dry_run: bool, profile_exists_fn: Any) -> Any:
++    """Dispatcher seam for a tick with no spawn slot: pickup does not run, so record why the cards pinned to this
++    machine wait (``budget_exhausted`` for the ones a slot would start; ``kanban_pickup_stall``). Returns ``result``."""
++    if dry_run or board_mode(conn) != "primary":
++        return result
++    from hermes_cli import kanban_worker_node as wn
++    try:
++        wn.note_capped(conn, profile_exists_fn())
++    except Exception:  # health: allow BLE001 -- pickup evidence must not stop the tick
++        _log.warning("kanban: worker-node capped pickup note failed", exc_info=True)
++    return result
++
++
+ def run_uid(conn: sqlite3.Connection, run_id: Optional[int]) -> Optional[str]:
+     if run_id is None or board_mode(conn) == "off":
+         return None
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 543f3534c4a..15401d7ea63 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -125,6 +125,8 @@ def safe_sweep(conn) -> int:
+     except Exception:  # health: allow BLE001 -- a notice failure must never stop dispatch
+         _log.warning("kanban dispatcher: parent-unclaimed notice sweep failed", exc_info=True)
+         posted = 0
++    from hermes_cli import kanban_pickup_stall
++    kanban_pickup_stall.safe_sweep(conn)  # pinned foreign cards this worker node has not picked up [daveey]
+     return posted + kanban_chat_wait.safe_sweep(conn)
+ 
+ 
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+new file mode 100644
+index 00000000000..df5ea56462b
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -0,0 +1,286 @@
++"""Pickup evidence and the stalled-pickup detector for worker nodes (``kanban.sync.pickup``). [daveey]
++
++t_01a1c9097f6a94bc (2026-11-11): t_01a1c81a5323b6d1 was ready on the Board, pinned ``runs_on=[machine:hub]``, for
++23 min while the hub neither imported nor claimed it. Its child waited, nothing alerted, and the cause could not be
++read back: pickup kept no record of why a pass skipped a candidate.
++
++* Evidence: every pickup pass (and every dispatcher tick that has no spawn budget, where pickup does not run) records
++  for each candidate pinned ``machine:<this host>`` that it did not import, ONE row per (card, reason) in the
++  machine-local ``kanban_pickup_skips`` table (not synced; first/last seen, pass count, detail). Rows are rewritten at
++  most every :data:`REFRESH_SECONDS` unless the reason changed, pruned after :data:`RETENTION_SECONDS` and capped at
++  :data:`MAX_ROWS`. ``kanban_show`` of the card on this host returns the latest as ``pickup_skip``.
++* Detector (:func:`sweep`, every non-dry dispatcher tick before the spawn cap): a card ``ready`` in this host's full
++  replica, pinned ``machine:<this host>``, created elsewhere, with no live lease and not imported here, whose
++  ``ready_since`` is older than ``kanban.sync.pickup_stall_seconds`` (default 600) gets ONE agent repair card on this
++  host (an open one, or one closed less than :data:`REPLACE_AFTER_SECONDS` ago, is reused). Host-wide causes share
++  ONE card per host naming the oldest card: ``budget_exhausted`` (the queue is simply full), ``hold`` and an
++  unreadable machine registry. ``budget_exhausted`` is recorded only for a card a slot would have started, so a
++  refusal is never hidden behind a full queue. No Inbox post, no human ask.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any, Mapping, Optional
++
++_log = logging.getLogger(__name__)
++
++TABLE = "kanban_pickup_skips"
++REASONS = ("budget_exhausted", "profile_ineligible", "capability_missing", "parents_incomplete", "hold", "other")
++DEFAULT_STALL_SECONDS = 600
++REFRESH_SECONDS = 60
++RETENTION_SECONDS = 7 * 86400
++MAX_ROWS = 2000
++REPLACE_AFTER_SECONDS = 3600
++DETECTOR = "pickup-stall-detector"
++KEY_PREFIX = "pickup-stall:"
++QUEUE_FULL = "queue-full"
++
++
++def _now_ms(now: Optional[float] = None) -> int:
++    return int((time.time() if now is None else now) * 1000)
++
++
++def _has_table(conn) -> bool:
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (TABLE,)).fetchone() is not None
++
++
++def record(conn, skips: Mapping[str, tuple[str, Optional[str]]], *, now: Optional[float] = None) -> int:
++    """Record ``{task_id: (reason, detail)}`` from one pass; returns rows written. A (card, reason) already recorded
++    is refreshed only when it is not the card's latest reason or :data:`REFRESH_SECONDS` passed, so a busy tick loop
++    writes nothing most ticks."""
++    if not skips:
++        return 0
++    from hermes_cli.kanban_db_connect import write_txn
++    at = _now_ms(now)
++    have: dict[str, dict[str, int]] = {}
++    if _has_table(conn):
++        marks = ",".join("?" * len(skips))
++        for row in conn.execute(f"SELECT task_id, reason, last_at FROM {TABLE} WHERE task_id IN ({marks})",
++                                tuple(skips)):
++            have.setdefault(row[0], {})[row[1]] = int(row[2])
++    todo = []
++    for tid, (reason, detail) in skips.items():
++        reason = reason if reason in REASONS else "other"
++        mine = have.get(tid, {})
++        newest = max(mine, key=lambda r: mine[r]) if mine else None
++        if newest == reason and at - mine[reason] < REFRESH_SECONDS * 1000:
++            continue
++        todo.append((tid, reason, str(detail)[:200] if detail else None))
++    if not todo:
++        return 0
++    with write_txn(conn):
++        conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (task_id TEXT NOT NULL, reason TEXT NOT NULL, "
++                     "detail TEXT, first_at INTEGER NOT NULL, last_at INTEGER NOT NULL, "
++                     "passes INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (task_id, reason))")
++        for tid, reason, detail in todo:
++            # Strictly after the card's other rows: a reason recorded in the same millisecond is still the latest.
++            ms = max(at, int(conn.execute(f"SELECT COALESCE(MAX(last_at), 0) + 1 FROM {TABLE} WHERE task_id = ? "
++                                          "AND reason != ?", (tid, reason)).fetchone()[0]))
++            conn.execute(
++                f"INSERT INTO {TABLE} (task_id, reason, detail, first_at, last_at) VALUES (?, ?, ?, ?, ?) "
++                "ON CONFLICT (task_id, reason) DO UPDATE SET detail = excluded.detail, "
++                "last_at = excluded.last_at, passes = passes + 1", (tid, reason, detail, ms, ms))
++    return len(todo)
++
++
++def latest(conn, task_id: str) -> Optional[dict[str, Any]]:
++    """This host's latest recorded pickup skip for ``task_id`` (``reason``, ``detail``, ``first_at``/``last_at`` ms,
++    ``passes``), or None."""
++    if not _has_table(conn):
++        return None
++    row = conn.execute(f"SELECT reason, detail, first_at, last_at, passes FROM {TABLE} WHERE task_id = ? "
++                       "ORDER BY last_at DESC LIMIT 1", (task_id,)).fetchone()
++    return None if row is None else dict(zip(("reason", "detail", "first_at", "last_at", "passes"), tuple(row)))
++
++
++def _stamp(ms: int) -> str:
++    from datetime import UTC, datetime
++    return datetime.fromtimestamp(int(ms) / 1000, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def describe(skip: Optional[Mapping[str, Any]]) -> str:
++    if not skip:
++        return "none recorded (no pickup pass on this host evaluated the card)"
++    detail = f" ({skip['detail']})" if skip.get("detail") else ""
++    return (f"{skip['reason']}{detail}, first {_stamp(skip['first_at'])}, last {_stamp(skip['last_at'])}, "
++            f"{skip['passes']} pass(es)")
++
++
++def not_here_note(conn, task_id: str) -> str:
++    """Suffix for ``hermes kanban show``'s not-found line when pickup skipped the card on this host."""
++    try:
++        skip = latest(conn, task_id)
++    except Exception:  # health: allow BLE001 -- an advisory note must never fail the read
++        return ""
++    return f" (not imported here; last pickup skip: {describe(skip)})" if skip else ""
++
++
++def _prune(conn, now_ms: int) -> None:
++    if not _has_table(conn):
++        return
++    floor = now_ms - RETENTION_SECONDS * 1000
++    count = conn.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0]
++    stale = conn.execute(f"SELECT 1 FROM {TABLE} WHERE last_at < ? LIMIT 1", (floor,)).fetchone()
++    if not stale and count <= MAX_ROWS:
++        return
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute(f"DELETE FROM {TABLE} WHERE last_at < ?", (floor,))
++        conn.execute(f"DELETE FROM {TABLE} WHERE rowid NOT IN (SELECT rowid FROM {TABLE} "
++                     "ORDER BY last_at DESC LIMIT ?)", (MAX_ROWS,))
++
++
++def stall_seconds() -> int:
++    """``kanban.sync.pickup_stall_seconds`` (default :data:`DEFAULT_STALL_SECONDS`)."""
++    from hermes_cli import kanban_db_sync as sync
++    value = sync.sync_config().get("pickup_stall_seconds")
++    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
++        return DEFAULT_STALL_SECONDS
++    return int(value)
++
++
++def stalled(conn, replica, own: str, *, now: Optional[float] = None) -> list[dict[str, Any]]:
++    """Cards ready in ``replica``, pinned ``machine:<own>``, created elsewhere, unleased, not in the live file,
++    ready longer than :func:`stall_seconds`; oldest first."""
++    from hermes_cli import kanban_worker_node as wn
++    now_ms = _now_ms(now)
++    limit_ms = stall_seconds() * 1000
++    out = []
++    for row in wn.pinned_rows(replica, own, now_ms=now_ms, statuses=("ready",)):
++        since = row["ready_since"] if row["ready_since"] is not None else int(row["created_at"] or 0) * 1000
++        if now_ms - int(since) <= limit_ms:
++            continue
++        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (row["id"],)).fetchone():
++            continue
++        out.append({"id": row["id"], "title": row["title"], "tenant": row["tenant"], "since_ms": int(since),
++                    "skip": latest(conn, row["id"])})
++    out.sort(key=lambda c: (c["since_ms"], c["id"]))
++    return out
++
++
++def _covering_repair(conn, key: str, now_ms: int) -> Optional[str]:
++    """The repair already covering ``key``: an open one, or one closed less than :data:`REPLACE_AFTER_SECONDS` ago
++    (so an agent that finished one is not handed the same card on the next tick)."""
++    row = conn.execute("SELECT id, status, COALESCE(completed_at, created_at) AS closed FROM tasks "
++                       "WHERE idempotency_key >= ? AND idempotency_key < ? "
++                       "ORDER BY created_at DESC, id DESC LIMIT 1", (key, key + "\U0010ffff")).fetchone()
++    if row is None:
++        return None
++    if row["status"] not in ("done", "archived"):
++        return row["id"]
++    return row["id"] if now_ms - int(row["closed"] or 0) * 1000 < REPLACE_AFTER_SECONDS * 1000 else None
++
++
++def _minutes(since_ms: int, now_ms: int) -> int:
++    return max(0, (now_ms - since_ms) // 60000)
++
++
++_TAIL = ("\n\nOn this host: `kanban_show <card>` returns its `pickup_skip`; the replica is "
++         "`~/.hermes/kanban/sync-shadow/<board>.db`; the Board row via "
++         "`Hub(load_identity()).row_evidence(<board>, 'tasks', <card>)`. Check `kanban.sync.pickup`, the machine "
++         "registry entry (labels, hold, pickup), profiles, capabilities and dispatcher capacity, fix the cause "
++         "(or re-place the card on a machine that can run it), and verify the card is imported and claimed. Do not "
++         "claim a cause the recorded evidence does not show, and never lift a registry hold you did not set. This "
++         "is agent-owned repair, not a human decision.")
++
++
++def _create(conn, *, key: str, title: str, body: str, tenant: Optional[str], own: str, now_ms: int,
++            priority: int = 0) -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_triage_sweep import _supervisor_profile
++    existing = _covering_repair(conn, key, now_ms)
++    if existing:
++        return existing
++    # A repair closed long ago is replaced, so the key carries the creation time (create_task returns any
++    # non-archived task with an equal key, done ones included).
++    return kb.create_task(conn, title=title, body=body + _TAIL, assignee=_supervisor_profile(), created_by=DETECTOR,
++                          workspace_kind="scratch", tenant=tenant, requires=["terminal", "file", "kanban"],
++                          idempotency_key=f"{key}{_now_ms()}", runs_on=[f"machine:{own}"], priority=priority)
++
++
++# Host-wide causes: one card per host, never one per pinned card. ``hold`` is an operator's deliberate state.
++_HOST_GROUPS = {
++    "budget_exhausted": (QUEUE_FULL, "Pickup queue full on {own}",
++                         "the last pickup skip of each is budget_exhausted (no spawn slot on this host). Decide "
++                         "whether the queue drains on its own (running cards near done) or work must move to a "
++                         "machine with slots."),
++    "hold": ("hold", "Pickup held on {own}",
++             "this machine is on hold in the machine registry, so it takes no Board work. An operator set that on "
++             "purpose: do not lift it; re-place cards that cannot wait for the hold to end."),
++    "registry": ("registry", "Pickup blind on {own}: machine registry unavailable",
++                 "the machine registry could not be read, so pickup copies nothing. Restore registry access "
++                 "(Board identity, network) and confirm the next pass imports the cards."),
++}
++
++
++def _group(card: Mapping[str, Any]) -> Optional[str]:
++    skip = card["skip"] or {}
++    if skip.get("reason") == "other" and skip.get("detail") == "machine registry unavailable":
++        return "registry"
++    return skip.get("reason") if skip.get("reason") in ("budget_exhausted", "hold") else None
++
++
++def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[float] = None) -> list[str]:
++    """One repair per stalled card with a card-specific last reason; one per host per host-wide cause
++    (:data:`_HOST_GROUPS`), naming the oldest card. Returns the covering repair ids."""
++    now_ms = _now_ms(now)
++    ids: list[str] = []
++    groups: dict[str, list[dict[str, Any]]] = {}
++    for card in cards:
++        group = _group(card)
++        if group is not None:
++            groups.setdefault(group, []).append(card)
++            continue
++        reason = (card["skip"] or {}).get("reason") or "none recorded"
++        waited = _minutes(card["since_ms"], now_ms)
++        ids.append(_create(
++            conn, key=f"{KEY_PREFIX}{own}:{card['id']}:", tenant=card["tenant"], own=own, now_ms=now_ms,
++            title=f"Pickup stalled: {card['id']} pinned to machine:{own}, ready {waited} min, not imported ({reason})",
++            body=(f"Card {card['id']} ({card['title']}) has been ready on the Board, pinned to machine:{own}, "
++                  f"for {waited} min (threshold {stall_seconds()} s) and this host has not imported or claimed "
++                  f"it.\n\nLast recorded pickup skip: {describe(card['skip'])}.")))
++    for group, members in groups.items():
++        slug, title, why = _HOST_GROUPS[group]
++        oldest = members[0]
++        listed = "\n".join(f"- {c['id']} ({c['title']}), ready {_minutes(c['since_ms'], now_ms)} min"
++                           for c in members[:20])
++        # Below ordinary work: a host-wide repair must not take the slot the cards it reports on are waiting for.
++        ids.append(_create(
++            conn, key=f"{KEY_PREFIX}{own}:{slug}:", tenant=oldest["tenant"], own=own, now_ms=now_ms, priority=-1,
++            title=(title.format(own=own) + f": oldest {oldest['id']} waiting "
++                   f"{_minutes(oldest['since_ms'], now_ms)} min ({len(members)} pinned card(s))"),
++            body=(f"{len(members)} card(s) pinned to machine:{own} have waited past {stall_seconds()} s, and {why}"
++                  f"\n\nOldest: {oldest['id']} ({oldest['title']}), last skip {describe(oldest['skip'])}."
++                  f"\n\n{listed}")))
++    return ids
++
++
++
++def sweep(conn, *, now: Optional[float] = None) -> list[str]:
++    """The detector pass (see the module doc). Returns the repair card ids now open for stalled cards."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    if sync.board_mode(conn) != "primary" or wn.pickup_mode() is None:
++        return []
++    from hermes_cli.kanban_gateway_drain import dispatch_paused
++    if dispatch_paused():
++        return []  # a draining gateway runs no pickup, so it writes no fresh evidence to judge a stall by
++    _prune(conn, _now_ms(now))
++    replica = wn.open_replica(conn)
++    if replica is None:
++        return []
++    try:
++        own = wn._own(conn)
++        cards = stalled(conn, replica, own, now=now)
++    finally:
++        replica.close()
++    return file_repairs(conn, own, cards, now=now) if cards else []
++
++
++def safe_sweep(conn) -> list[str]:
++    try:
++        return sweep(conn)
++    except Exception:  # health: allow BLE001 -- the detector must never stop dispatch
++        _log.warning("kanban dispatcher: pickup-stall sweep failed", exc_info=True)
++        return []
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 2ad95bbce27..a649e64c6c3 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -404,54 +404,141 @@ def import_cards(conn: sqlite3.Connection, replica: sqlite3.Connection, ids: Ite
+     return done
+ 
+ 
++def open_replica(conn: sqlite3.Connection) -> Optional[sqlite3.Connection]:
++    """Read-only connection to this board's full replica, or None when there is none yet."""
++    path = _replica_path(conn)
++    if not path.exists():
++        return None
++    from hermes_cli import kanban_lockguard
++    replica = kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
++    replica.row_factory = sqlite3.Row
++    return replica
++
++
++def pinned_rows(replica: sqlite3.Connection, own: str, *, now_ms: Optional[int] = None,
++                statuses: tuple[str, ...] = ("ready", "review")) -> list[sqlite3.Row]:
++    """Foreign ``statuses`` cards without a live lease whose ``runs_on`` names ``machine:<own>`` (parents ignored)."""
++    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
++    return replica.execute(
++        f"SELECT * FROM tasks WHERE status IN ({','.join('?' * len(statuses))}) AND created_on IS NOT NULL "
++        "AND created_on != ? AND (lease_holder IS NULL OR COALESCE(lease_expires, 0) < ?) AND json_valid(runs_on) "
++        "AND EXISTS (SELECT 1 FROM json_each(tasks.runs_on) WHERE value = ?)",
++        (*statuses, own, now_ms, f"machine:{own}")).fetchall()
++
++
++def _unimported_pinned(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str) -> set[str]:
++    try:
++        return {r["id"] for r in pinned_rows(replica, own)
++                if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (r["id"],)).fetchone()}
++    except Exception:  # health: allow BLE001 -- pickup evidence must never stop a pickup
++        _log.warning("kanban worker node: could not list pinned cards for pickup evidence", exc_info=True)
++        return set()
++
++
++def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *, mode: str, limit: int,
++              profile_exists: Optional[Callable[[str], bool]], full_detail: str,
++              ) -> tuple[list[str], dict[str, tuple[str, Optional[str]]]]:
++    """One pass over the candidates: ids to copy (at most ``limit``, in candidate order) and, for each card pinned
++    to this machine that the pass leaves on the Board, why. ``budget_exhausted`` only for a card this pass would
++    otherwise have copied, so a refusal is never hidden behind a full queue."""
++    from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
++    mine = _unimported_pinned(conn, replica, own)
++    reg = registry()
++    if not reg:
++        return [], {tid: ("other", "machine registry unavailable") for tid in mine}
++    review_enabled = review_dispatch_enabled()
++    listed = candidates(replica, own)
++    skips: dict[str, tuple[str, Optional[str]]] = {
++        tid: ("parents_incomplete", "a parent is not done") for tid in mine - {c["id"] for c in listed}}
++    picked: list[str] = []
++    for card in listed:
++        full = len(picked) >= limit
++        if full and card["id"] not in mine:
++            continue
++        reason = _skip_reason(conn, card, own, reg["machines"], mode=mode, review_enabled=review_enabled,
++                              profile_exists=profile_exists)
++        if reason is None and full:
++            reason = ("budget_exhausted", full_detail)
++        if reason is None:
++            picked.append(card["id"])
++        elif reason[0] and card["id"] in mine:
++            skips[card["id"]] = reason
++    return picked, skips
++
++
++def note_capped(conn: sqlite3.Connection, profile_exists: Optional[Callable[[str], bool]] = None) -> None:
++    """A tick with no spawn budget runs no pickup: record why this machine's pinned cards wait (``budget_exhausted``
++    for the ones a slot would start). Evidence only (``kanban_pickup_stall``); copies nothing."""
++    mode = pickup_mode()
++    if sync.board_mode(conn) != "primary" or mode is None:
++        return
++    replica = open_replica(conn)
++    if replica is None:
++        return
++    try:
++        _, skips = _evaluate(conn, replica, _own(conn), mode=mode, limit=0, profile_exists=profile_exists,
++                             full_detail="no spawn slot this tick")
++    finally:
++        replica.close()
++    _record_skips(conn, skips)
++
++
+ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+            profile_exists: Optional[Callable[[str], bool]] = None) -> list[str]:
+     """One tick's pickup: evict finished copies, then copy up to ``budget`` eligible foreign cards. Returns the
+-    ids copied. A no-op unless the board is primary and ``kanban.sync.pickup`` is on."""
++    ids copied. A no-op unless the board is primary and ``kanban.sync.pickup`` is on. Each card pinned to this
++    machine that the pass does not import gets its reason recorded (``kanban_pickup_stall.record``)."""
+     mode = pickup_mode()
+     if sync.board_mode(conn) != "primary" or mode is None:
+         return []
+     evict(conn)
+     limit = DEFAULT_PICKUP_BATCH if budget is None else budget
+     if limit <= 0:
++        note_capped(conn, profile_exists)
+         return []
+-    reg = registry()
+-    if not reg:
++    replica = open_replica(conn)
++    if replica is None:
+         return []
+-    own = _own(conn)
+-    machines = reg["machines"]
+-    path = _replica_path(conn)
+-    if not path.exists():
+-        return []
+-    from hermes_cli import kanban_lockguard
+-    replica = kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+-    replica.row_factory = sqlite3.Row
+-    from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
+-    review_enabled = review_dispatch_enabled()
+     try:
+-        picked: list[str] = []
+-        for card in candidates(replica, own):
+-            if len(picked) >= limit:
+-                break
+-            if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (card["id"],)).fetchone():
+-                continue
+-            if (mode == "explicit" or card["status"] == "review") and card["runs_on"] is None:
+-                continue  # a default-placement review stays with its creator
+-            if card["status"] == "review" and not review_enabled:
+-                continue
+-            if eligible(dict(card), own, machines) is not None:
+-                continue
+-            if profile_exists is not None and card["assignee"] and not profile_exists(card["assignee"]):
+-                continue
+-            # [daveey] Never claim a card this machine's profile cannot satisfy: it would run, then fail its own
+-            # handoffs here (t_01a184ac93d31979). Left on the Board for a machine that can.
+-            from hermes_cli.kanban_runs_on_capabilities import claim_refusal
+-            if claim_refusal(dict(card), me=own) is not None:
+-                continue
+-            picked.append(card["id"])
++        picked, skips = _evaluate(conn, replica, _own(conn), mode=mode, limit=limit, profile_exists=profile_exists,
++                                  full_detail="pickup batch full this tick")
+         imported = import_cards(conn, replica, picked)
+     finally:
+         replica.close()
++    skips.update({tid: ("other", "import failed") for tid in picked if tid not in imported})
++    _record_skips(conn, {tid: why for tid, why in skips.items() if tid not in imported})
+     if imported:
+         _log.info("kanban worker node: picked up %d card(s) from other gateways: %s", len(imported), imported)
+     return imported
++
++
++def _record_skips(conn: sqlite3.Connection, skips: dict[str, tuple[str, Optional[str]]]) -> None:
++    from hermes_cli import kanban_pickup_stall as kps
++    try:
++        kps.record(conn, skips)
++    except Exception:  # health: allow BLE001 -- pickup evidence must never undo or stop a pickup
++        _log.warning("kanban worker node: could not record pickup skips", exc_info=True)
++
++
++def _skip_reason(conn: sqlite3.Connection, card: sqlite3.Row, own: str, machines: Mapping[str, Mapping[str, Any]], *,
++                 mode: str, review_enabled: bool,
++                 profile_exists: Optional[Callable[[str], bool]]) -> Optional[tuple[str, Optional[str]]]:
++    """None when this machine may copy ``card``; else ``(reason, detail)`` (reason ``""``: nothing to record)."""
++    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (card["id"],)).fetchone():
++        return "", None  # already here
++    if (mode == "explicit" or card["status"] == "review") and card["runs_on"] is None:
++        return "", None  # a default-placement review stays with its creator
++    if card["status"] == "review" and not review_enabled:
++        return "other", "review dispatch disabled"
++    refused = eligible(dict(card), own, machines)
++    if refused is not None:
++        return ("hold" if refused == "held" else "capability_missing"), refused
++    if profile_exists is not None and card["assignee"] and not profile_exists(card["assignee"]):
++        return "profile_ineligible", f"no profile {card['assignee']!r} here"
++    # [daveey] Never claim a card this machine's profile cannot satisfy: it would run, then fail its own
++    # handoffs here (t_01a184ac93d31979). Left on the Board for a machine that can.
++    from hermes_cli.kanban_runs_on_capabilities import claim_refusal
++    refusal = claim_refusal(dict(card), me=own)
++    if refusal is not None:
++        return "capability_missing", str(refusal)
++    return None
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+new file mode 100644
+index 00000000000..8072c4817ad
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -0,0 +1,343 @@
++"""A ready card pinned ``machine:<this host>`` that the host never imports gets pickup evidence and agent repair work.
++
++t_01a1c9097f6a94bc (2026-11-11): t_01a1c81a5323b6d1 sat on the Board ready and pinned to ``machine:hub`` for 23 min
++while the hub neither imported nor claimed it, and nothing recorded why or alerted. Pickup now records, per pinned
++candidate it does not import, the reason (deduped per card and reason); the dispatcher's sweep opens ONE agent repair
++card for a card stalled past ``kanban.sync.pickup_stall_seconds`` (default 600 s), and ONE per host while the queue is
++simply full. Same fake-Board two-gateway harness as ``test_kanban_worker_node``.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++WORKER, HUB = support.WORKER, support.HUB
++DETECTOR = "pickup-stall-detector"
++svc = support.svc
++gws = support.gws
++
++
++def _pinned(hub, title="pinned to the worker", to=WORKER):
++    return support._hub_card(hub, title=title, runs_on=[f"machine:{to}"])
++
++
++def _age(worker, tid, seconds):
++    """Make the replica say the card became ready ``seconds`` ago (the Board's ``ready_since`` and creation)."""
++    path = wn._replica_path(worker.conn)
++    with sqlite3.connect(path) as replica:
++        replica.execute("UPDATE tasks SET ready_since = COALESCE(ready_since, created_at * 1000) - ?, "
++                        "created_at = created_at - ? WHERE id = ?", (seconds * 1000, seconds, tid))
++
++
++def _repairs(conn):
++    return conn.execute("SELECT * FROM tasks WHERE created_by = ? ORDER BY created_at, id", (DETECTOR,)).fetchall()
++
++
++def _no_profiles(monkeypatch):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: name != "default"))
++
++
++def test_a_pinned_card_left_unpicked_past_the_threshold_gets_one_repair_card(gws, monkeypatch):
++    hub, worker = gws
++    _no_profiles(monkeypatch)  # the worker has no `default` profile, so pickup skips the card every pass
++    tid = _pinned(hub)
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None  # not imported
++    assert not _repairs(worker.conn)  # not stalled long enough yet
++    _age(worker, tid, 601)
++    worker.tick()
++    [repair] = _repairs(worker.conn)
++    assert repair["human_request"] is None
++    assert tid in repair["body"] and "profile_ineligible" in repair["body"]
++    assert repair["status"] in ("ready", "running")
++    worker.tick()
++    assert len(_repairs(worker.conn)) == 1  # a second tick reuses the open card
++
++
++def test_the_skip_reason_is_recorded_once_per_reason_and_shown_on_the_target_host(gws, monkeypatch):
++    hub, worker = gws
++    _no_profiles(monkeypatch)
++    tid = _pinned(hub)
++    worker.round()
++    for _ in range(3):
++        worker.tick()
++    from hermes_cli import kanban_pickup_stall as kps
++    rows = worker.conn.execute("SELECT reason FROM kanban_pickup_skips WHERE task_id = ?", (tid,)).fetchall()
++    assert [r["reason"] for r in rows] == ["profile_ineligible"]
++    last = kps.latest(worker.conn, tid)
++    assert last["reason"] == "profile_ineligible" and last["first_at"] <= last["last_at"]
++    worker.enter()
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_show({"task_id": tid}))
++    assert out["source"] == "replica"
++    assert out["pickup_skip"]["reason"] == "profile_ineligible"
++
++
++@pytest.mark.parametrize("closed,closed_ago,want", [
++    (None, 0, 1),             # open: reused
++    ("done", 60, 1),          # just finished: not handed straight back
++    ("done", 3601, 2),        # finished over an hour ago and still stalled: replaced
++    ("archived", 3601, 2),
++])
++def test_an_open_or_recent_repair_is_reused_and_an_old_closed_one_replaced(gws, monkeypatch, closed, closed_ago,
++                                                                            want):
++    hub, worker = gws
++    _no_profiles(monkeypatch)
++    tid = _pinned(hub)
++    worker.round()
++    worker.tick()
++    _age(worker, tid, 601)
++    worker.tick()
++    [first] = _repairs(worker.conn)
++    if closed:
++        with kb.write_txn(worker.conn):
++            worker.conn.execute("UPDATE tasks SET status = ?, completed_at = CAST(strftime('%s','now') AS INTEGER) "
++                                "- ?, created_at = created_at - ? WHERE id = ?",
++                                (closed, closed_ago, closed_ago, first["id"]))
++    worker.tick()
++    assert len(_repairs(worker.conn)) == want
++
++
++def test_a_held_machine_files_one_hold_card_not_one_per_card(gws):
++    hub, worker = gws
++    a = _pinned(hub, title="a")
++    b = _pinned(hub, title="b")
++    worker.round()
++    worker.enter()
++    machines = {**support.MACHINES, WORKER: {**support.MACHINES[WORKER], "hold": True}}
++    wn.set_registry_fetch(lambda: {"me": WORKER, "machines": list(machines.values())})
++    wn._REGISTRY.update(at=None, value=None, retry=False)
++    wn.pickup(worker.conn, budget=4)
++    _age(worker, a, 900)
++    _age(worker, b, 700)
++    from hermes_cli import kanban_pickup_stall as kps
++    kps.sweep(worker.conn)
++    kps.sweep(worker.conn)
++    [card] = _repairs(worker.conn)
++    assert "held" in card["title"].lower() and a in card["title"] and b in card["body"]
++    assert "do not lift it" in card["body"] and card["priority"] == -1
++
++
++def test_a_refused_card_is_not_hidden_behind_a_full_queue(gws, monkeypatch):
++    """budget_exhausted only for cards a slot would start: a capped tick still names a profile refusal."""
++    hub, worker = gws
++    _no_profiles(monkeypatch)
++    tid = _pinned(hub)
++    worker.round()
++    worker.tick(max_spawn=0)
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.latest(worker.conn, tid)["reason"] == "profile_ineligible"
++
++
++def test_a_card_imported_in_time_raises_nothing(gws):
++    hub, worker = gws
++    tid = _pinned(hub)
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid).status == "running"
++    _age(worker, tid, 601)
++    worker.tick()
++    assert not _repairs(worker.conn)
++
++
++def test_a_card_pinned_to_another_host_raises_nothing_here(gws, monkeypatch):
++    hub, worker = gws
++    tid = _pinned(hub, to=HUB)
++    worker.round()
++    worker.tick()
++    _age(worker, tid, 601)
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None
++    assert not _repairs(worker.conn)
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.latest(worker.conn, tid) is None  # nothing recorded for a card pinned elsewhere
++
++
++def test_a_full_queue_files_one_card_per_host_naming_the_oldest(gws):
++    hub, worker = gws
++    old = _pinned(hub, title="oldest")
++    new = _pinned(hub, title="newer")
++    worker.round()
++    worker.tick(max_spawn=0)  # at capacity: pickup never runs, the capped path records why
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.latest(worker.conn, old)["reason"] == "budget_exhausted"
++    assert kps.latest(worker.conn, new)["reason"] == "budget_exhausted"
++    _age(worker, old, 900)
++    _age(worker, new, 700)
++    worker.tick(max_spawn=0)
++    worker.tick(max_spawn=0)
++    [card] = _repairs(worker.conn)
++    assert old in card["title"] and "queue" in card["title"].lower()
++    assert "budget_exhausted" in card["body"] and new in card["body"]
++
++
++def test_a_stall_with_another_last_reason_gets_its_own_card_beside_the_queue_card(gws):
++    hub, worker = gws
++    full = _pinned(hub, title="waits for a slot")
++    odd = _pinned(hub, title="refused here")
++    worker.round()
++    worker.tick(max_spawn=0)
++    from hermes_cli import kanban_pickup_stall as kps
++    kps.record(worker.conn, {odd: ("capability_missing", "labels_mismatch")})  # a later pass refused it
++    assert kps.latest(worker.conn, odd)["reason"] == "capability_missing"
++    _age(worker, full, 700)
++    _age(worker, odd, 900)
++    worker.tick(max_spawn=0)  # the sweep runs before the capped record, so it sees the refusal
++    repairs = _repairs(worker.conn)
++    assert len(repairs) == 2
++    [own] = [r for r in repairs if odd in r["title"]]
++    assert "capability_missing" in own["body"] and "labels_mismatch" in own["body"]
++    [queue] = [r for r in repairs if r["id"] != own["id"]]
++    assert full in queue["title"] and odd not in queue["body"]
++
++
++def test_the_threshold_is_configurable(gws, monkeypatch):
++    hub, worker = gws
++    _no_profiles(monkeypatch)
++    from hermes_cli import kanban_db_sync as sync
++    real = sync.sync_config
++    monkeypatch.setattr(sync, "sync_config", lambda: {**real(), "pickup_stall_seconds": 1200})
++    tid = _pinned(hub)
++    worker.round()
++    worker.tick()
++    _age(worker, tid, 601)
++    worker.tick()
++    assert not _repairs(worker.conn)
++    _age(worker, tid, 700)
++    worker.tick()
++    assert len(_repairs(worker.conn)) == 1
++
++
++def test_a_held_machine_records_hold_and_a_parentless_gap_records_parents_incomplete(gws):
++    hub, worker = gws
++    held = _pinned(hub, title="held machine")
++    parent = support._hub_card(hub, title="parent not done")
++    gated = _pinned(hub, title="gated")
++    worker.round()
++    path = wn._replica_path(worker.conn)
++    with sqlite3.connect(path) as replica:  # the Board says ready while a parent is open: refused parents_not_done
++        replica.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, gated))
++    worker.enter()
++    machines = {**support.MACHINES, WORKER: {**support.MACHINES[WORKER], "hold": True}}
++    wn.set_registry_fetch(lambda: {"me": WORKER, "machines": list(machines.values())})
++    wn._REGISTRY.update(at=None, value=None, retry=False)
++    wn.pickup(worker.conn, budget=4)
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.latest(worker.conn, held)["reason"] == "hold"
++    assert kps.latest(worker.conn, gated)["reason"] == "parents_incomplete"
++    assert kb.get_task(worker.conn, held) is None
++
++
++def test_records_are_deduped_per_card_and_reason_and_refreshed_on_change(tmp_path):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_pickup_stall as kps
++    conn = kbc.connect(tmp_path / "kanban.db")
++    t0 = 1_800_000_000.0
++    assert kps.record(conn, {"t_a": ("budget_exhausted", "x")}, now=t0) == 1
++    assert kps.record(conn, {"t_a": ("budget_exhausted", "x")}, now=t0 + 10) == 0  # same reason, inside refresh
++    assert kps.record(conn, {"t_a": ("budget_exhausted", "x")}, now=t0 + 61) == 1
++    assert kps.latest(conn, "t_a")["passes"] == 2
++    assert kps.record(conn, {"t_a": ("profile_ineligible", "y")}, now=t0 + 62) == 1
++    assert kps.latest(conn, "t_a")["reason"] == "profile_ineligible"
++    assert kps.record(conn, {"t_a": ("budget_exhausted", "x")}, now=t0 + 62) == 1  # a change is written at once
++    assert kps.latest(conn, "t_a")["reason"] == "budget_exhausted"
++    assert kps.record(conn, {"t_b": ("bogus", None)}, now=t0) == 1
++    assert kps.latest(conn, "t_b")["reason"] == "other"
++    assert conn.execute(f"SELECT count(*) FROM {kps.TABLE}").fetchone()[0] == 3
++
++
++def test_records_are_bounded_by_age_and_count(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_pickup_stall as kps
++    conn = kbc.connect(tmp_path / "kanban.db")
++    t0 = 1_800_000_000.0
++    kps.record(conn, {"t_old": ("hold", None)}, now=t0 - kps.RETENTION_SECONDS - 5)
++    kps.record(conn, {f"t_{i}": ("hold", None) for i in range(5)}, now=t0)
++    monkeypatch.setattr(kps, "MAX_ROWS", 3)
++    kps._prune(conn, int(t0 * 1000))
++    ids = {r[0] for r in conn.execute(f"SELECT task_id FROM {kps.TABLE}")}
++    assert len(ids) == 3 and "t_old" not in ids
++
++
++def test_cli_show_names_the_skip_for_a_card_not_imported_here(gws, monkeypatch):
++    hub, worker = gws
++    _no_profiles(monkeypatch)
++    tid = _pinned(hub)
++    worker.round()
++    worker.tick()
++    from hermes_cli import kanban_pickup_stall as kps
++    note = kps.not_here_note(worker.conn, tid)
++    assert "not imported here" in note and "profile_ineligible" in note
++    assert kps.not_here_note(worker.conn, "t_unknown") == ""
++
++
++def test_a_full_pickup_batch_records_budget_exhausted_for_the_rest(gws):
++    hub, worker = gws
++    first = _pinned(hub, title="first")
++    second = _pinned(hub, title="second")
++    worker.round()
++    worker.enter()
++    imported = wn.pickup(worker.conn, budget=1)
++    [left] = [t for t in (first, second) if t not in imported]
++    from hermes_cli import kanban_pickup_stall as kps
++    assert len(imported) == 1
++    assert kps.latest(worker.conn, left)["reason"] == "budget_exhausted"
++    assert kps.latest(worker.conn, imported[0]) is None
++
++
++def test_an_unreachable_registry_is_recorded_as_other(gws):
++    hub, worker = gws
++    tid = _pinned(hub)
++    worker.round()
++    worker.enter()
++
++    def down():
++        raise OSError("registry down")
++    wn.set_registry_fetch(down)
++    wn._REGISTRY.update(at=None, value=None, retry=False)
++    assert wn.pickup(worker.conn, budget=4) == []
++    from hermes_cli import kanban_pickup_stall as kps
++    skip = kps.latest(worker.conn, tid)
++    assert skip["reason"] == "other" and "registry" in skip["detail"]
++
++
++@pytest.mark.parametrize("value,want", [(None, 600), (1200, 1200), (0, 600), (-5, 600), ("x", 600), (True, 600)])
++def test_stall_seconds_config(monkeypatch, value, want):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_pickup_stall as kps
++    monkeypatch.setattr(sync, "sync_config", lambda: {} if value is None else {"pickup_stall_seconds": value})
++    assert kps.stall_seconds() == want
++
++
++def test_a_draining_gateway_files_no_repair(gws, monkeypatch):
++    hub, worker = gws
++    _no_profiles(monkeypatch)
++    tid = _pinned(hub)
++    worker.round()
++    worker.tick()
++    _age(worker, tid, 601)
++    from hermes_cli import kanban_gateway_drain
++    from hermes_cli import kanban_pickup_stall as kps
++    monkeypatch.setattr(kanban_gateway_drain, "dispatch_paused", lambda home=None: True)
++    worker.enter()
++    assert kps.sweep(worker.conn) == []
++    assert _repairs(worker.conn) == []
++
++
++def test_a_card_whose_import_fails_is_recorded(gws, monkeypatch):
++    hub, worker = gws
++    tid = _pinned(hub)
++    worker.round()
++    worker.enter()
++    monkeypatch.setattr(wn, "import_cards", lambda conn, replica, ids: [])
++    assert wn.pickup(worker.conn, budget=4) == []
++    from hermes_cli import kanban_pickup_stall as kps
++    assert kps.latest(worker.conn, tid)["detail"] == "import failed"
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 50e02ede5b3..ee08f6fe447 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -27,6 +27,9 @@ def show(args: dict) -> str:
+                 owner = kfc.created_on(replica, tid)
+                 out = _detail(kb, replica, task, args, replica=True)
+                 out["owner"] = None if owner is kfc._UNSET else owner
++                from hermes_cli.kanban_pickup_stall import latest as pickup_skip
++                if skip := pickup_skip(conn, tid):  # why this host's pickup has not imported it [daveey]
++                    out["pickup_skip"] = skip
+                 return json.dumps(out)
+         kt._existing_task(kb, conn, tid)  # preserve the existing not-found error
+     raise AssertionError("missing task lookup must reject")
+-- 
+2.55.0
+

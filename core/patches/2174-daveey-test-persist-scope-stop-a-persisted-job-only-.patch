@@ -1,0 +1,72 @@
+From 245c37601d25e588d399506a85fef6aa1d798782 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:27:18 +0000
+Subject: [PATCH] [daveey] test(persist scope): stop a persisted job only once
+ its command runs
+
+test_real_persisted_job_survives_stop_of_its_spawning_user_service[sleep] and
+test_real_persisted_job_lands_outside_run_scope flaked (TimeoutExpired stopping the job's scope) when
+run beside the new survivable-process integration tests. Why: the journal shows the scope stopped
+17 ms after it started; its only member then was `bash -lic`, which as an interactive shell ignores
+SIGTERM, so the stop was lost and systemd waited out TimeoutStopSec (~30 s) after the wrapper and
+`sleep` started. The readiness wait proved the pid was in the scope, not that the command ran; a
+loaded host widens that startup window. Wait for the command itself (comm 'sleep' in the scope's
+cgroup) before stopping. Paired run: flaky 3/4 before, 0/3 after.
+---
+ tests/tools/test_persist_job_own_scope.py | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/tests/tools/test_persist_job_own_scope.py b/tests/tools/test_persist_job_own_scope.py
+index 919ad116d0..38e1d431a5 100644
+--- a/tests/tools/test_persist_job_own_scope.py
++++ b/tests/tools/test_persist_job_own_scope.py
+@@ -4,6 +4,7 @@ The run scope is OOMPolicy=stop / KillMode=control-group and is stopped when the
+ it ends, which killed a persisted paid-rental watchdog (hub, 2026-11-03 03:42Z).
+ """
+ 
++import contextlib
+ import json
+ import os
+ import subprocess
+@@ -206,8 +207,12 @@ def test_real_persisted_job_survives_stop_of_its_spawning_user_service(tmp_path,
+         # systemd-run execs the job only once its scope exists; stopping the spawner earlier tests nothing.
+         wait_until(lambda: spawned["unit"] and Path(f"/proc/{pid}/cgroup").read_text().rstrip().endswith(
+             "/" + spawned["unit"]), what="the job's own scope")
++        # ...and only once the command itself runs: until then the scope holds ``bash -lic``, which ignores
++        # SIGTERM, so a stop in that window is lost and waits out TimeoutStopSec (a loaded host widens it).
+         if chatty:
+             wait_until(ticks.exists, what="the job's first output")
++        else:
++            wait_until(lambda: "sleep" in _scope_comms(pid), what="the job's command to start")
+         # ``stop`` returns once systemd has killed the unit's whole cgroup (KillMode=control-group).
+         subprocess.run(["systemctl", "--user", "stop", unit], check=True, timeout=30, env=env)
+         assert subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit],
+@@ -227,6 +232,16 @@ def test_real_persisted_job_survives_stop_of_its_spawning_user_service(tmp_path,
+             os.kill(spawned["pid"], 9)
+ 
+ 
++def _scope_comms(pid: int) -> set:
++    """Command names of every process in ``pid``'s cgroup."""
++    rel = Path(f"/proc/{pid}/cgroup").read_text().strip().split("::", 1)[-1]
++    comms = set()
++    for member in (Path("/sys/fs/cgroup") / rel.lstrip("/") / "cgroup.procs").read_text().split():
++        with contextlib.suppress(OSError):
++            comms.add(Path(f"/proc/{member}/comm").read_text().strip())
++    return comms
++
++
+ def _in_real_run_scope() -> bool:
+     return kanban_run_scope_cgroup() is not None and pr._systemd_run_user_scope_available()
+ 
+@@ -252,6 +267,8 @@ def test_real_persisted_job_lands_outside_run_scope(tmp_path, monkeypatch):
+         assert session.systemd_unit and cgroup.rstrip().endswith("/" + session.systemd_unit), cgroup
+         assert f"/{KANBAN_SLICE}/" in cgroup
+         assert "hermes-worker-kanban-" not in cgroup
++        # A stop before the command runs hits ``bash -lic`` (ignores SIGTERM) and waits out TimeoutStopSec.
++        wait_until(lambda: "sleep" in _scope_comms(session.pid), what="the job's command to start")
+     finally:
+         subprocess.run(["systemctl", "--user", "stop", session.systemd_unit], check=False, timeout=15,
+                        env=pr.systemd_user_bus_env() or os.environ)
+-- 
+2.55.0
+

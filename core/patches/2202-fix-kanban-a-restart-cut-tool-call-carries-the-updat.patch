@@ -1,0 +1,295 @@
+From 15dffdf2e8a99964bd15dec517711cab659def48 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:39:24 +0000
+Subject: [PATCH] fix(kanban): a restart-cut tool call carries the update-pause
+ result in the real stop path [daveey]
+
+Review of c1570eb7001: a clean restart Stop hard-interrupts the managed child, whose own executor then
+answers the cut-off call (a killed command's '[Command interrupted]' output, or the abandoned/skipped
+cancel text) and closes the turn with assistant rows. The continuation only answered calls left with
+no result, so the spec's '[interrupted by Hermes update at <UTC>: re-run if still needed]' was never
+written; the model saw replay cleanup's orphan-recovery notice instead.
+
+- prepare() now rewrites, in place (a result must stay right after its call), the stopped turn's
+  cancelled/skipped/interrupted tool results: the tool rows after the last assistant tool-call
+  message, past the closing assistant rows and nothing else. A finished call's result, or any tool row
+  before a later user turn, is never touched. Idempotent: the rewritten text matches none of them.
+- Worker: claim.continuing is cleared once a turn is admitted, so after the continuation a final owner
+  answer is final again (not an uncounted restart loss) and owner silence gets OWNER_WAIT_S.
+- Correction to c1570eb7001's message: dropping the _require_admission_open pre-check means a draining
+  owner can record the continuation marker before submit refuses runtime_draining; the next owner then
+  reuses that same marker/request id (same as admit_claim for a first admission).
+
+Proof: the real two-owner probe gains a mid_tool_call case (SIGTERM while the turn's terminal call
+runs 'sleep 120'): the continued turn's model request carries exactly the update-pause text for that
+call (before this commit: the orphan-recovery notice). Mutants S1-S7 on the new conditions all killed.
+---
+ gateway/session_kanban_continue.py            | 44 +++++++++-
+ hermes_cli/kanban_worker_client.py            |  1 +
+ .../fixtures/kanban_restart_continue_probe.py | 19 ++++-
+ .../test_kanban_restart_continuation.py       | 84 ++++++++++++++++++-
+ 4 files changed, 138 insertions(+), 10 deletions(-)
+
+diff --git a/gateway/session_kanban_continue.py b/gateway/session_kanban_continue.py
+index 1cbecd2c8f..30de98e976 100644
+--- a/gateway/session_kanban_continue.py
++++ b/gateway/session_kanban_continue.py
+@@ -115,11 +115,43 @@ def _unanswered(history):
+     return _unanswered_tool_calls(history)
+ 
+ 
++# What the agent's own executor writes for a tool call a hard interrupt cancelled or skipped
++# (agent/tool_executor.py). With a killed command's own interrupted output (replay_cleanup's
++# ``is_interrupted_tool_result`` shape) these become the update-pause text after a restart Stop.
++_STOP_RESULT_PREFIXES = ('[Tool execution cancelled \u2014 ', '[Tool execution skipped \u2014 ')
++
++
++def _stop_result_rows(session_db, session_id) -> list:
++    """Row ids of the stopped turn's cancelled, skipped or interrupted tool results: the tool rows right
++    after the transcript's last assistant tool-call message, past the closing assistant rows the
++    stopped turn wrote (its empty final reply, the interrupted-delivery note) and nothing else."""
++    from agent.replay_cleanup import is_interrupted_tool_result
++    found = []
++    for row in reversed(session_db.get_messages(session_id, latest=True, limit=256)):
++        role = row.get('role')
++        if role == 'assistant' and row.get('tool_calls'):
++            return found
++        if role == 'assistant':
++            if found:
++                return []  # an assistant reply between tool results: not one stopped tool block
++            continue
++        if role != 'tool':
++            return []
++        content = row.get('content')
++        if isinstance(content, str) and (content.startswith(_STOP_RESULT_PREFIXES)
++                                         or is_interrupted_tool_result(content)):
++            found.append(int(row['id']))
++    return []
++
++
+ def _answer_interrupted_calls(session_db, session_id, at) -> int:
+-    """Append the interrupted-by-update result for each trailing tool call left without one."""
++    """Give each tool call the restart Stop cut off the interrupted-by-update result: rewrite the
++    cancel/skip/interrupted result the stopping agent wrote for it, and append one for a trailing call
++    left with none."""
++    stopped = _stop_result_rows(session_db, session_id)
+     history = session_db.get_messages_as_conversation(session_id)
+     calls = _unanswered(history)
+-    if not calls:
++    if not calls and not stopped:
+         return 0
+     text = interrupted_result(at)
+     from agent.message_metadata import TOOL_CALL_UID, tool_call_uid_from_history
+@@ -134,9 +166,13 @@ def _answer_interrupted_calls(session_db, session_id, at) -> int:
+         rows.append(msg)
+ 
+     def write(conn):
+-        added, _ = session_db._insert_message_rows(conn, session_id, rows)
++        # In place (a tool result must stay right after its call), like set_user_message_content.
++        rewritten = conn.executemany(
++            "UPDATE messages SET content = ?, api_content = NULL WHERE id = ? AND session_id = ? AND role = 'tool' "
++            'AND active = 1', [(session_db._encode_content(text), row_id, session_id) for row_id in stopped]).rowcount
++        added, _ = session_db._insert_message_rows(conn, session_id, rows) if rows else (0, None)
+         conn.execute('UPDATE sessions SET message_count=message_count+? WHERE id=?', (added, session_id))
+-        return added
++        return max(rewritten, 0) + added
+     return int(session_db._execute_write(write))
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index ce5213c479..9fc53ba1f4 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -308,6 +308,7 @@ async def _await_receipt(client, params, board_db, claim):
+         accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
+         receipt = accepted['receipt']
+         claim.session_id, claim.admission_id = accepted['session_id'], receipt['admission_id']
++        claim.continuing = False  # [daveey] continued (or first) turn admitted: ordinary owner-loss rules again
+         print(f'Session: {claim.session_id}', file=sys.stderr)
+     else:
+         receipt = await _receipt(client, claim)
+diff --git a/tests/gateway/fixtures/kanban_restart_continue_probe.py b/tests/gateway/fixtures/kanban_restart_continue_probe.py
+index f934a9e036..665e1de9f1 100644
+--- a/tests/gateway/fixtures/kanban_restart_continue_probe.py
++++ b/tests/gateway/fixtures/kanban_restart_continue_probe.py
+@@ -2,7 +2,7 @@
+ 
+ Actual dispatcher argv, real ``gateway.run`` owners on one disposable home, loopback model. The first
+ owner is stopped (SIGTERM: the runtime Stop of a gateway shutdown/restart) while the card's turn waits
+-on the model; a second owner then starts on the same home. The run's submitter (the real
++on the model (or, with ``PROBE_MID_TOOL=1``, while its ``terminal`` tool call runs); a second owner then starts on the same home. The run's submitter (the real
+ ``hermes_cli.kanban_worker_client``) must survive the gap and the second owner must continue the same
+ turn in the same session: one run, one claim, one worker pid, no reclaim/crash/failure.
+ """
+@@ -33,11 +33,17 @@ class Model(BaseHTTPRequestHandler):
+             self.server.requests.append(body)
+         users = [m for m in messages if m['role'] == 'user']
+         continued = any(isinstance(m.get('content'), str) and m['content'].startswith(CONTINUE_PREFIX) for m in users)
+-        if messages and body.get('tools') and not continued and not self.server.blocked.is_set():
+-            self.server.blocked.set()  # the first turn waits here until its owner is stopped
+-            self.server.release.wait(120)
+         message = {'role': 'assistant', 'content': 'CONTINUED_COMPLETE'}
+         finish = 'stop'
++        if messages and body.get('tools') and not continued and not self.server.blocked.is_set():
++            self.server.blocked.set()
++            if self.server.mid_tool:  # the first turn runs a tool that is still running at the stop
++                message = {'role': 'assistant', 'content': None, 'tool_calls': [{'index': 0, 'id': 'midtool-1',
++                    'type': 'function', 'function': {'name': 'terminal', 'arguments': json.dumps(
++                        {'command': f'touch {self.server.marker} && sleep 120', 'timeout': 300})}}]}
++                finish = 'tool_calls'
++            else:  # the first turn waits here until its owner is stopped
++                self.server.release.wait(120)
+         if continued and body.get('tools') and messages[-1]['role'] == 'user':
+             message = {'role': 'assistant', 'content': None, 'tool_calls': [{'index': 0, 'id': 'continued-complete',
+                 'type': 'function', 'function': {'name': 'kanban_complete',
+@@ -79,6 +85,7 @@ def main():
+     peer = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+     peer.requests = []
+     peer.blocked, peer.release = threading.Event(), threading.Event()
++    peer.mid_tool, peer.marker = os.environ.get('PROBE_MID_TOOL') == '1', home / 'tool-started'
+     threading.Thread(target=peer.serve_forever, daemon=True).start()
+     url = f'http://127.0.0.1:{peer.server_port}/v1'
+     os.environ.update(OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+@@ -123,6 +130,8 @@ def main():
+                 task = kb.get_task(conn, tid)
+                 receipt.update(run_id=task.current_run_id, claim_lock=task.claim_lock)
+                 assert peer.blocked.wait(90), 'model never reached'
++                if peer.mid_tool:
++                    _wait(peer.marker.exists, 90, 'the turn\'s terminal tool call started')
+                 receipt['worker_pid'] = kb.get_task(conn, tid).worker_pid
+                 proc.terminate()  # the runtime Stop of a gateway shutdown/restart, mid-turn
+                 proc.wait(60)
+@@ -148,6 +157,8 @@ def main():
+             receipt['admissions'] = [list(r) for r in db.execute(
+                 'SELECT target_session_id, request_id, status, outcome FROM session_admissions ORDER BY seq')]
+         turns = [[m.get('content') for m in r['messages'] if m['role'] == 'user'] for r in peer.requests if r.get('tools')]
++        receipt['mid_tool_results'] = sorted({m.get('content') for r in peer.requests for m in r['messages']
++                                              if m.get('role') == 'tool' and m.get('tool_call_id') == 'midtool-1'})
+         receipt['continued_in_history'] = any(
+             any(isinstance(t, str) and 'RESTART_CONTINUE_SENTINEL' in t for t in turn)
+             and any(isinstance(t, str) and t.startswith(CONTINUE_PREFIX) for t in turn) for turn in turns)
+diff --git a/tests/gateway/test_kanban_restart_continuation.py b/tests/gateway/test_kanban_restart_continuation.py
+index 4ba07e6243..5bb9f002b7 100644
+--- a/tests/gateway/test_kanban_restart_continuation.py
++++ b/tests/gateway/test_kanban_restart_continuation.py
+@@ -25,14 +25,16 @@ _FORBIDDEN = {'reclaimed', 'crashed', 'owner_restart_lost', 'gave_up', 'timed_ou
+ 
+ # --- real owners: dispatcher argv, two gateway.run processes on one disposable home ---------------
+ 
+-def test_a_real_owner_restart_mid_turn_continues_the_same_run(tmp_path):
++@pytest.mark.parametrize('mid_tool', [False, True], ids=['mid_model_call', 'mid_tool_call'])
++def test_a_real_owner_restart_mid_turn_continues_the_same_run(tmp_path, mid_tool):
+     import subprocess
+     import sys
+     repo = Path(__file__).resolve().parents[2]
+     from tests.gateway.fixtures.local_recovery_probe import child_env
+     env = child_env()
+     env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'),
+-               PYTHONPATH=f"{repo}{__import__('os').pathsep}{repo / 'tests' / 'gateway' / 'fixtures'}")
++               PYTHONPATH=f"{repo}{__import__('os').pathsep}{repo / 'tests' / 'gateway' / 'fixtures'}",
++               PROBE_MID_TOOL='1' if mid_tool else '0')
+     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_restart_continue_probe.py')],
+                             env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=420,
+                             check=False)
+@@ -56,6 +58,12 @@ def test_a_real_owner_restart_mid_turn_continues_the_same_run(tmp_path):
+         ['terminal', 'interrupted'], ['terminal', 'completed']], receipt['admissions']
+     assert receipt['admissions'][1][1].startswith(receipt['admissions'][0][1] + '#continue:')
+     assert receipt['continued_in_history'], 'the continued turn did not carry the first turn as history'
++    if mid_tool:
++        # The tool call the Stop cut off reaches the continued turn with exactly the update-pause result.
++        import re
++        assert len(receipt['mid_tool_results']) == 1, receipt['mid_tool_results']
++        assert re.fullmatch(r'\[interrupted by Hermes update at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ: re-run if still needed\]',
++                            receipt['mid_tool_results'][0]), receipt['mid_tool_results']
+ 
+ 
+ # --- the worker: a fake owner that restarts mid-turn -------------------------------------------
+@@ -239,6 +247,36 @@ def test_an_owner_gap_with_no_checkpoint_still_fails_at_owner_wait(board, clock,
+     assert clock[0] < kanban_worker_client.OWNER_WAIT_S + 30
+ 
+ 
++def test_after_the_continuation_is_admitted_owner_errors_are_final_again(board, clock, monkeypatch):
++    # Once the next owner admitted the continued turn, a final owner answer is that answer (not
++    # a restart loss requeued uncounted), as for any first admission.
++    owner = _RestartingOwner(board, clock)
++    base = owner.connect()
++
++    @asynccontextmanager
++    async def _connect(*a, **k):
++        async with base(*a, **k) as client:
++            if owner.dials == 1:
++                yield client
++                return
++            real = client.rpc
++
++            async def rpc(method, **params):
++                if method == 'kanban.run':
++                    owner.runs.append(params)
++                    return {'session_id': 's1', 'receipt': {'status': 'started', 'admission_id': 'a2'}}
++                if params.get('admission_id') == 'a2':
++                    raise gateway_client.GatewayRPCError('kanban_claim_mismatch')
++                return await real(method, **params)
++            client.rpc = rpc
++            yield client
++    monkeypatch.setattr(gateway_client, 'connect_gateway', _connect)
++    with pytest.raises(gateway_client.GatewayRPCError, match='kanban_claim_mismatch') as raised:
++        asyncio.run(kanban_worker_client.run(board.params, board.db))
++    assert not isinstance(raised.value, kanban_worker_client.OwnerRestartLost)
++    assert len(owner.runs) == 2
++
++
+ def test_an_owner_that_will_not_continue_falls_back_to_the_uncounted_requeue(board, clock, monkeypatch, capsys):
+     owner = _RestartingOwner(board, clock, refusal='kanban_continuation_unsafe')
+     monkeypatch.setattr(gateway_client, 'connect_gateway', owner.connect())
+@@ -369,6 +407,48 @@ def test_the_new_owner_answers_the_interrupted_tool_call_and_records_the_continu
+     assert pending_admission(board.db, board.params, board.request)[1] is None
+ 
+ 
++@pytest.mark.parametrize('stopped, rewritten', [
++    ('[Tool execution cancelled \u2014 terminal was abandoned: interrupt requested]', True),
++    ('[Tool execution skipped \u2014 terminal was not started. Turn interrupted]', True),
++    ('{"output": "[Command interrupted]", "exit_code": 130, "error": null}', True),
++    ('{"output": "done", "exit_code": 0, "error": null}', False),  # a call that finished keeps its result
++], ids=['cancelled', 'skipped', 'killed_command', 'finished'])
++def test_the_stopping_agents_tool_result_becomes_the_update_text(board, tmp_path, monkeypatch, stopped, rewritten):
++    # What a real restart Stop leaves: the agent answered the cut-off call itself, then closed its turn.
++    from gateway.session_kanban_restart import record_restart_interruption
++    from gateway.session_kanban_continue import pending_admission
++    record_restart_interruption(_policy(board), checkpoint={'session_id': 's1', 'request_id': board.request,
++                                                            'admission_id': 'a1', 'cause': 'restart'})
++    _target, checkpoint = pending_admission(board.db, board.params, board.request)
++    assert checkpoint is not None
++    db = _session_db(tmp_path, [*[{'role': m['role'], 'content': m['content'], 'tool_calls': m.get('tool_calls')}
++                                  for m in _MID_TOOL],
++                                {'role': 'tool', 'content': stopped, 'tool_call_id': 'call-1'},
++                                {'role': 'assistant', 'content': ''},
++                                {'role': 'assistant', 'content': 'An automated delivery was interrupted.'}])
++    assert _prepare(board, db, checkpoint, monkeypatch)['answered'] == int(rewritten)
++    tools = [m for m in db.get_messages_as_conversation('s1') if m['role'] == 'tool']
++    assert len(tools) == 1 and tools[0]['tool_call_id'] == 'call-1'  # rewritten in place, never a second row
++    assert tools[0]['content'].startswith('[interrupted by Hermes update at ') is rewritten
++
++
++def test_a_tool_result_before_a_later_user_turn_is_never_rewritten(board, tmp_path, monkeypatch):
++    from gateway.session_kanban_restart import record_restart_interruption
++    from gateway.session_kanban_continue import pending_admission
++    record_restart_interruption(_policy(board), checkpoint={'session_id': 's1', 'request_id': board.request,
++                                                            'admission_id': 'a1', 'cause': 'restart'})
++    _target, checkpoint = pending_admission(board.db, board.params, board.request)
++    assert checkpoint is not None
++    old = '{"output": "[Command interrupted]", "exit_code": 130, "error": null}'
++    db = _session_db(tmp_path, [*[{'role': m['role'], 'content': m['content'], 'tool_calls': m.get('tool_calls')}
++                                  for m in _MID_TOOL],
++                                {'role': 'tool', 'content': old, 'tool_call_id': 'call-1'},
++                                {'role': 'assistant', 'content': 'stopped earlier'},
++                                {'role': 'user', 'content': 'a later turn'}])
++    assert _prepare(board, db, checkpoint, monkeypatch)['answered'] == 0
++    assert [m['content'] for m in db.get_messages_as_conversation('s1') if m['role'] == 'tool'] == [old]
++
++
+ def test_a_retried_ask_racing_the_first_writes_one_interrupted_result(board, tmp_path, monkeypatch):
+     import threading
+     from gateway import session_kanban_continue as cont
+-- 
+2.55.0
+

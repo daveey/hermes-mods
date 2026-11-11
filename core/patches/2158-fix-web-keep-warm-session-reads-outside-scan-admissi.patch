@@ -1,0 +1,131 @@
+From 583b2984bb3ccb8c7c9d85ac3dd798fed5df5909 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 16:53:53 -0800
+Subject: [PATCH] fix(web): keep warm session reads outside scan admission
+ [daveey]
+
+---
+ hermes_cli/session_list_flight.py             | 10 +++++++
+ hermes_cli/web_routers/sessions.py            | 30 +++++++++++++++----
+ .../test_profile_scan_http_admission.py       | 25 +++++++++++++++-
+ 3 files changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/session_list_flight.py b/hermes_cli/session_list_flight.py
+index 450e005b8b..3f30c52e30 100644
+--- a/hermes_cli/session_list_flight.py
++++ b/hermes_cli/session_list_flight.py
+@@ -118,6 +118,16 @@ class SingleFlightCache:
+             flight.done.set()
+         return self.copy(flight.value)
+ 
++    def peek(self, key: Hashable, stamp: Optional[tuple]) -> tuple[bool, Any]:
++        """Return a fresh completed result without joining a running computation."""
++        if stamp is None or self.ttl_s <= 0:
++            return False, None
++        with self._lock:
++            hit = self._done.get(key)
++            if hit is not None and hit[0] == stamp and self.clock() - hit[1] < self.ttl_s:
++                return True, self.copy(hit[2])
++        return False, None
++
+     def clear(self) -> None:
+         with self._lock:
+             self._done.clear()
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 972d72c1c6..c67f57260e 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -7,6 +7,8 @@ helpers are reached via the late-binding seam so monkeypatching keeps working.
+ """
+ 
+ import asyncio
++import functools
++import inspect
+ import json
+ import re
+ import sqlite3
+@@ -230,11 +232,29 @@ def get_sessions(
+ 
+ 
+ # Queue expensive list contenders before consuming the shared HTTP worker pool.
+-list_router.add_api_route(
+-    "/api/sessions",
+-    coalesced_read(get_sessions, admission_key=lambda args: args["profile"], max_concurrent=2),
+-    methods=["GET"],
+-)
++_sessions_admitted = coalesced_read(get_sessions, admission_key=lambda args: args["profile"], max_concurrent=2)
++
++
++def _peek_sessions(arguments):
++    try:
++        db_path = _session_db_path_for_profile(arguments["profile"])
++    except HTTPException:
++        return False, None  # normal implementation retains the validation error
++    return SESSION_LIST_CACHE.peek((str(db_path), *arguments.values()), data_stamp(db_path))
++
++
++@functools.wraps(_sessions_admitted)
++async def _sessions_http(*args, **kwargs):
++    from starlette.concurrency import run_in_threadpool
++    bound = inspect.signature(get_sessions).bind(*args, **kwargs)
++    bound.apply_defaults()
++    hit, value = await run_in_threadpool(_peek_sessions, bound.arguments)
++    if hit:
++        return value
++    return await _sessions_admitted(*args, **kwargs)
++
++
++list_router.add_api_route("/api/sessions", _sessions_http, methods=["GET"])
+ 
+ 
+ def _list_sessions_payload(
+diff --git a/tests/hermes_cli/test_profile_scan_http_admission.py b/tests/hermes_cli/test_profile_scan_http_admission.py
+index dfcd020ec9..473b9f93dc 100644
+--- a/tests/hermes_cli/test_profile_scan_http_admission.py
++++ b/tests/hermes_cli/test_profile_scan_http_admission.py
+@@ -45,6 +45,8 @@ async def test_profile_scan_burst_keeps_status_responsive(monkeypatch, tmp_path,
+     db_path.touch()
+     monkeypatch.setattr(sessions, '_session_db_path_for_profile', lambda profile: db_path)
+     monkeypatch.setattr(sessions, '_list_sessions_payload', payload)
++    monkeypatch.setattr(sessions, 'data_stamp', lambda path: ('stable',))
++    sessions.SESSION_LIST_CACHE.clear()
+     monkeypatch.setattr(profiles, 'profile_project_trees', projects)
+     monkeypatch.setattr(profiles, '_profile_state_db', lambda home: db_path)
+     monkeypatch.setattr(profiles, 'subagent_listing_scope', lambda *a, **kw: (False, None))
+@@ -69,7 +71,7 @@ async def test_profile_scan_burst_keeps_status_responsive(monkeypatch, tmp_path,
+     limiter.total_tokens = 2
+     try:
+         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+-            cached_route = param != 'limit'
++            cached_route = param != 'limit' or route == '/api/sessions'
+             if cached_route:
+                 release.set()
+                 warm = await client.get(route, params={param: 99})
+@@ -108,3 +110,24 @@ async def test_profile_scan_burst_keeps_status_responsive(monkeypatch, tmp_path,
+             assert (await client.get('/api/profiles/sessions?archived=bogus')).status_code == 400
+     finally:
+         limiter.total_tokens = previous
++        sessions.SESSION_LIST_CACHE.clear()
++
++
++def test_session_list_peek_requires_fresh_matching_stamp():
++    from hermes_cli.session_list_flight import SingleFlightCache, copy_session_list
++    now = [0.0]
++    cache = SingleFlightCache(clock=lambda: now[0], copy=copy_session_list)
++    assert cache.peek('missing', ('a',)) == (False, None)
++    cache.get('key', ('a',), lambda: {'sessions': [{'id': 'first'}]})
++    found, value = cache.peek('key', ('a',))
++    assert found
++    value['sessions'][0]['id'] = 'changed'
++    assert cache.peek('key', ('a',))[1]['sessions'][0]['id'] == 'first'
++    assert cache.peek('key', ('b',)) == (False, None)
++    assert cache.peek('key', None) == (False, None)
++    cache.ttl_s = 0
++    assert cache.peek('key', ('a',)) == (False, None)
++    cache.ttl_s = 2
++    now[0] = 2.0
++    assert cache.peek('key', ('a',)) == (False, None)
++
+-- 
+2.55.0
+

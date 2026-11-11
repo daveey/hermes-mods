@@ -1,0 +1,202 @@
+From e681f6971d43ee866da774c17c2058d022963d9d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:25:46 +0000
+Subject: [PATCH] fix(kanban): open repair work for expired missing parents
+ [daveey]
+
+---
+ hermes_cli/kanban_db_graph.py                 | 37 +++++++++-
+ .../test_kanban_missing_parent_detector.py    | 72 +++++++++++++++++++
+ .../test_kanban_restart_before_push.py        | 47 ++++++++++++
+ 3 files changed, 155 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_missing_parent_detector.py
+ create mode 100644 tests/hermes_cli/test_kanban_restart_before_push.py
+
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index 520cff8255..17d83253e1 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -34,13 +34,48 @@ def note_missing_parents(
+     )
+     if cur.rowcount != 1:
+         return False
++    repair_id = missing_parent_repair(conn, task_id, missing)
+     kb._append_event(conn, task_id, "blocked", {
+-        "reason": reason + f" (unlink it with `hermes kanban unlink <parent> {task_id}`, then unblock)",
++        "reason": reason + f"; repair card {repair_id} owns investigation and recovery",
+         "kind": "transient", "source": "parent_missing", "parents": missing,
++        "repair_task_id": repair_id,
+     })
+     return True
+ 
+ 
++def missing_parent_repair(conn: sqlite3.Connection, task_id: str, missing: list[str]) -> str:
++    """Compose repair admission in the readiness transaction, once per open incident."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_triage_sweep import _supervisor_profile
++    existing = conn.execute(
++        "SELECT t.id FROM task_events e JOIN tasks t "
++        "ON t.id = json_extract(e.payload, '$.repair_task_id') "
++        "WHERE e.task_id = ? AND e.kind = 'blocked' "
++        "AND json_extract(e.payload, '$.source') = 'parent_missing' "
++        "AND t.status NOT IN ('done', 'archived') ORDER BY e.id DESC LIMIT 1", (task_id,),
++    ).fetchone()
++    if existing is not None:
++        return existing['id']
++    # create_task opts into a savepoint. Failure rolls back the child's block
++    # too, leaving the next readiness tick free to retry the whole transition.
++    task = conn.execute("SELECT title, tenant FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return kb.create_task(
++        conn, title=f"Recover missing dependencies for {task_id}",
++        body=(f"Card {task_id} ({task['title']}) has waited at least "
++              f"{kb.PARENT_MISSING_BLOCK_SECONDS} seconds for unknown parent(s): "
++              + ", ".join(missing) + ".\n\n"
++              "Inspect the owning gateway, full Board replica and authoritative Board row evidence. "
++              "A missing local row is not proof of Board loss; check sync freshness and pickup eligibility. "
++              "Recover missing publication or dependency state, then unblock the child. "
++              "Do not unlink a required dependency merely to make it run. Record evidence and verify "
++              "the child resumes. This is agent-owned repair, not a human decision."),
++        assignee=_supervisor_profile(), created_by="missing-parent-detector",
++        workspace_kind="scratch", tenant=task['tenant'],
++        requires=["terminal", "file", "kanban"],
++        creator_task_id=task_id,
++    )
++
++
+ def inherit_creator_origin(
+     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
+     created_at: int,
+diff --git a/tests/hermes_cli/test_kanban_missing_parent_detector.py b/tests/hermes_cli/test_kanban_missing_parent_detector.py
+new file mode 100644
+index 0000000000..11eabd40b4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_missing_parent_detector.py
+@@ -0,0 +1,72 @@
++"""Expired missing dependencies get agent-owned repair work, not just a red child."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_cross_gateway_parents as support
++
++local = support.local
++
++
++def test_expired_missing_parent_files_one_repair_card(local):
++    child = kb.create_task(local, title="dependent", assignee="worker")
++    support._link_raw(local, "t_unknown", child)
++    kb.recompute_ready(local)
++    assert not local.execute("SELECT id FROM tasks WHERE created_by = 'missing-parent-detector'").fetchall()
++    with kb.write_txn(local):
++        local.execute("UPDATE task_events SET created_at = created_at - 601 WHERE task_id = ?", (child,))
++    kb.recompute_ready(local)
++    cards = local.execute("SELECT * FROM tasks WHERE created_by = 'missing-parent-detector'").fetchall()
++    assert len(cards) == 1
++    repair = cards[0]
++    assert repair['status'] == 'ready'
++    assert repair['human_request'] is None
++    assert child in repair['body'] and 't_unknown' in repair['body']
++    assert kb.parent_ids(local, repair['id']) == []
++    event = json.loads(support._events(local, child, 'blocked')[-1]['payload'])
++    assert event['repair_task_id'] == repair['id']
++    kb.recompute_ready(local)
++    assert local.execute("SELECT count(*) FROM tasks WHERE created_by = 'missing-parent-detector'").fetchone()[0] == 1
++
++
++def _expired(local):
++    child = kb.create_task(local, title="dependent", assignee="worker")
++    support._link_raw(local, "t_unknown", child)
++    kb.recompute_ready(local)
++    with kb.write_txn(local):
++        local.execute("UPDATE task_events SET created_at = created_at - 601 WHERE task_id = ?", (child,))
++    return child
++
++
++@pytest.mark.parametrize('closed', [False, True])
++def test_reopened_child_reuses_open_repair_but_replaces_closed(local, closed):
++    child = _expired(local)
++    kb.recompute_ready(local)
++    first = local.execute("SELECT id FROM tasks WHERE created_by = 'missing-parent-detector'").fetchone()[0]
++    with kb.write_txn(local):
++        if closed:
++            local.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (first,))
++        local.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
++    kb.recompute_ready(local)
++    repairs = local.execute("SELECT id FROM tasks WHERE created_by = 'missing-parent-detector'").fetchall()
++    assert len(repairs) == (2 if closed else 1)
++
++
++def test_failed_repair_admission_rolls_back_block(local, monkeypatch):
++    child = _expired(local)
++    def fail(*args, **kwargs):
++        raise RuntimeError('injected admission failure')
++    monkeypatch.setattr(kb, 'create_task', fail)
++    with pytest.raises(RuntimeError, match='injected admission'):
++        kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == 'todo'
++    assert not support._events(local, child, 'blocked')
++
++
++def test_returned_parent_does_not_raise_repair(local):
++    parent = kb.create_task(local, title="parent", assignee="worker")
++    child = kb.create_task(local, title="child", assignee="worker", parents=[parent])
++    kb.recompute_ready(local)
++    assert kb.parent_states(local, child) == [(parent, 'ready')]
++    assert not local.execute("SELECT id FROM tasks WHERE created_by = 'missing-parent-detector'").fetchall()
+diff --git a/tests/hermes_cli/test_kanban_restart_before_push.py b/tests/hermes_cli/test_kanban_restart_before_push.py
+new file mode 100644
+index 0000000000..43d154b410
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_restart_before_push.py
+@@ -0,0 +1,47 @@
++"""A fresh producer exits before push; its durable card/edge reach Board on restart.
++
++The transport is FakeService, not production Board. This is preventative coverage,
++not evidence the historical incident lost an outbox operation.
++"""
++import json
++import subprocess
++import sys
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++
++
++def test_worker_created_hub_parent_survives_process_exit_before_push(gws, monkeypatch):
++    hub, worker = gws
++    worker.enter()
++    worker.conn.close()
++    code = '''
++import json
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++conn = kbc.connect()
++parent = kb.create_task(conn, title="hub helper", assignee="default", runs_on=["machine:hub"])
++child = kb.create_task(conn, title="dependent worker", assignee="default", parents=[parent])
++print(json.dumps([parent, child]))
++conn.close()
++'''
++    result = subprocess.run([sys.executable, '-c', code], capture_output=True,
++                            text=True, encoding='utf-8', timeout=30, check=True)
++    parent, child = json.loads(result.stdout.strip().splitlines()[-1])
++    worker.conn = kbc.connect(worker.home / 'kanban.db')
++    row = worker.conn.execute('SELECT runs_on FROM tasks WHERE id = ?', (parent,)).fetchone()
++    assert json.loads(row[0]) == ['machine:hub']
++    worker.round()
++    hub.round()
++    hub.enter()
++    monkeypatch.setattr(wn, 'pickup_mode', lambda: 'explicit')
++    assert wn.pickup(hub.conn, budget=1) == [parent]
++    assert kb.get_task(hub.conn, parent).title == 'hub helper'
++    worker.enter()
++    assert kb.parent_states(worker.conn, child) == [(parent, 'ready')]
++    assert kb.get_task(worker.conn, child).status == 'todo'
+-- 
+2.55.0
+

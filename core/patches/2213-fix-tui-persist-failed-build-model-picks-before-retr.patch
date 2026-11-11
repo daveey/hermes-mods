@@ -1,0 +1,351 @@
+From 6869924c2fee57647e2e0bcf88db211d2c097ecc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:22:41 +0000
+Subject: [PATCH] fix(tui): persist failed-build model picks before retry
+ [daveey]
+
+Agent-less picks updated only memory, so the next allocation had no committed authority to replace an exact pin. Record the canonical ordered intent under the stored session key before publishing the override, serialized with build admission. Existing canonical mutation coverage did not cross the legacy failed-build setter. Add composed allocator and ordering/refusal regressions plus bounded chained build diagnostics.
+---
+ .../test_agentless_model_intent.py            | 183 ++++++++++++++++++
+ tests/tui_gateway/test_build_diagnostics.py   |  40 ++++
+ tui_gateway/build_diagnostics.py              |  25 +++
+ tui_gateway/model_switch.py                   |  29 ++-
+ tui_gateway/session_registry.py               |   4 +-
+ 5 files changed, 278 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tui_gateway/test_agentless_model_intent.py
+ create mode 100644 tests/tui_gateway/test_build_diagnostics.py
+ create mode 100644 tui_gateway/build_diagnostics.py
+
+diff --git a/tests/tui_gateway/test_agentless_model_intent.py b/tests/tui_gateway/test_agentless_model_intent.py
+new file mode 100644
+index 0000000000..b6859396ff
+--- /dev/null
++++ b/tests/tui_gateway/test_agentless_model_intent.py
+@@ -0,0 +1,183 @@
++"""Failed-build picks cross the TUI setter, durable intent and real allocator."""
++import json
++import threading
++from contextlib import nullcontext
++
++import pytest
++
++from agent.model_routing_state import RoutingState
++from hermes_cli.model_switch import ModelSwitchResult
++from hermes_state import SessionDB
++from tests.agent import test_route_switch_intent as routes
++from tests.tui_gateway.test_failed_agent_build_retry import failed_session
++from tui_gateway import server
++
++managed = routes.managed
++routing_home = routes.routing_home
++streaming_route = routes.streaming_route
++destinations = routes.destinations
++seams = routes.seams
++
++
++@pytest.fixture
++def picking(destinations, seams, tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('pin', 'desktop', model='anthropic-deep')
++    session = failed_session(tmp_path, 'ui-id')
++    session['session_key'] = 'pin'  # UI id is NOT the allocation/transcript id.
++    session['resume_runtime_overrides'] = {
++        'model_override': {'model': 'anthropic-deep', 'provider': 'anthropic'},
++        'provider_override': 'anthropic', 'keep': 'resume-history'}
++    monkeypatch.setattr(server, '_session_profile_runtime_scope', lambda *a: nullcontext())
++    monkeypatch.setattr(server, '_current_model_runtime', lambda *a: ('anthropic', 'anthropic-deep', '', ''))
++    def preflight(model, provider, *a, **kw):
++        result = ModelSwitchResult(success=True, new_model=model, target_provider=provider or 'anthropic')
++        return result, result, {}, None
++    monkeypatch.setattr(server, '_preflight_model_switch', preflight)
++    monkeypatch.setattr(server, '_expensive_model_confirm', lambda *a: None)
++    monkeypatch.setattr(server, '_persist_live_session_runtime', lambda *a: None)
++    monkeypatch.setattr('hermes_cli.observability.shared_metrics_events.record_model_switch', lambda **kw: None)
++    yield db, session
++    server._sessions.pop('ui-id', None)
++    db.close()
++
++
++def test_failed_build_pick_rebuilds_new_exact_route(picking, tmp_path, monkeypatch):
++    db, session = picking
++    routes._build('anthropic-deep', session_db=db)
++    state = RoutingState(tmp_path / 'model-routing.sqlite3')
++    assert state.peek('pin', 'deep')['exact_pin']
++    def rebuild(sid, current):
++        kwargs = current['resume_runtime_overrides']
++        assert kwargs['keep'] == 'resume-history'
++        model = kwargs['model_override']['model']
++        try:
++            current['agent'] = routes._build(model, session_db=db)
++        except Exception as exc:
++            current['agent_error'] = str(exc)
++        finally:
++            current['agent_ready'].set()
++    monkeypatch.setattr(server, '_start_agent_build', rebuild)
++    result = server._set_model(1, {'session_id': 'ui-id', 'confirm_expensive_model': True},
++                               'model', 'z-anthropic-deep --provider anthropic --session', session)
++    assert 'error' not in result, result
++    assert session['agent'].model == 'z-anthropic-deep'
++    row = state.peek('pin', 'deep')
++    assert (row['selected_model'], row['reason'], row['pin_source']) == (
++        'z-anthropic-deep', 'explicit-switch', 'explicit')
++    assert db.route_switch_intent('pin') is None
++    assert db.route_switch_intent('ui-id') is None
++
++
++def test_later_pick_supersedes_previous_tuple(picking):
++    db, session = picking
++    def raw(model):
++        return f'{model} --provider anthropic --session'
++    server._apply_model_switch('ui-id', session, raw('z-anthropic-deep'))
++    first = json.loads(db.route_switch_intent('pin'))
++    server._apply_model_switch('ui-id', session, raw('anthropic-standard'))
++    second = json.loads(db.route_switch_intent('pin'))
++    assert second['model'] == 'anthropic-standard'
++    assert second['event']['store'] == first['event']['store']
++    assert second['event']['seq'] > first['event']['seq']
++    assert session['model_override']['model'] == second['model']
++
++
++def test_unconfirmed_pick_records_nothing(picking, monkeypatch):
++    db, session = picking
++    monkeypatch.setattr(server, '_expensive_model_confirm', lambda *a: {'confirm_required': True})
++    result = server._apply_model_switch('ui-id', session, 'z-anthropic-deep --provider anthropic --session')
++    assert result['confirm_required']
++    assert db.route_switch_intent('pin') is None
++    assert 'model_override' not in session
++
++
++def test_intent_write_failure_does_not_publish_override(picking, monkeypatch):
++    db, session = picking
++    def refused(*a):
++        raise RuntimeError('intent write refused')
++    monkeypatch.setattr('agent.model_routing_switch_intent.record_in_transaction', refused)
++    with pytest.raises(RuntimeError, match='intent write refused'):
++        server._apply_model_switch('ui-id', session, 'z-anthropic-deep --provider anthropic --session')
++    assert 'model_override' not in session
++    assert db.route_switch_intent('pin') is None
++
++
++@pytest.mark.parametrize('case', ['no-key', 'internal', 'once', 'unavailable-db'])
++def test_non_commits_and_unavailable_store(picking, monkeypatch, case):
++    db, session = picking
++    options = {}
++    raw = 'z-anthropic-deep --provider anthropic --session'
++    if case == 'no-key':
++        session.pop('session_key')
++    elif case == 'internal':
++        options['pin_session_override'] = False
++    elif case == 'once':
++        raw = 'z-anthropic-deep --provider anthropic --once'
++    else:
++        monkeypatch.setattr(server, '_session_db', lambda *a: nullcontext(None))
++    if case in ('once', 'unavailable-db'):
++        with pytest.raises(ValueError):
++            server._apply_model_switch('ui-id', session, raw, **options)
++        assert 'model_override' not in session
++    else:
++        server._apply_model_switch('ui-id', session, raw, **options)
++    assert db.route_switch_intent('pin') is None
++
++
++def test_intent_uses_stored_generation_and_allows_new_lazy_row(picking):
++    db, session = picking
++    db._execute_write(lambda conn: conn.execute("UPDATE sessions SET runtime_generation=7 WHERE id='pin'"))
++    server._apply_model_switch('ui-id', session, 'z-anthropic-deep --provider anthropic --session')
++    assert json.loads(db.route_switch_intent('pin'))['generation'] == 7
++    session['session_key'] = 'fresh-unbuilt'
++    server._apply_model_switch('ui-id', session, 'z-anthropic-deep --provider anthropic --session')
++    assert json.loads(db.route_switch_intent('fresh-unbuilt'))['generation'] == 0
++
++
++def test_concurrent_picks_publish_in_commit_order(picking, monkeypatch):
++    db, session = picking
++    committed = threading.Event()
++    second_entering = threading.Event()
++    release = threading.Event()
++    lock = threading.Lock()
++    errors = []
++    class ObservedLock:
++        def __enter__(self):
++            if threading.current_thread().name == 'pick-B':
++                second_entering.set()
++            lock.acquire()
++        def __exit__(self, *args):
++            lock.release()
++    session['agent_build_lock'] = ObservedLock()
++    monkeypatch.setattr(server, '_session_db', lambda *a: nullcontext(db))
++    original = db._execute_write
++    def write(fn):
++        result = original(fn)
++        if threading.current_thread().name == 'pick-A':
++            committed.set()
++            assert release.wait(5)
++        return result
++    monkeypatch.setattr(db, '_execute_write', write)
++    def pick(model):
++        try:
++            server._apply_model_switch('ui-id', session, f'{model} --provider anthropic --session')
++        except Exception as exc:
++            errors.append(exc)
++    first = threading.Thread(target=pick, args=('z-anthropic-deep',), name='pick-A')
++    second = threading.Thread(target=pick, args=('anthropic-standard',), name='pick-B')
++    first.start()
++    try:
++        assert committed.wait(5)
++        second.start()
++        assert second_entering.wait(5)
++        assert json.loads(db.route_switch_intent('pin'))['model'] == 'z-anthropic-deep'
++    finally:
++        release.set()
++        first.join(5)
++        if second.ident is not None:
++            second.join(5)
++    assert not first.is_alive() and not second.is_alive()
++    assert not errors
++    intent = json.loads(db.route_switch_intent('pin'))
++    assert intent['model'] == session['model_override']['model'] == 'anthropic-standard'
+diff --git a/tests/tui_gateway/test_build_diagnostics.py b/tests/tui_gateway/test_build_diagnostics.py
+new file mode 100644
+index 0000000000..7b6a502598
+--- /dev/null
++++ b/tests/tui_gateway/test_build_diagnostics.py
+@@ -0,0 +1,40 @@
++"""Build diagnostics retain the failing call site without unbounded payloads."""
++import logging
++
++from tui_gateway.build_diagnostics import log_build_failure
++
++
++def test_bounded_traceback_retains_innermost_frame(caplog):
++    def failing_build(depth):
++        local_secret = 'not-a-log-field'
++        if depth:
++            return failing_build(depth - 1)
++        raise ValueError('failure ' + 'x' * 20000 + local_secret)
++    try:
++        failing_build(35)
++    except ValueError as exc:
++        log_build_failure(logging.getLogger('build-diagnostic-test'), 'ui-id', 'stored-id', exc)
++    assert caplog.records[-1].exc_info is not None
++    message = caplog.text
++    assert 'ui-id (stored-id): ValueError: failure' in message
++    assert 'Traceback (most recent call last;' in message
++    assert message.count('in failing_build') == 20
++    assert 'not-a-log-field' not in message
++    assert 'raise ValueError' not in message
++    assert len(message) < 8500
++
++
++def test_wrapped_failure_keeps_cause_frames(caplog):
++    def inner_failure():
++        raise ValueError('original cause')
++    try:
++        try:
++            inner_failure()
++        except ValueError as exc:
++            raise RuntimeError('outer wrapper') from exc
++    except RuntimeError as exc:
++        log_build_failure(logging.getLogger('build-diagnostic-test'), 'ui', 'stored', exc)
++    assert 'in inner_failure' in caplog.text
++    assert 'ValueError: original cause' in caplog.text
++    assert 'RuntimeError: outer wrapper' in caplog.text
++    assert caplog.records[-1].exc_info[2] is None
+diff --git a/tui_gateway/build_diagnostics.py b/tui_gateway/build_diagnostics.py
+new file mode 100644
+index 0000000000..900ee45a11
+--- /dev/null
++++ b/tui_gateway/build_diagnostics.py
+@@ -0,0 +1,25 @@
++"""Bounded build-failure logging, without session dictionaries or frame locals."""
++import traceback
++
++
++class BuildFailureTraceback(Exception):
++    """Log-only bounded rendering; never retains the original exception or frames."""
++
++
++def log_build_failure(logger, sid, key, exc):
++    # Use a detached diagnostic exception for exc_info. Passing the original
++    # exception lets formatters expand arbitrary provider payloads and chains.
++    parts = []
++    current = exc
++    for _ in range(3):
++        frames = traceback.extract_tb(current.__traceback__, limit=-20)
++        stack = '\n'.join(f'  File "{f.filename}", line {f.lineno}, in {f.name}' for f in frames)
++        parts.append(f'{type(current).__name__}: {str(current)[:300]}\n{stack}')
++        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
++        if current is None:
++            break
++    diagnostic = BuildFailureTraceback(('Traceback (most recent call last; outer exception first):\n'
++                                       + '\nCaused by / during handling:\n'.join(parts))[:8000])
++    logger.warning('agent build failed for session %s (%s): %s: %s',
++                   sid, key, type(exc).__name__, str(exc)[:300],
++                   exc_info=(BuildFailureTraceback, diagnostic, None))
+diff --git a/tui_gateway/model_switch.py b/tui_gateway/model_switch.py
+index 8fb89dd881..c27467c629 100644
+--- a/tui_gateway/model_switch.py
++++ b/tui_gateway/model_switch.py
+@@ -392,6 +392,29 @@ def _commit_recording_composer_profile(
+         raise
+ 
+ 
++def _commit_agentless_switch(session: dict, result, override: dict) -> None:
++    """Commit the explicit pick before publishing overrides or retrying a failed build.
++
++    The allocation belongs to the stored session key, never the UI transport id.
++    Use the same ordered event writer as the canonical model mutation; a missing
++    store must fail closed rather than acknowledge a pick the allocator cannot honour.
++    """
++    from agent.model_routing_switch_intent import record_in_transaction
++    key = session.get("session_key")
++    with session.setdefault("agent_build_lock", threading.Lock()):
++        if key:
++            with _session_db(session) as db:
++                if db is None:
++                    raise ValueError("Cannot persist model switch: session store unavailable")
++                def write(conn):
++                    row = conn.execute('SELECT runtime_generation FROM sessions WHERE id=?', (key,)).fetchone()
++                    record_in_transaction(conn, key, result.new_model, result.target_provider, row[0] if row else 0)
++                db._execute_write(write)
++        # Same lock as retry admission: two picks cannot commit A, commit/publish B,
++        # then publish A and build a tuple that no longer matches the newest intent.
++        session["model_override"] = override
++
++
+ def _apply_model_switch(
+     sid: str, session: dict, raw_input: str, *, confirm_expensive_model: bool = False,
+     pin_session_override: bool = True, parsed_flags: Any | None = None,
+@@ -439,9 +462,13 @@ def _apply_model_switch(
+     # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
+     # every same-profile session in one process, so os.environ would leak the switch to all.
+     if pin_session_override and isinstance(session, dict) and not one_turn:
+-        session["model_override"] = {
++        override = {
+             "model": result.new_model, "provider": result.target_provider,
+             "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}
++        if agent is None:
++            _commit_agentless_switch(session, result, override)
++        else:
++            session["model_override"] = override
+     if persist_global:
+         from hermes_cli.model_switch import persist_model_selection
+         persist_model_selection(result)
+diff --git a/tui_gateway/session_registry.py b/tui_gateway/session_registry.py
+index 0c58624da3..d7074076cc 100644
+--- a/tui_gateway/session_registry.py
++++ b/tui_gateway/session_registry.py
+@@ -309,8 +309,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             current["agent_error"] = str(e)
+             # Logged: a failed build otherwise leaves no trace, so a prompt waiting on it reads in agent.log as
+             # a message that "never ran" (the client only got an event, which a disconnect can lose). [daveey]
+-            logger.warning("agent build failed for session %s (%s): %s: %s",
+-                           sid, key, type(e).__name__, str(e)[:300])
++            from tui_gateway.build_diagnostics import log_build_failure
++            log_build_failure(logger, sid, key, e)
+             # A client can route "no provider is set up" to its setup flow instead of a dead-end
+             # error toast — but only if it can tell. The sentence is for the reader, the code is
+             # for the client; older clients keep matching the text.
+-- 
+2.55.0
+

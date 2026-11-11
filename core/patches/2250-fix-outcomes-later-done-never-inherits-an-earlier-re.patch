@@ -1,0 +1,215 @@
+From a1fc71167f72c35a4b79d07a91deb7847402e2fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:41:15 +0000
+Subject: [PATCH] fix(outcomes): later done never inherits an earlier receipt
+ [daveey]
+
+Review fixes: a new declared or derived done after a newer user request has
+unspecified acceptance; receipt validated before the goal judge on tool and
+CLI paths; CLI reports unpreservable evidence cleanly; tooltip labels deferred
+owners unverified.
+---
+ apps/desktop/src/lib/session-outcome.test.ts  |  8 +++++++
+ apps/desktop/src/lib/session-outcome.ts       |  5 +++-
+ hermes_cli/kanban.py                          | 10 ++++++++
+ hermes_state_outcome.py                       | 15 +++++++++++-
+ tests/hermes_state/test_completion_receipt.py | 23 +++++++++++++++++++
+ ...est_kanban_complete_receipt_entry_paths.py | 19 +++++++++++++++
+ tools/kanban_tools.py                         |  2 +-
+ tools/kanban_tools_completion.py              | 12 ++++++++++
+ 8 files changed, 91 insertions(+), 3 deletions(-)
+
+diff --git a/apps/desktop/src/lib/session-outcome.test.ts b/apps/desktop/src/lib/session-outcome.test.ts
+index 7ff3ae5b8d8..0ee5d9d492c 100644
+--- a/apps/desktop/src/lib/session-outcome.test.ts
++++ b/apps/desktop/src/lib/session-outcome.test.ts
+@@ -269,9 +269,17 @@ describe('completion receipt tooltip projection', () => {
+         state: 'pending',
+         owner: '@task:default@other/t_example',
+         reason: 'Accepted linked investigation.'
++      },
++      {
++        scope: 'later rollout',
++        state: 'deferred',
++        owner: '@task:default@other/t_later',
++        reason: 'Deferred to a named card.'
+       }
+     ]
+     const text = outcomeTooltip(outcome, r)!
++    expect(text).toContain('owner (unverified): @task:default@other/t_later')
++    expect(text).toContain('remaining pending: cause investigation · owner: @task:default@other/t_example')
+     expect(text).toContain('deferred: enforcement')
+     expect(text).toContain('User deferred; no execution authorized.')
+     expect(text).toContain('@task:default@other/t_example')
+diff --git a/apps/desktop/src/lib/session-outcome.ts b/apps/desktop/src/lib/session-outcome.ts
+index c731414b117..e55245ef193 100644
+--- a/apps/desktop/src/lib/session-outcome.ts
++++ b/apps/desktop/src/lib/session-outcome.ts
+@@ -251,8 +251,11 @@ const receiptTooltip = (outcome: SessionOutcome): string | null => {
+         return null
+       }
+ 
++      // Only pending owners are admitted against live ownership; a deferred owner is an unverified reference.
++      const ownerLabel = remaining.state === 'deferred' && remaining.owner !== null ? 'owner (unverified)' : 'owner'
++
+       lines.push(
+-        `  remaining ${remaining.state}: ${receiptValue(remaining.scope)} · owner: ${receiptValue(String(remaining.owner))} · ${receiptValue(remaining.reason)}`
++        `  remaining ${remaining.state}: ${receiptValue(remaining.scope)} · ${ownerLabel}: ${receiptValue(String(remaining.owner))} · ${receiptValue(remaining.reason)}`
+       )
+     }
+   }
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 2cf1ac627f0..947995ffc55 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1269,6 +1269,12 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+     metadata, rc = _parse_metadata_flag(raw_meta)
+     if rc:
+         return rc
++    if isinstance(metadata, dict) and "completion_receipt" in metadata:
++        from hermes_completion_receipt import validate_completion_receipt
++        try:  # structural refusal before the goal judge or any write
++            validate_completion_receipt(metadata["completion_receipt"])
++        except ValueError as receipt_err:
++            return _err(f"kanban complete: {receipt_err}", 1)
+     fail_msg: dict[str, str] = {}
+     with kbc.connect_closing() as conn:
+         def op(tid):
+@@ -1299,6 +1305,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
+                                  f"describing what was done (an empty completion is not evidence).")
+                 return False
++            except kb.ArtifactPreservationError as preserve_err:
++                # Receipt evidence could not be preserved durably: the completion rolled back.
++                fail_msg[tid] = f"cannot complete {tid}: {preserve_err}"
++                return False
+             except ValueError as receipt_err:
+                 if not str(receipt_err).startswith("completion_receipt"):
+                     raise
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index cec6c6e93fb..d366c9a1b2f 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -567,6 +567,17 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     from hermes_completion_receipt import historical_fields
+     historical = historical_fields(_parse((_row(db, sid) or {}).get("outcome_json")))
+     current = _derive_current(db, sid, ignore_live_turn=ignore_live_turn, pending_reply=pending_reply)
++    if current.get("kind") == "done":
++        # A declared done carries its own receipt (or none: unspecified). A derived
++        # done keeps the last receipt only while no newer user request arrived, i.e.
++        # it still describes the turn that declared it; later work is unspecified.
++        if current.get("source") == "declared":
++            return current
++        declared_at = (historical.get("completion_receipt_source") or {}).get("declared_at")
++        if not isinstance(declared_at, (int, float)) or db._read_one(
++                "SELECT 1 FROM messages WHERE session_id = ? AND active = 1 AND role = 'user' AND timestamp > ?"
++                " LIMIT 1", (sid, declared_at)):
++            return current
+     return {**historical, **current}
+ 
+ 
+@@ -661,7 +672,9 @@ def declare_outcome(sid: str, outcome: dict, *, db: Any = None) -> dict[str, Any
+                 "profile": get_active_profile_name(), "gateway": gateway_names()[0] or None,
+                 "declared_at": declared["at"],
+             }
+-        else:
++        elif declared["kind"] != "done":
++            # A new non-done state keeps the last receipt as history. A new done
++            # without a receipt is new work whose artifact acceptance is unspecified.
+             from hermes_completion_receipt import historical_fields
+             declared.update(historical_fields(_parse((_row(handle, tip) or {}).get("outcome_json"))))
+         # Persist intent before touching the separate cron store. A failed DB
+diff --git a/tests/hermes_state/test_completion_receipt.py b/tests/hermes_state/test_completion_receipt.py
+index eb8abee1acf..156c12bbd43 100644
+--- a/tests/hermes_state/test_completion_receipt.py
++++ b/tests/hermes_state/test_completion_receipt.py
+@@ -215,3 +215,26 @@ def test_sidebar_rows_and_cli_json_project_receipt_and_source(db, monkeypatch, c
+     printed = json.loads(capsys.readouterr().out)
+     assert printed["outcome"]["completion_receipt"] == value
+     assert printed["outcome"]["completion_receipt_source"] == row["outcome"]["completion_receipt_source"]
++
++
++@pytest.mark.parametrize("later", ["declared", "derived"])
++def test_later_plain_done_does_not_inherit_earlier_receipt(db, monkeypatch, later):
++    """A receipt belongs to the declaration that made it, never to a later done."""
++    import hermes_state_outcome as so
++
++    monkeypatch.setattr(so, "_live_turn", lambda *_: False)
++    fixtures.turn(db)
++    so.declare_outcome("chat", {"kind": "done", "summary": "A delivered.",
++                                "completion_receipt": receipt("delivered")}, db=db)
++    fixtures.say(db, "user", "Now do B")
++    if later == "declared":
++        out = so.declare_outcome("chat", {"kind": "done", "summary": "B plain"}, db=db)
++    else:
++        fixtures.say(db, "assistant", fixtures.SUMMARY)
++        out = so.refresh_outcome("chat", "manual", db=db)
++    assert out["kind"] == "done"
++    assert "completion_receipt" not in out and "completion_receipt_source" not in out
++    stored = so.get_outcome("chat", db=db)
++    assert "completion_receipt" not in stored
++    row = next(r for r in db.list_sessions_rich(limit=5) if r["id"] == "chat")
++    assert "completion_receipt" not in row["outcome"]
+diff --git a/tests/tools/test_kanban_complete_receipt_entry_paths.py b/tests/tools/test_kanban_complete_receipt_entry_paths.py
+index 104b1eb3649..c13321f969f 100644
+--- a/tests/tools/test_kanban_complete_receipt_entry_paths.py
++++ b/tests/tools/test_kanban_complete_receipt_entry_paths.py
+@@ -178,3 +178,22 @@ def test_terminal_subprocess_path_rejects_then_admits(board, tmp_path):
+     good = _subprocess(tid, value, tmp_path)
+     assert good.returncode == 0, good
+     assert _stored_receipt(board, tid)["completion_receipt"] == value
++
++
++def test_malformed_receipt_refused_before_goal_judge(board, monkeypatch):
++    """No judge call (and so no judge-driven park) for a structurally invalid receipt."""
++    from hermes_cli import kanban as cli
++    from tools import kanban_tools as kt
++
++    def judge(*_a, **_k):
++        raise AssertionError("goal judge consulted before receipt validation")
++
++    monkeypatch.setattr(kt, "_goal_gate", judge)
++    monkeypatch.setattr(cli, "_goal_gate_error", judge)
++    tid = _task(board, monkeypatch)
++    before = _state(board, tid)
++    assert "completion_receipt" in _direct(_args(MALFORMED))["error"]
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++    assert _cli(tid, MALFORMED) != 0
++    assert _state(board, tid) == before
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index f56e1d20396..488778c814d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -893,7 +893,7 @@ def _handle_complete(args: dict, **kw) -> str:
+     if artifacts:
+         metadata = _merge_artifacts(metadata, artifacts)
+     _check(summary or result, "provide at least one of: summary (preferred), result", "empty")
+-    _require_dict_metadata(metadata)
++    _kc.require_completion_metadata(metadata, _require_dict_metadata)  # dict + receipt shape before the judge
+     metadata = _stamp_worker_session_metadata(tid, metadata)
+     with _board(args.get("board")) as (kb, conn):
+         from hermes_cli import kanban_foreign_card as _kfc
+diff --git a/tools/kanban_tools_completion.py b/tools/kanban_tools_completion.py
+index 8f3c210ab8b..350d5700bb6 100644
+--- a/tools/kanban_tools_completion.py
++++ b/tools/kanban_tools_completion.py
+@@ -71,3 +71,15 @@ def pr_acceptance_refused(conn, tid: str, mark: int) -> bool:
+     except (TypeError, ValueError):
+         return False
+     return isinstance(payload, dict) and payload.get("ok") is False and not payload.get("waived")
++
++
++def require_completion_metadata(metadata, require_dict) -> None:
++    """``require_dict(metadata)``, then the receipt's structure, before the goal judge or any write.
++
++    Owner admission still runs inside canonical ``complete_task``; this only refuses a malformed
++    ``completion_receipt`` early so no judge call (and no judge-driven park) precedes the refusal.
++    """
++    require_dict(metadata)
++    if isinstance(metadata, dict) and "completion_receipt" in metadata:
++        from hermes_completion_receipt import validate_completion_receipt
++        validate_completion_receipt(metadata["completion_receipt"])
+-- 
+2.55.0
+

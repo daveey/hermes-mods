@@ -1,0 +1,281 @@
+From 16867e61c541665ddbd31a1b2c7dfcaf00702451 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:14:28 +0000
+Subject: [PATCH] fix(update): hold the pinned-checkout verdict through
+ recovery, the manual sweep and migration [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review of the two commits before this one found paths that did not share the verdict:
+
+- `python -m` puts the working directory ahead of PYTHONPATH unless safe-path mode is on;
+  _gateway_code_root now probes in the interpreter's order and only for a plain
+  `python -m …` launch (other interpreter options can change the import path), so a
+  gateway started inside checkout A with PYTHONPATH naming B is read as A.
+- the manual-process sweep stopped a pinned unit's gateway whenever its unit PID lookup
+  failed; it now drops gateways on another checkout first.
+- restart-abort recovery restarted every planned profile it had not seen restarted; its
+  partition now reads each profile's live gateway itself (it can run before the restart
+  phase looked at any unit) and lists a pinned one as skipped with the reason.
+- the post-update multiplex migration could fold (stop and uninstall) a pinned unit that is
+  not `gateway.standalone`; a code-root guard blocks it.
+- a supervisor that cannot be disarmed (systemctl stop / launchctl bootout failing) raised a
+  refusal without gateway names, so its deferrals never built a streak.
+---
+ hermes_cli/gateway_migrate_guards.py          | 12 +++++
+ hermes_cli/update_cmd_fleet.py                | 11 ++++-
+ hermes_cli/update_cmd_posix_pause.py          |  6 +--
+ hermes_cli/update_fleet_scope.py              | 38 ++++++++++++++++
+ hermes_cli/update_receipt.py                  | 19 +++++---
+ .../hermes_cli/test_update_pause_deferrals.py |  8 ++++
+ .../test_update_pause_pinned_runtime.py       | 45 +++++++++++++++++++
+ 7 files changed, 129 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/gateway_migrate_guards.py b/hermes_cli/gateway_migrate_guards.py
+index d39f8b667bd..2a01a80e70c 100644
+--- a/hermes_cli/gateway_migrate_guards.py
++++ b/hermes_cli/gateway_migrate_guards.py
+@@ -151,10 +151,22 @@ def _guard_home_tree(plan: MigrationPlan, profile: ProfileGateway) -> Optional[s
+             f"the multiplexer would serve {profile.home} instead of the live home.")
+ 
+ 
++def _guard_code_root(plan: MigrationPlan, profile: ProfileGateway) -> Optional[str]:
++    """A gateway pinned to its own core (an Ask Eve pinned owner) must not be folded into a
++    multiplexer running this checkout: that would silently drop its pin. [daveey]"""
++    from hermes_cli.update_fleet_scope import gateway_foreign_code_root
++    root = gateway_foreign_code_root(profile.pid or 0, profile.runtime_home or profile.home)
++    if root is None:
++        return None
++    return (f"Profile '{profile.name}' runs its gateway from another checkout ({root}): "
++            "the multiplexer would serve it from this one instead of its pinned code.")
++
++
+ _AUTO_MIGRATION_GUARDS: tuple[Callable[[MigrationPlan, ProfileGateway], Optional[str]], ...] = (
+     _guard_service_domain,
+     _guard_unix_user,
+     _guard_home_tree,
++    _guard_code_root,
+ )
+ 
+ 
+diff --git a/hermes_cli/update_cmd_fleet.py b/hermes_cli/update_cmd_fleet.py
+index 8fc8b5bb9da..307bdf74476 100644
+--- a/hermes_cli/update_cmd_fleet.py
++++ b/hermes_cli/update_cmd_fleet.py
+@@ -1083,6 +1083,8 @@ def _gateway_recovery_partition(plan, *, skip_profiles: set[str] | None = None)
+     skip_profiles = skip_profiles or set()
+     candidates: dict[str, str] = {}
+     skipped: list[dict] = []
++    from hermes_cli.update_fleet_scope import profiles_on_another_checkout
++    pinned = profiles_on_another_checkout()  # recovery would only bounce these onto their pin [daveey]
+     with _best_effort('Could not prepare fresh gateway restart profiles: %s'):
+         for runtime in getattr(plan, "runtimes", ()) or ():
+             kind = getattr(runtime, "kind", None)
+@@ -1093,6 +1095,10 @@ def _gateway_recovery_partition(plan, *, skip_profiles: set[str] | None = None)
+             if kind == "gateway":
+                 if profile in skip_profiles:
+                     continue
++                if profile in pinned:
++                    skipped.append({"profile": profile, "kind": "gateway", "supervisor": str(supervisor),
++                                    "reason": f"runs its own checkout ({pinned[profile]}), which this update does not change"})
++                    continue
+                 if supervisor in _FRESH_RESTART_SUPERVISORS:
+                     candidates.setdefault(profile, str(supervisor))
+                     continue
+@@ -1555,7 +1561,10 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
+     from hermes_cli.update_cmd_posix_pause import already_restarted
+     # Plus the gateways this update paused and already restarted on the new code.
+     service_pids = _get_service_pids(all_profiles=True) | already_restarted()["pids"]
+-    manual_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
++    from hermes_cli.update_fleet_scope import drop_gateways_on_another_checkout
++    # A pinned unit's gateway reaches this sweep whenever its unit PID lookup failed above. [daveey]
++    manual_pids = drop_gateways_on_another_checkout(
++        find_gateway_pids(exclude_pids=service_pids, all_profiles=True))
+     profile_processes = {
+         proc.pid: proc
+         for proc in find_profile_gateway_processes(exclude_pids=service_pids)
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index ca58cf208d5..4dd4d641891 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -353,13 +353,13 @@ def _stop_unit(unit: dict) -> None:
+     from hermes_cli.update_cmd_fleet_unit_budget import UNIT_JOB_STILL_RUNNING, run_unit_job
+     cmd = _manage_cmd(unit["scope"])
+     if cmd is None:
+-        raise PauseRefused(f"no privilege to stop system unit {unit['unit']}")
++        raise PauseRefused(f"no privilege to stop system unit {unit['unit']}", [unit["unit"]])
+     result = run_unit_job(cmd, _scope_cmd(unit), "stop", unit["unit"], timeout=_STOP_TIMEOUT_S)
+     if result.returncode == UNIT_JOB_STILL_RUNNING and not _alive(unit["pid"], unit.get("ct")) \
+             and _unit_main_pid(_scope_cmd(unit), unit["unit"]) <= 0:
+         return
+     if result.returncode != 0:
+-        raise PauseRefused(f"systemctl stop {unit['unit']} failed: {(result.stderr or '').strip()}")
++        raise PauseRefused(f"systemctl stop {unit['unit']} failed: {(result.stderr or '').strip()}", [unit["unit"]])
+ 
+ 
+ def _start_unit(unit: dict) -> int:
+@@ -394,7 +394,7 @@ def _stop_job(job: dict, *, drained: bool = False) -> None:
+     _wait_gone([job["pid"]], 30.0)
+     # KeepAlive may have respawned the drained gateway already: the job, not the old PID, decides.
+     if result.returncode != 0 and (_locate_launchd_gateway_service(job["label"])[1] or 0) > 0:
+-        raise PauseRefused(f"launchctl bootout {job['label']} failed: {(result.stderr or '').strip()}")
++        raise PauseRefused(f"launchctl bootout {job['label']} failed: {(result.stderr or '').strip()}", [job["label"]])
+ 
+ 
+ def _start_job(job: dict) -> None:
+diff --git a/hermes_cli/update_fleet_scope.py b/hermes_cli/update_fleet_scope.py
+index 4fc3939233d..6b3629392dd 100644
+--- a/hermes_cli/update_fleet_scope.py
++++ b/hermes_cli/update_fleet_scope.py
+@@ -179,6 +179,44 @@ def gateway_foreign_code_root(pid: int, home) -> Path | None:
+     return None
+ 
+ 
++def profiles_on_another_checkout() -> dict[str, Path]:
++    """Profile → the other checkout its live gateway runs, read fresh from each profile's own
++    status record. Restart-abort recovery asks this itself: it can run before the restart phase
++    looked at any unit, so nothing an earlier pass remembered is there to rely on."""
++    import json
++
++    import psutil
++    from hermes_cli.update_receipt import _profile_homes
++    pinned: dict[str, Path] = {}
++    with suppress(Exception):
++        for profile, home in _profile_homes():
++            with suppress(Exception):
++                pid = int(json.loads((home / "gateway_state.json").read_text(encoding="utf-8-sig")).get("pid") or 0)
++                root = gateway_foreign_code_root(pid, home) if pid > 0 and psutil.pid_exists(pid) else None
++                if root is not None:
++                    pinned[profile] = root
++    return pinned
++
++
++def drop_gateways_on_another_checkout(pids) -> list[int]:
++    """*pids* minus the gateway processes that provably run another checkout (each named once).
++
++    The manual sweep stops every gateway process of this home that no supervisor claims; a pinned
++    unit's gateway lands there whenever its unit PID lookup fails, and it is not stale either."""
++    from hermes_cli.dashboard_procs import _hermes_home_for_pid
++    kept = []
++    for pid in pids:
++        home = None
++        with suppress(Exception):
++            home = _hermes_home_for_pid(pid)
++        root = gateway_foreign_code_root(pid, home)
++        if root is None:
++            kept.append(pid)
++        else:
++            announce_skipped_runtime("gateway process", f"PID {pid}", home, code_root=root)
++    return kept
++
++
+ def describe_skipped_runtime(kind: str, name: str, home: str | None, code_root: Path | None = None) -> str:
+     """One notice line for a runtime the update leaves alone (foreign home, its own checkout, or
+     unreadable ownership)."""
+diff --git a/hermes_cli/update_receipt.py b/hermes_cli/update_receipt.py
+index 7c110f3abb7..0dcb675f484 100644
+--- a/hermes_cli/update_receipt.py
++++ b/hermes_cli/update_receipt.py
+@@ -1088,13 +1088,20 @@ def _gateway_code_root(pid: int, home: Path) -> Optional[Path]:
+         import psutil  # type: ignore
+ 
+         process = psutil.Process(pid)
+-        # The import path outranks where the interpreter lives: ``python -m hermes_cli.main`` under a
+-        # PYTHONPATH naming a checkout runs THAT checkout whatever venv the python came from, and
+-        # names no other path at all (an Ask Eve pinned owner's unit). [daveey]
++        # ``python -m hermes_cli.main`` names no path at all, so the import path decides, in the
++        # interpreter's own order: the working directory (unless safe-path mode drops it), then
++        # PYTHONPATH, and only then the venv the python came from (an Ask Eve pinned owner's unit
++        # runs another venv's python under a PYTHONPATH naming its pinned core). [daveey]
+         with suppress(Exception):
+-            for probe in ((process.environ() or {}).get("PYTHONPATH") or "").split(os.pathsep):
+-                if probe and os.path.isabs(probe) and (Path(probe) / "hermes_cli" / "main.py").is_file():
+-                    return Path(probe).resolve()
++            cmdline, env = process.cmdline() or [], process.environ() or {}
++            # Interpreter options end at the first ``-m``; any other option (``-P``, ``-I``, ``-E``,
++            # ``-u``…) may change the import path, so only the two plain shapes are read here.
++            if cmdline[1:2] == ["-m"]:
++                safe = bool(env.get("PYTHONSAFEPATH"))
++                probes = ([] if safe else [process.cwd()]) + (env.get("PYTHONPATH") or "").split(os.pathsep)
++                for probe in probes:
++                    if probe and os.path.isabs(probe) and (Path(probe) / "hermes_cli" / "main.py").is_file():
++                        return Path(probe).resolve()
+         with suppress(Exception):
+             root = _code_root_for_path((process.environ() or {}).get("VIRTUAL_ENV"))
+             if root:
+diff --git a/tests/hermes_cli/test_update_pause_deferrals.py b/tests/hermes_cli/test_update_pause_deferrals.py
+index 7c67af90680..90ac2e8fec3 100644
+--- a/tests/hermes_cli/test_update_pause_deferrals.py
++++ b/tests/hermes_cli/test_update_pause_deferrals.py
+@@ -28,6 +28,14 @@ def test_refused_units_ride_the_refusal(monkeypatch):
+     assert refused.value.units == ["old-gw"]
+ 
+ 
++def test_a_supervisor_that_cannot_be_disarmed_names_its_gateway(monkeypatch):
++    """A drained gateway whose unit cannot be stopped defers the update too: it must be counted."""
++    monkeypatch.setattr(pause, "_manage_cmd", lambda scope: None)
++    with pytest.raises(pause.PauseRefused) as refused:
++        pause._stop_unit({"unit": "old-gw", "scope": "system", "pid": 4242})
++    assert refused.value.units == ["old-gw"]
++
++
+ def _board(tmp_path, monkeypatch) -> Path:
+     from hermes_cli.config import save_config
+     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+diff --git a/tests/hermes_cli/test_update_pause_pinned_runtime.py b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+index d266f4bc176..66f2adacb55 100644
+--- a/tests/hermes_cli/test_update_pause_pinned_runtime.py
++++ b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+@@ -181,3 +181,48 @@ def test_best_effort_restart_skips_a_pinned_unit(host):
+     failed: list[str] = []
+     fleet._restart_systemd_gateway_units_best_effort(failed, fleet._systemd_gateway_unit_listings())
+     assert failed == [] and host["writes"] == []
++
++
++def test_recovery_and_manual_sweeps_honour_the_same_verdict(host):
++    """Restart-abort recovery (which may run before any unit was looked at) and the manual-process
++    sweep (reached when the unit PID lookup fails) both leave the pinned gateway alone."""
++    from types import SimpleNamespace
++
++    from hermes_cli.update_fleet_scope import drop_gateways_on_another_checkout
++    plan = SimpleNamespace(runtimes=[SimpleNamespace(kind="gateway", profile="askeve-builder", supervisor="systemd")])
++    pinned = _run_pinned(host, status_record=True)
++
++    candidates, skipped = fleet._gateway_recovery_partition(plan)
++    assert candidates == {} and [s["profile"] for s in skipped] == ["askeve-builder"]
++    assert str(host["core"]) in skipped[0]["reason"]
++
++    control = _run_on_checkout(host)
++    assert drop_gateways_on_another_checkout([pinned, control]) == [control]
++    (host["home"] / "gateway_state.json").write_text(json.dumps({"pid": control, "argv": ["-c"]}))
++    assert fleet._gateway_recovery_partition(plan) == ({"askeve-builder": "systemd"}, [])
++
++
++def test_working_directory_outranks_pythonpath_without_safe_path(host):
++    """``python -m`` puts the working directory ahead of PYTHONPATH: a gateway started in checkout A
++    with PYTHONPATH naming B runs A, and must not be read as pinned to B."""
++    from hermes_cli.update_receipt import _gateway_code_root
++    here = host["core"].parent / "checkout-a"
++    (here / "hermes_cli").mkdir(parents=True)
++    (here / "hermes_cli" / "__init__.py").write_text("")
++    (here / "hermes_cli" / "main.py").write_text((host["core"] / "hermes_cli" / "main.py").read_text())
++    env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONSAFEPATH")}
++    env["PYTHONPATH"] = str(host["core"])
++    proc = _spawn([sys.executable, "-m", "hermes_cli.main", "gateway", "run"], env, here)
++    host["procs"].append(proc)
++    assert _gateway_code_root(proc.pid, host["home"]) == here.resolve()
++
++
++def test_auto_migration_does_not_fold_a_pinned_gateway(host):
++    """The post-update multiplex migration would stop and uninstall the unit just left alone."""
++    from hermes_cli.gateway_migrate import ProfileGateway
++    from hermes_cli.gateway_migrate_guards import _guard_code_root
++    profile = ProfileGateway(name="askeve-builder", home=host["home"], pid=_run_pinned(host, status_record=True))
++    assert str(host["core"]) in (_guard_code_root(None, profile) or "")
++    (host["home"] / "gateway_state.json").unlink()
++    profile.pid = _run_on_checkout(host)
++    assert _guard_code_root(None, profile) is None
+-- 
+2.55.0
+

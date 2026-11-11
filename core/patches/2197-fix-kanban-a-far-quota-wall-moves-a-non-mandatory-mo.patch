@@ -1,0 +1,1056 @@
+From 456257634d754125b47c93be12e7b16699f4bd4a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:14:22 +0000
+Subject: [PATCH] fix(kanban): a far quota wall moves a non-mandatory model pin
+ to a same-class peer, one run at a time [daveey]
+
+example-tools M4 (t_01a19715a1a9ccef) was pinned to gpt-6-astra/openai-codex. Run 49 ended
+rate_limited with the Codex reset ~56 h out, and the quota episode held the card for the whole
+wall: an explicit pin had no alternate route, workers cannot re-pin a card (set-model is fenced),
+and no supervisor model-edit op exists. Three runners-board cards (K2 t_01a188c7c974c529,
+shepherd t_82f80db4, H3 t_174a18ae) stranded on the same pin. David approved option (b),
+11-11 (t_01a19990897b9d9b): pins are reroutable within their class unless marked mandatory.
+
+Rule (hermes_cli/kanban_pin_reroute.py `pinned_route`). Every condition must hold; anything
+else keeps the pin and today's hold:
+1. one of the card's own runs hit a wall on the pin's provider (quota_episode receipts or the
+   live episode), and the wall is still up;
+2. it resets kanban.pin_quota_reroute_min_hours (default 6) or more from now;
+3. the pin is not mandatory (new tasks.model_pin_mandatory, or the require_model marker);
+4. the lane is ready, not review;
+5. the pinned model is in exactly one routing class of the assignee's policy, and a route of
+   that class is eligible, off every walled/disabled provider and not live-walled. No fallback to
+   default_model or the strong tier.
+
+Rule 1 reads the card's history, not only the live episode: a rerouted run that ends
+(reclaimed, continued) closes the episode, and the next run must not go back into the wall.
+
+Invariants:
+- the pin row is never written; the reroute is on the in-memory claimed task, so the first run
+  after the reset uses the pin again (run_route reason `pinned`);
+- every rerouted admission records a `model_reroute` event (from/to, walled provider,
+  resets_at, episode_id, run_id) and tier reason `pinned+pin_quota_reroute:<provider>`, with
+  one card comment per wall naming the opt-out command;
+- if that record cannot be written the run keeps its pin (reason
+  `pinned+pin_quota_reroute_unrecorded`): no unrecorded reroute;
+- a mandatory pin is never moved.
+
+Mandatory mark: nullable tasks.model_pin_mandatory (migration via _LATER_TASK_COLUMNS, Board
+sync column), set by kanban_create(pin_mandatory=true), `hermes kanban create --pin-mandatory`
+and `hermes kanban set-model <id> [--mandatory|--no-mandatory]`; clearing the pin clears it,
+a new pin keeps it. Workers stay fenced. kanban_assignment_routing's no-model-edit message
+now says the dispatcher handles quota walls.
+
+Proof:
+- tests/hermes_cli/test_kanban_pin_reroute.py (31): reroute+record, mandatory flag and marker,
+  threshold 2/5.9/6.2 h and config 1/bogus/-1/100, review lane (live and closed episode), pin in
+  0 or 2 classes, peer walled by file/live pool/disabled/routing off (and the moving control),
+  skip a live-walled first peer, an expired earlier wall frees its provider, another card's wall
+  alone holds, one comment per wall across
+  runs, back on the pin after the reset, preview == admission and writes nothing, failed record
+  keeps the pin, create/set-model/tool/sync for the mark.
+- test_kanban_quota_episode.py: the pinned case of the shared preview test now expects the
+  same-class reroute; the repin test marks its pin mandatory.
+- hermes-core-wt test tests/hermes_cli tests/tools -k "kanban or quota or routing": 7926
+  passed, 0 failed (1 unrelated collection error: tests/tools/test_fal_sdk.py, no fal_client).
+- scripts/check: 16 checks ok (code health 0 blocking: kanban_db.py stays at 4221 lines,
+  create_task CC unchanged).
+- Mutants (sdlc-review mutants.py, 3 quota test files): 27 of 27 killed: every rule condition,
+  history read, expiry filter, comment dedup, unrecorded-reroute fallback, closed-episode path,
+  create/set-model/sync/tool wiring. A 28th (episode walls passed as extra exclusions) survived as
+  equivalent, so that parameter was removed.
+- Replay (read-only, every board DB + sync-shadow on build-worker): 7 open pinned cards
+  carry a past codex quota episode; all 7 walls have expired, so the rule moves none of them
+  today (a guard that holds less, not more).
+---
+ hermes_cli/config_defaults.py                 |   4 +-
+ hermes_cli/kanban.py                          |  10 +-
+ hermes_cli/kanban_assignment_routing.py       |   4 +-
+ hermes_cli/kanban_db.py                       |  30 +-
+ hermes_cli/kanban_db_connect.py               |   1 +
+ hermes_cli/kanban_db_sync.py                  |   2 +-
+ hermes_cli/kanban_model_tier.py               |  26 ++
+ hermes_cli/kanban_parser.py                   |   6 +
+ hermes_cli/kanban_pin_reroute.py              | 211 ++++++++++
+ hermes_cli/kanban_quota_episode.py            |   9 +-
+ tests/hermes_cli/test_kanban_pin_reroute.py   | 375 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_quota_episode.py |  19 +-
+ tools/kanban_tools.py                         |   6 +-
+ tools/kanban_tools_schemas.py                 |   8 +
+ website/docs/user-guide/configuration.md      |   7 +
+ 15 files changed, 682 insertions(+), 36 deletions(-)
+ create mode 100644 hermes_cli/kanban_pin_reroute.py
+ create mode 100644 tests/hermes_cli/test_kanban_pin_reroute.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 06403059c4..eaf8ac111f 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1990,8 +1990,8 @@ DEFAULT_CONFIG = {
+         # review-lane, retry-after-failure and keep-pattern cards run on while default_model is set.
+         # "" = the old behaviour (the profile's own model, or class:deep with a class default), which
+         # silently followed every change of the profile's default model.
+-        "strong_model": "",
+-        "strong_provider": "",
++        "strong_model": "", "strong_provider": "",
++        "pin_quota_reroute_min_hours": 6,  # a card pin walled this long runs on a same-class peer (kanban_pin_reroute)
+         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 0ff11d3a07..ec00b034cf 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -527,7 +527,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 idempotency_key=idem_key,
+                 max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                 max_retries=max_retries, model_override=getattr(args, "model_override", None),
+-                provider_override=getattr(args, "provider_override", None),
++                provider_override=getattr(args, "provider_override", None), pin_mandatory=bool(getattr(args, "pin_mandatory", False)),
+                 goal_mode=bool(getattr(args, "goal_mode", False)),
+                 goal_max_turns=getattr(args, "goal_max_turns", None),
+                 reasoning_effort=getattr(args, "reasoning_effort", None),
+@@ -867,12 +867,16 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
+     provider = getattr(args, "provider", None)
+     try:
+         with kbc.connect_closing() as conn:
+-            ok = kb.set_model_override(conn, args.task_id, model, provider=provider)
++            from hermes_cli.kanban_pin_reroute import set_model_cli
++            ok, wrote = set_model_cli(conn, args.task_id, args.model, model, provider, getattr(args, "mandatory", None))
+     except (ValueError, RuntimeError) as exc:
+         return _err(f"kanban: {exc}", 2)
+     if not ok:
+         return _err(f"no such task: {args.task_id}")
+-    if model:
++    if not wrote:
++        print(f"{args.task_id}: model pin " + ("mandatory: a quota wall never moves it" if args.mandatory
++                                               else "reroutable: a far quota wall may move it within its class"))
++    elif model:
+         label = f"{provider}:{model}" if provider else model
+         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
+     else:
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index cd1485eea8..2efd271fb6 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -95,7 +95,9 @@ def _authority_error(task_id, needs, reason=None):
+             f'execution_authority_mismatch: task {task_id} asks to edit another card model/provider '
+             f'({", ".join(needs)}). Every worker profile has the same mutation fence; '
+             'assignment repair cannot grant non-worker authority and none was recorded. '
+-            'No supported supervisor model-edit operation exists. Preserve mandatory model pins '
++            'No supported supervisor model-edit operation exists, and none is needed for a quota '
++            'wall: the dispatcher already runs a non-mandatory pin on a same-class peer while its '
++            'provider is walled 6 h or more (kanban_pin_reroute, `model_reroute` event). Preserve mandatory model pins '
+             'and subscription billing policy; recover availability through the existing owner '
+             'or an authorized non-worker operator, not another profile or repeated repair cards. '
+             'A legacy repair cannot complete on profile existence alone; archive it before '
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index df9ea040ef..960f66613d 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -648,6 +648,7 @@ class Task:
+     requires: Optional[list] = None          # Configured assignment capabilities
+     model_override: Optional[str] = None
+     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
++    model_pin_mandatory: Optional[int] = None  # 1 = never rerouted around a quota wall
+     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
+     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
+     max_retries: Optional[int] = None
+@@ -695,7 +696,7 @@ _TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expire
+ _TASK_OPTIONAL_COLUMNS = (
+     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
+     "max_runtime_seconds", "current_run_id", "workflow_template_id",
+-    "current_step_key", "max_retries", "session_id", "completion_contract", "placement_policy",
++    "current_step_key", "max_retries", "session_id", "completion_contract", "placement_policy", "model_pin_mandatory",
+ )
+ # Text columns where "" is stored/read as "not set".
+ _TASK_EMPTY_IS_NULL_COLUMNS = (
+@@ -1217,7 +1218,7 @@ def create_task(
+     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
+     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+     max_retries: Optional[int] = None, model_override: Optional[str] = None,
+-    provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
++    provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None, pin_mandatory: bool = False,
+     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
+     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
+     project_source_task_id: Optional[str] = None, creator_task_id: Optional[str] = None,
+@@ -1278,6 +1279,8 @@ def create_task(
+         raise ValueError(_lint)
+     completion_contract = validate_contract(completion_contract)
+     model_override, provider_override = _validate_model_override(model_override, provider_override)
++    from hermes_cli.kanban_pin_reroute import mandatory_column
++    pin_column = mandatory_column(pin_mandatory, model_override)
+     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+     assignee = _canonical_assignee(assignee)
+     if not title or not title.strip():
+@@ -1366,23 +1369,19 @@ def create_task(
+                 conn.execute(
+                     """
+                     INSERT INTO tasks (
+-                        id, title, body, assignee, status, priority,
+-                        created_by, created_at, workspace_kind, workspace_path,
+-                        branch_name, project_id, tenant, idempotency_key,
+-                        max_runtime_seconds,
+-                        skills, max_retries, model_override, provider_override,
+-                        reasoning_effort,
++                        id, title, body, assignee, status, priority, created_by, created_at, workspace_kind, workspace_path,
++                        branch_name, project_id, tenant, idempotency_key, max_runtime_seconds,
++                        skills, max_retries, model_override, provider_override, model_pin_mandatory, reasoning_effort,
+                         goal_mode, goal_max_turns, session_id, completion_contract, requires, placement_policy
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         task_id, title.strip(), body, assignee, task_status, priority,
+                         created_by, now, workspace_kind, workspace_path,
+-                        branch_name, project_id, tenant, idempotency_key,
+-                        _opt_int(max_runtime_seconds),
++                        branch_name, project_id, tenant, idempotency_key, _opt_int(max_runtime_seconds),
+                         json.dumps(skills_list) if skills_list is not None else None,
+-                        _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
++                        _opt_int(max_retries), model_override, provider_override, pin_column,
++                        reasoning_effort, 1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                         json.dumps(required), placement_policy,
+                     ),
+                 )
+@@ -1528,8 +1527,9 @@ def set_model_override(
+         from hermes_cli.kanban_model_assignment import validate_task_pin
+         model, provider = validate_task_pin(conn, task_id, model, provider)
+     return _set_task_override(
+-        conn, task_id,
+-        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
++        conn, task_id,  # clearing the pin clears its mandatory mark; a new pin keeps the card's mark
++        "UPDATE tasks SET model_override = ?, provider_override = ?, model_pin_mandatory = CASE WHEN ? IS NULL "
++        "THEN NULL ELSE model_pin_mandatory END WHERE id = ?", (model, provider, model),
+         "model_override_set", {"model": model, "provider": provider},
+         ("model_override", "provider_override"), archived_msg="cannot set model override",
+     )
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index e7933adcd4..48d691dcde 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1071,6 +1071,7 @@ _LATER_TASK_COLUMNS = (
+     ("max_retries", "max_retries INTEGER"),
+     ("model_override", "model_override TEXT"),
+     ("provider_override", "provider_override TEXT"),
++    ("model_pin_mandatory", "model_pin_mandatory INTEGER"),  # 1 = a quota wall never moves the pin
+     ("reasoning_effort", "reasoning_effort TEXT"),
+     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
+     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 60d987c6c0..da15ae12bb 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -57,7 +57,7 @@ SYNCED_COLUMNS: dict[str, frozenset[str]] = {
+         "completed_at", "workspace_kind", "branch_name", "tenant", "result", "idempotency_key",
+         "consecutive_failures", "last_failure_error", "max_runtime_seconds", "current_run_id",
+         "workflow_template_id", "current_step_key", "skills", "requires", "model_override",
+-        "provider_override", "reasoning_effort", "max_retries", "goal_mode", "goal_max_turns",
++        "provider_override", "model_pin_mandatory", "reasoning_effort", "max_retries", "goal_mode", "goal_max_turns",
+         "block_kind", "human_request", "block_recurrences", "completion_contract", "runs_on", "placement_policy",
+     }),
+     "task_links": frozenset({"parent_id", "child_id"}),
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 7c948f2a82..fe45a9cc71 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -292,6 +292,20 @@ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+     from hermes_cli.kanban_quota_episode import active, decision
+     base = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
+     _, route = decision(conn, task, lane=lane, cfg=cfg, base=base)
++    if base[2] == 'pinned':
++        from hermes_cli.kanban_pin_reroute import REASON, pinned_route
++        if not route and not active(conn, task.id):
++            # The episode is closed (a rerouted run ended) but the pin's wall may still be up.
++            import time
++            try:
++                route = pinned_route(conn, task, lane=lane, now=time.time(),
++                                     cfg=load_tier_config() if cfg is None else cfg)
++            except sqlite3.Error:
++                raise
++            except Exception:
++                logger.warning('kanban pin reroute: resolve failed for %s; keeping the pin', task.id, exc_info=True)
++        if route:
++            return *route, f'pinned+{REASON}:{str(task.provider_override).strip().lower()}'
+     if route:
+         return *route, f'{base[2]}+quota_reroute'
+     if active(conn, task.id):
+@@ -339,6 +353,8 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+                            model, why, getattr(task, "id", "?"))
+             reason = f"{reason}+unroutable:{model}:{why}"
+             model = provider = None
++    origin = (getattr(task, "model_override", None), getattr(task, "provider_override", None))
++    repinned = bool(model) and reason.startswith("pinned+pin_quota_reroute")
+     if model:
+         task.model_override = model
+         task.provider_override = provider
+@@ -350,7 +366,17 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+                        "lane": lane}
+             with _kb.write_txn(conn):
+                 _kb._append_event(conn, task.id, "model_tier", payload, run_id=getattr(task, "current_run_id", None))
++                if repinned:
++                    # The pin moves for this run only (in memory); the reroute is always on the record.
++                    from hermes_cli.kanban_pin_reroute import record
++                    record(conn, task, (_str(origin[0]), _str(origin[1]).lower()), (_str(model), _str(provider)))
+         except Exception as exc:
++            if repinned:
++                # Never an unrecorded reroute: the run goes back to its pin (and its wall).
++                logger.warning("kanban model tier: pin reroute record failed for %s; keeping the pin (%s)",
++                               getattr(task, "id", "?"), exc, exc_info=True)
++                task.model_override, task.provider_override = origin
++                return "pinned+pin_quota_reroute_unrecorded"
+             logger.debug("kanban model tier: event write failed for %s (%s)", getattr(task, "id", "?"), exc,
+                          exc_info=True)
+     return reason
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index e0c8676c7a..4abd5ec3c8 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -285,6 +285,9 @@ _SPECS = [
+         _arg("--provider", dest="provider_override",
+              help="Provider the --model belongs to (passed as --provider <name> to "
+                   "the worker). Requires --model."),
++        _arg("--pin-mandatory", action="store_true", dest="pin_mandatory",
++             help="The --model pin is mandatory: a far quota wall never moves it to a same-class peer. "
++                  "Requires --model."),
+         _arg("--completion-contract", metavar="CONTRACT",
+              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+         _arg("--goal", action="store_true", dest="goal_mode",
+@@ -353,6 +356,9 @@ _SPECS = [
+         _arg("--provider",
+              help="Provider the model belongs to (worker is spawned with "
+                   "--provider <name>). Cleared together with the model."),
++        _arg("--mandatory", action=argparse.BooleanOptionalAction, default=None,
++             help="--mandatory: a far quota wall never moves this pin to a same-class peer (the card waits "
++                  "for the reset). --no-mandatory lifts that. Omit to keep the card's setting."),
+     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
+     _cmd("move", [
+diff --git a/hermes_cli/kanban_pin_reroute.py b/hermes_cli/kanban_pin_reroute.py
+new file mode 100644
+index 0000000000..e723ea3d79
+--- /dev/null
++++ b/hermes_cli/kanban_pin_reroute.py
+@@ -0,0 +1,211 @@
++"""A far quota wall moves a Kanban card's model pin to a same-class peer for one run at a time. [daveey]
++
++example-tools M4 (t_01a19715a1a9ccef, 11-01) was pinned to openai-codex/gpt-6-astra. Its run hit a
++Codex subscription wall resetting ~56 h out, and the quota episode held the card for the whole wall:
++an explicit pin had no fallback, and workers cannot re-pin a card. David, 11-11 (t_01a19990897b9d9b):
++"Let them move to another provider of the same class."
++
++Rule (:func:`pinned_route`); every condition must hold, anything else keeps the pin as before:
++
++1. one of the card's own runs hit a wall on the pin's provider (its ``quota_episode`` receipts, or the
++   live episode), and that wall is still up;
++2. it resets ``kanban.pin_quota_reroute_min_hours`` (default 6) or more from now;
++3. the pin is not mandatory: neither ``tasks.model_pin_mandatory`` nor the ``require_model`` marker;
++4. the lane is ready, not review;
++5. the pinned model sits in exactly one routing class of the assignee's policy, and a route of that
++   class is eligible, on no walled or disabled provider, and not quota-walled in the live pool.
++   There is never a fallback to ``kanban.default_model`` or the strong tier.
++
++Rule 1 reads the card's history, not only the live episode: a rerouted run that ends (continued,
++reclaimed, blocked) closes the episode, and the next run must not go back into a wall the card knows.
++
++The reroute lives on the in-memory claimed task only: the row's pin is never written, so the first
++run after the reset goes back to the pin. Every rerouted admission records a ``model_reroute`` event;
++the card gets one comment per wall (:func:`record`).
++"""
++from __future__ import annotations
++
++import logging
++import time
++from datetime import datetime
++from typing import Any, Optional
++from zoneinfo import ZoneInfo
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_MIN_HOURS = 6.0
++REASON = "pin_quota_reroute"
++EVENT = "model_reroute"
++COMMENT_AUTHOR = "kanban-dispatcher"
++
++
++def _norm(value: Any) -> str:
++    return str(value or "").strip()
++
++
++def is_mandatory_pin(task: Any) -> bool:
++    """True when the card's creator said its pin must never move."""
++    from hermes_cli.kanban_provider_walls import REQUIRE_MODEL_MARKER
++    if getattr(task, "model_pin_mandatory", None):
++        return True
++    return REQUIRE_MODEL_MARKER in f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}"
++
++
++def min_wall_seconds(cfg: Optional[dict]) -> float:
++    """``kanban.pin_quota_reroute_min_hours`` in seconds; an unreadable value is the default."""
++    raw = (cfg or {}).get("pin_quota_reroute_min_hours", DEFAULT_MIN_HOURS)
++    try:
++        hours = float(raw)
++    except (TypeError, ValueError):
++        logger.warning("kanban pin reroute: bad kanban.pin_quota_reroute_min_hours %r; using %s", raw,
++                       DEFAULT_MIN_HOURS)
++        hours = DEFAULT_MIN_HOURS
++    if hours != hours or hours < 0:  # NaN or negative
++        hours = DEFAULT_MIN_HOURS
++    return hours * 3600
++
++
++def pin(task: Any) -> Optional[tuple[str, str]]:
++    """The card's concrete ``(model, provider)`` pin, or None (unpinned, class pin, unknown provider)."""
++    from agent.model_routing import is_class_selector
++    model, provider = _norm(getattr(task, "model_override", None)), _norm(getattr(task, "provider_override", None))
++    provider = provider.lower()
++    if not model or not provider or provider == "auto" or is_class_selector(model):
++        return None
++    return model, provider
++
++
++def own_walls(conn: Any, task_id: str, now: float,
++              current: Optional[dict[str, float]] = None) -> dict[str, tuple[float, Any]]:
++    """``provider -> (until, episode_id)`` for every wall this card's own runs hit that is still up.
++
++    Read from the card's ``quota_episode`` receipts; ``current`` adds the live episode's walls (its
++    receipt may not carry them yet)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_quota_episode import _providers, episode
++    out: dict[str, tuple[float, Any]] = {}
++
++    def add(name: str, until: Any, episode_id: Any) -> None:
++        if isinstance(until, (int, float)) and until > now and (name not in out or until > out[name][0]):
++            out[name] = (float(until), episode_id)
++    for row in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='quota_episode'", (task_id,)):
++        state = kb._json_dict(row[0])
++        for name in _providers(state):
++            add(name, state.get("until"), state.get("episode_id"))
++    if current:
++        live = episode(conn, task_id) or {}
++        for name, until in current.items():
++            add(name, until, live.get("episode_id"))
++    return out
++
++
++def pinned_route(conn: Any, task: Any, *, lane: str, now: float, cfg: Optional[dict],
++                 current: Optional[dict[str, float]] = None) -> Optional[tuple[str, str]]:
++    """Same-class ``(model, provider)`` this pinned card's run may use instead of its walled pin, or None.
++
++    ``current`` is the live quota episode's walls. Other cards' walls (the provider wall files and the
++    live pool) only rule peers out, never move a pin. Non-allocating: reads config and the credential
++    pool and writes nothing, so preview and admission decide alike."""
++    from agent.model_routing import ModelRoutingError, eligible_routes, validate_policy
++    from agent.model_routing_agent import class_requirements
++    from hermes_cli.config import is_provider_enabled
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    from hermes_cli.kanban_provider_walls import active_walls, live_quota_wall
++    pinned = pin(task)
++    if lane == "review" or pinned is None or is_mandatory_pin(task):
++        return None
++    model, provider = pinned
++    own = own_walls(conn, task.id, now, current)
++    if provider not in own or own[provider][0] - now < min_wall_seconds(cfg):
++        return None
++    config = _assignee_config(getattr(task, "assignee", None)) or {}
++    policy = config.get("model_routing") or {}
++    try:
++        validate_policy(policy)
++    except ModelRoutingError:
++        return None
++    if not policy.get("enabled"):
++        return None
++    # The pin's strength is its class; a model in no class (or in two) has no peer we can prove equal.
++    levels = [key for key, routes in policy.get("routes", {}).items() if any(r["model"] == model for r in routes)]
++    if len(levels) != 1:
++        return None
++    walled = {**active_walls(now=now), **{name: wall[0] for name, wall in own.items()}}
++    providers = config.get("providers") or {}
++    routes = eligible_routes(policy, levels[0], class_requirements(config), eligible=lambda r: (
++        r["provider"] not in walled and is_provider_enabled(providers.get(r["provider"], {}))))
++    for route in routes:
++        if live_quota_wall(route["provider"], route["model"]) is None:
++            return route["model"], route["provider"]
++    return None
++
++
++def _pt(epoch: float) -> str:
++    return datetime.fromtimestamp(epoch, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M PT")
++
++
++def record(conn: Any, task: Any, origin: tuple[str, str], target: tuple[str, str], *,
++           now: Optional[float] = None) -> dict:
++    """Write the ``model_reroute`` event for this run and, once per wall, a card comment.
++
++    Runs inside the caller's write transaction. Returns the event payload."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_quota_episode import _outstanding, _providers, episode
++    now = time.time() if now is None else now
++    state = episode(conn, task.id)
++    current: dict[str, float] = {}
++    for wall in (_outstanding(conn, task.id, state, now) if state else []):
++        if origin[1] in _providers(wall):
++            current[origin[1]] = max(current.get(origin[1], 0), wall["until"])
++    resets_at, episode_id = own_walls(conn, task.id, now, current).get(origin[1], (None, None))
++    payload = {"from_model": origin[0], "from_provider": origin[1], "to_model": target[0],
++               "to_provider": target[1], "walled_provider": origin[1], "resets_at": resets_at,
++               "episode_id": episode_id, "run_id": getattr(task, "current_run_id", None)}
++    earlier = [kb._json_dict(row[0]) for row in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (task.id, EVENT))]
++    kb._append_event(conn, task.id, EVENT, payload, run_id=payload["run_id"])
++    if any(p.get("episode_id") == episode_id and p.get("walled_provider") == origin[1] for p in earlier):
++        return payload
++    until = f"until {_pt(resets_at)}" if resets_at else "until its quota resets"
++    kb.add_comment(conn, task.id, COMMENT_AUTHOR, (
++        f"Quota wall: {origin[0]} ({origin[1]}) is out {until}. This card's runs use {target[0]} "
++        f"({target[1]}), the same model class, until then; the pin itself is unchanged and the first run "
++        f"after the reset uses it again. To make this card wait for its pin instead: "
++        f"`hermes kanban set-model {task.id} {origin[0]} --provider {origin[1]} --mandatory`."))
++    return payload
++
++
++def mandatory_column(pin_mandatory: Any, model_override: Optional[str]) -> Optional[int]:
++    """``tasks.model_pin_mandatory`` for a new card: 1 or NULL. A mark needs a pin to mark."""
++    if not pin_mandatory:
++        return None
++    if not _norm(model_override):
++        raise ValueError("pin_mandatory requires a model pin")
++    return 1
++
++
++def set_pin_mandatory(conn: Any, task_id: str, mandatory: bool) -> bool:
++    """Mark (or unmark) a card's model pin as mandatory: a quota wall never moves a mandatory pin."""
++    from hermes_cli import kanban_db as kb
++    if mandatory:
++        row = conn.execute("SELECT model_override FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if row is not None and not _norm(row[0]):
++            raise ValueError("--mandatory needs a model pin: set a model first")
++    value = 1 if mandatory else None
++    return kb._set_task_override(
++        conn, task_id, "UPDATE tasks SET model_pin_mandatory = ? WHERE id = ?", (value,),
++        "model_pin_mandatory_set", {"mandatory": bool(mandatory)}, ("model_pin_mandatory",),
++        archived_msg="cannot change the model pin")
++
++
++def set_model_cli(conn: Any, task_id: str, raw_model: Optional[str], model: Optional[str],
++                  provider: Optional[str], mandatory: Optional[bool]) -> tuple[bool, bool]:
++    """``hermes kanban set-model``: ``(found, wrote_model)``. A bare ``--[no-]mandatory`` changes only the
++    mark (``set-model <id>`` alone still clears the pin, as before)."""
++    from hermes_cli import kanban_db as kb
++    if raw_model is None and mandatory is not None:
++        return set_pin_mandatory(conn, task_id, mandatory), False
++    found = kb.set_model_override(conn, task_id, model, provider=provider)
++    if found and mandatory is not None:
++        set_pin_mandatory(conn, task_id, mandatory)
++    return found, True
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 94a2be97e5..2c28f66a98 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -182,6 +182,7 @@ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+         unknown = unknown or not names
+         for name in names:
+             walls[name] = max(walls.get(name, 0), wall['until'])
++    episode_walls = dict(walls)  # this episode's own walls: a pin moves only off a wall its own run hit
+     try:
+         base = base or resolve_model_tier(conn, task, lane=lane, cfg=cfg)
+         target = _base_route(task, base)
+@@ -202,7 +203,13 @@ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+         # An unrecorded wall may be any provider: no route can be proven to avoid it.
+         return held, None
+     try:
+-        route = alternate_route(conn, task, walls, base, now) or _strong_fallback(task, base, walls, cfg, now)
++        if base[2] == 'pinned':
++            from hermes_cli.kanban_model_tier import load_tier_config
++            from hermes_cli.kanban_pin_reroute import pinned_route
++            route = pinned_route(conn, task, lane=lane, now=now, current=episode_walls,
++                                 cfg=load_tier_config() if cfg is None else cfg)
++        else:
++            route = alternate_route(conn, task, walls, base, now) or _strong_fallback(task, base, walls, cfg, now)
+     except sqlite3.Error:
+         raise
+     except Exception:
+diff --git a/tests/hermes_cli/test_kanban_pin_reroute.py b/tests/hermes_cli/test_kanban_pin_reroute.py
+new file mode 100644
+index 0000000000..0d93c721cb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pin_reroute.py
+@@ -0,0 +1,375 @@
++"""A far quota wall moves a non-mandatory Kanban card pin to a same-class peer, one run at a time.
++
++example-tools M4 (t_01a19715a1a9ccef, 11-01) was pinned to openai-codex/gpt-6-astra and held for a
++~56 h Codex wall although claude-opus-5-5 in the same ``deep`` class was free. David, 11-11
++(t_01a19990897b9d9b): pins are reroutable within their class unless marked mandatory.
++"""
++import argparse
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as kbsync
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_pin_reroute as pr
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli.kanban_quota_episode import episode
++from hermes_cli.kanban_shared_blockers import task_route
++from tests.hermes_cli.test_kanban_quota_episode import board as board, reap, routing  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++
++HUB_CFG = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
++           'strong_model': 'claude-opus-5-5', 'strong_provider': 'anthropic'}
++PIN = ('gpt-6-astra', 'openai-codex')
++PEER = ('claude-opus-5-5', 'anthropic')
++
++
++def _codex_wall(reset):
++    return dict(text=f'SubscriptionQuotaUnavailable: Subscription quota unavailable for '
++                f'openai-codex/gpt-6-astra; resets at {reset}.0',
++                fields={'failure_reason': 'rate_limit', 'failure_retryable': True,
++                        'failure_resets_at': float(reset),
++                        'route_provider': 'openai-codex', 'route_model': 'gpt-6-astra'})
++
++
++def _clock(monkeypatch, start=1_800_000_000):
++    clock = [start]
++    monkeypatch.setattr(kb.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(walls.time, 'time', lambda: clock[0])
++    return clock
++
++
++def _deep(monkeypatch, cfg=None, extra=()):
++    """Assignee policy: ``deep`` = opus (anthropic) + astra (codex); tier config = the hub's."""
++    config, _ = routing(monkeypatch)
++    std = config['model_routing']['routes']['standard']
++    config['model_routing']['routes'] = {'deep': [dict(std[0], model='claude-opus-5-5'),
++                                                  dict(std[1], model='gpt-6-astra'), *extra]}
++    cfg = dict(HUB_CFG, **(cfg or {}))
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: cfg)
++    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    return config, cfg
++
++
++def _pinned_card(conn, title='M4 pinned to astra', body=None, mandatory=False):
++    return kb.create_task(conn, title=title, body=body, assignee='a', model_override=PIN[0],
++                          provider_override=PIN[1], pin_mandatory=mandatory)
++
++
++def _events(conn, tid, kind):
++    return [kb._json_dict(r[0]) for r in conn.execute(
++        'SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id', (tid, kind))]
++
++
++def _comments(conn, tid):
++    return [r[0] for r in conn.execute(
++        "SELECT body FROM task_comments WHERE task_id=? AND author='kanban-dispatcher' ORDER BY id", (tid,))]
++
++
++def _tick(conn):
++    seen = []
++    dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++    return seen
++
++
++def _walled_card(conn, cfg, clock, hours=55, **kw):
++    tid = _pinned_card(conn, **kw)
++    reap(conn, tid, admit=cfg, **_codex_wall(clock[0] + hours * 3600))
++    clock[0] += 301
++    return tid
++
++
++def test_far_wall_reroutes_a_pin_in_class_and_records_it(board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        assert _tick(conn) == [PEER]
++        task = kb.get_task(conn, tid)
++        assert (task.model_override, task.provider_override) == PIN  # I2: row never written
++        route = _events(conn, tid, 'run_route')[-1]
++        assert (route['model'], route['provider']) == PEER
++        assert route['tier_reason'] == 'pinned+pin_quota_reroute:openai-codex'
++        assert tier.owner_model_pin(conn, task) == PEER  # the owner spawns the reroute's -m/--provider
++        [event] = _events(conn, tid, 'model_reroute')
++        assert event == {'from_model': PIN[0], 'from_provider': PIN[1], 'to_model': PEER[0],
++                         'to_provider': PEER[1], 'walled_provider': 'openai-codex',
++                         'resets_at': float(clock[0] - 301 + 55 * 3600),
++                         'episode_id': episode(conn, tid)['episode_id'], 'run_id': task.current_run_id}
++        [comment] = _comments(conn, tid)
++        assert 'gpt-6-astra (openai-codex) is out until' in comment and 'claude-opus-5-5 (anthropic)' in comment
++        assert f'set-model {tid} gpt-6-astra --provider openai-codex --mandatory' in comment
++
++
++@pytest.mark.parametrize('why', ['flag', 'marker'])
++def test_mandatory_pin_is_never_rerouted(board, monkeypatch, all_assignees_spawnable, why):
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock, mandatory=why == 'flag',
++                           body='must run on astra: require_model' if why == 'marker' else None)
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        assert _tick(conn) == []
++        assert _events(conn, tid, 'model_reroute') == [] and _comments(conn, tid) == []
++
++
++@pytest.mark.parametrize('hours, min_hours, moved', [(2, None, False), (5.9, None, False), (6.2, None, True),
++                                                      (2, 1, True), (2, 'bogus', False), (2, -1, False), (55, 100, False)])
++def test_wall_shorter_than_the_threshold_holds(board, monkeypatch, all_assignees_spawnable, hours, min_hours, moved):
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch, cfg={} if min_hours is None else {'pin_quota_reroute_min_hours': min_hours})
++    with kbc.connect() as conn:
++        tid = _pinned_card(conn)
++        reap(conn, tid, admit=cfg, **_codex_wall(clock[0] + int(hours * 3600)))
++        clock[0] += 301
++        assert _tick(conn) == ([PEER] if moved else [])
++
++
++def test_review_lane_pin_holds(board, monkeypatch):
++    clock = _clock(monkeypatch)
++    _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _pinned_card(conn)
++        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        conn.commit()
++        reap(conn, tid, lane='review', provider='openai-codex', **_codex_wall(clock[0] + 55 * 3600))
++        clock[0] += 301
++        assert dispatch.check_respawn_guard(conn, tid, lane='review') == 'subscription_quota_reset'
++
++
++def test_review_lane_after_a_closed_episode_keeps_the_pin(board, monkeypatch, all_assignees_spawnable):
++    """The closed-episode path (history walls) also leaves review runs on the pin."""
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        assert _tick(conn) == [PEER]
++        kb.reclaim_task(conn, tid, reason='test')
++        task = kb.get_task(conn, tid)
++        assert tier.resolve_dispatch_tier(conn, task, lane='ready')[:2] == PEER
++        assert tier.resolve_dispatch_tier(conn, task, lane='review')[:2] != PEER
++
++
++@pytest.mark.parametrize('classes', [0, 2])
++def test_pin_in_no_class_or_two_classes_holds(board, monkeypatch, all_assignees_spawnable, classes):
++    clock = _clock(monkeypatch)
++    config, cfg = _deep(monkeypatch)
++    routes = config['model_routing']['routes']
++    if classes == 0:
++        routes['deep'] = [r for r in routes['deep'] if r['model'] != PIN[0]]
++    else:
++        routes['standard'] = [dict(routes['deep'][1]), dict(routes['deep'][0], model='claude-sonnet-5-5')]
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        assert _tick(conn) == []
++        assert _events(conn, tid, 'model_reroute') == []
++
++
++def _block_peer(blocked, monkeypatch, config, clock):
++    """Take the anthropic class peer out of reach the ``blocked`` way."""
++    until = float(clock[0] + 3600)
++    {'provider_file': lambda: monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'anthropic': until}),
++     'live_pool': lambda: monkeypatch.setattr(
++         walls, 'live_quota_wall', lambda provider, model: until if provider == 'anthropic' else None),
++     'disabled': lambda: config['providers'].__setitem__('anthropic', {'enabled': False}),
++     'routing_off': lambda: config['model_routing'].__setitem__('enabled', False),
++     'none': lambda: None}[blocked]()
++
++
++@pytest.mark.parametrize('blocked', ['provider_file', 'live_pool', 'disabled', 'routing_off', 'none'])
++def test_no_eligible_peer_holds_and_never_falls_back_to_tier_models(
++        board, monkeypatch, all_assignees_spawnable, blocked):
++    """Only the class peer counts: with it walled, disabled or routing off the pin waits, even though
++    the tier's strong model (also opus here) is not walled; ``none`` is the moving control."""
++    clock = _clock(monkeypatch)
++    config, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        _walled_card(conn, cfg, clock)
++        _block_peer(blocked, monkeypatch, config, clock)
++        assert _tick(conn) == ([PEER] if blocked == 'none' else [])
++
++
++def test_live_walled_first_peer_is_skipped_for_the_next(board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    config, cfg = _deep(monkeypatch)
++    sonnet = dict(config['model_routing']['routes']['deep'][0], model='grok-5', provider='xai-oauth')
++    config['model_routing']['routes']['deep'].append(sonnet)
++    monkeypatch.setattr(walls, 'live_quota_wall',
++                        lambda provider, model: float(clock[0] + 3600) if provider == 'anthropic' else None)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        assert _tick(conn) == [('grok-5', 'xai-oauth')]
++        assert _events(conn, tid, 'model_reroute')[0]['to_provider'] == 'xai-oauth'
++
++
++def test_an_expired_earlier_wall_does_not_rule_out_its_provider(board, monkeypatch, all_assignees_spawnable):
++    """The card once hit anthropic (1 h, long over); now codex is out 55 h: anthropic is a free peer."""
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _pinned_card(conn)
++        reap(conn, tid, admit=cfg, text='Anthropic usage limit resets in ~1h', provider='anthropic',
++             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
++        clock[0] += 2 * 3600
++        reap(conn, tid, admit=cfg, **_codex_wall(clock[0] + 55 * 3600))
++        clock[0] += 301
++        assert _tick(conn) == [PEER]
++
++
++def test_pin_walled_only_by_another_cards_wall_holds(board, monkeypatch, all_assignees_spawnable):
++    """Rule 1: the card's own episode must have hit the pin's provider. Here its run was walled on
++    anthropic and codex is walled only by another card's wall: the pin waits, as before."""
++    clock = _clock(monkeypatch)
++    _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _pinned_card(conn)
++        reap(conn, tid, text='Anthropic usage limit resets in ~11h', provider='anthropic',
++             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + 55 * 3600)})
++        clock[0] += 301
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        assert _tick(conn) == []
++
++
++def test_each_run_records_a_reroute_and_one_comment_per_episode(board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        assert _tick(conn) == [PEER]
++        # The rerouted run is reclaimed (not a wall: the episode continues); the next tick reroutes again.
++        kb.reclaim_task(conn, tid, reason='test')
++        assert _tick(conn) == [PEER]
++        reroutes = _events(conn, tid, 'model_reroute')
++        assert len(reroutes) == 2 and len({r['run_id'] for r in reroutes}) == 2
++        assert len({r['episode_id'] for r in reroutes}) == 1
++        assert len(_comments(conn, tid)) == 1
++
++
++def test_after_the_reset_the_run_is_back_on_the_pin(board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        clock[0] = int(episode(conn, tid)['until']) + 1
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        assert _tick(conn) == [PIN]
++        assert _events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned'
++        assert _events(conn, tid, 'model_reroute') == []
++
++
++def test_preview_matches_admission_and_writes_nothing(board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        before = conn.total_changes
++        preview = task_route(conn, tid)
++        assert conn.total_changes == before
++        assert _events(conn, tid, 'model_reroute') == []
++        assert _tick(conn) == [preview[:2]] == [PEER]
++
++
++def test_failed_record_keeps_the_pin(board, monkeypatch, all_assignees_spawnable):
++    """I3: a reroute that cannot be recorded does not happen; the run stays on its pin."""
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++
++    def broken(*_a, **_k):
++        raise RuntimeError('disk full')
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        monkeypatch.setattr(pr, 'record', broken)
++        assert _tick(conn) == [PIN]
++        assert _events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned+pin_quota_reroute_unrecorded'
++        assert _events(conn, tid, 'model_tier')[-1]['reason'] != 'pinned+pin_quota_reroute:openai-codex'
++
++
++# --- the mandatory mark: create, set-model, tool, sync ---------------------------------------------
++
++def test_create_flag_requires_a_pin_and_persists(board):
++    with kbc.connect() as conn:
++        with pytest.raises(ValueError, match='pin_mandatory requires a model pin'):
++            kb.create_task(conn, title='no pin', assignee='a', pin_mandatory=True)
++        tid = _pinned_card(conn, mandatory=True)
++        assert kb.get_task(conn, tid).model_pin_mandatory == 1
++        assert kb.get_task(conn, _pinned_card(conn)).model_pin_mandatory is None
++
++
++def _cli(*args):
++    from hermes_cli import kanban
++    from hermes_cli.kanban_parser import build_parser
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    return kanban.kanban_command(parser.parse_args(['kanban', *args]))
++
++
++def _set_model(tid, model=None, provider=None, mandatory=None):
++    args = ['set-model', tid] + ([model] if model else []) + (['--provider', provider] if provider else [])
++    return _cli(*args, *({True: ['--mandatory'], False: ['--no-mandatory']}.get(mandatory, [])))
++
++
++def test_set_model_mandatory_flags(board, capsys, monkeypatch):
++    monkeypatch.setattr('hermes_cli.kanban_model_assignment.validate_task_pin',
++                        lambda conn, tid, model, provider: (model, provider))
++    with kbc.connect() as conn:
++        tid = _pinned_card(conn)
++    assert _set_model(tid, mandatory=True) == 0
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.model_pin_mandatory == 1 and (task.model_override, task.provider_override) == PIN
++        assert _events(conn, tid, 'model_pin_mandatory_set') == [{'mandatory': True}]
++    assert 'mandatory' in capsys.readouterr().out
++    assert _set_model(tid, *PEER) == 0  # a new pin keeps the card's mark
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).model_pin_mandatory == 1
++    assert _set_model(tid, mandatory=False) == 0
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).model_pin_mandatory is None
++    assert _set_model(tid, *PIN, mandatory=True) == 0
++    assert _set_model(tid, 'none') == 0  # clearing the pin clears its mark
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.model_override is None and task.model_pin_mandatory is None
++    assert _set_model(tid, mandatory=True) == 2  # nothing to mark
++    assert 'needs a model pin' in capsys.readouterr().err
++
++
++def test_cli_create_pin_mandatory(board, monkeypatch, all_assignees_spawnable):
++    assert _cli('create', 'cli pin', '--assignee', 'a', '--model', PIN[0], '--provider', PIN[1],
++                '--pin-mandatory') == 0
++    with kbc.connect() as conn:
++        tid = conn.execute("SELECT id FROM tasks WHERE title='cli pin'").fetchone()[0]
++        assert kb.get_task(conn, tid).model_pin_mandatory == 1
++
++
++def test_kanban_create_tool_passes_pin_mandatory(board, monkeypatch):
++    from tools import kanban_tools as kt
++    seen = {}
++    real = kb.create_task
++
++    def spy(conn, **kw):
++        seen.update(kw)
++        return real(conn, **kw)
++    monkeypatch.setattr(kb, 'create_task', spy)
++    import json
++    out = json.loads(kt._handle_create({'title': 'tool pin', 'assignee': 'a', 'model': PIN[0],
++                                        'provider': PIN[1], 'pin_mandatory': True, 'requires': []}))
++    assert seen.get('pin_mandatory') is True, out
++    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
++    assert KANBAN_CREATE_SCHEMA['parameters']['properties']['pin_mandatory']['type'] == 'boolean'
++
++
++def test_board_sync_carries_the_mark_and_a_synced_mandatory_copy_holds(board, monkeypatch, all_assignees_spawnable):
++    assert 'model_pin_mandatory' in kbsync.SYNCED_COLUMNS['tasks']
++    clock = _clock(monkeypatch)
++    _, cfg = _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _walled_card(conn, cfg, clock)
++        # A pull from another machine lands the column as written there.
++        conn.execute('UPDATE tasks SET model_pin_mandatory=1 WHERE id=?', (tid,))
++        conn.commit()
++        assert _tick(conn) == []
+diff --git a/tests/hermes_cli/test_kanban_quota_episode.py b/tests/hermes_cli/test_kanban_quota_episode.py
+index 97a193c168..08c42c78e9 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode.py
++++ b/tests/hermes_cli/test_kanban_quota_episode.py
+@@ -238,15 +238,12 @@ def test_walled_concrete_default_model_reroutes_to_class_peer(board, monkeypatch
+         clock[0] += 301
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
+-        if pinned:
+-            # Explicit pins keep their model and wait for the reset.
+-            assert seen == []
+-            assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
+-        else:
+-            assert seen == [('claude-opus-5-5', 'anthropic')]
+-            route = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
+-                                 "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
+-            assert '"provider": "anthropic"' in route and 'quota_reroute' in route
++        # A non-mandatory pin moves within its class too (t_01a19990897b9d9b); only its reason differs.
++        assert seen == [('claude-opus-5-5', 'anthropic')]
++        route = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
++                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
++        assert '"provider": "anthropic"' in route
++        assert ('pin_quota_reroute:openai-codex' if pinned else 'quota_reroute') in route
+ 
+ 
+ def test_new_unpinned_card_created_after_a_known_wall_never_routes_to_it(board, monkeypatch, all_assignees_spawnable):
+@@ -414,7 +411,9 @@ def test_changed_explicit_pin_is_judged_by_its_own_provider(board, monkeypatch,
+     _, cfg = routing(monkeypatch)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='pinned', assignee='a')
+-        conn.execute("UPDATE tasks SET model_override='claude-sonnet-5-5', provider_override='anthropic' WHERE id=?", (tid,))
++        # Mandatory: a far wall would otherwise move this in-class pin (kanban_pin_reroute).
++        conn.execute("UPDATE tasks SET model_override='claude-sonnet-5-5', provider_override='anthropic', "
++                     "model_pin_mandatory=1 WHERE id=?", (tid,))
+         conn.commit()
+         reap(conn, tid, text='resets in ~11h')
+         assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index d1c7561e8b..2f04d3a642 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1580,9 +1580,9 @@ def _handle_create(args: dict, **kw) -> str:
+     # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
+     project_id = args["project"] if "project" in args else args.get("project_id")
+     project_source_task_id = None
+-    triage, skills, goal_mode = (
++    triage, skills, goal_mode, pin_mandatory = (
+         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
+-        _parse_bool_arg(args, "goal_mode"))
++        _parse_bool_arg(args, "goal_mode"), _parse_bool_arg(args, "pin_mandatory"))
+     model_override, provider_override = args.get("model"), args.get("provider")
+     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+     max_retries = _ca.max_retries_arg(args)
+@@ -1686,7 +1686,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 placement_checked=True,  # this front door already checked pins, origins and portability
+                 placement_audit=_creation_audit(args, assignee=str(assignee), skills=skills, project_id=project_id),
+                 require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+-                model_override=model_override, provider_override=provider_override,
++                model_override=model_override, provider_override=provider_override, pin_mandatory=pin_mandatory,
+                 goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+                 completion_contract=args.get("completion_contract"),
+                 initial_status=str(args.get("initial_status") or "running"),
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index de4fa4e041..32b35b5c93 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -901,6 +901,14 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "the profile's provider and will fail if it belongs "
+                 "to a different one. Requires 'model'."
+         )),
++        "pin_mandatory": _prop("boolean", (
++                "Mark the 'model' pin mandatory. Without it, when the "
++                "pinned provider's subscription quota is out for 6 h or "
++                "more, single runs use another provider's model of the "
++                "same class until the reset (recorded on the card). Set "
++                "true only when the work must run on exactly this model. "
++                "Requires 'model'."
++        )),
+     },
+     ["title"],
+ )
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index ba68385bf2..1dd142f009 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3490,6 +3490,13 @@ kanban:
+ 
+ `kanban.strong_model` names the model dispatched for strong-tier cards; `kanban.strong_provider` optionally pins its provider, otherwise it is inferred from the model name.
+ 
++```yaml
++kanban:
++  pin_quota_reroute_min_hours: 6   # a card pin walled this long runs on a same-class peer
++```
++
++A card pinned to a model (`kanban_create(model=...)`, `hermes kanban create --model`) normally runs on exactly that model. When the card's own run hits that provider's subscription quota and the reset is `kanban.pin_quota_reroute_min_hours` (default 6) or more away, each later run until the reset uses another eligible, unwalled route of the pinned model's routing class (`model_routing.routes`). The card row keeps its pin, so the first run after the reset is back on it. Every such run records a `model_reroute` event and a `pinned+pin_quota_reroute:<provider>` route reason, and the card gets one comment per quota episode. A pin whose model sits in no class (or in two) still waits, as does any review-lane run. To make a pin always wait for its reset, create the card with `pin_mandatory=true` / `--pin-mandatory`, or run `hermes kanban set-model <id> --mandatory` (`--no-mandatory` undoes it); a card body containing `require_model` is treated the same way.
++
+ `kanban.auto_recover_corruption` (default `true`): when a board's table b-trees fail `integrity_check` (damage `REINDEX` can't fix), its dispatch pauses and the gateway dispatcher also starts `hermes kanban recover` for it in a child process (salvage, fill from the newest healthy backup, write back in place, loss report and a follow-up card). Set it to `false` to keep only the pause. `kanban.recovery_card_assignee` (default `default`) is the assignee of that follow-up card.
+ 
+ ## Kanban default placement
+-- 
+2.55.0
+

@@ -1,0 +1,885 @@
+From 9eb188d230584db861af852da9bc61c7cdd7ea9b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:44:26 +0000
+Subject: [PATCH] fix(kanban): no-progress budget stops re-spawning cards whose
+ runs change nothing [daveey]
+
+t_e3e216d4 spent 141 runs (10-23..11-10) on clock wakes that re-read an
+unchanged graph, commented and parked again; t_01a1a27deb10165f 599 on a
+probe that kept breaking. No guard saw it: the crash breaker counts failures,
+max_continuations counts back-to-back `continued` only, card waits are exempt
+from the 3x re-park escalation.
+
+kanban_no_progress (hooked in lane_admission_refused, before any claim) counts
+trailing waiting runs since the last progress marker (status hand-off, link,
+attachment, edit, move, contract, condition_met, human comment, linked-card
+completion/review/edit; agent comments and bare unblocks are not progress,
+run losses neutral, declared clock windows exempt, clock polls 1/4). At
+kanban.no_progress_runs (default 5, 0 off), re-decided under the write lock
+and never under a live claim, it re-parks behind this episode's own wake
+condition (24 h fallback) or files one idempotent owner card the card waits
+on; a looping owner card goes to triage. No continuation_exhausted /
+goal_unachievable is written, so no recovery loop.
+
+Proof: tests/hermes_cli/test_kanban_no_progress.py 23 pass; 5 fail with the
+admission hook removed; 21 anchor mutants killed; 92 kanban dispatch/guard/
+continuation files 1343 pass. Replay over every hub board (read-only, at each
+run's start): 41 cards held, 976 runs not spawned, 32 park / 14 escalate
+episodes; t_e3e216d4 101/142 caught. Card t_01a1c7d033912ae9.
+---
+ hermes_cli/kanban_db_dispatch.py            |   4 +-
+ hermes_cli/kanban_db_dispatch_admission.py  |   5 +
+ hermes_cli/kanban_no_progress.py            | 322 ++++++++++++++++
+ hermes_cli/kanban_ops.py                    |   3 +
+ tests/hermes_cli/test_kanban_no_progress.py | 404 ++++++++++++++++++++
+ website/docs/user-guide/features/kanban.md  |  28 ++
+ 6 files changed, 764 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_no_progress.py
+ create mode 100644 tests/hermes_cli/test_kanban_no_progress.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 2db69c065e..7574bec8cf 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -225,6 +225,7 @@ class DispatchResult:
+     (quota/auth error — also auto-blocked), ``"shared_blocker"`` (parked behind
+     a declared shared blocker another card is probing), ``"recent_success"`` (completed run
+     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
++    no_progress_held: list[tuple[str, str]] = field(default_factory=list)  # (task_id, action): kanban_no_progress
+     clock_held: dict[str, tuple[str, int]] = field(default_factory=dict)
+     """``task_id -> (guard reason, epoch the hold ends)`` for guarded cards waiting on a known clock (quota reset,
+     cooldowns; ``kanban_db_dispatch_clock``). The stuck warning names the deadline and stays quiet when every
+@@ -2092,8 +2093,7 @@ def _dispatch_lane_task(
+         return False
+ 
+     def _count_spawn(name: str) -> None:
+-        # Later rows in this tick respect the per-profile cap; subsequent
+-        # ticks re-query from the DB.
++        # Later rows in this tick respect the per-profile cap; subsequent ticks re-query from the DB.
+         if per_profile_cap is not None and name:
+             per_profile_running[name] = per_profile_running.get(name, 0) + 1
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_admission.py b/hermes_cli/kanban_db_dispatch_admission.py
+index fadef0bb57..3736669fad 100644
+--- a/hermes_cli/kanban_db_dispatch_admission.py
++++ b/hermes_cli/kanban_db_dispatch_admission.py
+@@ -28,6 +28,11 @@ def lane_admission_refused(conn: sqlite3.Connection, task_id: str, assignee: str
+     if (code := dispatch_refusal(conn, task_id, assignee, spawn_fn, dry_run=dry_run)) is not None:
+         result.capsule_refused.append((task_id, code))
+         return True
++    # No-progress budget: N runs in a row that only parked again leave the lane (kanban_no_progress). [daveey]
++    from hermes_cli.kanban_no_progress import hold as no_progress_hold
++    if not dry_run and (held := no_progress_hold(conn, task_id)) is not None:
++        result.no_progress_held.append((task_id, held))
++        return True
+     return False
+ 
+ 
+diff --git a/hermes_cli/kanban_no_progress.py b/hermes_cli/kanban_no_progress.py
+new file mode 100644
+index 0000000000..9268620541
+--- /dev/null
++++ b/hermes_cli/kanban_no_progress.py
+@@ -0,0 +1,322 @@
++"""No-progress budget: stop re-spawning a card whose runs change nothing. [daveey]
++
++A card can park (``scheduled``), wait-continue or block, get woken by its clock or an unblock, and spawn a
++worker that re-reads the same world, posts a reconciliation comment and parks again. Nothing in that loop is a
++failure, so neither the crash breaker nor the continuation cap (which only counts back-to-back ``continued``
++runs, and resets on any other outcome) sees it: t_e3e216d4 spent 141 runs, t_7e2ee45c 69 and
++t_01a194ca90736cea 32, mostly on clock wakes while the card they waited on, or an external precondition,
++had not moved.
++
++The budget counts trailing closed runs that ended in a wait (``scheduled``, ``blocked``, or ``continued`` into
++``scheduled``) and started after the card's last *progress marker*: a completion or review hand-off, a link,
++attachment, body/assignee/placement/pin edit, a met wake condition, a human comment, or a completion, archive,
++review or edit on a linked (parent or child) card. Crashes, reclaims, quota releases and other run losses are
++neutral: they neither count nor reset. Agent comments are never progress -- they are what the loop produces --
++and neither is a bare ``unblocked`` (t_7e2ee45c's recovery loop was 11 of them); an unblock that resolved
++something comes with its evidence (a completed parent, a human comment, an edit).
++
++At ``kanban.no_progress_runs`` (default 5; 0 disables) such runs, the dispatcher does not spawn. Instead (decided
++again under the write lock, and never under another dispatcher's live claim):
++
++* this episode's latest park carried a wake condition whose probe has not broken since -> it is parked again
++  behind that same condition, with the clock wake pushed out by ``REPARK_SECONDS``; only the condition (or
++  real progress) brings the next run. Each 24 h fallback that finds nothing new re-parks it again: one
++  dispatcher event a day, no worker run;
++* no condition to wait on (none declared, or its probe kept breaking) -> ONE owner card is filed (idempotent per episode) and the card waits on it in
++  ``todo``; it resumes when the owner completes. An owner card that itself loops goes to ``triage``: no
++  owner-of-owner chain, and no ``continuation_exhausted`` / ``goal_unachievable`` event is written, so the
++  kernel recovery requester (``kanban_resume_requester``) never opens a recovery loop for it.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_LIMIT = 5
++REPARK_SECONDS = 24 * 3600
++PARKED_EVENT = "no_progress_parked"
++ESCALATED_EVENT = "no_progress_escalated"
++CREATED_BY = "kanban-no-progress"
++
++# Run outcomes a worker chooses when it found nothing to do yet.
++WAIT_OUTCOMES = frozenset({"scheduled", "blocked", "continued"})
++# A run that handed work on: the streak ends there.
++RESET_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested"})
++# Events on the card itself that change what the next run would see.
++CARD_PROGRESS_EVENTS = (
++    "completed", "review_requested", "changes_requested", "linked", "unlinked", "attached", "edited",
++    "condition_met", "reopened", "contract_changed", "contract_waived", "assigned", "moved",
++    "model_override_set", "promoted_manual", "shared_blocker_cleared",
++)
++# Events on a parent or child card that count as that card moving.
++LINKED_PROGRESS_EVENTS = ("completed", "archived", "review_requested", "changes_requested", "reopened", "edited")
++
++
++def limit(cfg: Optional[dict] = None) -> int:
++    """``kanban.no_progress_runs``: runs without progress before the dispatcher stops spawning; 0 disables."""
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config
++            cfg = load_config()
++        except Exception:  # health: allow BLE001 -- the dispatcher must not die on an unreadable config
++            logger.warning("kanban: no-progress budget could not read config; using %d", DEFAULT_LIMIT, exc_info=True)
++            cfg = {}
++    raw = ((cfg or {}).get("kanban") or {}).get("no_progress_runs", DEFAULT_LIMIT)
++    try:
++        return max(0, int(raw))
++    except (TypeError, ValueError):
++        return DEFAULT_LIMIT
++
++
++def _marks(items) -> str:
++    return ",".join("?" for _ in items)
++
++
++def progress_marker(conn: sqlite3.Connection, task_id: str, *, before: Optional[int] = None) -> int:
++    """Epoch of the newest progress marker for ``task_id`` (strictly before ``before``, if given), else 0."""
++    cut = int(time.time()) + 1 if before is None else int(before)
++    own = conn.execute(
++        f"SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND created_at < ? "
++        f"AND (kind IN ({_marks(CARD_PROGRESS_EVENTS)}) "
++        "OR (kind = 'commented' AND json_extract(payload, '$.writer_kind') = 'human'))",
++        (task_id, cut, *CARD_PROGRESS_EVENTS),
++    ).fetchone()[0]
++    linked = conn.execute(
++        f"SELECT MAX(e.created_at) FROM task_events e WHERE e.created_at < ? "
++        f"AND e.kind IN ({_marks(LINKED_PROGRESS_EVENTS)}) AND e.task_id IN ("
++        "SELECT parent_id FROM task_links WHERE child_id = ? UNION SELECT child_id FROM task_links WHERE parent_id = ?)",
++        (cut, *LINKED_PROGRESS_EVENTS, task_id, task_id),
++    ).fetchone()[0]
++    return int(max(own or 0, linked or 0))
++
++
++def _run_parks(conn: sqlite3.Connection, task_id: str, cut: int) -> dict[int, dict]:
++    """``run_id -> payload`` of the ``scheduled`` / ``continued`` event that ended each of the card's runs."""
++    parks: dict[int, dict] = {}
++    for run_id, raw in conn.execute(
++            "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled', 'continued') "
++            "AND run_id IS NOT NULL AND created_at < ? ORDER BY id", (task_id, cut)):
++        try:
++            data = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        if isinstance(data, dict):
++            parks[int(run_id)] = data  # the newest event for a run wins
++    return parks
++
++
++def _declared_window(park: Optional[dict]) -> bool:
++    """A declared pure time window (``clock_only`` or an explicit ``clock`` awaiting): each clock wake is the
++    measurement itself, so the run is neutral, not a no-progress run."""
++    if not park:
++        return False
++    awaiting = park.get("awaiting") if isinstance(park.get("awaiting"), dict) else {}
++    return bool(park.get("clock_only")) or (awaiting.get("kind") == "clock" and not awaiting.get("inferred"))
++
++
++# A clock poll (a park with no wake condition: the clock wake is the only way to look again, e.g. a CI wait
++# re-checked every 20 min) costs a quarter of a run against the budget, so ``budget * CLOCK_POLL_WEIGHT`` polls
++# with nothing changing (20 at the default) end the same way. [daveey]
++CLOCK_POLL_WEIGHT = 4
++
++
++def streak(conn: sqlite3.Connection, task_id: str, *, as_of: Optional[int] = None) -> tuple[float, int]:
++    """``(runs, marker)``: trailing waiting runs that started after the last progress marker, a clock poll
++    counting ``1 / CLOCK_POLL_WEIGHT``."""
++    cut = int(time.time()) + 1 if as_of is None else int(as_of)
++    marker = progress_marker(conn, task_id, before=cut)
++    units = 0
++    parks = _run_parks(conn, task_id, cut)
++    for run_id, outcome, started in conn.execute(
++            "SELECT id, outcome, started_at FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
++            "AND ended_at < ? ORDER BY id DESC", (task_id, cut)):  # stops at the marker; neutral rows never cap it
++        if int(started or 0) <= marker or outcome in RESET_OUTCOMES:
++            break
++        if outcome not in WAIT_OUTCOMES:
++            continue  # crash, reclaim, quota release, owner loss: neutral
++        park = parks.get(int(run_id)) if outcome != "blocked" else None
++        if outcome == "continued" and (park is None or park.get("status") != "scheduled"):
++            break  # long work checkpointing itself (an immediate continue) is progress the board cannot see
++        if _declared_window(park):
++            continue
++        has_condition = bool(park and isinstance(park.get("wake_check"), str) and park["wake_check"].strip())
++        units += CLOCK_POLL_WEIGHT if outcome == "blocked" or has_condition else 1
++    return units / CLOCK_POLL_WEIGHT, marker
++
++
++def _latest_condition_park(conn: sqlite3.Connection, task_id: str, *, after: int,
++                           before: int) -> Optional[tuple[dict, int]]:
++    """``(payload, created_at)`` of the newest park (``scheduled`` / ``continued``) of this episode (after the
++    progress marker) that waited on a wake condition: a condition from before the last progress is obsolete."""
++    for raw, created in conn.execute(
++            "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind IN ('scheduled', 'continued') "
++            "AND created_at > ? AND created_at < ? ORDER BY id DESC", (task_id, after, before)):
++        try:
++            data = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        if isinstance(data, dict) and isinstance(data.get("wake_check"), str) and data["wake_check"].strip() \
++                and not data.get("clock_only"):
++            return data, int(created)
++    return None
++
++
++def decide(conn: sqlite3.Connection, task_id: str, *, budget: int,
++           as_of: Optional[int] = None) -> Optional[tuple[str, int, int, Optional[dict]]]:
++    """``None`` (spawn; always when ``budget`` <= 0) or ``(action, runs, marker, park)``: ``action`` is ``park`` (re-park behind ``park``'s
++    wake condition) or ``escalate`` (no usable condition: none was declared in this episode, or that probe
++    broke since it was set, so parking behind it would only re-wake the card)."""
++    cut = int(time.time()) + 1 if as_of is None else int(as_of)
++    runs, marker = streak(conn, task_id, as_of=cut)
++    if budget <= 0 or runs < budget:
++        return None
++    found = _latest_condition_park(conn, task_id, after=marker, before=cut)
++    if found is not None:
++        park, parked_at = found
++        broken = conn.execute(  # that probe (not an earlier one) broke since it was set
++            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'wake_check_broken' AND created_at >= ? "
++            "AND created_at < ? LIMIT 1", (task_id, parked_at, cut)).fetchone()
++        if not broken:
++            return "park", runs, marker, park
++    return "escalate", runs, marker, None
++
++
++def _note(runs: int, marker: int) -> str:
++    since = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(marker)) if marker else "the card's first run"
++    return (f"No-progress budget: {runs} runs in a row since {since} ended in a wait with no status, link, "
++            "attachment, edit, met condition, human comment or linked-card change")
++
++
++# Never take a card off the lane under a live claim another dispatcher holds.
++_UNCLAIMED = "(claim_lock IS NULL OR claim_expires IS NULL OR claim_expires < ?)"
++
++
++def _repark(conn, task_id: str, park: dict, runs: int, marker: int, now: int) -> bool:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    wake_check = park["wake_check"].strip()
++    every = kwc.normalize_every(park.get("check_every"))
++    host = park.get("probe_host") if isinstance(park.get("probe_host"), str) else None
++    own = kwc.own_gateway(conn)
++    reason = (f"{_note(runs, marker)}. Parked behind its own wake condition; only the condition or real "
++              f"progress brings the next run (clock fallback in {REPARK_SECONDS // 3600} h).")
++    # Runs inside hold()'s write transaction.
++    cur = conn.execute(
++        "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
++        "WHERE id = ? AND status IN ('ready', 'review') AND current_run_id IS NULL AND " + _UNCLAIMED,
++        (task_id, now))
++    if cur.rowcount != 1:
++        return False
++    payload: dict[str, Any] = {"reason": reason, "wake_at": now + REPARK_SECONDS, "wake_check": wake_check,
++                               "check_every": every, "no_progress": {"runs": runs, "since": marker}}
++    if host:
++        payload["probe_host"] = host
++    if isinstance(park.get("awaiting"), dict):
++        payload["awaiting"] = park["awaiting"]
++    kb._append_event(conn, task_id, "scheduled", payload)
++    kb._append_event(conn, task_id, PARKED_EVENT, {"runs": runs, "since": marker, "wake_check": wake_check})
++    kwc.set_check(conn, task_id, wake_check, every, now=now, register_here=not host or not own or host == own)
++    return True
++
++
++def _owner_body(task, runs: int, marker: int) -> str:
++    return (
++        f"{_note(runs, marker)}: card {task.id} ({task.title!r}). Its latest park named no usable wake condition, so the "
++        "dispatcher stopped spawning it and it now waits on this card. (A wake check that kept breaking counts as "
++        "no condition: parking behind it only re-woke the card.)\n\n"
++        "This is agent-owned, not a question for David. Read its runs and comments (`kanban_show`) and remove the "
++        "cause once: do the missing step where the capability lives, give the card a real wake condition "
++        "(`kanban_schedule` with `wake_check`), split it, or complete/archive it with a comment naming the "
++        f"disposition. Do not unblock or requeue {task.id} unchanged: that restarts the same loop. Complete this "
++        f"card with the evidence; {task.id} resumes when it is done."
++    )
++
++
++def _escalate(conn, task, runs: int, marker: int, now: int) -> Optional[str]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_awaiting import _supervisor_profile
++
++    note = _note(runs, marker)
++    # Runs inside hold()'s write transaction.
++    if task.created_by == CREATED_BY:
++        cur = conn.execute("UPDATE tasks SET status = 'triage', claim_lock = NULL, claim_expires = NULL, "
++                           "worker_pid = NULL WHERE id = ? AND status IN ('ready', 'review') "
++                           "AND current_run_id IS NULL AND " + _UNCLAIMED, (task.id, now))
++        if cur.rowcount == 1:
++            kb._append_event(conn, task.id, ESCALATED_EVENT, {"runs": runs, "since": marker, "owner": None,
++                                                              "status": "triage", "reason": note})
++        return None if cur.rowcount != 1 else ""
++    cur = conn.execute("UPDATE tasks SET status = 'todo', claim_lock = NULL, claim_expires = NULL, "
++                       "worker_pid = NULL WHERE id = ? AND status IN ('ready', 'review') "
++                       "AND current_run_id IS NULL AND " + _UNCLAIMED, (task.id, now))
++    if cur.rowcount != 1:
++        return None
++    key = f"no-progress:{task.id}:{marker}"
++    existing = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ?", (key,)).fetchone()
++    owner = existing[0] if existing and existing[1] not in ("done", "archived") else None
++    if owner is None:
++        supervisor = _supervisor_profile(task)
++        owner = kb.create_task(
++            conn, title=f"Unstick {task.id}: {runs} runs with no progress"[:200],
++            body=_owner_body(task, runs, marker), assignee=supervisor, created_by=CREATED_BY,
++            workspace_kind="scratch", triage=supervisor is None, idempotency_key=None if existing else key,
++            creator_task_id=task.id, session_id=task.session_id, tenant=task.tenant, priority=task.priority,
++        )
++    kb._link(conn, owner, task.id)
++    kb._append_event(conn, task.id, ESCALATED_EVENT, {"runs": runs, "since": marker, "owner": owner,
++                                                      "status": "todo", "reason": note})
++    return owner
++
++
++def hold(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
++         budget: Optional[int] = None) -> Optional[str]:
++    """Called by the dispatcher before claiming a ready/review card. None = spawn as usual; otherwise the card
++    was moved off the lane and the return names how (``parked`` / ``escalated:<owner>`` / ``triage``)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_wake_check import foreign_copy
++
++    lim = limit() if budget is None else int(budget)
++    if foreign_copy(conn, task_id):
++        return None  # a worker-node copy: its home board owns the decision
++    now = int(time.time()) if now is None else int(now)
++    if decide(conn, task_id, budget=lim, as_of=now + 1) is None:
++        return None  # cheap read on every tick; the write lock is taken only for a card over budget
++    with kb.write_txn(conn):
++        # Decide again under the lock, with a cutoff taken now: progress recorded since the read above must win.
++        now = max(now, int(time.time()))
++        verdict = decide(conn, task_id, budget=lim, as_of=now + 1)
++        if verdict is None:
++            return None
++        action, runs, marker, park = verdict
++        if action == "park":
++            done = _repark(conn, task_id, park, runs, marker, now)
++        else:
++            task = kb.get_task(conn, task_id)
++            done = None if task is None else _escalate(conn, task, runs, marker, now)
++    if action == "park":
++        if done:
++            logger.info("kanban: no-progress budget parked %s behind its wake condition (%d runs)", task_id, runs)
++            return "parked"
++        return None
++    owner = done
++    if owner is None:
++        return None
++    logger.info("kanban: no-progress budget escalated %s (%d runs) -> %s", task_id, runs, owner or "triage")
++    return f"escalated:{owner}" if owner else "triage"
++
++
++def held_json(held: list[tuple[str, str]]) -> list[dict]:
++    """``dispatch --json`` rows for ``DispatchResult.no_progress_held``."""
++    return [{"task_id": tid, "action": action} for (tid, action) in held]
++
++
++def print_held(held: list[tuple[str, str]]) -> None:
++    """``hermes kanban dispatch`` text lines for ``DispatchResult.no_progress_held``."""
++    for tid, action in held:
++        print(f"No-progress budget ({action}): {tid}")
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index d988a05220..3427c8ae67 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -15,6 +15,7 @@ from pathlib import Path
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_no_progress import held_json, print_held
+ from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
+ 
+ 
+@@ -110,6 +111,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+                 for (tid, reason) in res.respawn_guarded
+             ],
+             "rate_limited": res.rate_limited,
++            "no_progress_held": held_json(res.no_progress_held),
+             # Cards this machine cannot lease (runs_on / placement) and claims the Board deferred. [daveey]
+             "skipped_ineligible": [{"task_id": tid, "reason": reason} for (tid, reason) in res.skipped_ineligible],
+             "claim_deferred": [{"task_id": tid, "reason": reason} for (tid, reason) in res.claim_deferred],
+@@ -160,6 +162,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+         )
+     for tid, reason in res.respawn_guarded:
+         print(f"Guarded ({reason}): {tid}")
++    print_held(res.no_progress_held)
+     for tid, reason in res.skipped_ineligible:
+         print(f"Skipped (this machine cannot lease it: {reason}): {tid}")
+     for tid, reason in res.claim_deferred:
+diff --git a/tests/hermes_cli/test_kanban_no_progress.py b/tests/hermes_cli/test_kanban_no_progress.py
+new file mode 100644
+index 0000000000..7c69dae25c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_no_progress.py
+@@ -0,0 +1,404 @@
++"""No-progress budget: a card whose runs only park again stops being re-spawned. [daveey]
++
++Repro of t_e3e216d4 (141 runs, Oct 23 - Nov 10): the shepherd parked on another card
++(``awaiting kind=card`` + ``wait-check task``), its clock wake fired before that card moved
++(``continuation_woken`` 98 times vs ``condition_met`` 8), and each spawned worker re-read the same
++graph, commented "reconciliation complete, rollout NOT complete" and parked again. Card waits are
++exempt from the 3x re-park escalation (their producer is accountable), and the continuation cap only
++counts back-to-back ``continued`` runs, so nothing bounded the loop.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_capability_registry as kcr
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_no_progress as knp
++from hermes_cli import kanban_resume_requester as krr
++from hermes_cli import kanban_wake_check as kwc
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "3600")
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
++                "HERMES_SESSION_ID", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK",
++                "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    # Probes and capability refreshes run real commands off-thread; the clock wake is what is under test.
++    monkeypatch.setattr(kwc, "run_due_wake_checks", lambda conn, *a, **k: [])
++    monkeypatch.setattr(kcr, "maybe_refresh_async", lambda *a, **k: None)
++    monkeypatch.setattr(knp, "limit", lambda cfg=None: knp.DEFAULT_LIMIT)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++class Spawns:
++    def __init__(self):
++        self.ids: list[str] = []
++
++    def __call__(self, task, workspace, board=None):
++        self.ids.append(task.id)
++
++
++def _clock_wake(conn) -> list[str]:
++    """The clock wake ``wake_due_continuations`` gives every scheduled card once its wake_at passes."""
++    return kc.wake_due_continuations(conn, now=int(time.time()) + 30 * 86400)
++
++
++def _card_wait_cycle(conn, tid: str, producer: str) -> None:
++    """One t_e3e216d4 run: claimed, found the producer unchanged, parked on it again, clock-woken."""
++    assert kb.claim_task(conn, tid)
++    assert kb.schedule_task(conn, tid, reason="Reconciliation complete, rollout NOT complete; waiting on producer",
++                            awaiting={"kind": "card", "ref": producer})
++    assert tid in _clock_wake(conn)
++
++
++def _shepherd(conn, cycles: int) -> tuple[str, str]:
++    producer = kb.create_task(conn, title="E: rollout", assignee="other")
++    tid = kb.create_task(conn, title="Shepherd the graph", assignee="default")
++    for _ in range(cycles):
++        _card_wait_cycle(conn, tid, producer)
++    return tid, producer
++
++
++def _events(conn, tid: str, kind: str) -> list:
++    return [e for e in kb.list_events(conn, tid) if e.kind == kind]
++
++
++def test_card_wait_loop_parks_behind_its_own_condition(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, producer = _shepherd(conn, knp.DEFAULT_LIMIT)
++        assert kb.get_task(conn, tid).status == "ready"
++        spawns = Spawns()
++        res = kbd.dispatch_once(conn, spawn_fn=spawns)
++        assert tid not in spawns.ids, "a 6th run was spawned into the same unchanged graph"
++        assert res.no_progress_held == [(tid, "parked")]
++        task = kb.get_task(conn, tid)
++        assert task.status == "scheduled"
++        park = _events(conn, tid, "scheduled")[-1].payload
++        assert park["wake_check"] == f"hermes kanban wait-check task {producer}"
++        assert park["wake_at"] >= int(time.time()) + knp.REPARK_SECONDS - 60
++        assert park["no_progress"]["runs"] == knp.DEFAULT_LIMIT
++        assert park["awaiting"]["ref"] == producer
++        row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()
++        assert row and row[0] == park["wake_check"]
++        assert len(_events(conn, tid, knp.PARKED_EVENT)) == 1
++        # Its probe's condition is the way back: a met condition is progress, so the next wake spawns.
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "condition_met", {"wake_check": park["wake_check"]})
++        assert kbd.dispatch_once(conn, spawn_fn=spawns).no_progress_held == []
++        assert tid in spawns.ids
++
++
++def test_below_budget_still_spawns(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, _ = _shepherd(conn, knp.DEFAULT_LIMIT - 1)
++        spawns = Spawns()
++        res = kbd.dispatch_once(conn, spawn_fn=spawns)
++        assert tid in spawns.ids and res.no_progress_held == []
++
++
++def test_clock_refallback_reparks_without_spawning(kanban_home):
++    """The 24 h clock fallback brings the card back to the lane; with still no progress it re-parks, no run."""
++    with kbc.connect_closing() as conn:
++        tid, _ = _shepherd(conn, knp.DEFAULT_LIMIT)
++        spawns = Spawns()
++        kbd.dispatch_once(conn, spawn_fn=spawns)
++        assert tid in _clock_wake(conn)
++        runs_before = conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
++        kbd.dispatch_once(conn, spawn_fn=spawns)
++        assert tid not in spawns.ids
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == runs_before
++
++
++def _human(conn, tid):
++    kb.add_comment(conn, tid, "daveey", "Use the other region.", writer_kind="human")
++
++
++def _linked_done(conn, tid):
++    parent = kb.create_task(conn, title="dep", assignee="other")
++    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, tid))
++        kb._append_event(conn, parent, "completed", {})
++
++
++def _linked_changes_requested(conn, tid):
++    child = kb.create_task(conn, title="impl", assignee="other")
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (tid, child))
++        kb._append_event(conn, child, "changes_requested", {})
++
++
++def _attached(conn, tid):
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "attached", {"filename": "proof.log"})
++
++
++@pytest.mark.parametrize("progress", [_human, _linked_done, _linked_changes_requested, _attached])
++def test_progress_resets_the_budget(kanban_home, progress):
++    with kbc.connect_closing() as conn:
++        tid, _ = _shepherd(conn, knp.DEFAULT_LIMIT)
++        progress(conn, tid)
++        spawns = Spawns()
++        assert kbd.dispatch_once(conn, spawn_fn=spawns).no_progress_held == []
++        assert tid in spawns.ids
++
++
++def test_agent_comments_are_not_progress(kanban_home):
++    """The loop's own output ("NO_PROOF retained", "no duplicate owner") never resets it."""
++    with kbc.connect_closing() as conn:
++        tid, _ = _shepherd(conn, knp.DEFAULT_LIMIT)
++        kb.add_comment(conn, tid, "default", "Reconciled: NO_PROOF retained.", writer_kind="agent")
++        kb.add_comment(conn, tid, "default", "Supervisor disposition: no duplicate owner.")
++        spawns = Spawns()
++        assert kbd.dispatch_once(conn, spawn_fn=spawns).no_progress_held == [(tid, "parked")]
++
++
++# --- synthetic run histories for the counting rules -----------------------------------------
++
++def _run(conn, tid: str, outcome: str, park: dict | None = None, *, at: int | None = None) -> int:
++    at = int(time.time()) if at is None else at
++    with kb.write_txn(conn):
++        rid = conn.execute(
++            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
++            "VALUES (?, 'default', ?, ?, ?, ?)", (tid, outcome, at, at, outcome)).lastrowid
++        if park is not None:
++            kind = "continued" if outcome == "continued" else "scheduled"
++            kb._append_event(conn, tid, kind, park, run_id=rid)
++            conn.execute("UPDATE task_events SET created_at = ? WHERE run_id = ?", (at, rid))
++    return rid
++
++
++COND = {"wake_at": 1, "wake_check": "exit 1", "check_every": 900}
++CONT_WAIT = {**COND, "status": "scheduled"}
++
++
++def _card(conn, title="loop") -> str:
++    tid = kb.create_task(conn, title=title, assignee="default")
++    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    conn.commit()
++    return tid
++
++
++def test_counting_rules(kanban_home):
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        for _ in range(4):
++            _run(conn, t, "scheduled", COND)
++        for neutral in ("crashed", "reclaimed", "rate_limited", "released"):
++            _run(conn, t, neutral)
++        assert knp.streak(conn, t)[0] == 4, "run losses must neither count nor reset"
++        _run(conn, t, "continued", CONT_WAIT)
++        assert knp.streak(conn, t)[0] == 5, "a continue into a wait is a waiting run"
++        _run(conn, t, "scheduled", {"wake_at": 1, "clock_only": True})
++        _run(conn, t, "scheduled", {"wake_at": 1, "awaiting": {"kind": "clock", "ref": "soak window"}})
++        assert knp.streak(conn, t)[0] == 5, "a declared time window's wakes are the measurement itself"
++        _run(conn, t, "scheduled", {"wake_at": 1})  # a clock poll with nothing to probe
++        assert knp.streak(conn, t)[0] == 5 + 1 / knp.CLOCK_POLL_WEIGHT
++        _run(conn, t, "blocked")
++        assert knp.streak(conn, t)[0] == 6 + 1 / knp.CLOCK_POLL_WEIGHT
++
++        long_work = _card(conn, "long build")
++        for _ in range(6):
++            _run(conn, long_work, "scheduled", COND)
++        _run(conn, long_work, "continued", {"status": "ready", "wake_at": 1})  # soft-deadline checkpoint
++        assert knp.streak(conn, long_work)[0] == 0
++        handed_on = _card(conn, "reviewed")
++        for _ in range(6):
++            _run(conn, handed_on, "scheduled", COND)
++        _run(conn, handed_on, "review_requested")
++        assert knp.streak(conn, handed_on)[0] == 0
++
++
++def test_clock_polls_need_the_weighted_budget(kanban_home):
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        polls = knp.DEFAULT_LIMIT * knp.CLOCK_POLL_WEIGHT
++        for _ in range(polls - 1):
++            _run(conn, t, "scheduled", {"wake_at": 1})
++        assert knp.hold(conn, t) is None
++        _run(conn, t, "scheduled", {"wake_at": 1})
++        assert knp.hold(conn, t).startswith("escalated:")
++
++
++def test_blocked_loop_files_one_owner_card_and_no_recovery_loop(kanban_home):
++    with kbc.connect_closing() as conn:
++        t = _card(conn, "goal card")
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "blocked")
++        spawns = Spawns()
++        res = kbd.dispatch_once(conn, spawn_fn=spawns)
++        assert t not in spawns.ids
++        [(held, action)] = res.no_progress_held
++        owner = action.split(":", 1)[1]
++        assert held == t and kb.get_task(conn, t).status == "todo"
++        o = kb.get_task(conn, owner)
++        assert o.created_by == knp.CREATED_BY and "Do not unblock or requeue" in o.body
++        assert conn.execute("SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?", (owner, t)).fetchone()
++        assert not {e.kind for e in kb.list_events(conn, t)} & {"continuation_exhausted", "goal_unachievable"}
++        assert krr.ensure_recovery_cards(conn) == []
++        # Requeued unchanged by someone: the same episode reuses the same owner card.
++        conn.execute("DELETE FROM task_links WHERE parent_id = ?", (owner,))
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
++        conn.commit()
++        assert knp.hold(conn, t) == f"escalated:{owner}"
++        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE created_by = ?", (knp.CREATED_BY,)).fetchone()[0] == 1
++
++
++def test_looping_owner_card_goes_to_triage_not_another_owner(kanban_home):
++    with kbc.connect_closing() as conn:
++        o = kb.create_task(conn, title="Unstick x", assignee="default", created_by=knp.CREATED_BY)
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (o,))
++        conn.commit()
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, o, "blocked")
++        assert knp.hold(conn, o) == "triage"
++        assert kb.get_task(conn, o).status == "triage"
++        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE created_by = ?", (knp.CREATED_BY,)).fetchone()[0] == 1
++
++
++def test_broken_probe_escalates_instead_of_reparking(kanban_home):
++    """t_01a1a27deb10165f: 591 runs, 588 ``wake_check_broken`` wakes; parking behind that probe re-wakes it."""
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "scheduled", COND)
++        assert knp.decide(conn, t, budget=knp.DEFAULT_LIMIT)[0] == "park"
++        with kb.write_txn(conn):
++            kb._append_event(conn, t, "wake_check_broken", {"rc": 127})
++        assert knp.decide(conn, t, budget=knp.DEFAULT_LIMIT, as_of=int(time.time()) + 2)[0] == "escalate"
++
++
++def test_clock_only_park_is_no_condition(kanban_home):
++    """A declared time window that also carries a probe is still a time window: nothing to park behind."""
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "blocked")
++        with kb.write_txn(conn):
++            kb._append_event(conn, t, "scheduled", {"wake_at": 1, "wake_check": "exit 1", "clock_only": True})
++        assert knp.decide(conn, t, budget=knp.DEFAULT_LIMIT, as_of=int(time.time()) + 2)[0] == "escalate"
++
++
++def test_condition_from_before_the_last_progress_is_not_reused(kanban_home):
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        old = int(time.time()) - 100
++        _run(conn, t, "scheduled", {**COND, "wake_check": "hermes kanban wait-check task OLD"}, at=old)
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'edited', '{}', ?)",
++                         (t, old + 10))
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "blocked", at=old + 20)
++        assert knp.decide(conn, t, budget=knp.DEFAULT_LIMIT)[0] == "escalate"
++
++
++def test_an_earlier_broken_probe_does_not_veto_the_current_one(kanban_home):
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        base = int(time.time()) - 100
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) "
++                         "VALUES (?, 'wake_check_broken', '{}', ?)", (t, base))
++        for i in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "scheduled", COND, at=base + 10 + i)
++        assert knp.decide(conn, t, budget=knp.DEFAULT_LIMIT)[0] == "park"
++
++
++def test_live_claim_is_never_taken_off_the_lane(kanban_home):
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "scheduled", COND)
++        conn.execute("UPDATE tasks SET claim_lock = 'other', claim_expires = ? WHERE id = ?",
++                     (int(time.time()) + 600, t))
++        conn.commit()
++        assert knp.hold(conn, t) is None
++        assert kb.get_task(conn, t).status == "ready"
++        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 1, t))
++        conn.commit()
++        assert knp.hold(conn, t) == "parked"
++
++
++def test_progress_between_read_and_lock_wins(kanban_home, monkeypatch):
++    """A human comment that lands after the cheap read but before the write lock keeps the card spawnable."""
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "scheduled", COND, at=int(time.time()) - 10)
++        real = knp.decide
++        calls = []
++
++        def racing(c, tid, **kw):
++            calls.append(tid)
++            if len(calls) == 1:
++                verdict = real(c, tid, **kw)
++                kb.add_comment(conn, t, "daveey", "use the other region", writer_kind="human")
++                return verdict
++            return real(c, tid, **kw)
++
++        monkeypatch.setattr(knp, "decide", racing)
++        assert knp.hold(conn, t) is None and len(calls) == 2
++        assert kb.get_task(conn, t).status == "ready"
++
++
++def test_neutral_rows_never_hide_the_streak(kanban_home):
++    """250 crashes between the waits: no row cap stops the count short of the budget."""
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "scheduled", COND)
++            for _ in range(50):
++                _run(conn, t, "crashed")
++        assert knp.streak(conn, t)[0] == knp.DEFAULT_LIMIT
++
++
++def test_disabled_and_foreign_copies_spawn(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        t = _card(conn)
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, t, "scheduled", COND)
++        assert knp.hold(conn, t, budget=0) is None
++        monkeypatch.setattr(kwc, "foreign_copy", lambda c, tid: tid == t)
++        assert knp.hold(conn, t) is None
++        assert kb.get_task(conn, t).status == "ready"
++
++
++def test_limit_reads_config():
++    assert knp.limit({"kanban": {"no_progress_runs": 0}}) == 0
++    assert knp.limit({"kanban": {"no_progress_runs": "7"}}) == 7
++    assert knp.limit({"kanban": {"no_progress_runs": "x"}}) == knp.DEFAULT_LIMIT
++    assert knp.limit({}) == knp.DEFAULT_LIMIT
++
++
++def test_dry_run_tick_moves_nothing(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, _ = _shepherd(conn, knp.DEFAULT_LIMIT)
++        res = kbd.dispatch_once(conn, spawn_fn=Spawns(), dry_run=True)
++        assert res.no_progress_held == [] and kb.get_task(conn, tid).status == "ready"
++
++
++def test_payload_json_roundtrip(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, _ = _shepherd(conn, knp.DEFAULT_LIMIT)
++        kbd.dispatch_once(conn, spawn_fn=Spawns())
++        raw = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                           (tid, knp.PARKED_EVENT)).fetchone()[0]
++        assert json.loads(raw)["runs"] == knp.DEFAULT_LIMIT
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 25705fd2fd..5e25a5e4ab 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -609,6 +609,34 @@ from automatic decomposition, so the supervising agent must split or resume the
+ preserved work. Local session counts and remote replica counts treat this as
+ unfinished agent work, never as waiting on a human.
+ 
++#### No-progress budget
++
++A card can also loop without ever failing: it parks, its clock wakes it, the
++worker finds nothing changed, comments and parks again. Before claiming a
++`ready` card the dispatcher counts its trailing runs that ended in a wait
++(`scheduled`, `blocked`, or `continued` into `scheduled`) since the card's last
++progress marker: a completion or review hand-off, a link, attachment, edit,
++reassignment, move, contract change, met wake condition, human comment, or a
++completion, archive, review, reopen or edit on a parent or child card. Agent
++comments are not progress, nor is a bare `unblocked` (a recovery loop is made
++of them). Crashes, reclaims and quota releases neither count nor reset; a declared time window (`clock_only`, `awaiting.kind=clock`) is not
++counted; a park with no wake condition (a clock poll) counts a quarter run.
++
++At `kanban.no_progress_runs` (default 5; 0 disables) the dispatcher spawns
++nothing and, deciding again under the write lock and never under another
++dispatcher's live claim, instead (event `no_progress_parked` / `no_progress_escalated`,
++`dispatch --json` key `no_progress_held`):
++
++- re-parks the card behind the latest wake condition it declared since its
++  last progress, with a 24 h clock fallback, so only the condition or real
++  progress brings the next run (a fallback that finds nothing new re-parks it
++  again: one event a day, no worker run);
++- or, when there is no usable condition (none declared since the last
++  progress, or that probe reported `wake_check_broken`), files one idempotent
++  owner card (`created_by=kanban-no-progress`) the card waits on in `todo`.
++  A looping owner card goes to `triage`. No `continuation_exhausted` or
++  `goal_unachievable` event is written, so no recovery card is opened.
++
+ #### Workers and systemd cgroups
+ 
+ Workers are fire-and-forget processes that outlive the dispatcher tick, so
+-- 
+2.55.0
+

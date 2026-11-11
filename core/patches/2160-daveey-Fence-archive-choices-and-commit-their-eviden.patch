@@ -1,0 +1,184 @@
+From a880769a259c25af6f2a32e5c64631f313f44035 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:50:57 +0000
+Subject: [PATCH] [daveey] Fence archive choices and commit their evidence
+ atomically
+
+Add optional precondition and reason-comment hooks matching unblock_task. Keep cleanup post-commit; refusals and exceptions retain neither comment nor state change. Enables the user-steps card projection to use core-owned transactions and an event receipt rather than an invalid nested write_txn.
+
+Proof: new tests RED on missing kwargs, GREEN with 25 targeted archive tests; user-steps real-core projection integration passes resume/archive and replay after board commit.
+---
+ hermes_cli/kanban_db.py                       |  6 +-
+ hermes_cli/kanban_db_archive.py               | 16 +++-
+ .../test_kanban_archive_choice_fence.py       | 95 +++++++++++++++++++
+ 3 files changed, 111 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_archive_choice_fence.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index c24aac76aa..4eb43a4b8d 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3828,9 +3828,11 @@ def specify_triage_task(
+ 
+ 
+ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None,
+-                 event_extra: Optional[dict] = None) -> bool:
++                 event_extra: Optional[dict] = None, comment: Optional[tuple[str, str]] = None,
++                 precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None) -> bool:
+     from hermes_cli.kanban_db_archive import archive_task as archive
+-    return archive(conn, task_id, signal_fn=signal_fn, via=via, event_extra=event_extra)
++    return archive(conn, task_id, signal_fn=signal_fn, via=via, event_extra=event_extra,
++                   comment=comment, precondition=precondition)
+ 
+ 
+ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
+diff --git a/hermes_cli/kanban_db_archive.py b/hermes_cli/kanban_db_archive.py
+index 8371876b1f..dcf493da4c 100644
+--- a/hermes_cli/kanban_db_archive.py
++++ b/hermes_cli/kanban_db_archive.py
+@@ -2,11 +2,12 @@
+ from __future__ import annotations
+ 
+ import sqlite3
+-from typing import Optional
++from typing import Callable, Optional
+ 
+ 
+ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None,
+-                 event_extra: Optional[dict] = None) -> bool:
++                 event_extra: Optional[dict] = None, comment: Optional[tuple[str, str]] = None,
++                 precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None) -> bool:
+     """Archive a task; a *running* task's host-local worker is terminated.
+ 
+     Clearing ``worker_pid`` in the DB alone left the OS process running past its
+@@ -18,10 +19,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+     lock. Post-release kill is safe here because ``archived`` is terminal: no
+     dispatcher can spawn a duplicate worker off the released claim. The
+     termination outcome lands as its own ``archive_worker_termination`` event so
+-    the ``archived`` event stays atomic with the status flip.
++    the ``archived`` event stays atomic with the status flip. Optional ``precondition``
++    runs inside that transaction; a nonempty refusal leaves no transition or comment.
++    ``comment`` and ``event_extra`` commit with the archive, before post-commit cleanup.
+     """
+     from hermes_cli import kanban_db as kb
+-    with kb.write_txn(conn):
++    from hermes_cli.kanban_reason_comment import reason_comment
++
++    with kb.write_txn(conn), reason_comment(conn, task_id, comment) as noted:
++        if precondition is not None and precondition(conn):
++            return False
+         row = conn.execute(
+             "SELECT status, human_request, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+             (task_id,),
+@@ -53,6 +60,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+         # for the dispatcher sweep (kanban_placement_forward.sweep_unresolved_archives).
+         from hermes_cli.kanban_placement_forward import record_cancel_intent
+         record_cancel_intent(conn, task_id, "archived")
++        noted.keep()
+     if was_running:
+         termination = kb._terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+         with kb.write_txn(conn):
+diff --git a/tests/hermes_cli/test_kanban_archive_choice_fence.py b/tests/hermes_cli/test_kanban_archive_choice_fence.py
+new file mode 100644
+index 0000000000..5509c004c8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_archive_choice_fence.py
+@@ -0,0 +1,95 @@
++"""Archive choice fences and decision evidence share the transition transaction."""
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = connect()
++    task = kb.create_task(conn, title="Synthetic archive choice", assignee="default")
++    try:
++        yield conn, task
++    finally:
++        conn.close()
++
++
++def test_archive_precondition_refusal_writes_nothing(board, monkeypatch):
++    conn, task = board
++    before = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
++    monkeypatch.setattr(
++        kb, "_cleanup_workspace", lambda *a: pytest.fail("refusal cleaned workspace")
++    )
++    checks = []
++
++    def refuse(c):
++        checks.append(c.in_transaction)
++        return "ask changed"
++
++    assert not kb.archive_task(
++        conn, task, precondition=refuse, comment=("user-steps", "Archive selected")
++    )
++    assert checks == [True]
++    assert kb.get_task(conn, task).status != "archived"
++    assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
++    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == before
++
++
++def test_archive_commits_choice_comment_and_receipt_before_cleanup(board, monkeypatch):
++    conn, task = board
++
++    def cleanup(c, tid):
++        assert not c.in_transaction
++        assert kb.get_task(c, tid).status == "archived"
++        assert (
++            c.execute(
++                "SELECT body FROM task_comments WHERE task_id=?", (tid,)
++            ).fetchone()[0]
++            == "Archive selected"
++        )
++
++    monkeypatch.setattr(kb, "_cleanup_workspace", cleanup)
++    assert kb.archive_task(
++        conn,
++        task,
++        precondition=lambda c: None,
++        comment=("user-steps", "Archive selected"),
++        event_extra={"choice_receipt": {"operation": "test-op"}},
++    )
++    event = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='archived'", (task,)
++    ).fetchone()[0]
++    assert "test-op" in event
++    assert not kb.archive_task(
++        conn, task, precondition=lambda c: None, comment=("user-steps", "Duplicate")
++    )
++    assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 1
++
++
++def test_failed_archive_rolls_back_comment_state_and_receipt(board, monkeypatch):
++    conn, task = board
++    original = kb._append_event
++
++    def broken(c, tid, kind, *args, **kwargs):
++        if kind == "archived":
++            raise RuntimeError("injected receipt failure")
++        return original(c, tid, kind, *args, **kwargs)
++
++    monkeypatch.setattr(kb, "_append_event", broken)
++    with pytest.raises(RuntimeError, match="injected"):
++        kb.archive_task(
++            conn,
++            task,
++            precondition=lambda c: None,
++            comment=("user-steps", "Archive selected"),
++        )
++    assert kb.get_task(conn, task).status != "archived"
++    assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
+-- 
+2.55.0
+

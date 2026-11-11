@@ -1,0 +1,281 @@
+From 031cf357fb49da48187167ea9dbd8671c599e18e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:41:14 +0000
+Subject: [PATCH] feat(outcomes): stage bounded completion receipt validation
+ [daveey]
+
+---
+ hermes_completion_receipt.py                  | 102 ++++++++++++++
+ hermes_state_outcome.py                       |   6 +
+ tests/hermes_state/test_completion_receipt.py | 133 ++++++++++++++++++
+ 3 files changed, 241 insertions(+)
+ create mode 100644 hermes_completion_receipt.py
+ create mode 100644 tests/hermes_state/test_completion_receipt.py
+
+diff --git a/hermes_completion_receipt.py b/hermes_completion_receipt.py
+new file mode 100644
+index 00000000000..ca3201a8a06
+--- /dev/null
++++ b/hermes_completion_receipt.py
+@@ -0,0 +1,102 @@
++"""Bounded, additive artifact-disposition receipts; never execution authorization.
++
++Stored inside existing outcome/run metadata, not a new ledger. Validation checks
++claims' shape, not their truth: ``independently_checked`` is attributed evidence,
++not permission to bypass acceptance, owner attestation or freshness gates.
++"""
++from __future__ import annotations
++
++from datetime import datetime
++import json
++import re
++from typing import Any
++
++DISPOSITIONS = ("delivered", "superseded", "contained", "rejected")
++VERIFICATIONS = ("reported", "independently_checked")
++MAX_ITEMS = 32
++MAX_EVIDENCE = 32
++MAX_REMAINING = 32
++MAX_TEXT = 2000
++MAX_REF = 2048
++_QUALIFIED_OWNER = re.compile(r"@(task|session):[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+/[^\s/@]+\Z")
++
++
++def _object(value: Any, required: set[str], optional: set[str] | None = None) -> dict:
++    if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - (optional or set()):
++        raise ValueError("completion_receipt: missing or unknown object fields")
++    return value
++
++
++def _text(value: Any, name: str, limit: int = MAX_TEXT) -> str:
++    if not isinstance(value, str) or not value.strip() or len(value) > limit:
++        raise ValueError(f"completion_receipt: {name} needs nonempty text of at most {limit} characters")
++    if any(ord(c) < 32 and c not in "\n\t" for c in value):
++        raise ValueError(f"completion_receipt: {name} contains control characters")
++    return value
++
++
++def _enum(value: Any, choices: tuple[str, ...], name: str) -> str:
++    if not isinstance(value, str) or value not in choices:
++        raise ValueError(f"completion_receipt: {name} must be one of {', '.join(choices)}")
++    return value
++
++
++def _array(value: Any, name: str, limit: int, *, nonempty: bool = False) -> list:
++    if not isinstance(value, list) or len(value) > limit or (nonempty and not value):
++        raise ValueError(f"completion_receipt: {name} needs {'1' if nonempty else '0'}..{limit} entries")
++    return value
++
++
++def _evidence(value: Any) -> dict:
++    raw = _object(value, {"ref", "observed_at", "verification"})
++    observed_at = _text(raw["observed_at"], "observed_at", 64)
++    try:
++        stamp = datetime.fromisoformat(observed_at)
++    except ValueError as exc:
++        raise ValueError("completion_receipt: observed_at needs an ISO8601 timestamp with timezone") from exc
++    if stamp.tzinfo is None:
++        raise ValueError("completion_receipt: observed_at needs a timezone")
++    return {"ref": _text(raw["ref"], "evidence ref", MAX_REF), "observed_at": observed_at,
++            "verification": _enum(raw["verification"], VERIFICATIONS, "verification")}
++
++
++def _remaining(value: Any) -> dict:
++    raw = _object(value, {"scope", "state", "owner", "reason"})
++    state = _enum(raw["state"], ("pending", "deferred"), "remaining state")
++    owner = raw["owner"]
++    if owner is None:
++        if state != "deferred":
++            raise ValueError("completion_receipt: pending remaining work needs a qualified owner")
++    elif not _QUALIFIED_OWNER.fullmatch(_text(owner, "owner", MAX_REF)):
++        raise ValueError("completion_receipt: owner must be @task:board@gateway/id or @session:profile@gateway/id")
++    return {"scope": _text(raw["scope"], "remaining scope"), "state": state, "owner": owner,
++            "reason": _text(raw["reason"], "remaining reason")}
++
++
++def _item(value: Any) -> dict:
++    raw = _object(value, {"scope", "disposition", "evidence", "remaining"}, {"superseded_by"})
++    disposition = _enum(raw["disposition"], DISPOSITIONS, "disposition")
++    out = {"scope": _text(raw["scope"], "scope"), "disposition": disposition,
++           "evidence": [_evidence(e) for e in _array(raw["evidence"], "evidence", MAX_EVIDENCE, nonempty=True)],
++           "remaining": [_remaining(r) for r in _array(raw["remaining"], "remaining", MAX_REMAINING)]}
++    if disposition == "superseded":
++        out["superseded_by"] = _text(raw.get("superseded_by"), "superseded_by", MAX_REF)
++    elif "superseded_by" in raw:
++        raise ValueError("completion_receipt: superseded_by is only valid for superseded scope")
++    return out
++
++
++def validate_completion_receipt(value: Any) -> dict:
++    """Validate the entire v1 value before any write; return an independent copy.
++
++    This is structural validation only. Writers must additionally resolve pending
++    owners against existing ownership/wait links before admitting the write.
++    Projections preserve the source evidence timestamp and verification unchanged.
++    """
++    raw = _object(value, {"version", "items"})
++    if type(raw["version"]) is not int or raw["version"] != 1:
++        raise ValueError("completion_receipt: version must be integer 1")
++    out = {"version": 1, "items": [_item(i) for i in _array(raw["items"], "items", MAX_ITEMS, nonempty=True)]}
++    if len(json.dumps(out, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > 32768:
++        raise ValueError("completion_receipt: canonical JSON must not exceed 32768 bytes")
++    return out
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index fb35b7990ea..1c00c8819a2 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -135,6 +135,12 @@ def validate_declaration(outcome: Any) -> dict[str, Any]:
+     if kind not in DECLARABLE_KINDS:
+         raise ValueError(f"outcome kind must be one of {', '.join(DECLARABLE_KINDS)}")
+     out: dict[str, Any] = {"kind": kind}
++    if "completion_receipt" in outcome:
++        from hermes_completion_receipt import validate_completion_receipt
++
++        if kind != "done":
++            raise ValueError("completion_receipt is only valid on a done declaration")
++        out["completion_receipt"] = validate_completion_receipt(outcome["completion_receipt"])
+     if kind == "done":
+         summary = _str(outcome.get("summary"))
+         if not summary:
+diff --git a/tests/hermes_state/test_completion_receipt.py b/tests/hermes_state/test_completion_receipt.py
+new file mode 100644
+index 00000000000..39644ffa88a
+--- /dev/null
++++ b/tests/hermes_state/test_completion_receipt.py
+@@ -0,0 +1,133 @@
++"""Artifact acceptance is independent of workflow completion (anonymous fixtures)."""
++from copy import deepcopy
++
++import pytest
++
++from hermes_state_outcome import validate_declaration
++from tests.hermes_state import test_session_outcome as fixtures
++
++board = fixtures.board
++db = fixtures.db
++
++
++def test_persisted_receipt_survives_refresh_and_reopen(db, monkeypatch):
++    import hermes_state_outcome as so
++    from hermes_state import SessionDB
++
++    monkeypatch.setattr(so, "_live_turn", lambda *_: False)
++    fixtures.turn(db)
++    value = receipt("rejected")
++    so.declare_outcome("chat", {"kind": "done", "summary": "Assessment finished; artifact rejected.",
++                               "completion_receipt": value}, db=db)
++    path = db.db_path
++    db.close()
++    reopened = SessionDB(db_path=path)
++    try:
++        assert so.get_outcome("chat", db=reopened)["completion_receipt"] == value
++        assert so.refresh_outcome("chat", "manual", db=reopened)["completion_receipt"] == value
++        assert so.refresh_outcome("chat", "manual", db=reopened)["completion_receipt"] == value
++    finally:
++        reopened.close()
++
++
++def test_malformed_declaration_leaves_existing_outcome_unchanged(db):
++    import hermes_state_outcome as so
++
++    fixtures.turn(db)
++    so.declare_outcome("chat", {"kind": "done", "summary": "Prior result"}, db=db)
++    before = so.get_outcome("chat", db=db)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        so.declare_outcome("chat", {"kind": "done", "summary": "Invalid replacement",
++                                   "completion_receipt": {"version": 1, "items": []}}, db=db)
++    assert so.get_outcome("chat", db=db) == before
++
++
++def receipt(disposition="delivered"):
++    item = {
++        "scope": "bounded assessment artifact",
++        "disposition": disposition,
++        "evidence": [{"ref": "https://example.com/review/1", "observed_at": "2026-01-01T00:00:00Z",
++                      "verification": "reported"}],
++        "remaining": [],
++    }
++    if disposition == "superseded":
++        item["superseded_by"] = "@task:default@other/t_successor"
++    return {"version": 1, "items": [item]}
++
++
++def declare(value):
++    return validate_declaration({"kind": "done", "summary": "Assessment finished.",
++                                 "completion_receipt": value})
++
++
++@pytest.mark.parametrize("disposition", ["delivered", "rejected", "contained", "superseded"])
++def test_workflow_done_does_not_imply_artifact_acceptance(disposition):
++    value = receipt(disposition)
++    out = declare(value)
++    assert out["kind"] == "done"
++    assert out["completion_receipt"] == value
++    assert out["completion_receipt"] is not value
++
++
++def test_report_delivered_does_not_authorize_deferred_enforcement():
++    value = receipt()
++    value["items"][0]["remaining"] = [{"scope": "enforcement", "state": "deferred", "owner": None,
++                                       "reason": "User deferred; no execution authorized."}]
++    assert declare(value)["completion_receipt"] == value
++
++
++def test_mixed_superseded_migration_and_delivered_hardening():
++    value = receipt("superseded")
++    value["items"] += receipt()["items"]
++    value["items"][1]["scope"] = "artifact hardening"
++    assert [i["disposition"] for i in declare(value)["completion_receipt"]["items"]] == [
++        "superseded", "delivered"]
++
++
++@pytest.mark.parametrize("mutate", [
++    lambda r: r.update(version=True),
++    lambda r: r.update(version=2),
++    lambda r: r.update(items=[]),
++    lambda r: r.update(extra="ignored would be unsafe"),
++    lambda r: r["items"][0].update(scope=""),
++    lambda r: r["items"][0].update(disposition="fixed"),
++    lambda r: r["items"][0].update(evidence=[]),
++    lambda r: r["items"][0]["evidence"][0].update(ref=""),
++    lambda r: r["items"][0]["evidence"][0].update(observed_at="yesterday"),
++    lambda r: r["items"][0]["evidence"][0].update(observed_at="2026-01-01T00:00:00"),
++    lambda r: r["items"][0]["evidence"][0].update(verification="verified"),
++    lambda r: r["items"][0].update(disposition="superseded"),
++    lambda r: r["items"][0].update(superseded_by="unrelated"),
++    lambda r: r["items"][0].update(remaining=[{"scope": "fix", "state": "pending", "owner": None,
++                                             "reason": "someone should"}]),
++    lambda r: r["items"][0].update(remaining=[{"scope": "fix", "state": "pending", "owner": "t_local",
++                                             "reason": "ambiguous owner"}]),
++    lambda r: r["items"][0].update(remaining=[{"scope": "fix", "state": "deferred", "owner": None,
++                                             "reason": ""}]),
++])
++def test_malformed_receipt_is_rejected_not_stripped(mutate):
++    value = receipt()
++    mutate(value)
++    before = deepcopy(value)
++    with pytest.raises(ValueError, match="completion_receipt"):
++        declare(value)
++    assert value == before
++
++
++def test_whole_receipt_size_is_bounded():
++    value = receipt()
++    item = value["items"][0]
++    item["scope"] = "x" * 2000
++    value["items"] = [deepcopy(item) for _ in range(32)]
++    with pytest.raises(ValueError, match="32768"):
++        declare(value)
++
++
++def test_legacy_done_has_unspecified_artifact_acceptance():
++    assert "completion_receipt" not in validate_declaration({"kind": "done", "summary": "Done"})
++
++
++def test_receipt_is_not_allowed_on_decision_declaration():
++    with pytest.raises(ValueError, match="completion_receipt"):
++        validate_declaration({"kind": "decision", "items": [{"question": "Continue?", "choices": ["yes", "no"]}],
++                              "completion_receipt": receipt()})
+-- 
+2.55.0
+

@@ -1,0 +1,340 @@
+From c937b8957bff3567ca0ed9b3f1c578d802facb88 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:01:47 +0000
+Subject: [PATCH] fix(update): leave a gateway pinned to its own checkout out
+ of the pause and restart [daveey]
+
+hermes-hub deferred every core update from 2026-11-11 00:41 to 05:43 UTC (11 runs):
+"Update deferred: hermes-gateway-askeve-builder does not support idle pause; restart
+that gateway on the installed code when idle". That unit runs through a drop-in whose
+ExecStart and PYTHONPATH name ~/.hermes/askeve-runtime/core-<sha>, a core older than
+the idle pause, so it answers `unsupported` and a restart only brings it back on its
+pin. The pause chose its set by HERMES_HOME alone (#93349), so a profile of this home
+on another checkout was treated as running the code being replaced.
+
+_systemd_unit_owned_by_update now also asks which checkout the unit's live gateway
+loads (update_receipt._gateway_code_root, the reader the fleet receipt already uses
+for its `external` rows). A gateway provably on another checkout is named once and
+left alone by all three callers: the pre-swap pause, the drain-then-restart and the
+best-effort restart. Unknown is never foreign: an unreadable code root keeps today's
+behaviour. _gateway_code_root gains the unit's PYTHONPATH as evidence, ahead of the
+interpreter's location, for `python -m hermes_cli.main` from a venv outside any
+checkout with no status record yet.
+
+Not covered: launchd jobs and bare `gateway run` processes on another checkout.
+---
+ hermes_cli/update_cmd_fleet.py                |  16 +-
+ hermes_cli/update_cmd_posix_pause.py          |   3 +
+ hermes_cli/update_fleet_scope.py              |  32 +++-
+ hermes_cli/update_receipt.py                  |   7 +
+ .../test_update_pause_pinned_runtime.py       | 179 ++++++++++++++++++
+ 5 files changed, 230 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_pause_pinned_runtime.py
+
+diff --git a/hermes_cli/update_cmd_fleet.py b/hermes_cli/update_cmd_fleet.py
+index 2b1b4e98a1a..8fc8b5bb9da 100644
+--- a/hermes_cli/update_cmd_fleet.py
++++ b/hermes_cli/update_cmd_fleet.py
+@@ -734,11 +734,23 @@ def _systemd_unit_owned_by_update(scope_cmd: list, svc_name: str) -> bool:
+     to drain and restart the account's real ``hermes-gateway.service`` because the unit was
+     listed, not because it ran the updated code. Foreign or unreadable ownership prints a notice
+     and leaves the unit alone; it is not a failed restart.
++
++    The same holds for a unit of THIS home whose live gateway loads another checkout (a drop-in
++    pinning ``ExecStart``/``PYTHONPATH`` to its own core, e.g. an Ask Eve pinned owner): the update
++    moves none of its code, so the pre-swap pause must not wait on it (an old pinned core answers
++    the idle pause ``unsupported`` forever and deferred every hub update on 2026-11-11) and the
++    restart must not bounce it: it would only come back on its pin. [daveey]
+     """
+-    from hermes_cli.update_fleet_scope import announce_skipped_runtime, systemd_unit_hermes_home, home_in_update_scope
++    from hermes_cli.update_fleet_scope import (
++        announce_skipped_runtime, gateway_foreign_code_root, home_in_update_scope, systemd_unit_hermes_home,
++    )
+     home = systemd_unit_hermes_home(scope_cmd, svc_name)
+     if home is not None and home_in_update_scope(home):
+-        return True
++        pinned = gateway_foreign_code_root(_unit_main_pid(scope_cmd, svc_name), home)
++        if pinned is None:
++            return True
++        announce_skipped_runtime("systemd unit", svc_name, home, code_root=pinned)
++        return False
+     announce_skipped_runtime("systemd unit", svc_name, home)
+     return False
+ 
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 98cffa4139b..ef5df915259 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -14,6 +14,9 @@ resumed by ``_resume_windows_gateways_after_update`` (which dispatches here on
+ ``platform == "posix"``), adopted by the next ``hermes update`` and resumed by the next launch
+ when this process dies.
+ 
++* a gateway of this home that loads ANOTHER checkout (a unit pinned to its own core, e.g. an Ask
++  Eve pinned owner) is not in the set at all: the move cannot reach its code, so it is named and
++  left running, neither paused here nor restarted afterwards (``_systemd_unit_owned_by_update``).
+ * each gateway accepts ``pause-if-idle-for-update`` only with no active work, checking and
+   closing admission in one loop callback. Busy gateways defer the update without starting a
+   drain. Unsupported gateways refuse explicitly until restarted on the installed code; a lost
+diff --git a/hermes_cli/update_fleet_scope.py b/hermes_cli/update_fleet_scope.py
+index f24d17157c7..4fc3939233d 100644
+--- a/hermes_cli/update_fleet_scope.py
++++ b/hermes_cli/update_fleet_scope.py
+@@ -161,14 +161,36 @@ def launchd_label_foreign_home(label: str, scope: set[Path] | None = None) -> st
+     return None
+ 
+ 
+-def describe_skipped_runtime(kind: str, name: str, home: str | None) -> str:
+-    """One notice line for a runtime the update leaves alone (foreign home or unreadable ownership)."""
++def gateway_foreign_code_root(pid: int, home) -> Path | None:
++    """The OTHER checkout the live gateway *pid* provably loads its code from, else ``None``.
++
++    A gateway pinned to its own core (unit ``ExecStart``/``PYTHONPATH`` outside this checkout, e.g.
++    an Ask Eve pinned owner) serves a profile of this home but none of this checkout's code: moving
++    the checkout cannot reach it, and restarting it only brings it back on its pin. Unknown is never
++    foreign: a gateway whose code root cannot be read is treated as this checkout's. [daveey]"""
++    from hermes_cli.update_receipt import _gateway_code_root, _updater_code_root
++    with suppress(Exception):
++        own = _updater_code_root()
++        if own is None or not pid or int(pid) <= 0 or home is None:
++            return None
++        root = _gateway_code_root(int(pid), Path(home))
++        if root is not None and root != own:
++            return root
++    return None
++
++
++def describe_skipped_runtime(kind: str, name: str, home: str | None, code_root: Path | None = None) -> str:
++    """One notice line for a runtime the update leaves alone (foreign home, its own checkout, or
++    unreadable ownership)."""
++    if code_root is not None:
++        return (f"  ↷ {name}: {kind} running its own checkout ({code_root}), which this update does not "
++                "change — left alone (not paused, not restarted)")
+     if home is None:
+         return f"  ↷ {name}: {kind} whose Hermes home could not be read — left alone (not restarted)"
+     return f"  ↷ {name}: {kind} of another Hermes home ({home}) — left alone (not restarted)"
+ 
+ 
+-def announce_skipped_runtime(kind: str, name: str, home: str | None) -> None:
++def announce_skipped_runtime(kind: str, name: str, home: str | None, code_root: Path | None = None) -> None:
+     """Print :func:`describe_skipped_runtime` once per update run, and name the runtime on its receipt.
+ 
+     The pre-swap pause and the post-swap restart phase each scope the same host-wide gateway list,
+@@ -176,10 +198,10 @@ def announce_skipped_runtime(kind: str, name: str, home: str | None) -> None:
+     that process) knows what the pause already announced. No open receipt: every call prints.
+     """
+     from hermes_cli import update_receipt
+-    entry = [kind, name, home]
++    entry = [kind, name, str(code_root) if code_root is not None else home]
+     current = update_receipt._current.get()
+     announced = list((current.data if current is not None else {}).get("runtimes_left_alone") or [])
+     if entry in announced:
+         return
+-    print(describe_skipped_runtime(kind, name, home))
++    print(describe_skipped_runtime(kind, name, home, code_root))
+     update_receipt.record_fact("runtimes_left_alone", [*announced, entry])
+diff --git a/hermes_cli/update_receipt.py b/hermes_cli/update_receipt.py
+index 97748b90366..7c110f3abb7 100644
+--- a/hermes_cli/update_receipt.py
++++ b/hermes_cli/update_receipt.py
+@@ -1088,6 +1088,13 @@ def _gateway_code_root(pid: int, home: Path) -> Optional[Path]:
+         import psutil  # type: ignore
+ 
+         process = psutil.Process(pid)
++        # The import path outranks where the interpreter lives: ``python -m hermes_cli.main`` under a
++        # PYTHONPATH naming a checkout runs THAT checkout whatever venv the python came from, and
++        # names no other path at all (an Ask Eve pinned owner's unit). [daveey]
++        with suppress(Exception):
++            for probe in ((process.environ() or {}).get("PYTHONPATH") or "").split(os.pathsep):
++                if probe and os.path.isabs(probe) and (Path(probe) / "hermes_cli" / "main.py").is_file():
++                    return Path(probe).resolve()
+         with suppress(Exception):
+             root = _code_root_for_path((process.environ() or {}).get("VIRTUAL_ENV"))
+             if root:
+diff --git a/tests/hermes_cli/test_update_pause_pinned_runtime.py b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+new file mode 100644
+index 00000000000..8439dacf5d0
+--- /dev/null
++++ b/tests/hermes_cli/test_update_pause_pinned_runtime.py
+@@ -0,0 +1,179 @@
++"""A gateway pinned to its own core never blocks, and is never bounced by, ``hermes update``.
++
++hermes-hub, 2026-11-11: ``hermes-gateway-askeve-builder`` runs through a drop-in whose ``ExecStart``
++and ``PYTHONPATH`` name ``~/.hermes/askeve-runtime/core-<sha>``, a core older than the idle pause.
++It answered ``unsupported`` to the pre-swap pause, and eleven hub updates in a row deferred on it
++("restart that gateway on the installed code when idle" cannot work: a restart comes back on the
++pin). Moving the checkout cannot reach that gateway's code, so the update leaves it alone.
++
++The gateway here is a real process started the way the drop-in starts it; systemd is the seam.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from gateway import control_socket
++from hermes_cli import dashboard_procs
++from hermes_cli import update_cmd_fleet as fleet
++from hermes_cli import update_cmd_posix_pause as pause
++
++# The pinned gateway is a stub ``python -m hermes_cli.main gateway run`` whose ``hermes_cli`` is the
++# fixture's own package; each test reaps it.
++pytestmark = [pytest.mark.platforms("posix"), pytest.mark.spawns_gateway_lookalike]
++
++UNIT = "hermes-gateway-askeve-builder"
++SCOPE_CMD = ["systemctl", "--user"]
++
++
++def _spawn(argv, env, cwd):
++    proc = subprocess.Popen(argv, env=env, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
++    assert proc.stdout is not None and proc.stdout.readline().strip() == b"up", \
++        "premise: the fixture gateway never started"
++    return proc
++
++
++@pytest.fixture
++def host(monkeypatch, tmp_path):
++    """An install root with an ``askeve-builder`` profile, its pinned drop-in, and a fake systemd
++    that lists the unit on whichever PID the test puts in ``state['pid']``."""
++    root = tmp_path / "root" / ".hermes"
++    home = root / "profiles" / "askeve-builder"
++    home.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setattr("hermes_cli.update_receipt._profile_homes",
++                        lambda: [("default", root), ("askeve-builder", home)])
++    core = tmp_path / "askeve-runtime" / "core-d426474bc63b"
++    (core / "hermes_cli").mkdir(parents=True)
++    (core / "hermes_cli" / "__init__.py").write_text("")
++    (core / "hermes_cli" / "main.py").write_text("import time\nprint('up', flush=True)\ntime.sleep(300)\n")
++    dropin = tmp_path / "systemd" / f"{UNIT}.service.d" / "50-askeve-pinned-owner.conf"
++    dropin.parent.mkdir(parents=True)
++    dropin.write_text(f"[Service]\nExecStart=\nExecStart={sys.executable} -m hermes_cli.main gateway run --quiet\n"
++                      f"Environment=PYTHONPATH={core}\n")
++    state = {"pid": 0, "writes": [], "repairs": [], "asked": [], "procs": []}
++
++    def fake_systemctl(cmd, *, timeout):
++        def done(stdout=""):
++            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
++        if "list-units" in cmd:
++            return done(f"{UNIT}.service loaded active running Hermes\n" if "--user" in cmd else "")
++        if "is-active" in cmd:
++            return done("active\n")
++        if "show" in cmd and "--property=MainPID" in cmd:
++            return done(f"{state['pid']}\n")
++        if "show" in cmd and "--property=Environment" in cmd:
++            return done(f"HERMES_HOME={home}\n")
++        if "show" in cmd and "--property=ControlGroup" in cmd:
++            return done(f"/user.slice/fixture/{UNIT}.service\n")
++        if "show" in cmd:
++            return done()
++        state["writes"].append(cmd)  # stop / start / restart / reset-failed
++        return done()
++
++    monkeypatch.setattr(fleet, "_systemctl", fake_systemctl)
++    monkeypatch.setattr(fleet, "_repair_unit_without_fatal_exit_park",
++                        lambda *a, **k: state["repairs"].append(a))
++    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: True)
++    monkeypatch.setattr("hermes_cli.gateway._ensure_user_systemd_env", lambda: None)
++    monkeypatch.setattr(dashboard_procs, "_hermes_home_for_pid", lambda pid: str(home))
++    # An old core's control server: it does not know the idle pause.
++    monkeypatch.setattr(control_socket, "pause_gateway_for_update",
++                        lambda h, **k: state["asked"].append(str(h)) or {"unsupported": True})
++    monkeypatch.setattr(pause, "_discover_launchd", list)
++    monkeypatch.setattr(pause, "_discover_bare", lambda service_pids: ([], []))
++    monkeypatch.setattr(pause, "_left_running", lambda units, jobs: (units, jobs, []))
++    state.update(root=root, home=home, core=core, dropin=dropin, dropin_before=dropin.read_bytes())
++    yield state
++    for proc in state["procs"]:
++        proc.kill()
++        proc.wait(timeout=10)
++
++
++def _run_pinned(host, *, status_record: bool) -> int:
++    """Start the gateway exactly as the drop-in does: a python outside the pinned core, the core on
++    PYTHONPATH. ``status_record`` adds the ``gateway_state.json`` a real gateway publishes."""
++    env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "PYTHONPATH")}
++    env.update(PYTHONPATH=f"{host['core']}{os.pathsep}{host['core'].parent / 'app'}", PYTHONSAFEPATH="1")
++    proc = _spawn([sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--quiet"], env, host["home"])
++    host["procs"].append(proc)
++    host["pid"] = proc.pid
++    if status_record:
++        (host["home"] / "gateway_state.json").write_text(json.dumps({
++            "pid": proc.pid, "argv": [str(host["core"] / "hermes_cli" / "main.py"), "gateway", "run", "--quiet"]}))
++    return proc.pid
++
++
++def _run_on_checkout(host) -> int:
++    """A gateway of the same unit whose code root is not provably elsewhere (control)."""
++    env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "PYTHONPATH")}
++    proc = _spawn([sys.executable, "-c", "import time; print('up', flush=True); time.sleep(300)"], env, host["home"])
++    host["procs"].append(proc)
++    host["pid"] = proc.pid
++    return proc.pid
++
++
++@pytest.mark.parametrize("status_record", [True, False], ids=["status-record", "pythonpath-only"])
++def test_update_proceeds_past_a_pinned_unit_that_cannot_idle_pause(host, capsys, status_record):
++    """The pinned unit answers ``unsupported``; the pause must not ask it, stop it or defer on it."""
++    _run_pinned(host, status_record=status_record)
++
++    verdict = pause._pause(pause._empty_token())
++
++    out = capsys.readouterr().out
++    assert verdict is None, f"the update was deferred on a gateway it cannot affect: {verdict}"
++    assert host["asked"] == [], "the pinned gateway was asked for an idle pause it cannot answer"
++    assert host["writes"] == [] and host["repairs"] == [], "the pinned unit was touched through systemd"
++    assert UNIT in out and "running its own checkout" in out and str(host["core"]) in out, out
++    assert host["procs"][0].poll() is None, "the pinned gateway was stopped"
++    assert host["dropin"].read_bytes() == host["dropin_before"], "the pin (drop-in ExecStart) changed"
++
++
++def test_a_checkout_unit_that_cannot_idle_pause_still_defers(host):
++    """Control: the same unit NOT proven on another checkout keeps the refusal (its code is the one
++    being replaced)."""
++    _run_on_checkout(host)
++
++    verdict = pause._pause(pause._empty_token())
++
++    assert verdict and f"{UNIT} does not support idle pause" in verdict
++    assert host["asked"] == [str(host["home"])]
++
++
++def test_post_commit_restart_leaves_a_pinned_unit_on_its_pin(host, monkeypatch):
++    """The fleet restart must not drain or restart the pinned unit (it would only come back on its
++    pin); the same unit running this checkout is still restarted (control)."""
++    drained: list[int] = []
++    monkeypatch.setattr(fleet, "_drain_or_signal_gateway_for_update", lambda pid, *a, **k: drained.append(pid) or True)
++    monkeypatch.setattr(fleet, "_wait_for_service_active", lambda *a, **k: True)
++
++    def restart():
++        restarted, failed = [], []
++        fleet._restart_one_systemd_gateway_unit(
++            UNIT, scope="user", scope_cmd=SCOPE_CMD, drain_budget=5.0, _manage_cmd_cache={},
++            restarted_services=restarted, failed_or_stale_units=failed)
++        return restarted, failed
++
++    _run_pinned(host, status_record=True)
++    assert restart() == ([], [])
++    assert drained == [] and host["writes"] == [] and host["repairs"] == []
++    assert host["dropin"].read_bytes() == host["dropin_before"]
++
++    control = _run_on_checkout(host)
++    (host["home"] / "gateway_state.json").unlink()
++    restarted, failed = restart()
++    assert drained == [control] and restarted == [UNIT] and failed == []
++
++
++def test_best_effort_restart_skips_a_pinned_unit(host):
++    """The blunt post-commit restart (no drain) applies the same ownership rule."""
++    _run_pinned(host, status_record=True)
++    failed: list[str] = []
++    fleet._restart_systemd_gateway_units_best_effort(failed, fleet._systemd_gateway_unit_listings())
++    assert failed == [] and host["writes"] == []
+-- 
+2.55.0
+

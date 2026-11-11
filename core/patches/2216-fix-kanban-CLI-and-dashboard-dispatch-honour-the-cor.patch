@@ -1,0 +1,392 @@
+From 66732e72b1123af3963f7bddbf5b0a9eb49e1dbf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:50:57 +0000
+Subject: [PATCH] fix(kanban): CLI and dashboard dispatch honour the
+ core-update drain hold [daveey]
+
+`dispatch_once` checked only the gateway's own draining snapshot; only the gateway watcher read
+hermes-sync's core-update drain hold (`agent.core_update_drain`). So `hermes kanban dispatch` and the
+dashboard `POST /dispatch` (both call `dispatch_once` directly) could claim and spawn inside a hold.
+
+Problem: hermes-hub 2026-11-11 02:10:36Z, `hermes kanban dispatch --json` (pid 4128172) claimed
+t_01a1c7dcfabfb0f1 run 165540 (lock hermes-hub:4128172) inside drainer 4107500's claim-hold
+[02:08:42, 02:18:43]; the gateway logged dispatch-held at 02:08:44 and claimed nothing.
+Why 1: the claim came from the CLI process, not the gateway (lock pid = CLI pid) -- the "PID discrepancy"
+  in the Path P evidence is this.
+Why 2: `_cmd_dispatch` -> `dispatch_once` has no drain-hold check; it only reads `dispatch_paused()`
+  (gateway_state draining) -- hermes_cli/kanban_db_dispatch.py, kanban_gateway_drain.py.
+Why 3: the hold was enforced at the caller (gateway/kanban_watchers_common.py `_kanban_dispatch_gate`)
+  instead of in the shared tick, while core_update_drain.py promises "the kanban dispatcher spawns nothing".
+Root (happened): a safety gate placed in one caller of a shared entry point instead of the entry point.
+Root (not caught): drain-hold tests drove only the gateway watcher; no test exercised the other
+  `dispatch_once` callers under a hold.
+Recurrence: first time for this path (gateway-side drain cards t_d97d2b17 et al. covered the watcher).
+
+Fix: `dispatch_once` reads the live hold after bookkeeping/placement (reclaim, wake probes, promotion
+still run, as in the gateway's held tick) and returns before the spawn budget, recording the hold on
+`DispatchResult.core_update_drain_hold`; `claim_if_admitting` rechecks it at claim time (both lanes) so a
+hold that starts mid-tick still refuses. Dead-writer holds don't count (`read_hold`), and a missing
+module fails open, both as in the gateway gate. CLI JSON/text report the hold as the reason for 0
+spawned. Caps (max_spawn / max_in_progress / memory pressure) are untouched.
+
+Proof: tests/hermes_cli/test_kanban_dispatch_core_drain_hold.py 13/13 RED on origin/main, 13/13 GREEN
+(CLI + dashboard x ready + review under live hold; dead-pid hold claims; mid-tick hold; fail-open;
+promotion kept; CLI text). Mutants of each added condition (tick check, claim recheck, ImportError,
+JSON field, text) each killed. 33 affected dispatch/drain/dashboard/cron-hold files: 360 passed, 0 failed.
+`scripts/check --base origin/main` ok; FILE_LINES offset by moving `_call_spawn_fn` to
+kanban_db_dispatch_spawn_call.py (re-imported under the old name), CC offset by `_print_zero_spawn_reasons`.
+---
+ hermes_cli/kanban_db_dispatch.py              |  17 +-
+ hermes_cli/kanban_db_dispatch_spawn_call.py   |  17 ++
+ hermes_cli/kanban_gateway_drain.py            |  16 +-
+ hermes_cli/kanban_ops.py                      |  14 +-
+ .../test_kanban_dispatch_core_drain_hold.py   | 198 ++++++++++++++++++
+ 5 files changed, 248 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_spawn_call.py
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_core_drain_hold.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 7574bec8cf6..69abb3e6b20 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -257,6 +257,7 @@ class DispatchResult:
+     """Memory pressure that restricted this tick: ``"critical"`` (no new
+     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
+     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
++    core_update_drain_hold: Optional[dict] = None  # live hermes-sync hold that refused every claim [daveey]
+ 
+ 
+ from hermes_cli.kanban_db_dispatch_stuck import (  # re-exports for the stuck detectors [daveey]
+@@ -2035,17 +2036,7 @@ def dispatch_once(
+     return run_owned_tick(conn, _locked_tick, dispatcher_id, board, dry_run)
+ 
+ 
+-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
+-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
+-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+-    import inspect
+-    try:
+-        sig = inspect.signature(spawn_fn)
+-        if "board" in sig.parameters:
+-            return spawn_fn(task, workspace, board=board)
+-        return spawn_fn(task, workspace)
+-    except (TypeError, ValueError):
+-        return spawn_fn(task, workspace)
++from hermes_cli.kanban_db_dispatch_spawn_call import call_spawn_fn as _call_spawn_fn  # moved out [daveey]
+ 
+ 
+ def _dispatch_lane_task(
+@@ -2430,6 +2421,10 @@ def _dispatch_once_locked(
+         except Exception:
+             logger = _kb._log
+             logger.warning("kanban worker placement failed; continuing local dispatch", exc_info=True)
++    from hermes_cli.kanban_gateway_drain import core_update_hold
++    result.core_update_drain_hold = core_update_hold()
++    if result.core_update_drain_hold is not None:  # every caller (CLI, dashboard, gateway) claims nothing
++        return result
+     may_spawn, spawn_budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
+                                                  board=board)
+     if not may_spawn:
+diff --git a/hermes_cli/kanban_db_dispatch_spawn_call.py b/hermes_cli/kanban_db_dispatch_spawn_call.py
+new file mode 100644
+index 00000000000..b5c91516efa
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_spawn_call.py
+@@ -0,0 +1,17 @@
++"""Call a dispatcher ``spawn_fn`` whatever its signature (moved out of ``kanban_db_dispatch``). [daveey]"""
++from __future__ import annotations
++
++from typing import Any, Optional
++
++
++def call_spawn_fn(spawn_fn, task: Any, workspace: str, board: Optional[str]) -> Optional[int]:
++    """Back-compat: older spawn_fn signatures (and test stubs) accept only
++    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
++    import inspect
++    try:
++        sig = inspect.signature(spawn_fn)
++        if "board" in sig.parameters:
++            return spawn_fn(task, workspace, board=board)
++        return spawn_fn(task, workspace)
++    except (TypeError, ValueError):
++        return spawn_fn(task, workspace)
+diff --git a/hermes_cli/kanban_gateway_drain.py b/hermes_cli/kanban_gateway_drain.py
+index dcc1fae76bc..ad2c4c37300 100644
+--- a/hermes_cli/kanban_gateway_drain.py
++++ b/hermes_cli/kanban_gateway_drain.py
+@@ -11,7 +11,7 @@ def claim_if_admitting(conn, task_id, assignee, lane, ttl_seconds, admission_che
+         owner_home = resolve_profile_env(assignee)
+     except FileNotFoundError:
+         owner_home = None
+-    if dispatch_paused(owner_home):
++    if dispatch_paused(owner_home) or core_update_hold() is not None:  # hold may start mid-tick [daveey]
+         return None
+     claim = kb.claim_review_task if lane == 'review' else kb.claim_task
+     if admission_check is None:
+@@ -19,6 +19,20 @@ def claim_if_admitting(conn, task_id, assignee, lane, ttl_seconds, admission_che
+     return claim(conn, task_id, ttl_seconds=ttl_seconds, admission_check=admission_check)
+ 
+ 
++def core_update_hold():
++    """The live hermes-sync core-update drain hold (``agent.core_update_drain``), or None.
++
++    The gateway watcher already holds its own ticks; ``dispatch_once`` checks this too so ``hermes kanban
++    dispatch`` and the dashboard nudge cannot claim inside a hold (hermes-hub 2026-11-11: a CLI dispatch
++    claimed run 165540 inside one). A dead writer's hold does not count (``read_hold``). [daveey]
++    """
++    try:
++        from agent.core_update_drain import active_hold
++    except ImportError:
++        return None
++    return active_hold()
++
++
+ def dispatch_paused(home=None):
+     """Read the owning gateway's lifecycle snapshot; dead snapshots must not park work forever."""
+     from gateway.status import read_runtime_status, runtime_status_pid_is_live
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 3427c8ae67f..00e917afd3c 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -57,6 +57,15 @@ def _cmd_tail(args: argparse.Namespace) -> int:
+     return _poll_loop(args.interval, tick)
+ 
+ 
++def _print_zero_spawn_reasons(res) -> None:
++    """Name a full cap or a core-update drain hold so "Spawned: 0" is not misread as stuck. [daveey]"""
++    if res.at_capacity:
++        print(f"At capacity:  {res.at_capacity} (ready work waits for a running worker to finish)")
++    if hold := res.core_update_drain_hold:
++        print(f"Held: core-update drain (pid {hold.get('pid')}, {hold.get('path')}); no new claims, "
++              "running workers continue")
++
++
+ def _cmd_dispatch(args: argparse.Namespace) -> int:
+     # Honour kanban.default_assignee, kanban.max_in_progress,
+     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
+@@ -125,6 +134,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+             # A full host/board cap is the usual reason for zero spawns; without it a
+             # bare "spawned: []" reads as a stuck dispatcher. [daveey]
+             "at_capacity": res.at_capacity,
++            # A live hermes-sync core-update drain hold refused every claim this tick. [daveey]
++            "core_update_drain_hold": res.core_update_drain_hold,
+         }, ascii=True)
+         return 0
+     print(f"Reclaimed:    {res.reclaimed}")
+@@ -141,8 +152,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+             print(f"  {', '.join(items)}")
+     print(f"Promoted:     {res.promoted}")
+     print(f"Spawned:      {len(res.spawned)}")
+-    if res.at_capacity:  # name the full cap so "Spawned: 0" is not misread as stuck [daveey]
+-        print(f"At capacity:  {res.at_capacity} (ready work waits for a running worker to finish)")
++    _print_zero_spawn_reasons(res)
+     tag = " (dry)" if args.dry_run else ""
+     for tid, who, ws in res.spawned:
+         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+diff --git a/tests/hermes_cli/test_kanban_dispatch_core_drain_hold.py b/tests/hermes_cli/test_kanban_dispatch_core_drain_hold.py
+new file mode 100644
+index 00000000000..9688e5f4a88
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_core_drain_hold.py
+@@ -0,0 +1,198 @@
++"""``hermes kanban dispatch`` and the dashboard ``POST /dispatch`` honour the core-update drain hold. [daveey]
++
++Only the gateway watcher used to check ``agent.core_update_drain``; ``dispatch_once`` checked just the
++gateway's own ``draining`` snapshot. On hermes-hub (2026-11-11 02:10:36Z) a CLI ``hermes kanban dispatch
++--json`` claimed run 165540 (lock ``hermes-hub:<cli pid>``) inside hermes-sync's claim-hold while the
++gateway itself was holding. These tests drive both non-gateway entry paths against a real board, on the
++ready and review lanes, with a live hold (refused) and a dead-writer hold (claims as usual).
++"""
++
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from agent import core_update_drain as drain
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen(["true"])
++    proc.wait()
++    return proc.pid
++
++
++def _write_hold(home: Path, pid: int) -> None:
++    path = home / drain.HOLD_RELPATH
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({"pid": pid, "started_at": time.time(), "reason": "core update"}))
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    """Real default board in a scratch home; spawns are recorded, never executed."""
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr(drain, "_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda **kw: [SimpleNamespace(name="default")])
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "default")
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
++    spawned: list[str] = []
++    monkeypatch.setattr(kbd, "_default_spawn", lambda task, ws, *, board=None: spawned.append(task.id) or None)
++    return SimpleNamespace(home=tmp_path, spawned=spawned)
++
++
++def _make_card(monkeypatch, lane: str) -> str:
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: lane == "review")
++    with kbc.connect_closing(board="default") as conn:
++        tid = kb.create_task(conn, title=f"{lane} card", assignee="default")
++        if lane == "review":
++            assert kb.claim_task(conn, tid) is not None
++            assert kb.request_review(conn, tid, summary="ready for review") is True
++        task = kb.get_task(conn, tid)
++        assert task.status == lane and task.claim_lock is None
++    return tid
++
++
++def _status(tid: str) -> tuple[str, object]:
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++
++    with kbc.connect_closing(board="default") as conn:
++        task = kb.get_task(conn, tid)
++        return task.status, task.claim_lock
++
++
++def _run_cli(monkeypatch, capsys, *, as_json: bool) -> str:
++    from hermes_cli import kanban as kb_cli
++
++    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
++    capsys.readouterr()
++    rc = kb_cli._cmd_dispatch(argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=as_json))
++    assert rc == 0
++    return capsys.readouterr().out
++
++
++def _run_dashboard() -> dict:
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++
++    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_kanban_drain_hold_test", plugin_file)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    app = FastAPI()
++    app.include_router(mod.router, prefix="/api/plugins/kanban")
++    response = TestClient(app).post("/api/plugins/kanban/dispatch?max=4")
++    assert response.status_code == 200, response.text
++    return response.json()
++
++
++def _dispatch(entry: str, monkeypatch, capsys) -> dict:
++    if entry == "cli":
++        return json.loads(_run_cli(monkeypatch, capsys, as_json=True))
++    return _run_dashboard()
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("entry", ["cli", "dashboard"])
++def test_live_hold_refuses_claim(board, monkeypatch, capsys, entry, lane):
++    tid = _make_card(monkeypatch, lane)
++    _write_hold(board.home, os.getpid())
++    out = _dispatch(entry, monkeypatch, capsys)
++    assert board.spawned == []
++    assert _status(tid) == (lane, None)
++    assert out["spawned"] == []
++    hold = out["core_update_drain_hold"]
++    assert hold["pid"] == os.getpid() and hold["path"] == str(board.home / drain.HOLD_RELPATH)
++    if entry == "dashboard":  # the tick stops before scheduling, not just at the claim-time recheck
++        assert out["scheduling_admitted"] is False and out["lane_candidates"] == 0
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("entry", ["cli", "dashboard"])
++def test_dead_writer_hold_does_not_block(board, monkeypatch, capsys, entry, lane):
++    tid = _make_card(monkeypatch, lane)
++    _write_hold(board.home, _dead_pid())
++    out = _dispatch(entry, monkeypatch, capsys)
++    assert board.spawned == [tid]
++    assert _status(tid)[0] == "running"
++    assert out["core_update_drain_hold"] is None
++    if entry == "dashboard":
++        assert out["scheduling_admitted"] is True and out["lane_candidates"] == 1
++
++
++def test_cli_text_names_the_hold_as_the_reason(board, monkeypatch, capsys):
++    _make_card(monkeypatch, "ready")
++    _write_hold(board.home, os.getpid())
++    out = _run_cli(monkeypatch, capsys, as_json=False)
++    assert "Spawned:      0" in out
++    assert f"Held: core-update drain (pid {os.getpid()}" in out
++    assert board.spawned == []
++
++
++def test_held_tick_keeps_promotion(board, monkeypatch, capsys):
++    """Bookkeeping still runs under the hold (same as the gateway's held tick): a todo whose parent is
++    done is promoted, it just is not claimed."""
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++
++    monkeypatch.setattr("hermes_cli.kanban_db_dispatch.review_dispatch_enabled", lambda: False)
++    with kbc.connect_closing(board="default") as conn:
++        parent = kb.create_task(conn, title="parent", assignee="default")
++        child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++    _write_hold(board.home, os.getpid())
++    out = json.loads(_run_cli(monkeypatch, capsys, as_json=True))
++    assert out["promoted"] >= 1
++    assert _status(child) == ("ready", None)
++    assert board.spawned == []
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_hold_that_starts_mid_tick_still_refuses_the_claim(board, monkeypatch, capsys, lane):
++    """The claim-time recheck (``claim_if_admitting``) sees a hold written after the tick-start check."""
++    from hermes_cli import kanban_gateway_drain as kgd
++
++    tid = _make_card(monkeypatch, lane)
++    calls = []
++    real = kgd.core_update_hold
++
++    def hold_after_first_check():
++        calls.append(1)
++        if len(calls) == 2:
++            _write_hold(board.home, os.getpid())
++        return real()
++
++    monkeypatch.setattr(kgd, "core_update_hold", hold_after_first_check)
++    _run_cli(monkeypatch, capsys, as_json=True)
++    assert len(calls) >= 2  # tick-start check passed, the claim-time check ran
++    assert board.spawned == []
++    assert _status(tid) == (lane, None)
++
++
++def test_unimportable_drain_module_fails_open(board, monkeypatch, capsys):
++    """Same rule as the gateway gate: no ``agent.core_update_drain`` means no hold, not a frozen board."""
++    tid = _make_card(monkeypatch, "ready")
++    _write_hold(board.home, os.getpid())
++    monkeypatch.setitem(sys.modules, "agent.core_update_drain", None)  # import raises ImportError
++    out = json.loads(_run_cli(monkeypatch, capsys, as_json=True))
++    assert out["core_update_drain_hold"] is None
++    assert board.spawned == [tid]
+-- 
+2.55.0
+

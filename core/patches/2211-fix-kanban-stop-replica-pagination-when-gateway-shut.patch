@@ -1,0 +1,190 @@
+From 116977896c33552217908b4a0c1bb8f6e3476870 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:03:21 +0000
+Subject: [PATCH] fix(kanban): stop replica pagination when gateway shuts down
+ [daveey]
+
+---
+ hermes_cli/kanban_sync_client.py              | 18 +++--
+ hermes_cli/kanban_sync_stop.py                | 40 +++++++++++
+ tests/hermes_cli/test_kanban_sync_shutdown.py | 68 +++++++++++++++++++
+ 3 files changed, 116 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_stop.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_shutdown.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 8c9c78caa2..dfbffaebce 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -833,10 +833,13 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+     """Apply every feed page after this file's cursor. Returns the number of changes read. On a board with an
+     outbox (primary), fields with an unanswered local edit are not overwritten; ``partition`` (a gateway name)
+     keeps only that gateway's cards."""
++    from hermes_cli.kanban_sync_stop import checkpoint
+     total = 0
+     cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+     while True:
++        checkpoint()
+         page = hub.changes(board, cursor)
++        checkpoint()
+         changes = [c for c in (adapt(ch) for ch in page.get("changes", [])) if c is not None]
+         if partition is not None:
+             changes = own_partition(conn, changes, partition)
+@@ -864,12 +867,15 @@ def _applying(conn: sqlite3.Connection) -> bool:
+ def resync(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool, partition: Optional[str] = None) -> int:
+     """Rebuild from the service snapshot (every live row, paged per table), then resume the feed at its head.
+     ``partition`` keeps only that gateway's cards (a primary board's live file)."""
++    from hermes_cli.kanban_sync_stop import checkpoint
+     head: Optional[int] = None
+     count = 0
+     for table in IMPORT_ORDER:
+         after = ""
+         while True:
++            checkpoint()
+             page = hub.snapshot_page(board, table, after)
++            checkpoint()
+             head = page["head"] if head is None else head
+             rows = page.get("rows", [])
+             changes = [_row_change(table, r) for r in rows]
+@@ -1442,16 +1448,8 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+     feed socket per synced board. Connected boards pull on feed/local invalidation; disconnected boards and
+     failed pulls retain the poll period. An independent full recovery audits all boards at least every 60s
+     (or the configured period if longer), subject to in-flight IO and the next poll tick."""
+-    from hermes_cli import kanban_sync_runstate as runstate
+-    # Record why the loop is not running, so the stuck-dispatcher warning, ``sync status`` and create name it
+-    # instead of a board that silently stalls behind the Board lease (MacBook, 2026-11-02). [daveey]
+-    try:
+-        _run_forever(keep_running, interval, runstate)
+-    except BaseException as exc:
+-        runstate.record_down(f"kanban sync loop crashed: {type(exc).__name__}: {exc}")
+-        raise
+-    finally:
+-        sync_timing.stop()
++    from hermes_cli.kanban_sync_stop import run_loop
++    run_loop(_run_forever, keep_running, interval)
+ 
+ 
+ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], runstate: Any) -> None:
+diff --git a/hermes_cli/kanban_sync_stop.py b/hermes_cli/kanban_sync_stop.py
+new file mode 100644
+index 0000000000..577a6cba4b
+--- /dev/null
++++ b/hermes_cli/kanban_sync_stop.py
+@@ -0,0 +1,40 @@
++"""Cooperative cancellation at sync transaction boundaries, scoped to one loop thread."""
++from contextlib import contextmanager
++from contextvars import ContextVar
++from typing import Callable
++
++_running: ContextVar[Callable[[], bool] | None] = ContextVar("kanban_sync_running", default=None)
++
++
++class SyncStopped(Exception):
++    """Normal gateway shutdown/yield, not a failed sync round."""
++
++
++@contextmanager
++def stop_scope(keep_running: Callable[[], bool]):
++    token = _running.set(keep_running)
++    try:
++        yield
++    finally:
++        _running.reset(token)
++
++
++def run_loop(loop, keep_running: Callable[[], bool], interval) -> None:
++    """Keep shutdown normal, crashes visible, and diagnostics cleanup unconditional."""
++    from hermes_cli import kanban_sync_runstate as runstate, kanban_sync_timing as timing
++    try:
++        with stop_scope(keep_running):
++            loop(keep_running, interval, runstate)
++    except SyncStopped:
++        runstate.record_down("stopped (gateway stopping, or the host sync lease went to another gateway)")
++    except BaseException as exc:
++        runstate.record_down(f"kanban sync loop crashed: {type(exc).__name__}: {exc}")
++        raise
++    finally:
++        timing.stop()
++
++
++def checkpoint() -> None:
++    running = _running.get()
++    if running is not None and not running():
++        raise SyncStopped()
+diff --git a/tests/hermes_cli/test_kanban_sync_shutdown.py b/tests/hermes_cli/test_kanban_sync_shutdown.py
+new file mode 100644
+index 0000000000..9234a36598
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_shutdown.py
+@@ -0,0 +1,68 @@
++"""A cancelled gateway watcher must not leave bootstrap in asyncio's executor."""
++import asyncio
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++
++
++@pytest.mark.parametrize("snapshot", [False, True])
++def test_gateway_stop_interrupts_active_replica_pages(monkeypatch, snapshot):
++    entered = threading.Event()
++    stopped = threading.Event()
++    pages = []
++    applied = []
++
++    class Hub:
++        def changes(self, board, cursor):
++            pages.append(cursor)
++            entered.set()
++            assert stopped.wait(5)
++            return {"changes": [], "next": cursor + 1, "more": len(pages) < 100}
++
++        def snapshot_page(self, board, table, after):
++            pages.append(after)
++            entered.set()
++            assert stopped.wait(5)
++            return {"rows": [], "head": 99, "next": str(len(pages)), "more": len(pages) < 100}
++
++    monkeypatch.setattr(client.sync, "sync_state", lambda conn: {"cursor": 0})
++    monkeypatch.setattr(client.sync, "apply_remote_changes", lambda *a, **k: applied.append(k["new_cursor"]))
++    monkeypatch.setattr(client, "pending_task_fields", lambda conn: {})
++    monkeypatch.setattr(client, "IMPORT_ORDER", ["tasks"])
++    conn = SimpleNamespace(execute=lambda *a: None)
++
++    def round_loop(keep_running, interval, runstate):
++        if snapshot:
++            client.resync(conn, Hub(), "default", observers=False)
++        else:
++            client.pull(conn, Hub(), "default", observers=False)
++
++    monkeypatch.setattr(client, "_run_forever", round_loop)
++
++    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
++    from tests.waiting import async_wait_until
++    runner = GatewayKanbanWatchersMixin()
++    runner._running = True
++    lease = SimpleNamespace(try_acquire=lambda: True, should_yield=lambda: False, release=lambda: None)
++    monkeypatch.setattr(runner, "_kanban_singleton_lease", lambda *a: lease)
++    monkeypatch.setattr(client.sync, "sync_enabled", lambda: True)
++
++    async def gateway():
++        task = asyncio.create_task(runner._kanban_sync_watcher())
++        try:
++            await async_wait_until(entered.is_set, timeout=5)
++        finally:
++            runner._running = False
++            stopped.set()
++            task.cancel()
++            await asyncio.gather(task, return_exceptions=True)
++
++    start = time.monotonic()
++    asyncio.run(gateway())  # includes the default executor's join, not just task cancellation
++    assert time.monotonic() - start < 5  # well inside hermes update's 30s wait
++    assert len(pages) == 1, "shutdown must stop bootstrap before requesting another page"
++    assert applied == [], "do not start applying a fetched page after shutdown"
+-- 
+2.55.0
+

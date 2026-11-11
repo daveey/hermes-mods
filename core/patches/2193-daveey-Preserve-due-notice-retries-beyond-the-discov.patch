@@ -1,0 +1,87 @@
+From f7f2c11589ab6351e6e918ee677f1270a24fb1b4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:12:12 -0800
+Subject: [PATCH] [daveey] Preserve due notice retries beyond the discovery
+ lookback
+
+Root (happened): candidates() rejected old last_active before checking durable deferred retries, so a quota reset beyond LOOKBACK_S silently expired the obligation. Keep trusted recency, grace, SQL eligibility and handling guards; exempt only a due deferral from the discovery age cutoff.
+
+Root (not caught): the prior retry regression advanced only one hour, never beyond the three-day discovery window. Recurrence: reviewed P2 in 8c77d01ac8; searched notice_guarantee history and its retry tests. Add actual SessionDB coverage through an eight-day quota reset, before-due control, exact due dispatch and terminal suppression; retain grace for due deferrals.
+
+Proof: hermes-core-wt test on hermes-hub. RED snapshot 8ba29db05a: new long-reset test failed at candidates(due), [] != [row], exit 1. GREEN snapshot 266ddd9530: test_notice_guarantee.py (38), test_notice_guarantee_idle.py (11), test_automation_replay.py (8): 57 passed, exit 0. No source or test edits during either snapshot run. Ruff and diff checks passed. No push or ship requested.
+---
+ tests/tui_gateway/test_notice_guarantee.py | 26 ++++++++++++++++++++--
+ tui_gateway/notice_guarantee.py            |  8 ++++---
+ 2 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_notice_guarantee.py b/tests/tui_gateway/test_notice_guarantee.py
+index 385691dbc9..d0a76c63d7 100644
+--- a/tests/tui_gateway/test_notice_guarantee.py
++++ b/tests/tui_gateway/test_notice_guarantee.py
+@@ -74,8 +74,9 @@ def test_an_unanswered_notice_gets_one_closeout_wake(db):
+     assert _run(db) == ([], [])  # claimed: never woken twice
+ 
+ 
+-def test_young_notice_waits_for_the_grace_window(db):
+-    _notice(db, "✔ Kanban t_aaa done — deploy card", age=30)
++@pytest.mark.parametrize("meta", [{}, {"closeout": {"state": "deferred", "retry_at": 0, "attempts": 1}}])
++def test_young_notice_waits_for_the_grace_window(db, meta):
++    _notice(db, "✔ Kanban t_aaa done — deploy card", age=30, **meta)
+     assert _run(db) == ([], [])
+ 
+ 
+@@ -119,6 +120,27 @@ def test_a_failed_wake_is_deferred_and_offered_again_after_retry_at(db, monkeypa
+     assert _run(db, now=now + 99999) == ([], [])  # started: never woken again
+ 
+ 
++def test_deferred_wake_survives_a_quota_reset_beyond_discovery_lookback(db, monkeypatch):
++    from tui_gateway import server
++
++    now = time.time()
++    reset = now + 8 * 86400
++    monkeypatch.setattr(server, "_find_live_session_by_key",
++                        lambda key: (key, {"agent_failure": {"failure_resets_at": reset}}))
++    row = _notice(db, "completed before a long quota reset")
++    assert _run(db, verdict="error", now=now)[1] == [(CHAT, row)]
++    due = reset + ng.DEFER_SLACK_S
++    assert tuple(_closeout_meta(db, row)) == ("deferred", due, 1)
++
++    # No writes or fresh activity: the same durable row must age into eligibility.
++    assert _run(db, now=due - 1) == ([], [])
++    assert [c["msg_id"] for c in ng.candidates(db, due)] == [row]
++    out, calls = _run(db, now=due)
++    assert calls == [(CHAT, row)] and [o["result"] for o in out] == ["dispatched"]
++    assert (_closeout_meta(db, row)[0], _closeout_meta(db, row)[2]) == ("started", 2)
++    assert _run(db, now=due + 1) == ([], [])
++
++
+ def test_failed_wakes_stop_after_max_attempts(db, monkeypatch):
+     now = time.time()
+     monkeypatch.setattr(ng, "_retry_at", lambda sid, t: t + 60, raising=False)
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 0a54c8252e..8187aa5d57 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -99,14 +99,16 @@ def candidates(db: Any, now: float) -> list[dict]:
+     out = []
+     for row in rows:
+         # Cache structure, not age: a notice can become due (or expire) without a commit.
+-        if row["last_active"] is None or row["last_active"] < now - LOOKBACK_S:
++        meta = _decode(row["display_metadata"])
++        deferred_due = _deferred_due(meta, now)
++        # Discovery lookback must not expire a durable retry during a long quota reset.
++        if row["last_active"] is None or (row["last_active"] < now - LOOKBACK_S and not deferred_due):
+             continue
+         if not isinstance(row["timestamp"], (int, float)):
+             continue
+         if row["timestamp"] > now - GRACE_S:
+             continue
+-        meta = _decode(row["display_metadata"])
+-        if "closeout" not in meta or _deferred_due(meta, now):
++        if "closeout" not in meta or deferred_due:
+             out.append({"sid": str(row["sid"]), "msg_id": int(row["msg_id"]), "content": str(row["content"] or ""),
+                         "meta": meta, "raw_meta": row["display_metadata"]})
+     return out
+-- 
+2.55.0
+

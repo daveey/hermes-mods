@@ -1,0 +1,202 @@
+From 3cdd53d2dd8ac2068bf1b5714964b9b06125bd29 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:55:28 +0000
+Subject: [PATCH] [daveey] Exempt verified frozen input files from host-only
+ placement
+
+Proof: pinned brief regression failed with home gateway marker before integration; 17 targeted tests now pass. Missing/stale/future/malformed receipts, changed hashes, uncovered destinations and unrelated state remain nonportable. Remote carriage verified independently through SSM before manifest publication.
+---
+ hermes_cli/kanban_carried_evidence.py         | 84 +++++++++++++++++++
+ hermes_cli/kanban_placement.py                |  4 +-
+ .../test_kanban_carried_evidence.py           | 73 ++++++++++++++++
+ 3 files changed, 160 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_carried_evidence.py
+ create mode 100644 tests/hermes_cli/test_kanban_carried_evidence.py
+
+diff --git a/hermes_cli/kanban_carried_evidence.py b/hermes_cli/kanban_carried_evidence.py
+new file mode 100644
+index 0000000000..3997631ce7
+--- /dev/null
++++ b/hermes_cli/kanban_carried_evidence.py
+@@ -0,0 +1,84 @@
++"""Narrow placement exemption for hash-pinned inputs verified on every worker.
++
++The publisher writes this receipt only after remote installation and readback.
++It is not a general exemption for the evidence or workspace directories.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import time
++from pathlib import Path
++
++from hermes_cli.config import get_hermes_home
++
++MAX_BYTES = 1024 * 1024
++MAX_AGE = 3600
++PATH_TOKEN = re.compile(r"(?<![\w/])(?:/home/[^/\s`\"']+|~)/\.hermes/kanban/(?:evidence|workspaces)/[^\s`\"'<>]+")
++
++
++def without_carried_inputs(text: str, cfg: dict) -> str:
++    """Remove only complete, locally intact file tokens with fresh fleet receipts.
++
++    All configured pool/heavy-route destinations must be covered, so adding a
++    worker cannot silently make the exemption apply to an unprovisioned host.
++    The card must itself pin the matching SHA256. Other markers stay visible.
++    """
++    pools = cfg.get("worker_pools") or {}
++    routes = cfg.get("heavy_route") or {}
++    if not isinstance(pools, dict) or not isinstance(routes, dict):
++        return text
++    destinations = set()
++    for members in pools.values():
++        if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
++            return text
++        destinations.update(members)
++    if not all(isinstance(m, str) for m in routes.values()):
++        return text
++    destinations.update(routes.values())
++    if not destinations:
++        return text
++    try:
++        path = get_hermes_home() / "kanban" / "carried-evidence.json"
++        if path.is_symlink() or path.stat().st_size > MAX_BYTES:
++            return text
++        receipt = json.loads(path.read_text(encoding="utf-8"))
++        if not isinstance(receipt, dict) or receipt.get("version") != 1:
++            return text
++        at = receipt.get("verified_at")
++        if not isinstance(at, (int, float)) or not 0 <= time.time() - at <= MAX_AGE:
++            return text
++        machines = receipt.get("machines")
++        if not isinstance(machines, list) or not all(isinstance(m, str) for m in machines):
++            return text
++        if not destinations.issubset(machines):
++            return text
++        files = receipt.get("files")
++        if not isinstance(files, dict):
++            return text
++    except (OSError, ValueError):
++        return text
++
++    def replace(match: re.Match) -> str:
++        token = match.group(0)
++        # Prose delimiters are not part of a path; descendants/suffixes are.
++        name = token.rstrip(".,;:)")
++        digest = files.get(name)
++        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
++            return token
++        if not re.search(r"(?<![0-9a-f])" + digest + r"(?![0-9a-f])", text):
++            return token
++        local = Path(name).expanduser()
++        try:
++            if ".." in local.parts or local.is_symlink() or local.resolve() != local:
++                return token
++            if not local.is_file() or local.stat().st_size > MAX_BYTES:
++                return token
++            if hashlib.sha256(local.read_bytes()).hexdigest() != digest:
++                return token
++        except OSError:
++            return token
++        return "[carried input]" + token[len(name):]
++
++    return PATH_TOKEN.sub(replace, text)
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 202a00b6b8..d803735f6e 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -434,7 +434,9 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     title, body = args.get("title") or "", without_evidence(without_placement_note(args.get("body") or ""))
+     if _local_marker(title, body, args.get("skills"), c):
+         return "local marker"
+-    full = f"{title}\n{body}"
++    from hermes_cli.kanban_carried_evidence import without_carried_inputs
++
++    full = without_carried_inputs(f"{title}\n{body}", c.raw)
+     extra = c.raw.get("extra_home_markers")
+     pats = list(HOME_GATEWAY_MARKERS) + (list(extra) if isinstance(extra, list) else [])
+     for p in pats:
+diff --git a/tests/hermes_cli/test_kanban_carried_evidence.py b/tests/hermes_cli/test_kanban_carried_evidence.py
+new file mode 100644
+index 0000000000..b0043beb52
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_carried_evidence.py
+@@ -0,0 +1,73 @@
++"""Carried briefs exempt exactly verified input files, not gateway state."""
++import hashlib
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_carried_evidence as ce
++from hermes_cli import kanban_placement as placement
++
++
++@pytest.fixture
++def carried(tmp_path, monkeypatch):
++    # Production path shape, isolated filesystem via Path translation.
++    home = tmp_path / "home"
++    file = home / "kanban/evidence/plan/BRIEF.md"
++    file.parent.mkdir(parents=True)
++    file.write_text("frozen plan\n")
++    name = "/home/example/.hermes/kanban/evidence/plan/BRIEF.md"
++    digest = hashlib.sha256(file.read_bytes()).hexdigest()
++    receipt = {"version": 1, "verified_at": time.time(), "machines": ["worker-1"], "files": {name: digest}}
++    manifest = home / "kanban/carried-evidence.json"
++    manifest.write_text(json.dumps(receipt))
++    monkeypatch.setattr(ce, "get_hermes_home", lambda: home)
++    real_path = ce.Path
++    monkeypatch.setattr(ce, "Path", lambda value: file if value == name else real_path(value))
++    cfg = {"worker_pools": {"hub": ["worker-1"]}}
++    body = f"Read {name}, SHA256 {digest}. Implement the approved plan."
++    return name, file, manifest, receipt, cfg, body
++
++
++def test_portable_verified_brief(carried):
++    *_, cfg, body = carried
++    assert placement.portable_reason({"title": "Implement plan", "body": body}, cfg) is None
++
++
++@pytest.mark.parametrize("fault", ["missing", "stale", "future", "nan", "uncovered", "bad_shape", "hash", "unpin", "suffix", "symlink", "oversize"])
++def test_fail_closed(carried, fault):
++    name, file, manifest, receipt, cfg, body = carried
++    if fault == "missing":
++        manifest.unlink()
++    elif fault in ("stale", "future", "nan"):
++        receipt["verified_at"] = {"stale": time.time() - 7200, "future": time.time() + 100, "nan": float("nan")}[fault]
++    elif fault == "uncovered":
++        cfg["worker_pools"]["hub"].append("worker-2")
++    elif fault == "bad_shape":
++        receipt["files"] = []
++    elif fault == "hash":
++        file.write_text("changed")
++    elif fault == "unpin":
++        body = body.replace(receipt["files"][name], "not pinned")
++    elif fault == "suffix":
++        body = body.replace(name, name + "/child")
++    elif fault == "symlink":
++        target = file.with_name("target")
++        file.rename(target)
++        file.symlink_to(target)
++    elif fault == "oversize":
++        file.write_bytes(b"x" * (ce.MAX_BYTES + 1))
++    if fault != "missing":
++        manifest.write_text(json.dumps(receipt))
++    assert placement.portable_reason({"body": body}, cfg) == "home gateway marker"
++
++
++@pytest.mark.parametrize("extra", ["Read /home/example/.hermes/kanban.db", "Run ssh host", "Edit /home/example/.hermes/kanban/evidence/other.md", "Read /home/example/.hermes/kanban/workspaces/other/report.md"])
++def test_other_host_markers_preserved(carried, extra):
++    *_, cfg, body = carried
++    assert placement.portable_reason({"body": body + "\n" + extra}, cfg) == "home gateway marker"
++
++
++def test_no_destinations_no_exemption(carried):
++    *_, body = carried
++    assert ce.without_carried_inputs(body, {}) == body
+-- 
+2.55.0
+

@@ -1,0 +1,267 @@
+From 003ab80a58ec0f31236f7c969177bc02de7a0e98 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:33:42 +0000
+Subject: [PATCH] fix(checkpoints): distinguish protected floor from failed
+ maintenance [daveey]
+
+---
+ tests/tools/test_checkpoint_health_floor.py | 88 +++++++++++++++++++++
+ tests/tools/test_checkpoint_size_pending.py |  7 +-
+ tools/checkpoint_health.py                  | 49 ++++++++++++
+ tools/checkpoint_maintenance.py             | 38 ++++++---
+ 4 files changed, 170 insertions(+), 12 deletions(-)
+ create mode 100644 tests/tools/test_checkpoint_health_floor.py
+ create mode 100644 tools/checkpoint_health.py
+
+diff --git a/tests/tools/test_checkpoint_health_floor.py b/tests/tools/test_checkpoint_health_floor.py
+new file mode 100644
+index 00000000000..e01b34fab5c
+--- /dev/null
++++ b/tests/tools/test_checkpoint_health_floor.py
+@@ -0,0 +1,88 @@
++"""Health thresholds are independent; a protected floor is not failed maintenance."""
++import json
++import logging
++import time
++
++import pytest
++
++from tools import checkpoint_maintenance as maintenance
++from tools import checkpoint_manager as checkpoints
++from tests.tools.test_checkpoint_size_pending import _over_cap_store
++
++
++@pytest.mark.parametrize("cap,age", [(0.5, 1), (1, 72)])
++def test_health_independent_thresholds(tmp_path, monkeypatch, caplog, cap, age):
++    base, _ = _over_cap_store(tmp_path, monkeypatch, 1)
++    (base / ".last_prune").write_text(str(time.time()), encoding="utf-8")
++    (base / ".last_prune_success").write_text(str(time.time() - age * 3600), encoding="utf-8")
++    caplog.set_level(logging.ERROR)
++    assert maintenance.check_store_health(base, cap) is True
++    assert "checkpoint store over cap:" in caplog.text
++
++
++def test_protected_floor_is_success(tmp_path, monkeypatch, caplog):
++    base, _ = _over_cap_store(tmp_path, monkeypatch, 2)
++    caplog.set_level(logging.INFO)
++    out = maintenance.prune_checkpoints(retention_days=0, delete_orphans=False,
++                                        checkpoint_base=base, max_total_size_mb=0.5)
++    assert out["errors"] == 0
++    assert out["protected_floor"] is True
++    assert (base / ".last_prune_success").exists()
++    (base / ".last_prune_success").write_text("1", encoding="utf-8")
++    assert maintenance.check_store_health(base, 0.5) is False
++    assert "protected floor" in caplog.text
++    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
++    # A subsequent real checkpoint invalidates the floor observation.
++    manager = checkpoints.CheckpointManager(enabled=True, max_total_size_mb=0)
++    work = tmp_path / "project-000"
++    (work / "note.txt").write_text("new history", encoding="utf-8")
++    assert manager.ensure_checkpoint(str(work), "new")
++    (base / ".last_health_check").unlink()
++    assert maintenance.check_store_health(base, 0.5) is True
++
++
++def test_failed_prune_does_not_refresh_success(tmp_path, monkeypatch):
++    base, _ = _over_cap_store(tmp_path, monkeypatch, 1)
++    success = base / ".last_prune_success"
++    success.write_text("1", encoding="utf-8")
++    # Explicitly exercise a failing maintenance return.
++    monkeypatch.setattr(maintenance, "_prune_checkpoints", lambda *args: {"errors": 1})
++    result = maintenance.prune_checkpoints(checkpoint_base=base)
++    assert result["errors"] == 1
++    assert success.read_text(encoding="utf-8") == "1"
++
++
++@pytest.mark.parametrize("fault", ["pending", "refs_failed", "empty", "foreign", "parents", "parents_failed"])
++def test_floor_record_fails_closed(tmp_path, monkeypatch, fault):
++    from tools import checkpoint_health as health
++    store = tmp_path / "store"
++    store.mkdir()
++    if fault == "pending":
++        (store / ".gc-pending").touch()
++    def git(args, *rest):
++        if args[0] == "for-each-ref":
++            refs = "" if fault == "empty" else (
++                "refs/heads/foreign abc" if fault == "foreign" else checkpoints._REFS_PREFIX + "project abc")
++            return fault != "refs_failed", refs, ""
++        return fault != "parents_failed", "abc" if fault == "parents" else "", ""
++    monkeypatch.setattr(health, "_run_git", git)
++    assert health.record_floor(store) is False
++    assert not (tmp_path / health.FLOOR_MARKER).exists()
++
++
++@pytest.mark.parametrize("fault", ["pending", "missing", "corrupt", "array", "size", "refs", "git_failure"])
++def test_floor_receipt_invalidated(tmp_path, monkeypatch, fault):
++    from tools import checkpoint_health as health
++    store = tmp_path / "store"
++    store.mkdir()
++    refs = checkpoints._REFS_PREFIX + "project abc"
++    receipt = {"refs": "different" if fault == "refs" else refs,
++               "size": 11 if fault == "size" else 10}
++    marker = tmp_path / health.FLOOR_MARKER
++    if fault != "missing":
++        marker.write_text("bad" if fault == "corrupt" else "[]" if fault == "array" else json.dumps(receipt),
++                          encoding="utf-8")
++    if fault == "pending":
++        (store / ".gc-pending").touch()
++    monkeypatch.setattr(health, "_run_git", lambda *args: (fault != "git_failure", refs, ""))
++    assert health.protected_floor(store, 10) is False
+diff --git a/tests/tools/test_checkpoint_size_pending.py b/tests/tools/test_checkpoint_size_pending.py
+index 590573fb975..ad2d11f293b 100644
+--- a/tests/tools/test_checkpoint_size_pending.py
++++ b/tests/tools/test_checkpoint_size_pending.py
+@@ -119,7 +119,7 @@ def test_auto_prune_off_without_pending_size_work_stays_skipped(tmp_path, monkey
+ def test_store_stuck_over_cap_logs_one_error_per_day(tmp_path, monkeypatch, caplog, last_prune_age_h):
+     base, _ = _over_cap_store(tmp_path, monkeypatch, 1)  # ~1.3 MB store > 2 x 0.5 MB cap
+     if last_prune_age_h is not None:
+-        (base / ".last_prune").write_text(str(time.time() - last_prune_age_h * 3600), encoding="utf-8")
++        (base / ".last_prune_success").write_text(str(time.time() - last_prune_age_h * 3600), encoding="utf-8")
+     caplog.set_level(logging.ERROR, logger="tools.checkpoint_maintenance")
+     assert checkpoint_maintenance.check_store_health(base, cap_mb=0.5) is True
+     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+@@ -134,8 +134,9 @@ def test_store_health_quiet_when_pruned_recently_or_under_cap(tmp_path, monkeypa
+     base, _ = _over_cap_store(tmp_path, monkeypatch, 1)
+     caplog.set_level(logging.ERROR, logger="tools.checkpoint_maintenance")
+     assert checkpoint_maintenance.check_store_health(base, cap_mb=500) is False  # under the cap
+-    (base / ".last_prune").write_text(str(time.time() - 3600), encoding="utf-8")
+-    assert checkpoint_maintenance.check_store_health(base, cap_mb=0.5) is False  # pruned 1h ago
++    (base / ".last_health_check").unlink()  # independently exercise the recent-prune branch
++    (base / ".last_prune_success").write_text(str(time.time() - 3600), encoding="utf-8")
++    assert checkpoint_maintenance.check_store_health(base, cap_mb=1) is False  # <2x and pruned 1h ago
+     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+ 
+ 
+diff --git a/tools/checkpoint_health.py b/tools/checkpoint_health.py
+new file mode 100644
+index 00000000000..4e168256241
+--- /dev/null
++++ b/tools/checkpoint_health.py
+@@ -0,0 +1,49 @@
++"""Maintenance receipts for the protected one-snapshot-per-project floor."""
++import json
++from pathlib import Path
++
++from tools.checkpoint_manager import _REFS_PREFIX, _dir_size_bytes, _run_git
++from tools.checkpoint_pruning import GC_PENDING_NAME
++
++SUCCESS_MARKER = ".last_prune_success"
++FLOOR_MARKER = ".protected_floor"
++
++
++def _refs(store: Path) -> str | None:
++    ok, refs, _ = _run_git(["for-each-ref", "--format=%(refname) %(objectname)"],
++                           store, str(store.parent))
++    if not ok or not refs.strip():
++        return None
++    if any(not line.startswith(_REFS_PREFIX) for line in refs.splitlines()):
++        return None
++    return refs
++
++
++def record_floor(store: Path) -> bool:
++    """Called under the maintenance lock, after successful reclaim and exhausted trimming."""
++    if (store / GC_PENDING_NAME).exists():
++        return False
++    refs = _refs(store)
++    if refs is None:
++        return False
++    ok, parents, _ = _run_git(["rev-list", "--all", "--min-parents=1", "--max-count=1"],
++                              store, str(store.parent))
++    if not ok or parents.strip():
++        return False
++    receipt = {"refs": refs, "size": _dir_size_bytes(store)}
++    (store.parent / FLOOR_MARKER).write_text(json.dumps(receipt), encoding="utf-8")
++    return True
++
++
++def protected_floor(store: Path, size: int) -> bool:
++    """Fail closed when history, objects, or pending work changed since compaction."""
++    if (store / GC_PENDING_NAME).exists():
++        return False
++    try:
++        receipt = json.loads((store.parent / FLOOR_MARKER).read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return False
++    if not isinstance(receipt, dict) or receipt.get("size") != size:
++        return False
++    refs = _refs(store)
++    return refs is not None and receipt.get("refs") == refs
+diff --git a/tools/checkpoint_maintenance.py b/tools/checkpoint_maintenance.py
+index bd5fbb121d5..23fe41c4a68 100644
+--- a/tools/checkpoint_maintenance.py
++++ b/tools/checkpoint_maintenance.py
+@@ -187,7 +187,11 @@ def prune_checkpoints(
+ 
+     try:
+         with store_lock(base):
+-            return _prune_checkpoints(base, result, retention_days, delete_orphans, max_total_size_mb, orphan_allowlist)
++            result = _prune_checkpoints(base, result, retention_days, delete_orphans, max_total_size_mb, orphan_allowlist)
++            if not result["errors"]:
++                from tools.checkpoint_health import SUCCESS_MARKER
++                (base / SUCCESS_MARKER).write_text(str(time.time()), encoding="utf-8")
++            return result
+     except (PruneError, OSError) as exc:
+         result["errors"] += 1
+         logger.warning("Checkpoint maintenance stopped: %s", exc)
+@@ -350,8 +354,13 @@ def _prune_checkpoints(
+             if result["deleted_orphan"] + result["deleted_stale"] or pruner.gc_pending():
+                 pruner.reclaim()
+             if not pruner.enforce_size(max_total_size_mb * 1024 * 1024):
+-                result["errors"] += 1
+-                logger.warning("Checkpoint store remains over its size cap; minimum history retained")
++                from tools.checkpoint_health import record_floor
++                if record_floor(store):
++                    result["protected_floor"] = True
++                    logger.info("Checkpoint store above cap: protected floor; final snapshots retained")
++                else:
++                    result["errors"] += 1
++                    logger.warning("Checkpoint store remains over its size cap; maintenance incomplete")
+         except (PruneError, OSError) as exc:
+             result["errors"] += 1
+             logger.warning("Checkpoint pruning stopped: %s", exc)
+@@ -465,9 +474,9 @@ _HEALTH_PRUNE_STALE_S = 48 * 3600
+ 
+ 
+ def check_store_health(base: Path, cap_mb: float) -> bool:
+-    """At most once a day: log an ERROR when the store is over twice its cap and no prune has run
+-    for 48 h (or ever), so the self-heal lane files it. The size walk itself is gated by the daily
+-    marker, so the housekeeping tick stays cheap. Returns whether it reported."""
++    """Daily ERROR for over-cap stores: twice the cap OR no successful prune in 48 h.
++    A verified compacted floor is an INFO exception, never permission to delete final snapshots.
++    The daily marker bounds observation cost. Returns whether it reported an error."""
+     if cap_mb <= 0:
+         return False
+     store = _store_path(base)
+@@ -486,14 +495,25 @@ def check_store_health(base: Path, cap_mb: float) -> bool:
+         pass
+     size = _dir_size_bytes(store)
+     cap_bytes = cap_mb * 1024 * 1024
+-    if size <= 2 * cap_bytes:
++    from tools.checkpoint_health import SUCCESS_MARKER, protected_floor
++
++    if size <= cap_bytes:
+         return False
+     try:
+-        last = float((base / _PRUNE_MARKER_NAME).read_text(encoding="utf-8-sig").strip())
++        last = float((base / SUCCESS_MARKER).read_text(encoding="utf-8-sig").strip())
+     except (OSError, ValueError):
+         last = None
+-    if last is not None and now - last < _HEALTH_PRUNE_STALE_S:
++    stale = last is None or now - last >= _HEALTH_PRUNE_STALE_S
++    if size <= 2 * cap_bytes and not stale:
+         return False
++    from tools.checkpoint_pruning import PruneError, store_lock
++    try:
++        with store_lock(base):
++            if protected_floor(store, _dir_size_bytes(store)):
++                logger.info("Checkpoint store above cap: protected floor; final snapshots retained (%s)", store)
++                return False
++    except (PruneError, OSError):
++        pass  # An unverified floor is not an exemption.
+     when = "never" if last is None else f"{(now - last) / 3600:.0f} h ago"
+     logger.error("checkpoint store over cap: %.2f GB / %g MB, last prune %s (%s); "
+                  "set checkpoints.auto_prune: true or run `hermes checkpoints prune`",
+-- 
+2.55.0
+

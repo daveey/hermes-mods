@@ -1,0 +1,214 @@
+From 68e0da0bcb48191c9aa100f0aea862d4d1d7ecb8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:20:33 +0000
+Subject: [PATCH] ci(detect): fall back to the merge commit's git diff when the
+ compare API fails [daveey]
+
+Every PR macOS state job queued 01:20-05:00Z on 2026-11-11 came from a
+detect that failed open: the compare call hit 'API rate limit exceeded for
+installation' (HTTP 403) three times, the classifier got no files and turned
+every lane on, so 16 PRs that touch no state code queued the one-runner
+macOS state lane (~9 h at 34 min/job). Example: PR #1066 touches only
+tui_gateway/agent files; classify() on its list gives hermes_state=false.
+
+The action now uses git diff of the checked-out PR merge commit against its
+first parent when the API fails. git fetch does not spend the REST quota. It is
+used only when HEAD equals GITHUB_SHA and the merge's second parent equals the
+event head SHA; otherwise, or with an empty diff, it fails open as before.
+--no-renames lists a rename under both names.
+
+Proof: tests/ci/test_detect_changes_git_fallback.py runs the action's own
+bash against a real depth-1 merge checkout with a rate-limited gh: unrelated
+change skips the state lane, state change and state rename select it,
+unverified checkouts fail open. Four mutants (each guard, rename mode, the
+fallback call) are each killed. tests/ci classify/macos routing/update routing
+pass (323).
+---
+ .github/actions/detect-changes/action.yml    |  23 ++++
+ tests/ci/test_detect_changes_git_fallback.py | 134 +++++++++++++++++++
+ 2 files changed, 157 insertions(+)
+ create mode 100644 tests/ci/test_detect_changes_git_fallback.py
+
+diff --git a/.github/actions/detect-changes/action.yml b/.github/actions/detect-changes/action.yml
+index 5abb945017..6770f416f3 100644
+--- a/.github/actions/detect-changes/action.yml
++++ b/.github/actions/detect-changes/action.yml
+@@ -139,12 +139,35 @@ runs:
+                 return 1
+             done
+           }
++          # API fallback: the same list from the checked-out PR merge commit.
++          # The GITHUB_TOKEN REST quota is shared by every workflow in the repo;
++          # when it ran out, every PR failed open and queued the one-runner macOS
++          # state lane (16 jobs, ~9 h). git fetch does not spend that quota.
++          # Only used when HEAD is exactly the event's merge commit and its
++          # second parent is the event's head SHA; anything else fails open as
++          # before. --no-renames lists a rename under both names, as the
++          # classifier expects. The diff against the merge's first parent is
++          # exactly what the merge commit under test changes.
++          merge_files() {
++            local head parents
++            head="$(git rev-parse HEAD 2>/dev/null)" || return 1
++            [ -n "${GITHUB_SHA:-}" ] && [ "$head" = "$GITHUB_SHA" ] || return 1
++            git fetch --no-tags --quiet --depth=2 origin "$head" || return 1
++            read -r -a parents <<< "$(git rev-list --parents -n 1 "$head")"
++            [ "${#parents[@]}" -eq 3 ] && [ "${parents[2]}" = "$HEAD_SHA" ] || return 1
++            git diff --no-renames --name-only "${parents[1]}" "$head"
++          }
+           CHANGED=""
+           for i in 1 2 3; do
+             if CHANGED="$(compare_files)"; then
+ 
+               break
+             fi
++            if CHANGED="$(merge_files)" && [ -n "$CHANGED" ]; then
++              echo "::warning::compare API failed; using the PR merge commit's git diff instead"
++              break
++            fi
++            CHANGED=""
+             if [ "$i" = 3 ]; then
+               echo "::warning::compare API failed after 3 attempts — failing open (all lanes run)"
+               CHANGED=""
+diff --git a/tests/ci/test_detect_changes_git_fallback.py b/tests/ci/test_detect_changes_git_fallback.py
+new file mode 100644
+index 0000000000..6ba049492c
+--- /dev/null
++++ b/tests/ci/test_detect_changes_git_fallback.py
+@@ -0,0 +1,134 @@
++"""Run detect-changes' real classify script with a failing GitHub API.
++
++When the GITHUB_TOKEN REST quota ran out, the compare call failed on every PR,
++detect failed open, and every PR queued the single-runner macOS state lane. The
++action now falls back to the checked-out merge commit's git diff, which needs no
++API quota. These tests run the action's own bash against a real git merge.
++"""
++import os
++import subprocess
++from pathlib import Path
++
++import hermes_yaml
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++CLASSIFIER = ROOT / "scripts/ci/classify_changes.py"
++
++
++def _script():
++    action = hermes_yaml.safe_load((ROOT / ".github/actions/detect-changes/action.yml").read_text())
++    step = next(s for s in action["runs"]["steps"] if s.get("id") == "classify")
++    return step["run"].replace("scripts/ci/classify_changes.py", str(CLASSIFIER))
++
++
++def _git(cwd, *args):
++    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
++                          text=True, encoding="utf-8").stdout.strip()
++
++
++@pytest.fixture
++def pr(tmp_path):
++    """An origin with base, PR head and the PR merge commit, and a depth-1 checkout of the merge."""
++    origin = tmp_path / "origin"
++    origin.mkdir()
++    _git(origin, "init", "-q", "-b", "main")
++    _git(origin, "config", "user.email", "t@example.com")
++    _git(origin, "config", "user.name", "t")
++    (origin / "hermes_state.py").write_text("x = 1\n")
++    (origin / "old_name.py").write_text("y = 1\n")
++    (origin / "README.md").write_text("base\n")
++    _git(origin, "add", ".")
++    _git(origin, "commit", "-q", "-m", "base")
++    base = _git(origin, "rev-parse", "HEAD")
++
++    def make(files, renames=()):
++        _git(origin, "checkout", "-q", "-B", "feature", base)
++        for name, text in files.items():
++            (origin / name).write_text(text)
++            _git(origin, "add", name)
++        for old, new in renames:
++            _git(origin, "mv", old, new)
++        _git(origin, "commit", "-q", "-m", "pr")
++        head = _git(origin, "rev-parse", "HEAD")
++        _git(origin, "checkout", "-q", "main")
++        (origin / "README.md").write_text("base moved on\n")  # base advanced: not the PR's change
++        _git(origin, "commit", "-q", "-am", "main moves")
++        _git(origin, "checkout", "-q", "--detach", "main")
++        _git(origin, "merge", "-q", "--no-ff", "-m", "merge", head)
++        merge = _git(origin, "rev-parse", "HEAD")
++        _git(origin, "update-ref", "refs/pull/1/merge", merge)
++        _git(origin, "checkout", "-q", "main")
++        work = tmp_path / "work"
++        _git(tmp_path, "clone", "-q", "--depth", "1", "--no-checkout", f"file://{origin}", str(work))
++        _git(work, "fetch", "-q", "--depth", "1", "origin", "refs/pull/1/merge")
++        _git(work, "checkout", "-q", "--detach", merge)
++        return work, head, merge
++
++    return tmp_path, base, make
++
++
++def _run(tmp_path, work, base, head, merge):
++    bin_dir = tmp_path / "bin"
++    bin_dir.mkdir(exist_ok=True)
++    gh = bin_dir / "gh"
++    gh.write_text("#!/bin/sh\necho 'gh: API rate limit exceeded for installation. (HTTP 403)' >&2\nexit 1\n")
++    gh.chmod(0o755)
++    (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n")
++    (bin_dir / "sleep").chmod(0o755)
++    out = tmp_path / "github_output"
++    out.write_text("")
++    env = {
++        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
++        "HOME": str(tmp_path),
++        "EVENT_NAME": "pull_request", "REPO": "owner/repo", "GH_TOKEN": "x",
++        "BASE_SHA": base, "HEAD_SHA": head, "GITHUB_SHA": merge,
++        "RUNNER_TEMP": str(tmp_path), "GITHUB_OUTPUT": str(out),
++        "GIT_CONFIG_NOSYSTEM": "1",
++    }
++    proc = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", _script()],
++                          cwd=work, env=env, capture_output=True, text=True, encoding="utf-8", check=False)
++    assert proc.returncode == 0, proc.stderr + proc.stdout
++    lanes = dict(line.split("=", 1) for line in out.read_text().split() if "=" in line)
++    changed = (tmp_path / "detect-changed-files.txt").read_text().split()
++    return proc.stdout, lanes, changed
++
++
++def test_api_failure_uses_merge_diff_and_skips_unrelated_state_lane(pr):
++    tmp_path, base, make = pr
++    work, head, merge = make({"tui_gateway_update_pause.py": "z = 1\n"})
++    stdout, lanes, changed = _run(tmp_path, work, base, head, merge)
++    assert "using the PR merge commit's git diff" in stdout
++    assert changed == ["tui_gateway_update_pause.py"]  # base's README move is not the PR's
++    assert lanes["hermes_state"] == "false"
++    assert lanes["python"] == "true"
++
++
++def test_state_change_still_selects_the_macos_state_lane(pr):
++    tmp_path, base, make = pr
++    work, head, merge = make({"hermes_state.py": "x = 2\n"})
++    _, lanes, changed = _run(tmp_path, work, base, head, merge)
++    assert changed == ["hermes_state.py"]
++    assert lanes["hermes_state"] == "true"
++
++
++def test_rename_counts_under_both_names(pr):
++    tmp_path, base, make = pr
++    work, head, merge = make({}, renames=[("hermes_state.py", "moved_state.py")])
++    _, lanes, changed = _run(tmp_path, work, base, head, merge)
++    assert sorted(changed) == ["hermes_state.py", "moved_state.py"]
++    assert lanes["hermes_state"] == "true"
++
++
++@pytest.mark.parametrize("break_it", ["head_sha", "github_sha"])
++def test_unverified_checkout_still_fails_open(pr, break_it):
++    tmp_path, base, make = pr
++    work, head, merge = make({"tui_gateway_update_pause.py": "z = 1\n"})
++    if break_it == "head_sha":
++        head = base  # merge's second parent is not the event's head
++    else:
++        merge = base  # HEAD is not the event's merge commit
++    stdout, lanes, changed = _run(tmp_path, work, base, head, merge)
++    assert "failing open" in stdout
++    assert changed == []
++    assert lanes["hermes_state"] == "true"
+-- 
+2.55.0
+

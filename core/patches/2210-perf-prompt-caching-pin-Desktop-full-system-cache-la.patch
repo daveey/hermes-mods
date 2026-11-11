@@ -1,0 +1,370 @@
+From c2ccf0be2f019047a54a91de5fe0e79879463d94 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 08:43:01 +0000
+Subject: [PATCH] perf(prompt-caching): pin Desktop full-system cache layout
+ across rounds [daveey]
+
+---
+ agent/agent_init.py                      |  12 +-
+ agent/background_review.py               |   1 +
+ agent/conversation_loop.py               |   1 +
+ agent/prompt_caching.py                  |  19 +--
+ agent/turn_request_assembly.py           |   1 +
+ tests/agent/test_desktop_system_cache.py | 166 +++++++++++++++++++++++
+ tests/agent/test_prompt_caching.py       |  36 +----
+ 7 files changed, 186 insertions(+), 50 deletions(-)
+ create mode 100644 tests/agent/test_desktop_system_cache.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index df2d384277..45943e6704 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -527,6 +527,12 @@ _STREAM_STATE: dict[str, Any] = {
+ 
+ 
+ def _init_prompt_cache_config(agent):
++    from agent.session_source import is_attended, session_source_for
++    # Pin the layout, not the round: Desktop shares its full system across fresh chats.
++    # Machine-paced sources retain the static-prefix fallback for differing tails.
++    agent._cache_full_system = (
++        is_attended(agent) and session_source_for(getattr(agent, "platform", None)) == "desktop"
++    )
+     # Anthropic prompt caching (~75% input savings): auto-enabled for Claude on native
+     # Anthropic, OpenRouter and anthropic_messages gateways. See _anthropic_prompt_cache_policy.
+     agent._use_prompt_caching, agent._use_native_cache_layout = (
+@@ -537,11 +543,6 @@ def _init_prompt_cache_config(agent):
+     # (1h when a person paces the session, 5m when a machine does); unknown values keep "5m". A falsy/off value disables caching entirely (OAuth plans
+     # billing cache writes, proxies adding their own cache_control); the disable survives
+     # /model switches and fallback re-derivation.
+-    # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from config.yaml under
+-    # prompt_caching.cache_ttl; unknown values keep "5m". 1h tier costs 2x on write vs 1.25x for 5m, but
+-    # amortizes across long sessions with >5-minute pauses between turns (#14971). This is useful for OAuth
+-    # subscription users where cache writes bill against "extra usage" or for third-party proxies that
+-    # inject their own cache_control markers (#13477).
+     agent._cache_ttl = "5m"
+     try:
+         from hermes_cli.config import load_config_readonly as _load_pc_cfg
+@@ -554,7 +555,6 @@ def _init_prompt_cache_config(agent):
+         elif _ttl == AUTO_CACHE_TTL:
+             # Decided once per session from its source (a delegated child is clamped to 5m again
+             # in delegate_tool regardless).
+-            from agent.session_source import session_source_for
+             agent._cache_ttl = auto_cache_ttl_for_source(session_source_for(getattr(agent, "platform", None)))
+         elif cache_ttl_means_disabled(_ttl):
+             agent._use_prompt_caching = False
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 3fdcbc0114..d197e4bbf6 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -1036,6 +1036,7 @@ def build_cache_parity_fork(
+     # routed fork build its own.
+     if not _routed:
+         review_agent._cached_system_prompt = agent._cached_system_prompt
++        review_agent._cache_full_system = getattr(agent, "_cache_full_system", False)
+         review_agent.session_start = agent.session_start
+         # Cache-scope parity (#109964): the fork shares the parent's physical session_id and
+         # byte-identical prefix, but is _persist_disabled (declared scope fails closed) and
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 5458744b6e..a558b7130e 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1324,6 +1324,7 @@ def _redecorate_prompt_cache_for_provider(
+             cache_ttl=effective_cache_ttl(agent._cache_ttl, provider=agent.provider, model=agent.model),
+             native_anthropic=agent._use_native_cache_layout,
+             static_system_prefix=static if isinstance(static, str) else None,
++            cache_full_system=getattr(agent, "_cache_full_system", False),
+             direct_native_tool_cache=getattr(
+                 agent, "_direct_native_anthropic_tool_cache_capability", lambda: False
+             )(),
+diff --git a/agent/prompt_caching.py b/agent/prompt_caching.py
+index 2b790bbd41..615f17b97e 100644
+--- a/agent/prompt_caching.py
++++ b/agent/prompt_caching.py
+@@ -178,6 +178,7 @@ def effective_cache_ttl(ttl: str | None, *, model: str = "", provider: str = "")
+ def _apply_system_cache_markers(
+     message: dict, cache_marker: dict, static_system_prefix: str | None, *,
+     native_anthropic: bool, mark_suffix: bool = True, fallback_to_whole: bool = True,
++    mark_prefix: bool = True,
+ ) -> int:
+     """Mark the static system prefix (and optionally the full prompt); returns markers applied.
+ 
+@@ -190,9 +191,9 @@ def _apply_system_cache_markers(
+     if isinstance(static_system_prefix, str) and static_system_prefix and isinstance(content, str) and content.startswith(static_system_prefix):
+         suffix = content[len(static_system_prefix):]
+         if suffix.strip():
+-            message["content"] = [_text_part(static_system_prefix, cache_marker),
++            message["content"] = [_text_part(static_system_prefix, cache_marker if mark_prefix else None),
+                                   _text_part(suffix, cache_marker if mark_suffix else None)]
+-            return 2 if mark_suffix else 1
++            return int(mark_prefix) + int(mark_suffix)
+     elif not fallback_to_whole:
+         return 0
+     _apply_cache_marker(message, cache_marker, native_anthropic=native_anthropic)
+@@ -314,6 +315,7 @@ def build_prompt_cache_plan(
+     api_messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, *,
+     cache_ttl: str = "5m", native_anthropic: bool = False, static_system_prefix: str | None = None,
+     direct_native_tool_cache: bool = False, tool_part_markers: bool = True,
++    cache_full_system: bool = False,
+ ) -> PromptCachePlan:
+     """Build copy-on-write cache sections for one resolved request destination
+     (``tool_part_markers=False`` keeps markers off role:tool parts on LiteLLM-style routes)."""
+@@ -327,17 +329,16 @@ def build_prompt_cache_plan(
+ 
+     messages = _strip_prior_decoration(list(api_messages or []))
+     marker = _build_marker(cache_ttl)
+-    endpoints = _completed_transaction_endpoint_indexes(messages, native_anthropic=True)[-2:]
+     if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+-        # Tool-cache layout: the tools array takes the suffix's usual slot. With fewer than two
+-        # endpoints (a new session's first requests) a slot is spare: mark the suffix too, so
+-        # the next new chat reads the whole shared system prompt instead of re-writing it.
++        # Desktop sessions spend the ONE system marker on the full shared prompt.
++        # Keep tools and both transaction endpoints; never choose by round count.
++        # Other callers keep the static-prefix fallback for differing system tails.
+         messages[0] = copy.deepcopy(messages[0])
+         _apply_system_cache_markers(messages[0], marker, static_system_prefix,
+-                                    native_anthropic=True, mark_suffix=len(endpoints) < 2,
+-                                    fallback_to_whole=False)
++                                    native_anthropic=True, mark_suffix=cache_full_system,
++                                    mark_prefix=not cache_full_system, fallback_to_whole=cache_full_system)
+     planned_tools[-1]["cache_control"] = dict(marker)
+-    for endpoint in endpoints:
++    for endpoint in _completed_transaction_endpoint_indexes(messages, native_anthropic=True)[-2:]:
+         messages[endpoint] = copy.deepcopy(messages[endpoint])
+         _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
+     _split_unmarked_scaffolds(messages)
+diff --git a/agent/turn_request_assembly.py b/agent/turn_request_assembly.py
+index cc75648461..dac072fc67 100644
+--- a/agent/turn_request_assembly.py
++++ b/agent/turn_request_assembly.py
+@@ -221,6 +221,7 @@ def assemble_api_request(
+                 _static_system_prefix if isinstance(_static_system_prefix, str) else None
+             ),
+             direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
++            cache_full_system=getattr(agent, "_cache_full_system", False),
+             # LiteLLM-style envelope routes forward part-level markers into
+             # tool_result.content[] → non-retryable 400.
+             tool_part_markers=envelope_tool_part_cache_markers_supported(
+diff --git a/tests/agent/test_desktop_system_cache.py b/tests/agent/test_desktop_system_cache.py
+new file mode 100644
+index 0000000000..6dd094ba63
+--- /dev/null
++++ b/tests/agent/test_desktop_system_cache.py
+@@ -0,0 +1,166 @@
++"""Full-system Desktop layout keeps tools and rolling transaction reuse."""
++import copy
++import json
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.prompt_caching import build_prompt_cache_plan, _count_cache_markers
++from tests.agent.test_prompt_caching import _tool_heavy_native_tools, MARKER
++from tests.agent import test_class_failure_wire as wire
++
++routing_home = wire.routing_home
++streaming_route = wire.streaming_route
++
++
++def _plan(messages):
++    return build_prompt_cache_plan(
++        messages, _tool_heavy_native_tools(), native_anthropic=True,
++        direct_native_tool_cache=True, static_system_prefix="stable prefix",
++        cache_full_system=True,
++    )
++
++
++def test_fresh_sessions_share_marked_system_and_rounds_keep_wire_bytes():
++    history = [
++        {"role": "system", "content": "stable prefix\nshared context and skills"},
++        {"role": "user", "content": "first distinct request"},
++    ]
++    first = _plan(history)
++    system = first.messages[0]
++    assert "cache_control" not in system["content"][0]
++    assert system["content"][-1]["cache_control"] == MARKER
++    second_history = copy.deepcopy(history)
++    second_history[-1]["content"] = "second distinct request"
++    # Explicit marker at the same tools+system prefix lets another fresh session read it;
++    # this is a plan-level contract, not fabricated provider cache accounting.
++    second = _plan(second_history)
++    assert second.tools == first.tools
++    assert second.messages[0] == system
++    expected_wire = json.dumps(system, sort_keys=True)
++    previous_endpoint = None
++    for round_no in range(4):
++        ids = [f"r{round_no}-{i}" for i in range(25)]
++        history.append({"role": "assistant", "content": "", "tool_calls": [
++            {"id": key, "type": "function", "function": {"name": "tool_00", "arguments": "{}"}}
++            for key in ids
++        ]})
++        history.extend({"role": "tool", "tool_call_id": key, "content": "result"} for key in ids)
++        plan = _plan(history)
++        assert json.dumps(plan.messages[0], sort_keys=True) == expected_wire
++        assert plan.tools[-1]["cache_control"] == MARKER
++        assert _count_cache_markers(plan.messages, plan.tools) <= 4
++        assert plan.messages[-1]["cache_control"] == MARKER
++        if previous_endpoint is not None:
++            assert plan.messages[previous_endpoint]["cache_control"] == MARKER
++        previous_endpoint = len(history) - 1
++        assert _plan(plan.messages) == plan
++
++
++@pytest.mark.parametrize("platform,source,attended,expected", [
++    ("desktop", "desktop", True, True), ("local", "desktop", True, True),
++    ("subagent", "desktop", False, False), ("local", "kanban", False, False),
++    ("cli", "cli", True, False), ("desktop", "desktop", False, False),
++])
++def test_layout_is_pinned_at_init_for_attended_desktop_only(platform, source, attended, expected):
++    from agent.agent_init import _init_prompt_cache_config
++    agent = SimpleNamespace(platform=platform, _anthropic_prompt_cache_policy=lambda: (True, True))
++    with patch("agent.session_source.session_source_for", return_value=source), \
++         patch("agent.session_source.is_attended", return_value=attended), \
++         patch("hermes_cli.config.load_config_readonly", return_value={}):
++        _init_prompt_cache_config(agent)
++    assert agent._cache_full_system is expected
++
++
++def test_failover_redecoration_keeps_pinned_full_system_layout():
++    from agent.conversation_loop import _redecorate_prompt_cache_for_provider
++    history = [{"role": "system", "content": "stable prefix\nshared context and skills"},
++               {"role": "user", "content": "hello"}]
++    original = _plan(history)
++    agent = SimpleNamespace(
++        provider="anthropic", base_url="https://api.anthropic.com", model="claude-sonnet-4-5",
++        _use_prompt_caching=True, _use_native_cache_layout=True, _cache_ttl="5m",
++        _cache_full_system=True, _cached_system_prompt_static="stable prefix",
++        _cached_system_prompt=history[0]["content"], tools=_tool_heavy_native_tools(),
++        _direct_native_anthropic_tool_cache_capability=lambda: True,
++    )
++    messages, _, tools = _redecorate_prompt_cache_for_provider(agent, original.messages)
++    assert messages[0] == original.messages[0]
++    assert tools == original.tools
++
++
++def test_desktop_wire_marks_full_system_without_changing_rounds(routing_home, streaming_route):
++    import anthropic
++    import httpx
++
++    sent = []
++    assembled = []
++    def capture_plan(*args, **kwargs):
++        plan = build_prompt_cache_plan(*args, **kwargs)
++        assembled.append(plan)
++        return plan
++    def respond(request):
++        body = json.loads(request.content)
++        sent.append(body)
++        return wire.completion(body["model"], len(sent) if len(sent) <= 2 else None)
++    sdk_class = anthropic.Anthropic
++    def sdk(**kwargs):
++        kwargs["http_client"] = httpx.Client(transport=httpx.MockTransport(respond))
++        return sdk_class(**kwargs)
++    schema = {"type": "function", "function": {"name": "read_file", "description": "Read fixture",
++              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
++    with patch("model_tools.get_tool_definitions", return_value=[schema]), \
++         patch("model_tools.handle_function_call", return_value="fixture contents"), \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("agent.session_source.session_source_for", return_value="desktop"), \
++         patch("gateway.session_finite.finite_turn_required", return_value=False), \
++         patch("agent.turn_request_assembly.build_prompt_cache_plan", side_effect=capture_plan), \
++         patch("anthropic.Anthropic", side_effect=sdk):
++        agent = wire.build_agent(session_id="desktop-cache-layout", platform="desktop", max_iterations=4)
++        try:
++            assert agent._cache_full_system is True
++            result = agent.run_conversation("Read both fixtures then say ok")
++            assert result["final_response"] == "ok", result
++            assert len(sent) == 3
++            assert assembled
++            assert all(p.messages[0]["content"][-1].get("cache_control") for p in assembled)
++            assert sent[0]["system"][-1].get("cache_control")
++            assert "cache_control" not in sent[0]["system"][0]
++            assert all(body["system"] == sent[0]["system"] for body in sent)
++            assert sent[2]["messages"][:len(sent[1]["messages"])] == sent[1]["messages"]
++        finally:
++            agent.release_clients()
++
++
++@pytest.mark.parametrize("parent_layout", [False, True])
++def test_cache_parity_fork_inherits_pinned_layout(parent_layout, monkeypatch):
++    from agent.background_review import build_cache_parity_fork
++    from tests.agent.test_background_review import _bare_agent, FakeReviewAgent
++    import run_agent
++    parent = _bare_agent()
++    parent._cache_full_system = parent_layout
++    monkeypatch.setattr(run_agent, "AIAgent", FakeReviewAgent)
++    fork, _, routed = build_cache_parity_fork(parent, max_iterations=1)
++    assert not routed
++    assert fork._cache_full_system is parent_layout
++
++
++@pytest.mark.parametrize("content,prefix", [
++    ("stable prefix", "stable prefix"), ("stable prefix  \n", "stable prefix"),
++    ("shared system", None), ("shared system", "different prefix"),
++    ([{"type": "text", "text": "stable prefix"},
++      {"type": "text", "text": "\nshared suffix"}], "stable prefix"),
++])
++def test_full_system_layout_has_exactly_one_system_marker(content, prefix):
++    messages = [{"role": "system", "content": content}, {"role": "user", "content": "hello"}]
++    original = copy.deepcopy(messages)
++    plan = build_prompt_cache_plan(messages, _tool_heavy_native_tools(), native_anthropic=True,
++                                  direct_native_tool_cache=True, static_system_prefix=prefix,
++                                  cache_full_system=True)
++    parts = plan.messages[0]["content"]
++    assert all(p["text"] for p in parts)
++    assert parts[-1]["cache_control"] == MARKER
++    assert sum("cache_control" in p for p in parts) == 1
++    assert _count_cache_markers(plan.messages, plan.tools) == 3
++    assert messages == original
+diff --git a/tests/agent/test_prompt_caching.py b/tests/agent/test_prompt_caching.py
+index 3d0cf92f27..f4179ac5be 100644
+--- a/tests/agent/test_prompt_caching.py
++++ b/tests/agent/test_prompt_caching.py
+@@ -183,43 +183,9 @@ class TestPromptCachePlan:
+             direct_native_tool_cache=True,
+         )
+ 
+-        # tools + static prefix + system suffix (spare budget); the pending endpoint takes none.
+-        assert _count_cache_markers(plan.messages, plan.tools) == 3
++        assert _count_cache_markers(plan.messages, plan.tools) == 2
+         assert "cache_control" not in plan.messages[-1]
+ 
+-    def test_first_turn_marks_the_system_suffix_with_spare_budget(self):
+-        """A new session's first request has one endpoint, so a slot is free: spend it on the
+-        end of the system prompt. Every new chat shares that prefix (project context, skills
+-        index, memory), so the next new chat reads it from cache instead of re-writing ~15k
+-        tokens before its first token."""
+-        messages = [
+-            {"role": "system", "content": "stable prefix\nvolatile suffix"},
+-            {"role": "user", "content": "first request"},
+-        ]
+-        plan = build_prompt_cache_plan(
+-            messages, _tool_heavy_native_tools(), native_anthropic=True,
+-            static_system_prefix="stable prefix", direct_native_tool_cache=True,
+-        )
+-
+-        system = plan.messages[0]["content"]
+-        assert [part["text"] for part in system] == ["stable prefix", "\nvolatile suffix"]
+-        assert all(part.get("cache_control") == MARKER for part in system)
+-        assert plan.tools[-1]["cache_control"] == MARKER
+-        assert "cache_control" in plan.messages[-1]["content"][-1]
+-        assert _count_cache_markers(plan.messages, plan.tools) == 4
+-
+-    def test_two_endpoints_keep_the_suffix_unmarked(self):
+-        """Once two transaction endpoints exist they own the budget; the suffix rides unmarked."""
+-        plan = build_prompt_cache_plan(
+-            _tool_heavy_native_history(), _tool_heavy_native_tools(), native_anthropic=True,
+-            static_system_prefix="stable prefix", direct_native_tool_cache=True,
+-        )
+-
+-        system = plan.messages[0]["content"]
+-        assert system[0].get("cache_control") == MARKER
+-        assert "cache_control" not in system[1]
+-        assert _count_cache_markers(plan.messages, plan.tools) == 4
+-
+     def test_static_prefix_equal_to_whole_prompt_emits_no_empty_block(self):
+         """Empty volatile suffix must not produce an empty text block.
+ 
+-- 
+2.55.0
+
