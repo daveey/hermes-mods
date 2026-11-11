@@ -55,7 +55,7 @@ ARGV_RESTORE_OPS = REFUSE_OPS | {"branch"}
 PUSH_OPS = {"push", "save", "store"}
 WRAPPERS = {"sudo", "env", "command", "exec", "time", "nice", "nohup", "stdbuf", "builtin"}
 # Wrappers that are programs, not shell builtins/keywords: the caller's state survives them.
-EXTERNAL_WRAPPERS = {"sudo", "env", "nice", "nohup", "stdbuf", "timeout"}
+EXTERNAL_WRAPPERS = {"sudo", "env", "nice", "nohup", "stdbuf", "timeout", "time"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 # Programs that run another argv (or a shell string) with option syntax the guard does not
 # model. Any argv suffix may be the command they run; xargs/parallel/find append words.
@@ -1210,8 +1210,27 @@ def _command_lookup_only(args: list[str]) -> bool:
     return lookup
 
 
-def _skip_wrappers(words: list[str]) -> list[str]:
+def _skip_wrappers(words: list[str], external_time: Optional[list] = None) -> list[str]:
     while words:
+        if os.path.basename(words[0]) == "time":
+            # This is the external program; the shell keyword was parsed as a pipeline.
+            if external_time is not None:
+                external_time.append(True)
+            words = words[1:]
+            while words and words[0].startswith("-") and words[0] != "--":
+                opt = words[0]
+                if opt in {"-p", "-l", "-a", "-h", "-v", "-q", "--portability",
+                           "--append", "--verbose", "--quiet", "--help", "--version"}:
+                    words = words[1:]
+                elif opt in {"-o", "-f", "--output", "--format"} and len(words) > 1:
+                    words = words[2:]
+                elif opt.startswith(("--output=", "--format=")) or re.fullmatch(r"-[of].+", opt):
+                    words = words[1:]
+                else:
+                    raise _ParseError("unsupported time option")
+            if words and words[0] == "--":
+                words = words[1:]
+            continue
         if os.path.basename(words[0]) in WRAPPERS | {"coproc"}:
             wrapper, words = os.path.basename(words[0]), words[1:]
             if wrapper == "command" and _command_lookup_only(words):
@@ -1702,13 +1721,17 @@ class _Analyzer:
         previous = self.source
         if not nested:
             self.source = " ".join(node[1] + node[2])
+        external_time = []
         try:
-            return self._simple(node, st, depth, nested, unknown_command)
+            result = self._simple(node, st, depth, nested, unknown_command, external_time)
+            # Still inspect the timed argv for restore/config evidence, but no shell
+            # state it produces can flow back through an external time process.
+            return ([st], [st]) if external_time else result
         finally:
             self.source = previous
 
     def _simple(self, node, st: _State, depth: int, nested: bool = False,
-                unknown_command: Optional[str] = None):
+                unknown_command: Optional[str] = None, external_time: Optional[list] = None):
         self.steps += 1
         if self.steps > MAX_STEPS:
             raise _Budget()
@@ -1768,7 +1791,7 @@ class _Analyzer:
             return self.exec(st.funcs[first], [st], depth + 1)
         wrapper_words = [_expand_word(w, st.vars) or _literal(w) for w in words]
         try:
-            kept = _skip_wrappers(wrapper_words)
+            kept = _skip_wrappers(wrapper_words, external_time)
         except _ParseError:
             # Expanded words carry scalar evidence that the raw text may only hold split.
             self.fail_closed(" ".join(words + wrapper_words))
@@ -1783,6 +1806,11 @@ class _Analyzer:
                 return [st], [st]
             unknown = _unknown([st])
             return [unknown], [unknown]
+        if external_time:
+            # Arguments expand in the caller, not in an export-filtered child shell.
+            # Function precedence was resolved above; stripped names bypass it as
+            # before. A copy also contains direct writes by builtin modeling.
+            st = st.copy()
         raw = words[len(lit) - len(kept):]
         lit = lit[len(lit) - len(kept):]
         if not lit:
@@ -1969,6 +1997,11 @@ class _Analyzer:
             # A string argument may be shell code it runs (`tmux new 'git …'`,
             # `make --eval`, `vim -c '!…'`, `npx -c`).
             for w in raw[1:]:
+                if w.startswith(("<(", ">(", "$(")) and _match_paren(w, 2) == len(w):
+                    # A complete substitution has already run in a copy of the current
+                    # shell state above. Its result is data (or an unknown command word),
+                    # not a new shell script inheriting only exported variables.
+                    continue
                 self.shadow_string(_expand_word(w, st.vars) or _literal(w), st, depth)
         # Alias names cannot contain '/', and command hashing only applies to bare
         # names. Use the expanded executable, not its basename: even when data text

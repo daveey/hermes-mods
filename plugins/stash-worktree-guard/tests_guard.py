@@ -145,6 +145,99 @@ def test_pathname_fix_preserves_remapping_and_git_refusals(multi, cmd):
     assert guard.refuse_reason(cmd, str(multi[1])) is not None
 
 
+@pytest.mark.parametrize("options", [
+    "-p", "-l", "-a", "-o timing.txt", "-h", "--portability", "--append",
+    "--output timing.txt", "--output=timing.txt", "--format %e", "--format=%e",
+    "--verbose", "-f %e", "--quiet", "--help", "--version", "--unknown",
+])
+def test_external_time_preserves_caller_state(multi, options):
+    cmd = f'/usr/bin/time {options} true; git -C $HOME/x log -1'
+    assert guard.refuse_reason(cmd, str(multi[1])) is None
+
+
+@pytest.mark.parametrize("wrapper,changes_parent", [
+    ("/usr/bin/time -p", False),
+    ("command time -p", False),
+    ("/usr/bin/env /usr/bin/time -p", False),
+    ("time -p", True),
+    # Bash permits pathname function names; function lookup wins over wrapper parsing.
+    ("/usr/bin/time() { cd /; }; /usr/bin/time -p", True),
+    ("function time { cd /; }; command time -p", False),
+])
+def test_time_child_boundary_cwd_matches_bash(multi, wrapper, changes_parent):
+    main, _wt = multi
+    cmd = f'{wrapper} cd /; pwd'
+    result = subprocess.run([BASH, "-c", cmd], cwd=main, env=GIT_ENV,
+                            capture_output=True, text=True, timeout=30)
+    expected = "/" if changes_parent else str(main)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+    analyzer = guard._Analyzer(str(main))
+    states = analyzer.run_text(cmd, [guard._State(str(main), {"PWD": str(main)}, set(), {})], 0)
+    assert states  # inspect the same modeled state used by subsequent Git commands
+    assert {state.cwd for state in states} == {expected}
+
+
+@pytest.mark.parametrize("wrapper", ["/usr/bin/time -p", "command time -p"])
+def test_time_child_boundary_preserves_unset_variable(multi, wrapper):
+    main, wt = multi
+    cmd = f'X={shlex.quote(str(wt))}; {wrapper} unset X; printf "%s\\n" "$X"'
+    result = subprocess.run([BASH, "-c", cmd], cwd=main, env=GIT_ENV,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(wt)
+    analyzer = guard._Analyzer(str(main))
+    states = analyzer.run_text(cmd, [guard._State(str(main), {"PWD": str(main)}, set(), {})], 0)
+    assert states and {state.vars.get("X") for state in states} == {str(wt)}
+
+
+@pytest.mark.parametrize("operation", ["cd /", "unset X"])
+def test_time_child_boundary_keeps_real_multiworktree_restore(multi, operation):
+    main, wt = multi
+    cmd = (f'X={shlex.quote(str(wt))}; command time -p {operation}; '
+           'git -C "$X" stash pop')
+    _assert_real_restore(cmd, main, wt)
+
+
+def test_external_time_preserves_interpreter_path(multi):
+    cmd = '''/usr/bin/time -p true -k plugins/other;
+"$HOME/Applications/Hermes Python.app/Contents/MacOS/python3.14" - <<'EOF'
+print(1)
+EOF
+'''
+    assert guard.refuse_reason(cmd, str(multi[1])) is None
+
+
+@pytest.mark.parametrize("wrapper", ["/usr/bin/time -p", "time -p"])
+def test_external_time_keeps_stash_refusal(multi, wrapper):
+    cmd = f'{wrapper} git -C "{multi[1]}" stash pop'
+    assert guard.refuse_reason(cmd, str(multi[1])) is not None
+
+
+@pytest.mark.parametrize("substitution", ["<(git -C $M show HEAD:a)",
+                                           ">(git -C $M show HEAD:a)",
+                                           "$(git -C $M show HEAD:a)"])
+def test_process_substitution_inherits_shell_state(multi, substitution):
+    cmd = f'M=/x; cmp -s y {substitution}'
+    assert guard.refuse_reason(cmd, str(multi[1])) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    'M=/x; cmp -s y <(git -C $M stash pop)',
+    'cmp y <(git -C $UNSET show HEAD)',
+])
+def test_process_substitution_keeps_uncertain_and_restore_refusals(multi, cmd):
+    assert guard.refuse_reason(cmd, str(multi[1])) is not None
+
+
+def test_process_substitution_real_restore(multi):
+    main, wt = multi
+    # Drain to EOF and wait: cmp's early mismatch must not SIGPIPE git's output.
+    cmd = (f'M={shlex.quote(str(wt))}; '
+           'cmp -s /dev/null <(git -C "$M" stash pop >/dev/null); wait "$!"')
+    _assert_real_restore(cmd, main, wt)
+
+
 # Non-POSIX bash looks functions up by name even when the name contains a slash; only
 # alias and hash remapping are skipped for pathnames.
 SLASH_FUNCTION_RESTORES = [
@@ -212,6 +305,11 @@ def single(tmp_path, monkeypatch):
 
 def block(tool, **args):
     return plugin._pre_tool_call(tool_name=tool, args=args)
+
+
+def _git_version():
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=30).stdout
+    return tuple(int(n) for n in re.search(r"(\d+)\.(\d+)\.(\d+)", out).groups())
 
 
 @pytest.fixture
@@ -461,6 +559,10 @@ def test_nested_runner_real_option_syntax(nested_repo, site, template):
     assert block("terminal", command=command, workdir=str(cwd))
     assert run(target, "stash", "list").stdout.count("stash@{") == 1
     assert (target / "f.txt").read_text() == "base\n"
+    if "--keep-going" in template and _git_version() < (2, 45, 3):
+        # for-each-repo --keep-going first shipped in Git 2.45.3 (v2.45.2 rejects it); the guard
+        # assertions above stay strict, only the real restore needs a Git that knows the option.
+        pytest.skip("git for-each-repo --keep-going needs Git >= 2.45.3")
     result = subprocess.run([BASH, "-c", command], cwd=cwd, env=env, capture_output=True, timeout=30)
     assert (target / "f.txt").read_text() == "stashed\n", result.stderr
     assert run(target, "stash", "list").stdout == ""
@@ -1367,8 +1469,13 @@ UNKNOWN_ARGV_RESTORES = [
 def test_unknown_argv_and_wrapper_restores_are_refused(multi, template):
     main, wt = multi
     cmd = template.format(wt=wt, main=main)
+    assert _blocked(cmd, main), cmd
+    assert _stash_count(main) == 1
+    assert (wt / "f.txt").read_text() == "base\n"
+    if "timeout" in cmd.split() and shutil.which("timeout") is None:
+        pytest.skip("real restore proof needs timeout, absent from PATH; "
+                    "guard refusal and unchanged stash/file checked")
     if any(not _host_runs(p) for p in ("flock", "setsid") if p in cmd.split()):
-        assert _blocked(cmd, main), cmd
         return
     _assert_real_restore(cmd, main, wt)
 
@@ -2457,13 +2564,24 @@ def test_phantom_fix_keeps_real_restores_blocked(multi, cmd):
     assert _blocked(cmd, main), cmd
 
 
+def test_single_quoted_trap_defers_variable_expansion(multi):
+    main, wt = multi
+    # W is harmless at installation time, but single quotes defer it until EXIT.
+    cmd = (f'R={shlex.quote(str(wt))}; W=status; '
+           'trap \'git -C $R $W\' EXIT; W="stash pop"')
+    assert guard.refuse_reason(cmd, str(main)), cmd
+    assert _blocked(cmd, main), cmd
+    _assert_real_restore(cmd, main, wt)
+
+
 def test_inferred_stash_pop_diagnostic_is_not_misleading(multi):
     main, _wt = multi
     # Nothing here says `stash`: the refusal must say it is inferred from an unresolved word.
     why = guard.refuse_reason("trap 'git -C $R worktree remove $W' EXIT", str(main))
     assert why and "inferred" in why and "no literal" in why, why
     assert 'git -C $R worktree remove $W' in why, why
-    assert 'Quote the word' not in why, why
+    assert 'Quote it' not in why, why
+    assert 'the unquoted word' not in why, why
 
 
 def test_embedded_interpreter_diagnostic_exact_report(multi):

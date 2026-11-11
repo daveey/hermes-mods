@@ -275,6 +275,12 @@ another linked worktree and `R` a scratch directory.
    script to `R/nice`, making it executable and invoking `R/nice -n 5 true` does not
    cause the analyzer to inspect its contents or verify that it is the system `nice`.
    Earlier writes in the same command do not establish the executable's semantics.
+5. **Runtime shell code from external data absent from the command text.** For example,
+   `X=$(cat f); trap "echo $X" EXIT` or `X=$(cat f); eval "echo $X"` can execute shell
+   syntax supplied by `f`, including a stash restore. The analyzer does not read `f` or
+   execute `cat` to discover that data. If the original command contains no recognizable
+   restore evidence, the bounded fallback may allow it. Double-quoted expansion when a
+   trap is installed does not make externally supplied shell code known or safe.
 
 These boundaries preserve the existing bounded-analysis policy rather than adding
 broad refusals or partial new shell semantics. Do not rely on this plugin as a security
@@ -442,7 +448,7 @@ an out-of-scope composition until 2026-11-01. It isn't obfuscation: `timeout` ca
 shell function, so this is the ordinary way to put one under a time limit. The analyzer gave
 every child shell an empty function table. Since then, only functions marked for export are
 carried into a child, and on to its children (`EXPORTED_FUNCTION_CASES`, with an unexported
-control). The four remaining items all depend on encoded or generated content.
+control). The remaining items depend on encoded, generated or external runtime content.
 
 A same-command round trip (`git stash -q; pytest ...; git stash pop -q`) ran unrefused in a
 seven-worktree hermes-mods clone on the hub (2026-11-01 20:07 PST). It restored the worker's
