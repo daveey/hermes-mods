@@ -825,6 +825,8 @@ def main():
     out += section_findings(data, ds, now, a.days, a.top) + [""]
     out += section_spend(ds, now, a.days) + [""]
     out += section_selfheal(data, now, a.days, homes=a.home or None) + [""]
+    import coach_hint_rates
+    out += coach_hint_rates.section(coach_hint_rates.load(selfheal_homes(a.home)), now, a.days) + [""]
     if not a.no_report_only:
         import coach_report_only
         out += coach_report_only.section(a.state_db, a.days, data=data, max_turns=a.report_only_max) + [""]

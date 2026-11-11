@@ -17,6 +17,8 @@ import json
 import os
 import re
 import time
+import threading
+import uuid
 from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
@@ -2261,6 +2263,106 @@ class AgentCoach:
         self.signals = signals  # SignalStore-like: subagents(sid, n), long_job(sid, reason), bug(sid, sig, sample)
         self.clock = clock
         self.sessions: dict[str, dict] = {}
+        self.hint_lock = threading.RLock()  # shared across reloads; interim hooks run asynchronously
+
+    def _hint_state(self, sid):
+        return self._s(sid).setdefault("hint_tracking", {"active": {}, "calls": {}, "seen": deque(maxlen=256)})
+
+    def _hint_outcome(self, sid, entry, heeded, evidence):
+        st = self._hint_state(sid)
+        if st["active"].pop(entry["hint_id"], None) is None:
+            return
+        if self.signals:
+            self.signals.log({"event": "agent_hint_outcome", "rule": entry["rule"],
+                              "hint_id": entry["hint_id"], "session_id": sid,
+                              "heeded": bool(heeded), "evidence": evidence})
+
+    def hint_tool_start(self, sid, tool_call_id):
+        """Reserve the next five *started after delivery* calls, not five completions.
+
+        Pre/post correlation is required. Older hosts without IDs abstain rather than
+        attribute an in-flight call to a hint the model had not yet seen.
+        """
+        if not sid:
+            return
+        with self.hint_lock:
+            st = self._hint_state(sid)
+            if not tool_call_id:
+                st["active"].clear()
+                return
+            if tool_call_id in st["calls"] or tool_call_id in st["seen"]:
+                return
+            slots = []
+            for e in st["active"].values():
+                if len(e["slots"]) < 5:
+                    slot = {"done": False}
+                    e["slots"].append(slot)
+                    slots.append((e["hint_id"], slot))
+            st["calls"][tool_call_id] = slots
+            if len(st["calls"]) > 256:
+                lost = st["calls"].pop(next(iter(st["calls"])))
+                for hid, _ in lost:
+                    st["active"].pop(hid, None)
+
+    def hint_tool_end(self, sid, tool_call_id, tool, args, result, status):
+        if not sid:
+            return
+        with self.hint_lock:
+            st = self._hint_state(sid)
+            if tool_call_id in st["seen"]:
+                return
+            if not tool_call_id or tool_call_id not in st["calls"]:
+                st["active"].clear()  # missed pre hook: the observation window is incomplete
+                return
+            slots = st["calls"].pop(tool_call_id, [])
+            if tool_call_id:
+                st["seen"].append(tool_call_id)
+            for hid, slot in slots:
+                e = st["active"].get(hid)
+                if e is None:
+                    continue
+                if status not in ("success", "error", "timeout"):
+                    st["active"].pop(hid, None)  # cancellation/unknown is not observed behavior
+                    continue
+                slot.update(done=True, poll=is_poll(tool, args),
+                            loop=is_poll_loop(tool, args) and not args.get("background"))
+                name = tool.rsplit("__", 1)[-1]
+                d = _as_dict(result)
+                checkpoint = (name in ("kanban_continue", "kanban_comment", "kanban_heartbeat")
+                              and status == "success" and d is not None
+                              and not failed(name, d, status) and d.get("ok") is not False)
+                if e["rule"] == "no_checkpoint" and checkpoint:
+                    self._hint_outcome(sid, e, True, "successful " + name)
+                elif len(e["slots"]) == 5 and all(x["done"] for x in e["slots"]):
+                    self._hint_window_end(sid, e, "five tool calls")
+
+    def _hint_window_end(self, sid, e, boundary):
+        if e["rule"] == "poll_loop":
+            polls = sum(x.get("poll", False) for x in e["slots"])
+            loop = any(x.get("loop", False) for x in e["slots"])
+            self._hint_outcome(sid, e, polls < 3 and not loop,
+                               f"{boundary}: polling_calls={polls}, foreground_poll_loop={loop}")
+        else:
+            self._hint_outcome(sid, e, False, boundary + ": no report or successful checkpoint")
+
+    def hint_report(self, sid, text):
+        if not sid or not isinstance(text, str) or not text.strip():
+            return
+        with self.hint_lock:
+            for e in list(self._hint_state(sid)["active"].values()):
+                if e["rule"] == "no_checkpoint":
+                    self._hint_outcome(sid, e, True, "nonempty assistant report")
+
+    def hint_turn_end(self, sid, text="", valid=False):
+        with self.hint_lock:
+            if valid:
+                self.hint_report(sid, text)
+            st = self._hint_state(sid)
+            for e in list(st["active"].values()):
+                if valid and e["rule"] == "poll_loop" and all(x["done"] for x in e["slots"]):
+                    self._hint_window_end(sid, e, "turn ended")
+            st["active"].clear()  # incomplete, shutdown and unknown never become heeded/ignored
+            st["calls"].clear()
 
     def _s(self, sid: str) -> dict:
         s = self.sessions.get(sid)
@@ -2271,16 +2373,22 @@ class AgentCoach:
         return s
 
     def _fire(self, s: dict, sid: str, rule: str, key: str, **fmt) -> None:
-        k = f"{rule}:{key}"
-        if k in s["fired"]:
-            return
-        s["fired"].add(k)
-        s["pending"].append(HINTS[rule].format(**fmt))
-        if self.signals:
-            self.signals.log({"event": "agent_hint", "session_id": sid, "rule": rule})
+        with self.hint_lock:
+            k = f"{rule}:{key}"
+            if k in s["fired"]:
+                return
+            s["fired"].add(k)
+            s["pending"].append(HINTS[rule].format(**fmt))
+            hid = "h_" + uuid.uuid4().hex if rule in ("no_checkpoint", "poll_loop") else None
+            if hid:
+                s.setdefault("pending_hint_ids", []).append({"hint_id": hid, "rule": rule, "slots": []})
+            if self.signals:
+                self.signals.log({"event": "agent_hint", "session_id": sid, "rule": rule,
+                                  **({"hint_id": hid} if hid else {})})
 
     def turn_start(self, sid: str, user_message: Any = None, platform: str = "", parent_session_id: str = "",
                    replied_before: bool = False) -> Optional[str]:
+        self.hint_turn_end(sid)  # a new turn without an observed end is unknown, not stopped
         s = self._s(sid)
         s["turn"] += 1
         # plan_first arms on a new build ask while the user has seen no reply in this session; a reply (turn_end)
@@ -2311,6 +2419,7 @@ class AgentCoach:
 
     def turn_end(self, sid: str, reply: str) -> None:
         """Remember the turn's final answer and tool log: the fix-loop judge reads them on the next user turn."""
+        self.hint_turn_end(sid, reply, valid=isinstance(reply, str) and bool(reply.strip()))
         s = self._s(sid)
         if isinstance(reply, str) and reply.strip():
             s["replied"] = True
@@ -2377,12 +2486,16 @@ class AgentCoach:
         return self._s(sid).get("turn_t0")
 
     def take(self, sid: str) -> Optional[str]:
-        s = self.sessions.get(sid)
-        if not s or not s["pending"]:
-            return None
-        out = " ".join(s["pending"])
-        s["pending"] = []
-        return out
+        with self.hint_lock:
+            s = self.sessions.get(sid)
+            if not s or not s["pending"]:
+                return None
+            out = " ".join(s["pending"])
+            s["pending"] = []
+            st = self._hint_state(sid)
+            for e in s.pop("pending_hint_ids", []):
+                st["active"][e["hint_id"]] = e
+            return out
 
     def check_live(self, sid: str, tool: str, args: Any) -> None:
         """live_checkout rule for one call. Also run from transform_tool_result: core's sequential path fires

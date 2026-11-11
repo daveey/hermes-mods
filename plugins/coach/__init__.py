@@ -121,6 +121,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     coach = rules.AgentCoach(checkout if checkout is not None else rules.default_live_checkout(), signals=store)
     goal_gate = _load("goal_disposition").build_gate(store)
     shared: dict = live if live is not None else {}
+    coach.hint_lock = shared.setdefault("hint_lock", coach.hint_lock)
     try:
         adopted_sessions = len(live.get("sessions") or {}) if live is not None else 0
         carried = _adopt(shared, coach, rules)
@@ -205,6 +206,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         try:
             goal_gate.observe(session_id=session_id, tool_name=tool_name, args=args, result=result,
                               status=status, tool_call_id=_.get("tool_call_id"))
+            coach.hint_tool_end(session_id, _.get("tool_call_id"), tool_name,
+                                args if isinstance(args, dict) else {}, result, status)
             coach.observe(session_id, tool_name, args, result, status, duration_ms or 0, error_type, error_message)
         except Exception as exc:
             log.debug("coach post_tool_call: %s", exc)
@@ -216,8 +219,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             coach.check_widget_send(session_id, tool_name, args)
             coach.check_plan_first(session_id, tool_name, args)
             coach.check_empty_wait(session_id, tool_name, args, result)
-            hint = coach.take(session_id)
-            return rules.attach_hint(result, hint) if hint and isinstance(result, str) else None
+            hint = coach.take(session_id) if isinstance(result, str) else None
+            return rules.attach_hint(result, hint) if hint else None
         except Exception as exc:
             log.debug("coach transform_tool_result: %s", exc)
             return None
@@ -380,7 +383,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     envelope_gate.assess_before_holds = True
 
+    def on_interim_message(session_id="", text="", **_):
+        coach.hint_report(session_id, text)
+
     def pre_tool_call(tool_name="", args=None, session_id="", **_):
+        coach.hint_tool_start(session_id, _.get("tool_call_id"))
         profiler = _load("profiler_safety")
         if profiler.blocked(tool_name, args):
             store.log({"event": "agent_block", "rule": "profiler_safety", "tool": tool_name})
@@ -691,6 +698,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 why = ("turn_failed" if _load("reply_check").turn_failed(text) else
                        "empty_reply" if not text.strip() else "turn_ended")
                 _close_open(session_id, why, why)
+                coach.hint_turn_end(session_id, text, valid=why == "turn_ended")
         except Exception as exc:
             log.debug("coach post_llm_call close nudges: %s", exc)
         try:
@@ -1096,7 +1104,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     hooks = {"pre_final_gate": goal_gate, "pre_final_gate:compute_envelope": envelope_gate,
                    "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
-                   "transform_tool_result": transform_tool_result}
+                   "transform_tool_result": transform_tool_result, "on_interim_message": on_interim_message}
     # Retirement removes the registered gate, not merely its enforcement mode.
     # Existing held callbacks still preserve the unresolved fallback on recheck.
     if _load("goal_disposition").settings()['mode'] == 'retired':

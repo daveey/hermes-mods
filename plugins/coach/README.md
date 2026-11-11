@@ -56,6 +56,47 @@ pending at the end of a turn rides the next turn's `pre_llm_call` context. Each 
 | `empty_wait` | a finished `terminal` call or `process_manage` job whose command contains `wait`, exit 0, and output empty, `{}`, `[]`, `None` or `null`. Once per job, on the same result (also checked in `transform_tool_result`) | a wait that printed nothing may have matched nothing: check it watched the runs you expect; for dispatched GitHub runs use `wait_for_ci.py --run-id/--expect`, which exits 1 on an empty manifest |
 | `plan_first` | the user's message is a new build ask (build/implement/extend/create… plus 25+ words, not a fix/bug report, not a "go"), the user has seen no reply in this session (no final reply, no answered `clarify`), and the agent makes its first project edit: `write_file`/`patch` outside scratch (`/tmp`, `$TMPDIR`, `~/.hermes/cache`, `~/.hermes/plans`; `COACH_SCRATCH_ROOTS` overrides), or a terminal `git commit` / `git worktree add` / `git apply` / `sed -i` / output redirect into a git repo, or the same `write_file`/`patch`/`terminal` helper calls inside `execute_code` (literal strings, string assignments, concatenation, f-strings, `os.path.join`/`Path(...)`/`/`, `expanduser`, `$TMPDIR` lookups, loops over string literals, imported aliases). A path with a dynamic tail is judged by its statically known prefix: `R + k` in a loop with `R` outside scratch fires, the same under `/tmp` or `$TMPDIR` does not. A path with no static prefix at all (a function's return value) is not inferred and stays quiet. Comments, code quoted as content and calls hidden behind user-defined functions do not count. Never for cron runs or subagents. Once per session | post the plan as the reply and end the turn for the user's go |
 
+### Deterministic agent-hint outcomes
+
+New `no_checkpoint` and `poll_loop` `agent_hint` records carry a unique `hint_id`.
+Taking a queued hint for a string tool result (or the next turn's context) starts its
+observation window. Legacy hints without IDs are delivered unchanged but never inferred
+into outcomes. Non-string results leave hints pending rather than consuming them unseen.
+
+`pre_tool_call` reserves the next five calls **started after delivery**, using
+`tool_call_id`; `post_tool_call` supplies their observations. Thus neither the delivering
+call nor already-running parallel siblings count, regardless of transform/post ordering.
+A full window waits for all five terminal observations, even when they finish out of order.
+Each resolved hint logs one `agent_hint_outcome` with `rule`, `hint_id`, `session_id`,
+`heeded` (boolean), and short `evidence`:
+
+- `no_checkpoint`: heeded by a subsequent nonempty `on_interim_message`/final report,
+  or a successful direct `kanban_continue`, `kanban_comment`, or `kanban_heartbeat`
+  result. Failure payloads do not count. A fully observed five-call window without
+  either is false.
+- `poll_loop`: heeded if the window contains fewer than three calls classified by the
+  existing `is_poll` predicate and no foreground shell loop classified by `is_poll_loop`.
+  A normally completed turn can close a shorter fully observed window, including zero calls.
+  A background shell loop is not a foreground violation (its existing sleep classification
+  still contributes to the polling-call count).
+
+State and a reentrant lock survive in-process plugin reloads, isolated by session and
+coach home. Repeated callbacks do not create duplicate outcomes. Correlation and recent
+completion IDs are capped at 256 calls per session. Missing pre hooks/IDs, unknown or
+cancelled observations, incomplete windows at a turn boundary, failed/empty turn endings,
+and process shutdown/restart produce **no boolean outcome**, not inferred success/failure.
+Tracking adds no model calls or per-tool database reads; events use the existing log sink.
+
+Limits: this measures observable behavior, not whether a report is useful or a hint caused
+it. Commentary is ordered by callback receipt: core's asynchronous hook only supplies
+session/text, so a pre-delivery message whose callback arrives late cannot be distinguished
+from a new message. Opaque `tool_call`/`execute_code` wrappers are not unpacked into checkpoint
+successes; direct checkpoint tool hooks are covered. State survives plugin reload, not a
+process restart; the latter leaves unresolved hints without outcomes. Tests drive both
+hook orders, concurrent completions/commentary, boundaries, legacy delivery, failed
+checkpoints, missing observations, and fresh-module reload adoption in
+`tests/test_agent_hint_outcomes.py`; no production rollout is asserted by these tests.
+
 The live checkout is the tree that `hermes_cli` is imported from. Override it with `COACH_LIVE_CHECKOUT`.
 The `live_checkout` hint attributes each mutation to its own directory (`git -C`, the last `cd` including one after a
 newline or inside `bash -c '…'`, or `workdir`) or to a live path in the same simple command, so `cd other-repo && git
