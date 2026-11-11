@@ -280,6 +280,18 @@ keeping an ask.
 
 Retirement paths and evidence review:
 
+- **resolved social reply draft**: queue reads and agent-turn reconciliation withdraw duplicate
+  Post/reply-approval asks whose title names an exact `bsky-reply-draft` or `x-reply-draft`
+  session ID or target URI/URL. The profile-local Inbox is read-only: posted, archived and
+  skipped outcomes qualify; `accepted/post` alone does not. A persisted session archive
+  also qualifies (as in Inbox outcome rendering). No origin metadata is stored by these
+  producers, so association requires the explicit identifier in the owning chat's ask;
+  author names, thread contents and general scope prose are not bindings. Unresolved
+  matching cards, foreign owners and missing evidence keep the ask. Withdrawal records
+  the card ID, state and outcome and never touches posting, approval receipts or decision
+  operations. Regression/safety coverage: `tests/test_social_reply_withdrawal.py` and
+  `tests/test_social_reply_safety.py` (including create → ask → accepted → archived).
+
 - **deleted owner**: `reconcile_moot` withdraws an undecided request by `system` with
   reason `its chat no longer exists` after a successful read confirms the session is absent
   from its known local owner profile's `state.db`. Unknown profiles, foreign gateways,

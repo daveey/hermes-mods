@@ -3760,9 +3760,88 @@ def _retire_orphan_owners(store: "ActionStore", ledger: "Ledger", owner: dict, n
         logging.getLogger('user-steps').warning('deleted-chat ask sweep deferred')
 
 
+def _reply_card_facts(owner: dict) -> list[dict]:
+    """Read only this process's profile Inbox; never interpret accepted Post as posted.
+
+    Reply producers store uri/target_url (Bluesky), reply_url (X), and the Inbox
+    session_id. They do not store an originating chat. Association is therefore
+    explicit in the owning request, not inferred from an author, title or thread.
+    Missing/legacy/unreadable state proves nothing and must not create a database.
+    """
+    try:
+        local = server_owner(owner['storedSessionId'])
+        if owner != local:
+            return []
+        c = _ro_connect(home() / 'inbox' / 'inbox.db', timeout=2)
+        try:
+            facts = [dict(session_id=sid, type=kind, state=state, outcome=outcome,
+                         fields=json.loads(raw or '{}'))
+                    for sid, kind, state, outcome, raw in c.execute(
+                        "SELECT session_id,type,state,outcome,fields_json FROM items "
+                        "WHERE type IN ('bsky-reply-draft','x-reply-draft')")]
+        finally:
+            c.close()
+        # Match Inbox.outcome's effective archive state, including sidebar and
+        # producer archives that leave accepted/post in the sidecar. Absence is
+        # not evidence: unlike Inbox presentation, this probe requires a row.
+        try:
+            sessions = _ro_connect(home() / 'state.db', timeout=2)
+            try:
+                for fact in facts:
+                    if fact['state'] in ('open', 'accepted'):
+                        row = sessions.execute('SELECT archived FROM sessions WHERE id=?',
+                                               (fact['session_id'],)).fetchone()
+                        if row and row[0]:
+                            fact['state'] = 'archived'
+            finally:
+                sessions.close()
+        except (OSError, sqlite3.Error):
+            pass  # explicit sidecar terminal evidence remains usable
+        return facts
+    except Exception:
+        return []
+
+
+def _resolved_reply(request: dict, facts: list[dict]) -> Optional[dict]:
+    """Only a duplicate approval/Post ask naming an exact card or target is moot.
+
+    Do not search thread/summary/author text or generic prose from the request's
+    scope: those are context, not a binding. Retain an ask when any matching card
+    remains open, accepted, failed or otherwise unproven.
+    """
+    title = request.get('title', '')
+    if not re.search(
+            r'\b(?:press\s+(?:the\s+)?post|post\s+(?:this|the)\s+reply|'
+            r'(?:approve|review)\s+(?:(?:the|this)\s+)?(?:reply|draft|card))\b', title, re.I):
+        return None
+    matched = []
+    for f in facts:
+        fields = f['fields']
+        if not isinstance(fields, dict):
+            continue
+        identifiers = [f['session_id']] + [fields.get(k) for k in (
+            ('uri', 'target_url') if f['type'] == 'bsky-reply-draft' else ('reply_url',))]
+        # URI/id continuation characters cannot turn a prefix into a binding.
+        boundary = r'[\w:/?&=.%#@+\-]'
+        if not any(isinstance(v, str) and v and re.search(
+                r'(?<!' + boundary + ')' + re.escape(v) + r'(?!' + boundary + ')', title)
+                   for v in identifiers):
+            continue
+        if not (f['state'] == 'archived' or
+                (f['state'] == 'resolved' and f['outcome'] in ('posted', 'archived', 'skip', 'skipped'))):
+            return None
+        matched.append(f)
+    return matched[0] if matched else None
+
+
 def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, boards=None,
                    now: Optional[float] = None) -> list[dict]:
     """Withdraw (by=system) each undecided ask whose chat is deleted or linked work is over.
+
+    Exact, boundary-safe reply-card/target references in duplicate Post/approval
+    titles also retire on a local reply draft's posted, archived or skipped state.
+    Only this owner's requests are considered; the Inbox is read-only, and an
+    accepted Post action is not evidence of publication.
 
     Other deleted chats in this owner's gateway/profile namespace are retired too (_retire_orphan_owners),
     but only the supplied chat's withdrawals are returned.
@@ -3785,7 +3864,19 @@ def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, board
     try:
         candidates = store.moot_candidates(owner)
         owner_gone = bool(candidates) and _owner_chat_absent(owner)
+        reply_facts = _reply_card_facts(owner) if candidates and not owner_gone else []
         for r, life in candidates:
+            reply = _resolved_reply(r, reply_facts)
+            if reply is not None:
+                try:
+                    out.append(withdraw_request(
+                        store, ledger, owner, r['requestId'], by='system',
+                        reason=f"Reply draft {reply['session_id']}: {reply['state']} (outcome={reply['outcome']})",
+                        evidence=f"Inbox {reply['session_id']}: state={reply['state']}, outcome={reply['outcome']}",
+                        expected_revision=r['revision'], now=now))
+                except ActionError:
+                    pass  # recorded decisions and revised asks win the race
+                continue
             if owner_gone:
                 try:
                     out.append(withdraw_request(store, ledger, owner, r['requestId'], by='system',
