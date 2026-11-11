@@ -2242,7 +2242,7 @@ class ActionStore:
                 raise ActionError('Alias already belongs to another request', 409)
             c.execute('INSERT OR IGNORE INTO aliases VALUES (?,?,?)', (_json(ref), ns, r['requestId']))
 
-    def create(self, owner, value, *, bind=None, created_at=None):
+    def create(self, owner, value, *, bind=None, created_at=None, bind_transaction=None):
         r = validate_action(value); ns = self._ns(owner)
         if r['owner'] != owner: raise ActionError('Owner mismatch', 403)
         if r['revision'] != 1 or 'resolution' in r or r['state'] not in ('open', 'needs_context'):
@@ -2256,6 +2256,9 @@ class ActionStore:
                 c.execute('INSERT OR IGNORE INTO lifecycle(namespace,id,created_at,asked_revision) VALUES (?,?,?,1)',
                           (ns, r['requestId'], float(created_at) if created_at else time.time()))
                 if bind is not None: bind(r, 0)
+                # Same-store receiver bindings must become visible with the request,
+                # never in a second transaction that leaves a routing gap.
+                if bind_transaction is not None: bind_transaction(c, r)
         except sqlite3.IntegrityError: raise ActionError('Request already exists', 409)
         return r
 

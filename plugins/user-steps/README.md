@@ -134,6 +134,43 @@ execution. A replacement revision after a decision gets a fresh card (same
 creation key; core idempotency skips archived cards), appended as a new alias:
 only the last kanban alias is live, earlier cards keep their decided binding.
 
+## Blocked work-card asks
+
+The Desktop `/requests` read projects a blocked work card's `human_request` into
+one server-bound `choice` request. Explicit `{label, value}` choices retain their
+exact values; absent choices produce **Unblock / Archive**. Selecting a supplied
+choice records the value in the card's comment thread and resumes the card through
+core's normal dependency gating. The fallback Archive abandons it. These are not
+commands: a `user_terminal` ask still needs authentication in its terminal window;
+Unblock means resume without that terminal result.
+
+The source is the creating user session, or the earliest stored local user-surface
+subscriber (including legacy custom-source chats). Presentation follows core's
+compression continuation, not branches, resets or delegates. A recorded decision
+keeps its original binding across compression and suppresses a second ask while
+pending. A changed ask or a new block generation cannot reuse the old answer.
+Unblock/archive/ask replacement withdraws the old tile on the next queue read.
+Unavailable state is not evidence of withdrawal; malformed legacy choices are
+logged and skipped without hiding other requests.
+
+Only this producer's immutable binding grants card-delivery authority; adding a
+Kanban source reference or alias does not. Core commits the comment, transition
+and operation receipt atomically. Receipt readback makes retries safe after a
+crash between the board commit and outbox acknowledgment. Dedicated metadata
+cards described above remain on their separate delivery path.
+
+Requires core `archive_task(precondition=..., comment=..., event_extra=...)`;
+deploy core before this plugin. `action_request` kinds are explicitly enumerated:
+`approval`, `choice`, `input`, `external_step` (not `decision` or `question`).
+
+Tests: `test_kanban_mirror.py` covers projection, exact values, lifecycle and REST;
+`test_kanban_mirror_hardening.py` covers conflicts, concurrency, subscription
+ownership, failed reads and tampering; `test_kanban_mirror_core.py` exercises real
+core transactions and replay; `test_kanban_mirror_compression.py` exercises core
+continuation classification and pending-decision preservation. The kind contract
+and terminal/decided hook filtering have separate regression tests. These tests
+are not a substitute for live Desktop click-through verification.
+
 ## Persistence and API
 
 Profile-scoped storage is under `<Hermes home>/user-steps/`:

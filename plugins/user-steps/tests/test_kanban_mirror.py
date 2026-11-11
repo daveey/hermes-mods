@@ -94,6 +94,7 @@ def fixture(tmp_path):
         boards=[("default", path)],
         backend=api,
         session_exists=lambda sid: sid in ("session-a", "session-b"),
+        tip=lambda sid: sid,
     )
     return mirror, store, path, hr
 
