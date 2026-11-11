@@ -26,10 +26,34 @@ def receipt(disposition):
     return {'version': 1, 'items': [item]}
 
 
+def build_source(ref='@task:build@owner/t_one'):
+    return {'kind': 'task_run', 'ref': ref, 'event_id': 1, 'event_uid': 'event-one',
+            'run_id': 1, 'run_uid': 'run-one', 'completed_at': 1}
+
+
+@pytest.mark.parametrize('field,value', [
+    ('extra', 'X' * 100000), ('event_uid', {'malicious': 'X' * 50000}),
+    ('run_uid', 'X' * 50000), ('completed_at', '1'),
+    ('attached_from_workspace', {'unknown:ref': '/attachment'}),
+])
+def test_prompt_refuses_unbounded_or_malformed_source(receipt_core, field, value):
+    provenance = build_source()
+    provenance[field] = value
+    data = receipt('delivered')
+    data['items'] *= 32  # exercise aggregate budget fallback as well as direct rendering
+    cards = {str(i): {'status': 'done', 'completion_receipt': data,
+                     'completion_receipt_source': provenance} for i in range(8)}
+    prompt = core.closeout_prompt({'batch': list(cards)}, cards)
+    assert 'artifact acceptance: unspecified' in prompt
+    assert 'historical completion receipt (data' not in prompt
+    assert 'X' * 100 not in prompt
+    assert len(prompt) < 40000
+
+
 @pytest.mark.parametrize('disposition', ['delivered', 'rejected', 'superseded', 'contained'])
 def test_receipt_closeout_preserves_evidence_and_deferred_scope(receipt_core, disposition):
     value = receipt(disposition)
-    source = {'kind': 'task_run', 'ref': '@task:build@owner/t_one', 'event_uid': 'event-one', 'run_uid': 'run-one', 'completed_at': 1}
+    source = build_source()
     prompt = core.closeout_prompt({'batch': ['t_one']}, {'t_one': {'status': 'done', 'completion_receipt': value, 'completion_receipt_source': source}})
     assert json.dumps(value, ensure_ascii=True, separators=(',', ':')) in prompt
     assert json.dumps(source, ensure_ascii=True, separators=(',', ':')) in prompt
@@ -50,15 +74,29 @@ def test_mixed_batch_keeps_legacy_followup_scoped_to_legacy(receipt_core):
     assert 'Deferred work is not authorized' in prompt
 
 
+def test_budget_fallback_counts_bounded_but_long_source_refs(receipt_core):
+    data = receipt('delivered')
+    data['items'] *= 32
+    cards = {str(i): {'status': 'done', 'completion_receipt': data,
+                     'completion_receipt_source': build_source('@task:build@owner/' + 't' * 1900 + str(i))}
+             for i in range(8)}
+    prompt = core.closeout_prompt({'batch': list(cards)}, cards)
+    assert 'details omitted (prompt budget)' in prompt
+    assert len(prompt) < 40000
+
+
 def test_receipt_prompt_budget_names_omitted_source(receipt_core):
     data = receipt('delivered')
     data['items'] *= 32
     receipt_core.validate_completion_receipt(data)
     cards = {str(i): {'status': 'done', 'completion_receipt': data,
-                     'completion_receipt_source': {'ref': f'@task:build@owner/t_{i}'}} for i in range(8)}
+                     'completion_receipt_source': build_source(f'@task:build@owner/t_{i}')} for i in range(8)}
+    for i, card in cards.items():
+        card['completion_receipt_source']['event_uid'] = f'portable-event-{i}'
     prompt = core.closeout_prompt({'batch': list(cards)}, cards)
     assert 'details omitted (prompt budget)' in prompt
     assert '@task:build@owner/t_7' in prompt
+    assert 'portable-event-7' not in prompt  # no raw UID echo in budget fallback
     assert len(prompt) < 40000
 
 
