@@ -39,6 +39,11 @@ LOAD_VERBS = {"bootstrap", "load"}
 REMOTE_TIMEOUT = 8
 APPROVED = re.compile(r"owner-approved=(t_[0-9a-f]+)")
 CHECKED_NONE = re.compile(r"owner-checked=none\b")
+# A unit pinned to its own runtime by a ``*pinned-owner*.conf`` drop-in (Ask Eve owners). A raw agent stop
+# of one is refused with no in-command override: stopping one coupled owner makes the operator checks refuse,
+# and a core update no longer needs it (hermes update leaves a pinned gateway alone).
+PINNED_DROPIN = re.compile(r"pinned-owner[^/\s]*\.conf$")
+MAX_SCRIPT_BYTES = 65536
 
 
 def enabled() -> bool:
@@ -220,6 +225,38 @@ def _systemctl(args: list, host) -> list:
             for u in pos[1:]]
 
 
+def _hermes(args: list, host) -> list:
+    """``hermes [-p NAME] gateway stop``: the stop of that profile's gateway unit."""
+    profile, i = "", 0
+    while i < len(args) and args[i] != "gateway":
+        if args[i] in {"-p", "--profile"} and i + 1 < len(args):
+            profile = args[i + 1]
+            i += 1
+        elif args[i].startswith("--profile="):
+            profile = args[i].split("=", 1)[1]
+        i += 1
+    if i + 1 >= len(args) or args[i + 1] != "stop":
+        return []
+    unit = "hermes-gateway-" + profile if profile and profile != "default" else "hermes-gateway"
+    return [{"tool": "systemctl", "verb": "stop", "host": host, "unit": unit, "user": True, "label": unit,
+             "key": unit}]
+
+
+def _script_text(args: list) -> str:
+    """The text of the script file a shell/python invocation runs (first non-option argument), else ''."""
+    for arg in args:
+        if arg.startswith("-") or arg in {"&", ">"} or arg[:1] in {">", "<", "&"} or arg[:2] == "2>":
+            continue
+        path = Path(os.path.expanduser(arg))
+        try:
+            if path.is_file() and path.stat().st_size <= MAX_SCRIPT_BYTES:
+                return path.read_text(errors="replace")
+        except OSError:
+            pass
+        return ""
+    return ""
+
+
 def _kill(prog: str, args: list, host) -> list:
     if prog == "pkill":
         # pgrep accepts the matching flags, not pkill's signal selector.
@@ -274,6 +311,13 @@ def _extract(argv: list, host, depth: int, out: list) -> None:
             if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", arg):
                 _extract_text(args[i + 1], host, depth + 1, out)
                 return
+        if not host:  # `bash script.sh`: the script's own commands
+            _extract_text(_script_text(args), host, depth + 1, out)
+    elif re.fullmatch(r"python[0-9.]*", prog) and depth < 3 and not host:
+        for cmd in _py_commands(_script_text(args)):
+            _extract_text(cmd, host, depth + 1, out)
+    elif prog == "hermes":
+        out.extend(_hermes(args, host))
     elif prog == "ssh" and depth < 3:
         opts, dest, cmd = _ssh_parts(args)
         _extract_text(cmd, {"dest": dest, "opts": opts}, depth + 1, out)
@@ -402,10 +446,34 @@ def classify(tool_name: str, args: Any) -> Optional[str]:
     return None
 
 
+def _pinned_dropin(act: dict) -> str:
+    """The pinned-owner drop-in of a local systemd unit, or '' (lookup failure reads as not pinned)."""
+    if act["tool"] != "systemctl" or act["host"]:
+        return ""
+    unit = act["unit"] if act["unit"].endswith(".service") else act["unit"] + ".service"
+    argv = ["systemctl"] + (["--user"] if act["user"] else []) + ["show", "-p", "DropInPaths", "--value", unit]
+    try:
+        rc, out = run_cmd(argv, 5)
+    except Exception:  # health: allow BLE001 -- a lookup bug must not break a tool call
+        return ""
+    if rc != 0:
+        return ""
+    return next((p for p in out.replace(" ", "\n").splitlines() if PINNED_DROPIN.search(p)), "")
+
+
 def _evaluate(text: str, actions: list) -> Optional[str]:
     stops = [a for a in actions if not a.get("load")]
     if not stops:
         return None
+    for act in stops:
+        dropin = _pinned_dropin(act)
+        if dropin:
+            _log(_host_name(act["host"]), act, "pinned-owner", "refused (pinned owner)")
+            return (f"Refused: {act['label']} is a pinned owner ({os.path.basename(dropin)}); an agent does not "
+                    f"{act['verb']} it with a raw command, and no owner-approved token overrides this. Stopping "
+                    f"one coupled Ask Eve owner makes the operator checks refuse, and hermes update no longer "
+                    f"needs it stopped. If it really must stop, hand the owner terminal the exact commands "
+                    f"(run_in_user_terminal) and do not run them yourself.")
     approved = set(APPROVED.findall(text))
     checked_none = bool(CHECKED_NONE.search(text))
     mine = os.environ.get("HERMES_KANBAN_TASK", "")
