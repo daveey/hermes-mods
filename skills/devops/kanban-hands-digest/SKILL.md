@@ -44,7 +44,12 @@ the leaf that nothing will move (a decision card, a `ready` card whose events ar
 a throttled queue, a PR wait whose PR is no longer queued: check its labels/timeline and the waiter's exit,
 not the card's "waiting on merge train" text), and report that leaf; the cards above it only poll. Then move that
 leaf yourself (re-submit, raise its **current** priority, or do the step), not just report it. Read priority before
-applying a suggested value: setting 10 lowers a card already at 20. If direct execution starts while the card
+applying a suggested value: setting 10 lowers a card already at 20. For a `ready` leaf, first read its
+latest comments: a subagent or chat may already have delivered the work there, and nobody closed the card.
+Verify the artifact (hash, served model in `state.db`) and `kanban_complete` it yourself. "0 ahead" counts
+only its own board, but `max_in_progress` is global: list `running`/`ready` across every board and check
+`~/.hermes/core-update/drain-hold` (a core-update drain pauses dispatch for at most `max_s`). Raising
+`max_in_progress` hands the new slot to the highest-priority ready card on any board, not to yours. If direct execution starts while the card
 is queued, recheck its claim before editing or publishing and hand off to a newly admitted worker; queue
 recovery must not create competing implementations. Also report two states that wait silently:
 - `triage` with a human `block_kind` (`needs_input`/`capability`): block-loop detection moved a repeatedly
