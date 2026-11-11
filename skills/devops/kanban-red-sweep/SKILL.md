@@ -85,6 +85,7 @@ bypassed with another writer.
   before the user answered, and he asked for forms with no timeout.
 - One `clarify` call holds up to 5 questions. The user wants to answer many at once, so batch them: one
   self-contained question per card, numbered "N/total", plain household terms, the decisive fact in the question.
+  Don't fold several decisions into one "accept all" question: the user wants a button per choice.
 - Choices: the recommended option first, labelled "(recommended)", one button per real option, and a last "Skip"
   choice. Use no card ids in the labels and no "unblock = / archive =" wording. Free-text follow-ups (an allowlist,
   a consent reference) get their own open question.
@@ -93,7 +94,10 @@ bypassed with another writer.
 - Record each answer on its card right away (comment with the exact choice and the chat id, then unblock, archive
   or complete). Then withdraw every For-you request this chat published for the same question
   (`action_request {"withdraw": ...}`), so nothing stale stays in the queue.
-- Physical or sign-in steps are not questions. List them as actions, each with its device and what "done" looks like.
+  A skipped question gets the safest narrow default, stated in the comment.
+- Don't re-publish unanswered questions as `session_outcome`/For-you tiles: they duplicate the form.
+- Physical or sign-in steps are not questions. Before listing one, check it's still true (e.g. open the page in the
+  signed-in browser); then list it with its device and what "done" looks like.
 
 ## Pitfalls
 
@@ -108,5 +112,6 @@ bypassed with another writer.
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
 - [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment?
-- [ ] The remaining asks went out in one `clarify` form (or `session_outcome` decide on timeout), recommended option first, with no card ids?
+- [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
+- [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
 - [ ] The report names the unlinked and reaped-only cards that still need the user?
