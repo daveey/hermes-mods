@@ -55,6 +55,14 @@ def ack(op, **kw):
                 scopeDigest=core.scope_digest(op['intent']['request']), **kw)
 
 
+def reserve(op, **kw):
+    return dict(ack(op), phase='reserved', **kw)
+
+
+def applied(op, evidence=None):
+    return dict(ack(op), phase='applied', evidence=evidence or EVIDENCE)
+
+
 EVIDENCE = [{'type': 'commit', 'id': '0123456789abcdef0123456789abcdef01234567'}]
 
 
@@ -208,10 +216,12 @@ def test_receipts_are_ordered_phases_and_delivery_alone_is_unknown(tmp_path):
     assert err.value.status == 409  # application needs a prior acknowledgment
     got = s.record_receipt(owner, ack(op))
     assert got['consumer']['phase'] == 'acknowledged' and got['consumer']['grants'] == []
+    s.record_receipt(owner, reserve(op))
     with pytest.raises(core.ActionError): s.record_receipt(owner, dict(ack(op), phase='applied'))  # no evidence
     done = s.record_receipt(owner, dict(ack(op), phase='applied', evidence=EVIDENCE))
     assert done['consumer']['phase'] == 'applied'
-    assert [x['phase'] for x in s.receipts(owner, op['operationId'])['receipts']] == ['acknowledged', 'applied']
+    assert [x['phase'] for x in s.receipts(owner, op['operationId'])['receipts']] == [
+        'acknowledged', 'reserved', 'applied']
     assert s.operation(owner, oid=op['operationId'])['operation']['intent'] == op['intent']  # nothing widened
     view = s.receipts(owner, op['operationId'])
     assert view['phase'] == 'applied' and view['delivery'] == 'delivered'
@@ -237,7 +247,7 @@ def test_receipts_require_confirmed_delivery_and_the_exact_revision_and_scope(tm
 
 def test_not_applied_needs_a_reason_and_excludes_applied(tmp_path):
     s, owner, r, op = delivered(tmp_path)
-    s.record_receipt(owner, ack(op))
+    s.record_receipt(owner, ack(op)); s.record_receipt(owner, reserve(op))
     with pytest.raises(core.ActionError): s.record_receipt(owner, dict(ack(op), phase='not_applied'))
     s.record_receipt(owner, dict(ack(op), phase='not_applied', reason='Superseded by a newer plan'))
     with pytest.raises(core.ActionError) as err:
@@ -249,6 +259,8 @@ def test_not_applied_needs_a_reason_and_excludes_applied(tmp_path):
 def test_decline_cannot_be_applied(tmp_path):
     s, owner, r, op = delivered(tmp_path, choice='decline')
     s.record_receipt(owner, ack(op))
+    with pytest.raises(core.ActionError) as err: s.record_receipt(owner, reserve(op))
+    assert err.value.status == 422  # only approve/answer can be reserved
     with pytest.raises(core.ActionError) as err:
         s.record_receipt(owner, dict(ack(op), phase='applied', evidence=EVIDENCE))
     assert err.value.status == 422
@@ -260,6 +272,7 @@ def test_duplicate_and_concurrent_receipts_keep_one_row_and_conflicts_fail_close
     s, owner, r, op = delivered(tmp_path)
     first = s.record_receipt(owner, ack(op))
     assert store(tmp_path).record_receipt(owner, ack(op))['receipt'] == first['receipt']  # lost reply, retried
+    s.record_receipt(owner, reserve(op))
     applied = dict(ack(op), phase='applied', evidence=EVIDENCE)
     with ThreadPoolExecutor(8) as pool:
         results = list(pool.map(lambda _: store(tmp_path).record_receipt(owner, applied)['receipt'], range(8)))
@@ -268,12 +281,12 @@ def test_duplicate_and_concurrent_receipts_keep_one_row_and_conflicts_fail_close
         s.record_receipt(owner, dict(applied, evidence=[{'type': 'pr', 'id': 'other'}]))
     assert err.value.status == 409
     with s._read() as c:
-        assert c.execute('SELECT COUNT(*) FROM owner_receipts').fetchone()[0] == 2
+        assert c.execute('SELECT COUNT(*) FROM owner_receipts').fetchone()[0] == 3
 
 
 def test_concurrent_applied_versus_not_applied_has_exactly_one_winner(tmp_path):
     s, owner, r, op = delivered(tmp_path)
-    s.record_receipt(owner, ack(op))
+    s.record_receipt(owner, ack(op)); s.record_receipt(owner, reserve(op))
     bodies = [dict(ack(op), phase='applied', evidence=EVIDENCE),
               dict(ack(op), phase='not_applied', reason='Chat moved on')] * 4
 
@@ -321,19 +334,20 @@ def test_restart_at_each_boundary_recovers_only_the_missing_phase(tmp_path):
     store(tmp_path).record_receipt(owner, ack(op))
     assert store(tmp_path).record_receipt(owner, ack(op))['consumer']['phase'] == 'acknowledged'
     # (d) post-apply / pre-receipt: the work happened, the receipt write is retried after restart exactly once.
+    assert store(tmp_path).record_receipt(owner, reserve(op))['reservation'] == 'new'
     applied = dict(ack(op), phase='applied', evidence=EVIDENCE)
     store(tmp_path).record_receipt(owner, applied)
     store(tmp_path).record_receipt(owner, applied)
     assert store(tmp_path).reconcile(owner, receiver) == [] and len(receiver.admitted) == 1
     assert [x['phase'] for x in store(tmp_path).receipts(owner, op['operationId'])['receipts']] == [
-        'acknowledged', 'applied']
+        'acknowledged', 'reserved', 'applied']
 
 
 # ---- 5. superseded / revised / archived ---------------------------------------------------------------------------
 
 def test_revised_request_rejects_stale_application_and_inherits_nothing(tmp_path):
     s, owner, r, op = delivered(tmp_path)
-    s.record_receipt(owner, ack(op))
+    s.record_receipt(owner, ack(op)); s.record_receipt(owner, reserve(op))  # reserved while still current
     r2 = s.revise(owner, r['requestId'], 1, dict(r, title='Synthetic change with more scope'))
     assert r2['state'] == 'open' and 'resolution' not in r2  # the replacement needs a fresh decision
     with pytest.raises(core.ActionError) as err:
@@ -545,3 +559,194 @@ def test_numbered_tool_entry_maps_but_never_decides(tmp_path, monkeypatch):
     assert s.get(OWNER, a['requestId'])['state'] == 'open' and s.undelivered('test-gateway', 'default') == []
     bad = json.loads(plugin.publish_action_request({'numbered': {'sourceId': '', 'n': 1}}, session_id='session-a'))
     assert bad['status'] == 422
+
+
+# ---- durable application reservation (corrective review of 0286fccd) --------------------------------------------
+# A fake downstream system with its own durable store, keyed by applicationKey: the only real effect counter. Without
+# a reservation nothing separates "agent acts" from "receipt stored", so these tests drive the full consumer protocol.
+
+class DurableSink:
+    def __init__(self, path):
+        import sqlite3
+        self.path = path
+        with sqlite3.connect(path) as c:
+            c.execute('CREATE TABLE IF NOT EXISTS effects (key TEXT PRIMARY KEY, n INTEGER)')
+
+    def has(self, key):
+        import sqlite3
+        with sqlite3.connect(self.path) as c:
+            return c.execute('SELECT 1 FROM effects WHERE key=?', (key,)).fetchone() is not None
+
+    def apply(self, key):
+        """Idempotent downstream write: a second call with the same key is absorbed."""
+        import sqlite3
+        with sqlite3.connect(self.path, timeout=30) as c:
+            c.execute('INSERT OR IGNORE INTO effects VALUES (?,1)', (key,))
+
+    def total(self):
+        import sqlite3
+        with sqlite3.connect(self.path) as c:
+            return c.execute('SELECT COUNT(*) FROM effects').fetchone()[0]
+
+
+class Crash(BaseException):
+    pass
+
+
+def consume(tmp_path, owner, op, sink, crash=None):
+    """The consumer protocol the prompt prescribes: ack -> reserve -> (effect only if new) -> applied receipt.
+    A repeat caller (mustVerify) reads the downstream back and never repeats an effect it cannot prove absent."""
+    s = store(tmp_path)  # a fresh store per call = a restarted process
+    s.record_receipt(owner, ack(op))
+    res = s.record_receipt(owner, reserve(op))
+    key = res['applicationKey']
+    if crash == 'after-reserve': raise Crash()
+    if res['reservation'] == 'new':
+        sink.apply(key)
+        if crash == 'after-effect': raise Crash()
+    else:
+        assert res['mustVerify'] is True
+        if not sink.has(key):
+            return 'uncertain'  # non-idempotent work whose result is unknown is never repeated
+    s.record_receipt(owner, applied(op))
+    return 'applied'
+
+
+def test_reservation_is_new_once_and_every_repeat_must_verify(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    with pytest.raises(core.ActionError) as err: s.record_receipt(owner, reserve(op))
+    assert err.value.status == 409  # reserve only after the exact revision is acknowledged
+    s.record_receipt(owner, ack(op))
+    first = s.record_receipt(owner, reserve(op))
+    assert first['reservation'] == 'new' and first['mustVerify'] is False
+    key = first['applicationKey']
+    assert key == core._sha([s._ns(owner), op['operationId'], op['revision'], core.scope_digest(op['intent']['request'])])
+    again = store(tmp_path).record_receipt(owner, reserve(op))
+    assert again['reservation'] == 'existing' and again['mustVerify'] is True and again['applicationKey'] == key
+    assert again['receipt'] == first['receipt']
+    view = s.receipts(owner, op['operationId'])
+    assert view['phase'] == 'uncertain' and view['applicationKey'] == key  # reserved only: outcome unknown
+    assert [x['phase'] for x in view['receipts']] == ['acknowledged', 'reserved']
+
+
+def test_concurrent_reservations_have_exactly_one_new(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op))
+    with ThreadPoolExecutor(8) as pool:
+        out = list(pool.map(lambda _: store(tmp_path).record_receipt(owner, reserve(op)), range(8)))
+    assert sorted(x['reservation'] for x in out) == ['existing'] * 7 + ['new']
+    assert all(x['mustVerify'] is (x['reservation'] == 'existing') for x in out)
+    assert len({x['applicationKey'] for x in out}) == 1
+    with s._read() as c:
+        assert c.execute("SELECT COUNT(*) FROM owner_receipts WHERE phase='reserved'").fetchone()[0] == 1
+
+
+def test_applied_without_a_reservation_is_denied_for_bound_operations(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op))
+    with pytest.raises(core.ActionError) as err: s.record_receipt(owner, applied(op))
+    assert err.value.status == 409 and 'reserv' in err.value.args[0].lower()
+    assert s.receipts(owner, op['operationId'])['phase'] == 'acknowledged'
+
+
+def test_legacy_unbound_operations_stay_unknown_and_are_never_backfilled(tmp_path):
+    s = store(tmp_path); r = s.create(OWNER, request())
+    with s._tx() as c: c.execute('DELETE FROM question_bindings WHERE 1=1')
+    op = s.decide(OWNER, decision(r))['operation']
+    s.dispatch(OWNER, op['operationId'], Receiver())
+    assert 'binding' not in op and s.receipts(OWNER, op['operationId'])['phase'] == 'unknown'
+    with s._read() as c:
+        assert c.execute('SELECT COUNT(*) FROM owner_receipts').fetchone()[0] == 0
+    s.record_receipt(OWNER, ack(op))
+    assert s.receipts(OWNER, op['operationId'])['phase'] == 'acknowledged'  # no reservation invented
+    with pytest.raises(core.ActionError): s.record_receipt(OWNER, reserve(op))  # legacy rows cannot reserve
+
+
+def test_stale_revised_requests_cannot_reserve(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op))
+    s.revise(owner, r['requestId'], 1, dict(r, title='Synthetic change with more scope'))
+    with pytest.raises(core.ActionError) as err: s.record_receipt(owner, reserve(op))
+    assert err.value.status == 409
+    assert s.receipts(owner, op['operationId'])['phase'] == 'acknowledged'
+    with s._read() as c:
+        assert c.execute("SELECT COUNT(*) FROM owner_receipts WHERE phase='reserved'").fetchone()[0] == 0
+
+
+def test_reservation_survives_a_revision_so_the_lost_application_is_still_verifiable(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op)); first = s.record_receipt(owner, reserve(op))
+    s.revise(owner, r['requestId'], 1, dict(r, title='Synthetic change with more scope'))
+    again = store(tmp_path).record_receipt(owner, reserve(op))  # read-only repeat, no new reservation
+    assert again['reservation'] == 'existing' and again['mustVerify'] is True
+    assert again['applicationKey'] == first['applicationKey']
+    with pytest.raises(core.ActionError) as err: s.record_receipt(owner, applied(op))  # existing stale rejection holds
+    assert err.value.status == 409
+
+
+@pytest.mark.parametrize('extra', [{'applicationKey': 'forged'}, {'evidenceVerified': True}, {'evidenceSource': 'verified'},
+                                   {'reservation': 'new'}, {'mustVerify': False}, {'verified': True}])
+def test_receipt_fields_owned_by_the_server_cannot_be_spoofed(tmp_path, extra):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op)); s.record_receipt(owner, reserve(op))
+    for body in (dict(reserve(op), **extra), dict(applied(op), **extra)):
+        with pytest.raises(core.ActionError) as err: s.record_receipt(owner, body)
+        assert err.value.status == 422
+    with pytest.raises(core.ActionError) as err:
+        s.record_receipt(owner, dict(applied(op), evidence=[dict(EVIDENCE[0], verified=True)]))
+    assert err.value.status == 422
+
+
+def test_applied_evidence_is_server_labelled_agent_reported_unverified_and_key_bound(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op)); res = s.record_receipt(owner, reserve(op))
+    done = s.record_receipt(owner, applied(op))
+    rec = done['receipt']
+    assert rec['evidenceSource'] == 'agent_reported' and rec['evidenceVerified'] is False
+    assert rec['applicationKey'] == res['applicationKey'] and done['consumer']['phase'] == 'applied'
+    assert done['consumer']['evidenceVerified'] is False and done['consumer']['grants'] == []
+
+
+def test_crash_after_reserve_before_effect_never_repeats_unknown_work(tmp_path):
+    sink = DurableSink(tmp_path / 'sink.db')
+    s, owner, r, op = delivered(tmp_path)
+    with pytest.raises(Crash): consume(tmp_path, owner, op, sink, crash='after-reserve')
+    assert sink.total() == 0
+    assert consume(tmp_path, owner, op, sink) == 'uncertain'  # restarted: reservation exists, effect unprovable
+    assert sink.total() == 0  # no safe repeat was claimed
+    view = store(tmp_path).receipts(owner, op['operationId'])
+    assert view['phase'] == 'uncertain' and [x['phase'] for x in view['receipts']] == ['acknowledged', 'reserved']
+
+
+def test_crash_after_effect_before_receipt_recovers_only_the_missing_phase(tmp_path):
+    sink = DurableSink(tmp_path / 'sink.db')
+    s, owner, r, op = delivered(tmp_path)
+    with pytest.raises(Crash): consume(tmp_path, owner, op, sink, crash='after-effect')
+    assert sink.total() == 1
+    assert store(tmp_path).receipts(owner, op['operationId'])['phase'] == 'uncertain'  # effect happened, unrecorded
+    assert consume(tmp_path, owner, op, sink) == 'applied'  # restart reads the sink back by applicationKey
+    assert sink.total() == 1  # exactly one real effect
+    view = store(tmp_path).receipts(owner, op['operationId'])
+    assert view['phase'] == 'applied' and view['receipts'][-1]['applicationKey'] == view['applicationKey']
+    assert sink.has(view['applicationKey'])
+
+
+def test_two_concurrent_consumers_produce_exactly_one_effect(tmp_path):
+    sink = DurableSink(tmp_path / 'sink.db')
+    s, owner, r, op = delivered(tmp_path)
+    with ThreadPoolExecutor(6) as pool:
+        out = list(pool.map(lambda _: consume(tmp_path, owner, op, sink), range(6)))
+    assert sink.total() == 1 and 'applied' in out
+    assert set(out) <= {'applied', 'uncertain'}  # a loser that cannot yet see the effect reports uncertain
+
+
+def test_reserved_phase_tool_schema_and_prompt(tmp_path):
+    plugin = load_module('bound_init2', ROOT / '__init__.py')
+    enum = plugin.PRODUCER_SCHEMA['parameters']['properties']['receipt']['properties']['phase']['enum']
+    assert enum == ['acknowledged', 'reserved', 'applied', 'not_applied']
+    s, owner, r, op = delivered(tmp_path)
+    text = prompt_delivery.PromptAdmission._params(op)['text']
+    for needle in ('reserved', 'applicationKey', 'idempotency', 'uncertain', 'never repeat'):
+        assert needle.lower() in text.lower(), needle
+    low = text.lower()
+    assert low.index('acknowledged') < low.index('reserved') < low.index('"applied"')

@@ -908,7 +908,13 @@ test('owner phase: delivery alone is not acknowledgment; only owner receipts cha
  assert.equal(m.ownerPhase(ackd),'acknowledged')
  assert.match(m.ownerPhaseText(ackd),/acknowledged this exact revision; not yet applied/)
  const applied={phase:'applied',receipts:[ackd.receipts[0],{phase:'applied',evidence:[{type:'commit',id:'abc123'}]}]}
- assert.match(m.ownerPhaseText(applied),/applied \(commit abc123\)/)
+ assert.match(m.ownerPhaseText(applied),/applied \(commit abc123\); agent-reported, unverified/)
+ assert.doesNotMatch(m.ownerPhaseText({...applied,receipts:[applied.receipts[0],{...applied.receipts[1],evidenceVerified:true}]}),/(?<!un)verified\b(?!\.)|confirmed/i,'a receipt can never make the UI claim verification')
+ const reserved={phase:'uncertain',receipts:[ackd.receipts[0],{phase:'reserved',evidence:[]}]}
+ assert.equal(m.ownerPhase(reserved),'uncertain')
+ assert.match(m.ownerPhaseText(reserved),/reserved the application before acting; whether it was applied is uncertain/)
+ assert.doesNotMatch(m.ownerPhaseText(reserved),/\bapplied\)|reports it applied/)
+ assert.equal(m.ownerPhase({phase:'uncertain',receipts:[ackd.receipts[0]]}),'unknown','uncertain without its reservation receipt is not trusted')
  assert.match(m.ownerPhaseText({phase:'not_applied',receipts:[{phase:'not_applied',reason:'Request was revised'}]}),/did not apply it: Request was revised/)
  const r=freshRequest(); await m.refreshRequests(async()=>({requests:[r]}))
  let consumer={phase:'unknown',receipts:[]}

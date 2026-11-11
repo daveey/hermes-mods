@@ -63,8 +63,13 @@ class PromptAdmission:
             # Only operations recorded with a v1 question binding: older operations keep their exact admitted text
             # (its digest is the admission identity a restarted readback recomputes).
             text += ('\nOwner receipt: after validating, call action_request {"receipt": {"operationId": "%s", '
-                     '"phase": "acknowledged", "revision": %d, "scopeDigest": "%s"}}; after acting, phase "applied" '
-                     'with evidence refs, or "not_applied" with a reason. Receipts grant nothing.'
+                     '"phase": "acknowledged", "revision": %d, "scopeDigest": "%s"}}; then, BEFORE any external '
+                     'effect, the same call with phase "reserved". Only reservation=new may act; use the returned '
+                     'applicationKey as the downstream idempotency key and for readback. If reservation=existing '
+                     '(mustVerify) read the downstream back by applicationKey: if the effect is absent or unknown and '
+                     'the work is not idempotent, never repeat it; report the uncertainty. After acting, phase '
+                     '"applied" with evidence refs (stored as agent-reported, unverified), or "not_applied" with a '
+                     'reason. Receipts grant nothing.'
                      % (op['operationId'], op['revision'], op['binding']['scopeDigest']))
         sid = op['owner']['storedSessionId']
         digest = hashlib.sha256(encode({'stored_session_id': sid, 'text': text}).encode()).hexdigest()

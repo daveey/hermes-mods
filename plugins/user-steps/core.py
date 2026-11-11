@@ -2136,7 +2136,9 @@ def _redact_error(exc) -> str:
 # are matched against that snapshot, never against the newest list or the session alone. Owner receipts record what
 # the consuming agent did with a delivered decision; none of them grants anything.
 BINDING_SCHEMA = 1
-RECEIPT_PHASES = ('acknowledged', 'applied', 'not_applied')
+# reserved sits between acknowledged and the outcome: the durable marker written BEFORE any external effect, so a crash
+# between effect and receipt leaves evidence that application may have started (never a safe-to-repeat claim).
+RECEIPT_PHASES = ('acknowledged', 'reserved', 'applied', 'not_applied')
 EVIDENCE_TYPES = ('message', 'tool_call', 'commit', 'pr', 'kanban', 'file', 'url', 'operation')
 
 
@@ -2530,9 +2532,22 @@ class ActionStore:
     def consumer_state(op, receipts):
         """Owner-side phase, separate from delivery. No receipt = unknown (rows before v1 are never backfilled)."""
         phases = {r['phase'] for r in receipts}
+        # Reserved without an outcome is 'uncertain': the effect may or may not have happened.
         phase = ('not_applied' if 'not_applied' in phases else 'applied' if 'applied' in phases
+                 else 'uncertain' if 'reserved' in phases
                  else 'acknowledged' if 'acknowledged' in phases else 'unknown')
-        return {'phase': phase, 'delivery': op.get('dispatchState'), 'receipts': receipts, 'grants': []}
+        out = {'phase': phase, 'delivery': op.get('dispatchState'), 'receipts': receipts, 'grants': []}
+        keyed = next((r for r in receipts if r.get('applicationKey')), None)
+        if keyed:
+            out['applicationKey'] = keyed['applicationKey']
+        if 'applied' in phases:
+            out['evidenceVerified'] = False  # agent-reported references; the server never checks the effect itself
+        return out
+
+    @staticmethod
+    def application_key(ns, oid, revision, digest):
+        """Deterministic downstream idempotency/readback key for exactly one delivered revision of one operation."""
+        return _sha([ns, oid, revision, digest])
 
     def receipts(self, owner, oid):
         with self._read() as c:
@@ -2555,8 +2570,8 @@ class ActionStore:
         reason = receipt.get('reason')
         if reason is not None:
             _string(reason); reason = ' '.join(reason.split())[:500]
-        if phase == 'acknowledged' and (evidence or reason):
-            raise ActionError('acknowledged carries no evidence or reason')
+        if phase in ('acknowledged', 'reserved') and (evidence or reason):
+            raise ActionError(f'{phase} carries no evidence or reason')
         if phase == 'applied' and not evidence: raise ActionError('applied requires exact-target evidence references')
         if phase == 'not_applied' and not reason: raise ActionError('not_applied requires a reason')
         ns = self._ns(consumer); oid = receipt['operationId']
@@ -2574,29 +2589,45 @@ class ActionStore:
                 raise ActionError('Not delivered: a receipt requires confirmed delivery', 409)
             body = {'operationId': oid, 'requestId': op['requestId'], 'revision': op['revision'],
                     'scopeDigest': receipt['scopeDigest'], 'phase': phase, 'evidence': evidence}
+            bound = bool(op.get('binding'))
+            if phase in ('reserved', 'applied') and bound:
+                body['applicationKey'] = self.application_key(ns, oid, op['revision'], receipt['scopeDigest'])
+            if phase == 'applied':
+                # Server labels, never caller fields: the references are what the agent says it did.
+                body.update(evidenceSource='agent_reported', evidenceVerified=False)
             if reason is not None: body['reason'] = reason
             fingerprint = _sha(body)
             existing = {r['phase']: r for r in self._receipts(c, ns, oid)}
             if phase in existing:
                 if existing[phase]['fingerprint'] != fingerprint:
                     raise ActionError('A different receipt is already recorded for this phase', 409)
-                return {'receipt': existing[phase], 'consumer': self.consumer_state(op, list(existing.values()))}
+                out = {'receipt': existing[phase], 'consumer': self.consumer_state(op, list(existing.values()))}
+                if phase == 'reserved':  # a repeat caller can never know whether the first one acted
+                    out.update(reservation='existing', mustVerify=True, applicationKey=body['applicationKey'])
+                return out
             if phase != 'acknowledged':
                 other = 'not_applied' if phase == 'applied' else 'applied'
                 if other in existing: raise ActionError(f'Conflicting outcome: {other} is already recorded', 409)
                 if 'acknowledged' not in existing:
                     raise ActionError('Acknowledge the exact revision before recording an outcome', 409)
-            if phase == 'applied':
-                if op['intent']['effect'] not in ('approve', 'answer'):
-                    raise ActionError('Only an approval or answer can be applied; record not_applied', 422)
+            if phase == 'reserved' and not bound:
+                raise ActionError('Legacy operation without a v1 binding cannot reserve an application', 409)
+            if phase in ('reserved', 'applied') and op['intent']['effect'] not in ('approve', 'answer'):
+                raise ActionError('Only an approval or answer can be applied; record not_applied', 422)
+            if phase == 'applied' and bound and 'reserved' not in existing:
+                raise ActionError('Reserve the application (phase reserved) before recording applied', 409)
+            if phase in ('reserved', 'applied'):
                 current = self._get(c, op['owner'], op['requestId'])
                 if current['revision'] != op['revision'] or current['state'] != 'resolved':
                     raise ActionError('Stale: the request is no longer resolved at the delivered revision; '
-                                      'applied cannot be recorded against it', 409)
+                                      f'{phase} cannot be recorded against it', 409)
             rec = dict(body, fingerprint=fingerprint, consumer=consumer,
                        recordedAt=datetime.now(timezone.utc).isoformat())
             c.execute('INSERT INTO owner_receipts VALUES (?,?,?,?,?)', (ns, oid, phase, fingerprint, _json(rec)))
-            return {'receipt': rec, 'consumer': self.consumer_state(op, self._receipts(c, ns, oid))}
+            out = {'receipt': rec, 'consumer': self.consumer_state(op, self._receipts(c, ns, oid))}
+            if phase == 'reserved':
+                out.update(reservation='new', mustVerify=False, applicationKey=body['applicationKey'])
+            return out
 
     def decide(self, owner, decision):
         _object(decision, ('requestId', 'expectedRevision', 'choiceId', 'idempotencyKey'), ('revisionText',))

@@ -776,10 +776,11 @@ export async function refreshRequests(call = api) {
 const operationId = op => op?.operationId || op?.id
 // Owner-side phase of a delivered decision (v1 owner receipts). Delivery is transport admission only: it never
 // implies the agent acknowledged or applied it. Anything malformed or absent stays 'unknown'; nothing is inferred.
-const OWNER_PHASES = ['unknown', 'acknowledged', 'applied', 'not_applied']
+const OWNER_PHASES = ['unknown', 'acknowledged', 'uncertain', 'applied', 'not_applied']
 export const ownerPhase = consumer => {
   if (!consumer || !OWNER_PHASES.includes(consumer.phase) || !Array.isArray(consumer.receipts)) return 'unknown'
-  if (consumer.phase !== 'unknown' && !consumer.receipts.some(x => x?.phase === consumer.phase)) return 'unknown'
+  if (consumer.phase !== 'unknown' && consumer.phase !== 'uncertain' && !consumer.receipts.some(x => x?.phase === consumer.phase)) return 'unknown'
+  if (consumer.phase === 'uncertain' && !consumer.receipts.some(x => x?.phase === 'reserved')) return 'unknown'
   if (consumer.phase === 'applied' && !consumer.receipts.some(x => x?.phase === 'applied' && Array.isArray(x.evidence) && x.evidence.length)) return 'unknown'
   return consumer.phase
 }
@@ -790,7 +791,9 @@ export const ownerPhaseText = consumer => {
   return {
     unknown: 'No owner acknowledgment recorded.',
     acknowledged: 'Agent acknowledged this exact revision; not yet applied.',
-    applied: applied ? `Agent reports it applied (${applied.evidence.map(e => `${e.type} ${e.id}`).join(', ')}).` : '',
+    uncertain: 'Agent reserved the application before acting; whether it was applied is uncertain.',
+    // Evidence references are the agent's own claim: this surface never calls them verified.
+    applied: applied ? `Agent reports it applied (${applied.evidence.map(e => `${e.type} ${e.id}`).join(', ')}); agent-reported, unverified.` : '',
     not_applied: notApplied ? `Agent did not apply it: ${notApplied.reason || 'no reason given'}.` : '',
   }[phase]
 }

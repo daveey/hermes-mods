@@ -645,6 +645,21 @@ acknowledgment recorded." / "...acknowledged this exact revision; not yet applie
 "...did not apply it: <reason>." (`ownerPhase` refuses a claimed phase without its receipt or evidence). Old rows
 have no receipts and show unknown; nothing is backfilled.
 
+**Application reservation (v1).** Between `acknowledged` and the outcome sits `reserved` (same `owner_receipts` table,
+no evidence/reason). The consumer writes it BEFORE any external effect. It needs the exact acknowledged revision, an
+approve/answer effect and a still-current resolved request (stale or revised: 409; legacy rows without a v1 binding
+cannot reserve). The server returns `applicationKey = sha256(canonical [namespace, operationId, revision, scopeDigest])`
+(never caller-supplied; extra receipt fields are 422). Exactly one caller gets `reservation: "new"` (`mustVerify: false`);
+every repeat or concurrent caller gets `reservation: "existing"`, `mustVerify: true` and must read the downstream back by
+that key. A reservation without an outcome reads as consumer phase `uncertain`; the store never says a repeat is safe, so
+non-idempotent work whose result cannot be read back is not repeated. For bound operations `applied` is denied without a
+reservation (existing stale rejection still applies, so an effect landing after a revision stays unrecorded as applied
+rather than inherited). Applied receipts carry server-set `evidenceSource: "agent_reported"`, `evidenceVerified: false`
+and the `applicationKey`; no generic external verification is claimed. Desktop shows reserved-only as "whether it was
+applied is uncertain" and applied as "agent-reported, unverified". Tests: `tests/test_bound_decisions.py` (fake durable
+sink keyed by applicationKey counts real effects across crash-before-effect and crash-after-effect restarts and
+concurrent consumers). Not covered: the sink is a fixture; no live consumer or Desktop packaged run.
+
 ## Tests
 
 ### Legacy Local ownership regression
