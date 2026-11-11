@@ -71,6 +71,22 @@ class TestAll(unittest.TestCase):
         self.assertIn("Python >= 3.11", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
 
+    def test_no_core_excludes_inherited_checkout_and_editable_install(self):
+        make_tree(self.root, {'example': '''
+            import importlib.util, os, subprocess, sys
+            from pathlib import Path
+            def test_isolated():
+                assert importlib.util.find_spec('hermes_bootstrap') is None
+                subprocess.run([sys.executable, '-c', "import importlib.util; assert importlib.util.find_spec('hermes_bootstrap') is None"], check=True)
+                assert 'HERMES_CORE_CHECKOUT' not in os.environ
+                assert 'HERMES_CORE_SOURCE' not in os.environ
+                assert not (Path.home() / '.hermes/hermes-agent').exists()
+        '''})
+        with patch.dict(os.environ, HERMES_CORE_SOURCE='/inherited/core'):
+            result = run(self.root, '--no-core', '--exact', '-k', 'plugins/example')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('core=None', result.stdout)
+
     def test_session_outcome_reports_real_core_results_even_on_success(self):
         make_tree(self.root, {"session-outcome": """
             import os

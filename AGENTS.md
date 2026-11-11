@@ -69,12 +69,14 @@ A new guard also belongs in private `home/plugins-every-host.txt`; export must n
    only the targeted suite (`-k`); the full run belongs on the hub. A new plugin's or skill's tests (`skills/<cat>/<name>/{scripts,tests}/test_*.py`, one suite per skill,
    CI: `.github/workflows/skill-tests.yml`) are picked up automatically, and CI runs every suite a change touches
    (`.github/workflows/plugin-suites.yml`, Python 3.11 + 3.14, no core: core-backed tests must skip there, not error); one with a non-pytest runner gets an entry in `SUITE_OVERRIDES` in that script.
-4. `git add` + `git commit` (the pre-commit hook runs gitleaks and the private denylist; enable it
+4. Before publishing to `main`, `.githooks/pre-push` validates the actual pushed revision with the same `scripts/ci-plugin-suites` selector as CI and runs the selected whole suites via `scripts/test-all --no-core --exact -k <suite>`. A failure or the 240-second gate budget refuses the push (inside sync's 300-second timeout); never substitute only touched test files. Emergency only: `HERMES_MODS_SKIP_PUSH_SUITES='<reason>' git push …` bypasses with a visible `EMERGENCY BYPASS` log.
+5. `git add` + `git commit` (the pre-commit hook runs gitleaks and the private denylist; enable it
    with `git config core.hooksPath .githooks` if `hermes-sync` hasn't yet). Then `git push`, or let
    the next `hermes-sync` run push it.
-5. New backend plugin → enable it with `hermes plugins enable <name>` (recorded in the private repo).
+   For a large selection, run `scripts/pre-push-suites --prepare origin/main HEAD` first on the hub. It permits up to one hour and saves a one-hour local success receipt for that exact base/head and gate code; the push reuses it, while a changed range, expired receipt, failure or changed gate reruns/refuses. Fetch before preparing. `--no-core` uses an isolated home and clean interpreter environment; do not run core-backed whole suites on the MacBook.
+6. New backend plugin → enable it with `hermes plugins enable <name>` (recorded in the private repo).
    Update the tables in `README.md`.
-6. Other machines pick it up on their next `hermes-sync` pass (≤10 min).
+7. Other machines pick it up on their next `hermes-sync` pass (≤10 min).
 
 - Core patches (`core/patches/NNNN-*.patch`) ship with their feature doc in the same commit: a new or extended
   `core/<feature>.md` and the patch number in its `core/README.md` row. The pre-commit hook

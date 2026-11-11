@@ -49,6 +49,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 
 if sys.version_info < (3, 11):
     # The driver needs tomllib (3.11+), but `#!/usr/bin/env python3` is macOS's 3.9 wherever /usr/bin
@@ -434,7 +435,7 @@ def discover(root: Path, core: Path | None, explicit_core: bool) -> list[dict]:
     return suites
 
 
-def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None, uv: str | None = None) -> dict:
+def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT, site: Path | None = None, uv: str | None = None, isolated_home: str | None = None, isolated_temp: str | None = None) -> dict:
     res = {"name": s["name"], "status": "", "rc": None, "secs": 0.0, "tail": "", "reason": s.get("skip", ""),
            "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
     if s.get("skip"):
@@ -456,9 +457,19 @@ def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = RO
         # chat-closeout's core-backed tests skip unless this names a core checkout. Always the core this run
         # selected, never an inherited value, so those tests exercise the core that PYTHONPATH imports.
         env["HERMES_CORE_SOURCE"] = str(core)
+    if isolated_home:
+        env['HOME'] = isolated_home
+        env['HERMES_HOME'] = str(Path(isolated_home) / '.hermes')
+        temp = Path(isolated_temp or isolated_home)
+        temp.mkdir(exist_ok=True)
+        env['TMPDIR'] = str(temp)
+        for key in ('HERMES_CORE_CHECKOUT', 'HERMES_CORE_SOURCE', 'HERMES_HUB_CLIENT_REAL'):
+            env.pop(key, None)
     cwd = root / s["cwd"] if s.get("cwd") else root
     cmd = [x.replace("{py}", shlex.quote(py) if s["cmd"][0] == "sh" else py).replace("{core}", str(core or "")).replace("{site}", str(site)) for x in s["cmd"]] if s.get("cmd") else \
         [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(s["dir"]), *s["args"], *s["targets"]]
+    # No-core uses a clean venv, including for nested sys.executable children.
+    # Dependencies remain on the explicit PYTHONPATH test site.
     t0 = time.time()
     if cmd[0] == 'uv':
         if not uv:
@@ -513,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-j", dest="jobs", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=1500, help="per-suite seconds (default 1500)")
     ap.add_argument("--hermes-core", dest="core")
+    ap.add_argument("--no-core", action="store_true", help="CI parity: no core imports or home discovery")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--exact", action="store_true",
                     help="-k names whole suites (as printed by --list), and repo-guards is not added")
@@ -521,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     root = Path(a.root).resolve()
-    core, explicit_core = find_core(a.core)
+    core, explicit_core = (None, False) if a.no_core else find_core(a.core)
     py, fallback = select_python(core)
     suites = discover(root, core, explicit_core=explicit_core)
     if a.match and a.exact:
@@ -562,8 +574,18 @@ def main(argv: list[str] | None = None) -> int:
         print(warning, flush=True)
 
     results = []
-    with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
-        futs = [ex.submit(run_suite, s, py, core, a.timeout, root, site, uv) for s in suites]
+    # Keep the synthetic home outside the real Hermes home and outside TMPDIR;
+    # tests of canonical HOME must not mistake it for a temporary export.
+    home_base = Path.home() / '.cache' / 'hm'
+    home_base.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='', dir=home_base) as home, tempfile.TemporaryDirectory(prefix='', dir=home_base) as temp, cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
+        if a.no_core:
+            # A fresh, pip-free venv excludes the invoking interpreter's editable
+            # core install even in grandchildren that don't inherit Python flags.
+            subprocess.run([py, '-m', 'venv', '--without-pip', str(Path(home) / 'venv')], check=True)
+            py = str(Path(home) / 'venv/bin/python')
+        futs = [ex.submit(run_suite, s, py, core, a.timeout, root, site, uv,
+                          home if a.no_core else None, temp if a.no_core else None) for s in suites]
         for f in cf.as_completed(futs):
             r = f.result()
             results.append(r)

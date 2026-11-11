@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Fail-closed main publication gate, sharing CI's suite selector.
+
+The entire gate is bounded to 240 seconds, below hermes-sync's 300-second push
+budget. A timeout refuses publication; it never turns incomplete tests green.
+HERMES_MODS_SKIP_PUSH_SUITES=<reason> is the sole emergency escape and is logged.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import re
+import shutil
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+BUDGET = 240
+
+
+def provision(snapshot, deadline):
+    """Use CI's pinned auth source, never a second independently maintained pin."""
+    workflow = snapshot / '.github/workflows/plugin-suites.yml'
+    if not workflow.is_file():
+        return  # Minimal fixture repositories have no CI provisions.
+    uv = shutil.which('uv') or str(Path.home() / '.local/bin/uv')
+    run([uv, 'python', 'install', '3.9'], deadline)
+    os.environ['HERMES_MODS_PY39'] = run([uv, 'python', 'find', '3.9'], deadline,
+                                       stdout=subprocess.PIPE, text=True).strip()
+    match = re.search(r'^\s*sha=([0-9a-f]{40})\s*$', workflow.read_text(), re.M)
+    if not match:
+        raise ValueError('CI auth source pin missing; update the shared provisioning contract')
+    sha = match.group(1)
+    cache = Path.home() / '.cache/hermes-mods-push'
+    cache.mkdir(parents=True, exist_ok=True)
+    dest = cache / (sha + '-web_server.py')
+    if not dest.is_file():
+        url = f'https://raw.githubusercontent.com/NousResearch/hermes-agent/{sha}/hermes_cli/web_server.py'
+        with urllib.request.urlopen(url, timeout=max(1, min(30, deadline-time.monotonic()))) as response:
+            data = response.read()
+        if b'def _require_token' not in data or b'def _has_valid_session_token' not in data:
+            raise ValueError('CI auth source does not contain the required helpers')
+        temporary = dest.with_suffix(f'.{os.getpid()}.tmp')
+        temporary.write_bytes(data)
+        temporary.replace(dest)
+    os.environ['RUNNERS_CORE_WEB_SERVER'] = str(dest)
+
+
+def run(cmd, deadline, **kwargs):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('gate budget exhausted')
+    # Kill descendants too: pytest/uv may spawn further processes.
+    with subprocess.Popen(cmd, start_new_session=True, **kwargs) as child:
+        try:
+            out, _ = child.communicate(timeout=remaining)
+        except BaseException:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            raise
+        if child.returncode:
+            raise subprocess.CalledProcessError(child.returncode, cmd)
+        return out
+
+
+def receipt_for(base, head):
+    """Local success receipts bind the immutable range and the exact gate code.
+
+    --prepare runs the identical gate outside git push, for selections that cannot
+    fit sync's push timeout. Changed refs/code/interpreter invalidate the receipt.
+    """
+    digest = hashlib.sha256()
+    for value in (base, head, sys.executable, sys.version,
+                  os.environ.get('HERMES_MODS_PYTHON', '')):
+        digest.update(value.encode() + b'\0')
+    for name in ('scripts/pre-push-suites', 'scripts/ci-plugin-suites', 'scripts/test-all'):
+        digest.update((ROOT / name).read_bytes())
+    common = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse',
+                                      '--path-format=absolute', '--git-common-dir'], text=True, timeout=10).strip()
+    return Path(common) / 'pre-push-suites' / (digest.hexdigest() + '.json')
+
+
+def has_receipt(path):
+    try:
+        data = json.loads(path.read_text())
+        return data.get('success') is True and 0 <= time.time() - data['finished'] < 3600
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def main():
+    started = time.monotonic()
+    # Git exports repository-local context to hooks. Never let fixture repos or
+    # snapshot commands inherit the publisher's index/worktree/object overrides.
+    for key in subprocess.check_output(['git', 'rev-parse', '--local-env-vars'], text=True, timeout=10).splitlines():
+        os.environ.pop(key, None)
+    preparing = sys.argv[1:2] == ['--prepare']
+    updates = []
+    if preparing:
+        if len(sys.argv) != 4:
+            print('usage: scripts/pre-push-suites --prepare BASE HEAD', file=sys.stderr)
+            return 2
+        refs = [subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', '--verify',
+                                        ref + '^{commit}'], text=True, timeout=10).strip()
+                for ref in sys.argv[2:]]
+        updates.append(tuple(refs))
+    else:
+        for line in sys.stdin:
+            local_ref, head, remote_ref, base = line.split()
+            if remote_ref == 'refs/heads/main' and set(head) != {'0'}:
+                updates.append((base, head))
+    if not updates:
+        return 0
+    reason = os.environ.get('HERMES_MODS_SKIP_PUSH_SUITES', '').strip()
+    if reason:
+        print('pre-push-suites: EMERGENCY BYPASS: ' + repr(reason), file=sys.stderr)
+        return 0
+    budget = 3600 if preparing else BUDGET
+    deadline = started + budget
+    try:
+        for base, head in updates:
+            receipt = receipt_for(base, head)
+            if not preparing and has_receipt(receipt):
+                print(f'pre-push-suites: verified local receipt {base}..{head}', file=sys.stderr)
+                continue
+            with tempfile.TemporaryDirectory(prefix='mods-push-') as tmp:
+                snapshot = Path(tmp) / 'tree'
+                run(['git', 'clone', '--shared', '--no-checkout', str(ROOT), str(snapshot)], deadline)
+                archive = Path(tmp) / 'tree.tar'
+                with archive.open('wb') as out:
+                    run(['git', '-C', str(ROOT), 'archive', head], deadline, stdout=out)
+                run(['tar', '-xf', str(archive), '-C', str(snapshot)], deadline)
+                # Disposable metadata: tests can run Git without touching the publisher.
+                run(['git', '-C', str(snapshot), 'update-ref', '--no-deref', 'HEAD', head], deadline)
+                run(['git', '-C', str(snapshot), 'read-tree', head], deadline)
+                selected = run([sys.executable, str(ROOT / 'scripts/ci-plugin-suites'),
+                                'select', '--root', str(snapshot), '--base', base, '--head', head],
+                               deadline, stdout=subprocess.PIPE, text=True).splitlines()
+                print(f'pre-push-suites: {base}..{head}: {len(selected)} suites (no core)',
+                      file=sys.stderr, flush=True)
+                if selected:
+                    provision(snapshot, deadline)
+                    args = [x for suite in selected for x in ('-k', suite)]
+                    run([sys.executable, str(ROOT / 'scripts/test-all'), '--root', str(snapshot),
+                         '--no-core', '--exact', *args, '-j', '4'], deadline)
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                temporary = receipt.with_suffix(f'.{os.getpid()}.tmp')
+                temporary.write_text(json.dumps({'success': True, 'finished': time.time(),
+                                                 'base': base, 'head': head, 'suites': selected}))
+                temporary.replace(receipt)
+    except (OSError, ValueError, subprocess.SubprocessError, TimeoutError) as exc:
+        print(f'pre-push-suites: REFUSED: {exc}', file=sys.stderr)
+        return 1
+    finally:
+        print(f'pre-push-suites: wall={time.monotonic() - started:.2f}s budget={budget}s',
+              file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
