@@ -68,13 +68,47 @@ def live_leases(shadow_dir, now_ms):
     return out
 
 
-def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=None):
+def waiting_cards(shadow_dir):
+    """Ready cards nobody holds yet, from every board replica: [{board, task, machines}].
+
+    ``machines`` are the ``machine:<name>`` pins in runs_on (empty = any machine may take it).
+    """
+    import json
+    out = []
+    for path in sorted(Path(shadow_dir).glob('*.db')):
+        try:
+            db = _ro_connect(path, timeout=1)
+        except sqlite3.Error:
+            continue
+        try:
+            try:
+                rows = db.execute("SELECT id, runs_on FROM tasks WHERE status = 'ready' AND lease_holder IS NULL "
+                                  "ORDER BY id").fetchall()
+            except sqlite3.OperationalError:  # replica from before runs_on: nothing is pinned
+                rows = [(t, None) for (t,) in db.execute(
+                    "SELECT id FROM tasks WHERE status = 'ready' AND lease_holder IS NULL ORDER BY id")]
+        except sqlite3.Error:
+            rows = []
+        finally:
+            db.close()
+        for task, runs_on in rows:
+            try:
+                labels = json.loads(runs_on) if runs_on else []
+            except ValueError:
+                labels = []
+            machines = [l.split(':', 1)[1] for l in labels if isinstance(l, str) and l.startswith('machine:')]
+            out.append(dict(board=path.stem, task=task, machines=machines))
+    return out
+
+
+def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=None, waiting=None):
     """One row per registered machine (and per unregistered lease holder).
 
     registry: ``{me, machines: {name: entry}}`` or None when the Board is unreachable.
     Slots are the registry's ``max_card_runs``; this gateway falls back to its own
     dispatcher cap. None means no fixed slot count is set. A registry older than
     REGISTRY_STALE_S keeps its slots and labels but says nothing about who is up.
+    waiting: ``waiting_cards()``; the section counts them all, each row the ones pinned to it.
     """
     stale = registry is not None and registry_age_s is not None and registry_age_s > REGISTRY_STALE_S
     machines = dict((registry or {}).get('machines') or {})
@@ -116,10 +150,12 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
             labels=list(entry.get('labels') or []) if entry else [],
             pinned_only=bool(entry and entry.get('pinned_only')),
             slots=slots, slots_source=slots_source,
+            waiting=sum(1 for w in waiting or [] if name in w['machines']),
             load=_load(entry.get('metrics'), now_ms) if entry else None,
             running=[dict(board=l['board'], task=l['task'], title=l['title'], started_at=l['started_at'])
                      for l in running]))
-    return dict(state='unknown' if registry is None else ('stale' if stale else 'ready'), machines=rows)
+    return dict(state='unknown' if registry is None else ('stale' if stale else 'ready'), machines=rows,
+                waiting=None if waiting is None else len(waiting))
 
 
 def machine_of(display_name):

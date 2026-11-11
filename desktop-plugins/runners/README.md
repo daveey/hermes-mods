@@ -5,7 +5,9 @@ Status-bar chip (order 6) and panel. Two groups, one row per machine, one square
 - **Gateway workers**: machines that run Kanban card runs, from the Board machine registry. Slots are the
   registry's `max_card_runs` (this gateway falls back to its own `kanban.max_in_progress`; otherwise
   "slots not set" and only the busy count). Busy slots are live Board leases from the gateway's sync-shadow
-  board replicas: hover shows card id, title, board and run time; click opens the card.
+  board replicas: hover shows card id, title, board and run time; click opens the card. The section header adds
+  `· N waiting` (ready cards with no lease, all boards); a row adds `· N waiting` for ready cards pinned to it
+  (`runs_on: machine:<name>`). Gateways older than this field show no waiting count, never a false 0.
 - **CI workers**: GitHub Actions runners from the runners collector, grouped into machines by runner name
   (`ec2-gwgen-2` → `ec2-gwgen`, `…-i-<instance>` → one ephemeral group). One runner = one slot. Each slot
   carries the runner entity id (`runner_…`) from the fleet projection. Click or hover a slot to open its

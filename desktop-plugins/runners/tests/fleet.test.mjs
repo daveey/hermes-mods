@@ -63,6 +63,20 @@ test('registry: gateway machines show fixed slots, flags and unset slot counts',
   await ui.close()
 })
 
+test('waiting: header shows ready cards waiting, rows show the ones pinned to them', async () => {
+  const body = fleet()
+  body.gateways.waiting = 90
+  body.gateways.machines = body.gateways.machines.map((m) => m.name === 'hub' ? { ...m, waiting: 18 } : { ...m, waiting: 0 })
+  const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
+  assert.match(ui.container.textContent, /1 \/ 7 slots busy · 90 waiting/)
+  assert.match(ui.container.querySelector('[data-machine="hub"] .hermes-fleet-count').textContent, /^1\/4 · 18 waiting$/)
+  assert.doesNotMatch(ui.container.querySelector('[data-machine="mini"]').textContent, /waiting/)
+  await ui.close()
+  const old = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))  // older gateway: no count
+  assert.doesNotMatch(old.container.textContent, /waiting/)
+  await old.close()
+})
+
 test('registry: each machine keeps its own cap whichever gateway answered last', () => {
   const hubView = fleet()
   const macView = fleet()

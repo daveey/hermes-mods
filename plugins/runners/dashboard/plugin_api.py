@@ -191,7 +191,8 @@ def _gateway_section():
     read_at = node._REGISTRY.get('at')
     age = time.monotonic() - read_at if registry is not None and read_at is not None else None
     section = fleet.gateway_workers(registry, leases, now_ms, registry_age_s=age,
-                                    local_cap=_local_cap())
+                                    local_cap=_local_cap(),
+                                    waiting=fleet.waiting_cards(ksc.shadow_path('x').parent))
     try:
         inv = _investigate()
         found = inv.latest(_board_dirs(), {m['name'] for m in section['machines']})

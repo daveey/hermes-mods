@@ -355,8 +355,9 @@ export function summarize(view) {
   const cOffline = slots.filter((s) => s.state === 'offline').length
   const lost = g.filter((m) => m.state === 'lost').length
   const unknown = [view.gateways, view.ci].some((s) => s.state !== 'ready' && s.state !== 'not_configured')
+  const gWaiting = typeof view.gateways.waiting === 'number' ? view.gateways.waiting : null
   return {
-    gBusy, gSlots, cBusy, cSlots: slots.length, cOffline, lost,
+    gBusy, gSlots, gWaiting, cBusy, cSlots: slots.length, cOffline, lost,
     tone: lost ? 'bad' : unknown ? 'warn' : gBusy + cBusy ? 'good' : 'muted'
   }
 }
@@ -425,7 +426,8 @@ function GatewayRow({ m, now, investigator, route }) {
         onClick: () => openCard(r)
       })),
       ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] }))),
-    h('span', { className: 'hermes-fleet-count' }, m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
+    h('span', { className: 'hermes-fleet-count', title: m.waiting ? `${m.waiting} ready card(s) pinned to ${m.name} waiting for a slot` : undefined },
+      (m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`) + (m.waiting ? ` · ${m.waiting} waiting` : '')),
     h('span', { className: 'hermes-fleet-meta' }, [meta, m.reason].filter(Boolean).join(' · ')),
     h(Meters, { load: m.load, now }),
     investigator && route ? h(Investigate, { m, now, investigator, route }) : null
@@ -675,7 +677,7 @@ export function Panel({ view, now, repairClient, investigator }) {
   return h('div', { className: 'hermes-fleet' },
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'Gateway workers'),
-      h('span', null, `${s.gBusy} / ${s.gSlots} slots busy`)),
+      h('span', null, `${s.gBusy} / ${s.gSlots} slots busy${s.gWaiting != null ? ` · ${s.gWaiting} waiting` : ''}`)),
     h(SectionNote, { section: view.gateways }),
     ...view.gateways.machines.map((m) => h(GatewayRow, { key: m.name, m, now, investigator, route: view.gateways.route })),
     h('div', { className: 'hermes-fleet-head' },

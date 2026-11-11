@@ -50,6 +50,29 @@ def test_live_leases_fill_slots_across_boards(tmp_path):
     assert [r['task'] for r in m['worker-1']['running']] == ['t_b']
 
 
+def test_waiting_cards_counted_per_section_and_per_pinned_machine(tmp_path):
+    db = sqlite3.connect(tmp_path / 'default.db')
+    db.execute('CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, started_at INTEGER, '
+               'lease_holder TEXT, lease_expires INTEGER, runs_on TEXT)')
+    db.executemany('INSERT INTO tasks VALUES (?,?,?,?,?,?,?)', [
+        ('t_any', 'Any', 'ready', None, None, None, None),
+        ('t_hub', 'Hub', 'ready', None, None, None, '["machine:hub"]'),
+        ('t_hub2', 'Hub2', 'ready', None, None, None, '["linux", "machine:hub"]'),
+        ('t_held', 'Held', 'ready', None, 'hub', NOW + MIN, '["machine:hub"]'),
+        ('t_todo', 'Todo', 'todo', None, None, None, '["machine:hub"]'),
+        ('t_run', 'Run', 'running', 1, 'hub', NOW + MIN, None)])
+    db.commit()
+    db.close()
+    _shadow(tmp_path, 'old', [('t_old', 'No runs_on column', 'ready', None, None, None)])
+    waiting = fleet.waiting_cards(tmp_path)
+    assert sorted(w['task'] for w in waiting) == ['t_any', 't_hub', 't_hub2', 't_old']
+    out = fleet.gateway_workers(_registry(hub={}, **{'worker-1': dict(max_card_runs=16)}), [], NOW, waiting=waiting)
+    m = {r['name']: r for r in out['machines']}
+    assert out['waiting'] == 4
+    assert (m['hub']['waiting'], m['worker-1']['waiting']) == (2, 0)
+    assert fleet.gateway_workers(_registry(hub={}), [], NOW)['waiting'] is None  # not measured != zero
+
+
 def test_ci_runners_grouped_into_machines_with_one_slot_each():
     entity = 'runner_' + 'ab' * 16
     def row(name, registration='online', activity='idle', labels=('self-hosted', 'Linux', 'X64'), **kw):
