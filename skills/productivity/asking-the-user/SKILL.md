@@ -35,12 +35,19 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 - Never ask the user to run a shell command themselves: no "run this in your terminal" text and no copy-paste
   instructions. When a command needs them (sudo/password, an interactive login or OAuth, a TTY prompt, their
   terminal's macOS permissions, or anything you won't run unattended), call `run_in_user_terminal`. It opens a
-  terminal window, shows the command, the user confirms there, it runs, and you get the exit code and output.
+  terminal window and runs the command; do not assume a separate confirmation gate. Read the returned status, exit code and output.
 - For an approved owner-chat-only handoff, read the recipe, pins and latest receipts, then establish one operator
-  before `run_in_user_terminal`. If coordination delivery is unknown or the target chat is busy, read its transcript:
-  a failed send is not evidence the operation is unclaimed. For an apply, inspect the lock holder (`fuser <lock>`) and
-  receipt directory; do not replay an in-flight or partially executed attempt. Preserve worker markers and guards.
-  Return verified results to the existing card rather than asking the user to relay them.
+  before `run_in_user_terminal`. If coordination is queued or unanswered, read the target transcript AND the actual
+  unit/process, invocation receipt and log: another chat may have launched before replying. An active invocation
+  takes precedence over missing acknowledgment; do not duplicate it. For an apply, also inspect the lock holder
+  (`fuser <lock>`); preserve worker markers and guards.
+  Return verified results to the existing card rather than asking the user to relay them. When a card blocks on
+  "from your own Hermes chat open the owner-terminal flow" and this chat IS the user's Desktop chat, the launch is
+  yours: run the reviewed recipe through `run_in_user_terminal`, comment the job id and log path, and unblock the
+  card; don't relay the ask. Before extending a bounded service hold, exercise the current updater's read-only
+  readiness predicate against the proposed stopped state: a longer hold cannot fix a guard that rejects deliberately
+  stopped services. Re-review changed timing and guard compatibility rather than treating duration as the only defect.
+  Report the script deadline separately from the service timeout and cleanup allowance; none alone proves restoration.
 - Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
