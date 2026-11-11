@@ -100,6 +100,7 @@ def fake(monkeypatch):
 @pytest.fixture
 def plugin(home, fake):
     mod = _load()
+    mod.PLUGINS = ROOT.parent  # Test this worktree's sibling producer, never the installed deployment.
     mod._llm = lambda system, user: "NO"
     mod._link_cards = lambda sid, cards: ([], [])  # the real kanban link runs in test_real_core.py
     mod.register(Ctx())
@@ -172,6 +173,38 @@ def test_decide_writes_steps_with_options_then_declares(plugin, fake, home):
     sid, outcome = fake.declared[0]
     assert outcome == {"kind": "decision", "items": [{"id": step["id"], "question": "Ship build 412 to prod?",
                                                       "choices": choices, "state": "open", "card_id": "t_00000001"}]}
+
+
+@pytest.mark.parametrize('flag', [True, False])
+def test_decide_preserves_explicit_authorization_through_real_migration(plugin, fake, home, flag):
+    choices = [{'label': 'Execute selected scope', 'value': 'go', 'authorizes': flag},
+               {'label': 'Hold', 'value': 'hold', 'authorizes': True}]
+    out = call(plugin, {'kind': 'decide', 'items': [{'question': 'Run the example migration now?',
+                                                  'choices': choices}]})
+    assert out['ok']
+    us = plugin._user_steps()
+    assert Path(us.__file__).resolve() == ROOT.parent / 'user-steps' / 'core.py'
+    step = json.loads((home / 'user-steps' / 'S1.json').read_text())['steps'][0]
+    assert step['choices'] == choices
+    owner = {'gatewayId': 'test-gateway', 'profile': 'default', 'storedSessionId': 'S1'}
+    store = us.ActionStore(home / 'probe-actions.sqlite3')
+    req = store.migrate_step(owner, step)
+    selected = next(c for c in req['choices'] if c['label'] == choices[0]['label'])
+    op = store.decide(owner, dict(requestId=req['requestId'], expectedRevision=1,
+                                choiceId=selected['id'], revisionText=selected['label'],
+                                idempotencyKey='explicit'))['operation']
+    assert op['intent']['executionAuthorized'] is flag
+    assert not next(c for c in req['choices'] if c['label'] == 'Hold').get('authorizes')
+    assert plugin.SCHEMA['parameters']['properties']['items']['items']['properties']['choices']['items'][
+        'properties']['authorizes']['type'] == 'boolean'
+
+
+@pytest.mark.parametrize('flag', ['yes', 1, None])
+def test_decide_invalid_authorizes_writes_nothing(plugin, fake, home, flag):
+    out = call(plugin, {'kind': 'decide', 'items': [{'question': 'Run the example?', 'choices': [
+        {'label': 'Go', 'value': 'go', 'authorizes': flag}, {'label': 'Hold', 'value': 'hold'}]}]})
+    assert not out['ok'] and 'boolean' in out['error']
+    assert fake.declared == [] and not (home / 'user-steps' / 'S1.json').exists()
 
 
 def test_decide_needs_two_choices_and_writes_nothing(plugin, fake, home):

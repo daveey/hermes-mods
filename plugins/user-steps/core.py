@@ -1190,7 +1190,12 @@ def add_step(session_id: str, question: str, options: list, *, ledger: Optional[
         label = str((o.get("label") if isinstance(o, dict) else o) or "").strip()[:OPTION_MAX]
         if label:
             value = o.get("value", label) if isinstance(o, dict) else label
-            choices.append({"label": label, "value": str(value)[:OPTION_MAX]})
+            choice: dict = {"label": label, "value": str(value)[:OPTION_MAX]}
+            if isinstance(o, dict) and 'authorizes' in o:
+                if type(o['authorizes']) is not bool:
+                    raise ValueError('authorizes must be a boolean')
+                choice['authorizes'] = o['authorizes']
+            choices.append(choice)
     choices = choices[:4]
     labels = [c["label"] for c in choices]
     kind = "choose" if len(labels) >= 2 else "input"
@@ -2907,31 +2912,56 @@ def explained_choices(labels: list[str], step: dict, *, boards=None) -> list[dic
                         **({'recommended': True} if m.get('recommended') else {})})
     return out
 
-# A question about WHEN or WHETHER to run/do something (not "which colour"): its go options authorize.
+# Run/timing questions and imperative action questions ("Run X now?") have go answers.
 _RUN_Q = re.compile(r"\b(?:when|whether|should\s+I|shall\s+I|ok(?:ay)?\s+to|go\s+ahead|want\s+me\s+to|can\s+I)\b", re.I)
 _RUN_VERB = re.compile(r"\b(?:run|start|do|restart|migrate|migration|ship|deploy|merge|apply|proceed|execute|kick\s+off|"
-                       r"launch|install|update|upgrade|reboot|rollout|roll\s+out|cut\s?over|switch|push|release)\w*\b", re.I)
-_GO = re.compile(r"^(?:now|right\s+now|yes|yes,?\s+\w.*|go(?:\s+ahead)?|do\s+it(?:\s+now)?|run\s+it(?:\s+now)?|proceed|asap|"
+                       r"launch|install|update|upgrade|reboot|rollout|roll\s+out|cut\s?over|switch|push|release|file|"
+                       r"transfer|delete|remove|create|send|publish|enable|disable)\w*\b", re.I)
+_GO = re.compile(r"^(?:now|right\s+now|yes|go(?:\s+ahead)?|approve|do\s+it(?:\s+now)?|run\s+it(?:\s+now)?|proceed|asap|"
                  r"when\s+(?:it'?s\s+)?idle|(?:once|after)\s+(?:it'?s\s+)?idle|tonight|immediately|start\s+now)[.!]?$", re.I)
-_NO_GO = re.compile(r"\b(?:no|not|don'?t|later|wait|hold|skip|never|cancel|stop|pause|defer|tomorrow)\b", re.I)
+_GO_PREFIX = re.compile(r"^(?:approve|go(?:\s+now|\s+ahead)?|yes)(?:\s|[:,—–-]|$)", re.I)
+_NO_GO = re.compile(r"\b(?:no|not|don['’]?t|later|wait|hold|skip|never|cancel|stop|pause|defer|tomorrow|"
+                       r"if|unless|maybe|perhaps|might|pending|possibly|probably)\b", re.I)
 
 
 def run_question(*texts) -> bool:
-    text = ' '.join(t for t in texts if isinstance(t, str))
-    return bool(_RUN_Q.search(text) and _RUN_VERB.search(text))
+    text = ' '.join(t for t in texts if isinstance(t, str)).strip()
+    return bool(_RUN_VERB.search(text) and (_RUN_Q.search(text) or
+                ('?' in text and _RUN_VERB.match(text))))
 
 
 def go_option(label: str) -> bool:
-    """'now', 'when idle', 'yes' approve; 'later', 'wait', 'no' and anything hedged do not."""
+    """Clear go/approve prefixes approve; negative or conditional labels never do."""
     label = _ws(label).strip()
-    return bool(_GO.match(label)) and not _NO_GO.search(label)
+    return bool(_GO.fullmatch(label) or _GO_PREFIX.match(label)) and not _NO_GO.search(label)
+
+
+def authorizing_answers(step: dict, choices: list[dict]) -> list[dict]:
+    """Authorize a named action, never infer an action from the appended button labels.
+
+    Agent-authored session_outcome choices may explicitly set authorizes true/false;
+    absent metadata uses the go-label fallback. Negative/hedged labels always veto.
+    "Only hermes" alone is a scope preference, NOT a go-ahead: it requires an explicit
+    true flag AND a run question. That pick restricts the frozen question's scope;
+    delivery carries the exact label and must not execute the unselected remainder.
+    Extracted questions retain the legacy timing fallback, not producer metadata.
+    """
+    authored = step.get('source') == 'session_outcome'
+    question = (step.get('text') or '') if authored else (step.get('paragraph') or step.get('text') or '')
+    if not run_question(question):
+        return []
+    flags = {c['label']: c['authorizes'] for c in step.get('choices', [])
+             if authored and isinstance(c, dict) and type(c.get('authorizes')) is bool}
+    return [c for c in choices if c['id'] != 'answer-text' and not _NO_GO.search(c['label'])
+            and flags.get(c['label'], go_option(c['label'])) is True]
 
 
 def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
     """Canonical v2 shape for an extracted step. Never a generic 'request' button:
     clarifications get their literal options + free text, user steps get Done + free
     text, approvals stay agent-incomplete (no user button) until a producer publishes
-    the exact plan. Nothing here grants execution permission."""
+    the exact plan. Only named go answers to an action question can authorize its
+    frozen scope, restricted by the selected label; free text never authorizes."""
     kind = {'approve': 'approval', 'choose': 'choice', 'do': 'external_step'}.get(step.get('kind'), 'input')
     markdown = step.get('paragraph') or step['text']
     title = step['text']
@@ -2946,7 +2976,7 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
     if kind in ('choice', 'input'):
         # Completeness here describes the QUESTION, never executable scope.
         r['choices'] = explained_choices(literal_options(step), step) + [dict(ANSWER_TEXT)]
-        go = run_question(markdown, step.get('text')) and [c for c in r['choices'] if go_option(c['label'])]
+        go = authorizing_answers(step, r['choices'])
         for c in go or []:
             c['authorizes'] = True
         if go:

@@ -53,8 +53,9 @@ class PromptAdmission:
         text = ('Canonical user decision. Act only on the frozen revision below. '
                 'Revise means prepare a replacement plan ONLY; keep implementation blocked. '
                 'Approve permits only this exact scope and limits; so does an answer with '
-                'executionAuthorized=true (a go option such as "now" on a when/whether-to-run question): '
-                'start that work now, no further confirmation. permissionRequired items '
+                'executionAuthorized=true (a go/approve option on a named-action question): '
+                'start that work now, no further confirmation. The selected answer restricts '
+                'the frozen scope: "Only hermes" never authorizes the other named projects. permissionRequired items '
                 'need independent owner permission; no GPU permission is granted here. '
                 'Never repeat an operation already executed.\n' +
                 encode({'operationId': op['operationId'], **op['intent']}))

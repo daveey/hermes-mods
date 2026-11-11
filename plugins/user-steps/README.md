@@ -28,10 +28,18 @@ change.
 
 Clarifications preserve literal source choice labels and provide a free-text
 answer, without approval/plan controls. Answers grant no execution permission,
-with one exception: on a question about when or whether to run something, a go
-option ("now", "when idle", "yes") is marked `authorizes: true` (shown as ✓) and
-picking it records `executionAuthorized: true` for exactly the frozen scope on the
-tile. "later", "wait", "no" and free text grant nothing (`tests/test_decisions.py`).
+with one exception: on a question naming an action (including imperative "Run X now?"),
+clear go/approve buttons ("Approve: run it now", "Go: selected projects", "Go now: example-org/repo",
+"Yes, file it", "now", "when idle") are marked `authorizes: true` (shown as ✓).
+Picking one records `executionAuthorized: true` for the frozen scope **restricted by the selected label**.
+For agent-authored `session_outcome` tiles, producers may set boolean `authorizes` on each choice:
+true explicitly marks a go button; false opts out of inference. Negative or conditional labels
+("Hold", "Later", "Don't file", "Not now", "Approve if tests pass") veto even explicit true.
+"Only hermes" alone expresses a scope preference and does **not** imply start-now; it requires
+explicit true plus an action question. It then authorizes only hermes, never the other projects.
+Free text never authorizes. Action detection uses the question, not appended button labels.
+Coverage: `tests/test_decisions.py::{test_decide_tile_go_labels,test_explicit_producer_authorization}`
+and session-outcome's `test_decide_preserves_explicit_authorization_through_real_migration`.
 The question's own "A, or B?" alternatives are buttons; a model option found
 verbatim is added when it is not already part of one. An "other" tail
 ("something else", "neither") is never a button: the free-text answer covers it

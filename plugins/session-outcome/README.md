@@ -15,7 +15,12 @@ the outcome and feeds core the two things only plugins know: open user decisions
   - `{"kind": "decide", "items": [{"question", "choices": [≥2 {"label", "value"}], "card_id"?}]}` writes each
     question into the user-steps ledger with `add_step` (a `choose` step whose labels become its buttons), then
     declares `{"kind": "decision", "items": [{id, question, choices, state: "open", card_id?}]}`. Nothing is
-    written when any item is malformed.
+    written when any item is malformed. Choices accept optional boolean `authorizes`: true marks a go
+    button for the named action; false disables label inference. The selected label restricts scope.
+    Hold/negative/conditional labels never authorize. "Only hermes" needs explicit true and an action
+    question; without it, narrowing scope does not imply start-now. Omitted flags use user-steps'
+    clear go/approve-label fallback. Tests: `test_decide_preserves_explicit_authorization_through_real_migration`
+    and `test_decide_invalid_authorizes_writes_nothing` in `tests/test_session_outcome.py`.
   - `{"kind": "wait", "on": [{"kind": "card|process|cron|time|capacity|subagent", "id", "label"?, "state"?,
     "eta"?}]}` declares `{"kind": "waiting", "on": [...]}`. Each `card` found on this gateway's boards also gets a
     `tui` shepherd subscription for the chat (`delivery_metadata.via = "outcome-wait"`), so the chat's task list and

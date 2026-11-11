@@ -388,6 +388,66 @@ def test_authorizes_flag_is_only_valid_on_answer_choices():
     with pytest.raises(core.ActionError): core.validate_action(dict(r))
 
 
+@pytest.mark.parametrize('question,label,authorized', [
+    ('Run the hermes-only migration now?', 'Approve: run it now', True),
+    ('Run the migrations now?', 'Go: hermes + babybear', True),
+    ('Run the migration now?', 'Go now: example-org/example-hermes', True),
+    ('File the issue now?', 'Yes, file it', True),
+    ('Run the migration now?', 'Run it now', True),
+    ('Run the migration now?', 'Hold', False),
+    ('Run the migration now?', 'Later', False),
+    ('File the issue now?', "Don't file", False),
+    ('Run the migration now?', 'Not now', False),
+    ('Run the migration now?', 'Approve if tests pass', False),
+    ('Run the migration now?', 'Go maybe', False),
+    ('Run both migrations now?', 'Only hermes', False),
+    ('Which colour?', 'Go: blue', False),
+    ('Which colour?', 'Only hermes', False),
+])
+def test_decide_tile_go_labels(tmp_path, question, label, authorized):
+    step = core.add_step('session-a', question, [label, 'Other answer'],
+                         ledger=core.Ledger(tmp_path / 'ledger', tmp_path / 'missing.db'))
+    r, choice, intent = _decide_label(tmp_path, step, label)
+    assert bool(choice.get('authorizes')) is authorized
+    assert intent['executionAuthorized'] is authorized
+    assert intent['request']['scope'] == r['scope']
+    assert intent['revisionText'] == label
+
+
+@pytest.mark.parametrize('label,flag,authorized', [
+    ('Execute the selected plan', True, True),
+    ('Only hermes', True, True),
+    ('Approve: run it now', False, False),
+    ('Hold', True, False),
+    ('Later', True, False),
+    ("Don't file", True, False),
+    ('Approve if tests pass', True, False),
+])
+def test_explicit_producer_authorization(tmp_path, label, flag, authorized):
+    step = core.add_step('session-a', 'Run both migrations now?',
+                         [{'label': label, 'value': 'pick', 'authorizes': flag}, 'Other answer'],
+                         ledger=core.Ledger(tmp_path / 'ledger', tmp_path / 'missing.db'))
+    assert step['choices'][0]['authorizes'] is flag
+    _, _, intent = _decide_label(tmp_path, step, label)
+    assert intent['executionAuthorized'] is authorized
+    assert intent['revisionText'] == label  # Only hermes restricts the frozen question; never run both.
+    delivery = load_module('scope_prompt_delivery', ROOT / 'prompt_delivery.py')
+    params = delivery.PromptAdmission._params({'operationId': 'scope-probe', 'owner': OWNER, 'intent': intent})
+    assert 'The selected answer restricts the frozen scope' in params['text']
+    assert json.loads(params['text'].split('\n', 1)[1])['revisionText'] == label
+
+
+@pytest.mark.parametrize('question,label', [
+    ('Which colour?', 'Go: run the migration'),
+    ('Which colour?', 'Only hermes'),
+])
+def test_explicit_flag_needs_action_in_question(tmp_path, question, label):
+    step = core.add_step('session-a', question,
+                         [{'label': label, 'value': 'go', 'authorizes': True}, 'Hold'],
+                         ledger=core.Ledger(tmp_path / 'ledger', tmp_path / 'missing.db'))
+    assert _decide_label(tmp_path, step, label)[2]['executionAuthorized'] is False
+
+
 def test_limit_permission_required_is_a_boolean_flag():
     r = request()
     r['limits'] = [dict(key='iam', value='one secret ARN', permissionRequired=True),

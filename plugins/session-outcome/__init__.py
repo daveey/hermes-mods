@@ -177,7 +177,8 @@ except Exception:
 # ---- the tool ------------------------------------------------------------------------------------------
 
 _CHOICE = {"type": "object", "additionalProperties": False, "required": ["label", "value"],
-           "properties": {"label": {"type": "string"}, "value": {"type": "string"}}}
+           "properties": {"label": {"type": "string"}, "value": {"type": "string"},
+                          "authorizes": {"type": "boolean", "description": "True marks a go button for exactly the question's action, restricted by this label. False opts out of inference. Hold/negative/conditional labels never authorize."}}}
 SCHEMA = {
     "name": TOOL,
     "description": (
@@ -259,8 +260,13 @@ def _validate(args: dict) -> dict:
         for i, it in enumerate(items):
             q = _text(it.get("question")) if isinstance(it, dict) else ""
             raw = it.get("choices") if isinstance(it, dict) else None
-            choices = [{"label": _text(c.get("label")), "value": str(c.get("value", "")).strip() or _text(c.get("label"))}
+            choices: list[dict] = [{"label": _text(c.get("label")), "value": str(c.get("value", "")).strip() or _text(c.get("label"))}
                        for c in raw or [] if isinstance(c, dict) and _text(c.get("label"))]
+            for c, choice in zip([c for c in raw or [] if isinstance(c, dict) and _text(c.get('label'))], choices):
+                if 'authorizes' in c:
+                    if type(c['authorizes']) is not bool:
+                        raise ValueError(f'items[{i}] choice authorizes must be a boolean')
+                    choice['authorizes'] = c['authorizes']
             if not q:
                 raise ValueError(f"items[{i}] needs a question")
             if len(choices) < 2:
