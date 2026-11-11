@@ -27,6 +27,8 @@ and record both `created_at`→completed (wall, queue included) and `run_started
 N min" target is judged on wall time unless the card says otherwise; exec time alone never closes it. A
 `workflow_dispatch` on that branch joins the same group, so dispatching doesn't help.
 
+Status of a finite LIST of runs: read `references/bulk-run-status.md` (bounded App-token inspector, never a `gh api` loop).
+
 ## Fixing the CI you wait on: use a worktree
 
 A CI fix (or any branch work) goes in its own worktree: `git worktree add <dir> -b <fix-branch> origin/main`, then
@@ -127,6 +129,8 @@ How to run it from an agent:
 - Don't cancel another session's queued run to get yours through: the queued run will contain your
   commit too.
 - Last: check Done means (below), fix at most 2 rounds, then report what still fails.
+
+If failed-only rerun is refused, read `references/refused-failed-only-rerun.md` before diagnosing a broken workflow.
 
 ## Done means
 - [ ] The sha was copied from `git`/`gh` output, and `--once` ran with the same arguments before any "waiting on CI"?

@@ -1,0 +1,3 @@
+# Refused failed-only rerun
+
+If a completed-failure run retains a queued aggregate and `gh run rerun ID --failed` says its workflow may be broken, do not treat that generic refusal as a syntax diagnosis. Preserve attempt/job/annotation evidence, then try one supported full `gh run rerun ID -R OWNER/REPO` when reruns are authorized. Read back the same head and incremented attempt; never repeat an accepted rerun. Verify all live-policy required contexts with the exact-head probe and actual aggregate step execution. Successful full rerun establishes recovery, not the original failure's root cause.
