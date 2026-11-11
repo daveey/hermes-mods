@@ -9,7 +9,7 @@ Contract: side-session-notes session-outcome-contract.md, "Mods". Core owns stor
   this gateway's boards also shepherd-subscribes the chat to it (``via: outcome-wait``), so the chat's task list
   shows what it waits on; a card it cannot find comes back in ``not_linked`` with the adopt command.
 - an outcome provider: open user-steps steps -> ``decision_items``.
-- an outcome judge: is the last assistant message a closing summary? Pool model, ``fast`` tier, thinking off, 6 s budget,
+- an outcome judge: is the last assistant message a closing summary? Pool model, ``standard`` tier, 6 s budget,
   None (core falls back to its heuristic) on any failure or timeout.
 - ``pre_final_gate``: a reply with no ``session_outcome`` call that would end ``unresolved{no_summary}`` is held
   once with a request for the call (open user-steps steps don't count there: the reply may resolve them after the
@@ -45,7 +45,7 @@ TOOL = "session_outcome"
 TOOLSET = "session_outcome"
 INTERACTIVE = frozenset({"desktop", "tui", "cli"})
 WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent")
-JUDGE_BUDGET_S = 6.0  # thinking off, a fast-tier call measured 0.7-3.0 s on the hub
+JUDGE_BUDGET_S = 6.0  # thinking off, a standard-tier reason-then-verdict call measured 1.4-3.6 s on the hub
 # The gate runs inside a busy Desktop serve process (a 30 s pre_final_gate limit, reply already buffered), where the
 # same call can take longer than in a quiet CLI refresh; it gets a longer budget so the two agree more often.
 GATE_JUDGE_BUDGET_S = 15.0
@@ -53,6 +53,13 @@ GATE_JUDGE_BUDGET_S = 15.0
 # tail. A long report leads with its answer; a tail-only cut leaves sources and a closing aside, which the judge
 # reads as "not a summary".
 JUDGE_INPUT_CHARS = 12000
+# Room for one or two sentences of reasoning before the YES/NO line (a bare one-token verdict misjudged clear reports).
+JUDGE_MAX_TOKENS = 300
+# The standard tier: the fast tier, even reasoning first or as a majority of 3, still flipped borderline replies
+# (a full review with its verdict, a "still broken" diagnosis) in replays; the standard tier got all 14 cases 3/3
+# at 1.4-3.6 s (tests/test_judge_live.py). It refuses {"type": "disabled"}; "between_tools" is its no-thinking mode.
+JUDGE_TIER = "standard"
+JUDGE_THINKING = {"type": "between_tools"}
 TAG = "[session-outcome]"
 SUMMARY_MAX = 1000
 PLUGINS = Path(__file__).resolve().parent.parent
@@ -492,14 +499,23 @@ JUDGE_SYSTEM = (
     "message NO. A message that says nothing needs the user and lists the remaining items as owned by cards or "
     "schedules is YES.\n"
     "Answer NO if the work is not finished: mid-task status, a promise that the assistant will do more or report "
-    "later, a bare acknowledgement, an error with no result, a question the user must answer before the work can go "
-    "on, or a request that the user approve, confirm or act before the work can finish.\n"
-    "Reply with exactly YES or NO.")
+    "later, a bare acknowledgement, an error with no result, a cause found for something broken that it says is "
+    "still broken (\"I haven't fixed it yet\"), a question the user must answer before the work can go on, or a "
+    "request that the user approve, confirm or act before the work can finish.\n"
+    "A message that says something is still broken, failing or not fixed is NO even when it fully answers a "
+    "\"why\" question; a limit or option it merely notes (not done on purpose, not asked for) is not that.\n"
+    "Take the facts the message reports (links, IDs, numbers, what it says it did) as true: you judge whether it "
+    "closes the work, not whether its claims are correct.\n"
+    "First write ONE short sentence (under 30 words) weighing the message against the request, then end with a "
+    "last line that is exactly YES or NO.")
 # The scheduled-later rule: a full answer to "why is it not green?" that named the chat's cron and its next runs got
 # NO 5 times in 5 (and NO with only its first two paragraphs) as "a promise to report later"; asked to reason first,
 # the same model said YES. tests/test_judge_live.py replays it.
 # The queued-card rule: a closing report that said "nothing needs you" but named a card "queued to confirm the fix;
 # that check hasn't run yet" got NO 3/3 (with the kanban notice as request; YES 3/3 with the rule).
+# The reason-first rule: a one-line "I posted the reply: <url>" report and a full review ending in its verdict both
+# got NO 3/3 from the bare one-token answer (the post report YES once the request's closing rules were cut);
+# reasoning first on the standard tier (JUDGE_TIER) said YES on both and kept every NO case NO (test_judge_live.py).
 # The judge's request context: the user's latest message, capped. Without it the judge read a finished answer to a
 # question ("what should I ask to vet X?" -> a list of questions) as "a question" and a report with caveats as
 # mid-task, and said NO on both.
@@ -516,16 +532,27 @@ NOTICE_PREFIX = "[Automatic notice, not typed by the user; it started this turn]
 
 
 def _pool_llm(system: str, user: str) -> str:
-    """One call on the subscription pool, fast tier (pool-llm's in-process library)."""
+    """One call on the subscription pool, JUDGE_TIER (pool-llm's in-process library)."""
     pool = _load_sibling("session_outcome_pool_llm", "pool-llm/pool_llm.py")
-    # Thinking off: fast-tier models think adaptively, and a thinking block spent the whole token budget, so about
+    # Thinking off: pool models think adaptively, and a thinking block spent the whole token budget, so about
     # two calls in three came back empty (None -> the heuristic, which then disagreed with a later judged refresh).
     r = pool.complete([{"role": "system", "content": system}, {"role": "user", "content": user}],
-                      provider="anthropic", tier="fast", max_tokens=8, thinking={"type": "disabled"})
+                      provider="anthropic", tier=JUDGE_TIER, max_tokens=JUDGE_MAX_TOKENS,
+                      thinking=JUDGE_THINKING)
     return str(r.get("text") or "")
 
 
 _llm: Callable[[str, str], str] = _pool_llm
+
+
+def _verdict_of(raw: Any) -> Optional[bool]:
+    """The judge's verdict from its reply: the last non-empty line, YES or NO (any case, markdown or a trailing
+    period around it), else None. The reasoning above it is never read, so a "yes" inside it can't flip the result."""
+    lines = [ln for ln in str(raw or "").splitlines() if ln.strip()]
+    word = lines[-1].strip().strip(".!:\"'`*#_ ").upper() if lines else ""
+    if word.startswith("VERDICT"):
+        word = word[len("VERDICT"):].strip(":- *").upper()
+    return True if word.startswith("YES") else False if word.startswith("NO") else None
 
 
 def _clip(text: str) -> str:
@@ -633,8 +660,7 @@ def judge(session_id: str, last_assistant_text: str, *, source: Optional[str] = 
     t0 = time.monotonic()
     try:
         raw = _with_budget(lambda: _llm(JUDGE_SYSTEM, _judge_input(text, request)), budget)
-        word = str(raw or "").strip().strip(".!\"'`*").upper()
-        verdict = True if word.startswith("YES") else False if word.startswith("NO") else None
+        verdict = _verdict_of(raw)
     except Exception as exc:
         # INFO, not debug: a judge that gives up makes the gate and a later refresh disagree, so it must be visible.
         log.info("session-outcome judge gave up for %s after %.1fs%s: %s: %s", session_id, time.monotonic() - t0,
@@ -643,7 +669,7 @@ def judge(session_id: str, last_assistant_text: str, *, source: Optional[str] = 
             scope["gave_up"] = True
         return None  # failures are not cached: the next call may get through
     if verdict is None:
-        log.info("session-outcome judge gave no YES/NO for %s: %r", session_id, str(raw or "")[:40])
+        log.info("session-outcome judge gave no YES/NO for %s: %r", session_id, str(raw or "")[-200:])
         if scope is not None:
             scope["gave_up"] = True
     if len(_JUDGED) > 256:

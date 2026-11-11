@@ -1,4 +1,4 @@
-"""Live judge replay: the real JUDGE_SYSTEM prompt against the real pool fast tier, on replies the judge got wrong.
+"""Live judge replay: the real JUDGE_SYSTEM prompt against the real pool judge tier, on replies the judge got wrong.
 
 Opt-in (it makes model calls): SESSION_OUTCOME_LIVE_JUDGE=1. Each case runs 3 times; every verdict must match.
 The NO cases guard the other side: a prompt that says YES to everything passes the regressions and fails here.
@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,43 @@ QUEUED_CHECK_NOTICE = ("[Automatic notice, not typed by the user; it started thi
                        "Kanban t_1 blocked: Please close this card as superseded, or tell me to activate the guard "
                        "anyway.")
 
+# A one-line delivery report for a scripted post request. The bare YES/NO judge said NO 3/3 with the full request
+# (YES once the request's closing rules were cut) and NO 3/3 with no request; asked to reason first it said YES.
+POSTED_REQUEST = (
+    "You pressed Post on Bluesky reply draft for https://bsky.app/profile/did:plc:aaa/post/3abc. Post exactly this "
+    "text as a reply to at://did:plc:aaa/app.bsky.feed.post/3abc and nothing else, by running in the terminal: "
+    "python3 ~/bin/bsky_post_reply.py at://did:plc:aaa/app.bsky.feed.post/3abc <<'BEOF'\nThat makes sense. The "
+    "context that explains a deviation mostly lives in people's heads.\nBEOF\n(it runs bsky_engage.py reply under "
+    "token-broker, refuses a duplicate, enforces the daily cap and logs to LOG.md). Report the resulting bsky.app "
+    "URL, or the error. Do not retry on error and do not post anything else. Never cross-post this to X.")
+POSTED_ANSWER = ("I posted the reply to @someone.example.com: https://bsky.app/profile/did:plc:bbb/post/3xyz\n\n"
+                 "It went to Bluesky only, not X.")
+# A complete review with a verdict (keep/revert) whose last lines note what was deliberately not done. Judged NO.
+REVIEW_REQUEST = (
+    "Review coach improvement 2026-11-08-1. Show me exactly what changed, then check whether it is helping using "
+    "the coach's before/after KPI and recent sessions. Give a one-line verdict: keep or revert. If it is clearly "
+    "hurting, run `coach-apply revert 2026-11-08-1 \"<why>\"` and tell me. If I answer keep / not now / never, "
+    "record it with `coach-apply decide 2026-11-08-1 keep|not_now|never`.")
+REVIEW_ANSWER = (
+    "## Exactly what changed\n\nAdded **one bullet under `## Do NOT`** in `skills/devops/kanban-worker/SKILL.md:189`. "
+    "Nothing was removed:\n\n> - Change a sibling rollout card's status when its owner explicitly prohibited "
+    "transitions.\n\nThe application ledger records November 10, 10:00 AM PST. I verified the live file contains "
+    "the bullet once.\n\n## Is it helping?\n\nI ran `coach_weekly.py --check` for this proposal.\n\n"
+    "| Measure | Seven days before | After |\n|---|---:|---:|\n| Sessions | 5,595 | 11 |\n"
+    "| Repeat-fix signals/session | 0.578 | 0.727 |\n\n**Coach recommendation: KEEP, provisional.** The rule had "
+    "been applied for less than an hour; the checker requires at least 15 sessions and three days, so neither "
+    "number demonstrates an effect. I inspected all 11 post-application session digests: no clear evidence of "
+    "harm, but no causal proof of benefit either.\n\n**Verdict: KEEP provisionally: the rule narrowly preserves "
+    "explicit owner instructions, and the post-change evidence is too young to justify reverting.**\n\n"
+    "No revert performed, and I have not recorded a user `keep` decision on your behalf.")
+
 CASES = [
+    (POSTED_REQUEST, POSTED_ANSWER, "YES"),
+    ("", POSTED_ANSWER, "YES"),
+    (REVIEW_REQUEST, REVIEW_ANSWER, "YES"),
+    ("when tasks are running, show an [H] in their box if they run on the hub",
+     "Cards scheduled for the hub will get an **H** in their colored box. It isn't showing yet: the frontend part "
+     "is deployed, but the backend part is still going through CI, and I haven't seen it on screen.", "NO"),
     ("why is it not green? it has a schedule icon", SCHEDULED_ANSWER, "YES"),
     (QUEUED_CHECK_NOTICE, QUEUED_CHECK_ANSWER, "YES"),
     ("why is the chat still yellow?",
@@ -82,8 +119,13 @@ def _load():
 
 def _verdicts() -> list[list[str]]:
     mod = _load()
-    return [[mod._llm(mod.JUDGE_SYSTEM, mod._judge_input(message, request)).strip().strip(".").upper()
-             for _ in range(RUNS)] for request, message, _ in CASES]
+    def one(request, message):
+        t0 = time.monotonic()
+        raw = mod._llm(mod.JUDGE_SYSTEM, mod._judge_input(message, request))
+        verdict = mod._verdict_of(raw)
+        print(f"{time.monotonic() - t0:.1f}s", file=sys.stderr)
+        return "YES" if verdict is True else "NO" if verdict is False else f"?{str(raw)[-60:]}"
+    return [[one(request, message) for _ in range(RUNS)] for request, message, _ in CASES]
 
 
 @pytest.fixture(scope="module")

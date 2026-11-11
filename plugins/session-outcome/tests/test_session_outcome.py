@@ -249,6 +249,19 @@ def test_judge_yes_no(plugin):
     assert plugin.judge("S1", "Working on it, will report back.") is False
 
 
+def test_judge_reads_only_the_last_line_after_its_reasoning(plugin):
+    # The judge reasons first (a bare one-token answer called clear reports NO); only its last line is the verdict.
+    plugin._llm = lambda s, u: "The user asked to post; yes, it reports the URL.\n\n**YES**"
+    assert plugin.judge("S1", "I posted the reply: https://example.com/p/1") is True
+    plugin._llm = lambda s, u: "Yes, it describes progress, but the deploy is still running.\nNO."
+    assert plugin.judge("S1", "Deploy started; I'll report back.") is False
+    plugin._llm = lambda s, u: "It reports the result.\nVerdict: YES"
+    assert plugin.judge("S1", "Merged and deployed v3.") is True
+    plugin._llm = lambda s, u: "YES, it reports the URL\nbut I am not sure"  # no verdict on the last line
+    assert plugin.judge("S1", "Posted: https://example.com/p/2") is None
+    assert "exactly YES or NO" in plugin.JUDGE_SYSTEM and "First write" in plugin.JUDGE_SYSTEM
+
+
 def test_judge_sees_head_and_tail_of_a_long_reply(plugin):
     # A long report leads with its answer and ends with sources; a tail-only cut hid the answer and the judge
     # called a finished research report "not a summary".
@@ -368,7 +381,7 @@ def test_judge_failure_returns_none(plugin):
     assert plugin.judge("S1", "Other reply text") is None
 
 
-def test_judge_default_path_is_pool_fast_tier(plugin, monkeypatch):
+def test_judge_default_path_is_pool_judge_tier(plugin, monkeypatch):
     seen = {}
 
     class Pool:
@@ -381,9 +394,11 @@ def test_judge_default_path_is_pool_fast_tier(plugin, monkeypatch):
     monkeypatch.setattr(plugin, "_load_sibling", lambda key, rel: Pool)
     plugin._llm = plugin._pool_llm
     assert plugin.judge("S1", "Done: merged and deployed.") is True
-    assert seen["tier"] == "fast"
-    # Thinking off, or a thinking block eats the tiny budget and the answer comes back empty.
-    assert seen["thinking"] == {"type": "disabled"} and seen["max_tokens"] >= 8
+    assert seen["tier"] == "standard"
+    # Thinking off ("between_tools" is the standard tier's off switch), or a thinking block eats the budget.
+    assert seen["thinking"] == {"type": "between_tools"}
+    # Room for the reasoning sentences before the verdict line, or the YES/NO is cut off.
+    assert seen["max_tokens"] >= 150
 
 
 # ---- pre_final_gate -----------------------------------------------------------------------------------

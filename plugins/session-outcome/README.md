@@ -26,9 +26,12 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - **Judge**: is the last assistant message a closing summary? Desktop, tui and cli chats only: any other
   `source=` (core passes it), or a session row whose source is known and not interactive, gets None with no model
   call. One call on the subscription pool
-  (`pool-llm`'s `complete`, `anthropic`, `fast` tier, thinking off, 8 tokens) with a 6 s budget. Thinking is
-  off because the fast model's adaptive thinking spent the whole token budget and about two calls in three came
-  back empty. The judge sees the user's latest real request (`<request>`, capped at 2,000 characters; kanban
+  (`pool-llm`'s `complete`, `anthropic`, `standard` tier, thinking off via `between_tools`, 300 tokens) with a 6 s
+  budget. The judge writes one short sentence of reasoning and ends with a YES/NO line; only that last line is read.
+  The bare one-token fast-tier answer called clear reports NO ("I posted the reply: <url>", a review ending in its
+  verdict); the fast tier reasoning first, or as a majority of 3, still flipped borderline replies, while the
+  standard tier got every live replay case 3/3 at 1.4-3.6 s. Thinking is off because adaptive thinking spent the
+  whole token budget and calls came back empty. The judge sees the user's latest real request (`<request>`, capped at 2,000 characters; kanban
   notices, auto-continue rows, this plugin's nudge and recovery re-prompts (`[False-stop recovery]`,
   `[Session babysitter]`, which only replay the event above them) are skipped) and the reply (`<message>`): without the
   request it judged a finished answer to "what should I ask?" as "a question". YES → True, NO → False, anything else,
@@ -89,7 +92,7 @@ also cover receipt passthrough and the older-core warning. Actual Desktop render
 - the judge skips non-interactive sources (by `source=` and by session row) without a model call;
 - decide writes ledger steps with options and choices, then declares;
 - the provider returns open steps as decision items;
-- the judge: YES/NO, timeout → None, failure or unclear answer → None, the default path calls pool `fast` tier;
+- the judge: YES/NO, timeout → None, failure or unclear answer → None, only the last line is the verdict, the default path calls pool `standard` tier;
 - the gate holds once when the judge gives up (error, unclear answer, cached unclear answer, timeout) and only the
   heuristic said done, and the second miss passes; the gate's judge budget is longer than a refresh's; the gate's
   scope does not leak into a later refresh; a wait that outranks the judge still passes;
@@ -124,8 +127,8 @@ only the separate opt-in live model suite may skip. The runner's output retentio
 `tests/test_test_all.py`. Use `HERMES_MODS_PYTHON` to select a dependency-equipped interpreter if the discovered
 core `.venv` is not suitable; missing imports are errors, not a passing coverage gap.
 
-`tests/test_judge_live.py` replays the real prompt on the real pool fast tier (3 runs per case, all must agree):
-replies that were misjudged (the scheduled-cron answer) plus NO cases (promises to report later, a question back, an
+`tests/test_judge_live.py` replays the real prompt on the real pool judge tier (3 runs per case, all must agree):
+replies that were misjudged (the scheduled-cron answer, a posted-reply report, a review with its verdict) plus NO cases (promises to report later, a question back, an
 approval ask, a diagnosis with no fix). It makes model calls, so it is opt-in: `SESSION_OUTCOME_LIVE_JUDGE=1`. The
 calls run in a child process, because under pytest core refuses to read the real auth store the pool needs.
 
