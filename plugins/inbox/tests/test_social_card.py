@@ -82,6 +82,7 @@ def _post(inbox, fields, key="bsky-reply-draft:x/post/3"):
                       type="bsky-reply-draft", key=key, fields=fields, poster="t")["session_id"]
 
 
+@pytest.mark.needs_core
 def test_thread_card_posts_directive_and_hidden_full_text(env):
     inbox, db = env
     sid = _post(inbox, _fields(thread=json.dumps(THREAD), summary="They asked X.", option_1_angle="Ask"))
@@ -97,6 +98,7 @@ def test_thread_card_posts_directive_and_hidden_full_text(env):
     assert "-->" not in hidden and "<!--" not in hidden  # cannot close the comment early
 
 
+@pytest.mark.needs_core
 def test_thread_text_cannot_escape_the_comment(env):
     inbox, db = env
     body = "x --> <img src=x onerror=alert(1)> <!-- y"
@@ -106,6 +108,7 @@ def test_thread_text_cannot_escape_the_comment(env):
     assert text.count("-->") == 1 and text.endswith("-->") and text.count("<!--") == 1
 
 
+@pytest.mark.needs_core
 def test_card_without_thread_is_unchanged(env):
     inbox, db = env
     sid = _post(inbox, _fields())
@@ -115,6 +118,7 @@ def test_card_without_thread_is_unchanged(env):
         "_Bluesky reply draft from t. Actions: **Post**, **Skip**, **Archive**._")
 
 
+@pytest.mark.needs_core
 @pytest.mark.parametrize("bad", ["", "not json", "{}", "[]", json.dumps([{"author": "a"}]), json.dumps(["s"])])
 def test_malformed_thread_falls_back_to_plain(env, bad):
     inbox, db = env
@@ -122,6 +126,7 @@ def test_malformed_thread_falls_back_to_plain(env, bad):
     assert "::social-card" not in _first(db, sid)
 
 
+@pytest.mark.needs_core
 def test_repost_update_also_uses_directive(env):
     inbox, db = env
     sid = _post(inbox, _fields(thread=json.dumps(THREAD)))
