@@ -238,6 +238,8 @@ When investigating authorization or plugin isolation, read `references/scope-and
 
 When fixtures depend on event chronology or expiry, read `references/clock-fixture-pitfalls.md` (PR assignment ordering and receipt TTL clocks).
 
+- For bounded readers that repeatedly return empty partial results, distinguish per-query exhaustion from shared quota exhaustion before raising any cap. Test eventual service across polls, including new arrivals and completed/disappearing cursor anchors: a fixed newest-first window can starve older active work forever. Preserve incomplete-coverage semantics and verify useful rows from the actual post-deploy collector, not just direct API probes; a concurrent maintenance stop makes that live check inconclusive.
+
 - Writing the chain after the fix is chosen, so the chain is built to justify it. Do the chain first; let it pick
   the fix.
 - Answers that restate the question ("it failed because it errored"). Each why must add new information.
