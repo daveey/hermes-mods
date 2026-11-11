@@ -641,3 +641,85 @@ def needs_attention(card: dict[str, Any], paths: Optional[list[Path]] = None) ->
         finally:
             conn.close()
     return not valid_followups(tid, summary, paths)
+
+
+# --- F: acceptance edits need this chat's own user authority (any session) -----------------------------------------
+
+def _acceptance_mod():
+    try:
+        from . import acceptance  # type: ignore
+        return acceptance
+    except ImportError:
+        import importlib.util
+        import sys
+
+        key = "kanban_honest_done_acceptance"
+        mod = sys.modules.get(key)
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name("acceptance.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod = sys.modules.setdefault(key, mod)
+        return mod
+
+
+# ``--body $(cat f)`` unquoted: the lexer splits the substitution, so read the raw command for it.
+_RAW_BODY_SUBST = re.compile(r"--body(?:=|\s+)\"?(\$\(\s*(?:cat\s+(?:--\s+)?|<\s*)[^()\s\"]+\s*\))")
+
+
+def _task_with_body_time(task_id: str, paths) -> Optional[dict]:
+    """The card plus ``body_set_at``: its newest body edit event, else its creation time."""
+    hit = find_task(task_id, paths)
+    if not hit:
+        return None
+    board, row = hit
+    row = dict(row)
+    try:
+        conn = ro_connect(board)
+        try:
+            ev = conn.execute("SELECT max(created_at) FROM task_events WHERE task_id=? AND kind='edited' "
+                              "AND payload LIKE '%\"body\"%'", (task_id,)).fetchone()
+            cr = conn.execute("SELECT created_at FROM tasks WHERE id=?", (task_id,)).fetchone()
+        finally:
+            conn.close()
+        row["body_set_at"] = (ev and ev[0]) or (cr and cr[0]) or 0
+    except sqlite3.Error:
+        row["body_set_at"] = 0
+    return row
+
+
+def check_shell_acceptance(command: str, session_id: str, paths_fn, env=None) -> Optional[str]:
+    """F: refusal for ``hermes kanban edit <id> --body ...`` that changes acceptance without a user message id this
+    chat received. Bodies built at runtime other than ``$(cat FILE)`` are not recovered (not refused)."""
+    acc = _acceptance_mod()
+    segs = _segments(command or "")
+    assigns = acc.assignments(segs)
+    raw_subst = _RAW_BODY_SUBST.findall(command or "")
+    for seg in segs:
+        hit = _kanban_verb(seg)
+        if not hit or hit[0] != "edit":
+            continue
+        args = hit[1]
+        target = _positional(args)
+        raw = _opt(args, "--body")
+        if not target or raw is None or not TASK_ID_RE.fullmatch(target.strip("\"'")):
+            continue
+        if raw.startswith("$") and raw_subst:
+            raw = raw_subst.pop(0)
+        body = acc.resolve_body(raw, assigns, env)
+        if body is None:
+            continue
+        why = acc.check_body_edit(target.strip("\"'"), body, session_id,
+                                  lambda t: _task_with_body_time(t, paths_fn()), db=acc.state_db(env))
+        if why:
+            return why
+    return None
+
+
+def check_python_acceptance(code: str, session_id: str, paths_fn, env=None) -> Optional[str]:
+    for cmd in _python_string_values(code or ""):
+        if "kanban" in cmd and "edit" in cmd and "--body" in cmd:
+            why = check_shell_acceptance(cmd, session_id, paths_fn, env)
+            if why:
+                return why
+    return None

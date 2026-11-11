@@ -10,6 +10,9 @@ B. completing its own card (``kanban_complete`` tool, or ``hermes kanban complet
    (``t_xxxxxxxx``) that exists, is open (or already done), and was created by or is linked to this card.
 D. completing its own card while the body/comments name an origin chat (``origin ... @session:X``) that is not
    linked to the card (chat link, notify subscription, or ``follow-through: SENT`` comment), so it never hears.
+F. (any session) ``hermes kanban edit <id> --body`` that adds acceptance-waiver text or drops an acceptance sentence,
+   unless the new body cites ``user message <id>`` that David typed in THIS chat (state.db, compression lineage).
+   Authority quoted from another chat, a card or a notice is refused (acceptance.py; t_7e2ee45c 2026-11-10).
 E. (any session, not only workers) ``kanban_create`` whose title/body names an origin chat on ANOTHER gateway
    (``origin ... @session:<profile>@<gw>/<id>``) without ``origin_session`` binding it: the chat would never see it.
 
@@ -111,10 +114,32 @@ def classify_create(tool_name: str, args: Any, names_fn=None, env=None) -> Optio
     return None
 
 
-def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[dict]:
+def classify_acceptance(tool_name: str, args: Any, session_id: str, paths_fn=None, env=None) -> Optional[str]:
+    """F: acceptance-changing body edits need a user message id from this chat. Any session."""
+    paths_fn = paths_fn or core.board_paths
+    args = args if isinstance(args, dict) else {}
+    name = _strip(str(tool_name or ""))
+    if name in SHELL_TOOLS:
+        cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
+        if "kanban" in cmd and "--body" in cmd:
+            return core.check_shell_acceptance(cmd, session_id, paths_fn, env)
+    if name in PY_TOOLS:
+        code = str(args.get("code") or "")
+        if "kanban" in code and "--body" in code:
+            return core.check_python_acceptance(code, session_id, paths_fn, env)
+    if name == "tool_call":
+        for call in args.get("calls") or []:
+            if isinstance(call, dict):
+                why = classify_acceptance(str(call.get("name") or ""), call.get("arguments"), session_id, paths_fn, env)
+                if why:
+                    return why
+    return None
+
+
+def _pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any) -> Optional[dict]:
     own = None
     try:
-        why = classify_create(tool_name, args)
+        why = classify_create(tool_name, args) or classify_acceptance(tool_name, args, session_id or "")
         if not why and _in_worker():
             own = core.own_task_id()
             why = classify(tool_name, args, own) if own else None
