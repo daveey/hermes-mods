@@ -13,7 +13,7 @@ same chat is a comment on it.
 
 Second lane, leftover test chats: an agent's OWN test chat (the first user turn is the probe) is fine while it runs,
 but one left visible in the sidebar is litter the user has to look at. A latency harness drove six real new chats
-through a Desktop window ("[latency probe, please reply just ok] ...") and only closed the window; the six chats sat
+through a Desktop window (`[latency probe, please reply just ok] ...`) and only closed the window; the six chats sat
 in David's sidebar until he asked. RPC harnesses create theirs ``hidden``; UI-driven ones cannot, so their teardown
 must delete them. A user-facing session whose digest says ``hidden: false`` and not archived, with at most
 LEFTOVER_MAX_TURNS user turns, a probe-shaped first turn and no activity for LEFTOVER_IDLE_S, is a hit. New hits on
@@ -45,8 +45,8 @@ USER_SOURCES = {"desktop", "cli", "tui", "telegram", "discord", "slack", "whatsa
 PROBE_ASK = re.compile(r"\breply\s+(?:with\s+)?exactly[:\s]+[`\"']?([A-Z][A-Z0-9]+(?:_[A-Za-z0-9]+)*)\b", re.I)
 # A whole reply that is one token with an underscore (ROUTE_INSTALLED_23ef49); "OK"/"Yes." are ordinary answers.
 TOKEN_REPLY = re.compile(r"^[`\"']?[A-Z][A-Z0-9]*(?:_[A-Za-z0-9]+)+[`\"'.]?$")
-# Probe-shaped FIRST turns of an agent's own test chat: "[latency probe, ...]", "[probe t_01a...]",
-# "Reply with just the word: fixb6233", "Reply with only: fresh_armF_one".
+# Probe-shaped FIRST turns of an agent's own test chat: `[latency probe, ...]`, `[probe t_01a...]`,
+# `Reply with just the word: fixb6233`, `Reply with only: fresh_armF_one`.
 PROBE_TAG = re.compile(r"^\s*\[[^\]\n]{0,80}\bprobe\b[^\]\n]{0,80}\]", re.I)
 REPLY_JUST = re.compile(r"\breply\s+(?:with\s+)?(?:just|only)\b(?:\s+the\s+word)?\s*[:`\"']?\s*[A-Za-z0-9_-]+\s*[.`\"']?\s*$", re.I)
 LEFTOVER_IDLE_S = 3600
