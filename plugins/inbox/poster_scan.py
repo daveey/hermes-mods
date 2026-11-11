@@ -22,18 +22,28 @@ def _const(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
 
+def _source_paths(root: Path):
+    """Select producer sources, excluding worktrees and state host snapshots."""
+    root = Path(root)
+    state_repo = (root / "hermes-sync").is_file() and (root / "shared-config.json").is_file()
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        # Nested agent worktrees and state hosts/<host>/ backups are not
+        # deployed producers. Do not exclude ordinary projects' hosts folders
+        # or other .claude sources (e.g. hooks).
+        nested_claude_tree = any(a == '.claude' and b == 'worktrees'
+                                 for a, b in zip(rel.parts, rel.parts[1:]))
+        host_snapshot = state_repo and len(rel.parts) >= 3 and rel.parts[0] == "hosts"
+        if (any(p in SKIP_DIRS or p == '.worktrees' for p in rel.parts)
+                or nested_claude_tree or host_snapshot or rel.name.startswith("test_")):
+            continue
+        yield path, rel
+
+
 def scan(root: Path) -> list[dict]:
     """Return ``{site, poster}`` for every literal poster handed to an inbox-posting call under ``root``."""
     out: list[dict] = []
-    for path in sorted(Path(root).rglob("*.py")):
-        rel = path.relative_to(root)
-        # Nested agent worktrees are stale copies, not deployed producers.
-        # Keep other .claude sources (e.g. hooks) in scope.
-        nested_claude_tree = any(a == '.claude' and b == 'worktrees'
-                                 for a, b in zip(rel.parts, rel.parts[1:]))
-        if (any(p in SKIP_DIRS or p == '.worktrees' for p in rel.parts)
-                or nested_claude_tree or rel.name.startswith("test_")):
-            continue
+    for path, rel in _source_paths(root):
         try:
             text = path.read_text(encoding="utf-8")
             tree = ast.parse(text)
@@ -73,12 +83,7 @@ _INBOX_POST = "inbox post"
 
 
 def _iter_sources(root: Path):
-    for path in sorted(Path(root).rglob("*.py")):
-        rel = path.relative_to(root)
-        nested_claude_tree = any(a == '.claude' and b == 'worktrees' for a, b in zip(rel.parts, rel.parts[1:]))
-        if (any(p in SKIP_DIRS or p == '.worktrees' for p in rel.parts)
-                or nested_claude_tree or rel.name.startswith("test_")):
-            continue
+    for path, rel in _source_paths(root):
         try:
             text = path.read_text(encoding="utf-8")
             tree = ast.parse(text)
