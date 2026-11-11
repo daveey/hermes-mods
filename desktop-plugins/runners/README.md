@@ -1,6 +1,10 @@
 # Runners Desktop — machines and slots
 
-Status-bar chip (order 6) and panel. Two groups, one row per machine, one square per slot:
+Status-bar chip (order 6) and panel. The chip shows two bars, **Hub** (the hub's card slots) and **Workers**
+(every other gateway with a slot cap): the track is capacity, the fill is scheduled cards; green while there is
+room, red once every slot is taken. A status dot appears only for warn/bad (stale data, lost machine).
+
+The panel has two groups, one row per machine, one square per slot:
 
 - **Gateway workers**: machines that run Kanban card runs, from the Board machine registry. Slots are the
   registry's `max_card_runs` (this gateway falls back to its own `kanban.max_in_progress`; otherwise

@@ -346,6 +346,8 @@ export function ago(ms) {
   return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago` : `${Math.round(s / 3600)}h ago`
 }
 
+const isHub = (m) => m.name === 'hub' || (m.labels || []).includes('machine:hub')
+
 export function summarize(view) {
   const g = view.gateways.machines || [], c = view.ci.machines || []
   const gBusy = g.reduce((n, m) => n + m.running.length, 0)
@@ -356,8 +358,17 @@ export function summarize(view) {
   const lost = g.filter((m) => m.state === 'lost').length
   const unknown = [view.gateways, view.ci].some((s) => s.state !== 'ready' && s.state !== 'not_configured')
   const gWaiting = typeof view.gateways.waiting === 'number' ? view.gateways.waiting : null
+  // Status-bar meters: the hub's card slots and the worker gateways' card slots. A machine
+  // without a slot cap (pinned-only Macs) has no capacity to fill, so it is left out.
+  const capped = g.filter((m) => typeof m.slots === 'number' && m.slots > 0)
+  const hub = capped.filter(isHub), workers = capped.filter((m) => !isHub(m))
+  const meter = (ms) => ({
+    busy: ms.reduce((n, m) => n + m.running.length, 0),
+    slots: ms.reduce((n, m) => n + m.slots, 0)
+  })
   return {
     gBusy, gSlots, gWaiting, cBusy, cSlots: slots.length, cOffline, lost,
+    hub: meter(hub), workers: meter(workers),
     tone: lost ? 'bad' : unknown ? 'warn' : gBusy + cBusy ? 'good' : 'muted'
   }
 }
@@ -712,6 +723,20 @@ function useNow(active) {
   return now
 }
 
+// Track = capacity, fill = scheduled. Green while there is room, red once every slot is taken.
+export function meterTone(m) {
+  if (!m.slots) return 'none'
+  return m.busy >= m.slots ? 'full' : 'ok'
+}
+
+function Meter({ name, m }) {
+  const tone = meterTone(m)
+  const pct = m.slots ? Math.min(100, Math.round((m.busy / m.slots) * 100)) : 0
+  return h('span', { className: 'hermes-fleet-chipmeter', 'data-meter': name.toLowerCase(), 'data-tone': tone },
+    h('span', null, name),
+    h('span', { className: `hermes-fleet-chipbar is-${tone}` }, h('span', { style: { width: `${pct}%` } })))
+}
+
 // The React Query cache keeps the last view across refetches (no flicker, no spinner);
 // one poll runs at a time and polling stops while the window is hidden.
 export function Runners({ ctx }) {
@@ -738,14 +763,18 @@ export function Runners({ ctx }) {
   const now = useNow(open && visible)
   const view = query.data
   const s = view ? summarize(view) : null
-  const label = s ? `Runners ${s.gBusy + s.cBusy}/${s.gSlots + s.cSlots}` : 'Runners …'
+  const label = s
+    ? `Runners · hub ${s.hub.busy}/${s.hub.slots} · workers ${s.workers.busy}/${s.workers.slots}`
+    : 'Runners …'
   const title = s
-    ? `Gateway workers ${s.gBusy}/${s.gSlots} busy · CI ${s.cBusy}/${s.cSlots} busy${s.lost ? ` · ${s.lost} machine lost` : ''}`
+    ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
     : 'Loading runners'
   return h(Popover, { open, onOpenChange: setOpen },
     h(PopoverTrigger, { asChild: true },
       h('button', { type: 'button', className: BAR, 'data-slot': 'runners-chip', 'aria-label': `Show runners: ${label}`, title },
-        h(StatusDot, { tone: s?.tone || 'muted' }), h('span', null, label))),
+        s && (s.tone === 'bad' || s.tone === 'warn') ? h(StatusDot, { tone: s.tone }) : null,
+        s ? [h(Meter, { key: 'hub', name: 'Hub', m: s.hub }), h(Meter, { key: 'workers', name: 'Workers', m: s.workers })]
+          : h('span', null, label))),
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
       style: { width: 'min(640px, calc(100vw - 24px))', maxHeight: '70vh', overflowY: 'auto' }
@@ -754,6 +783,12 @@ export function Runners({ ctx }) {
 }
 
 const CSS = `
+.hermes-fleet-chipmeter{display:inline-flex;align-items:center;gap:4px}
+.hermes-fleet-chipbar{display:inline-block;width:44px;height:6px;border-radius:3px;background:var(--ui-stroke-secondary);overflow:hidden}
+.hermes-fleet-chipbar>span{display:block;height:100%;border-radius:3px}
+.hermes-fleet-chipbar.is-ok>span{background:#2ea043}
+.hermes-fleet-chipbar.is-full{background:rgba(214,69,69,.3)}
+.hermes-fleet-chipbar.is-full>span{background:#d64545}
 .hermes-fleet{display:flex;flex-direction:column;gap:3px;font-size:12px;padding:4px}
 .hermes-fleet-head{display:flex;justify-content:space-between;margin-top:8px;font-weight:600;text-transform:uppercase;font-size:11px;color:var(--ui-text-secondary)}
 .hermes-fleet-head:first-child{margin-top:0}

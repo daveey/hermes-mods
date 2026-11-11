@@ -190,7 +190,9 @@ test('polls every 15s open or closed, updates the open panel in place, stops whi
   await ui.flush()
   assert.equal(row(), node, 'same DOM row, updated in place')
   assert.equal(row().querySelectorAll('.is-busy').length, 1)
-  assert.match(document.querySelector('[data-slot="runners-chip"]').textContent, /Runners 3\/12/)
+  const chip = document.querySelector('[data-slot="runners-chip"]')
+  assert.match(chip.getAttribute('aria-label'), /hub 1\/4 · workers 1\/3/)
+  assert.equal(chip.querySelector('[data-meter="workers"] .hermes-fleet-chipbar>span').style.width, '33%', 'bar updated in place')
   assert.equal(ctx.calls.length, 3, 'one request per poll')
   // Hidden window: polling stops (no interval left running).
   Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
@@ -202,4 +204,31 @@ test('polls every 15s open or closed, updates the open panel in place, stops whi
     delete document.visibilityState
     await ui.close()
   }
+})
+
+test('status bar: one meter for the hub, one for worker gateways; track = capacity, fill = scheduled, red when full', async () => {
+  const v = fleet()
+  const s = P.summarize(P.merge([{ route, body: v, at: NOW, failures: 0, nextAt: 0 }], NOW))
+  // hub: 1 of 4; workers: worker-1 0 of 3 (the uncapped mini adds no capacity)
+  assert.deepEqual(s.hub, { busy: 1, slots: 4 })
+  assert.deepEqual(s.workers, { busy: 0, slots: 3 })
+  assert.equal(P.meterTone(s.hub), 'ok')
+  assert.equal(P.meterTone({ busy: 3, slots: 3 }), 'full')
+  assert.equal(P.meterTone({ busy: 5, slots: 3 }), 'full')
+  assert.equal(P.meterTone({ busy: 0, slots: 0 }), 'none')
+
+  const full = fleet()
+  full.gateways.machines[1].running = [1, 2, 3].map((i) => ({ board: 'default', task: `t_cccc000${i}`, title: 'x', started_at: NOW / 1000 }))
+  const ui = await mount(React.createElement(P.Runners, { ctx: ctxWith([full]) }))
+  try {
+    const chip = document.querySelector('[data-slot="runners-chip"]')
+    const hub = chip.querySelector('[data-meter="hub"]'), workers = chip.querySelector('[data-meter="workers"]')
+    assert.equal(hub.dataset.tone, 'ok')
+    assert.ok(hub.querySelector('.hermes-fleet-chipbar.is-ok'))
+    assert.equal(hub.querySelector('.hermes-fleet-chipbar>span').style.width, '25%')
+    assert.equal(workers.dataset.tone, 'full')
+    assert.ok(workers.querySelector('.hermes-fleet-chipbar.is-full'))
+    assert.equal(workers.querySelector('.hermes-fleet-chipbar>span').style.width, '100%')
+    assert.match(chip.textContent, /Hub.*Workers/)
+  } finally { await ui.close() }
 })
