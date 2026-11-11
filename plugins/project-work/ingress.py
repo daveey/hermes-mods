@@ -3,8 +3,11 @@ import logging
 from collections import OrderedDict
 from dataclasses import asdict
 import json
+import os
 import re
+import sys
 import threading
+import types
 
 from .service import AuthContext
 
@@ -25,8 +28,73 @@ NOTICES = {
 }
 
 
+# ---- reload-stable live state ------------------------------------------------------------------
+# Core wires a Slack handler factory ONCE per (plugin, qualname) on a live Bolt client and Bolt
+# middleware cannot be removed (gateway/platforms/base.py BasePlatformAdapter._wire_plugin_handlers).
+# A reload-plugins (force re-discovery evicts hermes_plugins.<slug>.* from sys.modules, imports it
+# again and re-runs register()) therefore leaves the FIRST registration's middleware receiving events
+# while the tools come from the NEW registration. Both use one per-profile event store held in a
+# sys.modules entry OUTSIDE the evicted namespace, and the wired middleware dispatches to the newest
+# registration's Ingress at call time, so its gate, kill switch and queue are always current.
+# Schema (version 1; keep stable across plugin versions): stores[home] -> namespace(events, lock),
+# current[home] -> newest Ingress (has async ``middleware(body, next, client=None)``).
+LIVE_MODULE = '_project_work_live_ingress'
+LIVE_VERSION = 1
+EVENT_CACHE = 2048
+
+
+def live_state():
+    holder = sys.modules.get(LIVE_MODULE)
+    if holder is None:
+        fresh = types.ModuleType(LIVE_MODULE)
+        fresh.version, fresh.lock, fresh.stores, fresh.current = LIVE_VERSION, threading.Lock(), {}, {}
+        holder = sys.modules.setdefault(LIVE_MODULE, fresh)  # atomic: first writer wins
+    if getattr(holder, 'version', None) != LIVE_VERSION:
+        raise PermissionError('Project work found an unknown live ingress holder in this process; '
+                              'restart the gateway')
+    return holder
+
+
+def home_key(home):
+    return os.path.realpath(str(home))
+
+
+def event_store(key):
+    """The one authenticated-event store for profile home ``key`` (created once, never replaced)."""
+    holder = live_state()
+    with holder.lock:
+        store = holder.stores.get(key)
+        if store is None:
+            store = holder.stores[key] = types.SimpleNamespace(events=OrderedDict(), lock=threading.Lock())
+        return store
+
+
+def publish(key, ingress):
+    """Make ``ingress`` the newest registration for ``key``; returns the one it replaced (or None)."""
+    holder = live_state()
+    with holder.lock:
+        previous = holder.current.get(key)
+        holder.current[key] = ingress
+    return previous
+
+
+def live_middleware(key):
+    """Bolt middleware for profile home ``key``: dispatches to the newest registration per event."""
+    async def middleware(body, next, client=None):
+        try:
+            ingress = live_state().current.get(key)
+        except Exception:
+            ingress = None
+        if ingress is None:
+            # No live registration: nothing is observed or queued; native routing/ack still runs.
+            log.warning('Project ingress refused: no live project-work registration for this profile')
+            return await next()
+        return await ingress.middleware(body, next, client=client)
+    return middleware
+
+
 class Ingress:
-    def __init__(self, policy, client, queue=None, gate=None, ingress_gate=None):
+    def __init__(self, policy, client, queue=None, gate=None, ingress_gate=None, store=None):
         self.policy, self.client = policy, client
         self.queue = queue
         # Re-run at every tool call: a skill or mount that appears after register() (a git pull, a
@@ -37,8 +105,9 @@ class Ingress:
         # only the tools. register() binds it to the registered profile's freshly read policy,
         # because the Bolt middleware runs in whatever context the Socket Mode task inherited.
         self.ingress_gate = ingress_gate if ingress_gate is not None else gate
-        self.events = OrderedDict()
-        self.lock = threading.Lock()
+        if store is None:
+            store = types.SimpleNamespace(events=OrderedDict(), lock=threading.Lock())
+        self.events, self.lock = store.events, store.lock
 
     def observe(self, body):
         """Call ONLY from authenticated native Slack Bolt middleware."""
@@ -55,7 +124,7 @@ class Ingress:
         with self.lock:
             self.events[key] = ctx
             self.events.move_to_end(key)
-            while len(self.events) > 2048:
+            while len(self.events) > EVENT_CACHE:
                 self.events.popitem(last=False)
         return ctx
 

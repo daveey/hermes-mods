@@ -418,6 +418,36 @@ def in_profile_scope(home, fn):
         reset_hermes_home_override(home_token)
 
 
+# Runtime kill switch, read on EVERY native Slack event (Bolt middleware outlives a disable +
+# reload, so config-time disabling alone cannot close ingress until the adapter is rebuilt).
+INGRESS_OFF = 'project-work.ingress-off'
+PLUGIN_NAME = 'project-work'
+
+
+def require_ingress_on(home):
+    """Refuse unless this profile's ingress is switched on: no ``<home>/project-work.ingress-off``
+    marker, and the profile's config.yaml lists project-work in ``plugins.enabled`` and not in
+    ``plugins.disabled`` (core's own enablement rule). Unreadable or missing config refuses."""
+    home = str(home)
+    if os.path.lexists(os.path.join(home, INGRESS_OFF)):
+        raise PermissionError('Project work ingress is switched off for this profile (marker)')
+    try:
+        try:
+            import hermes_yaml as yaml  # core's own config parser (same YAML 1.1 policy)
+        except ImportError:
+            import yaml
+        with open(os.path.join(home, 'config.yaml'), encoding='utf-8') as fh:
+            config = yaml.safe_load(fh) or {}
+        plugins = config.get('plugins') or {}
+        enabled, disabled = plugins.get('enabled') or [], plugins.get('disabled') or []
+        if not isinstance(enabled, list) or not isinstance(disabled, list):
+            raise ValueError('plugins lists')
+    except Exception as exc:
+        raise PermissionError('Project work cannot read this profile\'s plugin enablement') from exc
+    if PLUGIN_NAME in disabled or PLUGIN_NAME not in enabled:
+        raise PermissionError('Project work is not enabled for this profile')
+
+
 def register(ctx):
     from hermes_constants import get_hermes_home
     home = Path(get_hermes_home())
@@ -425,19 +455,36 @@ def register(ctx):
         return
     policy, endpoint, _ = load_config(home)
     require_sandbox()
+    key = _ingress.home_key(home)
+    store = _ingress.event_store(key)
     # Profile-local configuration is necessary but not sufficient: prove the
     # gateway has bound this profile before authorizing each individual turn.
     client = Client(endpoint)
     queue = DurableIngressQueue(endpoint.parent / 'ingress.sqlite3', client)
-    # Tool calls run inside core's per-turn profile scope, rebuilt for every turn. The native Slack
-    # middleware does not: it only inherits the ContextVars the Socket Mode task was created with
-    # at connect(), a snapshot that never sees later config edits. Re-read THIS profile's policy.
-    ingress = Ingress(policy, client, queue, gate=require_sandbox,
-                      ingress_gate=lambda: in_profile_scope(home, require_sandbox))
+
+    def ingress_gate():
+        # Tool calls run inside core's per-turn profile scope, rebuilt for every turn. The native
+        # Slack middleware does not: it only inherits the ContextVars the Socket Mode task was
+        # created with at connect(), a snapshot that never sees later config edits. Re-read THIS
+        # profile's kill switch and policy. Module globals are looked up per event, so a test (or a
+        # newer registration) sees the current gate.
+        require_ingress_on(home)
+        in_profile_scope(home, require_sandbox)
+    ingress = Ingress(policy, client, queue, gate=require_sandbox, ingress_gate=ingress_gate, store=store)
+
     def wire(native, adapter):
-        native.use(ingress.middleware)
+        # The newest registration's Ingress, dereferenced per event (reload-stable; see ingress.py).
+        native.use(_ingress.live_middleware(key))
     ctx.register_platform_handler('slack', wire)
     register_tools(ctx, ingress)
+    previous = _ingress.publish(key, ingress)
+    if previous is not None and getattr(previous, 'queue', None) is not queue:
+        # One drain worker per profile: the replaced registration's journal rows stay durable and
+        # this queue (same sqlite file) delivers them.
+        old = previous.queue
+        if old is not None and hasattr(old, 'stop'):
+            old.stop.set()
+            old.wake.set()
     queue.start()
 
 

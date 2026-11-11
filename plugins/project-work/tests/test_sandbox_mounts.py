@@ -549,7 +549,7 @@ def test_register_wires_the_gate_into_ingress(monkeypatch, tmp_path):
     seen = {}
 
     class FakeIngress:
-        def __init__(self, *a, gate=None, ingress_gate=None):
+        def __init__(self, *a, gate=None, ingress_gate=None, store=None):
             seen['gate'] = gate
             seen['ingress_gate'] = ingress_gate
 
@@ -562,6 +562,7 @@ def test_register_wires_the_gate_into_ingress(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin, 'Ingress', FakeIngress)
     monkeypatch.setattr(plugin, 'register_tools', lambda ctx, ingress: None)
     (tmp_path / 'project-work.json').write_text('{}')
+    (tmp_path / 'config.yaml').write_text('plugins:\n  enabled: [project-work]\n')  # ingress kill switch: on
     monkeypatch.setitem(sys.modules, 'hermes_constants', types.SimpleNamespace(get_hermes_home=lambda: tmp_path))
     plugin.register(types.SimpleNamespace(register_platform_handler=lambda *a: None))
     assert seen['gate'] is plugin.require_sandbox

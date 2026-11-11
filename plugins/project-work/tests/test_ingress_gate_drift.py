@@ -101,12 +101,27 @@ class StubCore:
         return lambda: (self.scope.reset(tokens[1]), self.home.reset(tokens[0]))
 
 
+def write_plugins(home, enabled=('project-work',), disabled=()):
+    """The profile's plugins section (project-work reads it per event as its ingress kill switch);
+    keeps any terminal section already written."""
+    path = home / 'config.yaml'
+    kept = []
+    if path.exists():
+        lines = path.read_text().splitlines()
+        if 'terminal:' in lines:
+            i = lines.index('terminal:')
+            kept = [lines[i]] + [l for l in lines[i + 1:] if l.startswith('  ')]
+    out = kept + ['plugins:', '  enabled: [%s]' % ', '.join(enabled), '  disabled: [%s]' % ', '.join(disabled)]
+    path.write_text('\n'.join(out) + '\n')
+
+
 def register_profile(core, env, tmp_path, monkeypatch, name='alpha'):
     """register() under profile ``name``'s scope (as core loads plugins), then wire Slack."""
     service, _, _ = env
     home = tmp_path / name
     home.mkdir()
     (home / 'project-work.json').write_text('{}')
+    write_plugins(home)
     core.files[str(home)] = dict(CLEAN)
     endpoint = tmp_path / ('run-' + name) / 'runtime.sock'
     endpoint.parent.mkdir(mode=0o700)
@@ -124,7 +139,7 @@ def register_profile(core, env, tmp_path, monkeypatch, name='alpha'):
     native.use = native.middleware.append
     factories[0][1](native, None)
     (middleware,) = native.middleware
-    return home, middleware, middleware.__self__
+    return home, middleware, im.live_state().current[im.home_key(home)]
 
 
 def ingress_warnings(caplog):
@@ -279,6 +294,7 @@ def real_core(monkeypatch, helpers):
 
 def write_terminal(home, **keys):
     lines = ['terminal:'] + ['  %s: %s' % (k, v) for k, v in keys.items()]
+    lines += ['plugins:', '  enabled: [project-work]']
     (home / 'config.yaml').write_text('\n'.join(lines) + '\n')
 
 
@@ -309,7 +325,7 @@ def test_real_core_drift_and_profile_binding(env, tmp_path, monkeypatch, real_co
         native.use = native.middleware.append
         factories[0](native, None)
         (middleware,) = native.middleware
-        ingress = middleware.__self__
+        ingress = im.live_state().current[im.home_key(alpha)]
         assert run(middleware, body(ctx, '!project request one'), None) == ('routed', [True])
         assert len(pending(ingress.queue)) == 1
         # Drift after connect: the snapshot bound above still says clean; the file now forwards a credential.

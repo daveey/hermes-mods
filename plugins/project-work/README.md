@@ -240,6 +240,23 @@ and verify visibility BEFORE checking evidence or thread watermark. Failed unarc
 readback retains the obligation. Deleted/edited owner approvals cannot authorize archive.
 Never manually change ledger status to `archived` or fabricate delivery receipts.
 
+### Closing Slack ingress at runtime, and plugin reloads
+
+Bolt middleware cannot be removed from a live Slack client, and core wires a plugin's handler
+factory once per `(plugin, qualname)`, so neither `plugins disable` nor `reload-plugins` takes
+the wired middleware away. The middleware therefore checks, on EVERY native Slack event and
+before observing or queueing anything:
+
+- the kill-switch marker `<profile home>/project-work.ingress-off` (any file) refuses;
+- the profile's `config.yaml` must list `project-work` in `plugins.enabled` and not in
+  `plugins.disabled`; an unreadable or missing config refuses.
+
+Removing the marker (or re-enabling) reopens ingress on the next event, no reload needed. After
+a reload (the package is re-imported and `register()` runs again) the first-wired middleware
+dispatches to the NEWEST registration's ingress (gate, kill switch, queue) and both share one
+per-profile authenticated-event store kept in `sys.modules['_project_work_live_ingress']`
+(bounded to 2048 events per profile home); the replaced registration's drain worker is stopped.
+
 ### Native card-create refusal (`create_refused`)
 
 `kanban_create` can refuse definitively, e.g.
