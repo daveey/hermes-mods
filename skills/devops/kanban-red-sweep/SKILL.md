@@ -22,7 +22,8 @@ metadata:
 with `block_kind` `needs_input`/`capability` (a block-loop moved them there). Sweep **all** of them on **every**
 board, unblock what an agent can, and only then ask the user about the rest, in one form.
 
-The user's standing order for this skill: do not ask before sweeping. Clear first, ask second.
+The user's standing order for this skill: do not ask before sweeping. Clear first, decide what you can
+reasonably guess for him, and ask only about what you are really unsure of.
 
 ## 1. Inventory (every board, read-only)
 
@@ -53,10 +54,13 @@ already says "resolved", "green again" or "replacement found". The block reason 
 | Ask covered by a standing approval (e.g. spend under the user's no-ask cap, fixing something broken) | Comment the standing rule, then unblock |
 | Agent-doable from an interactive session but refused to a headless worker (guarded `rm -rf` of a verified scratch dir, a tailnet/ssh probe, a `gh` read the worker's profile lacked) | Do it here, verify it, comment, then complete or unblock |
 | Missing credential on the worker profile | Find it with token-broker (`user/github` etc.) before calling it human, then do the step or unblock with the route |
-| Real consent, policy, acceptance or scope decision; physical or sign-in step; protected-file Allow | Keep it and ask (step 4). If a live chat opened it in the last day, leave the ask to that chat |
+| Decision card (policy, acceptance, scope, review-tier approval) where you can make a reasonable guess at what the user would pick | Apply your recommendation: comment the choice, why you expect the user to pick it, and "applied under the red-sweep standing rule, not an explicit answer", then unblock. Report it so the user can reverse it |
+| Decision where you are really unsure (options near a toss-up, hard to reverse, real money, touches other people, or no evidence of the user's preference); physical or sign-in step; protected-file Allow | Keep it and ask (step 4). If a live chat opened it in the last day, leave the ask to that chat |
 
-Never grant consent, change acceptance or approve protected paths on the user's behalf. A rejected guard is never
-bypassed with another writer.
+The user's rule: for each card blocked on him, first ask yourself whether you can reasonably guess how he would
+unblock it. He will usually just take your recommendation, so take it for him; ask only when really unsure.
+A guess must still follow the card's own limits (scope, exclusions, normal review and landing gates). Physical and
+sign-in steps and protected-file Allows are never guessed. A rejected guard is never bypassed with another writer.
 
 ## 3. Act
 
@@ -128,6 +132,7 @@ bypassed with another writer.
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
 - [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment?
+- [ ] Each decision card was either unblocked on your recommendation (comment says it is a guess under the standing rule) or asked because you were really unsure?
 - [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
 - [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
 - [ ] The report names the unlinked and reaped-only cards that still need the user?
