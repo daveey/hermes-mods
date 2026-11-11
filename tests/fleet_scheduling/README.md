@@ -56,6 +56,10 @@ exit status and cleanup in JSON v1 receipts. Cleanup failure is failure and
 preserves the fixture for diagnosis. Store receipts privately: they contain
 absolute paths and runtime diagnostics.
 
-Run the same commands from published/installed sources after shipping. Keep
+Run the same commands from published/installed sources after shipping. Pass
+`--sync-runtime /absolute/path/to/installed/hermes-sync` to import the installed
+updater itself; its bytes must match the selected state source, and the adapter
+records its resolved path and digest (a mismatch is refused).
+Keep
 source-level testing, publication, installed-source verification and production
 observations separate. A PASS on a worktree does not establish deployment.
