@@ -73,6 +73,26 @@ class ReadOnlySelection(unittest.TestCase):
             s.choose_snapshot([], provider='anthropic', model='claude-fixture',
                               account_id='removed', base_url='https://api.anthropic.com')
 
+class DisabledSelection(unittest.TestCase):
+    def test_disabled_account_is_rejected_and_disabled_row_never_chosen(self):
+        try:
+            import agent.credential_pool_disabled as cpd
+        except ImportError:
+            self.skipTest('core without hermes auth disable')
+        s = selection()
+        a, b = entry('A', access_token='sk-ant-shared-fixture'), entry('B', access_token='sk-ant-shared-fixture')
+        ident = _identity_id_for('anthropic', b)
+        self.assertEqual(ident, _identity_id_for('anthropic', a))  # two rows of one account
+        with patch.object(cpd, 'disabled_keys', return_value=(frozenset({'A', 'B'}), frozenset())):
+            with self.assertRaisesRegex(s.SelectionRejected, 'disabled'):
+                s.choose_snapshot([a, b], provider='anthropic', model='claude-fixture',
+                                  account_id=ident, base_url='https://api.anthropic.com')
+        with patch.object(cpd, 'disabled_keys', return_value=(frozenset({'A'}), frozenset())):
+            result = s.choose_snapshot([a, b], provider='anthropic', model='claude-fixture',
+                                       account_id=ident, base_url='https://api.anthropic.com')
+        self.assertEqual(result.entry_id, 'B')
+
+
 def codex_token(plan):
     import base64
     import json

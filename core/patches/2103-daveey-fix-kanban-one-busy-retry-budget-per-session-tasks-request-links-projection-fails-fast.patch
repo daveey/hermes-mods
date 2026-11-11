@@ -1,0 +1,236 @@
+From 347a2b5ddd05657bfd0e2f2bc763a2ed13118854 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:41:57 +0000
+Subject: [PATCH] [daveey] fix(kanban): one busy-retry budget per session-tasks
+ request; links projection fails fast
+
+Review of the first-read retry: the 3 s budget was per board, so several cold busy boards could stack past the
+Desktop's 15 s timeout, and _without_local_open_duplicates retried under _links_lock. The deadline is now created
+once per ksa.session_tasks call and shared by every board; a call with no deadline (the links projection) never
+retries. Fake-clock tests cover the shared budget, fail-fast, non-busy errors and the no-spin pause.
+---
+ hermes_cli/kanban_session_activity.py         |   6 +-
+ hermes_cli/kanban_session_activity_busy.py    |  24 ++--
+ .../hermes_cli/test_kanban_busy_first_read.py | 128 ++++++++++++++++++
+ 3 files changed, 147 insertions(+), 11 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_busy_first_read.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index ff9b6164dbe..7123bb46346 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -922,7 +922,7 @@ def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
+ 
+     def contains(path: Path, sid: str, task_id: str) -> bool:
+         key = (path, sid)
+-        if key not in task_ids:
++        if key not in task_ids:  # no deadline: never wait out a busy board while the caller holds _links_lock
+             task_ids[key] = {t['id'] for t in _busy.session_tasks(path, [sid], LISTED_STATUSES, _read_session_tasks)}
+         return task_id in task_ids[key]
+ 
+@@ -1603,8 +1603,10 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+     if not ids:
+         return []
+     out: list[dict[str, Any]] = []
++    deadline = _busy.request_deadline()  # one busy-retry budget for the whole request, not per board
+     for path in _board_db_paths():
+-        out.extend(_busy.session_tasks(path, ids, statuses, _read_session_tasks))  # busy board: last list, stale
++        # busy board: last list, stale; never read before: re-read until the shared deadline
++        out.extend(_busy.session_tasks(path, ids, statuses, _read_session_tasks, deadline=deadline))
+     for t in out:
+         t.setdefault("key", f"{t['board']}/{t['id']}")
+     # [daveey] Cards on other gateways this lineage owns: the same rows the counts use, owner-qualified
+diff --git a/hermes_cli/kanban_session_activity_busy.py b/hermes_cli/kanban_session_activity_busy.py
+index e3398061276..ac3a7464999 100644
+--- a/hermes_cli/kanban_session_activity_busy.py
++++ b/hermes_cli/kanban_session_activity_busy.py
+@@ -31,12 +31,17 @@ reuse_sink = threading.local()
+ _tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # last good per-board task list, by (board, ids, statuses)
+ _tasks_lock = threading.Lock()
+ TASKS_MEMO_MAX = 512
+-# A busy board with no last good list for the query keeps being read this long (well inside the Desktop's 15 s
+-# request timeout) before the request fails; the pause only bounds an error that returns without waiting.
++# One request's shared budget for re-reading busy boards that have no last good list for the query (well inside the
++# Desktop's 15 s request timeout); the pause only bounds an error that returns without waiting.
+ FIRST_READ_BUSY_BUDGET_S = 3.0
+ FIRST_READ_RETRY_PAUSE_S = 0.05
+ 
+ 
++def request_deadline() -> float:
++    """The monotonic deadline one ``session_tasks`` request shares across every board it reads."""
++    return time.monotonic() + FIRST_READ_BUSY_BUDGET_S
++
++
+ def begin_recompute() -> None:
+     reuse_sink.reused = False
+ 
+@@ -65,15 +70,17 @@ def board_reads(path: Path, key: tuple, hit: tuple | None, parked: bool, stalled
+ 
+ 
+ def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
+-                  read: Callable[[Path, list[str], tuple[str, ...]], list[dict[str, Any]]]) -> list[dict[str, Any]]:
++                  read: Callable[[Path, list[str], tuple[str, ...]], list[dict[str, Any]]], *,
++                  deadline: float | None = None) -> list[dict[str, Any]]:
+     """``read(path, ids, statuses)``, or on a busy board its last good list for the same query, every row ``stale``.
+ 
+     A busy board with no last list for this query (a chat opened for the first time since the backend started) is
+-    read again until ``FIRST_READ_BUSY_BUDGET_S`` runs out before it raises: one read only waits 500 ms for the
+-    board, and a lifecycle hold a little longer than that made ``/api/session-kanban-tasks`` 500 and the Desktop
+-    panel show "Task status unavailable" for every newly opened chat."""
++    read again until the caller's ``deadline`` (``time.monotonic()``) passes, then raises: one read only waits 500 ms
++    for the board, and a lifecycle hold a little longer than that made ``/api/session-kanban-tasks`` 500 and the
++    Desktop panel show "Task status unavailable" for every newly opened chat. The deadline belongs to the whole
++    request (``request_deadline``), so several busy boards share one budget. ``None`` never retries: callers holding
++    a lock (the links projection under ``_links_lock``) must fail fast."""
+     key = (str(path), tuple(ids), tuple(statuses))
+-    deadline = None
+     while True:
+         try:
+             tasks = read(path, ids, statuses)
+@@ -87,8 +94,7 @@ def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
+                 _log.warning("kanban board %s busy; reused last counts", path)
+                 return [{**t, "stale": True} for t in last]
+             now = time.monotonic()
+-            deadline = now + FIRST_READ_BUSY_BUDGET_S if deadline is None else deadline
+-            if now >= deadline:
++            if deadline is None or now >= deadline:
+                 raise
+             time.sleep(min(FIRST_READ_RETRY_PAUSE_S, deadline - now))  # an instant busy error must not spin
+     with _tasks_lock:
+diff --git a/tests/hermes_cli/test_kanban_busy_first_read.py b/tests/hermes_cli/test_kanban_busy_first_read.py
+new file mode 100644
+index 00000000000..9312cd09f71
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_busy_first_read.py
+@@ -0,0 +1,128 @@
++"""A chat's first session-tasks read waits out a brief busy board, within one budget per request. [daveey]
++
++The Desktop session panel showed "Task status unavailable" whenever ``/api/session-kanban-tasks`` hit a board whose
++lifecycle lock was held past one read's 500 ms and the chat had no memoized list yet. The retry budget is shared by
++the whole request (several busy boards never stack past the Desktop timeout), and callers that pass no deadline
++(the links projection under ``_links_lock``) still fail fast. Fake clock: no real waiting.
++"""
++
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_generation as gen
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_session_activity_busy as busy
++
++
++class _Clock:
++    def __init__(self):
++        self.now = 100.0
++        self.sleeps: list[float] = []
++
++    def monotonic(self):
++        return self.now
++
++    def sleep(self, s):
++        self.sleeps.append(s)
++        self.now += s
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    c = _Clock()
++    monkeypatch.setattr(busy.time, "monotonic", c.monotonic)
++    monkeypatch.setattr(busy.time, "sleep", c.sleep)
++    busy.reset()
++    yield c
++    busy.reset()
++
++
++def _reader(fail_times: dict[str, int], calls: list[str], cost: float = 0.0, clock=None):
++    """``read`` that raises busy for the first ``fail_times[path]`` calls on each path, each costing ``cost`` s."""
++    def read(path, ids, statuses):
++        calls.append(str(path))
++        if clock is not None:
++            clock.now += cost
++        if fail_times.get(str(path), 0) > 0:
++            fail_times[str(path)] -= 1
++            raise gen.BoardLifecycleBusy()
++        return [{"id": f"t-{Path(path).name}", "board": "default"}]
++    return read
++
++
++def test_busy_first_read_retries_until_the_board_frees(clock):
++    calls: list[str] = []
++    read = _reader({"a": 3}, calls, cost=0.5, clock=clock)
++    out = busy.session_tasks(Path("a"), ["s1"], ("running",), read, deadline=clock.now + 3.0)
++    assert [t["id"] for t in out] == ["t-a"] and calls == ["a"] * 4
++
++
++def test_no_deadline_never_retries(clock):
++    calls: list[str] = []
++    with pytest.raises(sqlite3.OperationalError):
++        busy.session_tasks(Path("a"), ["s1"], ("running",), _reader({"a": 1}, calls), deadline=None)
++    assert calls == ["a"] and clock.sleeps == []
++
++
++def test_non_busy_error_is_not_retried(clock):
++    calls: list[str] = []
++
++    def read(path, ids, statuses):
++        calls.append(str(path))
++        raise sqlite3.OperationalError("no such table: tasks")
++
++    with pytest.raises(sqlite3.OperationalError, match="no such table"):
++        busy.session_tasks(Path("a"), ["s1"], ("running",), read, deadline=clock.now + 3.0)
++    assert calls == ["a"] and clock.sleeps == []
++
++
++def test_an_instant_busy_error_pauses_instead_of_spinning(clock):
++    calls: list[str] = []
++    start = clock.now
++    with pytest.raises(sqlite3.OperationalError):
++        busy.session_tasks(Path("a"), ["s1"], ("running",), _reader({"a": 10**6}, calls), deadline=start + 3.0)
++    assert clock.sleeps and all(0 < s <= busy.FIRST_READ_RETRY_PAUSE_S for s in clock.sleeps)
++    assert len(calls) <= int(3.0 / busy.FIRST_READ_RETRY_PAUSE_S) + 2
++    assert clock.now - start <= 3.0 + 1e-9
++
++
++def test_several_busy_boards_share_one_budget(clock):
++    """Two boards that never free up: the second gets only what the first left, so the total stays bounded."""
++    calls: list[str] = []
++    read = _reader({"a": 10**6, "b": 10**6}, calls, cost=0.5, clock=clock)
++    start = clock.now
++    deadline = start + 3.0
++    for p in ("a", "b"):
++        with pytest.raises(sqlite3.OperationalError):
++            busy.session_tasks(Path(p), ["s1"], ("running",), read, deadline=deadline)
++    assert calls.count("b") == 1  # the budget was spent on "a": "b" fails after one read
++    assert clock.now - start <= 3.0 + 0.5 + 0.5 + 1e-9  # budget + the last in-flight read + b's single read
++
++
++def test_request_shares_one_deadline_across_boards(tmp_path, monkeypatch):
++    seen: list[float | None] = []
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [tmp_path / "a", tmp_path / "b", tmp_path / "c"])
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [])
++    monkeypatch.setattr(ksa._busy, "session_tasks",
++                        lambda path, ids, statuses, read, *, deadline=None: seen.append(deadline) or [])
++    ksa.session_tasks(["s1"])
++    assert len(seen) == 3 and seen[0] is not None and len(set(seen)) == 1
++
++
++def test_links_projection_never_waits_on_a_busy_board(tmp_path, monkeypatch):
++    seen: list[float | None] = []
++    db = tmp_path / "kanban.db"
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [db])
++
++    def fake(path, ids, statuses, read, *, deadline=None):
++        seen.append(deadline)
++        raise gen.BoardLifecycleBusy()
++
++    monkeypatch.setattr(ksa._busy, "session_tasks", fake)
++    rows = [{"gateway": "g", "profile": "p", "board": "default", "id": "t1", "key": "g/default/t1",
++             "session": "s1", "origin_session": "s1"}]
++    with pytest.raises(sqlite3.OperationalError):
++        ksa._without_local_open_duplicates(rows, gateway="g", profile="p")
++    assert seen == [None]
+-- 
+2.55.0
+

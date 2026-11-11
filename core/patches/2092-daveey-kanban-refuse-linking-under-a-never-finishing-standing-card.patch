@@ -1,0 +1,221 @@
+From 3f92fafd39785d26f44bec05381bf53172beb839 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 05:42:42 +0000
+Subject: [PATCH] [daveey] kanban: refuse linking under a never-finishing
+ standing card
+
+A child linked under a 'Standing:' card (or one re-parked >5 times in 72 h
+without completing) waits forever while health checks see a validly
+scheduled parent (agent-0fddefc2d0: Ask Eve rollout stuck 8 days). The
+error names wake_check / human_request instead.
+---
+ hermes_cli/kanban_db.py                       |   5 +-
+ hermes_cli/kanban_dependency_validation.py    |  10 ++
+ hermes_cli/kanban_standing_parent.py          |  46 ++++++++
+ .../test_kanban_standing_parent_link.py       | 100 ++++++++++++++++++
+ 4 files changed, 158 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_standing_parent.py
+ create mode 100644 tests/hermes_cli/test_kanban_standing_parent_link.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8613e65fe39..99984ea0c14 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1587,7 +1587,7 @@ def link_tasks(
+         raise ValueError("a task cannot depend on itself")
+     gated = False
+     with write_txn(conn):
+-        from hermes_cli.kanban_dependency_validation import missing_dependency_error, would_cycle
++        from hermes_cli.kanban_dependency_validation import check_link_parent, missing_dependency_error
+         missing = _missing_task_ids(conn, [parent_id, child_id])
+         if missing:
+             raise missing_dependency_error(missing)
+@@ -1599,8 +1599,7 @@ def link_tasks(
+             or child["current_run_id"] != expected_child_run_id
+         ):
+             raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
+-        if would_cycle(conn, parent_id, child_id):
+-            raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
++        check_link_parent(conn, parent_id, child_id)  # cycles; standing parents [daveey]
+         _link(conn, parent_id, child_id)
+         # If child was ready but parent is not yet terminal, demote child to todo
+         # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
+diff --git a/hermes_cli/kanban_dependency_validation.py b/hermes_cli/kanban_dependency_validation.py
+index 30fec3ddb58..210dfb67adc 100644
+--- a/hermes_cli/kanban_dependency_validation.py
++++ b/hermes_cli/kanban_dependency_validation.py
+@@ -39,3 +39,13 @@ def validate_dependency_block(conn, task_id, kind):
+     missing = [parent for parent, state in parent_states(conn, task_id) if state is None]
+     if missing:
+         raise missing_dependency_error(missing)
++
++
++def check_link_parent(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
++    """Refuse an edge that would cycle or hang under a never-finishing standing card. [daveey]"""
++    if would_cycle(conn, parent_id, child_id):
++        raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
++    from hermes_cli.kanban_standing_parent import standing_parent_error, standing_reason
++    standing = standing_reason(conn, parent_id)
++    if standing:
++        raise standing_parent_error(parent_id, child_id, standing)
+diff --git a/hermes_cli/kanban_standing_parent.py b/hermes_cli/kanban_standing_parent.py
+new file mode 100644
+index 00000000000..47e9d61811f
+--- /dev/null
++++ b/hermes_cli/kanban_standing_parent.py
+@@ -0,0 +1,46 @@
++"""Refuse a never-finishing "standing" card as a dependency parent. [daveey]
++
++A standing card (a permanent listener: "Standing: support Eve", a hand-off watcher) re-parks itself forever
++and never reaches ``done``, so a child linked under it waits forever while every health check sees a validly
++scheduled parent (defect agent-0fddefc2d0: the Ask Eve rollout card sat in ``todo`` for 8 days). A wait on
++an event is a ``kanban_schedule`` park with a ``wake_check``; a wait on a person is a ``human_request`` block.
++
++Standing = not done/archived, and either the title starts with "Standing:" or the card ended more than
++``REPARK_LIMIT`` runs as ``scheduled`` in the last ``REPARK_WINDOW_S`` seconds (an active re-park cycle with
++no completion in that window).
++"""
++from __future__ import annotations
++
++import sqlite3
++import time
++from typing import Optional
++
++REPARK_LIMIT = 5
++REPARK_WINDOW_S = 72 * 3600
++TITLE_PREFIX = "standing:"
++
++
++def standing_reason(conn: sqlite3.Connection, task_id: str, *, now: Optional[float] = None) -> Optional[str]:
++    """Why ``task_id`` is a standing card, or None when it is an ordinary (finishable) parent."""
++    row = conn.execute("SELECT title, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or row["status"] in ("done", "archived"):
++        return None
++    if (row["title"] or "").strip().lower().startswith(TITLE_PREFIX):
++        return "its title starts with 'Standing:'"
++    since = int((now if now is not None else time.time()) - REPARK_WINDOW_S)
++    parks = conn.execute(
++        "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND outcome = 'scheduled' AND ended_at >= ?",
++        (task_id, since),
++    ).fetchone()[0]
++    if parks > REPARK_LIMIT:
++        return f"it re-parked {parks} times in the last 72 h without completing"
++    return None
++
++
++def standing_parent_error(parent_id: str, child_id: str, reason: str) -> ValueError:
++    return ValueError(
++        f"cannot link {parent_id} -> {child_id}: {parent_id} is a standing card ({reason}); it never "
++        "finishes, so the child would wait forever. Wait on an event with kanban_schedule(wake_check=...) "
++        "(a probe on the reply/file/row you expect; it sends nothing), or on a person with "
++        "kanban_block(kind='needs_input', human_request={...}). Wakes are not messages."
++    )
+diff --git a/tests/hermes_cli/test_kanban_standing_parent_link.py b/tests/hermes_cli/test_kanban_standing_parent_link.py
+new file mode 100644
+index 00000000000..1abae28822a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_standing_parent_link.py
+@@ -0,0 +1,100 @@
++"""kanban_link refuses a never-finishing standing card as a parent. [daveey]
++
++Defect agent-0fddefc2d0: the Ask Eve rollout card t_01a18e12cdcab970 sat in ``todo`` for 8 days because an
++agent linked it under t_01a184cee94603eb ("Standing: support Eve"), a permanent listener that re-parks
++forever and never completes, as a "dependency hold". A link to such a card is a silent forever-hold; the
++right tools are a wake_check park (an event) or a human_request block (a person). ``link_tasks`` now refuses a
++parent that is standing: its title starts with "Standing:", or it re-parked more than 5 times in the last
++72 h without completing. Both the db entry point and the ``kanban_link`` tool are covered.
++"""
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _parks(conn, task_id, n, *, age_s):
++    now = int(time.time())
++    with kbc.write_txn(conn):
++        for i in range(n):
++            conn.execute(
++                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
++                "VALUES (?, 'default', 'scheduled', ?, ?, 'scheduled')",
++                (task_id, now - age_s - 60 - i, now - age_s - i))
++
++
++def _pair(conn, parent_title):
++    parent = kb.create_task(conn, title=parent_title, assignee="default")
++    child = kb.create_task(conn, title="rollout: wait for Eve's evidence", assignee="default")
++    return parent, child
++
++
++def test_standing_title_parent_refused(kanban_home):
++    with kbc.connect() as conn:
++        parent, child = _pair(conn, "Standing: support Eve on Ask Eve")
++        with pytest.raises(ValueError) as err:
++            kb.link_tasks(conn, parent, child)
++        msg = str(err.value)
++        assert "standing" in msg.lower() and "wake_check" in msg and "human_request" in msg
++        assert kb.parent_ids(conn, child) == []
++
++
++def test_frequently_reparked_parent_refused(kanban_home):
++    with kbc.connect() as conn:
++        parent, child = _pair(conn, "hub side of Alpha hand-offs")
++        _parks(conn, parent, 6, age_s=3600)
++        with pytest.raises(ValueError, match="wake_check"):
++            kb.link_tasks(conn, parent, child)
++        assert kb.parent_ids(conn, child) == []
++
++
++def test_normal_parent_still_links(kanban_home):
++    with kbc.connect() as conn:
++        parent, child = _pair(conn, "Ask Eve PR6: admin settings page")
++        _parks(conn, parent, 5, age_s=3600)          # 5 recent parks is not "more than 5"
++        kb.link_tasks(conn, parent, child)
++        assert kb.parent_ids(conn, child) == [parent]
++
++
++def test_old_parks_do_not_count(kanban_home):
++    with kbc.connect() as conn:
++        parent, child = _pair(conn, "rollout card that waited on Eve last week")
++        _parks(conn, parent, 9, age_s=4 * 86400)     # all outside the 72 h window
++        kb.link_tasks(conn, parent, child)
++        assert kb.parent_ids(conn, child) == [parent]
++
++
++def test_kanban_link_tool_refuses_standing_parent(kanban_home):
++    from tools.registry import registry
++    import tools.kanban_tools  # registers the tools
++    assert tools.kanban_tools
++
++    with kbc.connect() as conn:
++        parent, child = _pair(conn, "Standing: support Eve on Ask Eve")
++        normal, child2 = _pair(conn, "ordinary parent")
++    tool = registry.get_entry("kanban_link")
++    assert tool is not None
++    out = json.loads(tool.handler({"parent_id": parent, "child_id": child}))
++    assert out.get("error") and "wake_check" in out["error"], out
++    ok = json.loads(tool.handler({"parent_id": normal, "child_id": child2}))
++    assert not ok.get("error"), ok
++    with kbc.connect() as conn:
++        assert kb.parent_ids(conn, child) == []
++        assert kb.parent_ids(conn, child2) == [normal]
+-- 
+2.55.0
+

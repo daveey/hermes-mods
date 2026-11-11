@@ -1,0 +1,346 @@
+From 1250b3a5eafdbf4925ef086f545cece782af02bc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:16:33 +0000
+Subject: [PATCH] fix(outcome): preserve completion intent and bind cron
+ release stores [daveey]
+
+---
+ cron/session_ownership.py                     |  99 ++++++++++--
+ hermes_state_outcome.py                       |  17 +-
+ .../hermes_state/test_outcome_cron_release.py | 147 +++++++++++++++++-
+ 3 files changed, 241 insertions(+), 22 deletions(-)
+
+diff --git a/cron/session_ownership.py b/cron/session_ownership.py
+index 4a7ef8eb8cf..c3da7257cb4 100644
+--- a/cron/session_ownership.py
++++ b/cron/session_ownership.py
+@@ -1,10 +1,43 @@
+ """Release conversation ownership without changing a job's execution contract."""
++import json
+ from datetime import UTC, datetime
++from pathlib import Path
+ 
+ from cron import jobs
+ from hermes_cli.cron_session_activity import _job_is_live
+ 
+ 
++def store_homes(db) -> list[Path]:
++    """Resolve only the DB's installation, never ambient HERMES_HOME."""
++    home = Path(db.db_path).resolve().parent
++    root = home.parent.parent if home.parent.name == "profiles" else home
++    return list(dict.fromkeys([home, root, *(p.parent.parent for p in sorted(root.glob("profiles/*/cron/jobs.json")))]))
++
++
++def release_for_database(db, session_ids: list[str], *, keep: bool = False) -> tuple[list[dict], list[str]]:
++    released, errors = [], []
++    for home in store_homes(db):
++        if not (home / "cron" / "jobs.json").exists():
++            continue
++        try:
++            with jobs.use_cron_store(home):
++                if keep:
++                    with jobs._jobs_lock():
++                        records = jobs.load_jobs()
++                        changed = False
++                        for job in records:
++                            if job.get("owner_session_id") in session_ids and not job.get("owner_retained"):
++                                job["owner_retained"] = True
++                                changed = True
++                        if changed:
++                            jobs.save_jobs(records)
++                else:
++                    released.extend(release_session_jobs(session_ids))
++        except (OSError, RuntimeError, ValueError) as exc:
++            errors.append(f"{home}: {exc}")
++    return released, errors
++
++
+ def release_session_jobs(session_ids: list[str]) -> list[dict]:
+     """Revalidate owners under the store lock; preserve every scheduling field."""
+     released = []
+@@ -30,18 +63,54 @@ def release_done_owners(db, *, apply: bool = False) -> list[dict]:
+     """
+     from hermes_state_outcome import get_outcome
+ 
+-    with jobs._jobs_lock():
+-        records = jobs.load_jobs()
+-        owners = set()
+-        plan = []
+-        for job in records:
+-            owner = job.get("owner_session_id")
+-            if not owner or not _job_is_live(job):
+-                continue
+-            outcome = get_outcome(owner, db=db) or {}
+-            if outcome.get("kind") == "done" and not outcome.get("keep_crons"):
+-                owners.add(owner)
+-                plan.append({"id": job["id"], "name": job.get("name") or job["id"]})
+-        if apply:
+-            return release_session_jobs(list(owners))
+-        return plan
++    plan = []
++    for home in store_homes(db):
++        if not (home / "cron" / "jobs.json").exists():
++            continue
++        with jobs.use_cron_store(home), jobs._jobs_lock():
++            if apply:
++                records = jobs.load_jobs()
++            else:
++                data = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8-sig"))
++                records = data.get("jobs", []) if isinstance(data, dict) else data
++                if not isinstance(records, list) or any(not isinstance(j, dict) for j in records):
++                    raise ValueError("Invalid cron records; migration will not repair them")
++            changed = False
++            for job in records:
++                owner = job.get("owner_session_id")
++                if not owner or not _job_is_live(job) or job.get("owner_retained"):
++                    continue
++                outcome = get_outcome(owner, db=db) or {}
++                if outcome.get("kind") != "done" or outcome.get("keep_crons"):
++                    continue
++                plan.append({"id": job["id"], "name": job.get("name") or job["id"],
++                             "owner_session_id": owner, "store": str(home / "cron" / "jobs.json")})
++                if apply:
++                    job["owner_session_id"] = None
++                    job["released_from"] = owner
++                    job["released_at"] = datetime.now(UTC).isoformat()
++                    changed = True
++            if changed:
++                jobs.save_jobs(records)
++    return plan
++
++
++def main(argv=None) -> int:
++    """``python -m cron.session_ownership --db HOME/state.db [--apply]``."""
++    import argparse
++    from hermes_state import SessionDB
++
++    parser = argparse.ArgumentParser(description="Release stored-done cron owners; dry-run by default.")
++    parser.add_argument("--db", type=Path, required=True)
++    parser.add_argument("--apply", action="store_true")
++    args = parser.parse_args(argv)
++    if not args.db.is_file():
++        parser.error("--db must name an existing session database")
++    with SessionDB(db_path=args.db) as db:
++        plan = release_done_owners(db, apply=args.apply)
++    print(json.dumps({"apply": args.apply, "jobs": plan}, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 1e926db336b..863e0bab045 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -576,7 +576,8 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     crons = _guarded("cron", sid, lambda: _cron_items(_lineage_ids(db, sid)), [])
+     named = {"crons": crons} if crons else {}
+     if holds and declared.get("kind") in ("done", "waiting"):
+-        return {**declared, **(named if declared.get("kind") == "done" else {})}
++        return {**{k: v for k, v in declared.items() if k != "crons"},
++                **(named if declared.get("kind") == "done" else {})}
+     if not tail:
+         return _outcome("unresolved", now, reason="empty", **carry)
+     reason = _tail_reason(tail)
+@@ -630,12 +631,16 @@ def declare_outcome(sid: str, outcome: dict, *, db: Any = None) -> dict[str, Any
+         tip = _tip(handle, sid)
+         if _row(handle, tip) is None:
+             raise ValueError(f"unknown session {sid}")
+-        if declared["kind"] == "done" and not declared.get("keep_crons"):
+-            from cron.jobs import use_cron_store
+-            from cron.session_ownership import release_session_jobs
++        # Persist intent before touching the separate cron store. A failed DB
++        # write must never release ownership without a completion receipt.
++        _write(handle, tip, declared)
++        if declared["kind"] == "done":
++            from cron.session_ownership import release_for_database
+ 
+-            with use_cron_store(Path(handle.db_path).parent):
+-                declared["released_crons"] = release_session_jobs(_lineage_ids(handle, tip))
++            declared["released_crons"], errors = release_for_database(
++                handle, _lineage_ids(handle, tip), keep=bool(declared.get("keep_crons")))
++            if errors:
++                declared["cron_release_error"] = "; ".join(errors)
+         _write(handle, tip, declared)
+     return declared
+ 
+diff --git a/tests/hermes_state/test_outcome_cron_release.py b/tests/hermes_state/test_outcome_cron_release.py
+index 5b98a50e448..a881f4cce87 100644
+--- a/tests/hermes_state/test_outcome_cron_release.py
++++ b/tests/hermes_state/test_outcome_cron_release.py
+@@ -1,4 +1,8 @@
+ """Declaring done ends ownership, not execution, of standing cron jobs."""
++import sqlite3
++
++import pytest
++
+ from cron import jobs
+ from hermes_cli import cron_session_activity
+ from hermes_state import SessionDB
+@@ -25,6 +29,50 @@ def test_done_releases_live_cron_without_changing_execution(tmp_path, monkeypatc
+                     assert after[key] == before[key], key
+ 
+ 
++def test_failed_declaration_write_does_not_release_jobs(tmp_path, monkeypatch):
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        before = jobs.get_job(job["id"])
++
++        def fail_write(*args):
++            raise sqlite3.OperationalError("injected write failure")
++
++        monkeypatch.setattr(outcomes, "_write", fail_write)
++        with pytest.raises(sqlite3.OperationalError, match="injected"):
++            outcomes.declare_outcome("chat", {"kind": "done", "summary": "Finished."}, db=db)
++        assert jobs.get_job(job["id"]) == before
++
++
++def test_corrupt_cron_store_reports_partial_completion(tmp_path):
++    cron_file = tmp_path / "cron" / "jobs.json"
++    cron_file.parent.mkdir()
++    cron_file.write_text("broken json", encoding="utf-8")
++    with SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        result = outcomes.declare_outcome("chat", {"kind": "done", "summary": "Finished."}, db=db)
++        assert result["kind"] == "done"
++        assert result["cron_release_error"]
++        assert outcomes.get_outcome("chat", db=db) == result
++    assert cron_file.read_text(encoding="utf-8") == "broken json"
++
++
++def test_done_releases_cross_profile_owner_not_unrelated_jobs(tmp_path, monkeypatch):
++    profile = tmp_path / "profiles" / "other"
++    profile.mkdir(parents=True)
++    with jobs.use_cron_store(profile):
++        owned = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        unrelated = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="someone-else")
++    monkeypatch.setattr(cron_session_activity, "_jobs_paths", lambda: [profile / "cron" / "jobs.json"])
++    with SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        result = outcomes.declare_outcome("chat", {"kind": "done", "summary": "Finished."}, db=db)
++        assert [j["id"] for j in result["released_crons"]] == [owned["id"]]
++        assert outcomes._cron_items(["chat"]) == []
++    with jobs.use_cron_store(profile):
++        assert jobs.get_job(unrelated["id"]) == unrelated
++
++
+ def test_done_can_keep_cron_ownership(tmp_path):
+     with jobs.use_cron_store(tmp_path):
+         job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
+@@ -32,7 +80,8 @@ def test_done_can_keep_cron_ownership(tmp_path):
+         with SessionDB(db_path=tmp_path / "state.db") as db:
+             db.create_session("chat", source="desktop")
+             result = outcomes.declare_outcome("chat", {"kind": "done", "summary": "Watching.", "keep_crons": True}, db=db)
+-            assert jobs.get_job(job["id"]) == before
++            assert before is not None
++            assert jobs.get_job(job["id"]) == {**before, "owner_retained": True}
+             assert result["keep_crons"] is True
+ 
+ 
+@@ -50,6 +99,102 @@ def test_audit_flags_stored_done_with_live_cron(tmp_path, monkeypatch):
+             assert row["on"][0]["id"] == job["id"]
+ 
+ 
++def test_migration_preserves_keep_intent_after_outcome_replaced(tmp_path):
++    from cron import session_ownership
++
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Watching.", "keep_crons": True}, db=db)
++        outcomes._write(db, "chat", {"kind": "done", "source": "derived", "summary": "Later followup complete."})
++        assert session_ownership.release_done_owners(db, apply=True) == []
++        assert jobs.get_job(job["id"])["owner_session_id"] == "chat"
++        # A later explicit done without keep is an intentional release.
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Stop owning the watch."}, db=db)
++        assert not jobs.get_job(job["id"])["owner_session_id"]
++
++
++def test_migration_binds_database_and_releases_only_planned_jobs(tmp_path):
++    from cron import session_ownership
++
++    home = tmp_path / "installation"
++    home.mkdir()
++    with jobs.use_cron_store(home), SessionDB(db_path=home / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        kept = jobs.create_job(prompt="Keep", schedule="every 1h", owner_session_id="chat")
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Watching.", "keep_crons": True}, db=db)
++        fresh = jobs.create_job(prompt="Release", schedule="every 1h", owner_session_id="chat")
++        outcomes._write(db, "chat", {"kind": "done", "source": "derived", "summary": "Finished."})
++        with jobs.use_cron_store(tmp_path):
++            foreign = jobs.create_job(prompt="Foreign", schedule="every 1h", owner_session_id="chat")
++            plan = session_ownership.release_done_owners(db)
++            assert [r["id"] for r in plan] == [fresh["id"]]
++            assert plan[0]["owner_session_id"] == "chat"
++            assert session_ownership.release_done_owners(db, apply=True) == plan
++            assert jobs.get_job(foreign["id"]) == foreign
++        assert jobs.get_job(kept["id"])["owner_session_id"] == "chat"
++        assert not jobs.get_job(fresh["id"])["owner_session_id"]
++
++
++def test_migration_dry_run_does_not_repair_legacy_store(tmp_path):
++    import json
++    from cron import session_ownership
++
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Finished."}, db=db)
++        job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        path = tmp_path / "cron" / "jobs.json"
++        raw = json.dumps([job])
++        path.write_text(raw, encoding="utf-8")
++        assert session_ownership.release_done_owners(db)[0]["id"] == job["id"]
++        assert path.read_text(encoding="utf-8") == raw
++
++
++def test_migration_cli_lists_owners_before_apply(tmp_path, capsys):
++    import json
++    from cron import session_ownership
++
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Finished."}, db=db)
++        job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        args = ["--db", str(tmp_path / "state.db")]
++        assert session_ownership.main(args) == 0
++        report = json.loads(capsys.readouterr().out)
++        assert report["apply"] is False
++        assert report["jobs"][0]["owner_session_id"] == "chat"
++        assert jobs.get_job(job["id"])["owner_session_id"] == "chat"
++        assert session_ownership.main([*args, "--apply"]) == 0
++        assert json.loads(capsys.readouterr().out)["apply"] is True
++        assert not jobs.get_job(job["id"])["owner_session_id"]
++
++
++def test_refresh_removes_migrated_cron_from_stored_declaration(tmp_path, monkeypatch):
++    from cron import session_ownership
++
++    monkeypatch.setattr(cron_session_activity, "_jobs_paths", lambda: [tmp_path / "cron" / "jobs.json"])
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Finished."}, db=db)
++        job = jobs.create_job(prompt="Check", schedule="every 1h", owner_session_id="chat")
++        assert outcomes.refresh_outcome("chat", "turn_end", db=db)["crons"][0]["id"] == job["id"]
++        session_ownership.release_done_owners(db, apply=True)
++        refreshed = outcomes.refresh_outcome("chat", "turn_end", db=db)
++        assert refreshed["kind"] == "done"
++        assert not refreshed.get("crons")
++
++
++def test_keep_does_not_write_unrelated_store(tmp_path, monkeypatch):
++    with jobs.use_cron_store(tmp_path), SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("chat", source="desktop")
++        jobs.create_job(prompt="Other", schedule="every 1h", owner_session_id="other")
++        def reject_save(*args, **kwargs):
++            pytest.fail("unrelated cron store was rewritten")
++        monkeypatch.setattr(jobs, "save_jobs", reject_save)
++        outcomes.declare_outcome("chat", {"kind": "done", "summary": "Watching.", "keep_crons": True}, db=db)
++
++
+ def test_migration_is_dry_by_default_and_preserves_non_done_owners(tmp_path):
+     from cron import session_ownership
+ 
+-- 
+2.55.0
+

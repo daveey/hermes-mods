@@ -1,0 +1,350 @@
+From 88b25221eeb43a2d4354891035a7d54a6fe97f58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:06:16 +0000
+Subject: [PATCH] [daveey] stall guard: a short reply ending on ':' with zero
+ tool calls re-prompts
+
+A reply like 'Reading the card first, together with the PR:' announced its next
+step and stopped (defect agent-b6540f8eef); trailing_continue_intent() only knew
+'let me now / I'll now / next, I'. trailing_colon_handoff() treats a <=400-char
+prose reply whose last character is ':' (not inside an open code fence) as a stall
+when tools are offered and the turn made no tool calls. Same bounded counter (max
+2 re-prompts) and the same 'Stall guard: turn ending on trailing continue-intent'
+log line.
+---
+ agent/agent_runtime_helpers.py   |  58 +---------------
+ agent/stall_tail_detectors.py    |  79 ++++++++++++++++++++++
+ agent/turn_final_response.py     |  11 ++--
+ tests/agent/test_stall_guards.py | 110 ++++++++++++++++++++++++++++++-
+ 4 files changed, 197 insertions(+), 61 deletions(-)
+ create mode 100644 agent/stall_tail_detectors.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 31c7f6822a8..0ffc044d59d 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -3357,62 +3357,8 @@ def tool_results_this_turn(messages: list[dict[str, Any]]) -> int:
+     return count
+ 
+ 
+-# Narrow "trailing continue-intent" detector for the stall guard (agent.stall_guards): only the
+-# message TAIL announcing a next action, so mid-sentence "I will" never trips it.
+-_TRAILING_CONTINUE_INTENT_RE = re.compile(
+-    r"(?:\blet me now\b|\bi(?:['\u2019])?ll now\b|\bi will now\b"
+-    r"|\bnow i(?:['\u2019]ll| will)\b|\bnext[,:] i\b)"
+-    r"[^.!?\n]{0,100}[.:\u2026]?\s*$", re.IGNORECASE,
+-)
+-
+-# Content longer than this is a substantive reply, not a dangling ack.
+-_TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
+-
+-
+-def trailing_continue_intent(text: str) -> bool:
+-    """Whether ``text`` is a short reply ENDING on an announced next action (stall-guard re-prompt trigger)."""
+-    t = (text or "").strip()
+-    if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
+-        return False
+-    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
+-
+-
+-# Broader tail detector for PROMOTED REASONING only (reasoning-only clean stop with tools offered
+-# and no tool call). Visible content keeps the narrow ``let me now`` shape above because a real
+-# reply legitimately says "I'll" mid-text; chain-of-thought that ENDS on a first-person plan
+-# ("Let me batch the terminal calls and run them in parallel.", "I need to check the log.") is a
+-# stalled model whose turn would otherwise report "complete" with zero tool calls (#111761).
+-# Tail-only and anchored on the last sentence, so reasoning that merely mentions a plan before
+-# stating its answer ("...Let me check. The answer is 42.") still promotes.
+-# Thai (unsegmented script, so no \b after the trigger, unlike the English group) shares the same
+-# tail shape: a first-person future-action marker immediately followed by more Thai text, often
+-# preceded by an em/en dash rather than sentence punctuation (#116495). Trigger glosses, in
+-# pattern order: "I will give you" / "I will", "next I('ll)" + one of {start,try,check,fix,send,
+-# do,look}, "please let me" + one of {start,try,check,fix,send,do,look}, "I('ll)" + one of
+-# {start,try,check,fix,send,do,look,run,fire}.
+-_PROMOTED_REASONING_PLAN_TAIL_RE = re.compile(
+-    r"(?:^|[.!?:\u3002\uff01\uff1f\u2014\u2013\n]\s*|\u2026\s*)"
+-    r"(?:let(?:['\u2019]s| me)\b|i(?:['\u2019]ll| will| need to| should| am going to|['\u2019]m going to)\b"
+-    r"|next[,:]? i\b|now i(?:['\u2019]ll| will| need to)\b|first[,:]? i(?:['\u2019]ll| will| need to)\b"
+-    r"|\u0e08\u0e30\u0e43\u0e2b\u0e49\u0e1c\u0e21|\u0e1c\u0e21\u0e08\u0e30"
+-    r"|\u0e15\u0e48\u0e2d\u0e44\u0e1b(?:\u0e08\u0e30|\u0e1c\u0e21\u0e08\u0e30)"
+-    r"|\u0e02\u0e2d(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39)"
+-    r"|\u0e08\u0e30(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39|\u0e23\u0e31\u0e19|\u0e22\u0e34\u0e07))"
+-    r"[^.!?\n\u3002\uff01\uff1f]{0,160}(?:[.:\u2026]+)?\s*$",
+-    re.IGNORECASE,
+-)
+-
+-
+-def promoted_reasoning_announces_action(text: str) -> bool:
+-    """Whether promoted reasoning ENDS on a first-person plan to act (stall, not an answer).
+-
+-    No overall length cap: the reasoning block of a stalled model is often 300-1600 chars of
+-    planning monologue; only the tail decides.
+-    """
+-    t = (text or "").strip()
+-    if not t:
+-        return False
+-    return bool(_PROMOTED_REASONING_PLAN_TAIL_RE.search(t[-240:]))
++# Moved to agent.stall_tail_detectors; re-exported for existing importers.
++from agent.stall_tail_detectors import promoted_reasoning_announces_action, trailing_continue_intent
+ 
+ 
+ _INTENT_ACK_ON = {"true", "always", "yes", "on"}
+diff --git a/agent/stall_tail_detectors.py b/agent/stall_tail_detectors.py
+new file mode 100644
+index 00000000000..a39390c4603
+--- /dev/null
++++ b/agent/stall_tail_detectors.py
+@@ -0,0 +1,79 @@
++"""Stall-guard tail detectors: does a text stop END on an announced next action instead of an answer?
++
++Split out of ``agent.agent_runtime_helpers`` (which re-exports the two older names). Callers:
++``agent.turn_final_response.finish_text_response`` (the said-continue-but-stopped re-prompt).
++"""
++
++import re
++
++
++# Narrow "trailing continue-intent" detector for the stall guard (agent.stall_guards): only the
++# message TAIL announcing a next action, so mid-sentence "I will" never trips it.
++_TRAILING_CONTINUE_INTENT_RE = re.compile(
++    r"(?:\blet me now\b|\bi(?:['\u2019])?ll now\b|\bi will now\b"
++    r"|\bnow i(?:['\u2019]ll| will)\b|\bnext[,:] i\b)"
++    r"[^.!?\n]{0,100}[.:\u2026]?\s*$", re.IGNORECASE,
++)
++
++# Content longer than this is a substantive reply, not a dangling ack.
++_TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
++
++
++def trailing_continue_intent(text: str) -> bool:
++    """Whether ``text`` is a short reply ENDING on an announced next action (stall-guard re-prompt trigger)."""
++    t = (text or "").strip()
++    if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
++        return False
++    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
++
++
++def trailing_colon_handoff(text: str) -> bool:
++    """Whether a short reply ENDS on ":" in prose — an announced next step, never a finished answer.
++
++    "Reading the card first, together with the PR:" or "Checking the PR now:" with no tool call is a
++    stalled model (defect agent-b6540f8eef): the narrow phrase list above misses every plain
++    wording, but the dangling colon is the signal itself. A colon inside an unclosed code fence is
++    code (``key:``), not a hand-off. The caller also requires zero tool calls this turn.
++    """
++    t = (text or "").rstrip()
++    if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS or not t.endswith(":"):
++        return False
++    return t.count("```") % 2 == 0
++
++
++# Broader tail detector for PROMOTED REASONING only (reasoning-only clean stop with tools offered
++# and no tool call). Visible content keeps the narrow ``let me now`` shape above because a real
++# reply legitimately says "I'll" mid-text; chain-of-thought that ENDS on a first-person plan
++# ("Let me batch the terminal calls and run them in parallel.", "I need to check the log.") is a
++# stalled model whose turn would otherwise report "complete" with zero tool calls (#111761).
++# Tail-only and anchored on the last sentence, so reasoning that merely mentions a plan before
++# stating its answer ("...Let me check. The answer is 42.") still promotes.
++# Thai (unsegmented script, so no \b after the trigger, unlike the English group) shares the same
++# tail shape: a first-person future-action marker immediately followed by more Thai text, often
++# preceded by an em/en dash rather than sentence punctuation (#116495). Trigger glosses, in
++# pattern order: "I will give you" / "I will", "next I('ll)" + one of {start,try,check,fix,send,
++# do,look}, "please let me" + one of {start,try,check,fix,send,do,look}, "I('ll)" + one of
++# {start,try,check,fix,send,do,look,run,fire}.
++_PROMOTED_REASONING_PLAN_TAIL_RE = re.compile(
++    r"(?:^|[.!?:\u3002\uff01\uff1f\u2014\u2013\n]\s*|\u2026\s*)"
++    r"(?:let(?:['\u2019]s| me)\b|i(?:['\u2019]ll| will| need to| should| am going to|['\u2019]m going to)\b"
++    r"|next[,:]? i\b|now i(?:['\u2019]ll| will| need to)\b|first[,:]? i(?:['\u2019]ll| will| need to)\b"
++    r"|\u0e08\u0e30\u0e43\u0e2b\u0e49\u0e1c\u0e21|\u0e1c\u0e21\u0e08\u0e30"
++    r"|\u0e15\u0e48\u0e2d\u0e44\u0e1b(?:\u0e08\u0e30|\u0e1c\u0e21\u0e08\u0e30)"
++    r"|\u0e02\u0e2d(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39)"
++    r"|\u0e08\u0e30(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39|\u0e23\u0e31\u0e19|\u0e22\u0e34\u0e07))"
++    r"[^.!?\n\u3002\uff01\uff1f]{0,160}(?:[.:\u2026]+)?\s*$",
++    re.IGNORECASE,
++)
++
++
++def promoted_reasoning_announces_action(text: str) -> bool:
++    """Whether promoted reasoning ENDS on a first-person plan to act (stall, not an answer).
++
++    No overall length cap: the reasoning block of a stalled model is often 300-1600 chars of
++    planning monologue; only the tail decides.
++    """
++    t = (text or "").strip()
++    if not t:
++        return False
++    return bool(_PROMOTED_REASONING_PLAN_TAIL_RE.search(t[-240:]))
+diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
+index 885c61904f6..9da9f8b6d72 100644
+--- a/agent/turn_final_response.py
++++ b/agent/turn_final_response.py
+@@ -14,6 +14,9 @@ from typing import Any, Callable, Dict, Optional
+ from agent.message_metadata import append_message
+ from agent.reasoning_promotion import answer_in_reasoning_capability
+ from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
++from agent.stall_tail_detectors import (
++    promoted_reasoning_announces_action, trailing_colon_handoff, trailing_continue_intent,
++)
+ from agent.stream_delivery import publish_held_final_row
+ from agent.turn_failure_copy import stamp_failure
+ from agent.turn_empty_response import (
+@@ -214,8 +217,7 @@ def finish_text_response(
+     # delivery channel (gateway status message / CLI print). NEVER appended to messages/api_messages:
+     # conversation context and the cached prompt prefix stay byte-identical.
+     from agent.agent_runtime_helpers import (
+-        intent_ack_continuation_mode, looks_like_degenerate_final, promoted_reasoning_announces_action,
+-        tool_results_this_turn, trailing_continue_intent,
++        intent_ack_continuation_mode, looks_like_degenerate_final, tool_results_this_turn,
+     )
+ 
+     _ack_mode = intent_ack_continuation_mode(agent)
+@@ -226,19 +228,20 @@ def finish_text_response(
+     # stalled model, and returning it as the answer aborts the tool loop while reporting
+     # "complete" (#111761). Same cap, so a model that never acts still ends after 2 nudges.
+     _stall_text = agent._strip_think_blocks(final_response or "")
++    _tool_rows = tool_results_this_turn(messages)
+     _stall_continue_intent = (
+         bool(getattr(agent, "_stall_guards", True))
+         and agent.valid_tool_names
+         and codex_ack_continuations < 2
+         and (
+-            trailing_continue_intent(_stall_text)
++            # A short prose reply ending on ":" with zero tool calls this turn is a stall too (agent-b6540f8eef).
++            trailing_continue_intent(_stall_text) or (_tool_rows == 0 and trailing_colon_handoff(_stall_text))
+             or (bool(_promoted) and promoted_reasoning_announces_action(_stall_text))
+         )
+     )
+     # Degenerate-final guard (#103483): the turn did real tool work and then stopped on a
+     # fragment. Same scope knob and the SAME bounded counter as the ack continuation; the nudge
+     # row itself closes the tool-work window, so a second fragment ends the turn as the answer.
+-    _tool_rows = tool_results_this_turn(messages)
+     _degenerate_final = (
+         bool(getattr(agent, "_stall_guards", True))
+         and _ack_mode != "off"
+diff --git a/tests/agent/test_stall_guards.py b/tests/agent/test_stall_guards.py
+index c4b9f54ebbd..68674c9f3fe 100644
+--- a/tests/agent/test_stall_guards.py
++++ b/tests/agent/test_stall_guards.py
+@@ -15,7 +15,11 @@ Two guards, both notice/re-prompt-only:
+ These assert behavior contracts, not message snapshots.
+ """
+ 
+-from agent.agent_runtime_helpers import trailing_continue_intent
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent.stall_tail_detectors import trailing_continue_intent
+ from agent.tool_guardrails import (
+     IDENTICAL_RESULT_STUB_MIN_CHARS,
+     STALL_GUARD_IDENTICAL_CALL_THRESHOLD,
+@@ -485,3 +489,107 @@ def test_promoted_reasoning_detector_ignores_thai_stated_answers():
+         "พรุ่งนี้จะฝนตกทั่วประเทศ",  # "tomorrow it will rain" — not a first-person action verb
+     ):
+         assert not promoted_reasoning_announces_action(text), text
++
++
++# ── colon hand-off stall: a short reply ENDING on ":" with zero tool calls ──────────────────
++# Verbatim tail from defect agent-b6540f8eef: the reply announced its next step and stopped, and
++# the narrow "let me now" detector above returned False for it.
++
++INCIDENT_TAIL = "Verifying this one the same way: \u2026 Reading the card first, together with the PR:"
++
++
++def test_colon_handoff_detector_catches_announced_next_step():
++    from agent.stall_tail_detectors import trailing_colon_handoff
++
++    for text in (INCIDENT_TAIL, "Checking the PR now:", "Let me check the card first:  \n"):
++        assert not trailing_continue_intent(text), text  # the old detector misses every one
++        assert trailing_colon_handoff(text), text
++
++
++def test_colon_handoff_detector_ignores_answers_code_and_long_replies():
++    from agent.stall_tail_detectors import trailing_colon_handoff
++
++    for text in (
++        "Here's the answer: 42.",
++        "Status: green",
++        "",
++        None,
++        "```yaml\nkey:",  # unclosed fence: the colon is code, not prose
++        "Use this:\n```python\nd = {\n    'a':",
++        ("Here is the full analysis. " * 20) + "Next steps:",
++    ):
++        assert not trailing_colon_handoff(text), text
++
++
++@pytest.fixture()
++def colon_agent():
++    from run_agent import AIAgent
++    with (
++        patch("model_tools.get_tool_definitions", return_value=[]),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++    ):
++        agent = AIAgent(
++            api_key="test-key-1234567890", base_url="http://127.0.0.1:8000/v1", model="test/model",
++            provider="vllm", quiet_mode=True, skip_context_files=True, skip_memory=True,
++        )
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.compression_enabled = False
++    agent.save_trajectories = False
++    agent.valid_tool_names = {"terminal", "read_file"}
++    agent._stall_guards = True
++    return agent
++
++
++def _run_colon(agent, responses):
++    agent.client.chat.completions.create.side_effect = list(responses)
++    with (
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++        patch("model_tools.handle_function_call", return_value="ok"),
++    ):
++        return agent.run_conversation("verify this card")
++
++
++@pytest.mark.parametrize("tail", [INCIDENT_TAIL, "Checking the PR now:"])
++def test_colon_tail_with_zero_tool_calls_reprompts(colon_agent, tail):
++    from tests.agent.test_run_agent import _mock_response
++
++    result = _run_colon(colon_agent, [
++        _mock_response(content=tail, finish_reason="stop"),
++        _mock_response(content="Card verified; PR merged.", finish_reason="stop"),
++    ])
++    assert result["api_calls"] == 2
++    assert result["final_response"] == "Card verified; PR merged."
++
++
++def test_colon_tail_stall_is_bounded_by_the_continuation_cap(colon_agent):
++    from tests.agent.test_run_agent import _mock_response
++
++    result = _run_colon(colon_agent, [_mock_response(content=INCIDENT_TAIL, finish_reason="stop") for _ in range(3)]
++                        + [_mock_response(content="NEVER REACHED", finish_reason="stop")])
++    assert result["api_calls"] == 3
++    assert result["final_response"] == INCIDENT_TAIL
++
++
++def test_colon_answer_and_colon_after_tool_calls_do_not_reprompt(colon_agent):
++    from tests.agent.test_run_agent import _mock_response, _mock_tool_call
++
++    result = _run_colon(colon_agent, [
++        _mock_response(content="Here's the answer: 42.", finish_reason="stop"),
++        _mock_response(content="NEVER REACHED", finish_reason="stop"),
++    ])
++    assert result["api_calls"] == 1
++
++    colon_agent.client.chat.completions.create.reset_mock()
++    tc = _mock_tool_call(name="terminal", arguments='{"command": "true"}', call_id="c1")
++    result = _run_colon(colon_agent, [
++        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
++        _mock_response(content="Results are below:", finish_reason="stop"),
++        _mock_response(content="NEVER REACHED", finish_reason="stop"),
++    ])
++    assert result["api_calls"] == 2
++    assert result["final_response"] == "Results are below:"
+-- 
+2.55.0
+

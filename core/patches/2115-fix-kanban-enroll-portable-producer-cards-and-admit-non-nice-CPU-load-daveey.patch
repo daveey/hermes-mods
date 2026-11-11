@@ -1,0 +1,425 @@
+From 5aea8ef7efae656a5dd47debfaeb831a8105a9c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:11:58 +0000
+Subject: [PATCH] fix(kanban): enroll portable producer cards and admit
+ non-nice CPU load [daveey]
+
+---
+ docs/worker-first-v1.md                       |  4 +-
+ hermes_cli/kanban.py                          |  1 +
+ hermes_cli/kanban_db.py                       |  6 +--
+ hermes_cli/kanban_origin_creation.py          |  3 +-
+ hermes_cli/kanban_placement.py                |  1 +
+ hermes_cli/kanban_worker_placement.py         | 29 +++++++++++
+ hermes_cli/machine_cpu_metrics.py             |  6 ++-
+ tests/hermes_cli/test_kanban_placement.py     | 52 +++++++++++++++++++
+ .../test_kanban_worker_placement.py           |  2 +
+ .../test_kanban_worker_policy_db.py           | 51 ++++++++++++++++++
+ tests/hermes_cli/test_machine_cpu_metrics.py  |  9 +++-
+ tools/kanban_tools.py                         |  7 ++-
+ tools/kanban_tools_placement.py               | 16 ++++++
+ website/docs/user-guide/configuration.md      |  2 +-
+ 14 files changed, 179 insertions(+), 10 deletions(-)
+
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+index b096d13063f..6cc9c1886ce 100644
+--- a/docs/worker-first-v1.md
++++ b/docs/worker-first-v1.md
+@@ -15,7 +15,9 @@ Workers always win. The Board reserves the origin hub for a portable card only w
+ 
+ ## Creation and schema
+ 
+-Tool and CLI creation enroll portable light and heavy cards. The shared conservative `portable_reason` preserves scratch/default-board, assignee, carried-option, host/local/skill marker, project and gateway-requirement exclusions. Caller placement and `runs_on` (including `[]`) bypass automatic enrollment. Courier/origin creation keeps its original path. Parent and chat links are not replaced.
++Tool, CLI and direct DB producers enroll portable light and heavy cards, including worker children and origin-bound chats. The shared conservative `portable_reason` preserves scratch/default-board, assignee, carried-option, host/local/skill marker, project and gateway-requirement exclusions. Explicit local/foreign placement and `runs_on` (including `[]`) bypass automatic enrollment. Courier creation keeps its immutable owner placement; a chat origin alone does not pin execution. Parent and chat links are not replaced. The internal `placement_checked` flag preserves a front door's already-resolved decision, including deliberate non-enrollment.
++
++The admission CPU sample measures **non-nice busy**: `100 * (delta_total - delta_idle - delta_iowait - delta_nice) / delta_total`. All positive-nice user CPU is excluded, not only nice >= 10; system, IRQ and steal still count. This does not relax memory, slot, drain or freshness guards. A busy batch workload is not evidence that the host has recovered memory or I/O capacity.
+ 
+ Local SQLite `tasks.placement_policy` is a nullable TEXT migration, included in Task and sync column declarations. `worker-first-v1` is persisted in the first create transaction. Unknown policies and contradictory policy/manual pins are refused. A policy card has no runnable local fallback: ready and review claim paths enforce the fence before requesting a Board lease, even when sync is off/shadow or registry retrieval fails.
+ 
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 8647562aee1..b0a37fe2802 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -538,6 +538,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True, runs_on=getattr(args, "runs_on", None),
+                 placement_policy=cli_policy(args, body, ws_kind, ws_path, board),
++                placement_checked=True, board=board,
+                 placement_audit=cli_audit(args, body, ws_kind, ws_path, board),
+                 insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+             )
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 4c71ad78240..dfbbbc21c8e 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -30,7 +30,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync
+-from hermes_cli.kanban_worker_placement import validate_creation
++from hermes_cli.kanban_worker_placement import resolved_db_policy, validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+@@ -1228,6 +1228,7 @@ def create_task(
+     requires: Optional[list[str]] = None,
+     lint_blocked: bool = True, runs_on: Optional[Iterable[str]] = None, require_declaration: bool = False,
+     placement_policy: Optional[str] = None,
++    placement_checked: bool = False,
+     insert_guard: Optional[Callable[[sqlite3.Connection], None]] = None, placement_audit: Optional[dict] = None,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+@@ -1307,8 +1308,7 @@ def create_task(
+     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
+         conn, project_id, project_source_task_id, workspace_kind, workspace_path
+     )
+-    validate_creation(placement_policy, runs_on=runs_on, workspace_kind=workspace_kind,
+-                      workspace_path=workspace_path, project=project_id, origin_intent=None, board=board)
++    placement_policy = resolved_db_policy(locals())
+     parents = tuple(p for p in parents if p)
+     skills_list = _normalize_task_skills(skills)
+ 
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 02f1709f232..2cc983f3205 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -61,6 +61,7 @@ def create_with_origin(conn, intent: dict, options: dict) -> str:
+     # The sender gated its own declaration; kept out of the stored envelope so an intent recorded
+     # before the option existed still matches on retry. [daveey]
+     options.pop("require_declaration", None)
++    options.pop("placement_checked", None)  # internal decision, not part of the immutable envelope
+     # Options added after intents were first stored: omit them while at their default (None) so an
+     # intent stored before the option existed still matches on retry; a real value stays in the
+     # envelope and a differing one remains a conflict.
+@@ -89,7 +90,7 @@ def create_with_origin(conn, intent: dict, options: dict) -> str:
+         # The receipt request ID, not legacy best-effort idempotency, owns this
+         # creation. Never adopt an unrelated existing task by its legacy key.
+         options["idempotency_key"] = None
+-        task_id = kb.create_task(conn, **options)
++        task_id = kb.create_task(conn, **options, placement_checked=True)  # courier retains owner placement
+         marker = {"binding_id": "binding-" + secrets.token_hex(16), "version": 1,
+                   "owner": {**intent["owner"], "task_id": task_id}, "origin": intent["origin"],
+                   "task_record_key": f"{intent['owner']['profile']}/{intent['owner']['board']}/{task_id}"}
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 20162dbb22e..ba68bb4f2b6 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -370,6 +370,7 @@ HOME_GATEWAY_MARKERS = (
+     r"\bkanban\.db\b", r"\bcron ?(job|jobs|tab)?\b",
+     r"\btoken-broker\b", r"\bhermes-sync\b", r"\bon the hub\b", r"\bthe hub's\b",
+     r"\bgateway (restart|config|service)\b", r"\bsystemctl\b", r"\blaunchd\b", r"\bssh\b",
++    r"\bjournalctl\b", r"\bthis host\b",
+     r"\brestart(ing)? (the )?gateway\b", r"\bhermes config (set|edit|unset)\b",
+ )
+ 
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 24c68d49cee..6c7e34afb55 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -77,6 +77,35 @@ def creation_audit(args, cfg=None):
+         return None
+ 
+ 
++def resolved_db_policy(fields):
++    """Validate the effective workspace after project inheritance, enrolling only unchecked producers."""
++    policy = fields["placement_policy"]
++    if policy is None and not fields["placement_checked"]:
++        policy = db_policy(fields)
++    validate_creation(policy, runs_on=fields["runs_on"], workspace_kind=fields["workspace_kind"],
++                      workspace_path=fields["workspace_path"], project=fields["project_id"],
++                      origin_intent=None, board=fields["board"])
++    return policy
++
++
++def db_policy(fields):
++    """Enroll direct producers at insertion; front doors may preserve an already checked decision."""
++    from hermes_cli import kanban_placement as placement
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++
++    cfg = placement.config()
++    if not cfg.get("worker_pools"):
++        return None
++    args = {**fields, "project": fields.get("project_id")}
++    db_file = _main_db_file(fields["conn"])
++    args["board"] = fields.get("board") or (board_slug_for_path(db_file) if db_file else "default")
++    if args.get("initial_status") == "running":
++        args.pop("initial_status")
++    result = creation_decision(args, cfg, placement.reg.self_gateway(), "auto", None)
++    return (result or {}).get("placement_policy")
++
++
+ def _cli_fields(args, body, workspace_kind, workspace_path, board):
+     fields = {**vars(args), "body": body, "workspace_kind": workspace_kind,
+               "workspace_path": workspace_path, "board": board}
+diff --git a/hermes_cli/machine_cpu_metrics.py b/hermes_cli/machine_cpu_metrics.py
+index a744e21f50c..d57c456eb52 100644
+--- a/hermes_cli/machine_cpu_metrics.py
++++ b/hermes_cli/machine_cpu_metrics.py
+@@ -1,7 +1,9 @@
+ """Measured CPU busy for the hub admission gate (worker-first overflow, docs/worker-first-v1.md).
+ 
+ Busy is computed from two aggregate ``/proc/stat`` snapshots taken about one second apart on the monotonic clock:
+-``100 * (Δtotal - Δidle - Δiowait) / Δtotal`` where total sums user..steal. ``guest``/``guest_nice`` are already
++``100 * (Δtotal - Δidle - Δiowait - Δnice) / Δtotal`` where total sums user..steal. Positive-nice user time is
++excluded so low-priority batch work does not veto foreground admission; system/IRQ/steal remain busy.
++This is aggregate non-nice busy, not a per-process nice>=10 filter. ``guest``/``guest_nice`` are already
+ included in user/nice and are never added again; ``steal`` counts as busy (time this host could not use). Any read
+ error, malformed line, counter decrease (reboot/reset), non-positive total, or an elapsed window outside
+ [1000, 2000] ms yields ``None`` (unknown), which every caller treats as "refuse", never as idle.
+@@ -44,7 +46,7 @@ def parse_proc_stat(text: str) -> Optional[tuple[int, int]]:
+         values = (user, nice, system, idle, iowait, irq, softirq, steal)
+         if any(v < 0 for v in values):
+             return None
+-        return sum(values), idle + iowait
++        return sum(values), idle + iowait + nice
+     return None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index fb0a2408709..bb07529df43 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -787,6 +787,58 @@ def test_pin_with_an_origin_session_is_refused_not_created_locally(mac):
+     assert _local_count() == 0
+ 
+ 
++@pytest.mark.parametrize("worker", [False, True])
++@pytest.mark.parametrize("pin", [None, "auto"])
++def test_origin_bound_portable_tool_card_enrolls(mac, monkeypatch, worker, pin):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    if worker:
++        with kbc.connect_closing() as conn:
++            parent = kb.create_task(conn, title="Coordinator", assignee="default")
++            claim = kb.claim_task(conn, parent)
++        monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
++        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claim.current_run_id))
++        monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
++    monkeypatch.setattr(kp, "config", lambda: {"worker_pools": {"macbook": ["worker-1"]}})
++    out = json.loads(kt._handle_create({"title": "Analyze public data", "requires": [],
++                                        "origin_session": "hub:abc123", "placement": pin}))
++    assert out.get("ok"), out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, out["task_id"]).placement_policy == "worker-first-v1"
++        if worker:
++            created = next(e for e in kb.list_events(conn, out["task_id"]) if e.kind == "created")
++            assert created.payload["creator_task_id"] == parent
++    assert out["placement"]["placement_policy"] == "worker-first-v1"
++    assert "worker pool" in out["runs_where"]
++    assert not mac["calls"]
++
++
++@pytest.mark.parametrize("surface", ["cli", "tool", "origin-tool"])
++def test_current_nondefault_board_does_not_enroll(mac, monkeypatch, surface):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban as cli
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    kb.create_board("other")
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other")
++    monkeypatch.setattr(kp, "config", lambda: {"worker_pools": {"macbook": ["worker-1"]}})
++    if surface == "cli":
++        output = cli.run_slash("--board other create 'Analyze public data' --assignee default")
++        assert "t_" in output, output
++    else:
++        args = {"title": "Analyze public data", "requires": []}
++        if surface == "origin-tool":
++            args["origin_session"] = "hub:abc123"
++        out = json.loads(kt._handle_create(args))
++        assert out.get("ok"), out
++    with kbc.connect_closing(board="other") as conn:
++        rows = conn.execute("SELECT placement_policy FROM tasks").fetchall()
++        assert len(rows) == 1 and rows[0][0] is None, output if surface == "cli" else out
++
++
+ def test_pin_with_a_structural_limit_is_refused_through_the_tool(mac):
+     from tools import kanban_tools as kt
+     out = json.loads(kt._handle_create({"title": "x", "placement": "hub", "workspace_kind": "dir",
+diff --git a/tests/hermes_cli/test_kanban_worker_placement.py b/tests/hermes_cli/test_kanban_worker_placement.py
+index 7123da16c41..c761afd6775 100644
+--- a/tests/hermes_cli/test_kanban_worker_placement.py
++++ b/tests/hermes_cli/test_kanban_worker_placement.py
+@@ -119,6 +119,8 @@ def test_hub_state_work_stays_local(title):
+ 
+ @pytest.mark.parametrize("title", [
+     # ~/.hermes/skills is host state, not a checkout: curator ledger, usage counts, locks, live-patched skills.
++    "Run `journalctl --user` to inspect worker OOM kills",
++    "Inspect this host's model routing registry and config.yaml",
+     "Patch ~/.hermes/skills/devops/kanban-orchestrator/SKILL.md (live edit)",
+     "Sum use_count from /home/ubuntu/.hermes/skills/.usage.json",
+     # Existing worktrees on this host hold unpushed work a worker cannot see.
+diff --git a/tests/hermes_cli/test_kanban_worker_policy_db.py b/tests/hermes_cli/test_kanban_worker_policy_db.py
+index b4588258ebc..adefe3a677b 100644
+--- a/tests/hermes_cli/test_kanban_worker_policy_db.py
++++ b/tests/hermes_cli/test_kanban_worker_policy_db.py
+@@ -35,6 +35,57 @@ def test_policy_is_captured_in_first_insert_with_parent_and_origin(conn):
+     assert kb.get_task(conn, tid).placement_policy == "worker-first-v1"
+ 
+ 
++@pytest.mark.parametrize("creator", ["self-heal", "user", "default"])
++def test_direct_producer_enrolls_portable_card(conn, monkeypatch, creator):
++    from hermes_cli import kanban_placement as placement
++
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    parent = kb.create_task(conn, title="Parent", assignee="default", runs_on=[])
++    tid = kb.create_task(conn, title="Analyze public data", assignee="default", created_by=creator,
++                         creator_task_id=parent, session_id="origin-chat", requires=["terminal"])
++    assert kb.get_task(conn, tid).placement_policy == "worker-first-v1"
++    inserts = conn.execute("SELECT fields FROM kanban_sync_outbox WHERE row_uid=? ORDER BY rowid", (tid,)).fetchall()
++    assert json.loads(inserts[0][0])["placement_policy"] == "worker-first-v1"
++
++
++@pytest.mark.parametrize("fields", [
++    {"runs_on": []}, {"runs_on": ["linux"]}, {"workspace_kind": "dir", "workspace_path": "/repo"},
++    {"board": "other"}, {"requires": ["host_repo"]}, {"placement_checked": True},
++])
++def test_direct_producer_keeps_placement_exclusions(conn, monkeypatch, fields):
++    from hermes_cli import kanban_placement as placement
++
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    tid = kb.create_task(conn, title="Analyze public data", assignee="default", **fields)
++    assert kb.get_task(conn, tid).placement_policy is None
++
++
++def test_direct_producer_uses_connection_board(conn, monkeypatch):
++    from hermes_cli import kanban_placement as placement
++
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    kb.create_board("other")
++    with kbc.connect(board="other") as other:
++        tid = kb.create_task(other, title="Analyze public data", assignee="default")
++        assert kb.get_task(other, tid).placement_policy is None
++
++
++def test_courier_keeps_immutable_placement(conn, monkeypatch):
++    from hermes_cli import kanban_placement as placement
++    from tests.hermes_cli.test_kanban_origin_creation import intent
++
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    tid = kb.create_task(conn, title="Analyze public data", assignee="default", origin_intent=intent())
++    assert kb.get_task(conn, tid).placement_policy is None
++    assert kb.create_task(conn, title="Analyze public data", assignee="default", origin_intent=intent()) == tid
++    envelope = json.loads(conn.execute("SELECT intent_json FROM origin_creation_intents").fetchone()[0])
++    assert "placement_checked" not in envelope["options"]
++
++
+ @pytest.mark.parametrize("mode", ["off", "shadow", "primary"])
+ @pytest.mark.parametrize("lane", ["ready", "review"])
+ def test_queue_fence_precedes_direct_claim_and_lease_even_without_sync(conn, mode, lane):
+diff --git a/tests/hermes_cli/test_machine_cpu_metrics.py b/tests/hermes_cli/test_machine_cpu_metrics.py
+index fdf02ce2f25..1504c1cdc28 100644
+--- a/tests/hermes_cli/test_machine_cpu_metrics.py
++++ b/tests/hermes_cli/test_machine_cpu_metrics.py
+@@ -16,7 +16,7 @@ def test_parse_sums_user_through_steal_and_never_adds_guest_twice():
+     total, idle = cm.parse_proc_stat(stat(user=100, nice=10, system=20, idle=500, iowait=30, irq=5, softirq=5,
+                                           steal=30, guest=90, guest_nice=9))
+     assert total == 100 + 10 + 20 + 500 + 30 + 5 + 5 + 30
+-    assert idle == 500 + 30  # iowait is not busy; steal is (unavailable to us)
++    assert idle == 500 + 30 + 10  # iowait and nice are not admission busy; steal is unavailable
+ 
+ 
+ @pytest.mark.parametrize("text", ["", "intr 1\n", "cpu  1 2 x 4\n", "cpu  1 2 3\n", "cpu  -1 2 3 4 5 6 7 8\n"])
+@@ -62,6 +62,13 @@ def sample(host, **kw):
+     return cm.sample(read=host.read, clock=host.clock, wall=host.wall_clock, sleep=host.sleep, linux=True, **kw)
+ 
+ 
++@pytest.mark.parametrize("nice,user,allowed", [(70, 10, True), (0, 80, False)])
++def test_admission_uses_non_nice_busy(nice, user, allowed):
++    out = sample(FakeHost([stat(), stat(user=user, nice=nice, idle=20)]))
++    assert out is not None
++    assert cm.below(out["cpu_busy_pct"], 50) is allowed
++
++
+ def test_sample_reports_complete_triple():
+     host = FakeHost([stat(user=0, idle=0), stat(user=30, idle=70)])
+     out = sample(host)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 23483423dd0..6ab126b2d0c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -22,7 +22,8 @@ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+-                                          _create_session_id, _placement_origin, _placement_refused, _runs_where)
++                                          _create_session_id, _placement_origin, _placement_refused, _runs_where,
++                                          _effective_board_args, _origin_enrollment)
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import (_blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard,
+                                           _wake_check_args, _wake_check_echo)
+@@ -1600,6 +1601,7 @@ def _handle_create(args: dict, **kw) -> str:
+     human_action_now = _parse_bool_arg(args, "human_action_now")
+     with _board(args.get("board")) as (kb, conn):
+         _check(*create_ask_check(conn, args, str(assignee)))  # ask line, then its filing probe [daveey]
++        args = _effective_board_args(args, origin_intent)
+         # Never infer approval from prose or silently turn a human gate into
+         # dispatchable work. Ask the creator to distinguish a future dependency
+         # from a human action that can actually be taken while parents are open.
+@@ -1663,6 +1665,8 @@ def _handle_create(args: dict, **kw) -> str:
+             _pin = _kp.explicit_foreign_pin(args, _reg.self_gateway())
+             if _pin:
+                 return _placement_refused(_pin, "an origin-bound card is created on this gateway")
++        marker_placement = _origin_enrollment(args, origin, marker_placement, assignee=assignee,
++                                               skills=skills, project_id=project_id)
+         try:
+             new_tid = kb.create_task(
+                 conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+@@ -1679,6 +1683,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+                 requires=args.get("requires"), runs_on=runs_on, max_retries=max_retries,
+                 placement_policy=(marker_placement or {}).get("placement_policy"),
++                placement_checked=True,  # this front door already checked pins, origins and portability
+                 placement_audit=_creation_audit(args),
+                 require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+                 model_override=model_override, provider_override=provider_override,
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index f200e5ca91f..ba1e7a7959e 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -9,6 +9,22 @@ from tools.registry import tool_error
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _effective_board_args(args, origin_intent):
++    from hermes_cli import kanban_db as kb
++    return args if origin_intent is not None else {**args, "board": args.get("board") or kb.get_current_board()}
++
++
++def _origin_enrollment(args, origin, marker, **effective):
++    """Chat ownership pins storage, not execution; never forward an origin-bound card."""
++    if origin is None:
++        return marker
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli.kanban_worker_placement import creation_decision
++    cfg, gateway = kp.config(), kp.reg.self_gateway()
++    return creation_decision({**args, **effective}, cfg, gateway,
++                             kp.canonical_pin(args.get("placement") or "auto", gateway, cfg), None)
++
++
+ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+     """Return a session id only when it is a real chat: present in this profile's state.db and not a
+     ``kanban.placement`` creator placeholder (a stray notice can give the placeholder a state.db row,
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index d9094b64ed2..a7c8848dea0 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3456,7 +3456,7 @@ kanban:
+ 
+ `kanban.admission.cpu_busy_below_pct` (default unset: off) turns on the measured-CPU admission gate on a host that takes overflow work from the Board's worker-first placement. It is read only from the installation-root `config.yaml`, never from a profile override. When set:
+ 
+-- the metrics reporter attaches a measured CPU busy percentage (two `/proc/stat` snapshots about 1 s apart) to its 10 s Board report, with a 2 s total budget and no replay;
++- the metrics reporter attaches a measured non-nice CPU busy percentage (two `/proc/stat` snapshots about 1 s apart) to its 10 s Board report, with a 2 s total budget and no replay. Positive-nice user time, idle and iowait are excluded; system, IRQ and steal count as busy. This excludes all positive nice values, not only nice >= 10;
+ - every new ready/review claim on the host takes an independent full ~1 s sample while `admission.lock` is held, and claims only when busy is strictly below the limit and the host's running count is below the root `kanban.max_in_progress`.
+ 
+ Any unknown (an unreadable config, a non-numeric or out-of-range value, a failed sample, a window outside 1-2 s) refuses the claim rather than admitting it. The Board-side `worker_overflow` setting decides whether the hub is offered overflow at all; with it absent or `{}` nothing is sent to the hub.
+-- 
+2.55.0
+

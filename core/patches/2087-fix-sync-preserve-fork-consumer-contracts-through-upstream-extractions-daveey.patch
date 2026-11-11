@@ -1,0 +1,514 @@
+From f0a1ed47e94f0e22f6d70b512f3b9c07d848b6f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 04:46:05 +0000
+Subject: [PATCH] fix(sync): preserve fork consumer contracts through upstream
+ extractions [daveey]
+
+---
+ tests/ci/just_recipes.py                      | 129 ++++++++++++++++++
+ tests/ci/test_fast_runner_routing.py          |  75 +++++++++-
+ tests/ci/test_runtime_install_shape.py        | 117 ++++++++++++++--
+ .../test_class_model_switch_persistence.py    |   5 +-
+ tests/gateway/test_gil_budget.py              |  13 +-
+ tests/gateway/test_session_race_guard.py      |  10 ++
+ 6 files changed, 334 insertions(+), 15 deletions(-)
+ create mode 100644 tests/ci/just_recipes.py
+
+diff --git a/tests/ci/just_recipes.py b/tests/ci/just_recipes.py
+new file mode 100644
+index 00000000000..0e64893356a
+--- /dev/null
++++ b/tests/ci/just_recipes.py
+@@ -0,0 +1,129 @@
++"""Resolve a workflow ``run: just <recipe>`` line to the commands the recipe runs.
++
++Workflow invariants that assert a command's shape must see through the justfile
++indirection: upstream moved inline step commands into recipes (``just
++js-install-tests``), and a contract over the YAML text alone then counts nothing.
++This is a deliberately small reader for the subset of just syntax such recipes
++use: plain dependencies, linewise bodies, ``@``/``-`` line prefixes, and nested
++``just <recipe>`` lines. Anything outside that subset (parameters, interpolation,
++shebang bodies, OS-specific variants, imports/modules) raises instead of guessing,
++so a recipe the reader cannot model fails the invariant rather than passing it.
++tests/ci/test_runtime_install_shape.py checks it against the real ``just --dry-run``.
++"""
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from pathlib import Path
++
++_HEADER = re.compile(r"^(@?)([A-Za-z_][A-Za-z0-9_-]*)([^:]*?):(?!=)(.*)$")
++_ATTRIBUTE = re.compile(r"^\[(.+)\]\s*$")
++_JUST_LINE = re.compile(r"^just(?:\s+(.*))?$")
++_RECIPE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
++_OS_ATTRIBUTES = {"unix", "windows", "linux", "macos", "openbsd", "freebsd", "netbsd", "dragonfly", "android", "ios"}
++
++
++class UnsupportedRecipe(ValueError):
++    """The recipe uses just syntax this reader does not model."""
++
++
++@dataclass
++class Recipe:
++    name: str
++    attributes: list[str] = field(default_factory=list)
++    parameters: str = ""
++    dependencies: list[str] = field(default_factory=list)
++    body: list[str] = field(default_factory=list)
++
++
++def parse(path: Path) -> dict[str, list[Recipe]]:
++    """Every recipe definition by name (a name may repeat under OS attributes)."""
++    recipes: dict[str, list[Recipe]] = {}
++    attributes: list[str] = []
++    current: Recipe | None = None
++    for raw in path.read_text(encoding="utf-8").splitlines():
++        if current is not None and (raw[:1] in (" ", "\t") or not raw.strip()):
++            if raw.strip():
++                current.body.append(raw.strip())
++            continue
++        current = None
++        line = raw.strip()
++        if not line or line.startswith("#"):
++            continue
++        if re.match(r"^(import|mod)\b", line):
++            raise UnsupportedRecipe(f"{path}: {line!r} (imports and modules are not modelled)")
++        attribute = _ATTRIBUTE.match(line)
++        if attribute:
++            attributes += [a.strip() for a in attribute.group(1).split(",")]
++            continue
++        if re.match(r"^(set|alias|export)\b", line) or re.match(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:=", line):
++            attributes = []
++            continue
++        header = _HEADER.match(line)
++        if not header:
++            raise UnsupportedRecipe(f"{path}: cannot read justfile line {line!r}")
++        current = Recipe(name=header.group(2), attributes=attributes, parameters=header.group(3).strip())
++        deps = header.group(4).split("#", 1)[0].strip()
++        if "(" in deps or "&&" in deps:
++            current.dependencies = [deps]  # kept verbatim; rejected when resolved
++        else:
++            current.dependencies = deps.split()
++        recipes.setdefault(current.name, []).append(current)
++        attributes = []
++    return recipes
++
++
++def _definition(recipes: dict[str, list[Recipe]], name: str) -> Recipe:
++    if name not in recipes:
++        raise UnsupportedRecipe(f"no recipe {name!r} in the justfile")
++    variants = recipes[name]
++    if len(variants) != 1 or any(a in _OS_ATTRIBUTES for a in variants[0].attributes):
++        raise UnsupportedRecipe(f"recipe {name!r} has OS-specific variants; resolve per OS explicitly")
++    recipe = variants[0]
++    if recipe.parameters or "positional-arguments" in recipe.attributes or "script" in recipe.attributes:
++        raise UnsupportedRecipe(f"recipe {name!r} takes parameters or runs as a script")
++    if recipe.body[:1] and recipe.body[0].startswith("#!"):
++        raise UnsupportedRecipe(f"recipe {name!r} has a shebang body")
++    return recipe
++
++
++def recipe_commands(justfile: Path, name: str, _stack: tuple[str, ...] = (), _recipes=None, *,
++                    follow_just: bool = True) -> list[str]:
++    """The shell commands ``just <name>`` runs, dependencies first, nested recipes expanded.
++
++    ``follow_just=False`` keeps a body's ``just <recipe>`` lines as they are, which is
++    what ``just --dry-run`` prints (it does not descend into a nested invocation).
++    """
++    recipes = _recipes if _recipes is not None else parse(justfile)
++    if name in _stack:
++        raise UnsupportedRecipe(f"recipe cycle: {' -> '.join(_stack + (name,))}")
++    recipe = _definition(recipes, name)
++    commands: list[str] = []
++    for dep in recipe.dependencies:
++        if not _RECIPE_NAME.match(dep):
++            raise UnsupportedRecipe(f"recipe {name!r} has a non-plain dependency {dep!r}")
++        commands += recipe_commands(justfile, dep, _stack + (name,), recipes, follow_just=follow_just)
++    joined: list[str] = []
++    for line in recipe.body:
++        if joined and joined[-1].endswith("\\"):
++            joined[-1] = joined[-1][:-1].rstrip() + " " + line
++        else:
++            joined.append(line)
++    for line in joined:
++        if "{{" in line:
++            raise UnsupportedRecipe(f"recipe {name!r} interpolates: {line!r}")
++        line = line.lstrip("@-").strip()
++        commands += expand(justfile, line, _stack + (name,), recipes) if follow_just else [line]
++    return commands
++
++
++def expand(justfile: Path, command: str, _stack: tuple[str, ...] = (), _recipes=None) -> list[str]:
++    """``command`` itself, or the commands of the recipe it runs when it is ``just <recipe>``."""
++    command = command.strip()
++    just = _JUST_LINE.match(command)
++    if not just:
++        return [command]
++    target = (just.group(1) or "").strip()
++    if not _RECIPE_NAME.match(target):
++        raise UnsupportedRecipe(f"{command!r}: only `just <recipe>` with no flags or arguments is modelled")
++    return recipe_commands(justfile, target, _stack, _recipes)
+diff --git a/tests/ci/test_fast_runner_routing.py b/tests/ci/test_fast_runner_routing.py
+index d5222b3a928..7d7dc18b9f3 100644
+--- a/tests/ci/test_fast_runner_routing.py
++++ b/tests/ci/test_fast_runner_routing.py
+@@ -6,6 +6,7 @@ is the executable scheduling configuration, not Python source under inspection.
+ """
+ from __future__ import annotations
+ 
++import os
+ import pathlib
+ import re
+ import shutil
+@@ -67,6 +68,33 @@ def _labels(job):
+     return [value] if isinstance(value, str) else value
+ 
+ 
++def _docker_calls(steps, tmp_path, root=ROOT):
++    """Run each hadolint step's script as the runner would, with `docker` recorded, not run.
++
++    The step text alone is not the behaviour: upstream moved the `docker run` into
++    scripts/ci/lint_docker.sh, so the contract follows the command the step executes.
++    """
++    hadolint = [s for s in steps if "run" in s and "hadolint" in f"{s.get('name', '')} {s['run']}"]
++    assert hadolint, "no hadolint step in the guards job"
++    stub = tmp_path / "bin"
++    stub.mkdir(exist_ok=True)
++    calls = tmp_path / "docker-calls.tsv"
++    docker = stub / "docker"
++    docker.write_text('#!/usr/bin/env bash\nprintf \'%s\\t\' "$@" >> "$DOCKER_CALLS"\necho >> "$DOCKER_CALLS"\n',
++                      encoding="utf-8")
++    docker.chmod(0o755)
++    env = {**os.environ, "PATH": f"{stub}{os.pathsep}{os.environ.get('PATH', '')}", "DOCKER_CALLS": str(calls)}
++    for step in hadolint:
++        assert "${{" not in step["run"], "expressions in the step need rendering before replay"
++        # GitHub's default Linux shell for `run:` is `bash --noprofile --norc -eo pipefail {0}`.
++        done = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
++                              cwd=root, env=env, capture_output=True, text=True, timeout=60, check=False)
++        assert done.returncode == 0, (step.get("name"), done.stdout, done.stderr)
++    if not calls.exists():
++        return []
++    return [line.split("\t")[:-1] for line in calls.read_text(encoding="utf-8").splitlines()]
++
++
+ def test_only_bounded_measured_checks_use_fast_lane():
+     workflows = _workflows()
+     routed = set()
+@@ -83,7 +111,7 @@ def test_only_bounded_measured_checks_use_fast_lane():
+     assert routed == FAST
+ 
+ 
+-def test_observers_and_long_work_do_not_compete_for_fast_slots():
++def test_observers_and_long_work_do_not_compete_for_fast_slots(tmp_path):
+     workflows = _workflows()
+     for wf, name in [
+         ("ci-review-comment.yml", "comment"),
+@@ -96,7 +124,7 @@ def test_observers_and_long_work_do_not_compete_for_fast_slots():
+         assert workflows[wf]["jobs"][name]["runs-on"] == labels, (wf, name)
+     # The combined guards job runs hadolint via `docker run`: only docker-ci has a daemon.
+     guards = workflows["repo-guards.yml"]["jobs"]["guards"]["steps"]
+-    assert any("docker run" in step.get("run", "") for step in guards)
++    assert ["run"] in [call[:1] for call in _docker_calls(guards, tmp_path)]
+     # Test suites and E2E stay on the heavy lane even when one run is short.
+     for wf, name in [
+         ("catalog-tests.yml", "catalog-tests"),
+@@ -107,6 +135,49 @@ def test_observers_and_long_work_do_not_compete_for_fast_slots():
+         assert workflows[wf]["jobs"][name]["runs-on"] == ["self-hosted", "hermes-hub"]
+ 
+ 
++_HADOLINT_STEP = {"name": "Lint Dockerfiles (hadolint)", "run": "scripts/ci/lint_docker.sh hadolint"}
++
++
++@pytest.mark.parametrize(
++    ("hadolint_body", "steps", "docker_run"),
++    [
++        # The real script's shape: the step runs a script whose function runs docker.
++        ('run_hadolint() { docker run --rm img hadolint Dockerfile; }', [_HADOLINT_STEP], True),
++        # Through one more level (a just-style wrapper script): still docker.
++        ('run_hadolint() { bash scripts/ci/inner.sh; }', [_HADOLINT_STEP], True),
++        # Broken: the script calls a hadolint binary (no daemon needed, so docker-ci is moot).
++        ("run_hadolint() { true hadolint Dockerfile; }", [_HADOLINT_STEP], False),
++        # Broken: docker only pulls, never runs.
++        ("run_hadolint() { docker pull img; }", [_HADOLINT_STEP], False),
++        # Broken: the step no longer calls the script.
++        ('run_hadolint() { docker run img; }', [{"name": "Lint Dockerfiles (hadolint)", "run": "true"}], False),
++    ],
++)
++def test_docker_run_contract_follows_the_script(tmp_path, hadolint_body, steps, docker_run):
++    """Negative controls: the docker-ci contract reads the executed script, not the step text."""
++    root = tmp_path / "repo"
++    (root / "scripts/ci").mkdir(parents=True)
++    script = root / "scripts/ci/lint_docker.sh"
++    script.write_text(f'#!/usr/bin/env bash\nset -euo pipefail\n{hadolint_body}\n'
++                      'case "$1" in hadolint) run_hadolint ;; *) exit 2 ;; esac\n', encoding="utf-8")
++    (root / "scripts/ci/inner.sh").write_text("docker run --rm img hadolint\n", encoding="utf-8")
++    script.chmod(0o755)
++    calls = _docker_calls(steps, tmp_path, root)
++    assert (["run"] in [call[:1] for call in calls]) is docker_run, calls
++
++
++def test_a_failing_hadolint_step_fails_the_contract(tmp_path):
++    root = tmp_path / "repo"
++    (root / "scripts/ci").mkdir(parents=True)
++    script = root / "scripts/ci/lint_docker.sh"
++    script.write_text("#!/usr/bin/env bash\ndocker run img\nexit 3\n", encoding="utf-8")
++    script.chmod(0o755)
++    with pytest.raises(AssertionError):
++        _docker_calls([_HADOLINT_STEP], tmp_path, root)
++    with pytest.raises(AssertionError, match="no hadolint step"):
++        _docker_calls([{"name": "other", "run": "docker run x"}], tmp_path, root)
++
++
+ def test_fast_label_is_known_and_checks_cannot_bypass_the_gate():
+     workflows = _workflows()
+     labels = YAML(typ="safe").load((ROOT / ".github" / "actionlint.yaml").read_text(encoding="utf-8"))
+diff --git a/tests/ci/test_runtime_install_shape.py b/tests/ci/test_runtime_install_shape.py
+index da5ccab8b1c..70827f611f4 100644
+--- a/tests/ci/test_runtime_install_shape.py
++++ b/tests/ci/test_runtime_install_shape.py
+@@ -1,7 +1,8 @@
+ """The runtime-only tests-js install shape is checked on the PRs that can break it.
+ 
+ desktop-bundle-smoke.yml and the install-e2e-*-run.yml workflows install
+-``pnpm install --filter "{./tests-js}..." --prod`` and launch
++``pnpm install --filter "{./tests-js}..." --prod`` (inline, or through the
++justfile's ``js-install-tests`` recipe) and launch
+ tests/install/e2e-assets drivers. They run on release/dispatch only, so a driver
+ importing a devDependency first failed at release time. js-tests.yml's
+ ``runtime-install-shape`` job installs the same shape on every frontend-lane PR
+@@ -12,10 +13,15 @@ from __future__ import annotations
+ 
+ import importlib.util
+ import re
++import shutil
++import subprocess
++import sys
+ from pathlib import Path
+ 
+ import pytest
+ 
++from tests.ci import just_recipes
++
+ _REPO = Path(__file__).resolve().parents[2]
+ # [daveey] The fork conftest (tests/ci/conftest.py) never turns a fork_guard failure into a skip: this file
+ # asserts the fork's own required-gate wiring.
+@@ -33,7 +39,9 @@ _WORKFLOWS = [
+     "install-e2e-macos-run.yml",
+     "install-e2e-windows-run.yml",
+ ]
++_RUN = re.compile(r"^\s*(?:-\s+)?run:\s*(\S.*)$", re.MULTILINE)
+ _INSTALL = re.compile(r'^\s*run:\s*(pnpm install .*--filter "\{\./tests-js\}\.\.\." .*)$', re.MULTILINE)
++_SHAPE = 'pnpm install --frozen-lockfile --filter "{./tests-js}..." --prod --ignore-scripts'
+ _ASSETS = _REPO / "tests/install/e2e-assets"
+ _CHECKER = (_REPO / ".github/scripts/check-runtime-driver-imports.mjs").read_text(
+     encoding="utf-8"
+@@ -46,17 +54,108 @@ def _yaml(rel: str):
+ 
+ 
+ def _install_commands(workflow: str) -> list[str]:
++    """Each one-line ``run:`` of the shape, seen through ``just <recipe>`` steps.
++
++    Upstream moved the install-e2e lanes' command into ``just js-install-tests``;
++    the shape is what the recipe (and any recipe it runs) executes, not the step text.
++    """
+     text = (_REPO / ".github/workflows" / workflow).read_text(encoding="utf-8")
+-    return [m.strip() for m in _INSTALL.findall(text)]
++    commands = []
++    for run in _RUN.findall(text):
++        for command in just_recipes.expand(_REPO / "justfile", run):
++            if _INSTALL.match(f"run: {command}"):
++                commands.append(command.strip())
++    return commands
++
++
++def test_just_reader_matches_just_dry_run():
++    """The reader's expansion is what `just` itself would run, for every recipe it models.
++
++    `just --dry-run` prints a nested `just <recipe>` line without descending, so the
++    comparison is one level deep; nesting is covered by the controls below.
++    """
++    just = shutil.which("just")
++    if not just:
++        pytest.skip("just is not on PATH; the reader is still exercised by the shape test")
++    recipes = just_recipes.parse(_REPO / "justfile")
++    assert "js-install-tests" in recipes
++    modelled = 0
++    for name in recipes:
++        try:
++            expected = just_recipes.recipe_commands(_REPO / "justfile", name, follow_just=False)
++            just_recipes.recipe_commands(_REPO / "justfile", name)  # the nested reading resolves too
++        except just_recipes.UnsupportedRecipe:
++            continue
++        dry = subprocess.run(
++            [just, "--justfile", str(_REPO / "justfile"), "--dry-run", name],
++            cwd=_REPO, capture_output=True, text=True, check=True,
++        )
++        assert dry.stderr.splitlines() == expected, name
++        modelled += 1
++    assert modelled >= 1
+ 
+ 
+-def test_every_runtime_install_in_the_workflows_is_one_shape():
+-    shapes = {c for w in _WORKFLOWS for c in _install_commands(w)}
++@pytest.mark.parametrize(
++    ("body", "ok"),
++    [
++        # Transitive: a recipe that runs another recipe, or depends on one.
++        (f"inner:\n    {_SHAPE}\njs-install-tests:\n    @just inner\n", True),
++        (f"inner:\n    {_SHAPE}\njs-install-tests: inner\n    echo done\n", True),
++        (f"js-install-tests:\n    {_SHAPE}\n", True),
++        # Broken recipes: a full install (the count drops), or the shape minus --prod
++        # (two shapes), each directly or one recipe down.
++        ("js-install-tests:\n    pnpm install --frozen-lockfile\n", False),
++        (f"js-install-tests:\n    {_SHAPE.replace(' --prod', '')}\n", False),
++        (f"inner:\n    {_SHAPE.replace(' --prod', '')}\njs-install-tests:\n    just inner\n", False),
++        ("inner:\n    pnpm install --frozen-lockfile\njs-install-tests: inner\n", False),
++    ],
++)
++def test_install_commands_follow_recipes(tmp_path, monkeypatch, body, ok):
++    """Negative controls: the shape is read through (transitive) recipes, and a broken one is caught."""
++    (tmp_path / ".github/workflows").mkdir(parents=True)
++    (tmp_path / ".github/workflows/inline.yml").write_text(
++        f"jobs:\n  j:\n    steps:\n      - run: {_SHAPE}\n", encoding="utf-8"
++    )
++    (tmp_path / ".github/workflows/recipe.yml").write_text(
++        "jobs:\n  j:\n    steps:\n      - name: Install\n        run: just js-install-tests\n", encoding="utf-8"
++    )
++    (tmp_path / "justfile").write_text(body, encoding="utf-8")
++    monkeypatch.setattr(sys.modules[__name__], "_REPO", tmp_path)
++    if ok:
++        _assert_one_shape(["inline.yml", "recipe.yml"], 2)
++    else:
++        with pytest.raises(AssertionError):
++            _assert_one_shape(["inline.yml", "recipe.yml"], 2)
++
++
++@pytest.mark.parametrize(
++    "body",
++    [
++        "js-install-tests:\n    pnpm install {{ args }}\n",  # interpolation
++        "js-install-tests arg:\n    pnpm install\n",  # parameters
++        "[unix]\njs-install-tests:\n    pnpm install\n[windows]\njs-install-tests:\n    pnpm i\n",
++        "js-install-tests:\n    #!/usr/bin/env bash\n    pnpm install\n",
++        "other:\n    true\n",  # missing recipe
++        "a:\n    just js-install-tests\njs-install-tests:\n    just a\n",  # cycle
++    ],
++)
++def test_unmodelled_recipes_fail_closed(tmp_path, body):
++    (tmp_path / "justfile").write_text(body, encoding="utf-8")
++    with pytest.raises(just_recipes.UnsupportedRecipe):
++        just_recipes.expand(tmp_path / "justfile", "just js-install-tests")
++
++
++def _assert_one_shape(workflows: list[str], total: int) -> None:
++    shapes = {c for w in workflows for c in _install_commands(w)}
+     assert len(shapes) == 1, shapes
+-    assert next(iter(shapes)) == 'pnpm install --frozen-lockfile --filter "{./tests-js}..." --prod --ignore-scripts'
+-    # desktop-bundle-smoke 1, install-e2e-run 1, macos 2, windows 2: a new
+-    # install step must be added to this count on purpose.
+-    assert sum(len(_install_commands(w)) for w in _WORKFLOWS) == 6
++    assert next(iter(shapes)) == _SHAPE
++    assert sum(len(_install_commands(w)) for w in workflows) == total
++
++
++def test_every_runtime_install_in_the_workflows_is_one_shape():
++    # desktop-bundle-smoke 1 (inline), install-e2e-run 1, macos 2, windows 2 (each
++    # `just js-install-tests`): a new install step must be added to this count on purpose.
++    _assert_one_shape(_WORKFLOWS, 6)
+ 
+ 
+ def test_job_installs_exactly_that_shape_and_gates_the_merge():
+@@ -113,6 +212,8 @@ def test_checker_covers_every_node_script_the_launchers_run():
+         "tests-js/scripts/mock-provider-config.ts",
+         "pnpm-lock.yaml",
+         "pnpm-workspace.yaml",
++        # The install-e2e lanes run the shape as `just js-install-tests`.
++        "justfile",
+     ],
+ )
+ def test_every_input_of_the_shape_selects_the_frontend_lane(path):
+diff --git a/tests/gateway/test_class_model_switch_persistence.py b/tests/gateway/test_class_model_switch_persistence.py
+index 1126b222df3..a5f1ce1bc1b 100644
+--- a/tests/gateway/test_class_model_switch_persistence.py
++++ b/tests/gateway/test_class_model_switch_persistence.py
+@@ -8,6 +8,7 @@ import pytest
+ from gateway.run import GatewayRunner
+ from gateway.run_class_routing import stored_class
+ from gateway.slash_commands_model import _ModelSwitchContext
++from hermes_cli.model_switch import ModelSwitchResult
+ from hermes_state import AsyncSessionDB, SessionDB
+ 
+ 
+@@ -34,7 +35,7 @@ async def test_same_model_global_pin_clears_class_without_cached_agent(tmp_path,
+     monkeypatch.setattr("gateway.slash_commands_model._persist_model_switch_to_config", AsyncMock())
+     ctx = _ModelSwitchContext(session_key="key", source=None, config_path=None,
+                               persist_global=True, current_model="selected-model")
+-    result = SimpleNamespace(new_model="selected-model", target_provider="anthropic", api_key="",
++    result = ModelSwitchResult(success=True, new_model="selected-model", target_provider="anthropic", api_key="",
+                              base_url="", api_mode="anthropic_messages", provider_label="Anthropic",
+                              request_overrides={}, runtime_capabilities={})
+     assert stored_class(runner, "key") == "class:deep"
+@@ -83,7 +84,7 @@ async def test_once_pin_preserves_durable_class_before_and_after_restore(tmp_pat
+     ctx = _ModelSwitchContext(session_key="key", source=None, config_path=None,
+                               persist_global=False, one_turn=True, current_model="selected-model",
+                               restore_snapshot=runner._snapshot_session_model_override("key"))
+-    result = SimpleNamespace(new_model="temporary-model", target_provider="anthropic", api_key="",
++    result = ModelSwitchResult(success=True, new_model="temporary-model", target_provider="anthropic", api_key="",
+                              base_url="", api_mode="anthropic_messages", provider_label="Anthropic",
+                              request_overrides={}, runtime_capabilities={})
+     try:
+diff --git a/tests/gateway/test_gil_budget.py b/tests/gateway/test_gil_budget.py
+index 1d5f4fb725c..fdabeb2116e 100644
+--- a/tests/gateway/test_gil_budget.py
++++ b/tests/gateway/test_gil_budget.py
+@@ -40,8 +40,15 @@ def test_disabled_override_keeps_the_current_interval(restore_interval):
+ def test_start_gateway_applies_it_before_serving():
+     """The bootstrap calls apply_gateway_switch_interval() before it builds the runner."""
+     from gateway import run_bootstrap
+-    src = inspect.getsource(run_bootstrap.start_gateway)
+-    calls = [n.func.id for n in ast.walk(ast.parse(src))
+-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
++
++    def _name_calls(fn):
++        src = inspect.getsource(fn)
++        return src, [n.func.id for n in ast.walk(ast.parse(src))
++                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
++
++    # start_gateway is the public entry; it delegates to the runtime body under the no-prompt guard.
++    _, entry_calls = _name_calls(run_bootstrap.start_gateway)
++    assert "_start_gateway_runtime" in entry_calls
++    src, calls = _name_calls(run_bootstrap._start_gateway_runtime)
+     assert "apply_gateway_switch_interval" in calls
+     assert src.index("apply_gateway_switch_interval()") < src.index("GatewayRunner(")
+diff --git a/tests/gateway/test_session_race_guard.py b/tests/gateway/test_session_race_guard.py
+index b867b35eccc..bdb97c254bd 100644
+--- a/tests/gateway/test_session_race_guard.py
++++ b/tests/gateway/test_session_race_guard.py
+@@ -27,6 +27,14 @@ class _FakeAdapter:
+         self._pending_messages = {}
+         self._active_sessions = {}
+         self.interrupted_sessions = []
++        self.discarded_debounce_keys = []
++
++    def _event_session_key(self, event):
++        return build_session_key(event.source)
++
++    def _discard_text_debounce(self, session_key):
++        # Accepted /stop /new /reset drop the adapter's held text/media burst (#81370).
++        self.discarded_debounce_keys.append(session_key)
+ 
+     async def send(self, chat_id, text, **kwargs):
+         pass
+@@ -267,6 +275,8 @@ async def test_stop_during_sentinel_force_cleans_session():
+         # Should NOT be queued as pending
+         adapter = runner.adapters[Platform.TELEGRAM]
+         assert session_key not in adapter._pending_messages
++        # The accepted /stop drops the burst the adapter still holds for this chat.
++        assert adapter.discarded_debounce_keys == [session_key]
+ 
+         barrier.set()
+         await task1
+-- 
+2.55.0
+

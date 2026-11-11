@@ -1,0 +1,151 @@
+From 195252806ced1fec6646ac4743dd63751daf66a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:20:07 +0000
+Subject: [PATCH] fix(kanban): audit direct producers and retain host quota
+ recovery locally [daveey]
+
+---
+ hermes_cli/kanban_db.py                       |  4 ++--
+ hermes_cli/kanban_provider_walls.py           |  2 +-
+ hermes_cli/kanban_worker_placement.py         | 21 +++++++++++++------
+ .../hermes_cli/test_kanban_provider_walls.py  |  6 +++++-
+ .../test_kanban_worker_policy_db.py           | 11 ++++++++++
+ 5 files changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index dfbbbc21c8e..9f85ca45d84 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -30,7 +30,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync
+-from hermes_cli.kanban_worker_placement import resolved_db_policy, validate_creation
++from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+@@ -1308,7 +1308,7 @@ def create_task(
+     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
+         conn, project_id, project_source_task_id, workspace_kind, workspace_path
+     )
+-    placement_policy = resolved_db_policy(locals())
++    placement_policy, placement_audit = resolved_db_placement(locals())
+     parents = tuple(p for p in parents if p)
+     skills_list = _normalize_task_skills(skills)
+ 
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index 423067774ab..e1ca4a01933 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -203,7 +203,7 @@ def alert_on_storm(conn: sqlite3.Connection, *, board: Optional[str] = None, now
+     walls = ", ".join(f"{p} until {time.strftime('%H:%M', time.localtime(u))}" for p, u in active_walls(now=now).items())
+     return _kb.create_task(
+         conn, title=f"{host}: {n} rate_limited kanban runs in the last hour (provider quota wall)",
+-        body=(f"More than {STORM_THRESHOLD} workers exited on a provider quota wall in an hour on {host}. "
++        body=(f"More than {STORM_THRESHOLD} workers exited on a provider quota wall in an hour on this host ({host}). "
+               f"Known walls: {walls or 'none recorded'}. Check `kanban.default_model`/`default_provider`, the "
+               "provider's usage limit, and cards pinned to the walled provider (`require_model`)."),
+         assignee="default", created_by="rate-limit-alert", priority=80, idempotency_key=f"rate_limit_storm:{host}:{day}",
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 6c7e34afb55..a97e9e2fcd3 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -77,7 +77,7 @@ def creation_audit(args, cfg=None):
+         return None
+ 
+ 
+-def resolved_db_policy(fields):
++def resolved_db_placement(fields):
+     """Validate the effective workspace after project inheritance, enrolling only unchecked producers."""
+     policy = fields["placement_policy"]
+     if policy is None and not fields["placement_checked"]:
+@@ -85,25 +85,34 @@ def resolved_db_policy(fields):
+     validate_creation(policy, runs_on=fields["runs_on"], workspace_kind=fields["workspace_kind"],
+                       workspace_path=fields["workspace_path"], project=fields["project_id"],
+                       origin_intent=None, board=fields["board"])
+-    return policy
++    audit = fields["placement_audit"]
++    if audit is None:
++        audit = creation_audit(_db_fields(fields))
++    return policy, audit
+ 
+ 
+ def db_policy(fields):
+     """Enroll direct producers at insertion; front doors may preserve an already checked decision."""
+     from hermes_cli import kanban_placement as placement
+-    from hermes_cli.kanban_db_connect import _main_db_file
+-    from hermes_cli.kanban_db_sync import board_slug_for_path
+ 
+     cfg = placement.config()
+     if not cfg.get("worker_pools"):
+         return None
++    result = creation_decision(_db_fields(fields), cfg, placement.reg.self_gateway(), "auto", None)
++    return (result or {}).get("placement_policy")
++
++
++def _db_fields(fields):
++    """Normalize direct-DB options exactly as front doors do, using the actual connection's board."""
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++
+     args = {**fields, "project": fields.get("project_id")}
+     db_file = _main_db_file(fields["conn"])
+     args["board"] = fields.get("board") or (board_slug_for_path(db_file) if db_file else "default")
+     if args.get("initial_status") == "running":
+         args.pop("initial_status")
+-    result = creation_decision(args, cfg, placement.reg.self_gateway(), "auto", None)
+-    return (result or {}).get("placement_policy")
++    return args
+ 
+ 
+ def _cli_fields(args, body, workspace_kind, workspace_path, board):
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index d36c9957450..759bb78ce1a 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -93,7 +93,10 @@ def test_record_wall_for_run_uses_tier_event_and_log(board, monkeypatch):
+     assert CODEX in walls.active_walls(path=p)
+ 
+ 
+-def test_storm_alert_opens_one_card(board):
++def test_storm_alert_opens_one_local_card_with_worker_pool(board, monkeypatch):
++    from hermes_cli import kanban_placement as placement
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+     conn = kbc.connect()
+     now = int(time.time())
+     for i in range(12):
+@@ -102,6 +105,7 @@ def test_storm_alert_opens_one_card(board):
+     conn.commit()
+     first = walls.alert_on_storm(conn)
+     assert first and walls.alert_on_storm(conn) == first
++    assert kb.get_task(conn, first).placement_policy is None
+ 
+ 
+ def test_storm_alert_quiet_below_threshold(board):
+diff --git a/tests/hermes_cli/test_kanban_worker_policy_db.py b/tests/hermes_cli/test_kanban_worker_policy_db.py
+index adefe3a677b..484ef85431d 100644
+--- a/tests/hermes_cli/test_kanban_worker_policy_db.py
++++ b/tests/hermes_cli/test_kanban_worker_policy_db.py
+@@ -62,6 +62,17 @@ def test_direct_producer_keeps_placement_exclusions(conn, monkeypatch, fields):
+     assert kb.get_task(conn, tid).placement_policy is None
+ 
+ 
++@pytest.mark.parametrize("title,reason", [("Analyze public data", None), ("Inspect this host", "home gateway marker")])
++def test_direct_producer_records_authoritative_audit(conn, monkeypatch, title, reason):
++    from hermes_cli import kanban_placement as placement
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    tid = kb.create_task(conn, title=title, assignee="default", created_by="owner-wake")
++    created = next(e for e in kb.list_events(conn, tid) if e.kind == "created")
++    assert "portable_reason" in created.payload
++    assert created.payload["portable_reason"] == reason
++
++
+ def test_direct_producer_uses_connection_board(conn, monkeypatch):
+     from hermes_cli import kanban_placement as placement
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,143 @@
+From f16685769a5e535faac8a8b6df794a2e3242f6f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:36:28 +0000
+Subject: [PATCH] [daveey] fix(kanban): a chat's first session-tasks read
+ outlasts a brief busy board instead of 500ing
+
+/api/session-kanban-tasks raised BoardLifecycleBusy (500) whenever any board's lifecycle lock was held past the
+500 ms read budget and that exact lineage had no memoized list yet (every chat opened for the first time since
+the backend started). Desktop then showed 'Task status unavailable' on the session panel. Retry a busy first read
+for up to 3 s before raising; a board held for longer still raises (unknown, never 'no work').
+---
+ hermes_cli/kanban_session_activity_busy.py    | 43 +++++++++++++------
+ .../test_kanban_busy_board_activity.py        | 31 ++++++++++++-
+ 2 files changed, 61 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity_busy.py b/hermes_cli/kanban_session_activity_busy.py
+index f5be1c11a96..e3398061276 100644
+--- a/hermes_cli/kanban_session_activity_busy.py
++++ b/hermes_cli/kanban_session_activity_busy.py
+@@ -4,8 +4,8 @@ kanban-359833be53: while another thread held one board's lifecycle lock, the cou
+ sidebar marked EVERY chat row ``kanban_unknown``; ``session_tasks`` failed the same way. Like the content probe and the
+ origin-work snapshot save, a busy board now means "degrade, retry next time": it serves its last good answer, logs
+ one WARNING line (no traceback, so self-heal sees a rate rather than a crash) and is read again on the next pass. A
+-board never read successfully before still raises: unknown, never "no work". A corrupt or missing board is not busy
+-and still raises.
++board ``session_tasks`` never read for the query is retried for a bounded budget, then raises: unknown, never "no
++work". A corrupt or missing board is not busy and still raises.
+ 
+ State is per process; ``kanban_session_activity`` resets it with its caches.
+ """
+@@ -15,6 +15,7 @@ from __future__ import annotations
+ import logging
+ import sqlite3
+ import threading
++import time
+ from pathlib import Path
+ from typing import Any, Callable
+ 
+@@ -30,6 +31,10 @@ reuse_sink = threading.local()
+ _tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # last good per-board task list, by (board, ids, statuses)
+ _tasks_lock = threading.Lock()
+ TASKS_MEMO_MAX = 512
++# A busy board with no last good list for the query keeps being read this long (well inside the Desktop's 15 s
++# request timeout) before the request fails; the pause only bounds an error that returns without waiting.
++FIRST_READ_BUSY_BUDGET_S = 3.0
++FIRST_READ_RETRY_PAUSE_S = 0.05
+ 
+ 
+ def begin_recompute() -> None:
+@@ -61,17 +66,31 @@ def board_reads(path: Path, key: tuple, hit: tuple | None, parked: bool, stalled
+ 
+ def session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...],
+                   read: Callable[[Path, list[str], tuple[str, ...]], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+-    """``read(path, ids, statuses)``, or on a busy board its last good list for the same query, every row ``stale``."""
++    """``read(path, ids, statuses)``, or on a busy board its last good list for the same query, every row ``stale``.
++
++    A busy board with no last list for this query (a chat opened for the first time since the backend started) is
++    read again until ``FIRST_READ_BUSY_BUDGET_S`` runs out before it raises: one read only waits 500 ms for the
++    board, and a lifecycle hold a little longer than that made ``/api/session-kanban-tasks`` 500 and the Desktop
++    panel show "Task status unavailable" for every newly opened chat."""
+     key = (str(path), tuple(ids), tuple(statuses))
+-    try:
+-        tasks = read(path, ids, statuses)
+-    except sqlite3.OperationalError as exc:
+-        with _tasks_lock:
+-            last = _tasks_memo.get(key)
+-        if last is None or not is_busy(exc):
+-            raise
+-        _log.warning("kanban board %s busy; reused last counts", path)
+-        return [{**t, "stale": True} for t in last]
++    deadline = None
++    while True:
++        try:
++            tasks = read(path, ids, statuses)
++            break
++        except sqlite3.OperationalError as exc:
++            if not is_busy(exc):
++                raise
++            with _tasks_lock:
++                last = _tasks_memo.get(key)
++            if last is not None:
++                _log.warning("kanban board %s busy; reused last counts", path)
++                return [{**t, "stale": True} for t in last]
++            now = time.monotonic()
++            deadline = now + FIRST_READ_BUSY_BUDGET_S if deadline is None else deadline
++            if now >= deadline:
++                raise
++            time.sleep(min(FIRST_READ_RETRY_PAUSE_S, deadline - now))  # an instant busy error must not spin
+     with _tasks_lock:
+         _tasks_memo.pop(key, None)
+         _tasks_memo[key] = tasks
+diff --git a/tests/hermes_cli/test_kanban_busy_board_activity.py b/tests/hermes_cli/test_kanban_busy_board_activity.py
+index 743271f8838..66bdffcf370 100644
+--- a/tests/hermes_cli/test_kanban_busy_board_activity.py
++++ b/tests/hermes_cli/test_kanban_busy_board_activity.py
+@@ -16,6 +16,7 @@ import pytest
+ 
+ from hermes_cli import kanban_generation as gen
+ from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_session_activity_busy as busy
+ from hermes_cli import kanban_session_activity_revalidate as revalidate
+ 
+ 
+@@ -117,7 +118,35 @@ def test_session_tasks_on_a_held_board_reuse_the_last_rows_marked_stale(kanban_r
+     assert not tasks["t2"].get("stale")
+ 
+ 
+-def test_held_board_with_no_previous_read_is_still_an_error_not_an_empty_list(kanban_root):
++def test_first_read_waits_out_a_hold_longer_than_one_read_budget(kanban_root, monkeypatch):
++    """A chat opened for the first time hit a board held a little past the 500 ms read budget: the route 500ed and
++    the Desktop showed "Task status unavailable". The first read now outlasts such a hold."""
++    db = kanban_root / "kanban.db"
++    _make_board(db, [("t1", "running", "s1")])
++    monkeypatch.setattr(busy, "FIRST_READ_BUSY_BUDGET_S", 5.0)
++    acquired, release = threading.Event(), threading.Event()
++
++    def hold():
++        with gen.lifecycle_access(db, timeout=5):
++            acquired.set()
++            release.wait(10)
++
++    holder = threading.Thread(target=hold, daemon=True)
++    holder.start()
++    assert acquired.wait(5)
++    timer = threading.Timer(1.2, release.set)  # longer than one read's 0.5 s lifecycle budget
++    timer.start()
++    try:
++        tasks = ksa.session_tasks(["s1"])
++    finally:
++        release.set()
++        timer.cancel()
++        holder.join(5)
++    assert [(t["id"], t.get("stale")) for t in tasks] == [("t1", None)]
++
++
++def test_held_board_with_no_previous_read_is_still_an_error_not_an_empty_list(kanban_root, monkeypatch):
++    monkeypatch.setattr(busy, "FIRST_READ_BUSY_BUDGET_S", 0.6)
+     db = kanban_root / "kanban.db"
+     _make_board(db, [("t1", "running", "s1")])
+     with _held(db):
+-- 
+2.55.0
+

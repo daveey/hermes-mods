@@ -1,0 +1,681 @@
+From a1ab69276c75a5626becbbaab4c3a747736dadce Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:12:33 +0000
+Subject: [PATCH] fix(state): defer unconfirmed read corruption without
+ latching writes [daveey]
+
+---
+ hermes_cli/web_routers/sessions.py            |   2 +
+ hermes_state.py                               |  10 ++
+ hermes_state_corruption_confirm.py            | 124 +++++++++++++++--
+ hermes_state_corruption_incident.py           | 101 ++++++++++++++
+ hermes_state_health.py                        |  13 +-
+ .../test_storage_corruption_background.py     | 130 ++++++++++++++++++
+ .../test_storage_corruption_incident.py       | 102 ++++++++++++++
+ .../test_storage_corruption_scoped_confirm.py |  10 +-
+ 8 files changed, 471 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_state_corruption_incident.py
+ create mode 100644 tests/hermes_state/test_storage_corruption_background.py
+ create mode 100644 tests/hermes_state/test_storage_corruption_incident.py
+
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index f004f64f9e8..f13ccb87c59 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -298,6 +298,8 @@ def _list_sessions_payload(
+                 else "Internal server error"),
+         ) from exc
+     except sqlite3.DatabaseError as exc:
++        if getattr(exc, "hermes_read_corrupt_unconfirmed", False):
++            raise HTTPException(status_code=503, detail="Session read failed; background integrity check pending.") from exc
+         # A damaged store is unavailable, not empty and not an internal error (#72046).
+         db_path = _session_db_path_for_profile(profile)
+         if not (note_storage_error(db_path, exc) or is_malformed_db_error(exc)):
+diff --git a/hermes_state.py b/hermes_state.py
+index cad0825ed08..e13f5029d3a 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -1295,8 +1295,18 @@ class SessionDB(
+             return "no replay: storage already latched"
+         if cache_released is False:  # fail closed: a replay could re-read the very page that failed
+             return "no replay: reader cache not released"
++        if _corrupt_confirm.background_confirmation_pending(self.db_path):
++            exc.__dict__["hermes_read_corrupt_unconfirmed"] = True
++            raise exc
+         confirm = _corrupt_confirm.confirm_corruption(
+             self.db_path, scope.tables(), _corrupt_confirm.confirm_budget(None))
++        if confirm.outcome in ("timeout", "no_budget"):
++            _corrupt_confirm.schedule_background_confirmation(
++                self.db_path, f"{exc} [{_corruption_detail(exc)}; op=read; {confirm.describe()}]")
++            # Raised from the handler: do not flow through note_storage_error below.
++            # The failed SELECT is not replayed, but unrelated writers remain available.
++            exc.__dict__["hermes_read_corrupt_unconfirmed"] = True
++            raise exc
+         if not confirm.clean:
+             return f"no replay: {confirm.describe()}"
+         logger.warning(
+diff --git a/hermes_state_corruption_confirm.py b/hermes_state_corruption_confirm.py
+index 356de200a7f..10fc5e413f9 100644
+--- a/hermes_state_corruption_confirm.py
++++ b/hermes_state_corruption_confirm.py
+@@ -14,9 +14,10 @@ indexes are checked with it), on a FRESH read-only connection in a FRESH process
+   process's fcntl locks; https://sqlite.org/howtocorrupt.html §2.2);
+ * read-only (``mode=ro`` + ``query_only``): the check can never write to the file;
+ * bounded: the child is killed at the caller's remaining write patience (capped);
+-* fail closed: only an exact ``ok`` for every checked table is "clean". Damage, a timeout,
+-  a missing budget, a spawn failure, unparsable output or any error is not, and the caller
+-  latches as before.
++* only an exact ``ok`` for every checked table is "clean". Writers fail closed on all
++  non-clean results. Read timeout/no_budget fails that read without latching and starts
++  one background whole-file check without an execution deadline; only damage from that
++  check latches. Immediate damage/errors and replay recurrence still latch as before.
+ 
+ The scope comes from a SQLite authorizer composed onto the connection for the attempt
+ (``TouchedTables`` + ``ScopedAuthorizerConnection``): it sees every table each statement reads
+@@ -68,8 +69,10 @@ import os
+ import sqlite3
+ import subprocess
+ import sys
++import threading
+ import time
+ from contextlib import contextmanager
++from contextvars import Context, copy_context
+ from dataclasses import dataclass
+ from typing import Iterator, Optional
+ 
+@@ -288,6 +291,7 @@ class ConfirmResult:
+     scope: str  # "full" or comma-separated checked table names
+     elapsed_s: float
+     detail: str = ""
++    table_results: tuple[tuple[str, str], ...] = ()
+ 
+     @property
+     def clean(self) -> bool:
+@@ -302,8 +306,20 @@ class ConfirmResult:
+ # argv: uri, JSON list of table names or null (whole file), busy timeout in ms.
+ # Prints one JSON object; problem rows are page/row locations, never row contents.
+ _CHILD = r"""
+-import json, sqlite3, sys
++import json, os, sqlite3, sys, threading
+ uri, scope_json, busy_ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
++parent_pid = int(sys.argv[4])
++
++# Detach from the caller's foreground process group, not from its lifetime. A restarted
++# POSIX gateway must not leave minutes-long read snapshots holding back WAL reclamation.
++def watch_parent():
++    tick = threading.Event()
++    while os.getppid() == parent_pid:
++        tick.wait(1.0)
++    os._exit(1)
++
++if os.name == "posix":
++    threading.Thread(target=watch_parent, daemon=True).start()
+ 
+ scope = json.loads(scope_json)
+ out = {}
+@@ -321,6 +337,8 @@ try:
+                 if is_virtual:
+                     virtual.append(name.lower())
+             known["sqlite_schema"] = known["sqlite_master"] = ("sqlite_schema", False)
++            if not scope:  # explicit diagnostic request: every ordinary/shadow table
++                scope = sorted(k for k, (_, vt) in known.items() if not vt)
+             targets = ["sqlite_schema"]
+             if "sqlite_sequence" in known:  # AUTOINCREMENT writes it with no authorizer callback
+                 targets.append(known["sqlite_sequence"][0])
+@@ -349,7 +367,13 @@ try:
+             problems = [] if problems == ["ok"] else problems
+         else:
+             for t in targets:
+-                rows = [r[0] for r in conn.execute("PRAGMA quick_check('%s')" % t.replace("'", "''"))]
++                try:
++                    rows = [r[0] for r in conn.execute("PRAGMA quick_check('%s')" % t.replace("'", "''"))]
++                except sqlite3.Error as exc:
++                    rows = ["%s/%s: %s" % (type(exc).__name__, getattr(exc, "sqlite_errorname", None), str(exc)[:160])]
++                    if out.get("sqlite") not in ("SQLITE_CORRUPT", "SQLITE_NOTADB"):
++                        out.update(error=type(exc).__name__, sqlite=getattr(exc, "sqlite_errorname", None), message=str(exc)[:160])
++                out.setdefault("table_results", []).append([t, "; ".join(str(r)[:160] for r in rows[:3])])
+                 if rows != ["ok"]:
+                     problems += rows
+         out.update(ok=not problems, checked=targets, problems=len(problems),
+@@ -366,7 +390,7 @@ sys.stdout.write(json.dumps(out))
+ 
+ def _child_argv(uri: str, scope_json: str, busy_ms: int) -> list[str]:
+     """The fresh-process command (a seam for tests that need a hung or failing child)."""
+-    return [sys.executable, "-I", "-S", "-c", _CHILD, uri, scope_json, str(busy_ms)]
++    return [sys.executable, "-I", "-S", "-c", _CHILD, uri, scope_json, str(busy_ms), str(os.getpid())]
+ 
+ 
+ def confirm_budget(deadline: Optional[float], *, default_s: float = READ_CONFIRM_TIMEOUT_S) -> float:
+@@ -391,20 +415,22 @@ def _scope_label(checked) -> str:
+     return ",".join(sorted("".join(ch for ch in str(n) if ch.isalnum() or ch == "_")[:64] for n in checked))[:400]
+ 
+ 
+-def confirm_corruption(db_path, tables: Optional[frozenset], timeout_s: float) -> ConfirmResult:
+-    """Bounded read-only ``quick_check`` of *tables* (``None`` = whole file) in a fresh process.
++def confirm_corruption(db_path, tables: Optional[frozenset], timeout_s: Optional[float]) -> ConfirmResult:
++    """Read-only ``quick_check`` in a fresh process; timeout None is background-only.
+ 
+-    Never loads extensions or raises; anything but an exact per-table ``ok`` is a non-clean result."""
++    tables=None checks the whole file; an empty frozenset requests all per-table results.
++    Never loads extensions; anything but an exact per-table ``ok`` is non-clean."""
+     started = time.monotonic()
+     requested = None if tables is None else sorted(tables)
+     label = _scope_label(requested)
+-    if timeout_s < CONFIRM_MIN_S:
++    if timeout_s is not None and timeout_s < CONFIRM_MIN_S:
+         return ConfirmResult("no_budget", label, 0.0, f"{max(timeout_s, 0.0):.3f}s left of the write patience")
+     try:
+-        argv = _child_argv(read_only_db_uri(db_path), json.dumps(requested), int(timeout_s * 1000))
++        argv = _child_argv(read_only_db_uri(db_path), json.dumps(requested),
++                           int((timeout_s if timeout_s is not None else 30.0) * 1000))
+         proc = subprocess.run(
+             argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout_s, check=False,
+-            close_fds=True, env=_child_env(),
++            close_fds=True, env=_child_env(), start_new_session=timeout_s is None,
+         )
+     except subprocess.TimeoutExpired:
+         return ConfirmResult("timeout", label, time.monotonic() - started, f"killed after {timeout_s:.2f}s")
+@@ -419,14 +445,82 @@ def confirm_corruption(db_path, tables: Optional[frozenset], timeout_s: float) -
+         return ConfirmResult("error", label, elapsed, f"child rc={proc.returncode}, unparsable output")
+     if "checked" in out:
+         label = _scope_label(out.get("checked"))
++    try:
++        results = tuple((str(t), str(r)) for t, r in out.get("table_results", []))
++    except (ValueError, TypeError):
++        return ConfirmResult("error", label, elapsed, "invalid per-table results")
+     if "error" in out:
+         detail = f"{out.get('error')}/{out.get('sqlite')}: {out.get('message', '')}"[:200]
+         corrupt = out.get("sqlite") in ("SQLITE_CORRUPT", "SQLITE_NOTADB") or "malformed" in str(out.get("message"))
+-        return ConfirmResult("damaged" if corrupt else "error", label, elapsed, detail)
++        return ConfirmResult("damaged" if corrupt else "error", label, elapsed, detail, results)
+     if out.get("ok") is True and out.get("problems") == 0:
+-        return ConfirmResult("clean", label, elapsed, str(out.get("widened") or ""))
++        return ConfirmResult("clean", label, elapsed, str(out.get("widened") or ""), results)
++    if out.get("ok") is not False or not isinstance(out.get("problems"), int) or out["problems"] <= 0:
++        return ConfirmResult("error", label, elapsed, "invalid check result")
+     first = "; ".join(str(p) for p in (out.get("first") or []))[:300]
+-    return ConfirmResult("damaged", label, elapsed, f"{out.get('problems')} problem(s): {first}")
++    return ConfirmResult("damaged", label, elapsed, f"{out.get('problems')} problem(s): {first}", results)
++
++
++_background_lock = threading.Lock()
++_background_thread: Optional[threading.Thread] = None
++_background_paths: dict[str, tuple[str, Context]] = {}
++
++
++def background_confirmation_pending(db_path) -> bool:
++    with _background_lock:
++        return os.path.realpath(db_path) in _background_paths
++
++
++def _run_background_confirmations() -> None:
++    global _background_thread
++    from hermes_state_health import mark_storage_corrupt
++
++    while True:
++        with _background_lock:
++            if not _background_paths:
++                _background_thread = None
++                return
++            path, (first_error, context) = next(iter(_background_paths.items()))
++        try:
++            logger.warning("state.db read corrupt unconfirmed; background quick_check started: %s; %s",
++                           path, first_error)
++            result = context.run(confirm_corruption, path, None, None)
++            logger.warning("state.db background quick_check result: %s; %s", path, result.describe())
++            if result.outcome == "damaged":
++                context.run(mark_storage_corrupt, path, f"{first_error}; background {result.describe()}")
++        except Exception:  # health: allow BLE001 -- a diagnostic failure is not evidence of damage; keep draining other profiles
++            logger.exception("state.db background quick_check failed: %s", path)
++        finally:
++            with _background_lock:
++                _background_paths.pop(path, None)
++
++
++def schedule_background_confirmation(db_path, first_error: str) -> bool:
++    """One whole-file child in flight per process. Queue distinct files, coalesce same-file scopes.
++
++    No execution deadline: only actual damage latches. Further reads of a queued/in-flight file
++    fail immediately without spawning another foreground check. Other profile files are queued,
++    not silently discarded. A subsequent incident after completion may request a new check.
++    """
++    global _background_thread
++    path = os.path.realpath(db_path)
++    with _background_lock:
++        if path in _background_paths:
++            return False
++        _background_paths[path] = (first_error, copy_context())
++        if _background_thread is not None:
++            logger.warning("state.db read corrupt unconfirmed; background quick_check queued: %s", path)
++            return True
++        thread = threading.Thread(target=_run_background_confirmations, name="state-db-confirm", daemon=True)
++        _background_thread = thread
++        try:
++            thread.start()
++        except RuntimeError:
++            _background_thread = None
++            _background_paths.pop(path, None)
++            logger.warning("state.db read corrupt unconfirmed; background quick_check could not start", exc_info=True)
++            return False
++        return True
+ 
+ 
+ __all__ = [
+diff --git a/hermes_state_corruption_incident.py b/hermes_state_corruption_incident.py
+new file mode 100644
+index 00000000000..c750218c9be
+--- /dev/null
++++ b/hermes_state_corruption_incident.py
+@@ -0,0 +1,101 @@
++"""Report a canonical state.db latch through independent Kanban storage, never Inbox."""
++from __future__ import annotations
++
++import hashlib
++import logging
++import threading
++import uuid
++from contextlib import closing
++from pathlib import Path
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++
++def schedule_incident(db_path, first_error: str) -> None:
++    from hermes_constants import get_hermes_home
++    from hermes_cli.kanban_db import kanban_db_path
++    from hermes_cli.profiles import get_active_profile_name
++
++    home = get_hermes_home()
++    if Path(db_path).resolve() != (home / "state.db").resolve():
++        return
++    # Capture scope before starting a thread: profile context does not propagate to it.
++    args = (home, first_error, kanban_db_path(), get_active_profile_name())
++    try:
++        threading.Thread(target=_report_safely, args=args, name="state-db-incident", daemon=True).start()
++    except RuntimeError:
++        logger.exception("state.db corruption incident reporter could not start")
++
++
++def _report_safely(home: Path, first_error: str, board_path: Path, profile: str) -> None:
++    try:
++        report_incident(home, first_error, board_path=board_path, profile=profile)
++    except Exception:  # health: allow BLE001 -- diagnostics must never replace the original storage failure
++        logger.exception("state.db corruption incident reporting failed")
++
++
++def _create_card(conn, path, first_error, profile, key):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_capabilities import CapabilityMismatchError
++
++    options: dict[str, Any] = dict(
++        title="Investigate state.db structural-corruption latch",
++        body=(f"Canonical store: {path}\n\nFirst corrupt line:\n{first_error}\n\n"
++              "The process has refused writes. Per-table read-only quick_check results "
++              "will be appended by the reporter. Diagnose the first failure and check "
++              "loaded code and other storage owners; do not recover or replace the live "
++              "database without confirmed damage and a coordinated holder shutdown. "
++              "Acceptance: identify and fix the cause, verify storage and writes, and "
++              "record the diagnostic evidence. A later clean check does not prove the "
++              "file was never damaged."),
++        assignee=profile, created_by="state-health", priority=200, workspace_kind="scratch",
++        requires=["terminal", "file", "git"], idempotency_key=key,
++    )
++    try:
++        return kb.create_task(conn, **options)
++    except CapabilityMismatchError:
++        # Keep requirements for the specifier to route; do not drop the incident because
++        # the observing profile cannot repair it. No user decision is requested.
++        options.update(assignee=None, triage=True)
++        return kb.create_task(conn, **options)
++
++
++def report_incident(home: Path, first_error: str, *, board_path=None, profile=None) -> str | None:
++    """One open card per canonical file; resolved/archived cards cannot own new incidents."""
++    from gateway.status import _release_file_lock, _try_acquire_file_lock
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_comment_ids import add_comment
++    from hermes_cli.kanban_db_connect import connect
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_state_corruption_confirm import confirm_corruption
++
++    path = home / "state.db"
++    board_path = board_path or kb.kanban_db_path()
++    profile = profile or get_active_profile_name()
++    fingerprint = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:24]
++    prefix = f"state-corruption:{fingerprint}:"
++    with (home / "state-corruption-report.lock").open("a+") as lock:
++        if not _try_acquire_file_lock(lock):
++            return None
++        try:
++            with closing(connect(board_path)) as conn:
++                row = conn.execute(
++                    "SELECT id FROM tasks WHERE idempotency_key LIKE ? "
++                    "AND status NOT IN ('done', 'archived') ORDER BY created_at DESC LIMIT 1",
++                    (prefix + "%",),
++                ).fetchone()
++                if row:
++                    add_comment(conn, row["id"], "state-health", f"Another storage owner latched: {first_error}")
++                    return row["id"]
++                task_id = _create_card(conn, path, first_error, profile, prefix + uuid.uuid4().hex)
++            logger.warning("state.db corruption incident card: %s", task_id)
++            result = confirm_corruption(path, frozenset(), None)
++            rows = "\n".join(f"- {table}: {value}" for table, value in result.table_results)
++            with closing(connect(board_path)) as conn:
++                add_comment(conn, task_id, "state-health",
++                            f"Read-only per-table quick_check: {result.describe()}\n"
++                            f"{rows or 'No per-table results available; check failed before completion.'}")
++            return task_id
++        finally:
++            _release_file_lock(lock)
+diff --git a/hermes_state_health.py b/hermes_state_health.py
+index f57f026ff9f..9075e6ff1f7 100644
+--- a/hermes_state_health.py
++++ b/hermes_state_health.py
+@@ -24,8 +24,9 @@ only that the pages read back consistent then, not that the file was never damag
+ (``SessionDB._execute_write``) and the pooled reader first run a bounded ``quick_check`` of the
+ tables the failing statement touched, read-only in a fresh process
+ (``hermes_state_corruption_confirm``). Only a clean check allows ONE replay of the rolled-back
+-statement on the same connection, counted by ``note_unconfirmed_corruption``; damage, a timeout
+-or any check error latches, and so does a recurrence. A COMMIT is never replayed (its settlement
++statement on the same connection, counted by ``note_unconfirmed_corruption``. Read timeout/no_budget
++fails only the read and starts an unbounded background check; actual background damage latches.
++Writer timeout, immediate damage/check errors and replay recurrence still latch. A COMMIT is never replayed (its settlement
+ is unknown). The latched reason names the SQLite code, operation, stage and check outcome.
+ """
+ 
+@@ -81,12 +82,18 @@ def mark_storage_corrupt(db_path, reason: object) -> None:
+         "`hermes sessions recover --source %s --inspect-only` or restore a snapshot.",
+         db_path, reason, db_path,
+     )
++    try:
++        from hermes_state_corruption_incident import schedule_incident
++
++        schedule_incident(db_path, str(reason))
++    except Exception:  # health: allow BLE001 -- incident reporting must not mask the original storage failure
++        logger.exception("state.db corruption incident scheduling failed")
+ 
+ 
+ def note_storage_error(db_path, exc: BaseException, *, context: Optional[str] = None) -> bool:
+     """Latch *db_path* when *exc* is structural corruption; True when it was. *context* (code,
+     operation, replay outcome) is appended to the latched reason."""
+-    if not is_structural_corruption_error(exc):
++    if getattr(exc, "hermes_read_corrupt_unconfirmed", False) or not is_structural_corruption_error(exc):
+         return False
+     mark_storage_corrupt(db_path, f"{exc} [{context}]" if context else exc)
+     return True
+diff --git a/tests/hermes_state/test_storage_corruption_background.py b/tests/hermes_state/test_storage_corruption_background.py
+new file mode 100644
+index 00000000000..1a66e2b505e
+--- /dev/null
++++ b/tests/hermes_state/test_storage_corruption_background.py
+@@ -0,0 +1,130 @@
++"""Large-table read confirmations must not quarantine healthy writers on budget exhaustion."""
++import sqlite3
++import threading
++
++import pytest
++
++import hermes_state_corruption_confirm as cc
++from hermes_state import SessionDB
++from hermes_state_health import reset_storage_state, storage_state
++
++
++@pytest.fixture
++def db(tmp_path):
++    reset_storage_state()
++    handle = SessionDB(db_path=tmp_path / "state.db")
++    handle.create_session("s1", source="cli")
++    yield handle
++    handle.close()
++    reset_storage_state()
++
++
++def corrupt_read(conn):
++    conn.execute("SELECT id FROM sessions").fetchall()
++    exc = sqlite3.DatabaseError("database disk image is malformed")
++    exc.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
++    exc.sqlite_errorname = "SQLITE_CORRUPT"
++    raise exc
++
++
++@pytest.mark.parametrize("outcome", ["timeout", "no_budget"])
++def test_read_budget_exhaustion_does_not_latch_and_schedules_once(db, monkeypatch, outcome):
++    entered, release = threading.Event(), threading.Event()
++    calls = []
++
++    def confirm(path, tables, timeout_s):
++        if timeout_s is not None:
++            return cc.ConfirmResult(outcome, "sessions", 5.0)
++        calls.append((path, tables, timeout_s))
++        entered.set()
++        assert release.wait(10)
++        return cc.ConfirmResult("clean", "full", 6.0)
++
++    monkeypatch.setattr(cc, "confirm_corruption", confirm)
++    try:
++        for _ in range(2):
++            with pytest.raises(sqlite3.DatabaseError):
++                db._read_retrying_ioerr(corrupt_read)
++            assert storage_state(db.db_path) == "ok"
++        assert entered.wait(5)
++        assert calls == [(str(db.db_path), None, None)]
++        db.append_message(session_id="s1", role="user", content="write remains allowed")
++        assert db.get_messages("s1")[-1]["content"] == "write remains allowed"
++    finally:
++        release.set()
++        thread = getattr(cc, "_background_thread", None)
++        if thread is not None:
++            thread.join(10)
++
++
++@pytest.mark.parametrize("background", [False, True])
++def test_confirmed_damage_latches(db, monkeypatch, background):
++    def confirm(path, tables, timeout_s):
++        outcome = "timeout" if background and timeout_s is not None else "damaged"
++        return cc.ConfirmResult(outcome, "sessions", 0.0, "bad page")
++
++    monkeypatch.setattr(cc, "confirm_corruption", confirm)
++    with pytest.raises(sqlite3.DatabaseError):
++        db._read_retrying_ioerr(corrupt_read)
++    thread = getattr(cc, "_background_thread", None)
++    if thread is not None:
++        thread.join(10)
++    assert storage_state(db.db_path) == "corrupt"
++    with pytest.raises(sqlite3.DatabaseError):
++        db.append_message(session_id="s1", role="user", content="must not land")
++
++
++@pytest.mark.parametrize("router", ["sessions", "profiles"])
++def test_web_outer_handlers_do_not_relatch_unconfirmed_read(db, monkeypatch, router):
++    from fastapi import HTTPException
++    from hermes_cli.web_routers import sessions, profiles
++
++    monkeypatch.setattr(cc, "confirm_corruption", lambda *args: cc.ConfirmResult("timeout", "sessions", 5.0))
++    monkeypatch.setattr(cc, "schedule_background_confirmation", lambda *args: True)
++    with monkeypatch.context() as m:
++        m.setattr(db, "close", lambda: None)
++        if router == "sessions":
++            m.setattr(sessions, "_open_session_db_for_profile", lambda *a, **k: db)
++            m.setattr(sessions, "_session_db_path_for_profile", lambda *a: db.db_path)
++            m.setattr(db, "list_sessions_rich", lambda **k: db._read_retrying_ioerr(corrupt_read))
++            with pytest.raises(HTTPException) as caught:
++                sessions.get_sessions(limit=20, offset=0)
++            assert caught.value.status_code == 503
++            assert "background integrity check" in caught.value.detail
++        else:
++            m.setattr(profiles, "_open_session_db_at_path", lambda *a, **k: db)
++            errors = []
++            assert profiles._read_profile_db("default", db.db_path.parent, errors,
++                lambda handle: handle._read_retrying_ioerr(corrupt_read)) is None
++            assert len(errors) == 1
++        assert storage_state(db.db_path) == "ok"
++        db.append_message(session_id="s1", role="user", content="router did not latch")
++
++
++def test_distinct_profile_checks_queue_and_errors_do_not_latch(tmp_path, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    paths = [tmp_path / "a.db", tmp_path / "b.db"]
++    seen = []
++
++    def confirm(path, tables, timeout_s):
++        seen.append(path)
++        if path == str(paths[0]):
++            entered.set()
++            assert release.wait(10)
++        return cc.ConfirmResult("error", "full", 0, "spawn failed")
++
++    monkeypatch.setattr(cc, "confirm_corruption", confirm)
++    try:
++        assert cc.schedule_background_confirmation(paths[0], "first")
++        assert entered.wait(5)
++        thread = cc._background_thread
++        assert cc.schedule_background_confirmation(paths[1], "second")
++        assert not cc.schedule_background_confirmation(paths[1], "duplicate")
++        assert cc.background_confirmation_pending(paths[1])
++    finally:
++        release.set()
++        thread = cc._background_thread
++        if thread is not None:
++            thread.join(10)
++    assert seen == [str(path) for path in paths]
++    assert all(storage_state(path) == "ok" for path in paths)
+diff --git a/tests/hermes_state/test_storage_corruption_incident.py b/tests/hermes_state/test_storage_corruption_incident.py
+new file mode 100644
+index 00000000000..ab7e013c80c
+--- /dev/null
++++ b/tests/hermes_state/test_storage_corruption_incident.py
+@@ -0,0 +1,102 @@
++"""Latch reporting uses an independent Kanban store and reuses only live incidents."""
++from contextlib import closing
++
++import hermes_state_corruption_confirm as cc
++import hermes_state_corruption_incident as incident
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli import kanban_db as kb
++from hermes_state_health import mark_storage_corrupt, reset_storage_state
++
++
++def test_latch_reports_only_first_error(tmp_path, monkeypatch):
++    seen = []
++    monkeypatch.setattr(incident, "schedule_incident", lambda *args: seen.append(args))
++    path = tmp_path / "state.db"
++    reset_storage_state(path)
++    mark_storage_corrupt(path, "first corrupt line")
++    mark_storage_corrupt(path, "later corrupt line")
++    assert seen == [(path, "first corrupt line")]
++    reset_storage_state(path)
++
++
++def test_incident_card_contains_first_line_and_table_results(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
++    monkeypatch.setattr(cc, "confirm_corruption", lambda *args: cc.ConfirmResult(
++        "damaged", "messages,sessions", 6.0, "bad page",
++        (("messages", "bad page 42"), ("sessions", "ok"))))
++    first = incident.report_incident(tmp_path, "SQLITE_CORRUPT original")
++    assert first
++    assert incident.report_incident(tmp_path, "repeated") == first
++    with closing(connect(tmp_path / "kanban.db")) as conn:
++        task = kb.get_task(conn, first)
++        assert task is not None and task.body
++        assert "SQLITE_CORRUPT original" in task.body
++        comments = kb.list_comments(conn, first)
++        assert len(comments) == 2
++        assert "messages: bad page 42" in comments[0].body
++        assert "sessions: ok" in comments[0].body
++        assert "Another storage owner latched: repeated" in comments[1].body
++        # Exercise a resolved predecessor: a new latch must get a new repair owner.
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (first,))
++        conn.commit()
++    second = incident.report_incident(tmp_path, "new incident")
++    assert second != first
++
++
++def test_scratch_database_never_schedules_live_card(tmp_path, monkeypatch):
++    def forbidden(*args, **kwargs):
++        raise AssertionError("scratch DB must not spawn a reporter")
++    monkeypatch.setattr(incident.threading, "Thread", forbidden)
++    incident.schedule_incident(tmp_path / "scratch.db", "fixture")
++
++
++def test_real_isolated_child_returns_per_table_results(tmp_path):
++    import sqlite3
++
++    path = tmp_path / "state.db"
++    with closing(sqlite3.connect(path)) as conn:
++        conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT)")
++        conn.commit()
++    result = cc.confirm_corruption(path, frozenset(), None)
++    assert result.clean
++    assert ("messages", "ok") in result.table_results
++    assert ("sqlite_schema", "ok") in result.table_results
++
++
++def test_isolated_child_exits_if_parent_identity_is_gone(tmp_path):
++    import os
++    import sqlite3
++    import subprocess
++    import pytest
++
++    if os.name != "posix":
++        pytest.skip("POSIX parent lifetime guard")
++    path = tmp_path / "state.db"
++    with closing(sqlite3.connect(path)) as conn:
++        conn.execute("CREATE TABLE messages(id INTEGER)")
++        conn.commit()
++        conn.execute("BEGIN EXCLUSIVE")
++        argv = cc._child_argv(path.as_uri() + "?mode=ro", "null", 30000)
++        argv[-1] = "-1"  # a parent PID which cannot be this process's real parent
++        proc = subprocess.run(argv, capture_output=True, timeout=5, check=False, start_new_session=True)
++        assert proc.returncode == 1
++        assert proc.stdout == b""
++
++
++def test_per_table_results_survive_real_damage(tmp_path):
++    import sqlite3
++
++    path = tmp_path / "state.db"
++    with closing(sqlite3.connect(path)) as conn:
++        conn.execute("CREATE TABLE broken(id INTEGER PRIMARY KEY, content TEXT)")
++        conn.execute("CREATE TABLE healthy(id INTEGER PRIMARY KEY)")
++        conn.commit()
++        size = conn.execute("PRAGMA page_size").fetchone()[0]
++        root = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name='broken'").fetchone()[0]
++    with path.open("r+b") as stream:
++        stream.seek(size * (root - 1))
++        stream.write(b"\xff" * size)
++    result = cc.confirm_corruption(path, frozenset(), None)
++    assert result.outcome == "damaged"
++    assert ("healthy", "ok") in result.table_results
++    assert any(table == "broken" and value != "ok" for table, value in result.table_results)
+diff --git a/tests/hermes_state/test_storage_corruption_scoped_confirm.py b/tests/hermes_state/test_storage_corruption_scoped_confirm.py
+index 85da3e58cee..67473a39b2c 100644
+--- a/tests/hermes_state/test_storage_corruption_scoped_confirm.py
++++ b/tests/hermes_state/test_storage_corruption_scoped_confirm.py
+@@ -487,7 +487,9 @@ class TestPooledRead:
+         finally:
+             db.close()
+ 
+-    def test_read_confirm_timeout_latches_without_replay(self, tmp_path, confirms, monkeypatch):
++    def test_read_confirm_timeout_fails_read_without_replay_or_latch(self, tmp_path, confirms, monkeypatch):
++        scheduled = []
++        monkeypatch.setattr(cc, "schedule_background_confirmation", lambda *args: scheduled.append(args))
+         db = SessionDB(db_path=tmp_path / "state.db")
+         try:
+             db.create_session("s1", source="cli")
+@@ -497,8 +499,10 @@ class TestPooledRead:
+                 db._read_one("SELECT id FROM sessions WHERE id = ?", ("s1",))
+             assert calls["n"] == 1
+             assert [c["result"].outcome for c in confirms] == ["timeout"]
+-            assert storage_state(db.db_path) == "corrupt"
+-            assert "confirm=timeout" in _reason(db.db_path)
++            assert storage_state(db.db_path) == "ok"
++            assert len(scheduled) == 1
++            assert "confirm=timeout" in scheduled[0][1]
++            db.append_message(session_id="s1", role="user", content="still writable")
+         finally:
+             db.close()
+ 
+-- 
+2.55.0
+

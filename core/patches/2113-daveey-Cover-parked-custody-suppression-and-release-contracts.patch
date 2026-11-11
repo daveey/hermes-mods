@@ -1,0 +1,228 @@
+From 0c736ccdbd4a40b2009edebe8226c629774c944c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:17:46 +0000
+Subject: [PATCH] [daveey] Cover parked custody suppression and release
+ contracts
+
+---
+ .../tools/test_process_orphan_readopt_tui.py  | 15 +++++++--
+ .../test_notification_poller_idle.py          | 28 +++++++++++++++++
+ tests/tui_gateway/test_notification_wait.py   | 14 +++++++--
+ .../test_readopted_completion_parking.py      | 19 ++++++++++--
+ .../tui_gateway/test_shutdown_job_receipts.py | 31 +++++++++++++++++--
+ 5 files changed, 96 insertions(+), 11 deletions(-)
+
+diff --git a/tests/tools/test_process_orphan_readopt_tui.py b/tests/tools/test_process_orphan_readopt_tui.py
+index f5817ece60d..f16f9b16c8b 100644
+--- a/tests/tools/test_process_orphan_readopt_tui.py
++++ b/tests/tools/test_process_orphan_readopt_tui.py
+@@ -238,9 +238,18 @@ def test_parked_events_are_taken_only_by_their_owner():
+     mine, theirs = {"session_key": "a"}, {"session_key": "b"}
+     registry.park_unowned_event(mine)
+     registry.park_unowned_event(theirs)
+-    assert registry.take_parked_events(lambda e: e["session_key"] == "a") == [mine]
+-    assert registry.take_parked_events(lambda e: e["session_key"] == "a") == []
+-    assert registry.take_parked_events(lambda e: True) == [theirs]
++    from tools.process_registry_awaiting import release
++    taken = registry.take_parked_events(lambda e: e["session_key"] == "a")
++    try:
++        assert taken == [mine]
++        assert registry.take_parked_events(lambda e: e["session_key"] == "a") == []
++    finally:
++        release(taken)
++    taken = registry.take_parked_events(lambda e: True)
++    try:
++        assert taken == [theirs]
++    finally:
++        release(taken)
+ 
+ 
+ def test_start_tui_orphan_recovery_runs_off_thread(checkpoint, procs):
+diff --git a/tests/tui_gateway/test_notification_poller_idle.py b/tests/tui_gateway/test_notification_poller_idle.py
+index 043378a6e3b..702401502c3 100644
+--- a/tests/tui_gateway/test_notification_poller_idle.py
++++ b/tests/tui_gateway/test_notification_poller_idle.py
+@@ -88,6 +88,34 @@ def test_production_poller_park_publication_delivers_within_two_seconds(poller,
+         notification_park.clear()
+ 
+ 
++@pytest.mark.parametrize("raises", [False, True])
++def test_park_claim_routing_releases_in_flight_custody(poller, monkeypatch, raises):
++    from tools.process_registry_awaiting import pending_events
++    from tui_gateway import notification_park, server
++    q, stop, thread, session, _timeouts, _delivered, _received = poller
++    monkeypatch.setattr(notification_park, "claim", session["_test_real_claim"])
++    monkeypatch.setattr(server, "_session_owns_notification_event", lambda sid, s, event: True)
++    event = {"type": "completion", "session_key": "idle", "owner_task_id": "park-owner"}
++    routed = []
++
++    def handle(sid, session, events, *args):
++        if event in events:
++            routed.append(any(e is event for e in pending_events(q)))
++            stop.set()
++            if raises:
++                raise RuntimeError("routing error")
++
++    monkeypatch.setattr(server, "_notif_handle_ready", handle)
++    try:
++        assert notification_park.park(event)
++        thread.join(3)
++        assert not thread.is_alive()
++        assert routed == [True]
++        assert not any(e is event for e in pending_events(q))
++    finally:
++        notification_park.clear()
++
++
+ def test_self_rehold_does_not_invalidate_wait_generation():
+     from tui_gateway import server
+     from tui_gateway.notification_wait import generation
+diff --git a/tests/tui_gateway/test_notification_wait.py b/tests/tui_gateway/test_notification_wait.py
+index e24613b8ec5..8364915257c 100644
+--- a/tests/tui_gateway/test_notification_wait.py
++++ b/tests/tui_gateway/test_notification_wait.py
+@@ -103,6 +103,7 @@ def test_both_park_producers_publish_a_wake(monkeypatch):
+     from tui_gateway import notification_park
+     from tui_gateway.notification_wait import generation
+     from tools.process_registry import process_registry
++    from tools.process_registry_awaiting import release
+     q = queue.Queue()
+     monkeypatch.setattr(process_registry, "completion_queue", q)
+     monkeypatch.setattr(process_registry, "_parked_events", [])
+@@ -113,15 +114,22 @@ def test_both_park_producers_publish_a_wake(monkeypatch):
+         process_registry.park_unowned_event(event)
+         assert generation(q) > before
+         assert process_registry.has_parked_events()
+-        assert process_registry.take_parked_events(lambda e: True) == [event]
++        taken = process_registry.take_parked_events(lambda e: True)
++        try:
++            assert taken == [event]
++        finally:
++            release(taken)
+         assert not process_registry.has_parked_events()
+         before = generation(q)
+         assert notification_park.park(event)
+         assert generation(q) > before
+         assert notification_park.has_parked()
+         taken = notification_park.claim(lambda e: True)
+-        assert taken == [event]
+-        notification_park.unhold(taken)
++        try:
++            assert taken == [event]
++        finally:
++            release(taken)
++            notification_park.unhold(taken)
+         assert not notification_park.has_parked()
+     finally:
+         notification_park.clear()
+diff --git a/tests/tui_gateway/test_readopted_completion_parking.py b/tests/tui_gateway/test_readopted_completion_parking.py
+index a617f433abd..c48da6e44ad 100644
+--- a/tests/tui_gateway/test_readopted_completion_parking.py
++++ b/tests/tui_gateway/test_readopted_completion_parking.py
+@@ -14,6 +14,7 @@ import threading
+ import pytest
+ 
+ from tools.process_registry import ProcessRegistry
++from tools.process_registry_awaiting import release
+ from tui_gateway import server
+ 
+ KEY = "20261014_152627_e39461"
+@@ -42,7 +43,11 @@ def test_unowned_readopted_completion_is_parked_not_dropped(owners):
+                                       completions) is True
+     assert completions == []
+     assert registry.completion_queue.empty()
+-    assert [e["session_id"] for e in registry.take_parked_events(lambda e: True)] == ["proc_4fa0a87e0e10"]
++    taken = registry.take_parked_events(lambda e: True)
++    try:
++        assert [e["session_id"] for e in taken] == ["proc_4fa0a87e0e10"]
++    finally:
++        release(taken)
+ 
+ 
+ def test_ordinary_unowned_completion_is_still_dropped(owners):
+@@ -138,7 +143,11 @@ def test_exit_for_a_chat_that_is_not_open_wakes_it(monkeypatch):
+     t = server._readopted_exit_deliver(dict(EVENT), registry=registry)
+     assert t is not None
+     t.join(5)
+-    assert [e["session_key"] for e in registry.take_parked_events(lambda e: True)] == [KEY]
++    taken = registry.take_parked_events(lambda e: True)
++    try:
++        assert [e["session_key"] for e in taken] == [KEY]
++    finally:
++        release(taken)
+     assert resumed and resumed[0]["session_id"] == KEY and resumed[0].get("omit_messages") is True
+ 
+ 
+@@ -147,7 +156,11 @@ def test_exit_for_an_open_chat_is_parked_without_a_resume(monkeypatch):
+     monkeypatch.setattr(server, "_notif_live_session_matches", lambda keys, exclude=None: KEY in keys)
+     monkeypatch.setitem(server._methods, "session.resume", lambda rid, params: pytest.fail("resumed an open chat"))
+     assert server._readopted_exit_deliver(dict(EVENT), registry=registry) is None
+-    assert len(registry.take_parked_events(lambda e: True)) == 1
++    taken = registry.take_parked_events(lambda e: True)
++    try:
++        assert len(taken) == 1
++    finally:
++        release(taken)
+ 
+ 
+ def test_wake_tries_named_profiles_when_the_launch_store_lacks_the_chat(monkeypatch, tmp_path):
+diff --git a/tests/tui_gateway/test_shutdown_job_receipts.py b/tests/tui_gateway/test_shutdown_job_receipts.py
+index f1d1ce2ee1f..974ead8bf9a 100644
+--- a/tests/tui_gateway/test_shutdown_job_receipts.py
++++ b/tests/tui_gateway/test_shutdown_job_receipts.py
+@@ -335,8 +335,9 @@ def test_finished_notice_survives_orderly_restart(home, registry, backend, monke
+     assert "were running" not in text and "jobs stopped" not in text.lower()
+ 
+ 
++@pytest.mark.parametrize("pending", ["queue", "registry_park", "notification_park"])
+ @pytest.mark.parametrize("control", ["stop", "quiet", "foreign_session", "consumed", "delivered"])
+-def test_finished_notice_shutdown_controls(home, registry, backend, monkeypatch, control):
++def test_finished_notice_shutdown_controls(home, registry, backend, monkeypatch, control, pending):
+     from tools.process_registry_notifications import format_process_notification
+ 
+     job = _job("proc_done", owner="turn-1", command="true", notify=True)
+@@ -357,7 +358,14 @@ def test_finished_notice_shutdown_controls(home, registry, backend, monkeypatch,
+      "consumed": lambda: registry._completion_consumed.add(job.id),
+      "delivered": delivered}[control]()
+     # A stale duplicate must not resurrect an acknowledged or suppressed completion.
+-    registry.completion_queue.put(event)
++    if pending == "registry_park":
++        registry.park_unowned_event(event)
++    elif pending == "notification_park":
++        from tui_gateway import notification_park
++        monkeypatch.setattr(notification_park, "_parked", [])
++        assert notification_park.park(event)
++    else:
++        registry.completion_queue.put(event)
+     server._shutdown_sessions()
+     assert read_turn_marker(home, "session-key") is None
+     assert read_turn_marker(home / "other-profile", "session-key") is None
+@@ -774,6 +782,25 @@ def test_claimed_parked_notice_keeps_exit_custody(home, registry, backend, monke
+     assert not any(e is event for e in pending_events(registry.completion_queue))
+ 
+ 
++@pytest.mark.parametrize("disposal", ["clear", "expire"])
++def test_park_disposal_does_not_release_an_independent_hold(registry, monkeypatch, disposal):
++    from tools.process_registry_awaiting import hold, pending_events, release
++    from tui_gateway import notification_park
++    monkeypatch.setattr(notification_park, "_parked", [])
++    event = {"type": "completion", "session_id": "proc_hold", "owner_task_id": "owner"}
++    hold([event])
++    try:
++        assert notification_park.park(event)
++        if disposal == "clear":
++            notification_park.clear()
++        else:
++            monkeypatch.setattr(notification_park, "time", types.SimpleNamespace(monotonic=lambda: float("inf")))
++            assert notification_park.claim(lambda evt: True) == []
++        assert any(e is event for e in pending_events(registry.completion_queue))
++    finally:
++        release([event])
++
++
+ def test_registry_park_claim_rechecks_presence(registry):
+     from tools.process_registry_awaiting import release
+     event = {"session_id": "proc_claim", "owner_task_id": "owner"}
+-- 
+2.55.0
+

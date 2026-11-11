@@ -56,4 +56,6 @@ the turn with a note of what is pending. Never turn quiet mode off yourself unle
   for the identified device, then repeat the list to verify. This stops the device, not its owning agent session
   or future launches; report those separately. Do not describe shutdown as a persistent speaker-access block.
 - Extend coverage by editing `BLOCK_TOOLS` / `HA_BLOCK_DOMAINS` / `_SHELL_PATTERNS`, then run
-  `~/.hermes/hermes-agent/venv/bin/python -m pytest -q ~/.hermes/plugins/quiet-mode/tests_quiet.py`.
+  `~/code/hermes-mods/scripts/test-all -k quiet-mode` (the targeted runner supplies pytest).
+  For core runtime probes use `~/.hermes/bin/hermes-core-python`; its production environment
+  does not include test-only dependencies. Never select the retired checkout venv.

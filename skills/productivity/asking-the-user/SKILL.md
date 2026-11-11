@@ -22,8 +22,12 @@ The one-line rules stay in the user's `~/AGENTS.md` ("Commands That Need Me", "P
 skill is how to carry them out. A decision or approval that should wait on the board is a blocked Kanban card
 (`kanban-orchestrator`, "Card mechanics for this user"), not anything here.
 
-**Look first:** can an agent do this step itself (a broker token, `remote_approve_dialog`, the browser tools)?
-Hand it over only when it can't.
+**Look first:** exhaust supported agent paths (broker credentials, existing authenticated sessions, browser tools)
+before handing over a step. When the user says “use your judgement” or “do it yourself,” remove discretionary
+choice blockers and resume the existing owner; don't repeat the same ask as a status update. For an ambiguous
+acceptance tolerance, pursue a stricter sufficient bound without declaring it the original requirement or selecting
+a tolerance to pass observed results. Keep genuine identity/permission boundaries separate: delegated judgement
+is not an authenticated login or authority to bypass a deny.
 
 ## Commands that need the user
 
@@ -33,6 +37,12 @@ Hand it over only when it can't.
   terminal window, shows the command, the user confirms there, it runs, and you get the exit code and output.
 - The tool is eager on most hosts. Where it isn't in the tool list, call it through `tool_call` (name
   `run_in_user_terminal`); never fall back to pasting the command.
+- The window opens on the user's own Mac (e.g. the MacBook), even from a hub chat, so a command naming a hub path
+  fails there ("No such file"). Stage hub files on that Mac first with `tailnet_copy` (`direction=put`, host
+  from `tailnet_hosts`, e.g. `mbp`), have the command write its output to a file on that Mac, then bring it back
+  with `tailnet_copy get`. Print the staged file's sha256 in the command so the user can match it to the reviewed
+  copy. The user's shell is zsh, which doesn't word-split an unquoted `$VAR`: write ssh options inline, never in
+  a variable.
 - Remote hosts too: `ssh -t <host> 'sudo ...'`. When the SSH key is refused, run
   `ssh-copy-id -i ~/.ssh/id_ed25519.pub <user>@<host>` there.
 - Get a go-ahead in chat first for anything destructive: the window runs the command at once, with no y/N step.
@@ -75,6 +85,13 @@ Hand it over only when it can't.
   ONE human step: "click OK, then type the password in the window that opens". The job waits `awaiting_consent` and
   opens the window by itself after the click (retries every 15 s until max wait). Keep waiting with its `job_id`;
   never add "unblock the card" or "reply done" so an agent retries (coach `consent_relay` holds that reply).
+- When the user answers "done" on a password/prompt step but the result is still absent, don't just re-ask. First check
+  that their input actually reached the prompt: look for auth attempts (`log show --last 60m --predicate 'process ==
+  "sudo"'`), and `sample` the app hosting the prompt. Terminal.app whose main thread sits in
+  `CA::Context::commit_transaction` at 0% CPU (and `open -a Terminal` fails with -1712) is hung and swallows every
+  keystroke; the user sees a beachball. If `ps -t <tty>` shows the stuck prompt is its only session, kill Terminal,
+  reopen the same `.command` file with `open`, confirm a fresh `sample` is idle in `_BlockUntilNextEventMatchingListInMode`,
+  then ask once more for the password in the new window.
 
 ## Inbox posts
 

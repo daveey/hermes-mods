@@ -413,6 +413,14 @@ def choose_snapshot(entries, *, provider, model, account_id, base_url):
                and _identity_id_for(provider, e) == account_id]
     if not matched:
         raise SelectionRejected('Account was removed or its identity changed; refresh usage')
+    try:
+        from agent.credential_pool_disabled import enabled_entries
+    except ImportError:  # core without `hermes auth disable`
+        enabled_entries = None
+    if enabled_entries is not None:
+        matched = enabled_entries(provider, matched)  # a disabled row never serves a manual pick
+        if not matched:
+            raise SelectionRejected('Account is disabled; enable it in the usage panel first')
     now = time.time()
     sole = len([e for e in rows if e.last_status != 'dead']) <= 1
     viable = []

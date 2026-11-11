@@ -182,6 +182,16 @@ rule itself leaves them and `unverified` alone. Control: a missing-permission as
 stated to be data, not instructions. SYSTEM's `already_answered` also covers "a standing decision in the user
 profile declines exactly this", so a declined key rotation is not asked again.
 
+**Soak is not a precondition.** A rule against soaks (an observation window after a change) does not answer an ask
+about waiting for the precondition event a test needs (a real overload, natural quota exhaustion). 11-10: David's
+"i dont want to wait for any soaking" was cited as `already_answered` for "wait for a real Claude overload to prove the
+switch"; t_7e2ee45c then re-reconciled for 69 runs. SYSTEM says so, and on both paths (`judge()`, `structured_llm`)
+`judge.is_precondition_wait` turns an `already_answered` whose evidence (source quote + reason) cites soak wording,
+for an ask that waits for an event and is not itself a soak, into `ok` (reason "precondition wait: …", one
+`precondition_kept` line in `ask-gate.jsonl`). An answer about the precondition itself with no soak wording ("don't wait for the
+overload, close it as NO_PROOF") and an ask that is itself a soak still hold. Replay of all 105 `already_answered` rows in the hub's
+log: 1 changes, the 21:12 incident ask. Tests: `tests/test_precondition_kept.py`.
+
 **Live-test rule.** A live test that runs a real agent never uses a real pending ask, credential or file of David's.
 Use a fictional, human-only topic and `-t todo`. (10-29: a live `hermes chat --oneshot` about a real key made the agent
 edit `~/.bash_profile`.) To check the judge against the real model, call `judge.judge(..., llm=judge.aux_llm)` directly;

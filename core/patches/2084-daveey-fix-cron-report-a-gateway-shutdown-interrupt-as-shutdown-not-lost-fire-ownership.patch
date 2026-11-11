@@ -1,0 +1,526 @@
+From 687b316b516daa986f528b1646789314882abfb9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 03:24:10 +0000
+Subject: [PATCH] [daveey] fix(cron): report a gateway-shutdown interrupt as
+ shutdown, not lost fire ownership
+
+cron-7c04faf754: the gateway's mark_running_jobs_interrupted writes the interrupted outcome,
+which clears the run's fire claim. The run's real claim heartbeat then missed its claim and the
+owner gateway's run (fed a reasonless forwarded cron.cancel) stopped with "cron fire ownership was
+lost", logged at ERROR with a traceback (the coach's "Job '<name>' failed:" defect line) although
+no other process took the claim.
+
+- cron/cancellation.py: ShutdownAwareCancel wraps a claim latch with an in-process "interrupted by
+  this gateway's stop" check; reason becomes "Gateway shutdown interrupted the run" and
+  shutdown_interrupted is exposed (also through _CombinedCancelEvent). CronShutdownInterrupted.
+- cron/scheduler.py: the fire-claim heartbeat latch is shutdown-aware (scoped by execution token)
+  and logs a distinct WARNING; _abort_if_fire_claim_lost raises CronShutdownInterrupted for it;
+  run_job logs that as one WARNING without traceback (_log_job_failure); real ownership loss and
+  every other failure stay ERROR + traceback. fire_interrupted_by_shutdown() for the owner side.
+- gateway/session_cron.py execute: the forwarded cancel is shutdown-aware for fires this process
+  interrupted.
+- tests: real heartbeat through a real interrupt mark (red before: reason 'cron fire ownership was
+  lost'), foreign takeover sibling still 'ownership was lost', owner-side execute both ways,
+  watchdog/log-level tests. Fakes of _run_with_fire_claim_heartbeat accept the new kwarg.
+---
+ cron/cancellation.py                      |  57 +++++-
+ cron/scheduler.py                         |  60 +++++--
+ gateway/session_cron.py                   |  12 +-
+ tests/cron/test_cron_relay_run_forward.py |   6 +-
+ tests/cron/test_shutdown_interrupt.py     | 202 +++++++++++++++++++++-
+ 5 files changed, 316 insertions(+), 21 deletions(-)
+
+diff --git a/cron/cancellation.py b/cron/cancellation.py
+index a4e63d3d745..59b12171d78 100644
+--- a/cron/cancellation.py
++++ b/cron/cancellation.py
+@@ -19,7 +19,7 @@ import os
+ import tempfile
+ import time
+ from pathlib import Path
+-from typing import Any, Dict, Optional, Protocol
++from typing import Any, Callable, Dict, Optional, Protocol
+ 
+ from hermes_constants import get_hermes_home
+ 
+@@ -136,6 +136,14 @@ class _CombinedCancelEvent:
+                 return getattr(event, "reason", None)
+         return None
+ 
++    @property
++    def shutdown_interrupted(self) -> bool:
++        """Whether the source that fired (same one ``reason`` reads) is a shutdown interrupt."""
++        for event in self._events:
++            if event.is_set():
++                return cancel_is_shutdown(event)
++        return False
++
+ 
+ class CancelRequest:
+     """``_CancelEventLike`` view of one execution's cancel marker.
+@@ -165,6 +173,53 @@ class CancelRequest:
+         return self._reason
+ 
+ 
++SHUTDOWN_INTERRUPT_REASON = "Gateway shutdown interrupted the run"
++
++
++class CronShutdownInterrupted(RuntimeError):
++    """A run stopped because this process's own gateway shutdown marked it interrupted
++    (``mark_running_jobs_interrupted``): an expected stop, not a lost fire claim. Shutdown
++    already wrote the job's interrupted ``last_status``; ``run_job`` logs it without a traceback."""
++
++
++def cancel_is_shutdown(cancel_event: Any) -> bool:
++    """True when the source that fired is this gateway's shutdown interrupt (cron-7c04faf754)."""
++    return bool(getattr(cancel_event, "shutdown_interrupted", False))
++
++
++class ShutdownAwareCancel:
++    """``_CancelEventLike`` around a fire-claim latch that knows when THIS process's shutdown fired it.
++
++    Gateway shutdown marks the execution interrupted (``scheduler._interrupted_job_ids``) and then
++    writes the interrupted outcome, which clears the fire claim. The run's claim heartbeat (and the
++    owner gateway's forwarded ``cron.cancel``) then see a claim that nobody else took. ``interrupted``
++    is that in-process flag check, read when the latch is inspected, so whichever path latched it
++    reports the shutdown instead of "cron fire ownership was lost" — a real takeover leaves the flag
++    unset and keeps the lost-ownership wording.
++    """
++
++    def __init__(self, event: Any, interrupted: Callable[[], bool]) -> None:
++        self._event = event
++        self._interrupted = interrupted
++
++    def is_set(self) -> bool:
++        return self._event.is_set()
++
++    def set(self) -> None:
++        self._event.set()
++
++    def wait(self, timeout: Optional[float] = None) -> bool:
++        return self._event.wait(timeout)
++
++    @property
++    def shutdown_interrupted(self) -> bool:
++        return self._event.is_set() and bool(self._interrupted())
++
++    @property
++    def reason(self) -> Optional[str]:
++        return SHUTDOWN_INTERRUPT_REASON if self.shutdown_interrupted else getattr(self._event, "reason", None)
++
++
+ def cancel_reason(cancel_event: Any) -> str:
+     """Human-facing cause for a cancelled run; the legacy wording when no source carries one."""
+     return getattr(cancel_event, "reason", None) or "cron fire ownership was lost"
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index c0b88079d4b..0cdaebc08dd 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -531,8 +531,9 @@ from cron.executions import (
+     recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
+ from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
+ from cron.scheduler_bookkeeping import _classify_delivery_outcome
+-from cron.cancellation import (CancelRequest, _CancelEventLike, _CombinedCancelEvent, cancel_reason,
+-                               clear_cancel, finish_lost_execution,
++from cron.cancellation import (CancelRequest, CronShutdownInterrupted, ShutdownAwareCancel,
++                               _CancelEventLike, _CombinedCancelEvent, cancel_is_shutdown,
++                               cancel_reason, clear_cancel, finish_lost_execution,
+                                run_job_unless_cancelled as _run_job_unless_cancelled)
+ 
+ # Response marker that suppresses delivery (output is still saved locally for audit).
+@@ -1216,6 +1217,18 @@ def _is_interrupted(job_id: str, token: Optional[object] = None) -> bool:
+         return key in _interrupted_job_ids
+ 
+ 
++def fire_interrupted_by_shutdown(job_id: str) -> bool:
++    """Has this process's shutdown marked ANY in-flight fire of ``job_id`` interrupted? For the
++    owner gateway's run (gateway.session_cron.execute), which holds no firer token: its forwarded
++    ``cron.cancel`` carries no reason, and when the firer is this same process the flag says the
++    stop was our own shutdown, not another process taking the claim (cron-7c04faf754)."""
++    key = _inflight_key(job_id)
++    with _running_lock:
++        if key in _interrupted_job_ids:
++            return True
++        return any(token in _interrupted_job_ids for token in _running_fire_owners.get(key, {}))
++
++
+ def _consume_interrupted_flag(job_id: str, token: Optional[object] = None) -> bool:
+     """Return True and clear the flag if shutdown marked THIS execution interrupted. Called right
+     before ``last_status`` is written; consuming stops the flag leaking into a later run."""
+@@ -2049,7 +2062,9 @@ def _run_agent_with_watchdog(
+         reason = cancel_reason(cancel_event)
+         if agent is not None and hasattr(agent, "interrupt"):
+             agent.interrupt(f"Cron run stopped: {reason}")
+-        raise RuntimeError(f"Cron job '{job_name}' was stopped: {reason}")
++        # This gateway's own shutdown is an expected stop, not a lost claim (cron-7c04faf754).
++        error = CronShutdownInterrupted if cancel_is_shutdown(cancel_event) else RuntimeError
++        raise error(f"Cron job '{job_name}' was stopped: {reason}")
+ 
+     def _heartbeat_run_claim_if_due():
+         nonlocal _last_claim_heartbeat
+@@ -2856,7 +2871,8 @@ def run_job(
+ 
+     except (Exception, ConfigBackendUnavailable) as e:  # the plane being down fails THIS fire only
+         error_msg = _job_error_message(e)
+-        logger.exception("Job '%s' failed: %s", job_name, error_msg)
++        if not _log_shutdown_stop(job_name, error_msg, e):
++            logger.exception("Job '%s' failed: %s", job_name, error_msg)
+         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
+         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
+         # tail can schedule a bounded automatic re-run instead of waiting a full period.
+@@ -2944,8 +2960,22 @@ def _teardown_cron_agent(
+         timeout_seconds=timeout_seconds)
+ 
+ 
+-def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
+-    """Run ``run`` while keeping this job's owned durable fire claim fresh."""
++def _log_shutdown_stop(job_name: str, error_msg: str, exc: BaseException) -> bool:
++    """``run_job``'s failure log for a stop by this gateway's own shutdown: expected (shutdown already
++    wrote the interrupted ``last_status``), so one WARNING without traceback and not the coach's
++    "Job '<name>' failed:" defect line. False for everything else, real ownership loss included,
++    which ``run_job`` keeps logging at ERROR with its traceback (cron-7c04faf754)."""
++    if not isinstance(exc, CronShutdownInterrupted):
++        return False
++    logger.warning("Job '%s' stopped by gateway shutdown: %s", job_name, error_msg)
++    return True
++
++
++def _run_with_fire_claim_heartbeat(job: dict, run, *, execution_token: Optional[object] = None) -> bool:
++    """Run ``run`` while keeping this job's owned durable fire claim fresh.
++
++    ``execution_token`` scopes the shutdown check: a claim cleared by THIS execution's shutdown
++    interrupt stops the run as a shutdown, not as lost ownership."""
+     claim = job.get("fire_claim")
+     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+     if not owner:
+@@ -2953,7 +2983,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
+ 
+     job_id = str(job.get("id") or "")
+     stop = threading.Event()
+-    lost_ownership = threading.Event()
++    lost_ownership = ShutdownAwareCancel(
++        threading.Event(), lambda: _is_interrupted(job_id, execution_token))
+ 
+     def _finish_unstarted(error: str) -> None:
+         execution_id = job.get("execution_id")
+@@ -2994,9 +3025,15 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
+                         last_confirmed = time.monotonic()
+                         continue
+                     lost_ownership.set()
+-                    logger.warning(
+-                        "Job '%s': fire claim ownership lost; interrupting stale run",
+-                        job_id)
++                    if lost_ownership.shutdown_interrupted:
++                        # Our own shutdown wrote the interrupted outcome, which cleared the claim.
++                        logger.warning(
++                            "Job '%s': gateway shutdown interrupted the run; stopping it",
++                            job_id)
++                    else:
++                        logger.warning(
++                            "Job '%s': fire claim ownership lost; interrupting stale run",
++                            job_id)
+                     return
+                 last_confirmed = time.monotonic()
+             except Exception:
+@@ -3123,7 +3160,8 @@ def run_one_job(
+                     extra_prompt=extra_prompt,
+                     claim_lost=lost_ownership,
+                     transport_cancel=cancel_event,
+-                    execution_token=execution_token))
++                    execution_token=execution_token),
++                execution_token=execution_token)
+     finally:
+         with _running_lock:
+             executions = _running_fire_owners.get(_fire_key)
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index a28636df8f1..58c6e58ea50 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -300,13 +300,19 @@ async def execute(authority, ref, row, policy):
+     job = dict(data['cron_job'], execution_id=execution_id)
+     token = bind_execution(authority, ref.session_id, job['id'], execution_id)
+     try:
+-        from cron.cancellation import CancelRequest, _CombinedCancelEvent
++        from cron.cancellation import CancelRequest, ShutdownAwareCancel, _CombinedCancelEvent
++        from cron.scheduler import fire_interrupted_by_shutdown
+ 
+         db_path = await asyncio.to_thread(Path(authority.db.db_path).resolve)
+         with _profile_runtime_scope(db_path.parent):
+             # The forwarded ``cron.cancel`` carries no reason, so the operator's marker is read here
+-            # first: a stopped agent run reports "cancelled on request", not a lost fire claim.
+-            stop = _CombinedCancelEvent(CancelRequest(execution_id), cancel)
++            # first: a stopped agent run reports "cancelled on request", not a lost fire claim. When
++            # the firer is this process and its shutdown interrupted the fire, the forwarded cancel
++            # reports that shutdown, not lost ownership (cron-7c04faf754).
++            job_id = job['id']
++            stop = _CombinedCancelEvent(
++                CancelRequest(execution_id),
++                ShutdownAwareCancel(cancel, lambda: fire_interrupted_by_shutdown(job_id)))
+             result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
+                                              extra_prompt=data['extra_prompt'], cancel_event=stop)
+         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
+diff --git a/tests/cron/test_cron_relay_run_forward.py b/tests/cron/test_cron_relay_run_forward.py
+index 5c09a1fe586..ac06fd17e29 100644
+--- a/tests/cron/test_cron_relay_run_forward.py
++++ b/tests/cron/test_cron_relay_run_forward.py
+@@ -153,7 +153,7 @@ class TestManualRunPromptConsumption:
+             "manual_run_prompt": "focus on EU numbers",
+         }
+         with patch.object(scheduler, "_run_one_job_body", side_effect=fake_body), patch.object(
+-            scheduler, "_run_with_fire_claim_heartbeat", side_effect=lambda j, fn: fn(None)
++            scheduler, "_run_with_fire_claim_heartbeat", side_effect=lambda j, fn, **_kw: fn(None)
+         ):
+             assert scheduler.run_one_job(job) is True
+         assert captured["extra_prompt"] == "focus on EU numbers"
+@@ -173,7 +173,7 @@ class TestManualRunPromptConsumption:
+             "manual_run_prompt": "stale stamp",
+         }
+         with patch.object(scheduler, "_run_one_job_body", side_effect=fake_body), patch.object(
+-            scheduler, "_run_with_fire_claim_heartbeat", side_effect=lambda j, fn: fn(None)
++            scheduler, "_run_with_fire_claim_heartbeat", side_effect=lambda j, fn, **_kw: fn(None)
+         ):
+             scheduler.run_one_job(job, extra_prompt="direct context")
+         assert captured["extra_prompt"] == "direct context"
+@@ -190,7 +190,7 @@ class TestManualRunPromptConsumption:
+ 
+         job = {"id": "j1", "manual_run_prompt": "orphaned"}
+         with patch.object(scheduler, "_run_one_job_body", side_effect=fake_body), patch.object(
+-            scheduler, "_run_with_fire_claim_heartbeat", side_effect=lambda j, fn: fn(None)
++            scheduler, "_run_with_fire_claim_heartbeat", side_effect=lambda j, fn, **_kw: fn(None)
+         ):
+             scheduler.run_one_job(job)
+         assert captured["extra_prompt"] is None
+diff --git a/tests/cron/test_shutdown_interrupt.py b/tests/cron/test_shutdown_interrupt.py
+index 16e7e0e601c..6a09ab1d238 100644
+--- a/tests/cron/test_shutdown_interrupt.py
++++ b/tests/cron/test_shutdown_interrupt.py
+@@ -200,7 +200,7 @@ class TestRunningFireOwnerRegistry:
+             "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner-1"},
+         }
+ 
+-        def _observe_registry(current_job, run):
++        def _observe_registry(current_job, run, **_kw):
+             assert list(sched._running_fire_owners[sched._inflight_key(current_job["id"])].values()) == [
+                 ("owner-1", sched._get_hermes_home().resolve())
+             ]
+@@ -219,7 +219,7 @@ class TestRunningFireOwnerRegistry:
+         release = threading.Event()
+         marked_owners: list[str] = []
+ 
+-        def hold_run(_job, _run):
++        def hold_run(_job, _run, **_kw):
+             entered.wait(timeout=2)
+             release.wait(timeout=2)
+             return True
+@@ -432,7 +432,7 @@ class TestCombinedCancelEvent:
+         with patch.object(
+             sched,
+             "_run_with_fire_claim_heartbeat",
+-            side_effect=lambda job_arg, run: run(threading.Event()),
++            side_effect=lambda job_arg, run, **_kw: run(threading.Event()),
+         ), patch.object(sched, "_run_one_job_body", return_value=True) as body:
+             assert sched.run_one_job(job, cancel_event=external) is True
+ 
+@@ -654,3 +654,199 @@ class TestRunOneJobHonoursInterruptedFlag:
+ 
+         assert result is False
+         mock_mark.assert_not_called()
++
++
++class TestRealHeartbeatThroughShutdownMark:
++    """cron-7c04faf754: a gateway shutdown's ``mark_running_jobs_interrupted`` clears the fire claim
++    of a run still in flight. The run's real fire-claim heartbeat then misses its claim and, before
++    this fix, stopped the run as "cron fire ownership was lost" (ERROR + traceback) although no
++    other process took the claim. These tests run the real heartbeat against the real store."""
++
++    @pytest.fixture
++    def fast_heartbeat(self, monkeypatch):
++        import cron.scheduler as sched
++
++        monkeypatch.setattr(sched, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.05)
++        monkeypatch.setattr(sched, "_FIRE_CLAIM_MISS_CONFIRM_SECONDS", 0.01)
++        # Run the body in-process: no restart-safe worker handoff.
++        monkeypatch.setattr(sched, "_launch_external_cron_worker", lambda job: False)
++
++    def _start_fire(self, monkeypatch):
++        """Claim a real job and start run_one_job with a body that waits for the cancel latch."""
++        import cron.scheduler as sched
++        from cron import jobs
++        from cron.cancellation import _CombinedCancelEvent, cancel_is_shutdown, cancel_reason
++
++        job = jobs.create_job(prompt="x", schedule="every 5m", name="hb-shutdown")
++        claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++        assert isinstance(claimed, dict)
++        started = threading.Event()
++        seen: dict = {}
++
++        def body(current_job, *, claim_lost, **_kw):
++            started.set()
++            seen["latched"] = claim_lost.wait(5)
++            combined = _CombinedCancelEvent(claim_lost)
++            seen["reason"] = cancel_reason(combined)
++            seen["shutdown"] = cancel_is_shutdown(combined)
++            return True
++
++        monkeypatch.setattr(sched, "_run_one_job_body", body)
++        thread = threading.Thread(target=sched.run_one_job, args=(claimed,))
++        thread.start()
++        assert started.wait(5)
++        return claimed, thread, seen
++
++    def test_shutdown_mark_stops_run_as_shutdown_not_lost_ownership(
++            self, fast_heartbeat, monkeypatch, caplog):
++        import logging
++
++        import cron.scheduler as sched
++        from cron import jobs
++
++        caplog.set_level(logging.DEBUG, logger="cron.scheduler")
++        claimed, thread, seen = self._start_fire(monkeypatch)
++        shutdown_text = "Gateway shutdown (test) killed the job's tool subprocess before the run finished."
++        assert sched.mark_running_jobs_interrupted(shutdown_text) == [claimed["id"]]
++        thread.join(timeout=5)
++        assert not thread.is_alive()
++
++        assert seen["latched"] is True
++        assert "shutdown" in seen["reason"].lower()
++        assert "ownership was lost" not in seen["reason"]
++        assert seen["shutdown"] is True
++        assert not [r for r in caplog.records if "ownership lost" in r.getMessage()
++                    or "ownership was lost" in r.getMessage()]
++        assert [r for r in caplog.records if r.levelno == logging.WARNING
++                and "shutdown interrupted" in r.getMessage().lower()]
++        stored = jobs.get_job(claimed["id"])
++        assert shutdown_text in (stored.get("last_error") or "")
++
++    def test_foreign_takeover_still_reports_lost_ownership(
++            self, fast_heartbeat, monkeypatch, caplog):
++        import logging
++
++        from cron import jobs
++
++        caplog.set_level(logging.DEBUG, logger="cron.scheduler")
++        claimed, thread, seen = self._start_fire(monkeypatch)
++        # Another process takes the claim: rewrite fire_claim.by on disk.
++        stored = jobs.load_jobs()
++        for record in stored:
++            if record["id"] == claimed["id"]:
++                record["fire_claim"] = dict(record["fire_claim"], by="someone-else")
++        jobs.save_jobs(stored)
++        thread.join(timeout=5)
++        assert not thread.is_alive()
++
++        assert seen["latched"] is True
++        assert seen["reason"] == "cron fire ownership was lost"
++        assert seen["shutdown"] is False
++        assert [r for r in caplog.records if r.levelno == logging.WARNING
++                and "ownership lost" in r.getMessage()]
++
++
++class TestOwnerSideShutdownCancel:
++    """The owner gateway runs the agent (gateway.session_cron.execute); the firer forwards its
++    latch as a reasonless ``cron.cancel``. When the owner is the same process whose shutdown
++    marked the fire interrupted, the owner's run must report the shutdown, not lost ownership."""
++
++    def _execute_with_cancel(self, monkeypatch, tmp_path, job_id):
++        import asyncio
++        import json
++        from types import SimpleNamespace
++
++        import cron.scheduler as sched
++        from cron.cancellation import cancel_is_shutdown, cancel_reason
++        from gateway import session_cron
++        from gateway.session_contract import SessionRef
++        from hermes_state_registry import acquire, release
++
++        captured = {}
++
++        def fake_run_job(job, *, cancel_event=None, **_kw):
++            captured["reason"] = cancel_reason(cancel_event)
++            captured["shutdown"] = cancel_is_shutdown(cancel_event)
++            return True, "doc", "answer", None
++
++        monkeypatch.setattr(sched, "run_job", fake_run_job)
++        db = acquire(sched._get_hermes_home() / "state.db")
++        ref = SessionRef("test-profile", "cron-owner-cancel")
++        db.create_session(ref.session_id, source="cron")
++        authority = SimpleNamespace(
++            db=db, sessions={ref.session_id: SimpleNamespace(
++                source=SimpleNamespace(user_id="cron-owner"))}, pending_results={})
++        cancel = threading.Event()
++        cancel.set()  # the firer's forwarded cron.cancel landed before the run checked it
++        authority._cron_cancellations = {"adm": cancel}
++        row = {"admission_id": "adm", "request_id": "req", "principal_id": "cron-owner",
++               "payload": {"text": ""}}
++        policy = SimpleNamespace(request_json=json.dumps({
++            "cron_job": {"id": job_id, "prompt": "x"}, "extra_prompt": None, "request_id": "req"}))
++        try:
++            asyncio.run(session_cron.execute(authority, ref, row, policy))
++        finally:
++            release(db)
++        return captured
++
++    def test_owner_reports_shutdown_when_this_process_interrupted_the_fire(self, monkeypatch, tmp_path):
++        import cron.scheduler as sched
++
++        token = object()
++        sched._running_fire_owners[sched._inflight_key("owner-job")] = {
++            token: ("owner-1", sched._get_hermes_home().resolve())}
++        sched._interrupted_job_ids.add(token)
++        captured = self._execute_with_cancel(monkeypatch, tmp_path, "owner-job")
++        assert "shutdown" in captured["reason"].lower()
++        assert captured["shutdown"] is True
++
++    def test_owner_keeps_lost_ownership_wording_without_shutdown(self, monkeypatch, tmp_path):
++        captured = self._execute_with_cancel(monkeypatch, tmp_path, "owner-job")
++        assert captured["reason"] == "cron fire ownership was lost"
++        assert captured["shutdown"] is False
++
++
++class TestShutdownStopLogging:
++    def test_watchdog_raises_shutdown_interrupt_for_a_shutdown_latch(self):
++        import cron.scheduler as sched
++        from cron.cancellation import CronShutdownInterrupted, SHUTDOWN_INTERRUPT_REASON
++
++        latch = threading.Event()
++        latch.reason = SHUTDOWN_INTERRUPT_REASON
++        latch.shutdown_interrupted = True
++        latch.set()
++
++        class Agent:
++            def run_conversation(self, prompt, task_id=None):
++                return {"final_response": "late"}
++
++            def interrupt(self, message):
++                pass
++
++        with pytest.raises(CronShutdownInterrupted) as raised:
++            sched._run_agent_with_watchdog(
++                Agent(), "p", {"schedule": {"kind": "every"}}, "j", "job", "t", latch)
++        assert SHUTDOWN_INTERRUPT_REASON in str(raised.value)
++
++    def test_shutdown_stop_logs_one_warning_without_traceback(self, caplog):
++        import logging
++
++        import cron.scheduler as sched
++        from cron.cancellation import CronShutdownInterrupted
++
++        caplog.set_level(logging.DEBUG, logger="cron.scheduler")
++        assert sched._log_shutdown_stop("job", "stopped", CronShutdownInterrupted("stopped")) is True
++        records = [r for r in caplog.records if r.name == "cron.scheduler"]
++        assert [(r.levelno, r.exc_info) for r in records] == [(logging.WARNING, None)]
++        assert not records[0].getMessage().startswith("Job 'job' failed: ")
++
++    def test_other_failures_keep_run_jobs_error_traceback(self, caplog):
++        """Real ownership loss (plain RuntimeError) is not claimed: run_job's logger.exception runs."""
++        import logging
++
++        import cron.scheduler as sched
++
++        caplog.set_level(logging.DEBUG, logger="cron.scheduler")
++        exc = RuntimeError("Cron job 'job' was stopped: cron fire ownership was lost")
++        assert sched._log_shutdown_stop("job", str(exc), exc) is False
++        assert [r for r in caplog.records if r.name == "cron.scheduler"] == []
+-- 
+2.55.0
+

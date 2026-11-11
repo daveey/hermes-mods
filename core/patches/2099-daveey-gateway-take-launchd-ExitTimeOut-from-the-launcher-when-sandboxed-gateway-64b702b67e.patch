@@ -1,0 +1,284 @@
+From 586cae395da8a2cacfb12adea0cf3994867fbcfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:13:59 +0000
+Subject: [PATCH] [daveey] gateway: take launchd ExitTimeOut from the launcher
+ when sandboxed (gateway-64b702b67e)
+
+The mini's com.daveey.myapp.hermes-household / -standard gateways run as
+`hermes-gateway-launcher -- /usr/bin/sandbox-exec -p <profile> hermes gateway run`, and the profile
+denies process-exec of /bin/launchctl (deliberate escape guard). read_launchd_exit_timeout_s's
+`launchctl print` therefore always failed there, _assumed_launchd_exit_timeout assumed the 60s gui
+clamp and wrote a launchd_budget_missing row, while launchd SIGKILLs these jobs at 45s, so a
+signal-driven drain could outrun the SIGKILL by 15s.
+
+The unsandboxed launcher (state e84f55624) now probes once and exports HERMES_LAUNCHD_EXIT_TIMEOUT_S.
+read_launchd_exit_timeout_s uses it (positive integer, else ignored) only when its own probe fails or
+finds no `exit timeout` line and a job label is known; a working live probe still wins. The boot log
+says "(from launcher)", and no launchd_budget_missing row is written in that case.
+
+Proof: tests/gateway/test_launchd_exit_timeout_from_launcher.py red 4 failed / 11 passed before
+(probe raises/nonzero + env 45 -> None; boot loader assumed 60 and logged launchd_budget_missing),
+15 passed after; with test_launchd_explicit_label, test_launchd_exit_timeout_drain_cap and
+test_launchd_label_reaches_gateway: 40 passed.
+Card: t_01a1c51ebad6c41c
+---
+ gateway/restart.py                            |  48 ++++++-
+ gateway/run_config_loaders.py                 |  17 ++-
+ ...test_launchd_exit_timeout_from_launcher.py | 131 ++++++++++++++++++
+ 3 files changed, 188 insertions(+), 8 deletions(-)
+ create mode 100644 tests/gateway/test_launchd_exit_timeout_from_launcher.py
+
+diff --git a/gateway/restart.py b/gateway/restart.py
+index 87b377e8da7..c008f77b2fe 100644
+--- a/gateway/restart.py
++++ b/gateway/restart.py
+@@ -39,6 +39,9 @@ EXTERNAL_GATEWAY_SUPERVISOR_ENV = "HERMES_GATEWAY_EXTERNAL_SUPERVISOR"
+ # Forwarded by the stderr-timestamp launchd wrapper (hermes_cli/stderr_timestamp.py) to the gateway
+ # grandchild, which sees ``XPC_SERVICE_NAME=0``. Read only via :func:`launchd_job_label`.
+ LAUNCHD_LABEL_ENV = "HERMES_LAUNCHD_LABEL"
++# [daveey] Live ExitTimeOut the unsandboxed hermes-gateway-launcher read with ``launchctl print`` for this job
++# (gateway-64b702b67e): a gateway under sandbox-exec cannot exec launchctl itself.
++LAUNCHD_EXIT_TIMEOUT_ENV = "HERMES_LAUNCHD_EXIT_TIMEOUT_S"
+ # launchd's app-coalition service names (``application.<bundle>.<n>``) leak into IDE integrated terminals;
+ # they never name a gateway job.
+ LAUNCHD_APP_COALITION_PREFIX = "application."
+@@ -143,10 +146,53 @@ def read_launchd_exit_timeout_s(
+     is not launchd-owned (non-darwin, or no ``ai.hermes`` job label — see :func:`launchd_job_label`), ``launchctl`` is missing
+     or fails, or the print output carries no ``exit timeout`` line. Callers
+     must treat ``None`` as fail-open: the configured drain stands unchanged.
++    [daveey] When the probe fails for a known job, the launcher's ``HERMES_LAUNCHD_EXIT_TIMEOUT_S`` is used
++    (see :func:`read_launchd_exit_timeout_with_source`).
++    """
++    return read_launchd_exit_timeout_with_source(label, environ=environ, uid=uid, run=run, platform=platform)[0]
++
++
++def launcher_exit_timeout_s(environ: Mapping[str, str] | None = None) -> float | None:
++    """[daveey] ``HERMES_LAUNCHD_EXIT_TIMEOUT_S`` as a positive integer number of seconds, else ``None``."""
++    env = os.environ if environ is None else environ
++    raw = str(env.get(LAUNCHD_EXIT_TIMEOUT_ENV, "") or "").strip()
++    if not raw.isdigit() or int(raw) <= 0:
++        return None
++    return float(int(raw))
++
++
++def read_launchd_exit_timeout_with_source(
++    label: str | None = None,
++    *,
++    environ: Mapping[str, str] | None = None,
++    uid: int | None = None,
++    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
++    platform: str = sys.platform,
++) -> tuple[float | None, str | None]:
++    """``(exit_timeout_s, source)`` with ``source`` ``"launchctl"``, ``"launcher"`` or ``None``.
++
++    [daveey] A gateway under ``sandbox-exec`` is denied ``launchctl`` (deliberate escape guard on the mini's
++    ``com.daveey.myapp.hermes-*`` jobs), so its own probe always fails. The unsandboxed
++    ``hermes-gateway-launcher`` probes once and exports ``HERMES_LAUNCHD_EXIT_TIMEOUT_S``; that value is used
++    only when this process's probe fails or finds no ``exit timeout`` line AND a job label is known
++    (gateway-64b702b67e). A working live probe always wins.
+     """
+     label = label or launchd_service_label(environ, platform=platform)
+     if not label:
+-        return None
++        return None, None
++    live = _probe_launchd_exit_timeout(label, uid=uid, run=run)
++    if live is not None:
++        return live, "launchctl"
++    fallback = launcher_exit_timeout_s(environ)
++    return (fallback, "launcher") if fallback is not None else (None, None)
++
++
++def _probe_launchd_exit_timeout(
++    label: str,
++    *,
++    uid: int | None,
++    run: Callable[..., subprocess.CompletedProcess[str]],
++) -> float | None:
+     if uid is None:
+         getuid = getattr(os, "getuid", None)  # absent on Windows; label is None there anyway
+         if getuid is None:
+diff --git a/gateway/run_config_loaders.py b/gateway/run_config_loaders.py
+index f3dc546a52e..bee294de96e 100644
+--- a/gateway/run_config_loaders.py
++++ b/gateway/run_config_loaders.py
+@@ -23,7 +23,7 @@ from gateway.restart import (
+     DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, EXTERNAL_GATEWAY_SUPERVISOR_ENV,
+     LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S, parse_cron_drain_timeout,
+     parse_restart_after_turn_timeout, parse_restart_drain_timeout,
+-    launchd_service_label, parse_signal_interrupt_grace_timeout, read_launchd_exit_timeout_s,
++    launchd_service_label, parse_signal_interrupt_grace_timeout, read_launchd_exit_timeout_with_source,
+     resolve_launchd_capped_drain,
+ )
+ from gateway.session import SessionSource
+@@ -468,22 +468,25 @@ class GatewayConfigLoadersMixin:
+         """
+         platform = sys.platform if platform is None else platform  # data, so both arms test on any host
+         label = launchd_service_label(platform=platform)
+-        # read_launchd_exit_timeout_s is already fail-open (returns None on any probe failure).
+-        exit_timeout = read_launchd_exit_timeout_s(label, platform=platform) if label else None
++        # Fail-open (None on any probe failure). [daveey] A sandboxed gateway cannot exec launchctl; its
++        # unsandboxed launcher's HERMES_LAUNCHD_EXIT_TIMEOUT_S stands in then (source "launcher").
++        exit_timeout, source = (read_launchd_exit_timeout_with_source(label, platform=platform)
++                                if label else (None, None))
+         if exit_timeout is None:
+             return GatewayConfigLoadersMixin._assumed_launchd_exit_timeout(label, platform)
++        via = " (from launcher)" if source == "launcher" else ""
+         effective = resolve_launchd_capped_drain(drain_timeout, exit_timeout)
+         if effective < drain_timeout:
+             logger.warning(
+-                "restart_drain_timeout=%.0fs exceeds the live launchd exit timeout (%.0fs) for %s; "
++                "restart_drain_timeout=%.0fs exceeds the live launchd exit timeout (%.0fs) for %s%s; "
+                 "signal-driven stops will drain at most %.0fs so teardown finishes before launchd "
+                 "SIGKILLs (launchd clamps ExitTimeOut in the per-user domain).",
+-                drain_timeout, exit_timeout, label, effective,
++                drain_timeout, exit_timeout, label, via, effective,
+             )
+         else:
+             logger.info(
+-                "launchd exit timeout for %s is %.0fs (drain %.0fs fits)",
+-                label, exit_timeout, drain_timeout,
++                "launchd exit timeout for %s is %.0fs%s (drain %.0fs fits)",
++                label, exit_timeout, via, drain_timeout,
+             )
+         return exit_timeout
+ 
+diff --git a/tests/gateway/test_launchd_exit_timeout_from_launcher.py b/tests/gateway/test_launchd_exit_timeout_from_launcher.py
+new file mode 100644
+index 00000000000..9851e4aecc4
+--- /dev/null
++++ b/tests/gateway/test_launchd_exit_timeout_from_launcher.py
+@@ -0,0 +1,131 @@
++"""[daveey] A sandboxed gateway takes launchd's ExitTimeOut from its launcher (gateway-64b702b67e, 2nd fix).
++
++The mini's ``com.daveey.myapp.hermes-household`` / ``-standard`` jobs run
++``hermes-gateway-launcher -- /usr/bin/sandbox-exec -p <profile> hermes gateway run``, and the profile denies
++``process-exec`` of ``/bin/launchctl`` on purpose (sandbox-escape guard). The gateway's own
++``launchctl print`` probe therefore always fails, it assumed the 60 s gui clamp and logged
++``launchd_budget_missing`` although launchd kills these jobs at 45 s. The launcher runs unsandboxed: it
++probes once and exports ``HERMES_LAUNCHD_EXIT_TIMEOUT_S``; the gateway uses it only when its own probe
++fails and its job label is known. A live probe that works still wins.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from gateway.restart import (
++    EXTERNAL_GATEWAY_SUPERVISOR_ENV,
++    LAUNCHD_EXIT_TIMEOUT_ENV,
++    LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S,
++    LAUNCHD_LABEL_ENV,
++    read_launchd_exit_timeout_s,
++)
++
++LABEL = "com.daveey.myapp.hermes-household"
++
++
++def _raises(cmd, **_kw):
++    raise PermissionError(1, "Operation not permitted", "launchctl")  # sandbox-exec deny process-exec
++
++
++def _nonzero(cmd, **_kw):
++    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="sandbox: deny process-exec")
++
++
++def _live(seconds: int):
++    def run(cmd, **_kw):
++        return subprocess.CompletedProcess(cmd, 0, stdout=f"\texit timeout = {seconds}\n", stderr="")
++    return run
++
++
++def _env(value: str | None) -> dict[str, str]:
++    env = {"XPC_SERVICE_NAME": "0", LAUNCHD_LABEL_ENV: LABEL}
++    if value is not None:
++        env[LAUNCHD_EXIT_TIMEOUT_ENV] = value
++    return env
++
++
++@pytest.mark.parametrize("run", [_raises, _nonzero], ids=["probe-raises", "probe-nonzero"])
++def test_failed_probe_uses_the_launchers_exit_timeout(run):
++    assert read_launchd_exit_timeout_s(environ=_env("45"), uid=501, run=run, platform="darwin") == 45.0
++
++
++@pytest.mark.parametrize("value", ["", "  ", "abc", "0", "-5", "45.5", "4e1", None])
++def test_garbage_or_missing_launcher_value_is_ignored(value):
++    assert read_launchd_exit_timeout_s(environ=_env(value), uid=501, run=_raises, platform="darwin") is None
++
++
++def test_live_probe_still_wins_over_the_launcher_value():
++    assert read_launchd_exit_timeout_s(environ=_env("45"), uid=501, run=_live(30), platform="darwin") == 30.0
++
++
++def test_launcher_value_needs_a_known_label():
++    env = {"XPC_SERVICE_NAME": "0", LAUNCHD_EXIT_TIMEOUT_ENV: "45"}
++    assert read_launchd_exit_timeout_s(environ=env, uid=501, run=_raises, platform="darwin") is None
++    assert read_launchd_exit_timeout_s(environ=_env("45"), uid=501, run=_raises, platform="linux") is None
++
++
++# ── the boot loader: log line and no launchd_budget_missing row ─────────────────────────────────────────
++
++
++def _loader():
++    from gateway.run_config_loaders import GatewayConfigLoadersMixin
++    return GatewayConfigLoadersMixin._load_launchd_exit_timeout
++
++
++def _diag_rows(home: Path) -> list[dict]:
++    log = home / "logs" / "gateway-exit-diag.log"
++    if not log.exists():
++        return []
++    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
++
++
++@pytest.fixture
++def sandboxed_gateway(tmp_path, monkeypatch):
++    """A darwin --external-supervisor gateway whose ``launchctl`` cannot run (empty PATH)."""
++    home = tmp_path / "home"
++    home.mkdir()
++    empty = tmp_path / "empty-path"
++    empty.mkdir()
++    monkeypatch.setenv("PATH", str(empty))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_GATEWAY_EXIT_DIAG", "1")
++    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
++    monkeypatch.setenv(LAUNCHD_LABEL_ENV, LABEL)
++    monkeypatch.setenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
++    return home
++
++
++def test_boot_takes_the_launcher_value_and_records_no_missing_budget(sandboxed_gateway, monkeypatch, caplog):
++    monkeypatch.setenv(LAUNCHD_EXIT_TIMEOUT_ENV, "45")
++    with caplog.at_level(logging.INFO, logger="gateway.run"):
++        budget = _loader()(30.0, platform="darwin")
++    assert budget == 45.0
++    assert f"launchd exit timeout for {LABEL} is 45s" in caplog.text
++    assert "(from launcher)" in caplog.text
++    assert "launchd_budget_missing" not in caplog.text
++    assert _diag_rows(sandboxed_gateway) == []
++
++
++def test_boot_warning_for_a_too_long_drain_names_the_launcher_source(sandboxed_gateway, monkeypatch, caplog):
++    monkeypatch.setenv(LAUNCHD_EXIT_TIMEOUT_ENV, "45")
++    with caplog.at_level(logging.WARNING, logger="gateway.run"):
++        budget = _loader()(180.0, platform="darwin")
++    assert budget == 45.0
++    assert "live launchd exit timeout (45s)" in caplog.text and "(from launcher)" in caplog.text
++    assert _diag_rows(sandboxed_gateway) == []
++
++
++def test_boot_with_garbage_launcher_value_still_assumes_the_clamp(sandboxed_gateway, monkeypatch, caplog):
++    monkeypatch.setenv(LAUNCHD_EXIT_TIMEOUT_ENV, "forty-five")
++    with caplog.at_level(logging.WARNING, logger="gateway.run"):
++        budget = _loader()(30.0, platform="darwin")
++    assert budget == float(LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S)
++    assert "launchd_budget_missing" in caplog.text
++    rows = [r for r in _diag_rows(sandboxed_gateway) if r["tag"] == "gateway.launchd_budget_missing"]
++    assert len(rows) == 1 and rows[0]["reason"] == "probe_failed"
+-- 
+2.55.0
+

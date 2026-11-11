@@ -1,0 +1,306 @@
+From 7747a6034e64fa539a968c2b0e08f27ef67fe1ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 00:18:37 +0000
+Subject: [PATCH] [daveey] session.resume: a live turn lease on an old chat is
+ a typed refusal, not -32603 (self-heal gateway-56086c8e65)
+
+Adopting a not-yet-adopted local chat (session.resume -> adopt_legacy_session ->
+bind_legacy_target) ran require_idle, whose transcript guard raises
+SessionTurnLeaseLostError / SessionCompressionInProgressError for another writer's
+live lease or lock. Nothing translated them, so they escaped the session
+dispatcher and the ws boundary answered JSON-RPC -32603 "internal error".
+
+- bind_legacy_target: translate MUTATION_GUARD_REFUSALS at the call: a live turn
+  lease -> runtime_coordination_required (the refusal the next check already meant
+  to give), a compression lock -> busy_refusal (session_busy, field=compression).
+- AuthorityConnection.dispatch: backstop for any caller that still forgets: reply
+  4001 busy_refusal(exc) and log one WARNING "untranslated mutation guard refusal
+  method=<m>" so the missed caller stays visible.
+
+Why-chain: root (happened) = each writer must translate the guard's refusal type
+(MUTATION_GUARD_REFUSALS, f13a1cd2290) and the adoption path (cb748e7a193) predates
+it; root (not caught) = migration tests only covered an active-session registry
+entry, never a bare DB lease, and no dispatcher test fed a guard refusal.
+
+Proof: tests/gateway/test_legacy_adoption_turn_lease.py (4 tests) red on
+aaf655ac4b4, green here; mutants (drop compression translation, flip the lease
+branch, demote the WARNING) each fail it; 191 related files / 1484 tests green.
+Undo: git revert this commit.
+---
+ default/SOUL.md                               |   1 +
+ default/cache/plugin_hooks.json               |   1 +
+ fixture/SOUL.md                               |   1 +
+ fixture/cache/plugin_hooks.json               |   1 +
+ gateway/session_controls.py                   |  10 +-
+ hermes_state_local_migration.py               |  12 +-
+ owned/SOUL.md                                 |   1 +
+ owned/cache/plugin_hooks.json                 |   1 +
+ p/SOUL.md                                     |   1 +
+ p/cache/plugin_hooks.json                     |   1 +
+ target/SOUL.md                                |   1 +
+ target/cache/plugin_hooks.json                |   1 +
+ .../test_legacy_adoption_turn_lease.py        | 104 ++++++++++++++++++
+ 13 files changed, 133 insertions(+), 3 deletions(-)
+ create mode 100644 default/SOUL.md
+ create mode 100644 default/cache/plugin_hooks.json
+ create mode 100644 fixture/SOUL.md
+ create mode 100644 fixture/cache/plugin_hooks.json
+ create mode 100644 owned/SOUL.md
+ create mode 100644 owned/cache/plugin_hooks.json
+ create mode 100644 p/SOUL.md
+ create mode 100644 p/cache/plugin_hooks.json
+ create mode 100644 target/SOUL.md
+ create mode 100644 target/cache/plugin_hooks.json
+ create mode 100644 tests/gateway/test_legacy_adoption_turn_lease.py
+
+diff --git a/default/SOUL.md b/default/SOUL.md
+new file mode 100644
+index 00000000000..de81136d437
+--- /dev/null
++++ b/default/SOUL.md
+@@ -0,0 +1 @@
++You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
+\ No newline at end of file
+diff --git a/default/cache/plugin_hooks.json b/default/cache/plugin_hooks.json
+new file mode 100644
+index 00000000000..586aaabb5f9
+--- /dev/null
++++ b/default/cache/plugin_hooks.json
+@@ -0,0 +1 @@
++{"version": 1, "fingerprint": "07774d3f617f2e7bec1c8a60ba7ec9b2c39aecf14b6a24b964230c3bace366a7", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/fixture/SOUL.md b/fixture/SOUL.md
+new file mode 100644
+index 00000000000..de81136d437
+--- /dev/null
++++ b/fixture/SOUL.md
+@@ -0,0 +1 @@
++You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
+\ No newline at end of file
+diff --git a/fixture/cache/plugin_hooks.json b/fixture/cache/plugin_hooks.json
+new file mode 100644
+index 00000000000..e8b4a20309b
+--- /dev/null
++++ b/fixture/cache/plugin_hooks.json
+@@ -0,0 +1 @@
++{"version": 1, "fingerprint": "f80ee98b8d860bf21115216a1403d411f2ef49924c5c236acd27969d8b718e1d", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index 0429ada2921..211a2292deb 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -12,6 +12,7 @@ from gateway.config import Platform
+ from gateway.session_contract import CANONICAL_GATEWAY_PROTOCOL, SessionActor, SessionRef, Submission
+ from gateway.session_llm_oneshot import DeferredReply
+ from hermes_constants import profile_name_for_home
++from hermes_state_mutation_guards import MUTATION_GUARD_REFUSALS, busy_refusal
+ from hermes_state_runtime import RuntimeStoreError
+ 
+ logger = logging.getLogger(__name__)
+@@ -381,6 +382,14 @@ class AuthorityConnection:
+             return {'jsonrpc': '2.0', 'id': rid, 'error': {
+                 'code': getattr(exc, 'wire_code', 4001), 'message': getattr(exc, 'wire_message', exc.reason),
+                 'data': _refusal_data(exc)}}
++        except MUTATION_GUARD_REFUSALS as exc:
++            # Backstop: a caller that never translated a live turn lease / compression lock still
++            # answers the retryable busy verdict, and the WARNING names the caller left to fix.
++            logger.warning('untranslated mutation guard refusal method=%s profile=%s: %s: %s', method,
++                           getattr(self.actor, 'profile_id', None), type(exc).__name__, exc)
++            refusal = busy_refusal(exc)
++            return {'jsonrpc': '2.0', 'id': rid, 'error': {
++                'code': 4001, 'message': refusal.reason, 'data': _refusal_data(refusal)}}
+         except sqlite3.Error as exc:
+             _log_storage_failure(getattr(self.actor, 'profile_id', None), method,
+                                  params.get('session_id'), exc)
+@@ -877,7 +886,6 @@ class AuthorityConnection:
+ 
+     async def mutate(self, ref, params):
+         from gateway.session_mutations import mutate_session
+-        from hermes_state_mutation_guards import MUTATION_GUARD_REFUSALS, busy_refusal
+         try:
+             result = await mutate_session(self.authority, self.actor, ref, params)
+         except MUTATION_GUARD_REFUSALS as exc:
+diff --git a/hermes_state_local_migration.py b/hermes_state_local_migration.py
+index 631eaf513d3..11c6729ec89 100644
+--- a/hermes_state_local_migration.py
++++ b/hermes_state_local_migration.py
+@@ -115,8 +115,16 @@ def bind_legacy_target(db, conn, receipt):
+     from hermes_state_compression import _CHAIN_STEP_SQL
+     if conn.execute(_CHAIN_STEP_SQL, (target,)).fetchone() is not None:
+         raise RuntimeStoreError('admission_conflict')
+-    from hermes_state_mutation_guards import require_idle
+-    require_idle(db, conn, [target])
++    from hermes_state_mutation_guards import MUTATION_GUARD_REFUSALS, busy_refusal, require_idle
++    from hermes_state_errors import SessionTurnLeaseLostError
++    try:
++        require_idle(db, conn, [target])
++    except MUTATION_GUARD_REFUSALS as exc:
++        # Another writer's live turn lease is the coordination refusal below; a compression lock
++        # is the retryable busy verdict. Neither may escape as an untyped internal error.
++        if isinstance(exc, SessionTurnLeaseLostError):
++            raise RuntimeStoreError('runtime_coordination_required') from exc
++        raise busy_refusal(exc) from exc
+     root = db._session_turn_lease_key_on_conn(conn, target)
+     if conn.execute('SELECT 1 FROM session_turn_leases WHERE conversation_id=? AND expires_at>?',
+                     (root, time.time())).fetchone():
+diff --git a/owned/SOUL.md b/owned/SOUL.md
+new file mode 100644
+index 00000000000..de81136d437
+--- /dev/null
++++ b/owned/SOUL.md
+@@ -0,0 +1 @@
++You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
+\ No newline at end of file
+diff --git a/owned/cache/plugin_hooks.json b/owned/cache/plugin_hooks.json
+new file mode 100644
+index 00000000000..e82ab198ae1
+--- /dev/null
++++ b/owned/cache/plugin_hooks.json
+@@ -0,0 +1 @@
++{"version": 1, "fingerprint": "e40844399b9022b253155d5996eed6145372cb401554c1860c73856fda98d0e6", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/p/SOUL.md b/p/SOUL.md
+new file mode 100644
+index 00000000000..de81136d437
+--- /dev/null
++++ b/p/SOUL.md
+@@ -0,0 +1 @@
++You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
+\ No newline at end of file
+diff --git a/p/cache/plugin_hooks.json b/p/cache/plugin_hooks.json
+new file mode 100644
+index 00000000000..0182ec64d06
+--- /dev/null
++++ b/p/cache/plugin_hooks.json
+@@ -0,0 +1 @@
++{"version": 1, "fingerprint": "6a2902661bf9754df31bd60d86adfc396ee83d390975bb99264e9c402a87cafe", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/target/SOUL.md b/target/SOUL.md
+new file mode 100644
+index 00000000000..de81136d437
+--- /dev/null
++++ b/target/SOUL.md
+@@ -0,0 +1 @@
++You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
+\ No newline at end of file
+diff --git a/target/cache/plugin_hooks.json b/target/cache/plugin_hooks.json
+new file mode 100644
+index 00000000000..54d59e2e751
+--- /dev/null
++++ b/target/cache/plugin_hooks.json
+@@ -0,0 +1 @@
++{"version": 1, "fingerprint": "86f89b61b7131caef37774ac851aee29e987756bc9c314b8b87f8c05bfd8a070", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/tests/gateway/test_legacy_adoption_turn_lease.py b/tests/gateway/test_legacy_adoption_turn_lease.py
+new file mode 100644
+index 00000000000..6103d9b077e
+--- /dev/null
++++ b/tests/gateway/test_legacy_adoption_turn_lease.py
+@@ -0,0 +1,104 @@
++"""A live DB turn lease / compression lock on an old chat is a typed busy refusal, never -32603.
++
++Self-heal gateway-56086c8e65: Desktop's ``session.resume`` of a not-yet-adopted local chat crashed
++with ``SessionTurnLeaseLostError`` (ws dispatch crash, JSON-RPC -32603) while another writer held a
++live turn lease that had no active-session registry entry.
++"""
++import logging
++from types import SimpleNamespace
++
++import pytest
++
++
++async def _authority(tmp_path, monkeypatch):
++    from gateway import run
++    from gateway.config import GatewayConfig
++    from gateway.session import SessionStore
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_controls import AuthorityConnection
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
++    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
++    db = store._db
++    db.create_session('old-leased', source='cli', model='old-model', cwd=str(tmp_path))
++    db.append_message('old-leased', role='user', content='OLD_QUESTION')
++    db.end_session('old-leased', 'cli_exit')
++    runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
++                             _cached_agent_for=lambda route: None)
++    runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
++    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
++    native = AuthorityConnection(authority, object(), {'provider': 'local', 'user_id': 'native',
++        'profile_id': str(tmp_path), 'instance_id': 'first'})
++    return db, native
++
++
++def _policy_rows(db):
++    with db._read_ctx() as conn:
++        return conn.execute("SELECT key FROM state_meta WHERE key LIKE 'gateway.local_policy.v1:%' "
++                            "OR key LIKE 'gateway.local_legacy%'").fetchall()
++
++
++@pytest.mark.asyncio
++async def test_resume_of_old_chat_under_live_turn_lease_is_typed_refusal(tmp_path, monkeypatch, caplog):
++    db, native = await _authority(tmp_path, monkeypatch)
++    # Another process's live turn (no active-session registry entry: only the DB lease).
++    assert db.acquire_session_turn_lease('old-leased', 'other-writer', ttl_seconds=300, wait_seconds=0)
++    with caplog.at_level(logging.WARNING, logger='gateway.session_controls'):
++        refused = await native.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': 'old-leased'}})
++    # Translated at the adoption path itself, not by the dispatcher backstop.
++    assert not [r for r in caplog.records if 'untranslated mutation guard refusal' in r.getMessage()]
++    assert 'error' in refused, refused
++    assert refused['error']['code'] == 4001, refused
++    assert refused['error']['message'] == 'runtime_coordination_required', refused
++    assert not _policy_rows(db)
++    assert db.get_session('old-leased')['source'] == 'cli'
++    db.release_session_turn_lease('old-leased', 'other-writer')
++    resumed = await native.dispatch({'id': 2, 'method': 'session.resume', 'params': {'session_id': 'old-leased'}})
++    assert resumed.get('result', {}).get('session_id') == 'old-leased', resumed
++    assert [m['content'] for m in resumed['result']['messages']] == ['OLD_QUESTION']
++
++
++@pytest.mark.asyncio
++async def test_resume_of_old_chat_under_compression_lock_is_session_busy(tmp_path, monkeypatch, caplog):
++    db, native = await _authority(tmp_path, monkeypatch)
++    assert db.try_acquire_compression_lock('old-leased', 'other-compressor', ttl_seconds=300)
++    with caplog.at_level(logging.WARNING, logger='gateway.session_controls'):
++        refused = await native.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': 'old-leased'}})
++    assert not [r for r in caplog.records if 'untranslated mutation guard refusal' in r.getMessage()]
++    assert 'error' in refused, refused
++    assert refused['error']['code'] == 4001, refused
++    assert refused['error']['message'] == 'session_busy', refused
++    assert refused['error']['data'].get('field') == 'compression', refused
++    assert not _policy_rows(db)
++    db.release_compression_lock('old-leased', 'other-compressor')
++    resumed = await native.dispatch({'id': 2, 'method': 'session.resume', 'params': {'session_id': 'old-leased'}})
++    assert resumed.get('result', {}).get('session_id') == 'old-leased', resumed
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('compressing', [False, True])
++async def test_dispatcher_turns_an_untranslated_guard_refusal_into_busy_and_warns(
++        tmp_path, monkeypatch, caplog, compressing):
++    """Detection guard: a caller that forgets to translate a guard refusal still answers a
++    retryable 4001 ``session_busy`` (not -32603) and logs one WARNING naming the method."""
++    from gateway.session_controls import AuthorityConnection
++    from hermes_state_errors import SessionCompressionInProgressError, SessionTurnLeaseLostError
++
++    _db, native = await _authority(tmp_path, monkeypatch)
++    error = SessionCompressionInProgressError if compressing else SessionTurnLeaseLostError
++
++    async def boom(self, ref, params):
++        raise error('held by another writer')
++
++    monkeypatch.setattr(AuthorityConnection, 'resume', boom)
++    with caplog.at_level(logging.WARNING, logger='gateway.session_controls'):
++        reply = await native.dispatch({'id': 7, 'method': 'session.resume',
++                                       'params': {'session_id': 'old-leased'}})
++    assert reply.get('error', {}).get('code') == 4001, reply
++    assert reply['error']['message'] == 'session_busy', reply
++    assert reply['error']['data'].get('field') == ('compression' if compressing else None), reply
++    warnings = [r for r in caplog.records if 'untranslated mutation guard refusal' in r.getMessage()]
++    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
++    assert warnings[0].levelno == logging.WARNING
++    assert 'method=session.resume' in warnings[0].getMessage()
+-- 
+2.55.0
+

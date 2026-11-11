@@ -1,0 +1,234 @@
+From 779f8e67a3274598b363c7b0999f246f822bb4c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:47:30 +0000
+Subject: [PATCH] [daveey] Close node-deps stopped-relay installer registration
+ gap
+
+---
+ scripts/build/node-deps-lock.mjs    |  8 +--
+ scripts/build/node-deps-relay.mjs   |  6 ++-
+ scripts/build/node-deps-watcher.mjs | 25 +++++----
+ tests-js/node-deps.test.mjs         | 79 ++++++++++++++++++++++++++---
+ 4 files changed, 98 insertions(+), 20 deletions(-)
+
+diff --git a/scripts/build/node-deps-lock.mjs b/scripts/build/node-deps-lock.mjs
+index 95962d115d4..65c9ba2282a 100644
+--- a/scripts/build/node-deps-lock.mjs
++++ b/scripts/build/node-deps-lock.mjs
+@@ -241,13 +241,15 @@ function breakLock(lock, token, text, mtime) {
+ // terminal's Ctrl-C and Ctrl-Z reach it and its scripts as they always did. The watcher does not:
+ // on POSIX it runs in a session of its own, so the Ctrl-Z that stops the run leaves it watching,
+ // and it kills the stopped tree as soon as the lock is broken, before the job can be resumed.
+-// The tree is the child's descendants: stopped first, so none forks while it is read, then
++// The tree is the relay and its descendants (excluding the watcher): stopped first, so none forks while it is read, then
+ // killed. A process that left the tree (daemonized, so re-parented away) is out of reach.
+ // Windows has no job control; the watcher ends the tree with taskkill /T /F.
+ // A relay (node-deps-relay.mjs) starts both, since this thread blocks: the watcher first, and the child only once the
+ // watcher has started (one that cannot start, at a process or descriptor limit, fails the run
+-// before anything writes the trees); the watcher gets the child's pid on stdin and ends with the
+-// relay. A signal to the caller's group (Ctrl-C, a caller's killpg) reaches the child itself, so
++// before anything writes the trees). On POSIX the watcher knows the relay pid from launch:
++// stopping the relay just after installer spawn cannot leave the watcher without a kill target.
++// Windows (no stopped jobs) retains the child's pid on stdin for taskkill. The watcher ends with
++// the relay. A signal to the caller's group (Ctrl-C, a caller's killpg) reaches the child itself, so
+ // the relay only waits; a signal aimed at this process alone kills it, and the relay, unsignalled
+ // and orphaned, passes SIGTERM on to the child, which used to be left running.
+ //
+diff --git a/scripts/build/node-deps-relay.mjs b/scripts/build/node-deps-relay.mjs
+index 30b18814e2b..ff0f077980d 100644
+--- a/scripts/build/node-deps-relay.mjs
++++ b/scripts/build/node-deps-relay.mjs
+@@ -10,7 +10,8 @@ let signalled = false;
+ for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(name, () => { signalled = true });
+ const parent = process.ppid;
+ // The watcher starts first: a child that writes the trees never runs unwatched.
+-const watch = spawn(process.execPath, [fileURLToPath(new URL('./node-deps-watcher.mjs', import.meta.url)), lock, token, every],
++const watch = spawn(process.execPath, [fileURLToPath(new URL('./node-deps-watcher.mjs', import.meta.url)), lock, token, every,
++  ...(process.platform === 'win32' ? [] : [String(process.pid)])],
+   { stdio: ['pipe', 'ignore', 'inherit'], detached: process.platform !== 'win32', windowsHide: true });
+ watch.on('error', error => {
+   console.error('node-deps: cannot start the lock watcher, so ' + file + ' did not run (' + error.message + ')');
+@@ -20,7 +21,8 @@ watch.on('spawn', () => {
+   const child = spawn(file, args, { stdio: 'inherit' });
+   setInterval(() => { if (!signalled && process.ppid !== parent) { signalled = true; child.kill('SIGTERM') } }, 200);
+   child.on('error', error => { console.error(error.message); process.exit(127) });
+-  // A watcher that has died since (EPIPE) must not crash the relay and leave the child unreaped.
++  // Keep the installer as a fallback if process enumeration fails, and as Windows'
++  // taskkill root. POSIX protection does not wait for this asynchronous handoff.
+   watch.stdin.on('error', () => {});
+   if (child.pid) watch.stdin.write(child.pid + '\n');
+   child.on('exit', (code, signal) => process.exit(code ?? 128 + (constants.signals[signal] ?? 0)));
+diff --git a/scripts/build/node-deps-watcher.mjs b/scripts/build/node-deps-watcher.mjs
+index d49da1b4811..2dceacc19f4 100644
+--- a/scripts/build/node-deps-watcher.mjs
++++ b/scripts/build/node-deps-watcher.mjs
+@@ -1,12 +1,15 @@
+-// The lock watcher (node-deps-lock.mjs runWatched): kills the child the relay started, with
+-// everything it started, once the lock is no longer `token`'s. Started by the relay in a session
+-// of its own; the child's pid arrives on stdin once the relay has started it, and the watcher ends
+-// with the relay (stdin closes). Arguments: lock, token, poll interval in ms.
++// The lock watcher (node-deps-lock.mjs runWatched): kills the relay and its installer tree
++// once the lock is no longer `token`'s. The relay pid is known before any installer can run,
++// even if the job stops immediately after spawn. The watcher has its own session and must
++// exclude itself from that tree. Stdin closing ends the watcher with a completed relay.
++// Arguments: lock, token, poll interval in ms, relay pid (POSIX). On Windows the installer
++// pid still arrives on stdin: taskkill must not target its own watcher/relay ancestry.
+ import { execFileSync, spawnSync } from 'node:child_process'
+ import { readdirSync, readFileSync } from 'node:fs'
+ 
+-const [lock, token, every] = process.argv.slice(2);
+-let root;
++const [lock, token, every, relay] = process.argv.slice(2);
++let root = relay;
++let installer;
+ let pending = false;
+ const lost = () => { try { return !readFileSync(lock, 'utf8').includes(token) } catch (error) { return error.code === 'ENOENT' } };
+ function parents() {
+@@ -31,11 +34,11 @@ function parents() {
+ }
+ function tree() {
+   let table;
+-  try { table = parents() } catch { return new Set([Number(root)]) }
++  try { table = parents() } catch { return new Set([root, installer].filter(Boolean).map(Number)) }
+   const found = new Set([Number(root)]);
+   for (let grew = true; grew;) {
+     grew = false;
+-    for (const [pid, ppid] of table) if (found.has(ppid) && !found.has(pid)) { found.add(pid); grew = true }
++    for (const [pid, ppid] of table) if (pid !== process.pid && found.has(ppid) && !found.has(pid)) { found.add(pid); grew = true }
+   }
+   return found;
+ }
+@@ -64,5 +67,9 @@ setInterval(tick, Number(every));
+ let input = '';
+ process.stdin.on('data', data => {
+   input += data;
+-  if (root === undefined && input.includes('\n')) { root = input.split('\n')[0]; if (pending) end() }
++  if (installer === undefined && input.includes('\n')) {
++    installer = input.split('\n')[0];
++    root ??= installer;
++    if (pending) end();
++  }
+ }).on('end', () => process.exit(0));
+diff --git a/tests-js/node-deps.test.mjs b/tests-js/node-deps.test.mjs
+index 3fa7093ed02..701a6e438a1 100644
+--- a/tests-js/node-deps.test.mjs
++++ b/tests-js/node-deps.test.mjs
+@@ -540,23 +540,75 @@ test.skipIf(process.platform === 'win32').each([['failed', 'rc=1'], ['succeeded'
+ // Ctrl-Z stops the whole job, pnpm with it, and once resumed pnpm went on where it stopped: by
+ // then the run that broke the stopped run's lock may have installed and certified its own trees.
+ // The lock watcher is not in the job, so it kills the stopped pnpm as soon as the lock is broken.
+-test.skipIf(process.platform === 'win32')('an owner stopped during its pnpm install cannot write into the next owner\'s trees', async () => {
++test.skipIf(process.platform === 'win32').each([[false, false], [true, false], [false, true]])('an owner stopped during its pnpm install cannot write into the next owner\'s trees (delayed relay: %s, failed enumeration: %s)', async (delayRelay, failEnumeration) => {
+   const { source, env } = fixture()
+   prepareNodeDependencies({ source, workspaces: ['web'], reuse: true, env, nativeToolchain: 'first' })
+   const dir = dirname(source)
+   mkdirSync(join(dir, 'owner'))
+   // A's pnpm: stopped (with all of A) in the middle of its work, which goes on into the tree once resumed.
+   writeFileSync(join(dir, 'owner/pnpm'), ['#!/bin/sh', 'if [ "$1" = install ]; then',
+-    `  touch '${dir}/owner.started'; sleep 2`,
+-    `  echo third > node_modules/.written-by-the-stopped-pnpm; '${pnpmCommand()}' "$@"; exit $?`,
++    `  echo $$ > '${dir}/owner.started'`,
++    `  while [ ! -f '${dir}/owner.release' ]; do sleep 0.05; done`,
++    `  echo third > node_modules/.written-by-the-stopped-pnpm; touch '${dir}/relay.release'; '${pnpmCommand()}' "$@"; exit $?`,
+     'fi', `exec '${pnpmCommand()}' "$@"`, ''].join('\n'))
+   chmodSync(join(dir, 'owner/pnpm'), 0o755)
+   json(join(dir, 'owner/package.json'), { name: 'pnpm', version: execFileSync(pnpmCommand(), ['--version']).toString().trim() })
+-  const owner = background(source, { ...env, PATH: `${join(dir, 'owner')}${delimiter}${env.PATH}` },
++  // Hold the relay after the real installer spawn, before its JS resumes. The installer is
++  // already runnable here; registering its pid afterwards cannot protect a stopped relay.
++  const delayed = join(dir, 'delayed-relay.cjs')
++  writeFileSync(delayed, `
++    if (${failEnumeration} && process.argv[1]?.endsWith('/node-deps-watcher.mjs')) {
++      const fs = require('node:fs');
++      const cp = require('node:child_process');
++      const readdir = fs.readdirSync;
++      const exec = cp.execFileSync;
++      fs.readdirSync = function(path, ...args) {
++        if (path === '/proc') throw new Error('injected enumeration failure');
++        return readdir(path, ...args);
++      };
++      cp.execFileSync = function(file, ...args) {
++        if (file === 'ps') throw new Error('injected enumeration failure');
++        return exec(file, ...args);
++      };
++      process.stdin.on('data', () => fs.writeFileSync(${JSON.stringify(join(dir, 'watcher.registered'))}, ''));
++      require('node:module').syncBuiltinESMExports();
++    }
++    if (process.argv[1]?.endsWith('/node-deps-relay.mjs')) {
++      const cp = require('node:child_process');
++      const original = cp.spawn;
++      cp.spawn = function(file, args, options) {
++        const child = original(file, args, options);
++        if (args[0]?.endsWith('/node-deps-watcher.mjs')) {
++          require('node:fs').writeFileSync(${JSON.stringify(join(dir, 'watcher.pid'))}, String(child.pid));
++          require('node:fs').writeFileSync(${JSON.stringify(join(dir, 'relay.pid'))}, String(process.pid));
++        }
++        if (${delayRelay} && file === ${JSON.stringify(join(dir, 'owner/pnpm'))} && args[0] === 'install') {
++          require('node:fs').writeFileSync(${JSON.stringify(join(dir, 'relay.held'))}, String(process.pid));
++          while (!require('node:fs').existsSync(${JSON.stringify(join(dir, 'relay.release'))})) {
++            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
++          }
++        }
++        return child;
++      };
++      require('node:module').syncBuiltinESMExports();
++    }
++  `)
++  const owner = background(source, { ...env, PATH: `${join(dir, 'owner')}${delimiter}${env.PATH}`,
++    NODE_OPTIONS: `--require="${delayed}"` },
+     '--workspace', 'web', '--reuse', '--native-toolchain', 'third')
+-  await until(() => existsSync(join(dir, 'owner.started')))
+-  owner.stop()
+   const timing = { ...lockTiming }
++  try {
++  await until(() => existsSync(join(dir, 'owner.started')) && readFileSync(join(dir, 'owner.started'), 'utf8').trim())
++  if (delayRelay) await until(() => existsSync(join(dir, 'relay.held')))
++  if (failEnumeration) await until(() => existsSync(join(dir, 'watcher.registered')))
++  const pid = name => readFileSync(join(dir, name), 'utf8').trim()
++  const state = name => spawnSync('ps', ['-o', 'pgid=,stat=', '-p', pid(name)], { encoding: 'utf8' }).stdout.trim().split(/\s+/)
++  expect(state('owner.started')[0]).toBe(state('relay.pid')[0])
++  expect(state('watcher.pid')[0]).not.toBe(state('relay.pid')[0])
++  owner.stop()
++  await until(() => state('owner.started')[1]?.startsWith('T') && state('relay.pid')[1]?.startsWith('T'))
++  expect(state('watcher.pid')[1]).not.toMatch(/^T/)
++  expect(existsSync(join(source, 'node_modules/.written-by-the-stopped-pnpm'))).toBe(false)
+   Object.assign(lockTiming, { stale: 1_500 })
+   try {
+     prepareNodeDependencies({ source, workspaces: ['web'], reuse: true, env, nativeToolchain: 'second' })
+@@ -564,6 +616,7 @@ test.skipIf(process.platform === 'win32')('an owner stopped during its pnpm inst
+     Object.assign(lockTiming, timing)
+   }
+   const built = readFileSync(join(webOnly(source), 'built'), 'utf8')
++  writeFileSync(join(dir, 'owner.release'), '')
+   owner.resume()
+   const { code, output } = await owner.exit
+   // Long enough for the stopped pnpm to have finished, had it survived.
+@@ -571,11 +624,25 @@ test.skipIf(process.platform === 'win32')('an owner stopped during its pnpm inst
+   expect(code).not.toBe(0)
+   expect(output).toMatch(/this run lost the checkout lock/)
+   expect(existsSync(join(source, 'node_modules/.written-by-the-stopped-pnpm'))).toBe(false)
++  const dead = name => { const status = state(name)[1]; return !status || status.startsWith('Z') }
++  await until(() => dead('owner.started') && dead('relay.pid') && dead('watcher.pid'))
+   // The tree is the one the receipt certifies.
+   expect(readFileSync(join(webOnly(source), 'built'), 'utf8')).toBe(built)
+   expect(readFileSync(join(source, 'node_modules/.hermes-node-deps.native-toolchain'), 'utf8')).toMatch(/"second"\n$/)
+   expect(readdirSync(join(source, '.cache'))).toEqual([])
+   prepareNodeDependencies({ source, workspaces: ['web'], reuse: true, env, nativeToolchain: 'second', install: false })
++  } finally {
++    Object.assign(lockTiming, timing)
++    // No failed assertion can strand the gated installer or a stopped job.
++    writeFileSync(join(dir, 'owner.release'), '')
++    writeFileSync(join(dir, 'relay.release'), '')
++    try { owner.kill() } catch (error) { expect(error.code).toBe('ESRCH') }
++    const watcherPid = join(dir, 'watcher.pid')
++    if (existsSync(watcherPid)) {
++      try { process.kill(Number(readFileSync(watcherPid, 'utf8')), 'SIGKILL') } catch (error) { expect(error.code).toBe('ESRCH') }
++    }
++    await owner.exit
++  }
+ }, 60000)
+ 
+ // The watcher leaves the job, pnpm does not: the terminal's Ctrl-C (SIGINT to the job's process
+-- 
+2.55.0
+
