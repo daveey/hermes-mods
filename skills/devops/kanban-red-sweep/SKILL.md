@@ -71,7 +71,11 @@ bypassed with another writer.
 - A card you unblock may sit `ready` behind a full worker pool. Read the queue head first
   (`select id,priority from tasks where status='ready' order by priority desc limit 10`) and set
   `hermes kanban edit <id> --priority <above the cards that should yield>`; a token bump like 10 leaves it behind
-  queues at 50-300.
+  queues at 50-300. If the hub is full, move portable cards to a pool worker:
+  `hermes kanban move <id> --runs-on machine:<worker> --reason "..."` (keep cards needing hub-only access,
+  the Macs or another profile on the hub). `no_machine` for a worker usually means a Board hold; read its owner
+  card before filing a fault. Free slots but nothing starting: check `~/.hermes/core-update/drain-hold` (a
+  core-update drain pauses dispatch for up to `max_s`).
 - A worker can't archive cards outside its own task; when its handoff names an exact archive/unblock command for
   sibling cards that follows the user's recorded answer, run it here, read back the status, and re-queue the worker.
 - Link every card still waiting on the user to this chat, so its wake lands here:
