@@ -10,8 +10,14 @@ The panel has two groups, one row per machine, one square per slot:
   registry's `max_card_runs` (this gateway falls back to its own `kanban.max_in_progress`; otherwise
   "slots not set" and only the busy count). Busy slots are live Board leases from the gateway's sync-shadow
   board replicas: hover shows card id, title, board and run time; click opens the card. The section header adds
-  `· N waiting` (ready cards with no lease, all boards); a row adds `· N waiting` for ready cards pinned to it
-  (`runs_on: machine:<name>`). Gateways older than this field show no waiting count, never a false 0.
+  `· N waiting`: unleased ready cards assigned to profiles the machine-wide gateway dispatcher can spawn
+  (existing profiles permitted by `kanban.dispatch_profiles`, evaluated under the Kanban home, not the UI profile).
+  Each row splits this queue into `N waiting` (placement fits here) and `N can't run here` (labels, including
+  skill labels, machine pins, creator/workspace restrictions or pinned-only policy). Hover either number
+  for its meaning. Portable cards may fit multiple rows but count once in the header. Availability, holds,
+  quotas and transient admission limits are separate: a fit does not promise immediate dispatch.
+  The projection assumes the shared board's machine-wide dispatcher policy; it does not inventory remote
+  profile configs. Older gateways and unreadable replica scans show no waiting count, never a false 0.
 - **CI workers**: GitHub Actions runners from the runners collector, grouped into machines by runner name
   (`ec2-gwgen-2` → `ec2-gwgen`, `…-i-<instance>` → one ephemeral group). One runner = one slot. Each slot
   carries the runner entity id (`runner_…`) from the fleet projection. Click or hover a slot to open its

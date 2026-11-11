@@ -68,47 +68,52 @@ def live_leases(shadow_dir, now_ms):
     return out
 
 
-def waiting_cards(shadow_dir):
-    """Ready cards nobody holds yet, from every board replica: [{board, task, machines}].
+def waiting_cards(shadow_dir, profile_dispatchable):
+    """Unleased ready cards assigned to profiles the gateway dispatcher can spawn.
 
-    ``machines`` are the ``machine:<name>`` pins in runs_on (empty = any machine may take it).
+    Retain placement fields for the core's eligibility predicate. Old replicas
+    without an assignee cannot establish slot demand and are excluded.
     """
-    import json
     out = []
+    if profile_dispatchable is None:
+        return None  # unknown is not zero (nor every ready card)
     for path in sorted(Path(shadow_dir).glob('*.db')):
         try:
             db = _ro_connect(path, timeout=1)
         except sqlite3.Error:
-            continue
+            return None  # an incomplete replica scan cannot establish a total
         try:
-            try:
-                rows = db.execute("SELECT id, runs_on FROM tasks WHERE status = 'ready' AND lease_holder IS NULL "
-                                  "ORDER BY id").fetchall()
-            except sqlite3.OperationalError:  # replica from before runs_on: nothing is pinned
-                rows = [(t, None) for (t,) in db.execute(
-                    "SELECT id FROM tasks WHERE status = 'ready' AND lease_holder IS NULL ORDER BY id")]
+            columns = {r[1] for r in db.execute('PRAGMA table_info(tasks)')}
+            if 'assignee' not in columns:
+                continue  # legacy replica: no evidence of a dispatchable assignment
+            optional = ', '.join(k if k in columns else f'NULL AS {k}'
+                                 for k in ('runs_on', 'created_on', 'workspace_kind'))
+            db.row_factory = sqlite3.Row
+            rows = db.execute(f"SELECT id, assignee, {optional} FROM tasks "
+                              "WHERE status = 'ready' AND lease_holder IS NULL ORDER BY id").fetchall()
         except sqlite3.Error:
-            rows = []
+            return None
         finally:
             db.close()
-        for task, runs_on in rows:
-            try:
-                labels = json.loads(runs_on) if runs_on else []
-            except ValueError:
-                labels = []
-            machines = [l.split(':', 1)[1] for l in labels if isinstance(l, str) and l.startswith('machine:')]
-            out.append(dict(board=path.stem, task=task, machines=machines))
+        for row in rows:
+            card = dict(row)
+            if card['assignee'] and profile_dispatchable(card['assignee']):
+                out.append(dict(card, board=path.stem, task=card['id']))
     return out
 
 
-def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=None, waiting=None):
+def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=None, waiting=None,
+                    eligible=None):
     """One row per registered machine (and per unregistered lease holder).
 
     registry: ``{me, machines: {name: entry}}`` or None when the Board is unreachable.
     Slots are the registry's ``max_card_runs``; this gateway falls back to its own
     dispatcher cap. None means no fixed slot count is set. A registry older than
     REGISTRY_STALE_S keeps its slots and labels but says nothing about who is up.
-    waiting: ``waiting_cards()``; the section counts them all, each row the ones pinned to it.
+    waiting: profile-filtered ``waiting_cards()``; counted once in the header.
+    eligible: core ``kanban_worker_node.eligible`` (None means a card fits).
+    Per-row counts overlap for portable cards. Holds and liveness do not change
+    placement fit: they are reported separately, as are slot/admission limits.
     """
     stale = registry is not None and registry_age_s is not None and registry_age_s > REGISTRY_STALE_S
     machines = dict((registry or {}).get('machines') or {})
@@ -145,12 +150,16 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
             reason = f'not seen for {int((now_ms - seen) / 60000)} min'
         else:
             state, reason = 'active', None
+        fit = None
+        if waiting is not None and eligible is not None and entry is not None:
+            placement = dict(machines, **{name: dict(entry, hold=False)})
+            fit = sum(eligible(w, name, placement) is None for w in waiting)
         rows.append(dict(
             name=name, me=name == me, state=state, reason=reason, last_seen=seen,
             labels=list(entry.get('labels') or []) if entry else [],
             pinned_only=bool(entry and entry.get('pinned_only')),
             slots=slots, slots_source=slots_source,
-            waiting=sum(1 for w in waiting or [] if name in w['machines']),
+            waiting=fit, ineligible=None if fit is None else len(waiting) - fit,
             load=_load(entry.get('metrics'), now_ms) if entry else None,
             running=[dict(board=l['board'], task=l['task'], title=l['title'], started_at=l['started_at'])
                      for l in running]))

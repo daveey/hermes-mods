@@ -66,15 +66,22 @@ test('registry: gateway machines show fixed slots, flags and unset slot counts',
   await ui.close()
 })
 
-test('waiting: header shows ready cards waiting, rows show the ones pinned to them', async () => {
+test('waiting: header counts dispatched cards; rows split placement fit with tooltips', async () => {
   const body = fleet()
   body.gateways.waiting = 90
-  body.gateways.machines = body.gateways.machines.map((m) => m.name === 'hub' ? { ...m, waiting: 18 } : { ...m, waiting: 0 })
+  body.gateways.machines = body.gateways.machines.map((m) => m.name === 'hub' ? { ...m, waiting: 18, ineligible: 72 } : { ...m, waiting: 0, ineligible: 90 })
   const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
   assert.match(ui.container.textContent, /1 \/ 7 slots busy · 90 waiting/)
-  assert.equal(ui.container.querySelector('[data-machine="hub"] .hermes-fleet-count').textContent, '1/4')
-  assert.equal(ui.container.querySelector('[data-machine="hub"] .hermes-fleet-slots > .hermes-fleet-waiting').textContent, '18 waiting')
-  assert.doesNotMatch(ui.container.querySelector('[data-machine="mini"]').textContent, /waiting/)
+  assert.match(ui.container.querySelector('.hermes-fleet-head [title]').title, /gateway-dispatched profiles.*counted once/)
+  const hub = ui.container.querySelector('[data-machine="hub"]')
+  assert.equal(hub.querySelector('.hermes-fleet-count').textContent, '1/4')
+  const fit = hub.querySelector('.hermes-fleet-slots > .hermes-fleet-waiting')
+  assert.equal(fit.textContent, '18 waiting')
+  assert.match(fit.title, /Need a slot here.*other machines/)
+  const excluded = hub.querySelector('.hermes-fleet-ineligible')
+  assert.equal(excluded.textContent, "72 can't run here")
+  assert.match(excluded.title, /placement labels, skill labels, machine pins or pinned-only/)
+  assert.match(ui.container.querySelector('[data-machine="mini"]').textContent, /0 waiting90 can't run here/)
   await ui.close()
   const old = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))  // older gateway: no count
   assert.doesNotMatch(old.container.textContent, /waiting/)

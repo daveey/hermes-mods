@@ -181,6 +181,18 @@ def _fleet():
         return sys.modules[name]
 
 
+def _waiting_cards(fleet, shadow_dir):
+    """Use the machine-wide dispatcher's profile policy, not the polled UI profile."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_cli.kanban_db import kanban_home
+    from hermes_cli.kanban_db_dispatch import _profile_exists_fn
+    token = set_hermes_home_override(kanban_home())
+    try:
+        return fleet.waiting_cards(shadow_dir, _profile_exists_fn())
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _gateway_section():
     import time
     fleet = _fleet()
@@ -191,8 +203,8 @@ def _gateway_section():
     read_at = node._REGISTRY.get('at')
     age = time.monotonic() - read_at if registry is not None and read_at is not None else None
     section = fleet.gateway_workers(registry, leases, now_ms, registry_age_s=age,
-                                    local_cap=_local_cap(),
-                                    waiting=fleet.waiting_cards(ksc.shadow_path('x').parent))
+                                    local_cap=_local_cap(), eligible=node.eligible,
+                                    waiting=_waiting_cards(fleet, ksc.shadow_path('x').parent))
     try:
         inv = _investigate()
         found = inv.latest(_board_dirs(), {m['name'] for m in section['machines']})

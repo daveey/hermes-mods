@@ -777,6 +777,33 @@ def test_fleet_gateway_section_failure_is_shared_for_the_window_not_retried_per_
     assert all(v == {'state': 'unavailable', 'reason': 'ImportError', 'machines': []} for v in out.values())
 
 
+def test_waiting_policy_uses_kanban_home_and_restores_context(api, monkeypatch, tmp_path):
+    module, _, _ = api
+    hc = pytest.importorskip('hermes_constants')
+    dispatch = pytest.importorskip('hermes_cli.kanban_db_dispatch')
+    kdb = pytest.importorskip('hermes_cli.kanban_db')
+    monkeypatch.setattr(kdb, 'kanban_home', lambda: tmp_path)
+    def predicate():
+        assert hc.get_hermes_home() == tmp_path
+        return lambda name: hc.get_hermes_home() == tmp_path and name == 'default'
+    monkeypatch.setattr(dispatch, '_profile_exists_fn', predicate)
+    def collect(path, allowed):
+        assert path == tmp_path / 'replicas'
+        assert allowed('default') and not allowed('queue')
+        return ['fixture']
+    token = hc.set_hermes_home_override(tmp_path / 'profiles' / 'other')
+    try:
+        assert module._waiting_cards(types.SimpleNamespace(waiting_cards=collect), tmp_path / 'replicas') == ['fixture']
+        assert hc.get_hermes_home() == tmp_path / 'profiles' / 'other'
+        def broken(*args):
+            raise RuntimeError('probe')
+        with pytest.raises(RuntimeError, match='probe'):
+            module._waiting_cards(types.SimpleNamespace(waiting_cards=broken), tmp_path / 'replicas')
+        assert hc.get_hermes_home() == tmp_path / 'profiles' / 'other'
+    finally:
+        hc.reset_hermes_home_override(token)
+
+
 def test_local_cap_parses_config_once_until_it_changes(api, monkeypatch, tmp_path):
     module, _, _ = api
     kdb = types.ModuleType('hermes_cli.kanban_db')

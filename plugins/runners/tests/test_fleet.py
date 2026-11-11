@@ -50,27 +50,71 @@ def test_live_leases_fill_slots_across_boards(tmp_path):
     assert [r['task'] for r in m['worker-1']['running']] == ['t_b']
 
 
-def test_waiting_cards_counted_per_section_and_per_pinned_machine(tmp_path):
+def test_waiting_cards_excludes_non_dispatched_assignees(tmp_path):
     db = sqlite3.connect(tmp_path / 'default.db')
-    db.execute('CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, started_at INTEGER, '
-               'lease_holder TEXT, lease_expires INTEGER, runs_on TEXT)')
+    db.execute('CREATE TABLE tasks (id TEXT, assignee TEXT, status TEXT, lease_holder TEXT, '
+               'runs_on TEXT, created_on TEXT, workspace_kind TEXT)')
     db.executemany('INSERT INTO tasks VALUES (?,?,?,?,?,?,?)', [
-        ('t_any', 'Any', 'ready', None, None, None, None),
-        ('t_hub', 'Hub', 'ready', None, None, None, '["machine:hub"]'),
-        ('t_hub2', 'Hub2', 'ready', None, None, None, '["linux", "machine:hub"]'),
-        ('t_held', 'Held', 'ready', None, 'hub', NOW + MIN, '["machine:hub"]'),
-        ('t_todo', 'Todo', 'todo', None, None, None, '["machine:hub"]'),
-        ('t_run', 'Run', 'running', 1, 'hub', NOW + MIN, None)])
+        ('t_any', 'default', 'ready', None, '[]', 'hub', 'scratch'),
+        ('t_hub', 'reviewer', 'ready', None, '["machine:hub", "skill:build"]', 'hub', 'scratch'),
+        ('t_held', 'default', 'ready', 'hub', None, None, None),
+        ('t_todo', 'default', 'todo', None, None, None, None),
+        ('t_run', 'default', 'running', 'hub', None, None, None),
+        *[(f't_{i}', assignee, 'ready', None, None, None, None)
+          for i, assignee in enumerate(['queue', 'dev', 'nobody', 'coach', None, ''])]])
     db.commit()
     db.close()
-    _shadow(tmp_path, 'old', [('t_old', 'No runs_on column', 'ready', None, None, None)])
-    waiting = fleet.waiting_cards(tmp_path)
-    assert sorted(w['task'] for w in waiting) == ['t_any', 't_hub', 't_hub2', 't_old']
-    out = fleet.gateway_workers(_registry(hub={}, **{'worker-1': dict(max_card_runs=16)}), [], NOW, waiting=waiting)
+    _shadow(tmp_path, 'legacy', [('t_unknown', 'No assignee column', 'ready', None, None, None)])
+    db = sqlite3.connect(tmp_path / 'old.db')
+    db.execute('CREATE TABLE tasks (id TEXT, assignee TEXT, status TEXT, lease_holder TEXT)')
+    db.execute("INSERT INTO tasks VALUES ('t_old', 'default', 'ready', NULL)")
+    db.commit()
+    db.close()
+    waiting = fleet.waiting_cards(tmp_path, lambda p: p in {'default', 'reviewer'})
+    assert sorted(w['task'] for w in waiting) == ['t_any', 't_hub', 't_old']
+    pinned = next(w for w in waiting if w['task'] == 't_hub')
+    assert pinned['runs_on'] == '["machine:hub", "skill:build"]'
+    assert pinned['created_on'] == 'hub' and pinned['workspace_kind'] == 'scratch'
+    assert fleet.waiting_cards(tmp_path, lambda p: False) == []
+    assert fleet.waiting_cards(tmp_path, None) is None
+
+
+def test_waiting_split_uses_core_placement_and_skill_labels():
+    import pytest
+    node = pytest.importorskip('hermes_cli.kanban_worker_node')
+    waiting = [
+        dict(runs_on=[], created_on='hub'),
+        dict(runs_on=['machine:hub'], created_on='hub'),
+        dict(runs_on=['linux', 'skill:build'], created_on='hub'),
+        dict(runs_on=['macos'], created_on='hub'),
+        dict(runs_on=None, created_on='hub', workspace_kind='worktree'),
+    ]
+    reg = _registry(hub=dict(labels=['linux']), worker=dict(labels=['linux', 'skill:build']),
+                    mini=dict(labels=['macos'], pinned_only=True), held=dict(hold=True, labels=['linux']))
+    out = fleet.gateway_workers(reg, [], NOW, waiting=waiting, eligible=node.eligible)
     m = {r['name']: r for r in out['machines']}
-    assert out['waiting'] == 4
-    assert (m['hub']['waiting'], m['worker-1']['waiting']) == (2, 0)
-    assert fleet.gateway_workers(_registry(hub={}), [], NOW)['waiting'] is None  # not measured != zero
+    assert out['waiting'] == 5  # not the sum of overlapping machine counts
+    assert (m['hub']['waiting'], m['hub']['ineligible']) == (3, 2)
+    assert (m['worker']['waiting'], m['worker']['ineligible']) == (2, 3)
+    assert (m['mini']['waiting'], m['mini']['ineligible']) == (0, 5)
+    assert (m['held']['waiting'], m['held']['ineligible']) == (1, 4)
+    assert reg['machines']['held']['hold'] is True  # never mutate registry
+    assert m['held']['state'] == 'draining'
+
+
+def test_waiting_unreadable_replica_does_not_report_zero(tmp_path):
+    (tmp_path / 'broken.db').write_bytes(b'not a sqlite database')
+    assert fleet.waiting_cards(tmp_path, lambda p: True) is None
+
+
+def test_waiting_unknown_is_not_zero():
+    out = fleet.gateway_workers(_registry(hub={}), [], NOW)
+    assert out['waiting'] is None
+    assert out['machines'][0]['waiting'] is None
+    assert out['machines'][0]['ineligible'] is None
+    out = fleet.gateway_workers(None, [dict(holder='missing', board='default', task='t_a', title='A', started_at=1)],
+                                NOW, waiting=[], eligible=lambda *args: None)
+    assert out['machines'][0]['waiting'] is None
 
 
 def test_ci_runners_grouped_into_machines_with_one_slot_each():
