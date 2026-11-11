@@ -101,7 +101,7 @@ How to run it from an agent:
   anything, then diagnose the wrapper. The hub's `github_quota.py` caps each process at a fixed request budget
   (exit 75, `Denied`), which one long wait outgrows; a slower `--interval` only delays it. For waits over ~20
   min, loop `--once` with a fresh `token-broker exec` per check (`sleep 300` between; stop on exit 0 or 1), so
-  each check gets its own budget.
+  each check gets its own budget. Exit 75 with a `shared_quota_brake` ledger row: `references/quota-brake-recovery.md`.
 - In a Kanban worker there is no async notify, and a poll loop burns `max_runtime_seconds` (most worker
   timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
@@ -125,25 +125,7 @@ How to run it from an agent:
 
 ## Batch acceptance: several PRs, one suite
 
-When the user approves batching several PRs through ONE full suite, a constituent PR does not need its own green run.
-Its acceptance is the batch's evidence, but only when all of the following hold:
-- One owner card builds the batch branch from fresh `main` and merges each PR's exact head with `--no-ff`, so every
-  source commit is an ancestor. That card records base sha, PR heads, integration head and tree, and run URLs in a
-  manifest. Fix-ups the merged tree needs (lint, code-health) go on the batch branch as their own commits.
-- Before pushing, run the repo's local lint gate (e.g. `scripts/check --base origin/main`) and focused tests. A
-  ratchet that only fails on the combined diff costs a full suite otherwise.
-- Every necessary workflow completed green on the exact batch head: one run per workflow, never "queued" or
-  "in progress", never one job standing in for the others. A PR head or `main` that moves invalidates the
-  evidence: rebuild and rerun.
-- Land with one fast-forward of `main` to the tested head, after checking `git merge-base --is-ancestor
-  origin/main <head>` immediately before the push. Never force-push `main`. Close each source PR only after the
-  landing, with the batch PR link and main sha. Never fake check statuses on the source heads.
-- Once the batch PR exists, cancel only the superseded runs of the constituent PRs. Leave runs on `main` and in
-  other repos alone.
-- The batch is done only when the post-landing `main` suite has completed green (`wait_for_ci.py <sha>`). Waiting
-  cards get the run URLs so they don't relaunch suites. If that run fails in a test outside the batch diff and
-  `main` has since fixed it, a later fully green `main` suite (every workflow) on a descendant of the landed sha
-  counts; record the failed run, the fix commits and the green runs in the manifest.
+A user-approved batch through ONE full suite: acceptance is the batch's evidence only if one owner card builds it from fresh `main` with exact-head `--no-ff` merges, every workflow is green on the exact batch head, and `main` and the PR heads have not moved. Land with one fast-forward after `merge-base --is-ancestor`; never force-push `main` or fake statuses. Full checklist: `references/ci-authoring-and-failure-fixes.md` §Batch acceptance.
 
 ## Notes
 

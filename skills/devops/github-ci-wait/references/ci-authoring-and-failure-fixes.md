@@ -35,3 +35,25 @@ CI itself is SKILL.md.
 - **Hermes E2E failures on loaded runners.** Audit sandbox daemon ownership before raising timeouts. `hermes -z` and viewer `/exit` deliberately retain the shared gateway: each isolated test home must stop its own home/PID/start-time-verified gateway before closing fake provider/proxy servers. Assert viewer-only cleanup first, then full runtime cleanup; never hide arbitrary children as persistent infrastructure. A cold public model-metadata fetch can also reach OpenRouter during another provider's test: seed metadata for the fake model rather than broadening the foreign-provider egress allowlist. For recording/prebuilt TUI probes, pass the installed Node explicitly with supported `HERMES_NODE` through the hermetic child's overrides; obsolete `HERMES_SKIP_NODE_BOOTSTRAP` has no reader, and Node on PATH alone still falls through to `pm.ensure('node')`. Prove attach-only isolation by forbidding PM acquisition in a real child CLI while retaining exact handoff/lease assertions, rather than raising its timeout.
 - **Docker: image pushed, then `exporting to GitHub Actions Cache` fails** (`error writing layer blob: not_found`). Keep cache exports advisory with `ignore-error=true` in each `cache-to: type=gha` option list, including release and sibling image workflows. Do not use step-level `continue-on-error`: image build/load/push failures must remain fatal. Test the parsed workflow exporter policy and verify a green main push run; a later artifact-quota warning alone does not establish why the cache backend failed.
 - **gitleaks install fails with "Destination file path ... already exists" on a self-hosted runner.** Self-hosted runners keep files between jobs. `gitleaks/gitleaks-action@v2` downloads to the fixed path `os.tmpdir()/gitleaks.tmp`, so one interrupted run makes every later install fail on that runner. Fix in the workflow, not on the hosts: set `TMPDIR: ${{ runner.temp }}` in the step's `env` (emptied per job). Check every runner's failure first (`runner_name` per job) to tell a systemic cause from one dirty host.
+
+## Batch acceptance: several PRs, one suite
+
+When the user approves batching several PRs through ONE full suite, a constituent PR does not need its own green run.
+Its acceptance is the batch's evidence, but only when all of the following hold:
+- One owner card builds the batch branch from fresh `main` and merges each PR's exact head with `--no-ff`, so every
+  source commit is an ancestor. That card records base sha, PR heads, integration head and tree, and run URLs in a
+  manifest. Fix-ups the merged tree needs (lint, code-health) go on the batch branch as their own commits.
+- Before pushing, run the repo's local lint gate (e.g. `scripts/check --base origin/main`) and focused tests. A
+  ratchet that only fails on the combined diff costs a full suite otherwise.
+- Every necessary workflow completed green on the exact batch head: one run per workflow, never "queued" or
+  "in progress", never one job standing in for the others. A PR head or `main` that moves invalidates the
+  evidence: rebuild and rerun.
+- Land with one fast-forward of `main` to the tested head, after checking `git merge-base --is-ancestor
+  origin/main <head>` immediately before the push. Never force-push `main`. Close each source PR only after the
+  landing, with the batch PR link and main sha. Never fake check statuses on the source heads.
+- Once the batch PR exists, cancel only the superseded runs of the constituent PRs. Leave runs on `main` and in
+  other repos alone.
+- The batch is done only when the post-landing `main` suite has completed green (`wait_for_ci.py <sha>`). Waiting
+  cards get the run URLs so they don't relaunch suites. If that run fails in a test outside the batch diff and
+  `main` has since fixed it, a later fully green `main` suite (every workflow) on a descendant of the landed sha
+  counts; record the failed run, the fix commits and the green runs in the manifest.
