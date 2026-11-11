@@ -77,7 +77,14 @@ say what's running, never what needs the user.
   waits on, first read the priority spread across `ready`, `scheduled` and `todo`, plus the priorities of
   recent `spawned` events (`task_events` joined to `tasks`). Set it above the top of all of them, because
   scheduled cards and continuations that wake later, at 9000+, jump ahead of a value that only beat the ready
-  queue. The notices' suggested `--priority 10` does nothing in this case. Verify a claimed run and
+  queue. The notices' suggested `--priority 10` does nothing in this case. A card created on another gateway but
+  pinned here fails `hermes kanban edit` with "unknown id" (`kanban show` says "not imported here; last pickup
+  skip: budget_exhausted"). Pickup imports only one foreign card per free slot, in effective-priority order, and
+  waiters donate their priority. So first raise its local waiting child, and once the card is imported, set the
+  card itself, because older cards boosted by their own waiters can still spawn ahead of it. When the hub is
+  full and the work is portable (code, tests, PR, CI), skip the bump and re-place it:
+  `hermes kanban move <id> --runs-on machine:worker-N --reason "..."`, plus a comment that a hub-only readback
+  becomes a small hub-pinned card, never a move back. Verify a claimed run and
   attributable worker activity; `~0 ahead` is queue position, not execution. If a repeat notice arrives
   without execution, dispatch an independent reviewer directly or re-place the existing work rather than
   repeating priority-only updates. Have the reviewer check for a dispatcher claim before running tests:
