@@ -123,7 +123,7 @@ test('a card row reads as status, title, who, what happened last, note and PR', 
     note: 'Opened the PR; CI green', pr_url: 'https://github.com/o/r/pull/42'
   })], { connectionId: 'conn', profile: 'default' })
   assert.deepEqual(m.cardRowModel(chip, now), {
-    status: 'review', look: null, wait: '', title: 'Fix the flaky wake test', meta: 'worker · review requested 5m ago',
+    status: 'review', onHub: false, look: null, wait: '', title: 'Fix the flaky wake test', meta: 'worker · review requested 5m ago',
     note: 'Opened the PR; CI green', prLabel: 'PR #42', prUrl: 'https://github.com/o/r/pull/42'
   })
   const [unsafe] = m.sessionTaskChips([card('t_x', 'running', { pr_url: 'javascript:alert(1)' })], { connectionId: 'conn', profile: 'default' })
@@ -202,4 +202,18 @@ test('a blocked or triage card keeps its status colour under a grey wait, but st
     assert.equal(m.chipColor(c.look || c.state), m.chipColor('blocked'))
     assert.match(m.waitLine(c), /^waiting on /)
   }
+})
+
+test('a hub-scheduled card shows [H] in its status box; a worker card does not', () => {
+  const chips = m.sessionTaskChips([
+    card('t_hub', 'running', { run_machine: 'hub' }), card('t_w', 'ready', { run_machine: 'worker-1' }),
+    card('t_pool', 'todo', { run_machine: 'worker-pool' }), card('t_none', 'scheduled')
+  ], { connectionId: 'conn', profile: 'default' })
+  const by = Object.fromEntries(chips.map(c => [c.id, c]))
+  assert.deepEqual(Object.fromEntries(chips.map(c => [c.id, [m.onHub(c), m.cardRowModel(c).onHub]])),
+    { t_hub: [true, true], t_w: [false, false], t_pool: [false, false], t_none: [false, false] })
+  assert.match(by.t_hub.title, /^t_hub · running · runs on hub/)
+  assert.match(by.t_w.title, /^t_w · ready · runs on worker-1/)
+  assert.match(by.t_pool.title, /runs on a pool worker/)
+  assert.doesNotMatch(by.t_none.title, /runs on/)
 })

@@ -381,3 +381,20 @@ test('panel: a chat whose cards are all done shows no panel; new open work bring
     assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running', '1 done'])
   } finally { await show(null) }
 })
+
+test('hub-scheduled running and waiting cards carry an H in their box; worker cards stay plain', async () => {
+  window.localStorage.clear()
+  const fresh = Date.now() / 1000 - 60
+  bridges({ chips: [
+    card('t_hub_run', 'running', { runMachine: 'hub', activityAt: fresh }),
+    card('t_w_run', 'running', { runMachine: 'worker-1', activityAt: fresh }),
+    card('t_hub_wait', 'scheduled', { runMachine: 'hub' }),
+    card('t_hub_todo', 'ready', { runMachine: 'hub' }),
+    card('t_pool', 'todo', { runMachine: 'worker-pool' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'hub' }))
+  const pips = [...el().querySelectorAll('[data-pip]')].map(x => [x.dataset.pip, x.hasAttribute('data-pip-hub'), x.textContent])
+  assert.deepEqual(pips, [['running', true, 'H'], ['running', false, ''], ['waiting', true, 'H'], ['queued', true, 'H'], ['queued', false, '']])
+  assert.equal(el().querySelector('[data-progress-pips]').getAttribute('aria-label'), '2 running (1 on hub), 1 waiting (1 on hub), 2 not started (1 on hub)')
+  assert.deepEqual(m.hubCounts(m.classify(window.__sessionTasks.snapshot.chips)), { running: 1, stuck: 0, waiting: 1, queued: 1 })
+})

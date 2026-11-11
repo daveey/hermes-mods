@@ -288,21 +288,29 @@ const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px 
 // Shape carries state as well as colour: open work is filled, waiting is an outline, not started is dashed.
 const PIP_ORDER = ['needsYou', 'stuck', 'running', 'waiting', 'queued', 'done']
 export const PIPS_MAX = 24 // boxes drawn before the rest fold into "+N"
-const pipStyle = k => {
+// A hub-scheduled card's box is a little larger and carries an "H" (running and waiting work alike).
+const pipStyle = (k, hub = false) => {
   const base = { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none' }
-  if (k === 'waiting') return { ...base, border: `1.5px solid ${C.waiting}` }
-  if (k === 'queued') return { ...base, border: `1.5px dashed ${C.waiting}`, opacity: 0.7 }
-  return { ...base, background: C[k] }
+  const h = hub ? { width: 12, height: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 8.5, fontWeight: 700, lineHeight: 1 } : {}
+  if (k === 'waiting') return { ...base, ...h, border: `1.5px solid ${C.waiting}`, color: C.waiting }
+  if (k === 'queued') return { ...base, ...h, border: `1.5px dashed ${C.waiting}`, opacity: 0.7, color: C.waiting }
+  return { ...base, ...h, background: C[k], color: 'var(--card, #fff)' }
 }
 
-export function Pips({ n }) {
+/** Per pip state, how many of its open cards are scheduled on the hub (session-tasks `runMachine`). */
+export function hubCounts(sorted) {
+  const on = list => (list || []).filter(i => i.kind === 'kanban' && i.chip?.runMachine === 'hub').length
+  return { running: on(sorted.active), stuck: on(sorted.stuck), waiting: on(sorted.waiting), queued: on(sorted.queued) }
+}
+
+export function Pips({ n, hub = {} }) {
   const order = PIP_ORDER.filter(k => n[k])
   if (!order.length) return null
-  const all = order.flatMap(k => Array.from({ length: n[k] }, () => k))
+  const all = order.flatMap(k => Array.from({ length: n[k] }, (_, i) => ({ k, hub: i < (hub[k] || 0) })))
   const shown = all.slice(0, PIPS_MAX), more = all.length - shown.length
-  const words = order.map(k => `${n[k]} ${LABEL[k]}`)
+  const words = order.map(k => `${n[k]} ${LABEL[k]}${hub[k] ? ` (${Math.min(hub[k], n[k])} on hub)` : ''}`)
   return jsxs('span', { 'data-progress-pips': '', role: 'img', 'aria-label': words.join(', '), title: words.join('\n'), style: { display: 'inline-flex', alignItems: 'center', gap: 3, flex: 'none' }, children: [
-    ...shown.map((k, idx) => jsx('span', { 'data-pip': k, 'aria-hidden': true, style: pipStyle(k) }, idx)),
+    ...shown.map((p, idx) => jsx('span', { 'data-pip': p.k, ...(p.hub ? { 'data-pip-hub': '' } : {}), 'aria-hidden': true, style: pipStyle(p.k, p.hub), children: p.hub ? 'H' : undefined }, idx)),
     more > 0 && jsx('span', { 'data-pip-more': '', 'aria-hidden': true, style: { ...muted, marginLeft: 2 }, children: `+${more}` })
   ] })
 }
@@ -413,7 +421,7 @@ export function Panel() {
     jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
       jsx('h2', { style: { margin: 0, fontSize: 13.5, fontWeight: 600, flex: 'none' }, children: 'This session' }),
       jsxs('span', { 'data-session-status': '', style: { ...muted, display: 'flex', alignItems: 'center', gap: 5, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [busy && jsx('span', { 'aria-hidden': true, style: { color: C.running }, children: '●' }), status] }),
-      jsx(Pips, { n }),
+      jsx(Pips, { n, hub: hubCounts(sorted) }),
       summary && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), style: { ...muted, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: summary }),
       jsx('button', { type: 'button', 'data-panel-toggle': '', 'aria-expanded': !collapsed, 'aria-label': collapsed ? 'Expand session status' : 'Collapse session status', title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: toggle, style: { ...btn, marginLeft: 'auto', flex: 'none', minHeight: 28, minWidth: 28, padding: '2px 6px' }, children: jsx('i', { 'aria-hidden': true, className: `codicon ${collapsed ? 'codicon-chevron-up' : 'codicon-chevron-down'}` }) })
     ] }),

@@ -188,6 +188,8 @@ function taskChip(t, status) {
     state: status,
     label: str(t.title) || t.id,
     assignee: str(t.assignee) || null,
+    // Where the card runs or will run (backend `run_machine`): 'hub', a worker name, 'worker-pool', or null.
+    runMachine: str(t.run_machine) || null,
     note: str(t.note) || null,
     prUrl: /^https:\/\/github\.com\//.test(str(t.pr_url)) ? str(t.pr_url) : null,
     activity: str(t.activity_kind) || null,
@@ -196,10 +198,14 @@ function taskChip(t, status) {
     // first claim or creation (`since`, display only): a hub row without events otherwise read as a week-old stall
     // (kanban-f241d1f60b).
     progressAt: Number(t.activity_at) || Number(t.current_run_started_at) || 0,
-    title: `${t.id} · ${status}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}${waitTitle}`,
+    title: `${t.id} · ${status}${t.run_machine ? ` · ${runsOnText(str(t.run_machine))}` : ''}${t.assignee ? ` · ${t.assignee}` : ''}${watching ? ' · shepherding (created by another chat)' : ''}${t.board && t.board !== 'default' ? ` · board ${t.board}` : ''}${t.stale ? ' · stale (last known)' : ''}\n${str(t.title)}${waitTitle}`,
     since: Number(t.current_run_started_at || t.started_at || t.created_at) || 0
   }
 }
+
+/** Hub-scheduled cards carry an [H] in their status box (exported for tests). */
+export const onHub = chip => chip?.runMachine === 'hub'
+export const runsOnText = m => (m === 'worker-pool' ? 'runs on a pool worker' : `runs on ${m}`)
 
 // A parked card ranks by its wait look (stalled/needs-you first, grey waiting with the other parked work).
 const rankOf = c => KANBAN_RANK[c.look || c.state] ?? 9
@@ -865,6 +871,7 @@ function Chip({ chip, now }) {
         className: chip.state === 'running' ? 'session-tasks-pulse' : undefined,
         style: { width: 6, height: 6, borderRadius: 999, background: color, flex: 'none' }
       }),
+      onHub(chip) && jsx('span', { 'data-on-hub': '', style: { color, fontSize: 10, fontWeight: 600, flex: 'none' }, children: '[H]' }),
       jsx('i', { 'aria-hidden': true, className: `codicon ${KIND_GLYPH[chip.kind]}`, style: { fontSize: 12, flex: 'none', opacity: 0.8 } }),
       chip.kind === 'kanban' && jsx('span', { style: { opacity: 0.7, fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontSize: 10.5 }, children: chip.id }),
       jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 11 }, children: truncate(chip.label) }),
@@ -894,6 +901,7 @@ export function cardRowModel(chip, now = Date.now()) {
   const pr = chip.prUrl ? chip.prUrl.match(/\/pull\/(\d+)$/) : null
   return {
     status: chip.look === 'stalled' ? 'stalled' : chip.state,
+    onHub: onHub(chip),
     look: chip.look || null,
     wait: waitLine(chip, now),
     title: chip.label,
@@ -928,7 +936,8 @@ function CardRow({ chip, now }) {
           fontSize: 10.5, lineHeight: '16px', padding: '0 6px', borderRadius: 999, whiteSpace: 'nowrap', marginTop: 1,
           color, border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, background: `color-mix(in srgb, ${color} 12%, transparent)`
         },
-        children: m.status
+        'data-on-hub': m.onHub ? '' : undefined,
+        children: m.onHub ? `[H] ${m.status}` : m.status
       }),
       jsxs('span', {
         style: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 },
