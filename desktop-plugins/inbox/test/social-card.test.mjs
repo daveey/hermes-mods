@@ -98,6 +98,18 @@ test('turns render in order, target marked, earlier turns folded past 4', () => 
   assert.deepEqual(links.map(a => a.props.href), ['https://example.com/p.pdf'])
 })
 
+test('header label never repeats the platform', () => {
+  assert.equal(m.kindLabel({ type: 'bsky-reply-draft', type_label: 'Bluesky reply draft' }), 'Bluesky reply draft')
+  assert.equal(m.kindLabel({ type: 'x-dm', type_label: 'DM' }), 'X · DM')
+  assert.equal(m.kindLabel({ type: 'other', type_label: 'Thing' }), 'Thing')
+})
+
+test('single-option draft shows its character count', () => {
+  const draft = { session_id: 'd', type: 'bsky-reply-draft', field_specs: { text: { max: 300 } }, fields: { text: 'One draft', thread: JSON.stringify(THREAD.slice(-1)) }, actions: [] }
+  const tree = render(m.SocialCardView({ item: draft, selected: {} }))
+  assert.equal(text(slot(tree, 'social-count')[0]), '9/300')
+})
+
 test('short threads are not folded', () => {
   const it = incoming()
   it.fields.thread = JSON.stringify(THREAD.slice(-2))

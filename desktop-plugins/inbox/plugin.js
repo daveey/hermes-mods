@@ -330,6 +330,15 @@ export function parseSources(raw) {
 
 const PLATFORM = t => (str(t).startsWith('bsky') ? 'Bluesky' : str(t).startsWith('x-') ? 'X' : '')
 
+/** "Bluesky · reply draft" style header label, without repeating the platform. */
+export function kindLabel(item) {
+  const plat = PLATFORM(item && item.type)
+  const label = str(item && item.type_label).trim()
+  if (!plat) return label
+  if (!label) return plat
+  return label.toLowerCase().startsWith(plat.toLowerCase()) ? label : `${plat} · ${label}`
+}
+
 // ── hermes-hub replica (hub-sync plugin) ────────────────────────────────────
 // Open cards of gateways whose live /items read failed (unreachable) or that
 // this Desktop has no connection for, from the routed gateway's hub replica.
@@ -982,7 +991,7 @@ const SC = {
 const initial = a => (str(a).replace(/^@/, '')[0] || '?').toUpperCase()
 const shortHandle = a => str(a).replace(/\.bsky\.social$/, '')
 
-function Turn({ turn, draft }) {
+function Turn({ turn, draft, count }) {
   const me = turn.self || draft
   const who = draft ? 'You · draft, not posted' : me ? 'You' : shortHandle(turn.author)
   return jsxs('div', {
@@ -999,7 +1008,8 @@ function Turn({ turn, draft }) {
             children: [
               jsx('span', { children: who }),
               turn.target ? jsx('span', { style: { color: C.target }, children: 'replying to this' }) : null,
-              turn.url ? jsx('a', { href: turn.url, target: '_blank', rel: 'noopener noreferrer', style: SC.link, title: 'Open post', children: '↗' }) : null
+              turn.url ? jsx('a', { href: turn.url, target: '_blank', rel: 'noopener noreferrer', style: SC.link, title: 'Open post', children: '↗' }) : null,
+              count ? jsx('span', { 'data-slot': 'social-count', style: { ...SC.link, fontVariantNumeric: 'tabular-nums' }, children: count }) : null
             ]
           }),
           jsx('div', { 'data-slot': 'social-text', children: turn.text })
@@ -1024,7 +1034,7 @@ export function SocialCardView({ item, selected, onSelect, maxChars }) {
     jsxs('div', {
       style: SC.head,
       children: [
-        jsx('span', { style: SC.kind, children: [PLATFORM(item.type), item.type_label || ''].filter(Boolean).join(' · ') }),
+        jsx('span', { style: SC.kind, children: kindLabel(item) }),
         target && !target.self ? jsx('span', { children: `· ${shortHandle(target.author)}` }) : null,
         jsx('span', { style: { marginLeft: 'auto' }, children: ago(item.created_at) })
       ]
@@ -1038,7 +1048,7 @@ export function SocialCardView({ item, selected, onSelect, maxChars }) {
           : null,
         ...(unfold ? folded : []).map((t, i) => jsx(Turn, { turn: t }, `f${i}`)),
         ...shown.map((t, i) => jsx(Turn, { turn: t }, `s${i}`)),
-        sel ? jsx(Turn, { turn: { self: true, text: sel.text }, draft: true }, 'draft') : null
+        sel ? jsx(Turn, { turn: { self: true, text: sel.text }, draft: true, count: opts.length === 1 ? counterText(sel.text, maxFor(sel.n)) : '' }, 'draft') : null
       ]
     }),
     opts.length > 1
