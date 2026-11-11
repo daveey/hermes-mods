@@ -154,25 +154,34 @@ def _segments(text: str) -> list:
 
 
 SHELL_KEYWORDS = {"then", "do", "else", "{", "!", "time", "if", "while", "until", "elif"}
+# Wrappers that run the program after them, and their options that take a separate value
+# (`sudo -u ubuntu systemctl ...`, `timeout -s KILL 10 systemctl ...`): the value is not the program.
+WRAPPERS = {"sudo": {"-u", "-g", "-C", "-D", "-p", "-r", "-t", "-U", "-T", "-R", "--user", "--group",
+                     "--chdir", "--prompt", "--role", "--type", "--other-user", "--command-timeout", "--chroot"},
+            "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"}, "nice": {"-n", "--adjustment"},
+            "timeout": {"-s", "-k", "--signal", "--kill-after"}, "exec": {"-a"}, "setsid": set(),
+            "command": set(), "nohup": set()}
 
 
 def _strip(argv: list) -> list:
-    i = 0
+    i, wrapper, duration = 0, "", False
     while i < len(argv):
         tok = argv[i]
         if tok in SHELL_KEYWORDS:  # `if x; then systemctl stop u; fi`: the program follows the keyword
             i += 1
-            continue
-        if re.match(r"^[A-Za-z_]\w*=", tok) or os.path.basename(tok) in {
-                "sudo", "env", "nice", "timeout", "command", "nohup", "exec", "setsid"}:
+        elif wrapper and tok == "--":
             i += 1
-            if os.path.basename(tok) == "timeout" and i < len(argv):
-                i += 1
-            continue
-        if tok.startswith("-") and i > 0 and os.path.basename(argv[i - 1]) in {"sudo", "env", "nice", "setsid"}:
+        elif wrapper and tok.startswith("-") and len(tok) > 1:
+            i += 2 if tok in WRAPPERS[wrapper] else 1
+        elif duration:  # `timeout [opts] DURATION cmd`
+            duration, i = False, i + 1
+        elif re.match(r"^[A-Za-z_]\w*=", tok):
             i += 1
-            continue
-        break
+        elif os.path.basename(tok) in WRAPPERS:
+            wrapper = os.path.basename(tok)
+            duration, i = wrapper == "timeout", i + 1
+        else:
+            break
     return argv[i:]
 
 
@@ -223,8 +232,19 @@ def _launchctl(args: list, host) -> list:
     return [dict(act, domain=domain, label=label, key=label)]
 
 
+SYSTEMCTL_VALUED = {"-s", "--signal", "-H", "--host", "-M", "--machine", "-p", "--property", "-P", "-t", "--type",
+                    "--state", "-n", "--lines", "-o", "--output", "--kill-whom", "--kill-value", "--root",
+                    "--image", "--job-mode", "--what", "--timestamp", "--preset-mode", "--message", "--when"}
+
+
 def _systemctl(args: list, host) -> list:
-    pos = [a for a in args if not a.startswith("-")]
+    pos, i = [], 0
+    while i < len(args):  # `systemctl -s KILL kill u`: an option's value is neither the verb nor a unit
+        if args[i] in SYSTEMCTL_VALUED:
+            i += 1
+        elif not args[i].startswith("-"):
+            pos.append(args[i])
+        i += 1
     if len(pos) < 2 or pos[0] not in SYSTEMCTL_STOP:
         return []
     user = "--user" in args
@@ -232,9 +252,12 @@ def _systemctl(args: list, host) -> list:
             for u in pos[1:]]
 
 
-def _hermes(args: list, host) -> list:
-    """``hermes [-p NAME] gateway stop [--all]``: the stop of that profile's gateway unit(s)."""
-    profile, words, i = "", [], 0
+def _hermes(args: list, host, home: str = "") -> list:
+    """``hermes [-p NAME] gateway stop [--all]``: the stop of that profile's gateway unit(s).
+
+    ``HERMES_HOME=<root>/profiles/NAME hermes gateway stop`` names the same profile."""
+    m = re.search(r"/profiles/([^/]+)/*$", home)
+    profile, words, i = (m[1] if m else ""), [], 0
     while i < len(args):
         arg = args[i]
         if arg in {"-p", "--profile"} and i + 1 < len(args):
@@ -321,7 +344,8 @@ def _kill(prog: str, args: list, host) -> list:
 
 
 def _extract(argv: list, host, depth: int, out: list) -> None:
-    argv = _strip(argv)
+    full, argv = argv, _strip(argv)
+    home = next((t.split("=", 1)[1] for t in full[:len(full) - len(argv)] if t.startswith("HERMES_HOME=")), "")
     if not argv:
         return
     prog, args = os.path.basename(argv[0]), argv[1:]
@@ -346,7 +370,7 @@ def _extract(argv: list, host, depth: int, out: list) -> None:
         else:
             _extract_text(text, host, depth + 1, out)
     elif prog == "hermes":
-        out.extend(_hermes(args, host))
+        out.extend(_hermes(args, host, home))
     elif prog == "ssh" and depth < 3:
         opts, dest, cmd = _ssh_parts(args)
         _extract_text(cmd, {"dest": dest, "opts": opts}, depth + 1, out)
@@ -476,6 +500,72 @@ def classify(tool_name: str, args: Any) -> Optional[str]:
     return None
 
 
+PROC = Path("/proc")
+MAX_KILL_PIDS = 64
+
+
+def _proc_unit(pid: int) -> tuple:
+    """(service unit, is a user unit) whose cgroup holds ``pid``, else ('', False)."""
+    try:
+        text = (PROC / str(pid) / "cgroup").read_text()
+    except (OSError, ValueError):
+        return "", False
+    for line in text.splitlines():
+        path = line.split(":", 2)[-1].strip()
+        for leaf in reversed(path.split("/")):
+            if leaf.endswith(".service") and not leaf.startswith("user@"):
+                return leaf, "/user@" in path
+    return "", False
+
+
+def _proc_ppid(pid: int) -> int:
+    try:
+        text = (PROC / str(pid) / "status").read_text()
+    except (OSError, ValueError):
+        return 0
+    m = re.search(r"^PPid:\s*(\d+)", text, re.M)
+    return int(m[1]) if m else 0
+
+
+def _kill_pids(act: dict) -> list:
+    """Local pids a kill/pkill/killall action targets (bounded); [] on any failure."""
+    if "pid" in act:
+        return [act["pid"]]
+    try:
+        res = subprocess.run(["ps", "-Ao", "pid=,ppid=,pcpu=,rss=,etime=,args="], capture_output=True, text=True,
+                             timeout=5)
+        table = libs()[0].parse_ps(res.stdout)
+        rx = re.compile(act["pattern"])
+        match = rx.fullmatch if act["verb"] == "killall" else rx.search
+        return [p for p, r in table.items() if p != os.getpid() and p > 1 and
+                match(r["args"] if act.get("full") else os.path.basename(r["args"].split(" ")[0]))][:MAX_KILL_PIDS]
+    except Exception:  # health: allow BLE001 -- a lookup bug must not break a tool call
+        return []
+
+
+def _pinned(act: dict) -> tuple:
+    """(pinned-owner drop-in, refusal label) for a local stop action, else ('', '')."""
+    if act["host"]:
+        return "", ""
+    if act["tool"] == "systemctl":
+        dropin = _pinned_dropin(act)
+        return dropin, act["label"] if dropin else ""
+    if act["tool"] != "kill":
+        return "", ""
+    seen = set()
+    for pid in _kill_pids(act):
+        unit, user = _proc_unit(pid)
+        # Only the unit's top process stops it: a child in the same cgroup (a dev server or tool the
+        # gateway's own agent started) is the agent's to kill.
+        if not unit or (unit, user) in seen or _proc_unit(_proc_ppid(pid)) == (unit, user):
+            continue
+        seen.add((unit, user))
+        dropin = _pinned_dropin({"tool": "systemctl", "host": None, "unit": unit, "user": user})
+        if dropin:
+            return dropin, f"{unit.removesuffix('.service')} (pid {pid})"
+    return "", ""
+
+
 def _pinned_dropin(act: dict) -> str:
     """The pinned-owner drop-in of a local systemd unit, or '' (lookup failure reads as not pinned)."""
     if act["tool"] != "systemctl" or act["host"]:
@@ -507,10 +597,10 @@ def _evaluate(text: str, actions: list) -> Optional[str]:
     if not stops:
         return None
     for act in stops:
-        dropin = _pinned_dropin(act)
+        dropin, label = _pinned(act)
         if dropin:
             _log(_host_name(act["host"]), act, "pinned-owner", "refused (pinned owner)")
-            return (f"Refused: {act['label']} is a pinned owner ({os.path.basename(dropin)}); an agent does not "
+            return (f"Refused: {label} is a pinned owner ({os.path.basename(dropin)}); an agent does not "
                     f"{act['verb']} it with a raw command, and no owner-approved token overrides this. Stopping "
                     f"one coupled Ask Eve owner makes the operator checks refuse, and hermes update no longer "
                     f"needs it stopped. If it really must stop, hand the owner terminal the exact commands "

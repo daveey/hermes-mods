@@ -6,6 +6,7 @@ guard let every raw stop through, and a stop of one coupled owner made the opera
 Fixtures only: ``run_cmd`` is stubbed; no real service is touched.
 """
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -165,6 +166,63 @@ class PinnedOwner(Base):
         """Known false positive, kept honest: the shared segmenter reads heredoc body lines as commands."""
         cmd = f"cat > /tmp/hold.sh <<'EOF'\nsystemctl --user stop {PINNED}\nEOF"
         self.assertIsNotNone(self.verdict(cmd))
+
+    def test_wrapper_option_values_do_not_hide_the_stop(self):
+        for cmd in (f"sudo -u ubuntu systemctl --user stop {PINNED}",
+                    f"sudo -u ubuntu XDG_RUNTIME_DIR=/run/user/1000 systemctl --user stop {PINNED}",
+                    f"sudo -E -u ubuntu -- systemctl --user stop {PINNED}",
+                    f"nice -n 10 systemctl --user stop {PINNED}", f"timeout -s KILL 10 systemctl --user stop {PINNED}",
+                    f"timeout --signal=KILL 10 systemctl --user stop {PINNED}",
+                    f"timeout -k 5 10 systemctl --user stop {PINNED}", f"env -u FOO systemctl --user stop {PINNED}",
+                    f"env -C /tmp systemctl --user stop {PINNED}"):
+            self.assertIsNotNone(self.verdict(cmd), cmd)
+
+    def test_systemctl_option_values_do_not_hide_the_verb_or_pose_as_units(self):
+        for cmd in (f"systemctl --user -s KILL kill {PINNED}", f"systemctl --user --signal KILL kill {PINNED}",
+                    f"systemctl --user --kill-whom main kill {PINNED}"):
+            self.assertIsNotNone(self.verdict(cmd), cmd)
+        self.shown.clear()
+        self.verdict(f"systemctl --user kill -s KILL {PINNED}")
+        self.assertEqual([a[-1] for a in self.shown if "DropInPaths" in a], [PINNED + ".service"])
+
+    def test_hermes_home_of_a_pinned_profile_names_its_gateway(self):
+        for cmd in ("HERMES_HOME=/home/u/.hermes/profiles/askeve-builder hermes gateway stop",
+                    "env HERMES_HOME=/home/u/.hermes/profiles/askeve-builder/ hermes gateway stop"):
+            self.assertIsNotNone(self.verdict(cmd), cmd)
+        self.assertIsNone(self.verdict("HERMES_HOME=/home/u/.hermes/profiles/askeve-builder hermes gateway status"))
+
+    def _fake_proc(self, pid, unit, user=True, ppid=1):
+        proc = Path(self.tmp.name) / "proc"
+        (proc / str(pid)).mkdir(parents=True, exist_ok=True)
+        slice_ = "user.slice/user-1000.slice/user@1000.service/app.slice" if user else "system.slice"
+        (proc / str(pid) / "cgroup").write_text(f"0::/{slice_}/{unit}\n")
+        (proc / str(pid) / "status").write_text(f"Name:\tx\nPPid:\t{ppid}\n")
+        self.g.PROC = proc
+
+    def test_kill_of_a_child_the_pinned_gateway_spawned_allowed(self):
+        """An agent inside the pinned gateway kills its own dev server: same cgroup, not the unit's main process."""
+        self._fake_proc(4242, PINNED + ".service")
+        self._fake_proc(4245, PINNED + ".service", ppid=4242)
+        self.assertIsNone(self.verdict("kill 4245"))
+        self.assertIsNotNone(self.verdict("kill 4245 4242"))
+
+    def test_kill_of_a_pinned_units_process_refused(self):
+        self._fake_proc(4242, PINNED + ".service")
+        self._fake_proc(4243, PLAIN + ".service")
+        self._fake_proc(4244, "init.scope")
+        self.assertIn("pinned owner", self.verdict("kill 4242"))
+        self.assertIsNotNone(self.verdict("kill -9 4243 4242"))
+        self.assertIsNone(self.verdict("kill 4243"))
+        self.assertIsNone(self.verdict("kill 4244"))
+        self.assertIsNone(self.verdict("kill -0 4242"))  # existence probe
+
+    def test_pkill_matching_a_pinned_units_process_refused(self):
+        proc = subprocess.Popen(["sleep", "137.25"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self._fake_proc(proc.pid, PINNED + ".service")
+        self.assertIn("pinned owner", self.verdict("pkill -f 'sleep 137.25'"))
+        self.assertIsNone(self.verdict("pkill -f 'sleep 999.75'"))
 
     def test_guard_off_switch_still_disables(self):
         with mock.patch.dict(os.environ, {"SERVICE_OWNER_GUARD": "off"}):

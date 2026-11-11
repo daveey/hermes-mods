@@ -34,11 +34,14 @@ across reboots), which need `owner-checked=none`. Lookup failed (unreachable, ti
 `~/.hermes/logs/service-owner-guard.log` (`SERVICE_OWNER_GUARD_LOG` overrides). `SERVICE_OWNER_GUARD=off` disables it.
 
 Pinned owners: a local systemd unit with a `*pinned-owner*.conf` drop-in (for example the Ask Eve gateways'
-`50-askeve-pinned-owner.conf`) is refused on `systemctl [--user] stop|disable|mask|kill` and `hermes [-p NAME] gateway stop`,
+`50-askeve-pinned-owner.conf`) is refused on `systemctl [--user] stop|disable|mask|kill`, `hermes [-p NAME] gateway stop`
+(or `HERMES_HOME=…/profiles/NAME hermes gateway stop`), and `kill|pkill|killall` of the unit's top process (read from
+`/proc/<pid>/cgroup`; children the gateway's own agent started stay killable), through `sudo -u`/`nice -n`/`timeout -s` wrappers,
 with no owner card needed and no `owner-approved=` override (stopping one coupled owner breaks the operator checks, and
 `hermes update` leaves a pinned gateway alone). The same applies to the commands inside a script run as `bash|sh|python
 <file>` (file under 64 KB, literal commands only). Start/restart/status are never refused. Not covered: stops built from
-variables in a script, `systemd-run` transient units, and anything run from an owner terminal (the intended path).
+variables in a script or a variable set in an earlier segment (`S=/x.sh; bash $S`), `xargs`/`cat f | bash`, pinned units on an
+ssh host, `systemd-run` transient units, and anything run from an owner terminal (the intended path).
 
 Dry run: `python3 -c "import importlib.util as u;s=u.spec_from_file_location('g','plugins/service-owner-guard/__init__.py');g=u.module_from_spec(s);s.loader.exec_module(g);print(g.check('launchctl bootout gui/501/<label>'))"`
 
