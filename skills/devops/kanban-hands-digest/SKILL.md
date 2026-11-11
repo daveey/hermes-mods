@@ -181,6 +181,7 @@ uv run --with pytest python -m pytest -q -p no:cacheprovider skills/devops/kanba
   - State settled facts as statements. Put a genuine decision in one `action_request`; when one is already
     open, don't restate it at all: the For you panel already shows it. Even a neutral closing list ("You still
     have two decisions in For you: …") or a "Your choices: Yes / Change / No" block gets published as a duplicate.
+  - `session_outcome {kind: decide}` publishes its own For you tile. Don't also file an `action_request` for the same ask (that makes two tiles); pick one. Compute any count you put in the ask with code first: a miscounted tile can't be edited, only duplicated.
   - After each reply, check the hook's open-request list for an auto-filed duplicate or stale prompt and
     remove it with `action_request {"withdraw": {"requestId", "reason"}}` (alone, no `request`); readback
     shows `state: withdrawn`. To correct one that is still needed, re-send it with its `requestId` and
