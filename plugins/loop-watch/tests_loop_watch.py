@@ -297,13 +297,28 @@ def _busy_frames():
     return stop, idle
 
 
+def test_cpu_profile_takes_min_samples_when_sleep_overshoots():
+    """A host whose 10 ms sleep takes 100 ms (load, timer coalescing) still gets min_samples."""
+    now = [0.0]
+    rep = watch.cpu_profile(0.3, sample_s=0.01, min_samples=12, frames=lambda: {}, names=lambda: {},
+                            clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + 0.1),
+                            cpu=lambda: 0.0)
+    assert rep["samples"] == 12 and rep["sample_ms"] == 100.0
+    now[0] = 0.0  # fast host: the wall-clock window still bounds the run once the floor is met
+    rep = watch.cpu_profile(0.3, sample_s=0.01, min_samples=2, frames=lambda: {}, names=lambda: {},
+                            clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + 0.01),
+                            cpu=lambda: 0.0)
+    assert 29 <= rep["samples"] <= 31
+
+
 def test_cpu_profile_names_busy_thread_and_skips_idle():
     stop, idle = _busy_frames()
     try:
-        rep = watch.cpu_profile(0.3, sample_s=0.01)
+        # Sample count is pinned by min_samples, not by how fast sleep(0.01) returns on a loaded host.
+        rep = watch.cpu_profile(0.3, sample_s=0.01, min_samples=20)
     finally:
         stop.set(); idle.set()
-    assert rep["kind"] == "cpu_profile" and rep["samples"] > 5
+    assert rep["kind"] == "cpu_profile" and rep["samples"] >= 20 and rep["sample_ms"] > 0
     threads = {t["thread"]: t["busy_pct"] for t in rep["threads"]}
     parked = {t["thread"]: t["pct"] for t in rep["parked_threads"]}
     assert threads.get("hot", 0) + parked.get("hot", 0) > 50 and threads.get("hot", 0) > 0

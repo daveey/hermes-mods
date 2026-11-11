@@ -152,13 +152,19 @@ PROFILE_REQUEST = "loop-watch.profile-request"
 PROFILE_MAX_S = 120.0
 
 
-def cpu_profile(seconds: float, *, sample_s: float = 0.02, frames: Callable[[], dict] = sys._current_frames,
+def cpu_profile(seconds: float, *, sample_s: float = 0.02, min_samples: int = 10, frames: Callable[[], dict] = sys._current_frames,
                 names: Optional[Callable[[], dict]] = None, clock: Callable[[], float] = time.monotonic,
                 sleep: Callable[[float], None] = time.sleep, cpu: Callable[[], float] = time.process_time) -> dict:
     """Sample every thread's Python stack for ``seconds``; report where non-idle samples landed.
 
     For "why does this backend burn 100% CPU": the busy share per thread and the hottest stacks, plus
-    the process CPU used during the window (all threads) so the shares can be read as cores."""
+    the process CPU used during the window (all threads) so the shares can be read as cores.
+
+    The window runs ``seconds`` of wall clock *and* at least ``min_samples`` samples. ``sleep(sample_s)``
+    is only a floor: under load, or in a nice/low-QoS process where macOS coalesces timers, a 10 ms sleep
+    returns after 30-100 ms, and a sampler waking while another thread spins in Python waits up to the GIL
+    switch interval too. A wall-clock-only window then held 2-4 samples, too few for a busy share to mean
+    anything. ``sample_ms`` reports the real mean spacing so a coarse profile is visible as such."""
     names = names or (lambda: {t.ident: t.name for t in threading.enumerate()})
     me = threading.get_ident()
     per_thread: Counter = Counter()
@@ -169,7 +175,7 @@ def cpu_profile(seconds: float, *, sample_s: float = 0.02, frames: Callable[[], 
     samples = 0
     last: dict = {}  # tid -> (leaf frame id, f_lasti): unchanged between samples = parked in a blocking C call
     c0, t0 = cpu(), clock()
-    while clock() - t0 < seconds:
+    while clock() - t0 < seconds or samples < min_samples:
         nm = names()
         for tid, fr in frames().items():
             if tid == me:
@@ -191,7 +197,7 @@ def cpu_profile(seconds: float, *, sample_s: float = 0.02, frames: Callable[[], 
         sleep(sample_s)
     wall = max(clock() - t0, 1e-9)
     return {
-        "kind": "cpu_profile", "pid": os.getpid(), "seconds": round(wall, 1), "samples": samples,
+        "kind": "cpu_profile", "pid": os.getpid(), "seconds": round(wall, 1), "samples": samples, "sample_ms": round(1000 * wall / max(samples, 1), 1),
         "process_cpu_pct": round(100 * (cpu() - c0) / wall, 1),
         "threads": [{"thread": t, "busy_pct": round(100 * n / max(samples, 1), 1)} for t, n in per_thread.most_common(15)],
         "leaves": [{"n": n, "frame": f} for f, n in leaves.most_common(15)],
