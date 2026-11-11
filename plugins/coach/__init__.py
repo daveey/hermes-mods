@@ -6,6 +6,7 @@ import contextvars
 import datetime
 import hashlib
 import importlib.util
+import json
 import logging
 import threading
 import os
@@ -132,6 +133,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         coach.sessions = shared.setdefault("sessions", coach.sessions)
 
     authority_users: dict = shared.setdefault("authority_users", {})
+    authority_rows: dict = shared.setdefault("authority_rows", {})
+    cap_due_seen: set = shared.setdefault("root_cap_due_seen", set())
     # session -> dollar totals the user approved by answering a priced ask with a bare yes ("approved").
     authority_asked: dict = shared.setdefault("authority_asked", {})
 
@@ -145,8 +148,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 canonical_user_content=_.get("canonical_user_content"))
             authority_users[session_id] = [r.get("content") for r in rows
                                           if isinstance(r.get("content"), str)]
+            # typed rows keep the native message identity for root_cap provenance (strings alone lose it)
+            authority_rows[session_id] = [{"content": r.get("content"), "message_uid": r.get("message_uid")}
+                                          for r in rows if isinstance(r.get("content"), str)]
         except Exception as exc:
             authority_users[session_id] = []
+            authority_rows[session_id] = []
             log.debug("coach compute authority scope unavailable: %s", exc)
         try:
             # The figure comes from the assistant's ask; the authority from the user's own typed yes to it.
@@ -155,6 +162,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             authority_asked[session_id] = []
             log.debug("coach compute authority answered asks unavailable: %s", exc)
+        try:  # existing owner recovery path: report due/conflicting temporary cap exceptions once (no auto-restore)
+            _load("root_cap").report_due(store.root, store.log, cap_due_seen,
+                                         homes=[os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")])
+        except Exception as exc:
+            log.debug("coach root_cap due report: %s", exc)
         try:
             if not session_id:
                 return None
@@ -206,7 +218,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         try:
             goal_gate.observe(session_id=session_id, tool_name=tool_name, args=args, result=result,
                               status=status, tool_call_id=_.get("tool_call_id"))
-            _load("root_cap").after(tool_name, args, session_id, store.root)
+            _load("root_cap").after(tool_name, args, session_id, store.root, tool_call_id=_.get("tool_call_id"))
             coach.hint_tool_end(session_id, _.get("tool_call_id"), tool_name,
                                 args if isinstance(args, dict) else {}, result, status)
             coach.observe(session_id, tool_name, args, result, status, duration_ms or 0, error_type, error_message)
@@ -393,11 +405,25 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         if profiler.blocked(tool_name, args):
             store.log({"event": "agent_block", "rule": "profiler_safety", "tool": tool_name})
             return {"action": "block", "message": profiler.MESSAGE}
-        try:  # frozen-rollout cap: a queue notice is not permission (root_cap.py); a guard fault never blocks tools
-            cap = _load("root_cap").check(tool_name, args, session_id, store.root, authority_users.get(session_id, ()))
+        try:  # frozen-rollout cap: a queue notice is not permission (root_cap.py)
+            rc = _load("root_cap")
+            cap = rc.check(tool_name, args, session_id, store.root, authority_rows.get(session_id, ()),
+                           tool_call_id=_.get("tool_call_id"))
         except Exception as exc:
+            # root_cap.check never raises; this is a load/import fault. Refuse ONLY a call that names the guarded
+            # key (targeted uncertainty); every other tool keeps working under the same fault.
             log.debug("coach root_cap: %s", exc)
             cap = None
+            try:
+                blob = json.dumps(args, default=str)
+            except Exception:
+                blob = str(args)
+            if tool_name in ("terminal", "execute_code") and "max_in_progress" in blob:
+                cap = {"message": "Root kanban.max_in_progress is guarded and the guard could not load "
+                                  f"({type(exc).__name__}); this targeted change is refused until it can be verified. "
+                                  "Unrelated config and tools are unaffected.",
+                       "event": {"event": "agent_block", "rule": "root_cap", "key": "kanban.max_in_progress",
+                                 "session": session_id, "fault": type(exc).__name__}}
         if cap:
             store.log(cap["event"])
             return {"action": "block", "message": cap["message"]}

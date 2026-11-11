@@ -6,6 +6,7 @@ authority capture (`pre_llm_call` -> goal_scope.recover_scope). Nothing in the g
 No command is ever executed; the live home, config and kanban are never touched.
 """
 import contextlib
+import os
 import hashlib
 import importlib.util
 import json
@@ -48,22 +49,29 @@ class World:
         monkeypatch.setenv("COACH_LESSONS", "0")
         self.monkeypatch = monkeypatch
         kdb = sqlite3.connect(tmp_path / "kanban.db")
-        kdb.execute("create table tasks (id text primary key, status text not null)")
-        kdb.executemany("insert into tasks values (?,?)", [(OWNER, "running"), (TEMP_OWNER, "running"),
-                                                           ("t_0000finished", "done")])
+        kdb.execute("create table tasks (id text primary key, status text not null, current_run_id integer, "
+                    "assignee text)")
+        kdb.executemany("insert into tasks values (?,?,?,?)", [(OWNER, "running", 7, "coach"),
+                                                               (TEMP_OWNER, "running", 1, "coach"),
+                                                               ("t_0000finished", "done", None, None)])
         kdb.commit()
         kdb.close()
         self.kdb = tmp_path / "kanban.db"
+        from hermes_cli.profiles import get_active_profile_name
+        self.profile = get_active_profile_name()
         sdb = sqlite3.connect(self.root / "state.db")
-        sdb.execute("create table sessions (id text primary key, parent_session_id text, source text, end_reason text)")
+        sdb.execute("create table sessions (id text primary key, parent_session_id text, source text, end_reason text, profile_name text, started_at real)")
         sdb.execute("create table messages (id integer primary key, session_id text, role text, content text, "
-                    "timestamp real, display_kind text)")
-        sdb.execute("insert into sessions values ('approval-chat', null, 'desktop', null)")
-        sdb.execute("insert into sessions values ('worker-chat', null, 'kanban', null)")
+                    "timestamp real, display_kind text, _compressed_summary integer, observed integer, display_metadata text, "
+                    "api_content text, message_uid text)")
+        sdb.execute("insert into sessions values ('approval-chat', null, 'desktop', null, '%s', 1)" % self.profile)
+        sdb.execute("insert into sessions values ('worker-chat', null, 'kanban', null, '%s', 1)" % self.profile)
         self.sdb = sdb
+        self.shared = self.root / "coach"  # the ROOT store every profile consults (root_cap.shared_dir)
         self.artifact = tmp_path / "approved" / "spec.md"
         self.artifact.parent.mkdir()
         self.artifact.write_text(f"# Approved rollout spec\n\nRoot {KEY} is frozen at {frozen} for the rollout.\n")
+        os.utime(self.artifact, (time.time() - 3600, time.time() - 3600))  # approval below is newer than the bytes
         self.mod = _coach_mod()
         monkeypatch.setattr(self.mod, "_bg_thread", lambda *a, **k: None)
         self.rc = self.mod._load("root_cap")
@@ -74,20 +82,26 @@ class World:
 
     def message(self, content, role="user", session="approval-chat", kind=None, ts=None):
         self._msg += 1
-        self.sdb.execute("insert into messages values (?,?,?,?,?,?)",
+        self.sdb.execute("insert into messages (id, session_id, role, content, timestamp, display_kind) values (?,?,?,?,?,?)",
                          (self._msg, session, role, content, ts or time.time() - 60, kind))
         self.sdb.commit()
         return self._msg
 
     def register(self, **over):
         approval = over.pop("approval_message_id", None) or self.message(
-            f"I approve freezing root {KEY} at {over.get('frozen_value', self.frozen)} for the worker-first rollout.")
+            f"I approve freezing root {KEY} at {over.get('frozen_value', self.frozen)} for the worker-first rollout "
+            f"({self.artifact.name}).")
         args = dict(target_home=self.root, key=KEY, frozen_value=self.frozen, contract_ref=self.artifact,
                     approval_session="approval-chat", approval_message_id=approval, owner_card=OWNER)
         args.update(over)
         return self.rc.register_contract(self.store.root, **args)
 
+    def session(self, session, source="desktop"):
+        self.sdb.execute("insert or ignore into sessions values (?,?,?,?,?,?)", (session, None, source, None, self.profile, 1))
+        self.sdb.commit()
+
     def turn(self, session, texts):
+        self.session(session)
         rows = [{"role": "user", "content": t} for t in texts]
         self.hooks["pre_llm_call"](session_id=session, user_message=texts[-1], conversation_history=rows,
                                    platform="desktop")
@@ -162,7 +176,7 @@ class TestFrozenMatrix:
     def test_temporary_complete_passes_and_persists_provenance(self, w, surface):
         w.register()
         assert not w.blocked(surface, SET8, texts=[TEMP])
-        recs = json.loads((w.store.root / "root_cap_exceptions.json").read_text())
+        recs = json.loads((w.shared / "root_cap_exceptions.json").read_text())
         assert len(recs) == 1
         r = recs[0]
         assert (r["kind"], r["key"], r["original_value"], r["override_value"], r["restore_value"]) == \
@@ -182,7 +196,7 @@ class TestFrozenMatrix:
 class TestRegistration:
     def test_valid_registration_is_projected_and_read_back(self, w):
         rec = w.register()
-        data = json.loads((w.store.root / "root_cap_contracts.json").read_text())
+        data = json.loads((w.shared / "root_cap_contracts.json").read_text())
         assert len(data) == 1 and data[0]["contract_revision_digest"] == hashlib.sha256(w.artifact.read_bytes()).hexdigest()
         assert set(rec) >= {"target_home", "key", "frozen_value", "contract_ref", "contract_revision_digest",
                             "approval_ref", "owner_ref", "active"}
@@ -201,7 +215,7 @@ class TestRegistration:
         mid = w.message(kwargs.pop("content"), role=kwargs.pop("role", "user"), session=sess, kind=kwargs.pop("kind", None))
         with pytest.raises(w.rc.RootCapError):
             w.register(approval_message_id=mid, approval_session=sess)
-        assert not (w.store.root / "root_cap_contracts.json").exists()
+        assert not (w.shared / "root_cap_contracts.json").exists()
 
     def test_missing_message_refused(self, w):
         with pytest.raises(w.rc.RootCapError):
@@ -228,8 +242,9 @@ class TestRegistration:
     def test_new_revision_supersedes_old(self, w):
         w.register()
         w.artifact.write_text(f"Root {KEY} is frozen at 9 (revision 2).")
+        os.utime(w.artifact, (time.time() - 3000, time.time() - 3000))
         w.register(frozen_value=9)
-        data = json.loads((w.store.root / "root_cap_contracts.json").read_text())
+        data = json.loads((w.shared / "root_cap_contracts.json").read_text())
         assert [d["active"] for d in data] == [False, True]
 
 
@@ -285,7 +300,7 @@ class TestContractScope:
 
     def test_two_active_contracts_with_different_values_are_ambiguous(self, w):
         w.register()
-        p = w.store.root / "root_cap_contracts.json"
+        p = w.shared / "root_cap_contracts.json"
         data = json.loads(p.read_text())
         data.append({**data[0], "frozen_value": 9, "contract_revision_digest": "x" * 64})
         p.write_text(json.dumps(data))
@@ -354,15 +369,15 @@ class TestAuthority:
     def test_permanent_supersession_retains_provenance_and_releases_freeze_after_readback(self, w):
         w.register()
         assert not w.blocked("terminal", SET8, texts=[PERM])
-        recs = json.loads((w.store.root / "root_cap_exceptions.json").read_text())
+        recs = json.loads((w.shared / "root_cap_exceptions.json").read_text())
         assert recs[0]["kind"] == "permanent" and recs[0]["override_value"] == 8 and recs[0]["state"] == "admitted"
         # Contract is still active until the mutation is read back.
-        assert json.loads((w.store.root / "root_cap_contracts.json").read_text())[0]["active"] is True
+        assert json.loads((w.shared / "root_cap_contracts.json").read_text())[0]["active"] is True
         w.config.write_text("kanban:\n  max_in_progress: 8\n")  # the real write happened
         w.hooks["post_tool_call"](session_id="s1", tool_name="terminal", args={"command": SET8}, result="Set")
-        recs = json.loads((w.store.root / "root_cap_exceptions.json").read_text())
+        recs = json.loads((w.shared / "root_cap_exceptions.json").read_text())
         assert recs[0]["state"] == "applied"
-        contract = json.loads((w.store.root / "root_cap_contracts.json").read_text())[0]
+        contract = json.loads((w.shared / "root_cap_contracts.json").read_text())[0]
         assert contract["active"] is False and contract["superseded_by"]["decision_sha256"] == recs[0]["decision_sha256"]
 
 
@@ -423,14 +438,14 @@ class TestTemporary:
         assert not w.blocked("terminal", SET8, texts=[TEMP])
         w.hooks["post_tool_call"](session_id="s1", tool_name="terminal", args={"command": SET8}, result="Set")
         # value still 7: mutation did not happen -> not marked active
-        assert json.loads((w.store.root / "root_cap_exceptions.json").read_text())[0]["state"] == "not_applied"
+        assert json.loads((w.shared / "root_cap_exceptions.json").read_text())[0]["state"] == "not_applied"
         w.config.write_text("kanban:\n  max_in_progress: 8\n")
         assert not w.blocked("terminal", SET8, texts=[TEMP], session="s2")
         w.hooks["post_tool_call"](session_id="s2", tool_name="terminal", args={"command": SET8}, result="Set")
-        states = [r["state"] for r in json.loads((w.store.root / "root_cap_exceptions.json").read_text())]
+        states = [r["state"] for r in json.loads((w.shared / "root_cap_exceptions.json").read_text())]
         assert states[-1] == "active"
         # temporary exception does not release the freeze
-        assert json.loads((w.store.root / "root_cap_contracts.json").read_text())[0]["active"] is True
+        assert json.loads((w.shared / "root_cap_contracts.json").read_text())[0]["active"] is True
 
     def test_restore_is_allowed_but_never_overwrites_a_newer_decision(self, w):
         w.register()
@@ -444,7 +459,7 @@ class TestTemporary:
 
     def test_persistence_failure_refuses_admission(self, w):
         w.register()
-        (w.store.root / "root_cap_exceptions.json").mkdir()  # cannot be written/read back
+        (w.shared / "root_cap_exceptions.json").mkdir()  # cannot be written/read back
         assert w.blocked("terminal", SET8, texts=[TEMP])
 
 
@@ -579,6 +594,9 @@ class TestWiring:
 
     def test_guard_runs_before_other_pre_tool_logic_and_is_failsafe(self, w):
         w.register()
-        w.mod._load("root_cap").check = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        w.monkeypatch.setattr(w.mod._load("root_cap"), "check", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         # an internal guard fault must not break unrelated tool calls
         assert w.hooks["pre_tool_call"](session_id="s1", tool_name="terminal", args={"command": "ls"}) is None
+        # ...while a targeted frozen write is refused under the same load/call fault (no cap=None fail-open)
+        out = w.hooks["pre_tool_call"](session_id="s1", tool_name="terminal", args={"command": SET8})
+        assert out and out["action"] == "block"
