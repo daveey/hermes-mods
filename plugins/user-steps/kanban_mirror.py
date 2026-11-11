@@ -14,6 +14,9 @@ import uuid
 from pathlib import Path
 
 
+MISMATCH = "Request no longer matches its frozen server binding"
+
+
 def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -164,9 +167,13 @@ class Mirror:
         finally:
             c.close()
 
-    def _request(self, owner, board, snap):
+    def _request(self, owner, board, snap, incarnation=0):
         # UUID5 identity includes the exact ask, lifecycle and owner, not a fuzzy title.
-        identity = encoded([owner, board, snap])
+        # A later incarnation re-projects the same ask after an earlier projection was
+        # withdrawn/retired; incarnation 0 keeps the original identity byte for byte.
+        identity = encoded(
+            [owner, board, snap] + ([incarnation] if incarnation else [])
+        )
         rid = str(uuid.uuid5(uuid.NAMESPACE_URL, "hermes:kanban-ask:" + identity))
         hr = snap["ask"]
         options = hr.get("choices") or [
@@ -229,6 +236,44 @@ class Mirror:
             ).fetchone()
             return dict(row) if row else None
 
+    def _current_request(self, owner, board, snap):
+        """The request to publish for this exact ask, or None when none may be shown.
+
+        Identity is deterministic, so a withdrawn (or mismatch-retired) projection can
+        never be reopened in place: returning to an owner mints the next incarnation.
+        A recorded answer or an unproven mismatch fails closed (None).
+        """
+        n = 0
+        while True:
+            request = self._request(owner, board, snap, n)
+            rid = request["requestId"]
+            binding = self.binding(owner, rid)
+            if binding is None:
+                return request  # unbound id: _publish proves it or rejects the conflict
+            stored = self.store.get(owner, rid)
+            resolution = stored.pop("resolution", None)
+            state = stored["state"]
+            if state in ("open", "needs_context"):
+                stored["state"] = json.loads(binding["request"]).get("state")
+                if encoded(stored) == binding["request"]:
+                    return request
+                if resolution:
+                    return None  # reconcile retires the operation; never deliver it
+                self._withdraw(owner, self.store.get(owner, rid))
+                if self.store.get(owner, rid)["state"] in ("open", "needs_context"):
+                    return None
+            elif state == "cancelled":
+                op = (
+                    self.store.operation(owner, resolution["operationId"])["operation"]
+                    if resolution
+                    else None
+                )
+                if not op or (op.get("retired") or {}).get("reason") != MISMATCH:
+                    return None
+            elif state != "withdrawn":
+                return None
+            n += 1
+
     def reconcile(self, owner):
         self.core.validate_owner(owner)
         for board, path in self.boards.items():
@@ -246,9 +291,10 @@ class Mirror:
                 continue  # unavailable is NOT evidence to withdraw
             for snap in filter(None, snapshots):
                 try:
-                    request = self._request(owner, board, snap)
                     if self._relocate(owner, board, snap):
-                        self._publish(owner, board, snap, request)
+                        request = self._current_request(owner, board, snap)
+                        if request is not None:
+                            self._publish(owner, board, snap, request)
                 except self.core.ActionError as exc:
                     # A malformed legacy ask or conflicting identity must not hide
                     # unrelated cards. Never adopt a different request as authority.
@@ -275,6 +321,26 @@ class Mirror:
                     binding["request_id"],
                     exc,
                 )
+        # Older owners may never reconcile again. Even an unchanged source ask
+        # needs its request checked against the frozen binding before work can linger.
+        with self.store._read() as c:
+            older = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT * FROM kanban_projections WHERE namespace=? AND session!=?",
+                    (self.store._ns(owner), owner["storedSessionId"]),
+                )
+            ]
+        for binding in older:
+            previous = dict(owner, storedSessionId=binding["session"])
+            try:
+                self._reconcile_binding(previous, binding)
+            except (ValueError, sqlite3.Error, OSError) as exc:
+                logging.getLogger("user-steps").warning(
+                    "Older card binding reconciliation deferred request=%s: %s",
+                    binding["request_id"],
+                    exc,
+                )
 
     def _reconcile_binding(self, owner, binding):
         if binding["board"] not in self.boards:
@@ -286,7 +352,10 @@ class Mirror:
         tip = self.tip(current["session"]) if current is not None else None
         if request["state"] not in ("open", "needs_context"):
             return
-        if encoded(current) == binding["snapshot"]:
+        public = {k: v for k, v in request.items() if k != "resolution"}
+        public["state"] = json.loads(binding["request"]).get("state")
+        mismatch = encoded(public) != binding["request"]
+        if encoded(current) == binding["snapshot"] and not mismatch:
             if not request.get("resolution") and tip != owner["storedSessionId"]:
                 self._withdraw(owner, request)
             return
@@ -307,8 +376,12 @@ class Mirror:
                         owner,
                         oid,
                         by="system",
-                        reason="Source card ask changed before delivery",
-                        evidence="Exact blocked-card snapshot no longer matches",
+                        reason=MISMATCH
+                        if mismatch
+                        else "Source card ask changed before delivery",
+                        evidence="Exact blocked-card snapshot no longer matches"
+                        if not mismatch
+                        else "Request no longer matches its frozen server binding",
                     )
                 except self.core.ActionError as exc:
                     if exc.status != 409 or self.store.operation(owner, oid)[
