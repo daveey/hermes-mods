@@ -98,7 +98,10 @@ How to run it from an agent:
   was waiting on.
 - A wait that ends with a wrapper's message instead of the script's verdict (e.g. a GitHub quota guard's
   `refused/failed`) was stopped by that wrapper, not by CI: run `--once` for CI's real state before reporting
-  anything, then diagnose the wrapper.
+  anything, then diagnose the wrapper. The hub's `github_quota.py` caps each process at a fixed request budget
+  (exit 75, `Denied`), which one long wait outgrows; a slower `--interval` only delays it. For waits over ~20
+  min, loop `--once` with a fresh `token-broker exec` per check (`sleep 300` between; stop on exit 0 or 1), so
+  each check gets its own budget.
 - In a Kanban worker there is no async notify, and a poll loop burns `max_runtime_seconds` (most worker
   timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
