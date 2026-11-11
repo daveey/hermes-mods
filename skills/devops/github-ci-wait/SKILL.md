@@ -60,7 +60,11 @@ gh can't find, a job that ended otherwise, or an expected job missing from a com
 anything is queued or running. Pass `--gh-repo OWNER/NAME` (dispatches often target helper branches of another repo).
 
 Exit codes: 0 done (prints the run URLs or tags; a run that built a later commit containing yours is marked
-`(ran on <sha>, a later commit containing it)`, so cite it as CI on that commit, not on yours. When a workflow's
+`(ran on <sha>, a later commit containing it)`, so cite it as CI on that commit, not on yours. Such a run stands in
+only when your commit has no run of that workflow of its own (none, or cancelled/skipped); otherwise your newest own
+run decides, so a red own run is exit 1 even after a later commit's run passed: that run need not have run what
+failed (plugin-suites picks suites by changed path). Clear it with `gh run rerun <id> --failed`, or wait on the commit
+that fixed it. When a workflow's
 newest finished run containing your commit went red after the green run that proved it (a later push broke it),
 its entry ends `; but the newest finished run containing it, on <sha>, ended failure: <url>`: your commit passed,
 but that workflow is red on the branch now. Never report the branch green from a pass line; read the notes); 1 stalled (nothing queued or running will finish it,

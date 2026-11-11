@@ -20,6 +20,12 @@ def run(sha, status="completed", conclusion="success", wf="CI", n=0):
             "url": f"u/{wf}/{sha}{n}"}
 
 
+# The stall line for commit c whose own run went red while a later commit d's run went green.
+OWN_RED_LATER_GREEN = ("stalled: its own run on cccccccccc ended failure: u/CI/" + "c" * 40 + "0; a later commit's green "
+                       "run does not clear it (u/CI/" + "d" * 40 + "0 (ran on dddddddddd, a later commit containing it)): "
+                       "that run need not have run what failed here")
+
+
 class EvaluateTests(unittest.TestCase):
     def test_success_on_later_commit_counts_even_when_newest_run_is_cancelled(self):
         runs = [run("d", conclusion="cancelled"), run("c"), run("b", conclusion="cancelled")]
@@ -35,6 +41,21 @@ class EvaluateTests(unittest.TestCase):
         state = w.evaluate(runs, ["b"], contains, None)
         self.assertIsNone(state["CI"]["done"])
         self.assertEqual(state["CI"]["failed"]["url"], "u/CI/c0")
+
+    def test_own_run_decides_over_a_later_commits_green_run(self):
+        # b's own run is red: d's green run doesn't clear it, and c's running one can't change it.
+        state = w.evaluate([run("d"), run("c", status="in_progress", conclusion=""), run("b", conclusion="failure")],
+                           ["b"], contains, None)["CI"]
+        self.assertIsNone(state["done"])
+        self.assertEqual(state["failed"]["url"], "u/CI/b0")
+        self.assertEqual(state["active"], 0)
+        # b's own run still queued: wait for it, whatever d did.
+        state = w.evaluate([run("d"), run("b", status="queued", conclusion="")], ["b"], contains, None)["CI"]
+        self.assertIsNone(state["done"])
+        self.assertEqual(state["active"], 1)
+        # b's own run was cancelled (replaced): d's green run stands in, as before.
+        state = w.evaluate([run("d"), run("b", conclusion="cancelled")], ["b"], contains, None)["CI"]
+        self.assertEqual(state["done"]["url"], "u/CI/d0")
 
     def test_active_run_keeps_waiting(self):
         runs = [run("d", status="queued", conclusion=""), run("c", conclusion="failure")]
@@ -398,15 +419,38 @@ class BoundedCallTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("(ran on dddddddddd, a later commit containing it)", out)
 
-    def test_pass_on_a_later_commit_says_the_commits_own_run_failed(self):
-        # The commit's own run went red and a later commit's run went green, because that later commit fixed
-        # it. "passed <sha>: … (ran on <later>)" alone got quoted as proof that this commit fixed CI.
+    def test_own_red_run_is_not_cleared_by_a_later_commits_green_run(self):
+        # The commit's own run is the verdict. plugin-suites picks suites by changed path: its run 43005757224 on
+        # 40e9695fbc selected 0 of 73 suites, and "passed 7876ab05a" (exit 0) was printed although that commit's
+        # own run 43005018913 had failed.
         green = dict(run("d" * 40), _wf="ci.yml")
         red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
         rc, out = self._main_out([[green, red]], "--once")
-        self.assertEqual(rc, 0)
-        self.assertIn("(ran on dddddddddd, a later commit containing it); but its own run on cccccccccc ended "
-                      "failure: u/CI/" + "c" * 40 + "0", out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn(OWN_RED_LATER_GREEN, out)
+        self.assertNotIn("passed", out)
+
+    def test_own_run_still_running_is_not_cleared_by_a_later_commits_green_run(self):
+        # A later commit's run that selected nothing finishes first; the commit's own run may still fail.
+        green = dict(run("d" * 40), _wf="ci.yml")
+        mine = dict(run("c" * 40, status="in_progress", conclusion=""), _wf="ci.yml")
+        rc, out = self._main_out([[green, mine]], "--once")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not yet", out)
+
+    def test_own_red_with_a_later_run_still_active_is_final_under_once(self):
+        # Only a run on the commit itself can change its verdict, so a later commit's running run is no reason to wait.
+        later = dict(run("d" * 40, status="in_progress", conclusion=""), _wf="ci.yml")
+        red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
+        rc, out = self._main_out([[later, red]], "--once")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stalled: newest finished run containing the commit ended failure: u/CI/" + "c" * 40 + "0", out)
+
+    def test_pass_cites_the_commits_own_green_run_over_a_later_one(self):
+        rc, out = self._main_out([[dict(run("d" * 40), _wf="ci.yml"), dict(run("c" * 40), _wf="ci.yml")]], "--once")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("passed ccccccccc: ci.yml u/CI/" + "c" * 40 + "0", out)
+        self.assertNotIn("ran on", out)
 
     def test_own_run_rerun_green_or_proof_on_the_commit_adds_no_note(self):
         # A rerun on the commit itself passed (newest own run green), or the proving run built the commit:
@@ -438,16 +482,14 @@ class BoundedCallTests(unittest.TestCase):
         self.assertIn("passed ccccccccc: ci.yml u/CI/" + "c" * 40 + "0; but the newest finished run containing it, on "
                       "dddddddddd, ended failure: u/CI/" + "d" * 40 + "0", out)
 
-    def test_newer_red_note_and_own_red_note_both_show(self):
-        # Own run red, a later commit's run green (the pass), a still later run red: both caveats apply.
+    def test_own_red_stays_red_after_a_later_green_and_a_newer_red(self):
+        # Own run red, a later commit's run green, a still later run red: the own run decides.
         newest_red = dict(run("e" * 40, conclusion="failure"), _wf="ci.yml")
         green = dict(run("d" * 40), _wf="ci.yml")
         own_red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
         rc, out = self._main_out([[newest_red, green, own_red]], "--once")
-        self.assertEqual(rc, 0, out)
-        self.assertIn("(ran on dddddddddd, a later commit containing it); but its own run on cccccccccc ended failure: "
-                      "u/CI/" + "c" * 40 + "0; but the newest finished run containing it, on eeeeeeeeee, ended "
-                      "failure: u/CI/" + "e" * 40 + "0", out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn(OWN_RED_LATER_GREEN, out)
 
     def test_newest_run_green_cancelled_or_running_adds_no_newer_note(self):
         # Only a FINISHED red run after the pass is news: a newer green, a cancelled replacement or a run still in
@@ -636,18 +678,41 @@ class PerJobFailureTests(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("jobs of run 7 unreadable", out)
 
-    def test_another_active_run_containing_the_commit_still_waits(self):
+    def test_another_active_run_still_waits_when_the_commit_has_no_run_of_its_own(self):
+        # Both runs built later commit d (the push that carried c ran CI only on d): the running one may still pass.
+        later = self.queued_run(sha="d" * 40, rid=8, status="in_progress")
+        jobs = {7: [self.job("macos", conclusion="failure"), self.job("ios", "queued", None)],
+                8: [self.job("macos", "in_progress", None)]}
+        rc, out = self._main_out([[later, self.queued_run(sha="d" * 40)]], jobs, "--once")
+        self.assertEqual(rc, 2, out)
+
+    def test_a_later_active_run_cannot_clear_a_failed_job_in_the_commits_own_run(self):
         later = self.queued_run(sha="d" * 40, rid=8, status="in_progress")
         jobs = {7: [self.job("macos", conclusion="failure"), self.job("ios", "queued", None)],
                 8: [self.job("macos", "in_progress", None)]}
         rc, out = self._main_out([[later, self.queued_run()]], jobs, "--once")
-        self.assertEqual(rc, 2, out)
+        self.assertEqual(rc, 1, out)
 
-    def test_a_green_run_containing_the_commit_still_passes(self):
+    def test_a_green_run_stands_in_when_the_commit_has_no_run_of_its_own(self):
+        green = dict(run("d" * 40), _wf="ci.yml", databaseId=9)
+        rc, out = self._main_out([[green, self.queued_run(sha="d" * 40)]], {7: [self.job("macos", conclusion="failure")]},
+                                 "--once")
+        self.assertEqual(rc, 0, out)
+
+    def test_a_later_green_run_does_not_clear_a_failed_job_in_the_commits_own_run(self):
         green = dict(run("d" * 40), _wf="ci.yml", databaseId=9)
         rc, out = self._main_out([[green, self.queued_run()]], {7: [self.job("macos", conclusion="failure")]},
                                  "--once")
-        self.assertEqual(rc, 0, out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stalled: its own run on cccccccccc ended failure", out)
+        self.assertIn("job 'macos' ended failure while the run is still queued", out)
+
+    def test_loop_mode_stalls_on_an_own_red_run_beside_a_later_green_one(self):
+        green = dict(run("d" * 40), _wf="ci.yml", databaseId=9)
+        red = dict(run(self.SHA, conclusion="failure"), _wf="ci.yml", databaseId=7)
+        rc, out = self._main_out([[dict(green), dict(red)] for _ in range(3)], {}, "--timeout-min", "5", grace=0)
+        self.assertEqual(rc, 1, out)
+        self.assertIn(OWN_RED_LATER_GREEN, out)
 
     def test_runs_not_containing_the_commit_and_finished_runs_are_not_queried(self):
         older = dict(self.queued_run(sha="a" * 40, rid=5))

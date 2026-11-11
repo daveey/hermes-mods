@@ -14,15 +14,18 @@ Done when:
                     (e.g. `v*`, `desktop-pod-*`): the commit is released
   otherwise         for every workflow (the --workflow ones, or else every workflow
                     with a run on a commit that contains the sha), some run on a
-                    commit containing the sha concluded `success`. A discovered
+                    commit containing the sha concluded `success`; when the sha has
+                    runs of its own (not cancelled or skipped), its newest own run
+                    must be that success: a later commit's green run never clears a
+                    red or still-running own run. A discovered
                     workflow whose runs there all ended `skipped` (no job ran) counts
                     as done, printed "skipped", once none of its runs on the sha
                     itself is queued or running; a --workflow one must succeed.
                     workflow_run events are ignored unless --workflow is given:
                     their headSha belongs to the default branch, not the triggering run
 
-Exit codes: 0 done; 1 stalled (nothing queued/running will finish it: the newest
-finished run containing the commit failed, or no run will ever pick it up), or
+Exit codes: 0 done; 1 stalled (nothing queued/running will finish it: the commit's own
+run, or the newest finished run containing it, failed, or no run will ever pick it up), or
 `gh run list` failed MAX_CALL_ERRORS times in a row (under --once, 1 also covers a
 failed job in a still-active run when no other active run can finish the wait);
 2 timed out, or not yet done
@@ -132,6 +135,13 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
     'skipped' set: every job's `if:` was false, so it checked nothing and can never succeed.
     It still waits while a run of that workflow on the sha itself is queued or running. A workflow
     named with --workflow must succeed: a skip there is not a pass.
+
+    When the commit has runs of the workflow on itself (headSha is the sha; cancelled and skipped ones
+    excluded), the newest of them decides: green passes, red fails, queued or running waits. A later commit's
+    green run never clears it, because that run need not have run what this commit changed: plugin-suites
+    picks suites by changed path, and its run on 40e9695fbc, which selected 0 of 73 suites, "passed" 7876ab05a
+    although that commit's own run had failed (hermes-mods runs 43005757224 and 43005018913). Without such a
+    run (none started, or it was cancelled or skipped), a run on a later commit containing it stands in.
     """
     if not workflows:
         runs = [r for r in runs if r.get("event") != "workflow_run"]
@@ -148,29 +158,29 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
             # Later commits keep starting runs of it; only a run on the sha itself can still decide.
             if not any(r["status"] in ACTIVE and r["headSha"] in shas for r in mine):
                 skipped = next((r for r in mine if r["status"] == "completed" and r["conclusion"] == "skipped"), None)
-        own = [r for r in finished if r["headSha"] in shas]
+        # Any active run of the workflow may still end up building a newer commit containing ours.
+        active = sum(1 for r in everyone if r["status"] in ACTIVE)
+        own = [r for r in mine if r["headSha"] in shas and (r["status"] in ACTIVE or r in finished)]
+        own_failed = None
+        if own:
+            latest = own[0]
+            green = latest["status"] == "completed" and latest["conclusion"] == "success"
+            own_failed = latest if latest["status"] == "completed" and not green else None
+            done, skipped = (latest if green else None), None
+            # Only a run on the commit itself can still change its verdict.
+            active = sum(1 for r in own if r["status"] in ACTIVE)
         state[name] = {
             "done": done or skipped,
             "skipped": done is None and skipped is not None,
-            # Any active run of the workflow may still end up building a newer commit containing ours.
-            "active": sum(1 for r in everyone if r["status"] in ACTIVE),
-            "failed": finished[0] if finished and finished[0]["conclusion"] != "success" else None,
-            # The newest finished run that built the commit itself, when it went red.
-            "own_failed": own[0] if own and own[0]["conclusion"] != "success" else None,
+            "active": active,
+            "failed": own_failed or (finished[0] if finished and finished[0]["conclusion"] != "success" else None),
+            # The commit's newest own run, when it went red: it decides, whatever later commits' runs did.
+            "own_failed": own_failed,
+            "newest": finished[0] if finished else None,
+            "later_green": next((r for r in mine if r["status"] == "completed" and r["conclusion"] == "success"
+                                 and r["headSha"] not in shas), None),
         }
     return state
-
-
-def own_failure_note(state: dict, shas: list[str]) -> str:
-    """Say so when a later commit's green run proves the commit but the commit's own run went red.
-
-    That later commit may have fixed this one (or a flake was retried there), so the pass proves the
-    combination, not this commit: "passed <sha>" alone got quoted as proof that <sha> fixed CI.
-    """
-    own, done = state.get("own_failed"), state.get("done")
-    if not own or not done or (done.get("headSha") or "") in shas:
-        return ""
-    return f"; but its own run on {own['headSha'][:10]} ended {own['conclusion']}: {own['url']}"
 
 
 def newer_failure_note(state: dict) -> str:
@@ -261,6 +271,19 @@ def failure_ref(run: dict, shas: list[str]) -> str:
     where = job.get("url") or run_ref(run, shas)
     return (f"{run_ref(run, shas)} (job {job.get('name')!r} ended {job.get('conclusion')} while the run is still "
             f"{run.get('_run_status')}: {where})")
+
+
+def red_reason(state: dict, shas: list[str]) -> str:
+    """The stall line for a red workflow; names the commit's own red run when a later run finished after it."""
+    failed = state["failed"]
+    if failed is not state.get("own_failed") or state.get("newest") is failed:
+        return f"newest finished run containing the commit ended {failed['conclusion']}: {failure_ref(failed, shas)}"
+    reason = f"its own run on {failed['headSha'][:10]} ended {failed['conclusion']}: {failure_ref(failed, shas)}"
+    later = state.get("later_green")
+    if later:
+        reason += (f"; a later commit's green run does not clear it ({run_ref(later, shas)}): that run need not "
+                   "have run what failed here. Re-run its failed jobs, or wait on the commit that fixed it")
+    return reason
 
 
 def gh_repo(repo: Path) -> str | None:
@@ -576,19 +599,18 @@ def main(argv: list[str] | None = None) -> int:
             missing = [g for g, t in tags.items() if not t]
             active = sum(1 for r in runs if r["status"] in ACTIVE)
             wf_state = evaluate(runs, shas, contains, a.workflow or None)
-            failed = [s["failed"] for s in wf_state.values() if s["failed"]]
+            reds = [s for s in wf_state.values() if s["failed"]]
             note = f"waiting for tag {', '.join(missing)}; {active} run(s) queued/running"
         else:
             wf_state = evaluate(runs, shas, contains, a.workflow or None)
             if wf_state and all(s["done"] for s in wf_state.values()):
                 print(f"passed {label}: " + ", ".join(
-                    f"{n} {'skipped ' if s['skipped'] else ''}{run_ref(s['done'], shas)}{own_failure_note(s, shas)}"
-                    f"{newer_failure_note(s)}"
+                    f"{n} {'skipped ' if s['skipped'] else ''}{run_ref(s['done'], shas)}{newer_failure_note(s)}"
                     for n, s in wf_state.items()))
                 return 0
             pend = {n: s for n, s in wf_state.items() if not s["done"]}
             active = sum(s["active"] for s in pend.values())
-            failed = [s["failed"] for s in pend.values() if s["failed"]]
+            reds = [s for s in pend.values() if s["failed"]]
             missing = list(pend) or ["(no run yet)"]
             note = f"waiting for {', '.join(missing)}; {active} run(s) queued/running"
         if job_notes:
@@ -597,9 +619,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.once:
             # A finished red run with nothing queued/running is final: a wake probe must see it
             # (exit 1) instead of "not yet" forever.
-            if failed and not active:
-                print(f"stalled: newest finished run containing the commit ended "
-                      f"{failed[0]['conclusion']}: {failure_ref(failed[0], shas)}")
+            if reds and not active:
+                print(f"stalled: {red_reason(reds[0], shas)}")
                 return 1
             print(f"not yet: {note}")
             return 2
@@ -610,8 +631,8 @@ def main(argv: list[str] | None = None) -> int:
         held = a.dispatch and any(r.get("_failed_job") for r in runs)
         idle = 0 if active or held else idle + 1
         if idle >= 2 and time.monotonic() - start >= STARTUP_GRACE_S:
-            reason = (f"newest finished run containing the commit ended {failed[0]['conclusion']}: {failure_ref(failed[0], shas)}"
-                      if failed else "no run containing the commit succeeded and none is queued or running")
+            reason = (red_reason(reds[0], shas) if reds
+                      else "no run containing the commit succeeded and none is queued or running")
             if a.dispatch and a.workflow and dispatches < 2:
                 for wf in a.workflow:
                     subprocess.run(gh_cmd(slug, "workflow", "run", wf, "--ref", a.branch), cwd=repo, check=True)
