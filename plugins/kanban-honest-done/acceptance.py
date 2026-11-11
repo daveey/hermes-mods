@@ -34,8 +34,19 @@ _ACCEPT_SENTENCE_CI = re.compile(r"\bacceptance\b", re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 MSG_RE = re.compile(r"\b(?:user\s+)?(?:message|msg)\s*#?\s*(\d{3,})\b", re.I)
 # Same closed shape as ask-gate core.runtime_notice: a typed reply never opens with "[" / "<" / "⏳ [".
-_RUNTIME_NOTICE = re.compile(r"^\s*(?:[\[<]|[\u2714\u2716\u26a0\u23f8\u23f3]\ufe0f?\s*\[)")
-MACHINE_SOURCES = {"kanban", "subagent", "cron", "oneshot", "tool", "probe"}
+# Real shapes seen in state.db (user role, source desktop): ``✔ [default] ...``, ``⚠ subagent Subagent: ... was
+# stopped by a restart`` (no bracket after the symbol), ``[Message from another Hermes session ...]``,
+# ``[PEER MESSAGE from ...]``, ``David pressed Post on X ...`` (a UI button, not typed words).
+_RUNTIME_NOTICE = re.compile(
+    r"^\s*(?:[\[<]|[\u2714\u2716\u26a0\u23f8\u23f3\u25b6\u2757]\ufe0f?(?:\s|$)|David pressed\s)")
+# The only sources where a user-role row can be words David typed. Everything else (peer-mail, kanban,
+# subagent, cron, task-dispatch, review/audit lanes, future machine lanes) is refused by default.
+HUMAN_SOURCES = frozenset({"desktop", "tui", "cli", "local"})
+# messages.display_kind: NULL = typed; ``steer`` = his mid-turn out-of-band message. Anything else
+# (kanban_notice, async_delegation_complete, process_complete, auto_continue, model_switch ...) was written by
+# the runtime.
+HUMAN_KINDS = frozenset({"", "steer"})
+_STEER = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]\n]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]\s*$", re.S)
 
 
 def _norm(s: str) -> str:
@@ -92,8 +103,40 @@ def state_db(env=None) -> Path:
     return Path(home) / "state.db"
 
 
-def _ro(path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+def _ro_connect(path, timeout: float = 2) -> sqlite3.Connection:
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows or creates a db."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
+def typed_text(content: str, display_kind: Optional[str]) -> Optional[str]:
+    """The words David typed in a user-role row, or None when the row is a runtime notice, a relay, a button
+    injection or an unrecognised kind. A mid-turn steering message is accepted only when the runtime stamped it
+    ``steer`` AND the whole row is exactly one OUT-OF-BAND envelope whose inside is itself typed text."""
+    kind = (display_kind or "").strip()
+    if kind not in HUMAN_KINDS:
+        return None
+    text = content or ""
+    if kind == "steer":
+        m = _STEER.match(text)
+        if not m:
+            return None
+        text = m.group(1)
+        if "OUT-OF-BAND USER MESSAGE" in text:
+            return None  # nested/forged envelope markers inside the body
+    elif text.lstrip().startswith("[OUT-OF-BAND USER MESSAGE"):
+        return None  # an envelope the runtime did not stamp as steering: not trusted as a typed turn
+    text = text.strip()
+    if not text or _RUNTIME_NOTICE.match(text):
+        return None
+    return text
 
 
 def lineage(conn: sqlite3.Connection, session_id: str) -> list[str]:
@@ -116,22 +159,27 @@ def verify_citation(msg_id: int, session_id: str, db: Path, after: float = 0) ->
     """(ok, why) for one cited message id against this chat's lineage. ``after``: when the card's current body was
     set; authority to change it must be newer (an old quote can't be re-applied after a restore)."""
     try:
-        c = _ro(db)
+        c = _ro_connect(db)
     except sqlite3.Error as e:
         return False, f"state.db unreadable ({type(e).__name__})"
     try:
-        row = c.execute("select session_id, role, content, timestamp from messages where id=?", (msg_id,)).fetchone()
+        try:
+            row = c.execute("select session_id, role, content, timestamp, display_kind from messages where id=?",
+                            (msg_id,)).fetchone()
+        except sqlite3.OperationalError:  # a state.db predating display_kind: the text checks still apply
+            row = c.execute("select session_id, role, content, timestamp, NULL from messages where id=?",
+                            (msg_id,)).fetchone()
         if not row:
             return False, f"message {msg_id} does not exist"
-        sid, role, content, ts = row
+        sid, role, content, ts, kind = row
         if role != "user":
             return False, f"message {msg_id} is {role}-authored, not a user turn"
-        if _RUNTIME_NOTICE.match(content or ""):
-            return False, f"message {msg_id} is a runtime/Kanban notice, not typed by the user"
+        if typed_text(content, kind) is None:
+            return False, f"message {msg_id} is a runtime/Kanban notice, relay or machine row, not typed by the user"
         src = c.execute("select source from sessions where id=?", (sid,)).fetchone()
         source = str((src or [""])[0] or "")
-        if source in MACHINE_SOURCES or source.startswith("selfheal"):
-            return False, f"message {msg_id} is the opening prompt of a {source} session, not the user"
+        if source not in HUMAN_SOURCES:
+            return False, f"message {msg_id} is the opening prompt of a {source or 'unknown'} session, not the user"
         if sid not in lineage(c, session_id):
             return False, f"message {msg_id} was said in another chat ({sid}), not this one"
         if after and float(ts or 0) <= after:
