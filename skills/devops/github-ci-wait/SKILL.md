@@ -236,6 +236,10 @@ explicit independently validated manifest, not a guessed name or a success-only 
 contexts, including a separate platform-state gate. No prefix/version stripping, fuzzy fallback or missing-name
 alias is safe: an absent required context remains failure. These job expectations are not a complete branch
 protection/ruleset evaluator (nor app-identity validation); external status contexts need their own exact-head proof.
+The probe checks only the `--expect` entries you pass: **the manifest must enumerate every required context**; a
+required context you omit is silently unchecked (the probe is not a policy evaluator and cannot notice it). It
+refuses a repeated `RUN:JOB` with conflicting conclusions before any gh call, and fails a run with more than one job
+bearing an expected name (ambiguous, in any order); it never picks one by position.
 
 For example, with a validated two-job policy, use the supported one-shot probe, not a custom waiter:
 ```bash

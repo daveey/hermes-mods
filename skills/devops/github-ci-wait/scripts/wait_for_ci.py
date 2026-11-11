@@ -386,7 +386,10 @@ def parse_manifest(run_ids: list[str], expects: list[str]) -> tuple[list[str], d
         rid, jobname, concl = m.group(1), m.group(2).strip(), m.group(3)
         if rid not in ids:
             ids.append(rid)
-        exp.setdefault(rid, {})[jobname] = concl
+        prior = exp.setdefault(rid, {}).get(jobname)
+        if prior is not None and prior != concl:
+            raise ValueError(f"--expect conflict: run {rid} job {jobname!r} expected both {prior} and {concl}")
+        exp[rid][jobname] = concl
     return ids, exp
 
 
@@ -404,6 +407,10 @@ def judge_run(run: dict, expected: dict[str, str], head_sha: str | None = None) 
     if head_sha is not None and run.get("headSha") != head_sha:
         return "fail", f"{where}: head mismatch: got {run.get('headSha')!r}, expected {head_sha}"
     jobs = {j.get("name"): j for j in run.get("jobs") or []}
+    for name in expected:
+        n = sum(1 for j in run.get("jobs") or [] if j.get("name") == name)
+        if n > 1:  # ambiguous required context: never pick one by order
+            return "fail", f"{where}: {n} jobs named {name!r}; ambiguous, refusing"
     seen = []
     for name, want in expected.items():
         j = jobs.get(name)
