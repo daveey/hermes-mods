@@ -269,11 +269,36 @@ def check_complete(task_id: str, summary: str, paths: list[Path], title: Optiona
 
     B: the handoff (summary AND every metadata text value) admits unfinished work with no follow-up card.
     D: the card names an origin chat in prose that is neither linked to the card nor reported to."""
+    receipt_hits = []
+    if isinstance(metadata, str):
+        import json
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            pass  # legacy malformed metadata still goes through the prose gate
+    if isinstance(metadata, dict) and "completion_receipt" in metadata:
+        try:
+            from hermes_completion_receipt import validate_completion_receipt
+            from hermes_cli.kanban_db import complete_task
+            if getattr(complete_task, "completion_receipt_admission", None) != 1:
+                return "[kanban-honest-done] completion_receipt needs a receipt-capable loaded writer; nothing completed."
+            receipt = validate_completion_receipt(metadata["completion_receipt"])
+        except ImportError:
+            return "[kanban-honest-done] completion_receipt needs a receipt-capable core; nothing completed."
+        except ValueError as exc:
+            return f"[kanban-honest-done] {exc}"
+        # Remaining obligations have typed semantics enforced by the writer.
+        # Evidence references/timestamps are not prose. Scope claims remain
+        # subject to the existing classifier, but receipt refs cannot vouch for
+        # a follow-up demanded by an unfinished summary or other metadata.
+        receipt_hits = dropped_work("\n".join(item["scope"] + "\n" + item.get("superseded_by", "")
+                                             for item in receipt["items"]))
+        metadata = {key: value for key, value in metadata.items() if key != "completion_receipt"}
     found = find_task(task_id, paths)
     if title is None:
         title = found[1].get("title") if found else ""
     handoff = "\n".join(x for x in (summary or "", metadata_text(metadata) if metadata else "") if x)
-    hits = dropped_work_in_handoff(handoff, title or "")
+    hits = receipt_hits + dropped_work_in_handoff(handoff, title or "")
     if hits and not valid_followups(task_id, handoff, paths):
         named = [t for t in dict.fromkeys(TASK_ID_RE.findall(handoff)) if t != task_id]
         return complete_refusal(task_id, hits, named)

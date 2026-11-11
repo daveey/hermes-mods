@@ -9,6 +9,24 @@ A goal-mode card couldn't run its live acceptance (the target machine was offlin
 "… (shipped; …run split to follow-up)", and completed 10 s later. No follow-up card existed. The goal judge accepted
 the narrowed body, every card in the chat was done, and the chat went green while the work wasn't done.
 
+## Structured completion receipts
+
+Optional `metadata.completion_receipt` is validated by the canonical core validator
+before the existing admission checks. The loaded completion writer must advertise
+receipt admission; newer helper files alone do not make an old running writer safe.
+Malformed or unsupported receipts are refused. Scope/supersession claims, summary,
+other metadata and origin delivery remain gated. Typed remaining obligations and
+historical evidence references are not flattened into dropped-work prose: explicit
+deferral does not demand a new execution obligation. The canonical writer separately
+verifies pending owners; a valid receipt is never an acceptance or approval waiver.
+Receipt-only references cannot satisfy a follow-up required by the prose gate.
+
+`tests/test_completion_receipt.py` exercises the guard classifier through direct
+completion, wrapped `tool_call`, terminal CLI text and decoded `execute_code` terminal
+text. Those are classifier tests, not actual subprocess/writer or live deployment
+proof. Dynamic Python/shell values remain subject to the canonical writer, not this
+static classifier.
+
 ## What it does
 
 Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call` hook refuses (E and F: any session):
