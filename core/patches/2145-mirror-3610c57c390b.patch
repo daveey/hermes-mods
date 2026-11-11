@@ -1,0 +1,184 @@
+From 3610c57c390b08844afc20fc21e74c83f1e7618e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:02:48 -0800
+Subject: [PATCH] [daveey] Fence failed gateway drops against concurrent
+ withdrawal receipts
+
+Check pending withdrawals transactionally before dropping an older failed claim. Ignore silent trailing events when draining archived subscriptions. RED: archive during send/wake at failure cap loses receipt, silent-tail cleanup strands subscription. GREEN: 49 tests across five files on hub. No historical replay or success declaration.
+---
+ gateway/kanban_watchers.py                    |  3 ++
+ gateway/kanban_watchers_notifier.py           |  9 ++++--
+ hermes_cli/kanban_db_notify.py                | 14 ++++++++--
+ .../gateway/test_kanban_request_withdrawal.py | 24 ++++++++++++----
+ .../test_kanban_request_withdrawal.py         | 28 +++++++++++++++++++
+ 5 files changed, 67 insertions(+), 11 deletions(-)
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 402df2f7b28..5e73f4752f7 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -193,6 +193,9 @@ class GatewayKanbanWatchersMixin:
+     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
+         self._kanban_sub_op(board, "remove_notify_sub", sub)
+ 
++    def _kanban_drop_failed(self, sub: dict, old_cursor: int, board: Optional[str] = None) -> None:
++        self._kanban_sub_op(board, "remove_notify_sub", sub, preserve_withdrawal_after=old_cursor)
++
+     def _kanban_rewind(self, sub: dict, claimed_cursor: int, old_cursor: int, board: Optional[str] = None) -> None:
+         """Undo a claimed notification cursor after send failure."""
+         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 235b1acad7c..421c6e7c80b 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -606,10 +606,13 @@ class _KanbanNotification:
+         has_withdrawal = any(ev.kind == "request_withdrawn" for ev in self.d["events"])
+         if fails >= MAX_SEND_FAILURES and not has_withdrawal:
+             logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
+-            await self.unsub()
++            await _to_thread_process_service(
++                self.runner._kanban_drop_failed, self.sub, self.d.get("old_cursor", 0), self.board_slug,
++            )
+             self.clear_failures()
+-        else:
+-            await self.rewind()
++        # A withdrawal may have committed while an older batch was being sent.
++        # The transactional drop guard retains it; rewind that older claim.
++        await self.rewind()
+ 
+     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
+         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index 3d6e251a529..7e2a245917b 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -385,13 +385,20 @@ def remove_notify_sub(
+     platform: str,
+     chat_id: str,
+     thread_id: Optional[str] = None,
++    preserve_withdrawal_after: Optional[int] = None,
+ ) -> bool:
+     # Pure composition primitive: reconciliation validates receipt + row snapshot
+     # and retires the subscription in one outer transaction.
+     with _kb.write_txn(conn, allow_nested=True):
++        guard = ""
++        extra = ()
++        if preserve_withdrawal_after is not None:
++            guard = (" AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = ? "
++                     "AND e.kind = 'request_withdrawn' AND e.id > ?)")
++            extra = (task_id, int(preserve_withdrawal_after))
+         cur = conn.execute(
+-            "DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+-            _sub_key(task_id, platform, chat_id, thread_id),
++            "DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE + guard,
++            (*_sub_key(task_id, platform, chat_id, thread_id), *extra),
+         )
+     return cur.rowcount > 0
+ 
+@@ -869,7 +876,8 @@ def ack_notify_claim(
+         ).fetchone()
+         if row is not None and row["inflight_from"] is None and row["status"] == "archived":
+             conn.execute("DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE
+-                         + " AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = ? AND e.id > ?)",
++                         + " AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = ? "
++                         "AND e.kind = 'request_withdrawn' AND e.id > ?)",
+                          (*key, task_id, int(upto)))
+     return cur.rowcount > 0
+ 
+diff --git a/tests/gateway/test_kanban_request_withdrawal.py b/tests/gateway/test_kanban_request_withdrawal.py
+index 0bccdb22e4f..abeab10035a 100644
+--- a/tests/gateway/test_kanban_request_withdrawal.py
++++ b/tests/gateway/test_kanban_request_withdrawal.py
+@@ -13,7 +13,8 @@ from tests.gateway import test_kanban_changes_requested_notifier as helpers
+ 
+ 
+ @pytest.mark.parametrize("mode", ["notify+wake", "wake"])
+-def test_withdrawal_send_failure_keeps_subscription_until_retry(tmp_path, monkeypatch, mode):
++@pytest.mark.parametrize("archive_during_failure", [False, True])
++def test_withdrawal_send_failure_keeps_subscription_until_retry(tmp_path, monkeypatch, mode, archive_during_failure):
+     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "withdrawal.db"))
+     kb.init_db()
+     with closing(kbc.connect()) as conn:
+@@ -23,12 +24,24 @@ def test_withdrawal_send_failure_keeps_subscription_until_retry(tmp_path, monkey
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='blocked', human_request=? WHERE id=?",
+                          ('{"action":"Choose"}', tid))
+-        kb.archive_task(conn, tid)
++            if archive_during_failure:
++                kb._append_event(conn, tid, "blocked", {})
++        if not archive_during_failure:
++            kb.archive_task(conn, tid)
+         adapter = helpers.RecordingAdapter(fail_send=True)
+         runner = helpers._runner(adapter)
+         async def fail_wake(event):
++            if archive_during_failure:
++                kb.archive_task(conn, tid)
+             raise RuntimeError("wake unavailable")
++        async def fail_send(*args, **kwargs):
++            if archive_during_failure:
++                kb.archive_task(conn, tid)
++            raise RuntimeError("send unavailable")
++        adapter.send = fail_send
+         adapter.handle_message = fail_wake
++        if archive_during_failure:
++            runner._kanban_sub_fail_counts[(tid, "telegram", "chat-1", "topic-7")] = notifier.MAX_SEND_FAILURES - 1
+         for _ in range(notifier.MAX_SEND_FAILURES + 1):
+             runner._running = True
+             asyncio.run(helpers._run_one_tick(monkeypatch, runner))
+@@ -36,10 +49,11 @@ def test_withdrawal_send_failure_keeps_subscription_until_retry(tmp_path, monkey
+         assert adapter.handled == []
+         adapter = helpers.RecordingAdapter()
+         asyncio.run(helpers._run_one_tick(monkeypatch, helpers._runner(adapter)))
+-        assert len(adapter.sent) == (1 if mode == "notify+wake" else 0)
++        assert len(adapter.sent) == ((2 if archive_during_failure else 1) if mode == "notify+wake" else 0)
+         if adapter.sent:
+-            assert "request withdrawn" in adapter.sent[0]["text"]
+-            assert "not proof of completion" in adapter.sent[0]["text"]
++            receipts = [sent for sent in adapter.sent if "request withdrawn" in sent["text"]]
++            assert len(receipts) == 1
++            assert "not proof of completion" in receipts[0]["text"]
+         assert len(adapter.handled) == 1
+         text = adapter.handled[0].text
+         assert "No answer is needed" in text
+diff --git a/tests/tui_gateway/test_kanban_request_withdrawal.py b/tests/tui_gateway/test_kanban_request_withdrawal.py
+index 82ba896392a..67317978834 100644
+--- a/tests/tui_gateway/test_kanban_request_withdrawal.py
++++ b/tests/tui_gateway/test_kanban_request_withdrawal.py
+@@ -150,6 +150,34 @@ def test_dispatched_withdrawal_keeps_claim_until_worker_persists(tmp_path, monke
+                 job()
+ 
+ 
++@pytest.mark.parametrize("kind,after,retained", [
++    ("request_withdrawn", True, True),
++    ("request_withdrawn", False, False),
++    ("comment", True, False),
++])
++def test_failed_drop_fences_only_pending_withdrawal(kind, after, retained):
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="Decision", assignee="worker")
++        ident = dict(task_id=tid, platform="tui", chat_id="failed-drop")
++        kbn.add_notify_sub(conn, **ident)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, kind, {})
++        cursor = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++        assert kbn.remove_notify_sub(conn, preserve_withdrawal_after=cursor - int(after), **ident) is not retained
++        assert bool(kbn.list_notify_subs(conn, task_id=tid)) is retained
++
++
++def test_silent_tail_does_not_strand_archived_subscription():
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="Ordinary archive", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="silent-tail")
++        kb.archive_task(conn, tid)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "archive_worker_termination", {})
++        assert server._collect_kanban_notifications({"session_key": "silent-tail"}) == []
++        assert kbn.list_notify_subs(conn, task_id=tid) == []
++
++
+ def test_request_withdrawal_is_deliverable_on_both_surfaces():
+     from gateway import kanban_watchers_notifier as notifier
+     ev = SimpleNamespace(kind="request_withdrawn", payload={})
+-- 
+2.55.0
+

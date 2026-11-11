@@ -1,0 +1,266 @@
+From 26b50d4760069e9e62a9a9cceb9195c44fa99463 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:54:25 +0000
+Subject: [PATCH] fix(kanban): dashboard comments record an agent courier's
+ writer_kind; human is never client-assertable [daveey]
+
+The Desktop session-mentions courier serves the agent cross_task tool by POSTing to
+/api/plugins/kanban/tasks/<id>/comments, the endpoint the Kanban drawer uses. It hardcoded
+writer_kind='human', so an agent's cross-gateway comment (comment 179201 on t_01a1c753e58ef690)
+reached the running worker as "from the operator". The agent-261aa31f49 fix (1915, c2f066a6d0)
+only covered the in-process kanban_comment tool and assumed every dashboard writer is a person.
+
+The endpoint now takes writer_kind='agent' (+ writer_session) from the courier. A client may only
+lower provenance: human stays the endpoint's own default for GUI comments, and an explicit
+'human', an unknown kind, or a session without a kind is a 400 with nothing stored. The actor
+resolution lives in plugin_api_comment_actor.py (facade size cap).
+
+Tests: tests/tools/test_kanban_dashboard_comment_actor.py (agent+session, agent without session,
+GUI authors desktop/user/dashboard/none stay human, 5 forged/malformed refusals store nothing,
+live note to a running worker says "another agent session" for the courier and "the operator"
+for the GUI). Card t_01a1c78af452ff15.
+---
+ plugins/kanban/dashboard/plugin_api.py        |   9 +-
+ .../dashboard/plugin_api_comment_actor.py     |  40 +++++
+ .../test_kanban_dashboard_comment_actor.py    | 147 ++++++++++++++++++
+ 3 files changed, 190 insertions(+), 6 deletions(-)
+ create mode 100644 plugins/kanban/dashboard/plugin_api_comment_actor.py
+ create mode 100644 tests/tools/test_kanban_dashboard_comment_actor.py
+
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 806a75c849f..72baadd3025 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -44,6 +44,7 @@ from plugins.kanban.dashboard import board_read
+ from plugins.kanban.dashboard.board_read import (  # BOARD_COLUMNS: the documented column list
+     BOARD_COLUMNS, diagnostic_inputs as _diagnostic_inputs, diagnostics_from_inputs as _diagnostics_from_inputs)
+ from plugins.kanban.dashboard.plugin_api_human_request import ask_filing_refusal, classify_request
++from plugins.kanban.dashboard.plugin_api_comment_actor import CommentBody, comment_writer
+ from hermes_cli.kanban_db_attachment_names import _collision_free_path, _safe_attachment_name
+ 
+ log = logging.getLogger(__name__)
+@@ -921,20 +922,16 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str)
+ 
+ # --- Comments / links -------------------------------------------------------
+ 
+-class CommentBody(BaseModel):
+-    body: str
+-    author: Optional[str] = "dashboard"
+-
+-
+ @router.post("/tasks/{task_id}/comments")
+ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query(None)):
+     if not payload.body.strip():
+         raise HTTPException(status_code=400, detail="body is required")
++    writer_kind, writer_session = comment_writer(payload)  # [daveey] agent courier vs GUI human
+     with _board_conn(board) as (board, conn):
+         _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
+         kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body,
+-                              writer_kind="human")  # [daveey] typed in the dashboard/Desktop
++                              writer_kind=writer_kind, writer_session=writer_session)
+         return {"ok": True}
+ 
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api_comment_actor.py b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+new file mode 100644
+index 00000000000..7ef20748c5f
+--- /dev/null
++++ b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+@@ -0,0 +1,40 @@
++"""Who wrote a dashboard comment: the trusted actor for ``POST /tasks/{id}/comments``. [daveey]
++
++The Desktop's session-mentions courier serves the agent ``cross_task`` tool through the same
++endpoint the Kanban drawer uses, and the endpoint stamped every note ``writer_kind='human'``: an
++agent's cross-gateway comment reached the worker as "from the operator" (comment 179201; the
++agent-261aa31f49 fix covered only the in-process ``kanban_comment`` tool).
++
++A caller may only LOWER provenance. ``writer_kind='agent'`` (with the sending agent's session) is
++accepted; human is this endpoint's own default for a person typing in the GUI and is never taken
++from the payload, so an explicit ``human`` claim, an unknown kind, or a session with no agent kind
++is refused before anything is stored.
++"""
++from __future__ import annotations
++
++from typing import Optional
++
++from fastapi import HTTPException
++from pydantic import BaseModel
++
++
++class CommentBody(BaseModel):
++    body: str
++    author: Optional[str] = "dashboard"
++    # Set only by an agent courier (session-mentions serving ``cross_task``), never by the GUI.
++    writer_kind: Optional[str] = None
++    writer_session: Optional[str] = None
++
++
++def comment_writer(payload: CommentBody) -> tuple[str, Optional[str]]:
++    """``(writer_kind, writer_session)`` to record for ``payload``; HTTP 400 for a forged/malformed actor."""
++    kind, session = payload.writer_kind, payload.writer_session
++    if kind is None:
++        if session is not None:
++            raise HTTPException(status_code=400, detail="writer_session requires writer_kind='agent'")
++        return "human", None
++    if kind != "agent":
++        raise HTTPException(status_code=400, detail=(
++            "writer_kind may only be 'agent'; omit it for a comment a person typed "
++            "(human provenance is not client-assertable)"))
++    return "agent", (session or "").strip()[:200] or None
+diff --git a/tests/tools/test_kanban_dashboard_comment_actor.py b/tests/tools/test_kanban_dashboard_comment_actor.py
+new file mode 100644
+index 00000000000..5173427b847
+--- /dev/null
++++ b/tests/tools/test_kanban_dashboard_comment_actor.py
+@@ -0,0 +1,147 @@
++"""Dashboard comment endpoint: who wrote the note, an agent courier or a human in the GUI. [daveey]
++
++The Desktop's session-mentions courier serves the agent ``cross_task`` tool by POSTing to
++``/api/plugins/kanban/tasks/<id>/comments``, the same endpoint the Kanban drawer uses. The endpoint
++stamped every note ``writer_kind='human'``, so an agent's cross-gateway comment reached the worker
++as "from the operator" (comment 179201; the agent-261aa31f49 fix covered only the in-process
++``kanban_comment`` tool). The courier now declares ``writer_kind='agent'`` with the sender session.
++
++Provenance may only be lowered by the caller: ``agent`` is accepted, an explicit ``human`` claim is
++refused (human stays the endpoint's own default for the GUI), as are unknown kinds and a session
++claim without an agent kind. A refused request stores nothing.
++"""
++from __future__ import annotations
++
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++import tools.kanban_tools as kt
++from tests.tools import test_kanban_comment_injection as inj
++from tests.tools.test_kanban_comment_writer_kind import AGENT_HEADER, OPERATOR_HEADER, _payload, _ready_task
++
++worker_home = inj.worker_home
++FakeAgent = inj.FakeAgent
++
++
++@pytest.fixture
++def client(worker_home, monkeypatch):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    spec = importlib.util.spec_from_file_location(
++        "kanban_dash_api_actor", Path(kt.__file__).resolve().parents[1] / "plugins/kanban/dashboard/plugin_api.py")
++    mod = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, spec.name, mod)
++    spec.loader.exec_module(mod)
++    app = FastAPI()
++    app.include_router(mod.router)
++    return TestClient(app)
++
++
++def _comments(tid: str) -> list:
++    conn = kbc.connect()
++    try:
++        return kb.list_comments(conn, tid)
++    finally:
++        conn.close()
++
++
++def _last_payload(tid: str) -> dict:
++    return _payload(tid, _comments(tid)[-1].id)
++
++
++def test_courier_agent_comment_records_agent_and_session(client):
++    tid = _ready_task()
++    r = client.post(f"/tasks/{tid}/comments", json={
++        "body": "Please re-check (c) yourself", "author": "Fix flaky test",
++        "writer_kind": "agent", "writer_session": "sess-cross-1"})
++    assert r.status_code == 200, r.text
++    p = _last_payload(tid)
++    assert p["writer_kind"] == "agent"
++    assert p["writer_session"] == "sess-cross-1"
++
++
++def test_courier_agent_comment_without_session_is_still_agent(client):
++    tid = _ready_task()
++    r = client.post(f"/tasks/{tid}/comments", json={"body": "x", "author": "a", "writer_kind": "agent"})
++    assert r.status_code == 200, r.text
++    p = _last_payload(tid)
++    assert p["writer_kind"] == "agent" and "writer_session" not in p
++
++
++@pytest.mark.parametrize("author", ["desktop", "user", "dashboard", None])
++def test_gui_comment_without_actor_stays_human(client, author):
++    """The Kanban drawer (author 'desktop'), the blocked panel ('user') and the web dashboard send
++    no actor: those are people typing, recorded human as before."""
++    tid = _ready_task()
++    body = {"body": "why are you asking me?"}
++    if author is not None:
++        body["author"] = author
++    r = client.post(f"/tasks/{tid}/comments", json=body)
++    assert r.status_code == 200, r.text
++    assert _last_payload(tid)["writer_kind"] == "human"
++
++
++@pytest.mark.parametrize("extra", [
++    {"writer_kind": "human"},                                   # forged human authority
++    {"writer_kind": "human", "writer_session": "sess-x"},
++    {"writer_kind": "robot"},                                   # unknown kind
++    {"writer_kind": ""},
++    {"writer_session": "sess-x"},                               # session claim with no agent kind
++])
++def test_forged_or_malformed_actor_is_refused_and_stores_nothing(client, extra):
++    tid = _ready_task()
++    r = client.post(f"/tasks/{tid}/comments", json={"body": "do it yourself", "author": "desktop", **extra})
++    assert r.status_code == 400, r.text
++    assert _comments(tid) == []
++
++
++def test_non_string_actor_is_rejected_by_the_schema(client):
++    tid = _ready_task()
++    r = client.post(f"/tasks/{tid}/comments", json={"body": "x", "writer_kind": {"kind": "human"}})
++    assert r.status_code == 422, r.text
++    assert _comments(tid) == []
++
++
++@pytest.mark.parametrize("session, stored", [("   ", None), ("s" * 500, "s" * 200)])
++def test_agent_session_is_trimmed_and_clipped(client, session, stored):
++    tid = _ready_task()
++    r = client.post(f"/tasks/{tid}/comments", json={"body": "x", "writer_kind": "agent", "writer_session": session})
++    assert r.status_code == 200, r.text
++    p = _last_payload(tid)
++    assert p["writer_kind"] == "agent" and p.get("writer_session") == stored
++
++
++def test_courier_agent_note_reaches_worker_as_agent(client, monkeypatch):
++    tid, _run = inj._running_worker(monkeypatch)
++    agent = FakeAgent()
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False  # seed
++    r = inj._as_other_session(lambda: client.post(f"/tasks/{tid}/comments", json={
++        "body": "Please re-check (c) yourself, then complete.", "author": "default",
++        "writer_kind": "agent", "writer_session": "sess-cross-2"}))
++    assert r.status_code == 200, r.text
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    note = agent.steers[0]
++    assert note.startswith("New note " + AGENT_HEADER), note
++    assert "(agent chat" in note and "from the operator" not in note
++
++
++def test_gui_note_reaches_worker_from_the_operator(client, monkeypatch):
++    tid, _run = inj._running_worker(monkeypatch)
++    agent = FakeAgent()
++    inj._unthrottle()
++    kt.inject_new_comments_from_env(agent)  # seed
++    r = inj._as_other_session(lambda: client.post(f"/tasks/{tid}/comments", json={
++        "body": "why are you asking me?", "author": "desktop"}))
++    assert r.status_code == 200, r.text
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    note = agent.steers[0]
++    assert note.startswith("New note " + OPERATOR_HEADER), note
++    assert "agent chat" not in note
+-- 
+2.55.0
+

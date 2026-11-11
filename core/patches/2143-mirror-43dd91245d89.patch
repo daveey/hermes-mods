@@ -1,0 +1,143 @@
+From 43dd91245d8938acf097196a5fa9bf1591f778ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:35:26 -0800
+Subject: [PATCH] [daveey] Retain withdrawal custody across wake dispatch and
+ older claim acknowledgments
+
+Review found two interleavings missed by archive-before-claim/passive-only fixtures. Worker owns ack after dispatched wake; archive cleanup requires no later unclaimed events. Remove unfenced surface cleanup. RED: 2 behavioral failures with 8 controls passing. GREEN: 32 focused tests then final 42 tests across five files; independent re-review still pending.
+---
+ gateway/kanban_watchers_notifier.py           |  4 +-
+ hermes_cli/kanban_db_notify.py                |  4 +-
+ .../test_kanban_request_withdrawal.py         | 60 +++++++++++++++++++
+ tui_gateway/kanban_unloaded.py                |  3 +
+ tui_gateway/session_notifications.py          |  2 +-
+ 5 files changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 5b05374b036..c8388210be1 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -868,6 +868,4 @@ class _KanbanNotification:
+         await self.advance()
+         if not is_push:
+             self.clear_failures()
+-        # Unsubscribe only on archive; ``done`` is reversible.
+-        if self.task and self.task.status == "archived":
+-            await self.unsub()
++        # advance/ack removes archived subscriptions only after all events drain.
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index 2f5ac0773f0..3d6e251a529 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -868,7 +868,9 @@ def ack_notify_claim(
+             "WHERE s.task_id = ? AND s.platform = ? AND s.chat_id = ? AND s.thread_id = ?", key,
+         ).fetchone()
+         if row is not None and row["inflight_from"] is None and row["status"] == "archived":
+-            conn.execute("DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE, key)
++            conn.execute("DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE
++                         + " AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = ? AND e.id > ?)",
++                         (*key, task_id, int(upto)))
+     return cur.rowcount > 0
+ 
+ 
+diff --git a/tests/tui_gateway/test_kanban_request_withdrawal.py b/tests/tui_gateway/test_kanban_request_withdrawal.py
+index 35876ddb821..82ba896392a 100644
+--- a/tests/tui_gateway/test_kanban_request_withdrawal.py
++++ b/tests/tui_gateway/test_kanban_request_withdrawal.py
+@@ -90,6 +90,66 @@ def test_unloaded_withdrawal_retries_failed_persist(tmp_path, monkeypatch, desti
+         assert ku.sweep_once(set(), now=time.time() + 3600, session_db=opener) == []
+ 
+ 
++def test_older_claim_ack_preserves_unclaimed_withdrawal():
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="Decision", assignee="worker")
++        ident = dict(task_id=tid, platform="tui", chat_id="old-claim", thread_id="")
++        kbn.add_notify_sub(conn, **ident)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='blocked', human_request=? WHERE id=?",
++                         ('{"action":"Choose"}', tid))
++            kb._append_event(conn, tid, "blocked", {})
++        claims = []
++        assert server._collect_kanban_notifications({"session_key": "old-claim"}, claims)
++        kb.archive_task(conn, tid)
++        assert kbn.ack_notify_claim(conn, upto=claims[0]["new"], from_cursor=claims[0]["old"], **ident)
++        assert len(kbn.list_notify_subs(conn, task_id=tid)) == 1
++        texts = server._collect_kanban_notifications({"session_key": "old-claim"})
++        assert len(texts) == 1 and "request withdrawn" in texts[0]
++
++
++def test_dispatched_withdrawal_keeps_claim_until_worker_persists(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    from tui_gateway import kanban_unloaded as ku
++
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "1")
++    ku._reset_wake_budget_for_tests()
++    pending = []
++    def spawn(job):
++        pending.append(job)
++        return "dispatched"
++    with closing(SessionDB(tmp_path / "state.db")) as db, closing(kbc.connect()) as conn:
++        sid = "withdrawal-dispatched"
++        db.create_session(sid, "desktop")
++        tid = kb.create_task(conn, title="Decision", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=sid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='blocked', human_request=? WHERE id=?",
++                         ('{"action":"Choose"}', tid))
++        kb.archive_task(conn, tid)
++        @contextmanager
++        def opener(chat_id):
++            yield db, sid
++        def fail(*args, **kwargs):
++            raise RuntimeError("write unavailable")
++        try:
++            assert len(ku.sweep_once(set(), now=time.time() + 3600, session_db=opener,
++                                    wake=lambda *args: "refused", holders=list, spawn=spawn)) == 1
++            assert len(kbn.list_notify_subs(conn, task_id=tid)) == 1
++            with monkeypatch.context() as m:
++                m.setattr(db, "append_kanban_notice", fail)
++                assert pending.pop()() == "error"
++            assert len(kbn.list_notify_subs(conn, task_id=tid)) == 1
++            assert len(ku.sweep_once(set(), now=time.time() + 3600, session_db=opener,
++                                    wake=lambda *args: "refused", holders=list, spawn=spawn)) == 1
++            assert pending.pop()() == "refused"
++            assert kbn.list_notify_subs(conn, task_id=tid) == []
++            assert len([m for m in db.get_messages(sid) if m.get("display_kind") == "kanban_notice"]) == 1
++        finally:
++            for job in pending:
++                job()
++
++
+ def test_request_withdrawal_is_deliverable_on_both_surfaces():
+     from gateway import kanban_watchers_notifier as notifier
+     ev = SimpleNamespace(kind="request_withdrawn", payload={})
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 651806e605c..540112b6aea 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -428,6 +428,9 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+     if verdict is None:  # a worker slot is ours: the job wakes, or writes the row itself
+         try:
+             verdict = spawn(lambda: _wake_job(wake, session_db, slug, ident, tip, text, metadata, old, new, now))
++            # The worker alone owns ack/rewind, including synchronous test dispatch.
++            return {"board": slug, "task_id": ident["task_id"], "chat_id": ident["chat_id"], "session_id": tip,
++                    "texts": texts, "woken": verdict == "started", "wake_result": verdict, "held_by": held_by}
+         except Exception:
+             _wake_slots.release()
+             logger.warning("kanban sweep could not start a wake for %s", tip, exc_info=True)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index b033ed90f7b..e17a205854e 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -813,7 +813,7 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+             # flight is removed by their ack instead, so the claim it records survives until delivery. [daveey]
+             if task and getattr(task, "status", "") == "archived" and (not sub_texts or claim is None):
+                 with contextlib.suppress(Exception):
+-                    _kbn.remove_notify_sub(conn, **sub_ident)
++                    _kbn.ack_notify_claim(conn, upto=_new, from_cursor=_old, **sub_ident)
+     from hermes_constants import get_hermes_home
+     from tui_gateway.kanban_consumer_health import polled
+     polled(get_hermes_home(), session_key, _kb.kanban_db_path(board=slug))
+-- 
+2.55.0
+

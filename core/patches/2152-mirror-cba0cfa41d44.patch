@@ -1,0 +1,256 @@
+From cba0cfa41d440e0d74a5399997986d68864c5a76 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:58:00 +0000
+Subject: [PATCH] feat(kanban): stamp run_machine on session-kanban-tasks rows
+ [daveey]
+
+The Desktop linked-card strip shows whether a running or waiting card runs on
+the hub or a worker. Each listed card (local board and replica) gets
+run_machine: the lease holder while running or assigned, a single
+machine:<m> pin, worker-pool for worker-first-v1 cards, else created_on.
+---
+ hermes_cli/kanban_chat_links.py               |  7 +-
+ hermes_cli/kanban_run_machine.py              | 79 ++++++++++++++++
+ .../kanban_session_activity_card_details.py   |  3 +
+ tests/hermes_cli/test_kanban_run_machine.py   | 93 +++++++++++++++++++
+ 4 files changed, 181 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_run_machine.py
+ create mode 100644 tests/hermes_cli/test_kanban_run_machine.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 267eb4a709f..e6c3564e48d 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -24,6 +24,8 @@ import time
+ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
++from hermes_cli.kanban_run_machine import placement_select, run_machine
++
+ _log = logging.getLogger(__name__)
+ 
+ KINDS = ("created", "shepherd")
+@@ -320,7 +322,8 @@ _replica_rows: dict[tuple[str, str, str], tuple[tuple, list[dict[str, Any]]]] =
+ def _read_replica_links(conn: sqlite3.Connection, gateway: str, profile: str) -> list[dict[str, Any]]:
+     return [dict(r) for r in conn.execute(
+         "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+-        "t.priority, t.block_kind, t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind, "
++        f"t.priority, t.block_kind, t.human_request, t.created_on, {placement_select(conn, 't')}, "
++        "l.chat_session, l.chat_profile, l.kind, "
+         "EXISTS (SELECT 1 FROM task_chat_links r WHERE r.task_id = l.task_id AND r.chat_gateway = l.chat_gateway "
+         "AND r.chat_profile IS l.chat_profile AND r.chat_session = l.chat_session AND r.released = 1) "
+         "AS chat_released "
+@@ -480,6 +483,8 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+                 "released": False, "reported_status": status, "synced_at": pulled, "stale": stale,
+                 "source": "replica",
+             }
++            if machine := run_machine(r):
++                out[pair]["run_machine"] = machine
+     return list(out.values())
+ 
+ 
+diff --git a/hermes_cli/kanban_run_machine.py b/hermes_cli/kanban_run_machine.py
+new file mode 100644
+index 00000000000..a1c4030e420
+--- /dev/null
++++ b/hermes_cli/kanban_run_machine.py
+@@ -0,0 +1,79 @@
++"""Which machine a listed card runs (or will run) on, for the Desktop linked-card strip. [daveey]
++
++``run_machine`` is display-only: the Board decides placement. It reads the card's own columns:
++- a running card, or one holding an unexpired lease (a Board assignment), runs on its ``lease_holder``;
++- a waiting card pinned to one machine (``runs_on: ["machine:<m>"]``) runs on ``<m>``;
++- a ``worker-first-v1`` card waits for the origin's worker pool (``POOL``);
++- other ``runs_on`` labels (or an explicit ``[]``) name no single machine (None);
++- otherwise the card runs where it was created (``created_on``).
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from typing import Any, Optional
++
++POOL = "worker-pool"
++_PLACEMENT = ("runs_on", "placement_policy", "lease_holder", "lease_expires")
++_LOCAL = (*_PLACEMENT, "created_on")
++
++
++def _labels(raw: Any) -> Optional[list[str]]:
++    if raw is None or raw == "":
++        return None
++    if isinstance(raw, str):
++        try:
++            raw = json.loads(raw)
++        except ValueError:
++            return None
++    return [str(x) for x in raw] if isinstance(raw, list) else None
++
++
++def _leased(row: dict[str, Any], now_ms: float) -> bool:
++    try:
++        return row.get("status") == "running" or float(row.get("lease_expires") or 0) > now_ms
++    except (TypeError, ValueError):
++        return False
++
++
++def run_machine(row: dict[str, Any], now: Optional[float] = None) -> Optional[str]:
++    """The machine name ``row`` runs on, ``POOL`` for a worker-pool card not yet leased, or None when unknown."""
++    lease = str(row.get("lease_holder") or "")
++    if lease and _leased(row, (time.time() if now is None else now) * 1000):
++        return lease
++    labels = _labels(row.get("runs_on"))
++    machines = [x[len("machine:"):] for x in labels or [] if x.startswith("machine:")]
++    if len(machines) == 1:
++        return machines[0] or None
++    if row.get("placement_policy") == "worker-first-v1":
++        return POOL
++    if labels is not None:
++        return None
++    return str(row.get("created_on") or "") or None
++
++
++def placement_select(conn: sqlite3.Connection, alias: str = "", names: tuple[str, ...] = _PLACEMENT) -> str:
++    """SELECT terms for ``names`` of ``tasks`` (aliased ``alias``); a column an older board lacks reads NULL."""
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    pre = f"{alias}." if alias else ""
++    return ", ".join(f"{pre}{c}" if c in cols else f"NULL AS {c}" for c in names)
++
++
++def add_run_machines(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
++    """Stamp ``run_machine`` on each listed card from its board row (display-only: a failed read stamps nothing)."""
++    if not found:
++        return
++    ids = list(found)
++    try:
++        got = conn.execute(f"SELECT id, {placement_select(conn, names=_LOCAL)} FROM tasks "
++                           f"WHERE id IN ({','.join('?' for _ in ids)})", ids).fetchall()
++    except sqlite3.Error:
++        return
++    for r in got:
++        card = found.get(r[0])
++        if card is not None:
++            row = dict(zip(_LOCAL, r[1:]))
++            if machine := run_machine({**row, "status": card.get("status")}):
++                card["run_machine"] = machine
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index 18b7801cf99..bd961eef751 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -6,6 +6,8 @@ import re
+ import sqlite3
+ from typing import Any
+ 
++from hermes_cli.kanban_run_machine import add_run_machines
++
+ _PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+ _NOTE_CHARS = 200
+ 
+@@ -57,3 +59,4 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+         found[task_id]["note"] = line
+     for task_id, (_, url) in prs.items():
+         found[task_id]["pr_url"] = url
++    add_run_machines(conn, found)  # where each card runs: the strip's hub/worker mark
+diff --git a/tests/hermes_cli/test_kanban_run_machine.py b/tests/hermes_cli/test_kanban_run_machine.py
+new file mode 100644
+index 00000000000..55f497662fd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_run_machine.py
+@@ -0,0 +1,93 @@
++"""Where a listed card runs, for the Desktop strip's hub/worker mark (``kanban_run_machine``). [daveey]"""
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.kanban_run_machine import POOL, add_run_machines, run_machine
++
++
++@pytest.mark.parametrize("row,want", [
++    ({"status": "running", "lease_holder": "hub", "runs_on": '["machine:worker-1"]'}, "hub"),  # the lease wins
++    ({"status": "running", "lease_holder": "worker-1", "created_on": "hub"}, "worker-1"),
++    # A ready card's expired lease names where it last ran, not where it will: its pin does.
++    ({"status": "ready", "lease_holder": "worker-1", "lease_expires": 1_000, "runs_on": '["machine:hub"]'}, "hub"),
++    # An unexpired lease on a waiting card is the Board's assignment.
++    ({"status": "ready", "lease_holder": "hub", "lease_expires": 4e12, "placement_policy": "worker-first-v1"}, "hub"),
++    ({"status": "todo", "runs_on": '["machine:worker-1"]', "created_on": "hub"}, "worker-1"),
++    ({"status": "ready", "runs_on": ["machine:hub"]}, "hub"),  # already decoded
++    ({"status": "ready", "placement_policy": "worker-first-v1", "created_on": "hub"}, POOL),
++    ({"status": "ready", "runs_on": '["linux"]', "created_on": "hub"}, None),  # any machine with the label
++    ({"status": "ready", "runs_on": "[]", "created_on": "hub"}, None),  # explicit any machine
++    ({"status": "ready", "runs_on": '["machine:a", "machine:b"]', "created_on": "hub"}, None),
++    ({"status": "scheduled", "created_on": "macbook"}, "macbook"),  # unplaced: runs where it was created
++    ({"status": "running", "created_on": "hub"}, "hub"),  # no sync lease: still its origin
++    ({"status": "ready"}, None),
++    ({"status": "ready", "runs_on": "{bad", "created_on": "hub"}, "hub"),  # undecodable pin reads as none
++])
++def test_run_machine(row, want):
++    assert run_machine(row) == want
++
++
++def test_add_run_machines_tolerates_old_boards():
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
++    conn.execute("INSERT INTO tasks VALUES ('t1', 'ready')")
++    found = {"t1": {"id": "t1", "status": "ready"}}
++    add_run_machines(conn, found)
++    assert "run_machine" not in found["t1"]
++
++
++def _board(path):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.execute(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL, assignee TEXT, session_id TEXT, "
++        "created_at INTEGER, started_at INTEGER, runs_on TEXT, placement_policy TEXT, lease_holder TEXT, "
++        "created_on TEXT)")
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, 'default', 's_me', 100, NULL, ?, ?, ?, 'hub')", [
++        ("t_hub", "On hub", "running", '["machine:hub"]', None, "hub"),
++        ("t_w", "On worker", "running", None, "worker-first-v1", "worker-1"),
++        ("t_pool", "Pool wait", "ready", None, "worker-first-v1", None),
++        ("t_pin", "Pinned", "todo", '["machine:worker-1"]', None, None),
++        ("t_here", "Unplaced", "scheduled", None, None, None),
++    ])
++    conn.commit()
++    conn.close()
++
++
++def test_session_tasks_stamp_run_machine(tmp_path, monkeypatch):
++    root = tmp_path / ".hermes"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setattr(ksa, "_kanban_root", lambda: root, raising=False)
++    monkeypatch.setattr(ksa, "_remote_cards", lambda ids, statuses, stale_ok: [])
++    _board(root / "kanban.db")
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [root / "kanban.db"])
++    ksa._reset_cache_for_tests()
++    got = {t["id"]: t.get("run_machine") for t in ksa.session_tasks(["s_me"])}
++    assert got == {"t_hub": "hub", "t_w": "worker-1", "t_pool": POOL, "t_pin": "worker-1", "t_here": "hub"}
++
++
++def test_replica_cards_stamp_run_machine(tmp_path, monkeypatch):
++    rep = tmp_path / "default.db"
++    conn = sqlite3.connect(rep)
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT, runs_on TEXT, "
++        "placement_policy TEXT, lease_holder TEXT);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, "
++        "chat_session TEXT, kind TEXT, released INTEGER, created_at INTEGER);")
++    conn.executemany("INSERT INTO tasks VALUES (?, 't', ?, 'w', 1, NULL, 0, NULL, NULL, 'macbook', ?, NULL, ?)", [
++        ("t_hub", "running", None, "hub"), ("t_mac", "ready", None, None)])
++    conn.executemany("INSERT INTO task_chat_links VALUES (?, ?, 'hub', 'default', 's1', 'shepherd', 0, 1)",
++                     [("u1", "t_hub"), ("u2", "t_mac")])
++    conn.commit()
++    conn.close()
++    monkeypatch.setattr(links, "_ledger_owners", lambda stale_ok=False: {})
++    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
++    got = {c["id"]: c.get("run_machine") for c in links.replica_cards(None, "hub", ksa.LISTED_STATUSES,
++                                                                      replicas=[("default", rep)])}
++    assert got == {"t_hub": "hub", "t_mac": "macbook"}
+-- 
+2.55.0
+

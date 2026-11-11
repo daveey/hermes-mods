@@ -1,0 +1,153 @@
+From febd289a6b34d53e200023a7f7c56e658121cc5b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:11:28 +0000
+Subject: [PATCH] fix(gateway): session.title.suggest runs under the profile's
+ secret scope [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Desktop rename pre-fill (⌘⇧E) always came back empty on the hub. The
+handler called the title_generation aux model with no profile secret scope.
+On a multiplexed gateway the credential pool's ANTHROPIC_TOKEN read raised
+UnscopedSecretError; suggest_short_name swallowed it at DEBUG level and
+returned title=null, so the dialog kept the old title and logged nothing.
+On a single-profile gateway the same call read the launch profile's
+credentials for a secondary profile's session.
+
+- Decorate the handler with @_profile_scoped, as llm.oneshot already is.
+- Log suggestion failures at WARNING so a silent empty pre-fill shows up in
+  the gateway log.
+
+Live repro (hub serve, sys.remote_exec probe): call_llm raised
+UnscopedSecretError at credential_pool._seed_anthropic_singletons; the RPC
+returned {title: None} in about 150 ms.
+---
+ agent/title_generator.py                      |  6 ++-
+ tests/agent/test_short_name_suggest.py        |  6 ++-
+ .../test_multi_profile_hosting_fail_closed.py | 43 +++++++++++++++++++
+ tui_gateway/methods_session.py                | 11 +++--
+ 4 files changed, 56 insertions(+), 10 deletions(-)
+
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index 9943fa8a1a3..05cfc3a6f36 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -847,8 +847,10 @@ def suggest_short_name(messages: list, *, timeout: float = 30.0, llm: Callable[.
+         )
+         message = response.choices[0].message
+         title = _clean_title(_extract_title_text(message.content or "") or _title_from_reasoning(message))
+-    except Exception:
+-        logger.debug("Short-name suggestion failed", exc_info=True)
++    except Exception as exc:
++        # WARNING, not DEBUG: a swallowed failure here is invisible to the user (the rename dialog just
++        # isn't pre-filled), so the log is the only place it can surface.
++        logger.warning("Short-name suggestion failed: %s: %s", type(exc).__name__, exc, exc_info=True)
+         return None
+     if not title:
+         return None
+diff --git a/tests/agent/test_short_name_suggest.py b/tests/agent/test_short_name_suggest.py
+index 6565741c4da..8bc48f71a62 100644
+--- a/tests/agent/test_short_name_suggest.py
++++ b/tests/agent/test_short_name_suggest.py
+@@ -37,9 +37,11 @@ def test_suggest_lowercases_and_parses_json():
+     assert calls[0]["task"] == "title_generation"
+ 
+ 
+-def test_suggest_fails_open():
++def test_suggest_fails_open(caplog):
+     def boom(**kw):
+         raise RuntimeError("no provider")
+ 
+-    assert suggest_short_name([{"role": "user", "content": "x"}], llm=boom) is None
++    with caplog.at_level("WARNING", logger="agent.title_generator"):
++        assert suggest_short_name([{"role": "user", "content": "x"}], llm=boom) is None
++    assert "Short-name suggestion failed: RuntimeError: no provider" in caplog.text
+     assert suggest_short_name([], llm=boom) is None
+diff --git a/tests/tui_gateway/test_multi_profile_hosting_fail_closed.py b/tests/tui_gateway/test_multi_profile_hosting_fail_closed.py
+index a1527e861d1..4d49e4de472 100644
+--- a/tests/tui_gateway/test_multi_profile_hosting_fail_closed.py
++++ b/tests/tui_gateway/test_multi_profile_hosting_fail_closed.py
+@@ -140,6 +140,49 @@ def test_rpc_scope_reaches_llm_oneshot_and_model_options(two_homes, monkeypatch)
+     assert seen["options"] == (b, B_VAL, None)
+ 
+ 
++@pytest.mark.usefixtures("two_homes")
++def test_session_title_suggest_runs_under_the_requested_profiles_scope(monkeypatch):
++    """⌘⇧E rename pre-fill: the aux call must see the requested profile's secrets. Unscoped on a
++    multiplexed gateway, its credential read raised UnscopedSecretError, suggest_short_name swallowed
++    it and the dialog silently got ``title: null``."""
++    import contextlib
++
++    from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active
++
++    seen = []
++
++    class _DB:
++        def resolve_session_id(self, target):
++            return target
++
++        def get_messages(self, key):
++            return [{"role": "user", "content": "rename me"}]
++
++    @contextlib.contextmanager
++    def fake_profile_db(params=None, *, writer=False):
++        yield _DB()
++
++    def fake_suggest(messages, **kwargs):
++        try:
++            seen.append((get_secret("A_ONLY_TOKEN"), get_secret("B_ONLY_TOKEN")))
++        except UnscopedSecretError:
++            seen.append("unscoped")
++            return None
++        return "renamed chat"
++
++    monkeypatch.setattr(server, "_profile_db", fake_profile_db)
++    monkeypatch.setattr("agent.title_generator.suggest_short_name", fake_suggest)
++
++    r = server._methods["session.title.suggest"]("r1", {"session_key": "s1", "profile": "b"})
++    assert r["result"]["title"] == "renamed chat", (r, seen)
++    assert seen[-1] == (None, B_VAL)
++    assert is_multiplex_active()
++    # The launch profile on the now-multiplexed gateway (the hub's own sessions): its own scope.
++    r = server._methods["session.title.suggest"]("r2", {"session_key": "s2"})
++    assert r["result"]["title"] == "renamed chat", (r, seen)
++    assert seen[-1] == (A_VAL, None)
++
++
+ @pytest.mark.parametrize("route", ["session.compress", "slash.compress"])
+ def test_manual_compress_routes_bind_the_sessions_full_runtime_scope(two_homes, monkeypatch, route):
+     """Manual compression must resolve secrets from its session across an A→B→A sequence."""
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 3f00070cd7e..0d3318026cd 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -1262,9 +1262,10 @@ def _(rid, params: dict, session: dict, db) -> dict:
+ 
+ 
+ @method("session.title.suggest")
++@_profile_scoped
+ def _(rid, params: dict) -> dict:
+-    """Suggest a short recognizable name (2-4 lowercase words) for a session from its transcript —
+-    Desktop's ⌘⇧N rename pre-fill. Read-only; ``title`` is None when nothing could be suggested."""
++    """A 2-4 lowercase-word name from the transcript (⌘⇧E rename pre-fill), ``title`` None if none. Scoped: unscoped,
++    its aux credential read raised UnscopedSecretError on a multiplexed gateway (always null)."""
+     from agent.title_generator import suggest_short_name
+     target = str(params.get("session_key") or params.get("session_id") or "")
+     if not target:
+@@ -1274,10 +1275,8 @@ def _(rid, params: dict) -> dict:
+         if db is None:
+             return _db_unavailable_error(rid, code=5007)
+         try:
+-            if live is not None:
+-                key = live["session_key"]
+-            else:
+-                key = (db.resolve_session_id(target) if hasattr(db, "resolve_session_id") else None) or target
++            key = live["session_key"] if live is not None else (
++                (db.resolve_session_id(target) if hasattr(db, "resolve_session_id") else None) or target)
+             messages = db.get_messages(key)
+         except Exception as e:
+             return _err(rid, 5007, str(e))
+-- 
+2.55.0
+

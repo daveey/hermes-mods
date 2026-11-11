@@ -1,0 +1,126 @@
+From 9d5b19bcfb5cdae6bbcbf86012d3f0e222155f5e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:48:52 -0800
+Subject: [PATCH] [daveey] Preserve withdrawal receipts past gateway failures
+ and in wake text
+
+Root: failure-cap unsub discarded undelivered withdrawal; wake-only discarded passive semantics. Tests previously exercised one failure and wake count, not exhausted failures and content. Proof: both modes RED at failure cap; after retention fix both RED for absent no-answer wording; cumulative five-file regression batch exits 0. No historical replay or successful outcome synthesis.
+---
+ gateway/kanban_watchers_notifier.py           | 14 +++++---
+ locales/en.yaml                               |  1 +
+ .../gateway/test_kanban_request_withdrawal.py | 32 ++++++++++++++-----
+ 3 files changed, 35 insertions(+), 12 deletions(-)
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index c8388210be1..235b1acad7c 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -514,13 +514,17 @@ def _fmt_timed_out(ev, n) -> tuple:
+     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
+ 
+ 
++def _fmt_request_withdrawn(ev, n):
++    detail = ("the card was archived. No answer is needed for this request; "
++              "this is not approval and not proof of completion.")
++    return f"ℹ {n.head} request withdrawn: {detail}", f"Request withdrawn: {detail}", None
++
++
+ # archived / unblocked are claimed (so the cursor advances past them) but
+ # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
+ # never wake the creator.
+ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+-    "request_withdrawn": lambda ev, n: (f"ℹ {n.head} request withdrawn: the card was archived. "
+-                                      "No answer is needed for this request; this is not approval "
+-                                      "and not proof of completion.", None, None),
++    "request_withdrawn": _fmt_request_withdrawn,
+     "completed": _fmt_completed,
+     "blocked": _fmt_blocked,
+     "gave_up": _fmt_failure("gave_up"),
+@@ -598,7 +602,9 @@ class _KanbanNotification:
+         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
+         self.sub_fail_counts[self.sub_key] = fails
+         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
+-        if fails >= MAX_SEND_FAILURES:
++        # Withdrawal is a durable revocation receipt, not a disposable ping.
++        has_withdrawal = any(ev.kind == "request_withdrawn" for ev in self.d["events"])
++        if fails >= MAX_SEND_FAILURES and not has_withdrawal:
+             logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
+             await self.unsub()
+             self.clear_failures()
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 81708870686..0fd54d53f2a 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -228,6 +228,7 @@ gateway:
+     truncated_suffix: "… (truncated; use `hermes kanban …` in your terminal for full output)"
+     no_output: "(no output)"
+     wake:
++      request_withdrawn: "request withdrawn (not approval or proof of completion)"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/tests/gateway/test_kanban_request_withdrawal.py b/tests/gateway/test_kanban_request_withdrawal.py
+index 9e347d970c6..0bccdb22e4f 100644
+--- a/tests/gateway/test_kanban_request_withdrawal.py
++++ b/tests/gateway/test_kanban_request_withdrawal.py
+@@ -2,33 +2,49 @@
+ import asyncio
+ from contextlib import closing
+ 
++import pytest
++
++from gateway import kanban_watchers_notifier as notifier
++
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_notify as kbn
+ from tests.gateway import test_kanban_changes_requested_notifier as helpers
+ 
+ 
+-def test_withdrawal_send_failure_keeps_subscription_until_retry(tmp_path, monkeypatch):
++@pytest.mark.parametrize("mode", ["notify+wake", "wake"])
++def test_withdrawal_send_failure_keeps_subscription_until_retry(tmp_path, monkeypatch, mode):
+     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "withdrawal.db"))
+     kb.init_db()
+     with closing(kbc.connect()) as conn:
+         tid = kb.create_task(conn, title="Decision", assignee="worker")
+         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+-                           thread_id="topic-7", delivery_mode="notify+wake")
++                           thread_id="topic-7", delivery_mode=mode)
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='blocked', human_request=? WHERE id=?",
+                          ('{"action":"Choose"}', tid))
+         kb.archive_task(conn, tid)
+         adapter = helpers.RecordingAdapter(fail_send=True)
+-        asyncio.run(helpers._run_one_tick(monkeypatch, helpers._runner(adapter)))
+-        assert kbn.list_notify_subs(conn, task_id=tid)
++        runner = helpers._runner(adapter)
++        async def fail_wake(event):
++            raise RuntimeError("wake unavailable")
++        adapter.handle_message = fail_wake
++        for _ in range(notifier.MAX_SEND_FAILURES + 1):
++            runner._running = True
++            asyncio.run(helpers._run_one_tick(monkeypatch, runner))
++            assert kbn.list_notify_subs(conn, task_id=tid)
+         assert adapter.handled == []
+         adapter = helpers.RecordingAdapter()
+         asyncio.run(helpers._run_one_tick(monkeypatch, helpers._runner(adapter)))
+-        assert len(adapter.sent) == 1
+-        assert "request withdrawn" in adapter.sent[0]["text"]
+-        assert "not proof of completion" in adapter.sent[0]["text"]
++        assert len(adapter.sent) == (1 if mode == "notify+wake" else 0)
++        if adapter.sent:
++            assert "request withdrawn" in adapter.sent[0]["text"]
++            assert "not proof of completion" in adapter.sent[0]["text"]
+         assert len(adapter.handled) == 1
++        text = adapter.handled[0].text
++        assert "No answer is needed" in text
++        assert "not approval" in text and "not proof of completion" in text
++        assert "gateway.kanban.wake.request_withdrawn" not in text
+         assert kbn.list_notify_subs(conn, task_id=tid) == []
+         asyncio.run(helpers._run_one_tick(monkeypatch, helpers._runner(adapter)))
+-        assert len(adapter.sent) == 1
++        assert len(adapter.handled) == 1
+-- 
+2.55.0
+

@@ -1,0 +1,179 @@
+From c2e6769d9ef8b17b6cfe157ff843c8a5619c3f82 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:00:03 +0000
+Subject: [PATCH] fix(desktop): show @ mention rows on the keystroke, not after
+ complete.path [daveey]
+
+Contributed @ sources (session/task mentions, bots) answer from memory, but
+their rows only reached the popover inside the fetcher, after the 60 ms
+debounce and the session owner's complete.path round trip. On a remote
+gateway that round trip is the whole perceived typeahead lag.
+
+useLiveCompletionAdapter takes an optional instant(query): while a new
+query's fetch is pending, search() returns those rows instead of the
+previous query's. useAtCompletions passes the contributed rows; path rows
+join when the answer lands.
+---
+ .../hooks/use-at-completions-contrib.test.tsx | 40 +++++++++++++++
+ .../chat/composer/hooks/use-at-completions.ts | 17 ++++++-
+ .../hooks/use-live-completion-adapter.ts      | 50 +++++++++++++++----
+ 3 files changed, 97 insertions(+), 10 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-at-completions-contrib.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-at-completions-contrib.test.tsx
+index 94a19f892de..a6ca14f335d 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-at-completions-contrib.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-at-completions-contrib.test.tsx
+@@ -211,6 +211,46 @@ describe('contributed @ completion sources', () => {
+     expect(rows[0]).toBe('@researcher')
+     expect(rows.length).toBeGreaterThan(1)
+   })
++  it('shows contributed rows on the keystroke, before a slow complete.path answers', async () => {
++    vi.useFakeTimers()
++    addSource('sessions', q => ('typeahead'.startsWith(q) ? [{ insert: '@session:abc', display: 'typeahead is slow' }] : []))
++
++    // The session owner is a remote gateway: complete.path takes a second.
++    const gateway = {
++      request: vi.fn(
++        () => new Promise(resolve => setTimeout(() => resolve({ items: [{ text: '@file:src/typeahead.ts', display: 'typeahead.ts' }] }), 1_000))
++      )
++    }
++
++    const { result } = renderHook(() => useAtCompletions({ gateway: gateway as never, sessionId: 's1', cwd: '/repo' }))
++
++    let first: readonly { label: string }[] = []
++    act(() => {
++      first = result.current.adapter.search?.('typ') || []
++    })
++    expect(first.map(r => r.label)).toEqual(['typeahead is slow'])
++
++    // Next keystroke, still before any answer: the rows follow the new query.
++    let second: readonly { label: string }[] = []
++    act(() => {
++      second = result.current.adapter.search?.('typx') || []
++    })
++    expect(second.map(r => r.label)).not.toContain('typeahead is slow')
++
++    // Path rows join once the round trip lands; the contributed row still leads.
++    const settled = await searchAndRead(result, 'typ')
++    expect(settled.length).toBeGreaterThan(0)
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(1_200)
++    })
++    let rows: readonly { label: string }[] = []
++    act(() => {
++      rows = result.current.adapter.search?.('typ') || []
++    })
++    expect(rows[0]?.label).toBe('typeahead is slow')
++    expect(rows.some(r => r.label.includes('typeahead.ts'))).toBe(true)
++  })
++
+   it('re-asks an open popover when a source signals its rows changed', async () => {
+     vi.useFakeTimers()
+     let rows: Array<{ insert: string; meta?: string }> = []
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-at-completions.ts b/apps/desktop/src/app/chat/composer/hooks/use-at-completions.ts
+index 9ac869cc497..406b53b61c4 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-at-completions.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-at-completions.ts
+@@ -307,7 +307,22 @@ export function useAtCompletions(options: {
+   // nothing when the answer is already in hand.
+   const isCached = useCallback((query: string) => hasCachedPathCompletion(cacheKey(query)), [cacheKey])
+ 
+-  return useLiveCompletionAdapter({ enabled, epoch: sourceEpoch, fetcher, isCached, toItem })
++  // Contributed sources answer from memory (session/task mentions, bots), so
++  // their rows show on the keystroke instead of waiting out the debounce and
++  // the owner's `complete.path` round trip, which on a remote gateway is the
++  // whole perceived lag. Path rows join when that answer lands.
++  const instant = useCallback(
++    (query: string): CompletionEntry[] => {
++      const { entries, claimedHandles } = contributedEntries(query)
++
++      return mergeCompletionEntries(entries, [], claimedHandles)
++    },
++    // sourceEpoch: a source's rows changed behind its cache.
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++    [contributedEntries, sourceEpoch]
++  )
++
++  return useLiveCompletionAdapter({ enabled, epoch: sourceEpoch, fetcher, instant, isCached, toItem })
+ }
+ 
+ /** Re-export `classify` for use by the formatter (insertion side). */
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-live-completion-adapter.ts b/apps/desktop/src/app/chat/composer/hooks/use-live-completion-adapter.ts
+index 39059deb313..a6aad714942 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-live-completion-adapter.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-live-completion-adapter.ts
+@@ -39,9 +39,15 @@ export function useLiveCompletionAdapter(options: {
+    *  an unchanged query would keep serving what it fetched before the source
+    *  changed, because the adapter de-dupes on the query alone. */
+   epoch?: number | string
++  /** Rows the caller can answer synchronously for a query (in-memory sources).
++   *  While the fetch for a new query is debounced or in flight, `search` shows
++   *  these instead of the previous query's rows, so they appear on the same
++   *  keystroke rather than after the round trip. The fetched answer replaces
++   *  them when it lands. An empty answer keeps the held rows. */
++  instant?: (query: string) => CompletionEntry[]
+   toItem: (entry: CompletionEntry, index: number) => Unstable_TriggerItem
+ }): { adapter: Unstable_TriggerAdapter; loading: boolean } {
+-  const { enabled, debounceMs = 60, epoch = 0, fetcher, isCached, toItem } = options
++  const { enabled, debounceMs = 60, epoch = 0, fetcher, instant, isCached, toItem } = options
+ 
+   const [state, setState] = useState<{ query: string; items: Unstable_TriggerItem[] }>({
+     query: EMPTY_QUERY,
+@@ -140,20 +146,46 @@ export function useLiveCompletionAdapter(options: {
+     [cancelTimer, debounceMs, enabled, fetcher, isCached, toItem]
+   )
+ 
+-  const adapter = useMemo<Unstable_TriggerAdapter>(
+-    () => ({
++  const adapter = useMemo<Unstable_TriggerAdapter>(() => {
++    // `search` runs on every render of the popover; compute the instant rows
++    // once per query.
++    let held: { query: string; items: Unstable_TriggerItem[] } | null = null
++
++    const instantItems = (query: string): Unstable_TriggerItem[] => {
++      if (!instant || !enabled) {
++        return []
++      }
++
++      if (held?.query !== query) {
++        let entries: CompletionEntry[] = []
++
++        try {
++          entries = instant(query)
++        } catch {
++          entries = []
++        }
++
++        held = { query, items: entries.map((entry, index) => toItem(entry, index)) }
++      }
++
++      return held.items
++    }
++
++    return {
+       categories: () => [],
+       categoryItems: () => [],
+       search: (query: string) => {
+-        if (query !== state.query) {
+-          scheduleFetch(query)
++        if (query === state.query) {
++          return state.items
+         }
+ 
+-        return state.items
++        scheduleFetch(query)
++        const early = instantItems(query)
++
++        return early.length > 0 ? early : state.items
+       }
+-    }),
+-    [scheduleFetch, state]
+-  )
++    }
++  }, [enabled, instant, scheduleFetch, state, toItem])
+ 
+   return { adapter, loading }
+ }
+-- 
+2.55.0
+

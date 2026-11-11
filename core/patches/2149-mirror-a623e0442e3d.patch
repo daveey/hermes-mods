@@ -1,0 +1,817 @@
+From a623e0442e3d88ebc74adb528d8d66037c09661d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:11:22 +0000
+Subject: [PATCH] fix(kanban): CLI comments record an agent writer when an
+ agent's process ran them [daveey]
+
+`hermes kanban comment` hardcoded writer_kind='human', so an agent running the CLI (a chat
+agent's terminal tool, execute_code, coach plugins spawned by the gateway, other harnesses)
+reached the worker as "from the operator", and the ask-gate read it as David's words.
+
+The CLI now records `agent` when the CLI process or any ancestor STARTED with an agent-harness
+marker (HERMES_AGENT/AI_AGENT, which every terminal-tool shell carries, plus the worker,
+delegated-child, execute_code, session, supervised-gateway and Desktop-backend identities,
+CLAUDECODE). Start-time environments (/proc/<pid>/environ, KERN_PROCARGS2 via psutil) are
+used, not os.environ: every hermes entrypoint setdefaults HERMES_AGENT itself, and `env -i` or
+`unset` inside the agent's shell does not clear the shell's own start env.
+
+No flag or variable asserts human. Human needs a complete walk to init with no marker; an
+inconclusive walk (psutil unusable, a vanished ancestor, an unreadable non-root process, the
+depth cap) records agent. Only root's unreadable process (a root real/effective/saved uid:
+sshd, launchd, macOS setuid login; or a non-dumpable sshd-session whose /proc environ is
+root's) is skipped, so a person's ssh or Terminal.app shell stays human while
+`sudo -u <other>` can't skip past the agent's own processes. Only the places a person types `/kanban` (the CLI composer
+and a gateway platform message from a non-bot author, excluding api_server/webhook payloads
+and internal events) pass run_slash(human_typed=True); a programmatic run_slash gets the
+ancestry check.
+
+Markers reach the agent's own tools and leave the GUI: stdio MCP servers now inherit the
+non-secret HERMES_AGENT/AI_AGENT, and both Desktop launch envs (`hermes desktop` and the
+post-update relaunch) drop the agent markers so the Electron terminal pane (a person's shell)
+starts clean (the backend re-advertises them itself).
+
+Residual: a same-user process that deliberately destroys its marked ancestry (exec env -i
+replacing the tool shell, daemonizing) or hands its command to a person's long-lived process
+(tmux send-keys, at, ssh to another host) is evasion or a handoff, not provenance. Windows walks
+end inconclusive (agent). Not covered: a dashboard-token POST that omits writer_kind is still
+recorded human (follow-up card t_01a1c8058acf9d74).
+
+Task t_01a1c7b27ca3b496 (follow-up to PR #1025 review finding 1).
+---
+ gateway/slash_commands.py                     |  12 +-
+ hermes_cli/cli_commands_mixin.py              |   2 +-
+ hermes_cli/kanban.py                          |  22 +-
+ hermes_cli/kanban_comment_writer.py           | 160 +++++++
+ hermes_cli/main_desktop.py                    |   4 +-
+ hermes_cli/top_level_env.py                   |  16 +-
+ .../test_kanban_cli_comment_writer.py         | 402 ++++++++++++++++++
+ .../tools/test_kanban_comment_writer_kind.py  |   6 +-
+ tools/mcp_tool_config.py                      |   5 +
+ 9 files changed, 617 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_comment_writer.py
+ create mode 100644 tests/hermes_cli/test_kanban_cli_comment_writer.py
+
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index d5296795ed7..7bf574dd0d8 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -35,6 +35,10 @@ from utils import atomic_json_write, is_truthy_value
+ 
+ logger = logging.getLogger("gateway.run")
+ 
++# [daveey] Sources whose "/kanban" text is a payload (an API client, a webhook body), not a person
++# typing: their kanban comments get the CLI's ancestry provenance, never ``human`` by fiat.
++_UNTYPED_SLASH_PLATFORMS = frozenset({"api_server", "webhook", "msgraph_webhook"})
++
+ 
+ # /rollback result keys -> i18n line for files the safe restore left alone.
+ _ROLLBACK_SKIP_LINES = (("skipped_user_edits", "gateway.rollback.kept_user_edits"),
+@@ -369,7 +373,13 @@ class GatewaySlashCommandsMixin(
+                 action = tok
+                 break
+         try:
+-            output = await asyncio.to_thread(run_slash, text)
++            # [daveey] A person's /kanban message: comments it writes are the person's. API and webhook
++            # payloads, bot authors and internal events are not a person typing; they get the CLI's
++            # ancestry check.
++            src = getattr(event, "source", None)
++            human_typed = (getattr(getattr(src, "platform", None), "value", None) not in _UNTYPED_SLASH_PLATFORMS
++                           and not getattr(src, "is_bot", False) and not getattr(event, "internal", False))
++            output = await asyncio.to_thread(run_slash, text, human_typed=human_typed)
+         except Exception as exc:  # pragma: no cover - defensive
+             return t("gateway.kanban.error_prefix", error=exc)
+ 
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index fd1a625c685..15d6564312a 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -1239,7 +1239,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
+         if rest.startswith("kanban"):
+             rest = rest[len("kanban"):].lstrip()
+         try:
+-            output = run_slash(rest)
++            output = run_slash(rest, human_typed=True)  # [daveey] typed at the composer
+         except Exception as exc:  # pragma: no cover - defensive
+             output = _t("kanban.failed", error=exc)
+         if output:
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index b0a37fe2802..ebcd5722c19 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1084,11 +1084,18 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
+             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
+     author = args.author or _profile_author()
++    # [daveey] /kanban (run_slash) is typed into a chat composer: human. The CLI is human only when
++    # no process in its ancestry started with an agent-harness marker (kanban_comment_writer).
++    if getattr(args, "_slash_typed", False):
++        writer_kind, writer_session = "human", None
++    else:
++        from hermes_cli.kanban_comment_writer import cli_comment_writer
++        writer_kind, writer_session, _evidence = cli_comment_writer()
+     with kbc.connect_closing() as conn:
+         try:
+-            # [daveey] The CLI and /kanban slash command are typed by a person; agents use the tool.
+             kb.add_comment(conn, args.task_id, author, body,
+-                           origin_gateway=getattr(args, "origin_gateway", None), writer_kind="human")
++                           origin_gateway=getattr(args, "origin_gateway", None),
++                           writer_kind=writer_kind, writer_session=writer_session)
+         except ValueError as exc:
+             return _err(f"kanban comment: {exc}", 2)
+         live = kb.live_run_id(conn, args.task_id)
+@@ -1909,9 +1916,13 @@ Read-only commands are safe while an agent is running.\
+ """
+ 
+ 
+-def run_slash(rest: str) -> str:
++def run_slash(rest: str, *, human_typed: bool = False) -> str:
+     """Execute a ``/kanban …`` string (``rest`` = everything after ``/kanban``) and return captured
+-    stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical."""
++    stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical.
++
++    ``human_typed``: only the composer/platform-message ingress points pass True (a person typed
++    the line); any other caller (an agent's script importing this) gets the CLI's ancestry check
++    for comment provenance. [daveey]"""
+     import io
+ 
+     # Non-posix split (Windows) keeps backslashes as path separators but
+@@ -1963,6 +1974,9 @@ def run_slash(rest: str) -> str:
+         return f"⚠ /kanban usage error\n{body}" if body else "⚠ /kanban usage error"
+     except argparse.ArgumentError as exc:
+         return f"⚠ /kanban usage error\n{_usage_for_error()}\n{exc}"
++    # [daveey] Set after parsing, so no argv spelling can claim it; only the ingress callers say a
++    # person typed this /kanban line.
++    args._slash_typed = bool(human_typed)
+ 
+     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+         try:
+diff --git a/hermes_cli/kanban_comment_writer.py b/hermes_cli/kanban_comment_writer.py
+new file mode 100644
+index 00000000000..d73db487903
+--- /dev/null
++++ b/hermes_cli/kanban_comment_writer.py
+@@ -0,0 +1,160 @@
++"""Who ran ``hermes kanban comment``: an agent's tool subprocess or a person's shell. [daveey]
++
++The ``commented`` event's ``writer_kind`` decides whether a worker hears a note "from the operator"
++(and the ask-gate treats it as David's words). The CLI hardcoded ``human``, yet agents run it too:
++a terminal-tool command, an ``execute_code`` script, a plugin subprocess of the gateway, a
++delegated child, another harness (Claude Code, Codex) driving ``hermes``. Their notes reached
++workers as the operator's.
++
++The signal is the agent-harness environment Hermes gives every tool subprocess, read from the
++process ANCESTRY's start-time environments, not from this process's mutable ``os.environ``:
++
++* every hermes entrypoint ``setdefault``s ``HERMES_AGENT``/``AI_AGENT`` in its own ``os.environ``
++  (so the CLI's own value is useless); the start-time environment (``/proc/<pid>/environ``,
++  ``KERN_PROCARGS2`` on macOS) is what the parent passed to ``exec`` and never changes later;
++* the terminal tool's shell (local backend: ``build_subprocess_env`` copies the agent's
++  ``os.environ``), the ``execute_code`` child, a worker's tools, a delegated child and the supervised
++  gateway service are each started with one of :data:`AGENT_ENV_MARKERS`; a person's login shell,
++  ssh session or the Desktop terminal pane (launched by launchd/sshd/Electron) carries none;
++* walking the ancestors means ``env -i hermes kanban comment`` or ``unset HERMES_AGENT`` inside the
++  agent's shell still finds the agent: the shell that ran it was itself started with the markers.
++
++No input asserts ``human``: no flag, no variable. Human is only a COMPLETE walk to init that found
++no marker; an inconclusive walk (psutil unusable, an ancestor vanishing mid-walk, a same-user
++process whose environment can't be read, the depth cap) records ``agent``. Only ROOT's unreadable
++process is skipped (``login``/``sshd``, launchd, a setuid ``login`` whose effective uid is root, a
++non-dumpable ``sshd-session`` whose environ is root's): an agent's own processes are this user's
++and readable. The ``/kanban`` slash command typed into a chat composer passes ``human`` explicitly
++(``run_slash(human_typed=True)`` at its ingress points). Fail-safe direction: a leaked marker (a
++terminal app started from an agent, the TUI's ``!`` shell) labels a person's note ``agent``, which
++only withholds operator authority; so does Windows, where an unreadable or exited ancestor (the
++parent of ``explorer.exe``) leaves every walk inconclusive. Out of reach: a same-user process that
++deliberately destroys its marked ancestry (``exec env -i`` replacing the tool shell, double-fork
++daemonizing) or hands its command to a process outside its ancestry (``tmux send-keys``, ``at``,
++``ssh <host> hermes kanban comment``, whose remote sshd session starts clean) — evasion or a
++handoff, not provenance, which needs real authentication. Not covered here: the dashboard API
++(``POST /api/plugins/kanban/tasks/<id>/comments``) still records ``human`` for any token holder
++that omits ``writer_kind`` (``plugin_api_comment_actor``); that server-side gap is a follow-up.
++"""
++from __future__ import annotations
++
++import os
++from typing import Callable, Mapping, Optional
++
++# Any one, non-empty, in a process's start-time environment marks it (and its descendants) as an
++# agent's. HERMES_AGENT/AI_AGENT: every terminal-tool shell exports them (BaseEnvironment
++# ._wrap_command) and every hermes process inherits them into its children; AI_AGENT also names
++# other harnesses. The rest are Hermes' per-context tool-subprocess identities.
++AGENT_ENV_MARKERS: tuple[str, ...] = (
++    "HERMES_KANBAN_WORKER_TASK",       # a Kanban worker's tool subprocesses
++    "HERMES_KANBAN_TASK",              # the worker process itself
++    "HERMES_DELEGATED_CHILD_CONTEXT",  # a delegate_task child's subprocesses
++    "HERMES_RPC_SOCKET",               # an execute_code script
++    "HERMES_SESSION_ID",               # a chat agent's terminal tool (when its session is bound)
++    "HERMES_AGENT",                    # Hermes harness attribution (always in tool shells)
++    "AI_AGENT",                        # cross-harness attribution standard
++    "CLAUDECODE",                      # Claude Code's Bash tool
++    "HERMES_SUPERVISED_CHILD",         # the systemd/launchd gateway service and all it spawns
++    "HERMES_DESKTOP",                  # a Desktop agent backend (`serve`), never the GUI's terminal
++)
++
++MAX_ANCESTRY = 64
++
++
++class Inconclusive(Exception):
++    """The ancestry could not be read far enough to rule an agent out."""
++
++
++# (ppid, start-time environ, or None for root's unreadable process) for a pid. Raises
++# :class:`Inconclusive` when the pid is gone or any other process can't be read.
++ProcReader = Callable[[int], tuple[int, Optional[Mapping[str, str]]]]
++
++
++def env_agent_marker(env: Optional[Mapping[str, str]]) -> Optional[str]:
++    """The first :data:`AGENT_ENV_MARKERS` name set (non-blank) in ``env``, else None."""
++    if not env:
++        return None
++    for name in AGENT_ENV_MARKERS:
++        if str(env.get(name) or "").strip():
++            return name
++    return None
++
++
++def _read_proc(pid: int) -> tuple[int, Optional[Mapping[str, str]]]:
++    try:
++        import psutil
++    except ImportError as exc:
++        raise Inconclusive("psutil unavailable") from exc
++    try:
++        proc = psutil.Process(pid)
++        ppid = proc.ppid()
++    except psutil.Error as exc:
++        raise Inconclusive(f"pid {pid}: {type(exc).__name__}") from exc
++    try:
++        return ppid, proc.environ()
++    except (psutil.Error, OSError) as exc:
++        if _foreign(proc, pid):  # root's login/sshd, launchd, a non-dumpable sshd-session
++            return ppid, None
++        raise Inconclusive(f"pid {pid}: environment unreadable") from exc
++
++
++def _foreign(proc, pid: int) -> bool:
++    """True when ``proc`` is root's rather than this user's: any of its real/effective/saved uids
++    is root (``sshd``, launchd, macOS setuid ``login``, which keeps the user's real uid), or
++    (Linux) its ``environ`` is owned by root (a non-dumpable process such as ``sshd-session``,
++    whose memory is root's). Only ROOT counts: a process of a third uid stays inconclusive, so
++    ``sudo -u <other> hermes kanban comment`` (every agent process looks foreign to <other>)
++    can't walk past the agent to a clean init. An agent's own processes are this user's and
++    dumpable. POSIX only: on Windows an unreadable process stays inconclusive."""
++    getuid = getattr(os, "getuid", None)
++    if getuid is None or getuid() == 0:
++        return False  # root reads every environ; nothing above it is foreign
++    try:
++        uids = tuple(proc.uids())
++    except Exception:  # health: allow BLE001 -- psutil/OS variance: fall through to the stat check
++        uids = ()
++    if 0 in uids:
++        return True
++    try:
++        return os.stat(f"/proc/{pid}/environ").st_uid == 0
++    except OSError:
++        return False
++
++
++def agent_ancestor(pid: Optional[int] = None, *, read: Optional[ProcReader] = None) -> Optional[str]:
++    """``"<pid>:<MARKER>"`` for the nearest process from ``pid`` (default: this one) up to init
++    whose start-time environment carries an agent marker; None after a complete clean walk.
++    Raises :class:`Inconclusive` when the walk can't be completed."""
++    read = read or _read_proc
++    current = os.getpid() if pid is None else int(pid)
++    seen: set[int] = set()
++    for _ in range(MAX_ANCESTRY):
++        if current in seen:
++            raise Inconclusive(f"ancestry loop at pid {current}")
++        seen.add(current)
++        ppid, environ = read(current)
++        marker = env_agent_marker(environ)
++        if marker:
++            return f"{current}:{marker}"
++        if current == 1 or ppid <= 0:
++            return None  # reached init (or a root with no parent): complete
++        current = ppid
++    raise Inconclusive(f"ancestry deeper than {MAX_ANCESTRY}")
++
++
++def cli_comment_writer(*, read: Optional[ProcReader] = None,
++                       env: Optional[Mapping[str, str]] = None) -> tuple[str, Optional[str], str]:
++    """``(writer_kind, writer_session, evidence)`` for a comment written by this CLI process.
++
++    ``agent`` when this process or any ancestor started with an agent marker, or when that can't
++    be ruled out; ``human`` only after a complete walk found none. ``writer_session`` is the agent's
++    inherited ``HERMES_SESSION_ID`` when it has one."""
++    env = os.environ if env is None else env
++    try:
++        found = agent_ancestor(read=read)
++    except Inconclusive as exc:
++        found = f"inconclusive:{exc}"
++    if found is None:
++        return "human", None, "clean-ancestry"
++    session = str(env.get("HERMES_SESSION_ID") or "").strip()[:200] or None
++    return "agent", session, found
+diff --git a/hermes_cli/main_desktop.py b/hermes_cli/main_desktop.py
+index cad7c5582bf..085b7dbceb2 100644
+--- a/hermes_cli/main_desktop.py
++++ b/hermes_cli/main_desktop.py
+@@ -1702,8 +1702,8 @@ def _desktop_launch_env(args: argparse.Namespace) -> tuple[dict, list[str]]:
+     """Electron child env + config-supplied extra flags. ``desktop.*`` config is bridged to env vars
+     Electron already reads; an explicit env var wins over config (and over keychain detection)."""
+     from hermes_constants import socket_safe_tmpdir, with_hermes_node_path
+-    # with_hermes_node_path() copies os.environ when called with no arg.
+-    env = with_hermes_node_path()
++    from hermes_cli.top_level_env import drop_agent_attribution
++    env = drop_agent_attribution(with_hermes_node_path())  # a copy of os.environ, minus the harness
+     tmpdir = env.get("TMPDIR", "")
+     if sys.platform == "linux" and len(os.fsencode(tmpdir)) > _ELECTRON_TMPDIR_MAX_BYTES:
+         # A longer TMPDIR hangs requestSingleInstanceLock(). Only Chromium's socket dir moves:
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index 29eeaa20f42..ced294ad91e 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -36,11 +36,25 @@ def scrub_leaked_worker_env(environ: Optional[MutableMapping[str, str]] = None)
+     return strip_agent_scope_env(os.environ if environ is None else environ)
+ 
+ 
++_AGENT_ATTRIBUTION_KEYS = ("HERMES_AGENT", "AI_AGENT", "HERMES_DESKTOP", "HERMES_SUPERVISED_CHILD",
++                           "HERMES_SESSION_ID")
++
++
++def drop_agent_attribution(env: dict[str, str]) -> dict[str, str]:
++    """``env`` without the agent-harness markers (main()'s advertisement, a backend's or service's
++    identity), for launching the Desktop GUI: Electron is not an agent, and its terminal pane (a
++    person's shell) copies Electron's env, so a CLI comment typed there must not read as an
++    agent's (kanban_comment_writer). The backend Electron spawns re-advertises them. [daveey]"""
++    for key in _AGENT_ATTRIBUTION_KEYS:
++        env.pop(key, None)
++    return env
++
++
+ def clean_launch_env(base: Optional[MutableMapping[str, str]] = None) -> dict[str, str]:
+     """A copy of ``base`` (default ``os.environ``) safe to hand to a top-level app launch."""
+     env = dict(os.environ if base is None else base)
+     scrub_leaked_worker_env(env)
+-    return env
++    return drop_agent_attribution(env)
+ 
+ 
+ def _first_positional(argv: Sequence[str]) -> str:
+diff --git a/tests/hermes_cli/test_kanban_cli_comment_writer.py b/tests/hermes_cli/test_kanban_cli_comment_writer.py
+new file mode 100644
+index 00000000000..9ce559cbf0a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_cli_comment_writer.py
+@@ -0,0 +1,402 @@
++"""``hermes kanban comment`` records who ran it: an agent's tool subprocess or a person. [daveey]
++
++Regression: ``_cmd_comment`` hardcoded ``writer_kind='human'``, so an agent's terminal running
++``hermes kanban comment`` (a chat agent's terminal tool, coach plugins spawned by the gateway,
++execute_code scripts, other harnesses) reached workers as "from the operator". The signal is the
++agent-harness marker in the start-time environment of the CLI process or any ancestor; no input
++asserts human, and an inconclusive walk is not human.
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban
++from hermes_cli import kanban_comment_writer as kcw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++import tools.kanban_tools as kt
++from tests.tools import test_kanban_comment_injection as inj
++from tests.waiting import wait_until
++
++worker_home = inj.worker_home
++AGENT_HEADER = "on your kanban task from another agent session (delivered mid-run)"
++OPERATOR_HEADER = "on your kanban task from the operator (delivered mid-run)"
++Table = dict  # pid -> (ppid, start-time environ or None for another user's unreadable process)
++
++
++def _tree(procs: Table):
++    def read(pid):
++        if pid not in procs:
++            raise kcw.Inconclusive(f"pid {pid} gone")
++        return procs[pid]
++    return read
++
++
++def _me(env, ppid: int, rest: Table):
++    return _tree({os.getpid(): (ppid, env), **rest})
++
++
++# A person's login shell (macOS Terminal / ssh): no process carries a marker; root's login/sshd and
++# launchd/init are another user's (unreadable, skipped).
++HUMAN_SHELL: Table = {500: (400, {"HOME": "/Users/d", "SHELL": "/bin/zsh"}), 400: (1, None), 1: (0, None)}
++# The terminal tool's shell: started by the Hermes agent with the harness markers (and the chat's
++# session id); the agent process itself was launched by launchd with none.
++AGENT_TERMINAL: Table = {
++    600: (550, {"HERMES_AGENT": "true", "AI_AGENT": "hermes-agent", "HERMES_SESSION_ID": "sess-a"}),
++    550: (1, {"HOME": "/Users/d"}), 1: (0, None)}
++
++
++def _payload(tid: str, cid: int) -> dict:
++    with kbc.connect_closing() as conn:
++        for e in kb.list_events(conn, tid):
++            if e.kind == "commented" and (e.payload or {}).get("comment_id") == cid:
++                return e.payload
++    raise AssertionError(f"no commented event for comment {cid}")
++
++
++def _task() -> str:
++    with kbc.connect_closing() as conn:
++        return kb.create_task(conn, title="t")
++
++
++def _last_comment(tid: str) -> int:
++    with kbc.connect_closing() as conn:
++        return kb.list_comments(conn, tid)[-1].id
++
++
++def _cli_comment(tid: str, text: str) -> int:
++    """``hermes kanban comment <tid> <text>`` through the real CLI parser and dispatcher."""
++    parser = argparse.ArgumentParser(prog="hermes")
++    kanban.build_parser(parser.add_subparsers(dest="command"))
++    args = parser.parse_args(["kanban", "comment", tid, *text.split()])
++    assert kanban.kanban_command(args) == 0
++    return _last_comment(tid)
++
++
++# --- the signal ---------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("marker", kcw.AGENT_ENV_MARKERS)
++def test_each_marker_marks_an_agent(marker):
++    assert kcw.env_agent_marker({marker: "x"}) == marker
++    assert kcw.env_agent_marker({marker: "  "}) is None
++    assert kcw.env_agent_marker({"HOME": "/h"}) is None
++
++
++def test_human_shell_has_no_agent_ancestor():
++    assert kcw.agent_ancestor(read=_me({"HOME": "/h"}, 500, HUMAN_SHELL)) is None
++
++
++def test_agent_terminal_is_found_through_the_parent_shell():
++    # The CLI's own start env lacks the markers (``env -i`` / ``unset`` inside the agent's shell):
++    # the shell that ran it still started with them.
++    assert kcw.agent_ancestor(read=_me({"PATH": "/usr/bin"}, 600, AGENT_TERMINAL)) == "600:HERMES_SESSION_ID"
++
++
++def test_gateway_service_descendant_is_an_agent():
++    # A plugin subprocess of the systemd/launchd gateway (coach notes), even with a scrubbed env.
++    gw = {700: (1, {"HERMES_SUPERVISED_CHILD": "1", "HERMES_HOME": "/h"}), 1: (0, None)}
++    assert kcw.agent_ancestor(read=_me({}, 700, gw)) == "700:HERMES_SUPERVISED_CHILD"
++
++
++@pytest.mark.parametrize("table", [
++    {10: (11, {}), 11: (10, {})},                    # loop
++    {10: (99, {})},                                  # an ancestor vanished mid-walk
++], ids=["loop", "vanished"])
++def test_an_incomplete_walk_is_not_human(table):
++    with pytest.raises(kcw.Inconclusive):
++        kcw.agent_ancestor(read=_me({}, 10, table))
++
++
++def test_depth_cap_is_not_human(monkeypatch):
++    monkeypatch.setattr(kcw, "MAX_ANCESTRY", 3)
++    with pytest.raises(kcw.Inconclusive):
++        kcw.agent_ancestor(read=_me({}, 10, {10: (11, {}), 11: (12, {}), 12: (1, {}), 1: (0, None)}))
++
++
++def test_inconclusive_records_agent():
++    def broken(pid):
++        raise kcw.Inconclusive("psutil unavailable")
++    kind, _session, evidence = kcw.cli_comment_writer(read=broken, env={"HERMES_AGENT": "true"})
++    assert kind == "agent" and evidence.startswith("inconclusive:")
++
++
++@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX uids")
++def test_same_user_unreadable_process_is_inconclusive(monkeypatch):
++    """psutil: a process that is not plainly this user's is skipped; this user's is inconclusive."""
++    import psutil
++
++    class P:
++        def __init__(self, uids):
++            self._uids = uids
++
++        def ppid(self):
++            return 1
++
++        def environ(self):
++            raise psutil.AccessDenied(4242)
++
++        def uids(self):
++            return self._uids
++
++    uid = os.getuid()  # windows-footgun: ok (POSIX-only test, skipped elsewhere)
++    if uid == 0:
++        pytest.skip("root reads every environ")
++    table = {4242: (uid, uid, uid), 1: (0, 0, 0), 77: (uid, 0, 0),  # 77: macOS setuid `login`
++             88: (uid + 1, uid + 1, uid + 1)}  # 88: a third user's process (`sudo -u other`)
++    monkeypatch.setattr(psutil, "Process", lambda pid: P(table[pid]))
++    monkeypatch.setattr(kcw.os, "stat", lambda path: SimpleNamespace(st_uid=uid))
++    with pytest.raises(kcw.Inconclusive):
++        kcw._read_proc(4242)
++    assert kcw._read_proc(1) == (1, None)
++    assert kcw._read_proc(77) == (1, None)
++    # Only root is foreign: from `sudo -u other`, the agent's own processes are a third uid's, and
++    # skipping them would walk past the agent to a clean init.
++    monkeypatch.setattr(kcw.os, "stat", lambda path: SimpleNamespace(st_uid=uid + 1))
++    with pytest.raises(kcw.Inconclusive):
++        kcw._read_proc(88)
++    # Linux non-dumpable same-uid process (sshd-session): /proc/<pid>/environ is root's.
++    monkeypatch.setattr(kcw.os, "stat", lambda path: SimpleNamespace(st_uid=0 if "4242" in path else uid))
++    assert kcw._read_proc(4242) == (1, None)
++
++
++NONDUMPABLE_PARENT = """
++import ctypes, subprocess, sys
++assert ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) == 0  # PR_SET_DUMPABLE = 0
++child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
++print(child.pid, flush=True)
++sys.stdin.readline()
++child.communicate(b"", timeout=30)
++"""
++
++
++@pytest.mark.skipif(not sys.platform.startswith("linux") or getattr(os, "geteuid", lambda: 0)() == 0,
++                    reason="Linux non-dumpable semantics; root reads every environ")
++def test_human_shell_under_a_real_nondumpable_parent_is_human():
++    """A person's ssh shell: its parent ``sshd-session`` runs as the user but is non-dumpable, so its
++    environ can't be read. That parent is skipped, not inconclusive, and the walk stays human."""
++    clean = {k: v for k, v in os.environ.items() if not kcw.env_agent_marker({k: v})}
++    parent = subprocess.Popen([sys.executable, "-c", NONDUMPABLE_PARENT], env=clean, text=True,
++                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
++    try:
++        assert parent.stdout is not None
++        child = int(parent.stdout.readline())
++        wait_until(lambda: _is_python(child), timeout=30)
++        assert kcw._read_proc(parent.pid) == (os.getpid(), None)
++        assert kcw.agent_ancestor(child, read=_bounded_read) is None
++    finally:
++        parent.communicate("\n", timeout=30)
++
++
++def _bounded_read(pid):
++    """The real reader, stopped at this test process (whose own ancestry may be an agent's)."""
++    if pid == os.getpid():
++        return 0, {}
++    return kcw._read_proc(pid)
++
++
++def _is_python(pid) -> bool:
++    import psutil
++    try:
++        return "python" in " ".join(psutil.Process(pid).cmdline())
++    except psutil.Error:
++        return False
++
++
++def test_real_process_start_env_is_read_and_later_setdefault_does_not_count():
++    """Real processes: a child spawned with a marker is an agent; a child spawned without one that
++    sets HERMES_AGENT in its own os.environ afterwards (what every hermes entrypoint does) is not."""
++    clean = {k: v for k, v in os.environ.items() if not kcw.env_agent_marker({k: v})}
++    code = "import os, sys; os.environ.setdefault('HERMES_AGENT', 'true'); sys.stdin.read()"
++    human = subprocess.Popen([sys.executable, "-c", code], env=clean, stdin=subprocess.PIPE)
++    agent = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
++                             env={**clean, "HERMES_KANBAN_WORKER_TASK": "t_x"})
++    try:
++        wait_until(lambda: _is_python(human.pid) and _is_python(agent.pid), timeout=30)
++        assert kcw.agent_ancestor(human.pid, read=_bounded_read) is None
++        assert kcw.agent_ancestor(agent.pid, read=_bounded_read) == f"{agent.pid}:HERMES_KANBAN_WORKER_TASK"
++    finally:
++        for p in (human, agent):
++            p.communicate(b"", timeout=30)
++
++
++# --- the CLI path end to end --------------------------------------------------------------------
++
++def test_cli_comment_from_agent_terminal_records_agent(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setenv("HERMES_SESSION_ID", "sess-a")
++    monkeypatch.setattr(kcw, "_read_proc", _me({"PATH": "/usr/bin"}, 600, AGENT_TERMINAL))
++    tid = _task()
++    p = _payload(tid, _cli_comment(tid, "Please re-check it yourself"))
++    assert p["writer_kind"] == "agent"
++    assert p["writer_session"] == "sess-a"
++
++
++def test_cli_comment_from_human_shell_records_human(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    # In-process, os.environ has HERMES_AGENT (main() sets it for every hermes command): it must
++    # not count; only the start-time environments do.
++    monkeypatch.setenv("HERMES_AGENT", "true")
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HOME": "/h"}, 500, HUMAN_SHELL))
++    tid = _task()
++    p = _payload(tid, _cli_comment(tid, "go ahead"))
++    assert p["writer_kind"] == "human"
++    assert "writer_session" not in p
++
++
++def test_typed_slash_command_is_human_inside_an_agent_process(worker_home, monkeypatch):
++    """``/kanban comment`` typed into the composer runs in the (marked) agent process itself."""
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HERMES_AGENT": "true"}, 600, AGENT_TERMINAL))
++    tid = _task()
++    assert "Comment added" in kanban.run_slash(f"comment {tid} why are you asking me?", human_typed=True)
++    assert _payload(tid, _last_comment(tid))["writer_kind"] == "human"
++
++
++def test_programmatic_run_slash_is_not_human(worker_home, monkeypatch):
++    """An agent's script importing ``run_slash`` gets the ancestry check, not the typed-line pass."""
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "_read_proc", _me({}, 600, AGENT_TERMINAL))
++    tid = _task()
++    assert "Comment added" in kanban.run_slash(f"comment {tid} re-check it yourself")
++    assert _payload(tid, _last_comment(tid))["writer_kind"] == "agent"
++
++
++@pytest.mark.asyncio
++async def test_gateway_platform_slash_comment_is_human(worker_home, monkeypatch):
++    """A Telegram/Discord user's ``/kanban comment`` (the gateway process is a marked agent host)."""
++    from gateway.config import Platform
++    from gateway.run import GatewayRunner
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HERMES_SUPERVISED_CHILD": "1"}, 1, {1: (0, None)}))
++    tid = _task()
++    runner = object.__new__(GatewayRunner)
++    source = SimpleNamespace(platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm", thread_id=None,
++                             user_id="u1")
++    event = SimpleNamespace(text=f"/kanban comment {tid} stop and ask me first", source=source,
++                            message_id="1", reply_to_message_id=None)
++    out = await GatewayRunner._handle_kanban_command(runner, event)
++    assert "Comment added" in out, out
++    assert _payload(tid, _last_comment(tid))["writer_kind"] == "human"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("platform,is_bot,internal", [("API_SERVER", False, False), ("WEBHOOK", False, False),
++                                                      ("DISCORD", True, False), ("TELEGRAM", False, True)],
++                         ids=["api", "webhook", "bot-author", "internal-event"])
++async def test_gateway_untyped_slash_comment_is_not_human_by_fiat(worker_home, monkeypatch, platform, is_bot,
++                                                                  internal):
++    """An API client's or webhook body's "/kanban comment", another bot's message or an internal event
++    is not a person typing."""
++    from gateway.config import Platform
++    from gateway.run import GatewayRunner
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HERMES_SUPERVISED_CHILD": "1"}, 1, {1: (0, None)}))
++    tid = _task()
++    runner = object.__new__(GatewayRunner)
++    source = SimpleNamespace(platform=getattr(Platform, platform), chat_id="c1", chat_type="dm",
++                             thread_id=None, user_id="u1", is_bot=is_bot)
++    event = SimpleNamespace(text=f"/kanban comment {tid} approve it", source=source, internal=internal,
++                            message_id="1", reply_to_message_id=None)
++    out = await GatewayRunner._handle_kanban_command(runner, event)
++    assert "Comment added" in out, out
++    assert _payload(tid, _last_comment(tid))["writer_kind"] == "agent"
++
++
++def test_mcp_stdio_server_env_carries_the_harness_marker(monkeypatch):
++    """A stdio MCP server is the agent's tool: its `hermes kanban comment` must find the marker."""
++    from tools.mcp_tool_config import _build_safe_env
++    monkeypatch.setenv("HERMES_AGENT", "true")
++    monkeypatch.setenv("AI_AGENT", "hermes-agent")
++    env = _build_safe_env(None)
++    assert kcw.env_agent_marker(env) == "HERMES_AGENT"
++
++
++def test_desktop_gui_launch_env_drops_the_harness_marker(monkeypatch):
++    """Electron (and so the Desktop terminal pane, a person's shell) must not start with it."""
++    from hermes_cli.main_desktop import _desktop_launch_env
++    monkeypatch.setenv("HERMES_AGENT", "true")
++    monkeypatch.setenv("AI_AGENT", "hermes-agent")
++    env, _flags = _desktop_launch_env(argparse.Namespace())
++    assert "HERMES_AGENT" not in env and "AI_AGENT" not in env
++
++
++def test_desktop_relaunch_env_drops_agent_markers(monkeypatch):
++    """Desktop reopened after an update run from an agent/backend starts its terminal pane clean."""
++    from hermes_cli.top_level_env import clean_launch_env
++    marked = {k: "1" for k in ("HERMES_AGENT", "AI_AGENT", "HERMES_DESKTOP", "HERMES_SUPERVISED_CHILD",
++                               "HERMES_SESSION_ID")}
++    assert kcw.env_agent_marker(clean_launch_env({"HOME": "/h", **marked})) is None
++
++
++def test_cli_composer_slash_comment_is_human(worker_home, monkeypatch):
++    from hermes_cli.cli_commands_mixin import CLICommandsMixin
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(kcw, "_read_proc", _me({"HERMES_AGENT": "true"}, 600, AGENT_TERMINAL))
++    tid = _task()
++    CLICommandsMixin._handle_kanban_command(object(), f"/kanban comment {tid} typed at the composer")
++    assert _payload(tid, _last_comment(tid))["writer_kind"] == "human"
++
++
++@pytest.mark.parametrize("forge", [["--writer-kind", "human"], ["--human"], ["--_slash_typed"],
++                                   ["--human-typed"]])
++def test_no_cli_input_asserts_human(forge):
++    parser = argparse.ArgumentParser(prog="hermes")
++    kanban.build_parser(parser.add_subparsers(dest="command"))
++    with pytest.raises(SystemExit):
++        parser.parse_args(["kanban", "comment", "t_1", "hi", *forge])
++
++
++def test_agent_cli_note_reaches_worker_as_another_agent(worker_home, monkeypatch):
++    tid, _run = inj._running_worker(monkeypatch)
++    agent = inj.FakeAgent()
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False  # seed
++    monkeypatch.setattr(kcw, "_read_proc", _me({}, 600, AGENT_TERMINAL))
++    inj._as_other_session(lambda: _cli_comment(tid, "re-check (c) yourself, then complete"))
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    note = agent.steers[0]
++    assert note.startswith("New note " + AGENT_HEADER), note
++    assert "from the operator" not in note
++
++
++def test_human_cli_note_reaches_worker_from_the_operator(worker_home, monkeypatch):
++    tid, _run = inj._running_worker(monkeypatch)
++    agent = inj.FakeAgent()
++    inj._unthrottle()
++    kt.inject_new_comments_from_env(agent)  # seed
++    monkeypatch.setattr(kcw, "_read_proc", _me({}, 500, HUMAN_SHELL))
++    inj._as_other_session(lambda: _cli_comment(tid, "stop the burners"))
++    inj._unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    assert agent.steers[0].startswith("New note " + OPERATOR_HEADER), agent.steers[0]
++
++
++def test_real_cli_subprocess_in_terminal_tool_shell_records_agent(worker_home):
++    """A real ``env -i hermes kanban comment`` inside the terminal tool's real wrapper script, run by
++    bash with the env the local backend gives it (the agent's os.environ, which carries
++    HERMES_AGENT). The wrapper is a multi-command script, so bash stays the CLI's marked parent."""
++    from tools.environments.local import LocalEnvironment
++    tid = _task()
++    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++    base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
++            "HERMES_HOME": os.environ["HERMES_HOME"], "PYTHONPATH": root}
++    inner = " ".join(f"{k}='{v}'" for k, v in base.items())
++    env = LocalEnvironment.__new__(LocalEnvironment)
++    env._snapshot_ready = False
++    env._session_id = "provtest0"
++    env._cwd_marker = "__HERMES_CWD_provtest0__"
++    env._snapshot_path = "/tmp/hermes-snap-provtest0.sh"
++    env._snapshot_passthrough_names = set()
++    wrapped = env._wrap_command(
++        f"env -i {inner} '{sys.executable}' -m hermes_cli.main kanban comment {tid} agent shell note", root)
++    proc = subprocess.run(["bash", "-c", wrapped], env={**base, "HERMES_AGENT": "true"},
++                          capture_output=True, text=True, timeout=180, check=False, cwd=root)
++    assert "Comment added" in proc.stdout, proc.stdout + proc.stderr
++    assert _payload(tid, _last_comment(tid))["writer_kind"] == "agent"
+diff --git a/tests/tools/test_kanban_comment_writer_kind.py b/tests/tools/test_kanban_comment_writer_kind.py
+index d1fd380ab30..5c5a6caedf1 100644
+--- a/tests/tools/test_kanban_comment_writer_kind.py
++++ b/tests/tools/test_kanban_comment_writer_kind.py
+@@ -66,7 +66,7 @@ def test_cli_comment_event_records_human_writer(worker_home, monkeypatch):
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     from hermes_cli import kanban
+     tid = _ready_task()
+-    assert "Comment added" in kanban.run_slash(f"comment {tid} why are you asking me?")
++    assert "Comment added" in kanban.run_slash(f"comment {tid} why are you asking me?", human_typed=True)
+     conn = kbc.connect()
+     try:
+         cid = kb.list_comments(conn, tid)[-1].id
+@@ -129,7 +129,7 @@ def test_spawn_context_labels_agent_comments_only(worker_home, monkeypatch):
+     from hermes_cli import kanban
+     tid = _ready_task()
+     kt._handle_comment({"task_id": tid, "body": "tool: re-check it yourself"})
+-    kanban.run_slash(f"comment {tid} human: why are you asking me?")
++    kanban.run_slash(f"comment {tid} human: why are you asking me?", human_typed=True)
+     conn = kbc.connect()
+     try:
+         kb.add_comment(conn, tid, "hub:gw:mac", "courier relay", writer_kind="agent")
+@@ -183,7 +183,7 @@ def test_mixed_notes_keep_operator_header_and_stamp_each_line(worker_home, monke
+     kt.inject_new_comments_from_env(agent)  # seed
+     _chat_tool_comment(tid, "agent says: re-check it yourself")
+     from hermes_cli import kanban
+-    inj._as_other_session(lambda: kanban.run_slash(f"comment {tid} why are you asking me?"))
++    inj._as_other_session(lambda: kanban.run_slash(f"comment {tid} why are you asking me?", human_typed=True))
+     inj._unthrottle()
+     assert kt.inject_new_comments_from_env(agent) is True
+     note = agent.steers[0]
+diff --git a/tools/mcp_tool_config.py b/tools/mcp_tool_config.py
+index 40d52e669ef..f5b82b3a919 100644
+--- a/tools/mcp_tool_config.py
++++ b/tools/mcp_tool_config.py
+@@ -216,6 +216,11 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
+     for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+         if key in os.environ:
+             env[key] = os.environ[key]
++    # [daveey] Harness attribution (non-secret): a stdio server is the agent's tool, so a
++    # `hermes kanban comment` it runs must not read as a person's (kanban_comment_writer).
++    for key in ("AI_AGENT", "HERMES_AGENT"):
++        if os.environ.get(key):
++            env[key] = os.environ[key]
+     # Pin the ACTIVE (served) profile's home so a stdio child never falls back to the
+     # platform-default home (issue #18594). Without it a child spawned by a multiplexed host
+     # or a dashboard/desktop backend serving ``--open-profile`` resolves HERMES_HOME to the
+-- 
+2.55.0
+

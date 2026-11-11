@@ -1,0 +1,506 @@
+From f17d732439b37babb65b2fc05656ba239ecf5373 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:35:30 +0000
+Subject: [PATCH] [daveey] fix(kanban): ready-wait alerts count from the last
+ run's end and name an active clock hold
+
+A run lost to a gateway restart is booked owner_restart_lost, which was not a ready-entry floor, so
+chat_wait_unclaimed and held_in_ready measured the wait from the run's claimed event: t_01a1a1dea9c64d6a's
+80-min run 163883 read as "ready 80 min with no worker" during its 120 s owner_restart_cooldown (twice on
+2026-11-10, after runs 163575 and 163883). The floor now adds owner_restart_lost and the latest
+task_runs.ended_at (events and runs paths; the chat-notice SQL prefilter derives from the same constant).
+held_in_ready names this episode's guard reason and its run-end clock (until/expired); chat_wait_unclaimed
+carries hold_reason/hold_until while a clock guard holds the card, and a failed lookup drops only the hold.
+Dispatch and the respawn guard are unchanged (read-only alerting).
+---
+ hermes_cli/kanban_chat_wait.py                |  55 ++++-
+ hermes_cli/kanban_diagnostics.py              |  59 ++++-
+ hermes_cli/kanban_parent_unclaimed.py         |  14 +-
+ .../test_kanban_ready_wait_restart_floor.py   | 228 ++++++++++++++++++
+ tests/tools/test_kanban_unblock_queue.py      |   3 +
+ 5 files changed, 340 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ready_wait_restart_floor.py
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 7917de1a787..5839e224117 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -88,21 +88,63 @@ def notice_text(payload: Any) -> str:
+     tid = str(payload.get("parent") or "<card>")[:64]
+     title = str(payload.get("parent_title") or "").strip()[:120]
+     named = f"{tid} ({title})" if title else tid
++    hold = ""
++    if payload.get("hold_reason") and payload.get("hold_until"):
++        stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["hold_until"])))
++        hold = f"; dispatcher hold {payload['hold_reason']} until {stamp}"
+     return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min with no "
+-            f"worker ({payload.get('queue') or 'queue place unknown'}). " + pu._options(tid) + ".")
++            f"worker ({payload.get('queue') or 'queue place unknown'}{hold}). " + pu._options(tid) + ".")
+ 
+ 
+-_FLOOR = ", ".join(f"'{k}'" for k in sorted({"created", "promoted", "reclaimed", "unblocked", "claimed",
+-                                              "spawned", "continuation_woken", "condition_met", "continued"}))
++def _floor_kinds() -> str:
++    from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++    return ", ".join(f"'{k}'" for k in sorted({*_READY_WAIT_FLOOR_KINDS, "continued"}))
++
++
++# Prefilter only (``pu.ready_since`` decides): the same event floor as the diagnostic, and the latest run's end,
++# so a long run that a restart requeued never counts as ready time. [daveey]
+ _CANDIDATES = (
+     "SELECT t.id, t.title, t.created_at FROM tasks t "
+     "WHERE t.status = 'ready' AND t.claim_lock IS NULL "
+     "AND (t.session_id IS NOT NULL OR EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = t.id)) "
+-    f"AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind IN ({_FLOOR})), "
+-    "t.created_at) BETWEEN ? AND ? ORDER BY t.id"
++    f"AND MAX(COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind IN "
++    f"({_floor_kinds()})), t.created_at), "
++    "COALESCE((SELECT MAX(r.ended_at) FROM task_runs r WHERE r.task_id = t.id), 0)) "
++    "BETWEEN ? AND ? ORDER BY t.id"
+ )
+ 
+ 
++def _clock_hold(conn, task_id: str, since: int, now: float) -> dict[str, Any]:
++    """``{"hold_reason", "hold_until"}`` while a clock guard still holds ``task_id``, else ``{}``.
++
++    The reason of this ready episode's latest ``respawn_guarded`` event (at or after ``since``); a latest run
++    lost to an owner restart is the owner-restart cooldown even before the tick that records the guard.
++    Advisory only: a failed lookup drops the hold from the notice, never the notice."""
++    try:
++        return _clock_hold_unchecked(conn, task_id, since, now)
++    except Exception:  # health: allow BLE001 -- the hold is advisory; the notice must still go out
++        _log.debug("chat-wait: clock hold lookup failed for %s", task_id, exc_info=True)
++        return {}
++
++
++def _clock_hold_unchecked(conn, task_id: str, since: int, now: float) -> dict[str, Any]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_dispatch import _is_owner_restart_run
++    from hermes_cli.kanban_db_dispatch_clock import guard_hold_until
++    reason = None
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' "
++                       "AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 1", (task_id, int(since))).fetchone()
++    if row is not None:
++        reason = kb._json_dict(row[0]).get("reason")
++    if not reason:
++        run = conn.execute("SELECT outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
++                           "ORDER BY ended_at DESC LIMIT 1", (task_id,)).fetchone()
++        if run is not None and _is_owner_restart_run(run):
++            reason = "owner_restart_cooldown"
++    until = guard_hold_until(conn, task_id, str(reason), int(now)) if reason else None
++    return {"hold_reason": str(reason), "hold_until": int(until)} if until else {}
++
++
+ def sweep(conn, *, now: Optional[float] = None) -> int:
+     """Append the once-per-ready-episode notice for every qualifying card; returns how many were appended."""
+     now = time.time() if now is None else now
+@@ -114,7 +156,8 @@ def sweep(conn, *, now: Optional[float] = None) -> int:
+         if ready_for < THRESHOLD_SECONDS or ready_for > MAX_EPISODE_SECONDS:
+             continue
+         if pu.post_notice(conn, row["id"], row["id"], wait_key=f"ready@{since}", waited_seconds=ready_for,
+-                          ready_seconds=ready_for, parent_title=row["title"], kind=NOTICE_KIND):
++                          ready_seconds=ready_for, parent_title=row["title"], kind=NOTICE_KIND,
++                          extra=_clock_hold(conn, row["id"], since, now)):
+             posted += 1
+     return posted
+ 
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 1db4166fe05..b2546617c9e 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -702,20 +702,56 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
+ 
+ 
+ # Events after which a now-ready, unclaimed task must have (re-)entered ready:
+-# the classic ready transitions plus every claim/park/wake on the way back.
++# the classic ready transitions plus every claim/park/wake on the way back, and a run lost
++# to a gateway restart (booked ``owner_restart_lost``, not ``reclaimed``: without it an 80-min
++# run read as 80 min ready, hermes-hub 2026-11-10). Other run-ending requeues are bounded by
++# the run's ``ended_at`` (``_last_run_end_ts``), never by kinds a pre-claim check may write. [daveey]
+ _READY_WAIT_FLOOR_KINDS = frozenset({
+     "created", "promoted", "reclaimed", "unblocked",
+     "claimed", "spawned", "continuation_woken", "condition_met", "wake_probe_stale",
+     "wake_check_stale",
++    "owner_restart_lost",
+ })
+ 
+ 
+-def _last_ready_entry_ts(events: Iterable[Any]) -> int:
+-    """Latest ready-entry floor; a ``continued`` checkpoint counts only when it resumed straight to ready."""
++def _last_run_end_ts(runs: Iterable[Any]) -> int:
++    """Latest ``ended_at`` over ``runs`` (0 if none): a card is never unclaimed-ready while a run is open."""
++    from hermes_cli import kanban_db as kb
++    ends = [kb._to_epoch(_task_field(r, "ended_at", None)) for r in (runs or [])]
++    return int(max([0, *(e for e in ends if e)]))
++
++
++def _last_ready_entry_ts(events: Iterable[Any], runs: Iterable[Any] = ()) -> int:
++    """Latest ready-entry floor; a ``continued`` checkpoint counts only when it resumed straight to ready.
++    The latest run's end bounds it too, whatever event (if any) the requeue left."""
+     events = list(events)
+     continued_ready = [_event_ts(ev) for ev in events
+                        if _event_kind(ev) == "continued" and _parse_payload(ev).get("status") == "ready"]
+-    return max([_latest_event_ts(events, _READY_WAIT_FLOOR_KINDS), *continued_ready])
++    return max([_latest_event_ts(events, _READY_WAIT_FLOOR_KINDS), *continued_ready, _last_run_end_ts(runs)])
++
++
++def _guard_clock(events: Iterable[Any], runs: Iterable[Any], cfg,
++                 since: int = 0) -> tuple[Optional[str], Optional[int]]:
++    """``(guard reason, hold-until epoch)`` from the latest ``respawn_guarded`` event of this ready episode
++    (at or after ``since``); the epoch only for a run-end clock hold (owner-restart / rate-limit /
++    infrastructure cooldown), computed like ``kanban_db_dispatch_clock.guard_hold_until`` (quota-episode
++    backoffs are not modelled). Advisory: the live verdict is the dispatcher's."""
++    guarded = [ev for ev in (events or []) if _event_kind(ev) == "respawn_guarded" and _event_ts(ev) >= since]
++    if not guarded:
++        return None, None
++    reason = _parse_payload(max(guarded, key=_event_ts)).get("reason")
++    reason = str(reason) if reason else None
++    end = _last_run_end_ts(runs)
++    if not end or reason not in ("owner_restart_cooldown", "rate_limit_cooldown", "infrastructure_cooldown"):
++        return reason, None
++    from hermes_cli import kanban_db as kb
++    if reason == "owner_restart_cooldown":
++        from hermes_cli.kanban_db_dispatch import OWNER_RESTART_COOLDOWN_SECONDS
++        cooldown = cfg.get("owner_restart_cooldown_seconds") or kb._env_int(
++            "HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", OWNER_RESTART_COOLDOWN_SECONDS)
++    else:
++        cooldown = cfg.get("rate_limit_cooldown_seconds") or kb._resolve_rate_limit_cooldown_seconds()
++    return reason, end + int(cooldown)
+ 
+ 
+ def _foreign_machines(task, cfg) -> list[str]:
+@@ -772,7 +808,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     # claim/park, so those events bound the wait from below too. Without them a
+     # card cycling claim -> scheduled -> condition_met -> ready all day read as
+     # "ready 18h with no worker" from its first promotion. [daveey]
+-    last_ready_ts = _last_ready_entry_ts(events)
++    last_ready_ts = _last_ready_entry_ts(events, runs)
+     if last_ready_ts == 0:
+         last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+     if last_ready_ts == 0:
+@@ -821,13 +857,18 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     reason = _ready_hold_reason(task, events, cfg)
+     if not reason:
+         return []
+-    since = _last_ready_entry_ts(events) or int(_task_field(task, "created_at", 0) or 0)
++    since = _last_ready_entry_ts(events, runs) or int(_task_field(task, "created_at", 0) or 0)
+     age = now - since
+     if not since or age < float(cfg.get("stranded_threshold_seconds", 30 * 60)):
+         return []
++    guard_reason, hold_until = _guard_clock(events, runs, cfg, since) if reason == "respawn_guarded" else (None, None)
++    hold = f"{reason}: {guard_reason}" if guard_reason else reason
++    if hold_until:
++        stamp = time.strftime("%H:%M:%SZ", time.gmtime(hold_until))
++        hold += f", until {stamp}" if hold_until > now else f", expired {stamp}"
+     return [Diagnostic(
+         kind="held_in_ready", severity="warning",
+-        title=(f"Ready {int(age / 60)}m, last observed hold ({reason})" if reason == "respawn_guarded"
++        title=(f"Ready {int(age / 60)}m, last observed hold ({hold})" if reason == "respawn_guarded"
+                else f"Ready {int(age / 60)}m, held ({reason})"),
+         detail=("The last recorded dispatch decision was a guard hold; the current hold is not verified. "
+                 "A cleared blocker, capacity limit, or missing pickup can leave this historical event "
+@@ -837,7 +878,9 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+         actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
+         first_seen_at=since, last_seen_at=since, count=1,
+         data={"ready_since": since, "age_seconds": int(age), "hold_reason": reason,
+-              "foreign_machines": _foreign_machines(task, cfg)},
++              "foreign_machines": _foreign_machines(task, cfg),
++              **({"guard_reason": guard_reason} if guard_reason else {}),
++              **({"hold_until": hold_until} if hold_until else {})},
+     )]
+ 
+ 
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 7e1db8525b7..543f3534c4a 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -29,10 +29,12 @@ def _minutes(seconds: float) -> int:
+ 
+ 
+ def ready_since(conn, task_id: str, created_at: Optional[int] = None) -> int:
+-    """When ``task_id`` last entered ``ready`` (the stranded-in-ready diagnostic's floor), else its creation."""
++    """When ``task_id`` last entered ``ready`` (the stranded-in-ready diagnostic's floor, its latest run's end
++    included), else its creation."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_diagnostics import _last_ready_entry_ts
+-    since = _last_ready_entry_ts(kb.list_events(conn, task_id))
++    ended = conn.execute("SELECT MAX(ended_at) AS ended_at FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
++    since = _last_ready_entry_ts(kb.list_events(conn, task_id), [dict(r) for r in ended])
+     return int(since or created_at or 0)
+ 
+ 
+@@ -127,11 +129,13 @@ def safe_sweep(conn) -> int:
+ 
+ 
+ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_seconds: float,
+-                ready_seconds: float, parent_title: Optional[str] = None, kind: str = NOTICE_KIND) -> bool:
++                ready_seconds: float, parent_title: Optional[str] = None, kind: str = NOTICE_KIND,
++                extra: Optional[dict[str, Any]] = None) -> bool:
+     """Append ONE ``kind`` event (default ``dependency_parent_unclaimed``) to ``task_id`` (its chats receive it
+     through their notify subscriptions) about ``waiting_on``, a card still ready and unclaimed. ``wait_key``
+     identifies the wait: a second call with the same (waiting_on, wait_key) posts nothing. Reused for a direct chat
+-    wait (``kanban_chat_wait``), where ``waiting_on`` is ``task_id`` itself. Returns True when it posted."""
++    wait (``kanban_chat_wait``), where ``waiting_on`` is ``task_id`` itself; ``extra`` adds payload fields (its
++    clock hold). Returns True when it posted."""
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
+         if any(kb._json_dict(p).get("wait_event_id") == wait_key and kb._json_dict(p).get("parent") == waiting_on
+@@ -144,6 +148,6 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+             "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
+-            "queue": _queue_words(_place(conn, waiting_on)),
++            "queue": _queue_words(_place(conn, waiting_on)), **(extra or {}),
+         })
+     return True
+diff --git a/tests/hermes_cli/test_kanban_ready_wait_restart_floor.py b/tests/hermes_cli/test_kanban_ready_wait_restart_floor.py
+new file mode 100644
+index 00000000000..07a8bae3028
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ready_wait_restart_floor.py
+@@ -0,0 +1,228 @@
++"""A ready card's wait starts when its last run ended, and a clock hold says when it ends. [daveey]
++
++hermes-hub 2026-11-10: t_01a1a1dea9c64d6a ran 80 min (run 163883, claimed 21:05:48Z) until a gateway restart
++requeued it (``owner_restart_lost`` 22:26:32Z). The same tick posted ``chat_wait_unclaimed`` "ready 80 min with no
++worker" (``wait_event_id ready@1794344748``) and the ``held_in_ready`` diagnostic said "Ready 82m": both measured the
++wait from the run's ``claimed`` event, because ``owner_restart_lost`` (and the run's end) were not ready-entry
++floors. The card was in its 120 s ``owner_restart_cooldown`` and the dispatcher claimed it 38 s after the cooldown
++ended. The same misreport followed run 163575 earlier that day. These tests pin: the run's interval never counts as
++ready time (events-only and runs paths, chat notice and diagnostic), a genuine 31-min unclaimed wait after the run
++still alerts, and an active clock hold is shown with its expiry.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_diagnostics as kd
++
++_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
++        "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT",
++        "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS")
++
++
++@pytest.fixture
++def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in _ENV:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++def _restart_lost_card(conn, *, claimed_ago: int, lost_ago: int, record_lost_event: bool = True) -> str:
++    """A subscribed card claimed ``claimed_ago`` s ago whose run was lost to a gateway restart ``lost_ago`` s ago."""
++    now = int(time.time())
++    tid = kb.create_task(conn, title="retention ladder", assignee="default", initial_status="running")
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="origin-chat", delivery_metadata={"reason": "create"})
++    conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (now - claimed_ago - 600, tid))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (now - claimed_ago - 600, tid))
++    meta = {"exit_code": 76, "owner_restart": True, "retry_status": "ready"}
++    conn.execute(
++        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
++        "VALUES (?, 'reclaimed', ?, ?, 'reclaimed', ?)", (tid, now - claimed_ago, now - lost_ago, json.dumps(meta)))
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'claimed', ?, ?)",
++                 (tid, json.dumps({"lock": "hub:1", "run_id": 1}), now - claimed_ago))
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'spawned', ?, ?)",
++                 (tid, json.dumps({"pid": 1}), now - claimed_ago))
++    if record_lost_event:
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES "
++                     "(?, 'owner_restart_lost', ?, ?)", (tid, json.dumps(meta), now - lost_ago))
++    conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?", (tid,))
++    conn.commit()
++    return tid
++
++
++def _notices(conn, tid):
++    from hermes_cli import kanban_chat_wait as cw
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, cw.NOTICE_KIND))]
++
++
++@pytest.mark.parametrize("record_lost_event", [True, False], ids=["owner_restart_lost_event", "run_end_only"])
++def test_restart_requeue_after_a_long_run_is_not_a_stale_ready_wait(board, record_lost_event):
++    """Regression: 80 min of running before the restart must not read as 80 min ready with no worker."""
++    from hermes_cli import kanban_chat_wait as cw
++    from hermes_cli import kanban_parent_unclaimed as pu
++    conn = kbc.connect()
++    try:
++        tid = _restart_lost_card(conn, claimed_ago=80 * 60, lost_ago=1, record_lost_event=record_lost_event)
++        assert cw.sweep(conn) == 0
++        assert _notices(conn, tid) == []
++        assert int(time.time()) - pu.ready_since(conn, tid) < 60
++        assert pu.ready_hint(conn, kb.get_task(conn, tid)) is None
++    finally:
++        conn.close()
++
++
++def test_genuine_unclaimed_wait_after_the_run_still_alerts_with_its_own_age(board):
++    """Control: 31 min unclaimed after the restart is a real wait; the notice counts from the run's end."""
++    from hermes_cli import kanban_chat_wait as cw
++    conn = kbc.connect()
++    try:
++        tid = _restart_lost_card(conn, claimed_ago=111 * 60, lost_ago=31 * 60)
++        assert cw.sweep(conn) == 1
++        (notice,) = _notices(conn, tid)
++        assert notice["ready_minutes"] == 31
++        assert "hold_until" not in notice  # the 120 s cooldown ended long ago
++        assert cw.sweep(conn) == 0
++    finally:
++        conn.close()
++
++
++def test_active_clock_hold_is_named_with_its_expiry_in_the_notice(board, monkeypatch):
++    """A genuine wait still alerts during a clock hold, and says which hold and when it ends."""
++    from hermes_cli import kanban_chat_wait as cw
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", str(3600))
++    conn = kbc.connect()
++    try:
++        tid = _restart_lost_card(conn, claimed_ago=100 * 60, lost_ago=31 * 60)
++        now = int(time.time())
++        assert cw.sweep(conn) == 1
++        (notice,) = _notices(conn, tid)
++        assert notice["hold_reason"] == "owner_restart_cooldown"
++        assert abs(notice["hold_until"] - (now - 31 * 60 + 3600)) <= 2
++        text = cw.notice_text(notice)
++        assert "owner_restart_cooldown" in text and "until" in text
++    finally:
++        conn.close()
++
++
++# --- held_in_ready / stranded_in_ready diagnostics (pure) ---------------------------------------------------------
++
++
++def _ev(kind, ts, **payload):
++    return {"kind": kind, "created_at": ts, "payload": payload or None}
++
++
++def _run(ended_at, *, owner_restart=True):
++    return {"id": 1, "outcome": "reclaimed", "ended_at": ended_at, "metadata": json.dumps({"owner_restart": owner_restart})}
++
++
++def test_held_diagnostic_excludes_the_prior_run_and_shows_the_active_cooldown_expiry():
++    now = 1_794_349_600
++    lost = now - 8
++    events = [_ev("created", now - 3 * 3600), _ev("claimed", now - 80 * 60), _ev("spawned", now - 80 * 60),
++              _ev("owner_restart_lost", lost, owner_restart=True),
++              _ev("respawn_guarded", lost + 1, reason="owner_restart_cooldown")]
++    task = {"id": "t_x", "assignee": "default", "status": "ready", "claim_lock": None, "created_at": now - 3 * 3600,
++            "consecutive_failures": 0}
++    diags = kd.compute_task_diagnostics(task, events, [_run(lost)], now=now)
++    assert [d for d in diags if d.kind in ("held_in_ready", "stranded_in_ready")] == []
++    # Same history seen 40 min later: a genuine hold age, counted from the run's end, with the guard reason and
++    # its (now expired) clock in the data.
++    later = lost + 40 * 60
++    (held,) = [d for d in kd.compute_task_diagnostics(task, events, [_run(lost)], now=later)
++               if d.kind == "held_in_ready"]
++    assert held.data["ready_since"] == lost
++    assert held.data["guard_reason"] == "owner_restart_cooldown"
++    assert held.data["hold_until"] == lost + 120
++    assert "owner_restart_cooldown" in held.title and "40m" in held.title
++
++
++def test_held_diagnostic_title_says_until_while_the_clock_hold_is_active():
++    now = 1_794_349_600
++    lost = now - 31 * 60
++    events = [_ev("created", now - 3 * 3600), _ev("claimed", now - 2 * 3600),
++              _ev("owner_restart_lost", lost), _ev("respawn_guarded", lost + 1, reason="owner_restart_cooldown")]
++    task = {"id": "t_x", "assignee": "default", "status": "ready", "claim_lock": None, "created_at": now - 3 * 3600}
++    cfg = {"owner_restart_cooldown_seconds": 3600}
++    (held,) = [d for d in kd.compute_task_diagnostics(task, events, [_run(lost)], now=now, config=cfg)
++               if d.kind == "held_in_ready"]
++    assert held.data["hold_until"] == lost + 3600
++    assert "until" in held.title
++
++
++def test_stranded_diagnostic_floors_on_the_last_run_end_but_still_fires_for_a_genuine_wait():
++    now = 1_794_349_600
++    task = {"id": "t_x", "assignee": "default", "status": "ready", "claim_lock": None, "created_at": now - 5 * 3600,
++            "consecutive_failures": 0}
++    events = [_ev("created", now - 5 * 3600), _ev("claimed", now - 4 * 3600)]
++    # The run ended 2 min ago (no requeue event recorded): not stranded.
++    assert [d for d in kd.compute_task_diagnostics(task, events, [_run(now - 120, owner_restart=False)], now=now)
++            if d.kind == "stranded_in_ready"] == []
++    # The run ended 45 min ago: stranded, aged from the run's end.
++    (stranded,) = [d for d in kd.compute_task_diagnostics(task, events, [_run(now - 45 * 60, owner_restart=False)],
++                                                          now=now) if d.kind == "stranded_in_ready"]
++    assert stranded.data["ready_since"] == now - 45 * 60
++
++
++
++def test_a_failed_hold_lookup_drops_the_hold_never_the_notice(board, monkeypatch):
++    from hermes_cli import kanban_chat_wait as cw
++    from hermes_cli import kanban_db_dispatch_clock as clock
++    calls = []
++
++    def _boom(*args, **_k):
++        calls.append(args)
++        raise RuntimeError("clock lookup broke")
++
++    monkeypatch.setattr(clock, "guard_hold_until", _boom)
++    conn = kbc.connect()
++    try:
++        tid = _restart_lost_card(conn, claimed_ago=100 * 60, lost_ago=31 * 60)
++        assert cw.sweep(conn) == 1
++        assert calls and calls[0][2] == "owner_restart_cooldown"  # the failing lookup was reached
++        (notice,) = _notices(conn, tid)
++        assert "hold_until" not in notice and notice["ready_minutes"] == 31
++    finally:
++        conn.close()
++
++
++def test_a_guard_from_an_earlier_ready_episode_does_not_mask_the_current_hold(board, monkeypatch):
++    """An old non-clock guard reason (before this episode's run ended) must not hide the owner-restart hold."""
++    from hermes_cli import kanban_chat_wait as cw
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", str(3600))
++    conn = kbc.connect()
++    try:
++        tid = _restart_lost_card(conn, claimed_ago=100 * 60, lost_ago=31 * 60)
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES "
++                     "(?, 'respawn_guarded', ?, ?)", (tid, json.dumps({"reason": "blocker_auth"}),
++                                                       int(time.time()) - 3 * 3600))
++        conn.commit()
++        assert cw.sweep(conn) == 1
++        (notice,) = _notices(conn, tid)
++        assert notice["hold_reason"] == "owner_restart_cooldown"
++    finally:
++        conn.close()
++
++
++def test_guard_clock_ignores_a_guard_before_the_episode_floor():
++    now = 1_794_349_600
++    lost = now - 40 * 60
++    events = [_ev("created", now - 6 * 3600), _ev("respawn_guarded", now - 5 * 3600, reason="rate_limit_cooldown")]
++    cfg = {"rate_limit_cooldown_seconds": 600}
++    # positive control: without the floor the old guard and its run-end clock are reported
++    assert kd._guard_clock(events, [_run(lost)], cfg) == ("rate_limit_cooldown", lost + 600)
++    assert kd._guard_clock(events, [_run(lost)], cfg, since=lost) == (None, None)
+diff --git a/tests/tools/test_kanban_unblock_queue.py b/tests/tools/test_kanban_unblock_queue.py
+index acdb0162120..9f08310cd72 100644
+--- a/tests/tools/test_kanban_unblock_queue.py
++++ b/tests/tools/test_kanban_unblock_queue.py
+@@ -261,6 +261,9 @@ def test_a_new_ready_episode_notifies_again(board):
+         then = int(time.time()) - 31 * 60
+         conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind IN ('blocked','unblocked')",
+                      (then, tid))
++        # block_task books a synthetic ``blocked`` run ending at the block; it ages with the block it records.
++        conn.execute("UPDATE task_runs SET started_at=?, ended_at=? WHERE task_id=? AND outcome='blocked'",
++                     (then, then, tid))
+         conn.commit()
+         assert cw.sweep(conn) == 1
+         assert len(_notices(conn, tid)) == 2
+-- 
+2.55.0
+

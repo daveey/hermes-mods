@@ -1,0 +1,474 @@
+From 704bf9b48ebd5f1666b1532495832dd677aba1ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:28:04 +0000
+Subject: [PATCH] fix(desktop): tile opens always log an outcome; sidebar focus
+ no longer logs a phantom abandoned open [daveey]
+
+The 11-10 @session ref live proof collected two [open-timing] lines for the target, both
+startedBy:"click" with no surface: sidebar-row main-pane opens, not the ref chip's tile.
+Tracing the entry paths showed:
+
+- markOpenClick (sidebar onResumeSession) is the only writer of startedBy:"click"; a sidebar click
+  on a chat already on screen as a tile only fronts the tile, so the record dangled and was flushed
+  as outcome:"abandoned" by the next open. Now a click that never entered resumeSession is dropped.
+- A tile open that threw (owner/resume failure) or lost a rebind race wrote no line at all, so a
+  failed ref click was indistinguishable from no click. It now logs outcome "failed"/"abandoned".
+- A cold tile open (REST paint) did not save its REST page, unlike the main pane; it now warms the
+  cache under the tile owner key.
+- isTileCachePaint/tileCachePaintProof: the acceptance gate for "ref click painted the tile from
+  cache" (surface tile + paint cache + outcome rest); main-pane, abandoned, failed and no-paint
+  records cannot satisfy it.
+
+Chip -> tile routing and prefetch key are pinned by a new test (passes before and after: not a defect).
+---
+ .../chat/session-ref-open-surface.test.tsx    | 104 ++++++++++++++++++
+ .../src/app/contrib/hooks/tile-cache-paint.ts |  16 +++
+ ...-session-tile-delegate.cache-paint.test.ts |  37 ++++++-
+ .../hooks/use-session-tile-delegate.ts        |   7 +-
+ apps/desktop/src/lib/open-timing.test.ts      |  62 ++++++++++-
+ apps/desktop/src/lib/open-timing.ts           |  60 +++++++++-
+ 6 files changed, 280 insertions(+), 6 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/session-ref-open-surface.test.tsx
+
+diff --git a/apps/desktop/src/app/chat/session-ref-open-surface.test.tsx b/apps/desktop/src/app/chat/session-ref-open-surface.test.tsx
+new file mode 100644
+index 00000000000..54ff006f874
+--- /dev/null
++++ b/apps/desktop/src/app/chat/session-ref-open-surface.test.tsx
+@@ -0,0 +1,104 @@
++/**
++ * [daveey] Which surface a `@session` ref open lands on, and what it logs.
++ *
++ * The 11-10 live proof of the ref cache paint collected two `[open-timing]` lines for the target, both
++ * `startedBy:"click"` with no `surface`: sidebar-row main-pane opens. These tests pin the two entry paths so a
++ * proof can tell them apart: the chip/link opens a TILE (and never writes a main-pane click record), under the
++ * same cache key the chip prefetched; a sidebar click on a chat already open as a tile only fronts that tile and
++ * must not leave a dangling click record that later logs as an abandoned open.
++ */
++import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { resetSessionRefPrefetch } from '@/app/chat/session-ref-prefetch'
++import { useOfflineFallback } from '@/app/chat/sidebar/use-offline-fallback'
++import { openSession } from '@/app/open-session'
++import { SessionRefChip } from '@/components/assistant-ui/directive-text'
++import { group } from '@/components/pane-shell/tree/model'
++import { $layoutTree } from '@/components/pane-shell/tree/store'
++import { type OpenTimingRecord, resetOpenTimings } from '@/lib/open-timing'
++import { __resetSessionLinkTitleCache } from '@/lib/session-link-title'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { $sessions, _resetSessionOwnerHintsForTests } from '@/store/session'
++import { $sessionTiles, openSessionTile } from '@/store/session-states'
++import type { SessionInfo } from '@/types/hermes'
++
++const TARGET = '20261018_114650_7ed013'
++const lines = () => (globalThis as { __hermesOpenTimings?: OpenTimingRecord[] }).__hermesOpenTimings ?? []
++const settle = (ms = 30) => act(() => new Promise(resolve => setTimeout(resolve, ms)))
++
++let previousDesktop: unknown
++let prefetch: ReturnType<typeof vi.fn>
++
++beforeEach(() => {
++  resetOpenTimings()
++  resetSessionRefPrefetch()
++  _resetSessionOwnerHintsForTests()
++  $sessionTiles.set([])
++  $layoutTree.set(null)
++  $connectionsRegistry.set({
++    connections: [
++      { id: 'local', kind: 'local', label: 'This device' },
++      { id: 'hermes-hub', kind: 'ssh', label: 'hermes-hub' }
++    ],
++    primary: 'local',
++    secureTokenStorage: true,
++    version: 2
++  } as never)
++  $sessions.set([{ connection_id: 'hermes-hub', id: TARGET, profile: 'default', title: 'Old target' } as SessionInfo])
++  prefetch = vi.fn()
++  previousDesktop = (window as { hermesDesktop?: unknown }).hermesDesktop
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = {
++    ...(previousDesktop as object),
++    transcriptCache: { prefetch }
++  }
++})
++
++afterEach(() => {
++  cleanup()
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = previousDesktop
++  $connectionsRegistry.set(null)
++  $sessions.set([])
++  $sessionTiles.set([])
++  $layoutTree.set(null)
++  __resetSessionLinkTitleCache()
++  resetOpenTimings()
++})
++
++describe('[daveey] @session ref open surface', () => {
++  it('a chip click opens a tile owned by the key the chip prefetched, and writes no main-pane click record', async () => {
++    render(<SessionRefChip label="Old target" value={`default/${TARGET}`} />)
++    await settle()
++
++    const key = { connectionId: 'hermes-hub', profile: 'default', sessionId: TARGET }
++    expect(prefetch).toHaveBeenCalledWith(key)
++
++    fireEvent.click(screen.getByRole('button'))
++    await settle(50)
++
++    const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === TARGET)
++
++    // The tile's cache paint reads (owner.connectionId, owner.targetProfile || owner.profile): the prefetched key.
++    expect(tile?.ownerRoute).toMatchObject({ connectionId: key.connectionId, targetProfile: key.profile })
++    expect(lines().filter(record => record.startedBy === 'click')).toEqual([])
++  })
++
++  it('a sidebar click on a chat already open as a tile fronts the tile and logs no abandoned main-pane open', () => {
++    const mainResume = vi.fn()
++    // wiring.openStoredSession: an in-place open; main resumes only when it routes there.
++    const resumeSession = (id: string) => openSession(id, () => mainResume(id))
++
++    openSessionTile(TARGET, 'center')
++    $layoutTree.set(group(['workspace', `session-tile:${TARGET}`], { active: 'workspace', id: 'main' }))
++
++    const { result } = renderHook(() => useOfflineFallback([], resumeSession))
++
++    act(() => result.current.onResumeSession(TARGET, $sessions.get()[0]))
++    expect(mainResume).not.toHaveBeenCalled()
++
++    // The next open used to flush the never-resumed click as {"startedBy":"click","outcome":"abandoned"}.
++    act(() => result.current.onResumeSession('other', { connection_id: 'hermes-hub', id: 'other' } as SessionInfo))
++
++    expect(lines().filter(record => record.id === TARGET)).toEqual([])
++  })
++})
+diff --git a/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts b/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
+index b8a00cc23b8..cb0b09d996a 100644
+--- a/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
++++ b/apps/desktop/src/app/contrib/hooks/tile-cache-paint.ts
+@@ -70,6 +70,16 @@ export function noteTileOwner(timing: TileOpenTiming | null, owner: unknown): vo
+   }
+ }
+ 
++/** [daveey] A tile open that throws still writes its line (`outcome:"failed"`), then rethrows: a failed ref click
++ *  must be distinguishable from one that never happened. */
++export function failTileOpen(timing: TileOpenTiming | null): (error: unknown) => never {
++  return error => {
++    timing?.reconciled('failed')
++
++    throw error
++  }
++}
++
+ /** What the tile's first publish showed: kept rows already on screen, the cache, or the REST page. */
+ export function tilePaintSource(
+   authoritative: boolean,
+@@ -116,6 +126,12 @@ export function settleTileOpen(args: SettleTileOpen): void {
+       timing?.paint('rest', prefetch?.messages?.length ?? 0)
+     }
+ 
++    // [daveey] Keep the cache as warm as a main-pane open does: the next open of this (often old, unlisted)
++    // session paints from the page this one waited on.
++    if (prefetch?.messages?.length) {
++      saveTranscriptTail(args.storedSessionId, prefetch.messages, args.scope)
++    }
++
+     timing?.reconciled(painted === 'kept' ? 'warm' : prefetch ? 'rest' : 'failed')
+ 
+     return
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
+index 4a6f2e1d966..3deb00d9efb 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.cache-paint.test.ts
+@@ -17,6 +17,7 @@ import { useSessionTileDelegate } from './use-session-tile-delegate'
+ 
+ vi.mock('@/hermes', async importActual => ({
+   ...(await importActual<typeof HermesModule>()),
++  fetchStoredTranscriptAcrossBackends: vi.fn(async () => null),
+   getLatestSessionMessages: vi.fn(async () => ({ messages: [], session_id: '' })),
+   getSession: vi.fn()
+ }))
+@@ -26,7 +27,7 @@ vi.mock('@/store/gateway', async importActual => ({
+   requestGatewayForProfile: vi.fn()
+ }))
+ 
+-const { getLatestSessionMessages } = await import('@/hermes')
++const { fetchStoredTranscriptAcrossBackends, getLatestSessionMessages } = await import('@/hermes')
+ const { requestGatewayForAgent } = await import('@/store/gateway')
+ 
+ const ROUTE = { connectionId: 'hermes-hub', mode: 'remote' as const, profile: 'default', targetProfile: 'default' }
+@@ -212,4 +213,38 @@ describe('[daveey] a tile (the @session ref click) paints from the transcript ca
+     expect(texts(states.get('runtime-refresh'))).toEqual(['fresh'])
+     expect(tileLines()).toEqual([expect.objectContaining({ paint: 'rest' })])
+   })
++
++  // [daveey] A tile open that throws (resume refused, no stored transcript anywhere) used to write NO line, so a
++  // live proof could not tell "the ref click failed" from "the ref was never clicked".
++  it('a tile open that fails writes outcome "failed" instead of nothing', async () => {
++    setSessionOwnerHint('dead-ref', ROUTE)
++    vi.mocked(getLatestSessionMessages).mockResolvedValue(null as never)
++    vi.mocked(fetchStoredTranscriptAcrossBackends).mockResolvedValue(null as never)
++    vi.mocked(requestGatewayForAgent).mockRejectedValue(new Error('backend refused'))
++    renderTile()
++
++    await expect(sessionTileDelegate()!.resumeTile('dead-ref')).rejects.toThrow()
++
++    expect(tileLines()).toEqual([
++      expect.objectContaining({ connection: 'hermes-hub', id: 'dead-ref', outcome: 'failed', surface: 'tile' })
++    ])
++    expect(tileLines()[0]).not.toHaveProperty('paint')
++  })
++
++  // [daveey] The main pane caches every REST page it opens with; a cold tile open (the first ref click on a session
++  // the prefetch had not warmed) did not, so the next open of the same old session missed the cache again.
++  it('a cold tile open caches the REST page it painted, under the tile owner key', async () => {
++    setSessionOwnerHint('cold-cache-ref', ROUTE)
++    vi.mocked(getLatestSessionMessages).mockResolvedValue({
++      messages: rows('from rest', 'answer'),
++      session_id: 'cold-cache-ref'
++    } as never)
++    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'runtime-cold-cache' } as never)
++    renderTile()
++
++    await sessionTileDelegate()!.resumeTile('cold-cache-ref')
++
++    expect(tileLines()).toEqual([expect.objectContaining({ outcome: 'rest', paint: 'rest' })])
++    expect(readCachedTranscript('cold-cache-ref', SCOPE)?.messages).toHaveLength(2)
++  })
+ })
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+index bfbf4c52a73..c9576186624 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+@@ -65,6 +65,7 @@ import type { ClientSessionState } from '../../types'
+ import type { GatewayRequester } from '../types'
+ 
+ import {
++  failTileOpen,
+   noteTileOwner,
+   settleTileOpen,
+   startTileTiming,
+@@ -449,7 +450,7 @@ export function useSessionTileDelegate({
+         // launch-profile DB and fork the conversation into the wrong profile —
+         // the same cross-profile bleed the recovery resumes had (#67603).
+         const timing = startTileTiming(storedSessionId, authoritativeSnapshot)
+-        let owner = await ownerForStoredSession(storedSessionId)
++        let owner = await ownerForStoredSession(storedSessionId).catch(failTileOpen(timing))
+ 
+         noteTileOwner(timing, owner)
+         const restScope = tileRestScope(owner)
+@@ -560,7 +561,7 @@ export function useSessionTileDelegate({
+ 
+             return stored
+           }
+-        )
++        ).catch(failTileOpen(timing))
+ 
+         // [daveey] REST still in flight: paint the cached transcript now and reconcile when the page lands.
+         // An explicit refresh (callers await fresh rows) and a read-only fallback wait on REST as before.
+@@ -610,6 +611,8 @@ export function useSessionTileDelegate({
+         // Another resume/rebind won while this request was in flight. Do not
+         // publish the older response into the runtime the tile now owns.
+         if (currentBinding && currentBinding !== existing && currentBinding !== runtimeId) {
++          timing?.reconciled('abandoned')
++
+           return currentBinding
+         }
+ 
+diff --git a/apps/desktop/src/lib/open-timing.test.ts b/apps/desktop/src/lib/open-timing.test.ts
+index 66c24f866a6..d99d91e4e05 100644
+--- a/apps/desktop/src/lib/open-timing.test.ts
++++ b/apps/desktop/src/lib/open-timing.test.ts
+@@ -1,13 +1,16 @@
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ import {
++  isTileCachePaint,
+   markOpenClick,
+   markOpenPaint,
+   markOpenReconciled,
+   markOpenStage,
+   markOpenStart,
+   type OpenTimingRecord,
+-  resetOpenTimings
++  parseOpenTimingLine,
++  resetOpenTimings,
++  tileCachePaintProof
+ } from './open-timing'
+ 
+ const records = () => (globalThis as { __hermesOpenTimings?: OpenTimingRecord[] }).__hermesOpenTimings ?? []
+@@ -67,4 +70,61 @@ describe('open timing log', () => {
+ 
+     expect(records()[0]).toMatchObject({ id: 'r1', outcome: 'asleep', startedBy: 'resume' })
+   })
++
++  // [daveey] A sidebar click on a chat already on screen as a tile only fronts the tile: main never resumes it,
++  // so the click is not a main-pane open. It used to dangle and log `outcome:"abandoned"` with no stages when the
++  // next open started (desktop.log 11-10 10:37:04, 97 s later), which read as a failed open of that session.
++  it('a click that never reached resumeSession (focused tile, refused offline) is not logged when superseded', () => {
++    markOpenClick('focused-tile', 'hermes-hub')
++    markOpenClick('next')
++
++    expect(records()).toEqual([])
++  })
++
++  it('a click that entered resumeSession and is superseded is still logged abandoned', () => {
++    markOpenClick('slow', 'hermes-hub')
++    markOpenStart('slow', 'hermes-hub')
++    markOpenClick('next')
++
++    expect(records()).toEqual([expect.objectContaining({ id: 'slow', outcome: 'abandoned', startedBy: 'click' })])
++  })
++})
++
++describe('tile cache-paint proof gate', () => {
++  const id = '20261018_114650_7ed013'
++
++  // The exact two lines the 11-10 live proof collected: sidebar main-pane opens, no surface.
++  const observed = [
++    '[open-timing] {"clickAt":33139333.099999905,"connection":"hermes-hub","id":"20261018_114650_7ed013","startedBy":"click","outcome":"abandoned","reconciledMs":97315}',
++    '[open-timing] {"clickAt":33333456.19999993,"connection":"hermes-hub","id":"20261018_114650_7ed013","startedBy":"click","stages":{"owner":68,"gateway":71,"rest":335},"paint":"rest","paintMs":336,"paintRows":13,"outcome":"rest","reconciledMs":336,"changed":true}'
++  ]
++
++  it('main-pane records cannot satisfy the tile proof, whatever they painted', () => {
++    expect(observed.map(line => parseOpenTimingLine(line)?.id)).toEqual([id, id])
++    expect(tileCachePaintProof(observed, id)).toBeNull()
++    expect(isTileCachePaint({ clickAt: 1, id, outcome: 'rest', paint: 'cache', startedBy: 'click' })).toBe(false)
++  })
++
++  it('abandoned, failed, never-painted and REST-painted tile opens are not success', () => {
++    const tile = { clickAt: 1, id, startedBy: 'resume' as const, surface: 'tile' as const }
++
++    expect(isTileCachePaint({ ...tile, outcome: 'abandoned', paint: 'cache' })).toBe(false)
++    expect(isTileCachePaint({ ...tile, outcome: 'failed', paint: 'cache' })).toBe(false)
++    expect(isTileCachePaint({ ...tile, outcome: 'abandoned' })).toBe(false)
++    expect(isTileCachePaint({ ...tile, outcome: 'failed' })).toBe(false)
++    expect(isTileCachePaint({ ...tile, outcome: 'rest', paint: 'rest' })).toBe(false)
++    expect(isTileCachePaint({ ...tile, outcome: 'rest', paint: 'cache' })).toBe(true)
++  })
++
++  it('finds the tile cache paint for the requested id only, ignoring other ids and non-timing lines', () => {
++    const hit = `[open-timing] {"clickAt":5,"id":"${id}","startedBy":"resume","surface":"tile","paint":"cache","paintMs":4,"paintRows":13,"outcome":"rest","reconciledMs":300,"changed":false}`
++    const otherId = hit.replace(id, 'someone-else')
++
++    expect(tileCachePaintProof([...observed, otherId, 'noise [open-timing] {not json', hit], id)).toMatchObject({
++      id,
++      paint: 'cache',
++      surface: 'tile'
++    })
++    expect(tileCachePaintProof([...observed, otherId], id)).toBeNull()
++  })
+ })
+diff --git a/apps/desktop/src/lib/open-timing.ts b/apps/desktop/src/lib/open-timing.ts
+index c8a7ab3d1dd..4c4b834d475 100644
+--- a/apps/desktop/src/lib/open-timing.ts
++++ b/apps/desktop/src/lib/open-timing.ts
+@@ -6,7 +6,8 @@
+  *
+  *   [open-timing] {"id":…,"connection":…,"paint":"cache","paintMs":12,"reconciledMs":840,"changed":false,…}
+  *
+- * - click:      sidebar click, or resumeSession entry when nothing clicked
++ * - click:      sidebar click, or resumeSession entry when nothing clicked. A click that never reaches
++ *               resumeSession (it fronted a chat already open as a tile) is dropped, not logged.
+  * - paint:      first transcript on screen (`cache`, `warm` or `rest`) and when
+  * - reconciled: the authoritative REST page applied (`rest`), the open ended
+  *               read-only on an asleep gateway (`asleep`), or another open
+@@ -39,6 +40,9 @@ export interface OpenTimingRecord {
+ const CLICK_WINDOW_MS = 2_000
+ const KEEP = 200
+ const open = new Map<string, OpenTimingRecord>()
++/** [daveey] Clicks whose resumeSession has started. A click that never got there (it only fronted a chat already
++ *  on screen as a tile, or an offline row was refused) is not a main-pane open and is dropped, not logged. */
++const entered = new Set<string>()
+ 
+ const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now())
+ 
+@@ -65,6 +69,7 @@ export function markOpenClick(id: string, connection?: string): void {
+   }
+ 
+   abandonOthers(id)
++  entered.delete(id)
+   open.set(id, { clickAt: now(), connection, id, startedBy: 'click' })
+ }
+ 
+@@ -72,6 +77,8 @@ export function markOpenClick(id: string, connection?: string): void {
+ export function markOpenStart(id: string, connection?: string): void {
+   const current = open.get(id)
+ 
++  entered.add(id)
++
+   if (current && !current.outcome && now() - current.clickAt < CLICK_WINDOW_MS) {
+     current.connection ||= connection
+ 
+@@ -112,6 +119,15 @@ export function markOpenReconciled(id: string, outcome: OpenOutcome, changed?: b
+     return
+   }
+ 
++  const opened = entered.has(id) || record.paint !== undefined || record.stages !== undefined
++  open.delete(id)
++  entered.delete(id)
++
++  // A superseded click that never opened anything (see `entered`) is not an abandoned open.
++  if (outcome === 'abandoned' && record.startedBy === 'click' && !opened) {
++    return
++  }
++
+   record.outcome = outcome
+   record.reconciledMs = Math.round(now() - record.clickAt)
+ 
+@@ -119,7 +135,6 @@ export function markOpenReconciled(id: string, outcome: OpenOutcome, changed?: b
+     record.changed = changed
+   }
+ 
+-  open.delete(id)
+   writeRecord(record)
+ }
+ 
+@@ -181,5 +196,46 @@ export function startTileOpenTiming(id: string, connection?: string) {
+ /** Test seam. */
+ export function resetOpenTimings(): void {
+   open.clear()
++  entered.clear()
+   history().splice(0)
+ }
++
++/** [daveey] One `[open-timing]` log line's record, or null for any other / malformed line. */
++export function parseOpenTimingLine(line: string): null | OpenTimingRecord {
++  const at = line.indexOf('[open-timing] ')
++
++  if (at < 0) {
++    return null
++  }
++
++  try {
++    const record = JSON.parse(line.slice(at + '[open-timing] '.length)) as OpenTimingRecord
++
++    return record && typeof record === 'object' && typeof record.id === 'string' ? record : null
++  } catch {
++    return null
++  }
++}
++
++/**
++ * [daveey] The acceptance gate for "a `@session` ref click painted its tile from the transcript cache": a TILE
++ * open (`surface:"tile"`) whose first paint was the cache and whose REST page then reconciled (`outcome:"rest"`).
++ * A main-pane record (sidebar click, no surface) never qualifies, whatever it painted; neither does an open that
++ * was abandoned, failed or never painted, nor a tile that waited on REST (`paint:"rest"`).
++ */
++export function isTileCachePaint(record: null | OpenTimingRecord | undefined): boolean {
++  return record?.surface === 'tile' && record.paint === 'cache' && record.outcome === 'rest'
++}
++
++/** The first log line proving a tile cache paint for `id`, or null. */
++export function tileCachePaintProof(lines: Iterable<string>, id: string): null | OpenTimingRecord {
++  for (const line of lines) {
++    const record = parseOpenTimingLine(line)
++
++    if (record?.id === id && isTileCachePaint(record)) {
++      return record
++    }
++  }
++
++  return null
++}
+-- 
+2.55.0
+

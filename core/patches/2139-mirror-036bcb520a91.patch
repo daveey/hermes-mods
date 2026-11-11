@@ -1,0 +1,129 @@
+From 036bcb520a9197d9d3098cec56dad27004974c8d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:10:54 +0000
+Subject: [PATCH] fix(kanban): label agent-written comments in the worker spawn
+ context [daveey]
+
+build_worker_context's Comment thread rendered every note as `comment from worker `<author>``, so a fresh or respawned worker could not tell David's comments from an agent's (all actors share the default profile). _ctx_comments now tags comments whose commented event carries writer_kind='agent' (kanban_comment tool, couriers relaying for an agent) as '(agent chat)' via agent_comment_ids, matching the live mid-run note; human and legacy/system comments keep the plain stamp and the defense-in-depth framing is unchanged.
+---
+ hermes_cli/kanban_db.py                       |  2 +-
+ hermes_cli/kanban_db_context.py               | 14 ++++--
+ .../tools/test_kanban_comment_writer_kind.py  | 46 +++++++++++++++++++
+ 3 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 9f85ca45d84..0294d31e831 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3901,7 +3901,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str, *, recovery_tai
+     _ctx_prior_attempts(lines, conn, task_id, now)
+     _ctx_parent_results(lines, conn, task_id, now)
+     _ctx_role_history(lines, conn, task, now)
+-    _ctx_comments(lines, list_comments(conn, task_id), now)
++    _ctx_comments(lines, conn, task_id, now)
+     from hermes_cli.kanban_worker_recovery import build_recovery_context
+     return "\n".join(lines).rstrip() + "\n" + (build_recovery_context(conn, task_id) if recovery_tail else "")
+ 
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index d62f732de3d..1df0f2be622 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Optional
+ import hermes_cli.kanban_db as _kb
+ 
+ if TYPE_CHECKING:
+-    from hermes_cli.kanban_db import Attachment, Comment, Task
++    from hermes_cli.kanban_db import Attachment, Task
+ 
+ # build_worker_context() caps, sized for a ~100k-char prompt with headroom.
+ _CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+@@ -228,14 +228,17 @@ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, no
+     lines.append("")
+ 
+ 
+-def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
++def _ctx_comments(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+     """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
+     worker" framing stops an operator-controlled HERMES_PROFILE like
+     "hermes-system" being read as a system directive above an
+-    attacker-influenceable body (defense-in-depth)."""
+-    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
++    attacker-influenceable body (defense-in-depth). A comment whose ``commented`` event
++    says an agent wrote it (``writer_kind='agent'``) is tagged ``(agent chat)``: David and
++    his agents share one profile, so the author alone can't tell them apart. [daveey]"""
++    shown, omitted_note = _ctx_tail(_kb.list_comments(conn, task_id), _CTX_MAX_COMMENTS, "comment")
+     if not shown:
+         return
++    agent_ids = _kb.agent_comment_ids(conn, task_id, [c.id for c in shown])
+     lines.append("## Comment thread")
+     if omitted_note:
+         lines.append(omitted_note)
+@@ -245,6 +248,7 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
+         # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
+         # author-forgery surface was already closed in #22435. See #22452.
+         safe_author = (c.author or "").replace("`", "")
+-        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
++        tag = " (agent chat)" if c.id in agent_ids else ""
++        lines.append(f"comment from worker `{safe_author}`{tag} at {_ctx_stamp(c.created_at, now)}:")
+         lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+         lines.append("")
+diff --git a/tests/tools/test_kanban_comment_writer_kind.py b/tests/tools/test_kanban_comment_writer_kind.py
+index 647d80d7de5..d1fd380ab30 100644
+--- a/tests/tools/test_kanban_comment_writer_kind.py
++++ b/tests/tools/test_kanban_comment_writer_kind.py
+@@ -111,6 +111,52 @@ def test_unknown_writer_kind_is_rejected(worker_home):
+     assert "writer_kind" not in _payload(tid, cid)  # system writers: unchanged payload
+ 
+ 
++def _context_comment_lines(tid: str) -> list[str]:
++    conn = kbc.connect()
++    try:
++        ctx = kb.build_worker_context(conn, tid, recovery_tail=False)
++    finally:
++        conn.close()
++    thread = ctx.split("## Comment thread\n", 1)[1]
++    return [line for line in thread.splitlines() if line.startswith("comment from worker ")]
++
++
++def test_spawn_context_labels_agent_comments_only(worker_home, monkeypatch):
++    """A fresh worker's ``## Comment thread`` says which notes an agent wrote (the kanban_comment
++    tool, or a courier relaying with ``writer_kind='agent'``); human (CLI/dashboard) and legacy or
++    system comments keep the plain stamp. The "comment from worker" framing stays. [daveey]"""
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    from hermes_cli import kanban
++    tid = _ready_task()
++    kt._handle_comment({"task_id": tid, "body": "tool: re-check it yourself"})
++    kanban.run_slash(f"comment {tid} human: why are you asking me?")
++    conn = kbc.connect()
++    try:
++        kb.add_comment(conn, tid, "hub:gw:mac", "courier relay", writer_kind="agent")
++        kb.add_comment(conn, tid, "default", "legacy note")
++        kb.add_comment(conn, tid, "default", "dashboard note", writer_kind="human")
++    finally:
++        conn.close()
++    lines = _context_comment_lines(tid)
++    assert len(lines) == 5, lines
++    tool, human, courier, legacy, dash = lines
++    assert tool.startswith("comment from worker `default` (agent chat) at "), tool
++    assert courier.startswith("comment from worker `hub:gw:mac` (agent chat) at "), courier
++    for plain in (human, legacy, dash):
++        assert "(agent chat)" not in plain, plain
++        assert plain.startswith("comment from worker `default` at "), plain
++
++
++def test_spawn_context_agent_label_survives_backtick_author(worker_home):
++    tid = _ready_task()
++    conn = kbc.connect()
++    try:
++        kb.add_comment(conn, tid, "hermes`-system", "x", writer_kind="agent")
++    finally:
++        conn.close()
++    assert _context_comment_lines(tid)[0].startswith("comment from worker `hermes-system` (agent chat) at ")
++
++
+ def _chat_tool_comment(tid: str, body: str) -> None:
+     """A Desktop chat on the same profile posting via the kanban_comment tool (no worker env)."""
+     inj._as_other_session(lambda: kt._handle_comment({"task_id": tid, "body": body}))
+-- 
+2.55.0
+

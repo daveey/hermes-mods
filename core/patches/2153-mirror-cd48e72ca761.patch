@@ -1,0 +1,421 @@
+From cd48e72ca761df989b78e8d668f57a88bb77f365 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:28:07 +0000
+Subject: [PATCH] fix(kanban): expose updater holds and validate move targets
+ [daveey]
+
+---
+ hermes_cli/kanban_admission.py                |   7 +-
+ hermes_cli/kanban_db.py                       |   4 +-
+ hermes_cli/kanban_db_dispatch_stuck.py        |  23 ++++
+ hermes_cli/kanban_move.py                     |  53 ++++++--
+ .../test_kanban_hold_diagnostics.py           |  61 +++++++++
+ .../hermes_cli/test_kanban_move_validation.py | 128 ++++++++++++++++++
+ 6 files changed, 262 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hold_diagnostics.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_validation.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 78abd6f2221..f4b04f0ce6c 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -198,7 +198,7 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+     return run_id
+ 
+ 
+-def admission_hold_set():
++def admission_hold_set(task_id=None):
+     """[daveey] Lock-free early read of the updater hold, for callers to check BEFORE side effects that
+     precede ``claim_transaction`` (the Board-service lease). Advisory only: ``claim_transaction`` still
+     re-checks under admission.lock, so a hold set after this read is still honoured. An unreadable
+@@ -209,7 +209,10 @@ def admission_hold_set():
+     if not SUPPORTED:
+         return False
+     try:
+-        return is_held(Path(get_default_hermes_root()) / "core-update")
++        held = is_held(Path(get_default_hermes_root()) / "core-update")
++        if held:
++            _defer(task_id, "update_admission_hold")
++        return held
+     except OSError:
+         return False
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 0294d31e831..c24aac76aa7 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2158,7 +2158,7 @@ def claim_task(
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+     # [daveey] Refuse a held fence, and a lock-free hub CPU advisory (final gate is under the lock), before the lease.
+-    if admission_hold_set() or hub_cpu_advisory(task_id):
++    if admission_hold_set(task_id) or hub_cpu_advisory(task_id):
+         return None
+     gate = _sync.claim_gate(conn, task_id, expires)
+     if gate.deferred:
+@@ -2198,7 +2198,7 @@ def claim_review_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+-    if admission_hold_set() or hub_cpu_advisory(task_id):  # [daveey] before the Board-service lease (see claim_task)
++    if admission_hold_set(task_id) or hub_cpu_advisory(task_id):  # [daveey] before the Board-service lease (see claim_task)
+         return None
+     gate = _sync.claim_gate(conn, task_id, expires, lane="review")
+     if gate.deferred:
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index f6bfd21492d..7c359bc4a2f 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -104,6 +104,22 @@ def cap_source(capacity: str) -> str:
+     return ""
+ 
+ 
++def held_cards(results: Iterable[Optional[Any]]) -> str:
++    """Name every recorded per-card hold, not just the buckets in the summary."""
++    held = set()
++    for res in results:
++        if res is None:
++            continue
++        for field in ("respawn_guarded", "claim_deferred", "skipped_ineligible", "capsule_refused"):
++            held.update(f"{tid}={reason}" for tid, reason in getattr(res, field, ()))
++        for field in ("skipped_unassigned", "skipped_nonspawnable", "rate_limited"):
++            held.update(f"{tid}={field}" for tid in getattr(res, field, ()))
++        held.update(f"{tid}=profile_capacity({profile},{count})"
++                    for tid, profile, count in res.skipped_per_profile_capped)
++        held.update(f"{tid}=owner_down({profile},{code})" for tid, profile, code in res.owner_down)
++    return "; ".join(sorted(held))
++
++
+ def stuck_warning(bad_ticks: int, results: Iterable[Optional[Any]]) -> str:
+     """The "dispatcher stuck" line for the CLI daemon and the embedded gateway dispatcher.
+ 
+@@ -114,6 +130,13 @@ def stuck_warning(bad_ticks: int, results: Iterable[Optional[Any]]) -> str:
+     repin = manual_repin_ids(results)
+     msg = (f"kanban dispatcher stuck: ready queue non-empty for {bad_ticks} consecutive ticks but 0 workers "
+            f"spawned.{f' Last tick held back: {held}.' if held else ''}")
++    cards = held_cards(results)
++    if cards:
++        msg += f" Held cards: {cards}."
++    if any(res is not None and any(reason == "update_admission_hold" for _, reason in res.claim_deferred)
++           for res in results):
++        return (msg + " Local updater admission hold blocks claims before the Board lease; "
++                "inspect core-update/holds/hermes-sync and its updater owner.")
+     if repin:
+         # No pool worker can run these (Board ``no_eligible_worker``); each card carries the repin command.
+         msg += f" Not a stall, waiting for a manual repin: {', '.join(repin)}."
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 783bc790ee0..821de1d6e81 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -9,8 +9,8 @@ does, and the lease CAS admits one claimer.
+ 
+ Guards:
+ 
+-* the target labels must be satisfiable now by a registry machine other than this one that is active and not
+-  on hold (``machine:<x>`` for an unregistered x never is);
++* the target labels must be satisfiable now by an active, unheld registry machine; a running card must leave
++  this machine, while a queued card may target it (``machine:<x>`` for an unregistered x never is);
+ * ``machine:<x>`` needs x to advertise pickup (``placement_unavailable`` otherwise: x would never copy the card,
+   :func:`hermes_cli.kanban_worker_node.check_machine_pins`);
+ * ``kanban.move.max_moves`` (default 3) moves per card;
+@@ -20,6 +20,8 @@ Guards:
+   tools are known or unknown; every match known to lack one refuses ``capability_mismatch``, naming the
+   machine and the missing tool (:mod:`hermes_cli.kanban_runs_on_capabilities`);
+ * the board must sync to the Board service (``runs_on`` is a Board placement field).
++* a target must attest ``capability:host_repo`` when required and ``skill:<pin>`` for every pinned skill,
++  in addition to satisfying the assignee's existing profile-tool check.
+ 
+ Every move is a ``moved`` event ``{from_machine, runs_on, previous_runs_on, reason, move_no, forced}``: the audit log.
+ """
+@@ -64,18 +66,44 @@ def history(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+     return out
+ 
+ 
+-def matching_machines(runs_on: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: str) -> list[str]:
+-    """Registry machines other than ``me`` that are active, not held and carry every label."""
++def matching_machines(runs_on: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: str,
++                      exclude_me: bool = True) -> list[str]:
++    """Active, unheld registry machines carrying every label; running moves exclude ``me``."""
+     from hermes_cli import kanban_worker_node as wn
+     out = []
+     for name, entry in machines.items():
+-        if name == me or not entry or entry.get("state", "active") != "active" or entry.get("hold"):
++        if (exclude_me and name == me) or not entry or entry.get("state", "active") != "active" or entry.get("hold"):
+             continue
+         if set(runs_on) <= wn.effective_labels(entry, name):
+             out.append(name)
+     return sorted(out)
+ 
+ 
++def _requirement_matches(matches, machines, requires, skills, *, me=None, assignee=None):
++    """Move-only attestation gate, using the Board worker contract's capability/skill labels.
++
++    Profile tools retain their existing known/unknown policy; host checkouts and pins instead need
++    affirmative labels. Filter first so separate machines cannot satisfy separate halves of the check.
++    """
++    from hermes_cli import kanban_worker_node as wn
++    required = ({"capability:host_repo"} if "host_repo" in requires else set())
++    required.update(f"skill:{pin}" for pin in skills)
++    lacking = {name: sorted(required - wn.effective_labels(machines[name], name)) for name in matches}
++    if me in matches and required and assignee:
++        # The origin need not advertise worker-pickup labels. Read its actual profile rather than
++        # rejecting a return home because the worker registry omits local checkout/skill inventory.
++        from hermes_cli import kanban_capabilities as caps
++        available = {f"capability:{c}" for c in caps._profile_capabilities(assignee)}
++        with caps._profile_policy(assignee):
++            available.update(f"skill:{pin}" for pin in skills if caps._skill_frontmatter(pin) is not None)
++        lacking[me] = sorted(required - available)
++    capable = [name for name in matches if not lacking[name]]
++    if not capable:
++        detail = "; ".join(f"machine {name} lacks {', '.join(missing)}" for name, missing in lacking.items())
++        raise MoveRefused("capability_mismatch", f"No move target satisfies required worker labels: {detail}")
++    return capable
++
++
+ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool = False,
+           machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
+           cfg: Optional[dict] = None) -> dict[str, Any]:
+@@ -88,7 +116,7 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+         raise MoveRefused("invalid_runs_on", str(exc)) from exc
+     if not labels:
+         raise MoveRefused("invalid_runs_on", "runs_on must name at least one label, e.g. ['machine:worker-1']")
+-    row = conn.execute("SELECT status, workspace_kind, runs_on, assignee, requires FROM tasks WHERE id = ?",
++    row = conn.execute("SELECT status, workspace_kind, runs_on, assignee, requires, skills FROM tasks WHERE id = ?",
+                        (task_id,)).fetchone()
+     if row is None:
+         raise MoveRefused("not_found", f"task {task_id} not found")
+@@ -102,11 +130,14 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+         if reg is None:
+             raise MoveRefused("registry_unavailable", "the Board machine registry is unreachable; try again")
+         machines = reg.get("machines") or {}
+-    matches = matching_machines(labels, machines, me=me)
++    pool: Mapping[str, Mapping[str, Any]] = machines or {}
++    exclude_me = row["status"] == "running"
++    matches = matching_machines(labels, pool, me=me, exclude_me=exclude_me)
+     if not matches:
+-        raise MoveRefused("no_machine", f"no active, unheld machine other than {me} has every label in {labels}")
++        other = f" other than {me}" if exclude_me else ""
++        raise MoveRefused("no_machine", f"no active, unheld machine{other} has every label in {labels}")
+     try:
+-        wn.check_machine_pins(conn, labels, machines=machines, me=me)
++        wn.check_machine_pins(conn, labels, machines=pool, me=me)
+     except wn.MachinePinRefused as exc:
+         raise MoveRefused(exc.code, str(exc)) from exc
+     from hermes_cli import kanban_runs_on_capabilities as roc
+@@ -114,9 +145,11 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+         requires = json.loads(row["requires"]) if row["requires"] else []
+     except ValueError:
+         requires = []
++    matches = _requirement_matches(matches, pool, requires, wn._parse(row["skills"]) or [],
++                                   me=me, assignee=row["assignee"])
+     try:
+         roc.check(labels, assignee=row["assignee"], requires=requires, workspace_kind=row["workspace_kind"] or "scratch",
+-                  me=me, machines={m: machines[m] for m in matches}, exclude_me=True)
++                  me=me, machines={m: pool[m] for m in matches}, exclude_me=exclude_me)
+     except roc.PlacementCapabilityMismatch as exc:
+         raise MoveRefused("capability_mismatch", str(exc)) from exc
+     past = history(conn, task_id)
+diff --git a/tests/hermes_cli/test_kanban_hold_diagnostics.py b/tests/hermes_cli/test_kanban_hold_diagnostics.py
+new file mode 100644
+index 00000000000..0a6ce9996a2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hold_diagnostics.py
+@@ -0,0 +1,61 @@
++"""Updater holds must not disappear from claim/stuck diagnostics."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from tests.hermes_cli import test_kanban_runs_on_dispatch as helpers
++
++svc = helpers.svc
++gws = helpers.gws
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_updater_hold_records_each_unclaimed_card_and_recovers(gws, monkeypatch, lane):
++    from hermes_cli import admission_fence
++    from hermes_constants import get_default_hermes_root
++    from pathlib import Path
++
++    hub, worker = gws
++    hub.enter()
++    ids = [kb.create_task(hub.conn, title=f'held {n}', assignee='default',
++                          runs_on=['machine:worker-1']) for n in range(3)]
++    if lane == 'review':
++        for tid in ids:
++            assert kb.request_review(hub.conn, tid, summary='ready for review')
++    hub.round()
++    worker.round()
++    worker.enter()
++    root = Path(get_default_hermes_root()) / 'core-update'
++    marker = root / 'holds' / 'hermes-sync'
++    marker.parent.mkdir(parents=True, exist_ok=True)
++    marker.write_text('{"pid": 570900, "created_at": 1}')
++    assert admission_fence.is_held(root)
++    result = worker.tick()
++    assert not result.spawned
++    assert set(result.claim_deferred) == {(tid, 'update_admission_hold') for tid in ids}
++    message = kbd.stuck_warning(300, [result])
++    assert all(tid in message for tid in ids)
++    assert 'update_admission_hold' in message
++    assert 'Board lease refused' not in message
++    marker.unlink()  # operator recovery, not automatic stale-hold reclamation
++    result = worker.tick()
++    assert {t for t, *_ in result.spawned} == set(ids)
++    assert not result.claim_deferred
++
++
++def test_warning_names_all_recorded_holds():
++    result = kbd.DispatchResult(
++        skipped_unassigned=['unassigned'], skipped_nonspawnable=['nonspawnable'],
++        skipped_per_profile_capped=[('capped', 'default', 2)],
++        owner_down=[('owner', 'default', 'service_failed')],
++        capsule_refused=[('capsule', 'transport_absent')],
++        respawn_guarded=[('guarded', 'recent_success')], rate_limited=['limited'],
++        skipped_ineligible=[('ineligible', 'labels_mismatch')],
++        claim_deferred=[('deferred', 'offline')],
++    )
++    message = kbd.stuck_warning(8, [result])
++    for tid in ('unassigned', 'nonspawnable', 'capped', 'owner', 'capsule', 'guarded', 'limited',
++                'ineligible', 'deferred'):
++        assert f'{tid}=' in message
++    for reason in ('service_failed', 'transport_absent', 'recent_success', 'labels_mismatch', 'offline'):
++        assert reason in message
+diff --git a/tests/hermes_cli/test_kanban_move_validation.py b/tests/hermes_cli/test_kanban_move_validation.py
+new file mode 100644
+index 00000000000..ce4e3bfd361
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_validation.py
+@@ -0,0 +1,128 @@
++"""Move preflight uses worker requirement labels without changing create's contract."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_runs_on_capabilities as roc
++from tests.hermes_cli import test_kanban_move as helpers
++
++svc = helpers.svc
++gws = helpers.gws
++
++
++def _card(hub, *, requires=(), skills=()):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="queued", assignee="default", requires=[])
++    # Existing cards can have remote-only pins/needs; do not invoke local create validation.
++    hub.conn.execute("UPDATE tasks SET requires = ?, skills = ? WHERE id = ?",
++                     (json.dumps(list(requires)), json.dumps(list(skills)), tid))
++    return tid
++
++
++def _machines(*labels):
++    return {"worker-1": {"state": "active", "pickup": "all", "labels": list(labels)}}
++
++
++def test_queued_move_can_target_self_without_pickup(gws):
++    hub, _ = gws
++    tid = _card(hub, requires=["terminal"])
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="keep local",
++                            machines={"hub": {"state": "active", "pickup": False}}, me="hub")
++    assert result["ok"] and result["matches"] == ["hub"], result
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == ["machine:hub"]
++    assert helpers._events(hub.conn, tid)[0]["queued"] is True
++
++
++@pytest.mark.parametrize("needs,pins,missing", [
++    (["host_repo"], [], "capability:host_repo"),
++    ([], ["five-whys"], "skill:five-whys"),
++    ([], ["plugin:custom"], "skill:plugin:custom"),
++])
++@pytest.mark.parametrize("running", [False, True])
++def test_move_refuses_missing_worker_labels_without_writes(gws, monkeypatch, needs, pins, missing, running):
++    hub, _ = gws
++    if running:
++        tid, _ = helpers._running_hub_card(hub)
++        hub.conn.execute("UPDATE tasks SET requires = ?, skills = ? WHERE id = ?",
++                         (json.dumps(needs), json.dumps(pins), tid))
++    else:
++        tid = _card(hub, requires=needs, skills=pins)
++    monkeypatch.setattr(roc, "_remote_tools", lambda name: None)
++    before = dict(hub.conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
++    result = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="move", checkpoint="saved",
++                          machines=_machines("profile:default", "capability:terminal"), me="hub") if running else (
++        km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="move",
++                       machines=_machines("profile:default", "capability:terminal"), me="hub"))
++    assert result.get("reason_code") == "capability_mismatch", result
++    assert missing in result["error"] and "worker-1" in result["error"]
++    assert dict(hub.conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()) == before
++    assert helpers._events(hub.conn, tid) == []
++
++
++def test_move_requires_one_target_with_both_labels_and_profile_tools(gws, monkeypatch):
++    hub, _ = gws
++    tid = _card(hub, requires=["terminal", "host_repo"], skills=["five-whys", "plan"])
++    machines = _machines("capability:host_repo", "skill:five-whys", "skill:plan")
++    machines["other"] = {"state": "active", "labels": []}
++    monkeypatch.setattr(roc, "_remote_tools", lambda name: {"default": [] if name == "worker-1" else ["terminal"]})
++    with pytest.raises(km.MoveRefused) as exc:
++        km.check(hub.conn, tid, ["linux"], machines={n: {**v, "labels": v["labels"] + ["linux"]}
++                                                  for n, v in machines.items()}, me="hub")
++    assert exc.value.code == "capability_mismatch"
++    monkeypatch.setattr(roc, "_remote_tools", lambda name: {"default": ["terminal"]})
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="capable target",
++                            machines=machines, me="hub")
++    assert result["ok"] and result["matches"] == ["worker-1"], result
++
++
++def test_queued_self_still_checks_local_profile_tools(gws, monkeypatch):
++    hub, _ = gws
++    tid = _card(hub, requires=["terminal"])
++    monkeypatch.setattr(roc, "_local_tools", lambda assignee: set())
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="local",
++                            machines={"hub": {"state": "active"}}, me="hub")
++    assert result.get("reason_code") == "capability_mismatch", result
++
++
++@pytest.mark.parametrize("missing", ["capability:host_repo", "skill:five-whys", "skill:plan"])
++def test_every_required_label_must_be_on_the_same_target(gws, monkeypatch, missing):
++    hub, _ = gws
++    tid = _card(hub, requires=["host_repo"], skills=["five-whys", "plan"])
++    labels = {"capability:host_repo", "skill:five-whys", "skill:plan"}
++    machines = _machines(*(labels - {missing}))
++    monkeypatch.setattr(roc, "_remote_tools", lambda name: None)
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="partial",
++                            machines=machines, me="hub")
++    assert result.get("reason_code") == "capability_mismatch" and missing in result["error"], result
++    machines["capable"] = {"state": "active", "labels": sorted(labels)}
++    for entry in machines.values():
++        entry["labels"].append("linux")
++    plan = km.check(hub.conn, tid, ["linux"], machines=machines, me="hub")
++    assert plan["matches"] == ["capable"]
++
++
++@pytest.mark.parametrize("entry", [{"state": "inactive"}, {"state": "active", "hold": True}, {}])
++def test_queued_self_must_still_be_active_and_unheld(gws, entry):
++    hub, _ = gws
++    tid = _card(hub)
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="local",
++                            machines={"hub": entry}, me="hub")
++    assert result.get("reason_code") == "no_machine", result
++
++
++@pytest.mark.parametrize('missing', [None, 'host_repo', 'skill'])
++def test_queued_return_uses_local_inventory_not_worker_labels(gws, monkeypatch, missing):
++    from contextlib import nullcontext
++    from hermes_cli import kanban_capabilities as caps
++    hub, _ = gws
++    tid = _card(hub, requires=['host_repo'], skills=['local-skill'])
++    monkeypatch.setattr(caps, '_profile_capabilities', lambda assignee: set() if missing == 'host_repo' else {'host_repo'})
++    monkeypatch.setattr(caps, '_profile_policy', lambda assignee: nullcontext())
++    monkeypatch.setattr(caps, '_skill_frontmatter', lambda pin: None if missing == 'skill' else {})
++    result = km.move_queued(hub.conn, tid, runs_on=['machine:hub'], reason='return home',
++                            machines={'hub': {'state': 'active'}}, me='hub')
++    assert result['ok'] is (missing is None), result
+-- 
+2.55.0
+

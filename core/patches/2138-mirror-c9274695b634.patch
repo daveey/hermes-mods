@@ -1,0 +1,522 @@
+From c9274695b6342f57fcd0db24a19d085b0bf178c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:08:02 +0000
+Subject: [PATCH] fix(kanban): restart-resume selector skips Board lease grants
+ released unused [daveey]
+
+Problem: the 2026-11-10 14:23 PST core update restarted the hub gateway under five running cards, and none of
+their next runs restored the interrupted conversation (no `restart_resume` event on any, old transcripts intact).
+t_01a1a1dea9c64d6a: run 163883 `reclaimed`/owner_restart -> run 164239 `released` {"unused_grant":true} ->
+run 164274 started fresh. The other four cards had the same shape (run chains 164178->164241->164304,
+164189->164244->164322, 164183->164321->164325, 164317->164318->164319).
+
+Why 1: `restart_candidate` returned None for all five. evidence: read-only replay of the selector over the hub's
+rows; gateway/session_kanban_resume.py read only the single immediately preceding task_runs row and required
+it to be an owner-restart loss.
+Why 2: that row was a grant run, not the restart loss. evidence: run 164239 has only `claimed` (holder/run_uid)
++ `released` {"unused_grant":true} events, no spawned/owner_admitted, no pid, metadata {"unused_grant":true}.
+Why 3: the Board grants a lease (writing a run row) before the gateway's final gate; when the gate refuses
+(capacity/CPU) or the CAS loses, ClaimGate.__exit__ releases the grant with unused_grant=true
+(hermes_cli/kanban_db_sync.py:737-758, kanban_sync_client.py:1994-1997) and the Board's run row syncs back as a
+`released` run between the restart loss and the real next run. Every core update restarts the gateway and the
+dispatcher then retries claims while the hub is busy, so a grant-then-refuse before the successful claim is
+routine, not an edge case.
+Root (happened): the selector's "immediately preceding run" rule was written for crashes/timeouts in between
+and assumed every run row is an execution; Board grants are run rows that execute nothing.
+Root (not caught): tests/gateway/test_session_kanban_restart_resume.py claims on an unsynced board
+(`kb.claim_task` direct), which never produces grant rows, so no test covered the primary/synced claim path that
+production uses. PR 266 fixed uncounted retries, not preservation, so nothing exercised restoration with grants.
+Recurrence: first occurrence of this chain; earlier restoration commits 6c1154108fd and 340f8d69833 built the
+resume and did not cover grant rows.
+
+Fix: restart_candidate walks back over rows that are explicitly released unused grants AND carry no execution
+or admission evidence (status/outcome released, ended, metadata exactly {"unused_grant": true}, no
+error/summary/worker_pid/heartbeat/claim_lock, events limited to the Board's claimed (no local `lock`) and a
+released with unused_grant true), at most 32, then applies the unchanged owner-restart test to the first other
+row. Crash, timeout, completion, ordinary release, a live grant, or any row with execution evidence still blocks.
+The `restart_resume` event records `skipped_unused_grant_runs`.
+
+Proof: tests/gateway/test_session_kanban_restart_resume_unused_grant.py (45 tests) builds the rows through the
+real path: HubLeaseClient against the Board fake (release now carries unused_grant like the Board), claim_gate +
+ClaimGate release, and ksc.sync_board pull/apply into the local DB, then the real run_task admission. Covers
+1 and 3 grants restoring the exact transcript and emitting the event, pending tool call, compaction,
+foreign home/profile fallbacks, new-run ownership, and 40+ blocking cases (each condition mutated by exact
+anchor). Without the fix 35 of the 45 fail.
+---
+ gateway/session_kanban_resume.py              |  68 +++-
+ ...sion_kanban_restart_resume_unused_grant.py | 326 ++++++++++++++++++
+ tests/hermes_cli/kanban_sync_fake_board.py    |  14 +-
+ 3 files changed, 402 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_session_kanban_restart_resume_unused_grant.py
+
+diff --git a/gateway/session_kanban_resume.py b/gateway/session_kanban_resume.py
+index aa0d864106a..727677b1433 100644
+--- a/gateway/session_kanban_resume.py
++++ b/gateway/session_kanban_resume.py
+@@ -62,19 +62,73 @@ def _json_dict(raw) -> dict:
+     return value if isinstance(value, dict) else {}
+ 
+ 
++# A grant the Board returned unused leaves a run row that never started anything here: the events it may
++# carry are the Board's grant (``claimed`` with holder/run_uid, no local ``lock``) and its ``released``.
++# Anything else (spawned, owner_admitted, worker_bound, heartbeat, worker_result, ...) is execution or
++# admission evidence and keeps the row an ordinary intervening run. [daveey]
++_UNUSED_GRANT_EVENT_KINDS = frozenset({'claimed', 'released'})
++# The Board's release writes exactly ``{"unused_grant": true}`` into the run's metadata. Any other key (the
++# sweep's pid/claimer/exit_code/owner_restart/worker_output/attempt_note, or one added later) fails closed:
++# the row is then an ordinary run and the resume is not attempted.
++_UNUSED_GRANT_METADATA_KEYS = frozenset({'unused_grant'})
++_MAX_UNUSED_GRANTS_SKIPPED = 32
++
++
++def _is_unused_grant_run(conn: sqlite3.Connection, run) -> bool:
++    """A run row that only records a Board lease grant that was released before anything started locally.
++
++    Both the Board's explicit ``unused_grant`` release (``task_runs.metadata``; ClaimGate.__exit__ in
++    ``kanban_db_sync``) and the absence of any execution or admission trace are required: an ordinary release,
++    a crash, a timeout or a completion, or a run that was spawned or admitted, is never skipped.
++    """
++    if run['ended_at'] is None or run['status'] != 'released' or (run['outcome'] or '') != 'released':
++        return False
++    meta = _json_dict(run['metadata'])
++    if meta.get('unused_grant') is not True or meta.keys() - _UNUSED_GRANT_METADATA_KEYS:
++        return False
++    if run['error'] or run['summary']:
++        return False
++    columns = run.keys()
++    if any(c not in columns or run[c] for c in ('worker_pid', 'last_heartbeat_at', 'claim_lock')):
++        return False
++    for kind, payload in conn.execute('SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=?',
++                                      (run['task_id'], run['id'])):
++        if kind not in _UNUSED_GRANT_EVENT_KINDS:
++            return False
++        body = _json_dict(payload)
++        if kind == 'claimed' and 'lock' in body:  # a local claim CAS happened: not a bare grant
++            return False
++        if kind == 'released' and body.get('unused_grant') is not True:
++            return False
++    return True
++
++
+ def restart_candidate(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[dict]:
+     """The run immediately before ``run_id`` on this card when it was lost to an owner restart, with the
+     session its owner admitted it to; ``None`` for every other requeue (crash, timeout, quota, block...).
+ 
+     Only the immediately preceding run counts: a crash or timeout in between means the restart loss is
+-    not what this run is recovering from, and the ordinary path applies unchanged.
++    not what this run is recovering from, and the ordinary path applies unchanged. The one exception is a
++    Board lease grant released unused (:func:`_is_unused_grant_run`): it never started anything, so it is
++    not "in between" and the restart loss behind it is still the run being recovered. Those rows are listed in
++    ``skipped_unused_grant_runs``.
+     """
+     from hermes_cli.kanban_db_dispatch import _is_owner_restart_run
+-    prev = conn.execute('SELECT * FROM task_runs WHERE task_id=? AND id<? ORDER BY id DESC LIMIT 1',
+-                        (task_id, run_id)).fetchone()
++    rows = conn.execute('SELECT * FROM task_runs WHERE task_id=? AND id<? ORDER BY id DESC LIMIT ?',
++                        (task_id, run_id, _MAX_UNUSED_GRANTS_SKIPPED + 1)).fetchall()
++    skipped: list[int] = []
++    prev = None
++    for row in rows:
++        if _is_unused_grant_run(conn, row):
++            skipped.append(int(row['id']))
++            continue
++        prev = row
++        break
+     if prev is None or prev['ended_at'] is None or not _is_owner_restart_run(prev):
+         return None
+     candidate = {'prior_run_id': int(prev['id']), 'prior_profile': prev['profile']}
++    if skipped:
++        candidate['skipped_unused_grant_runs'] = sorted(skipped)
+     admitted = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' "
+                             'ORDER BY id DESC LIMIT 1', (task_id, prev['id'])).fetchone()
+     payload = _json_dict(admitted[0] if admitted else None)
+@@ -122,6 +176,8 @@ def plan_resume(candidate: Optional[dict], *, task, run_id: int, session_db, own
+     if candidate is None:
+         return None
+     plan = {'prior_run_id': candidate['prior_run_id'], 'run_id': run_id}
++    if candidate.get('skipped_unused_grant_runs'):
++        plan['skipped_unused_grant_runs'] = list(candidate['skipped_unused_grant_runs'])
+ 
+     def fallback(reason, **extra):
+         return {**plan, 'fallback': reason, **extra}
+@@ -187,7 +243,9 @@ def plan_and_seed(candidate: dict, *, task, run_id: int, session_db, owner_db: O
+     except Exception:
+         logger.warning('Kanban restart resume: planning failed; fresh session', exc_info=True)
+         return {'prior_run_id': candidate.get('prior_run_id'), 'run_id': run_id,
+-                'prior_session_id': candidate.get('session_id'), 'fallback': 'plan_failed'}, 0
++                'prior_session_id': candidate.get('session_id'), 'fallback': 'plan_failed',
++                **({'skipped_unused_grant_runs': candidate['skipped_unused_grant_runs']}
++                   if candidate.get('skipped_unused_grant_runs') else {})}, 0
+     if not plan.get('resumed_session_id'):
+         return plan, 0
+     try:
+@@ -265,7 +323,7 @@ def record_resume_event(conn, task_id: str, run_id: int, plan: dict, copied: Opt
+     """One ``restart_resume`` event per admitted attempt that follows an owner-restart loss."""
+     from hermes_cli import kanban_db as kb
+     payload = {k: plan[k] for k in ('prior_run_id', 'prior_session_id', 'messages', 'tokens', 'threshold',
+-                                    'fallback') if plan.get(k) is not None}
++                                    'fallback', 'skipped_unused_grant_runs') if plan.get(k) is not None}
+     if plan.get('resumed_session_id'):
+         if copied:
+             payload.update(resumed_session_id=plan['resumed_session_id'], copied_messages=copied,
+diff --git a/tests/gateway/test_session_kanban_restart_resume_unused_grant.py b/tests/gateway/test_session_kanban_restart_resume_unused_grant.py
+new file mode 100644
+index 00000000000..18e3f3be9ee
+--- /dev/null
++++ b/tests/gateway/test_session_kanban_restart_resume_unused_grant.py
+@@ -0,0 +1,326 @@
++"""A Board lease grant released unused sits between an owner-restart loss and the next run without having started
++anything; it must not hide the restart loss from the restart-resume selector. [daveey]
++
++Live (hermes-hub, 2026-11-10 14:23 PST, t_01a1a1dea9c64d6a): run 163883 was lost to the gateway restart, the
++Board then granted run 164239 and the gateway's final gate returned it (``unused_grant: true``), and run 164274
++started with ``restart_candidate`` looking only at run 164239: no ``restart_resume`` event, the transcript was
++not restored. Five cards had the same shape.
++
++These tests use the real path that produces such a row: ``claim_gate`` acquires through ``HubLeaseClient`` against
++the Board fake (``lease_runs=True``, release with ``unused_grant``), the release goes out through
++``ClaimGate.__exit__``, and the run row and its events come back through ``ksc.sync_board``'s pull and
++``apply_remote_changes``. Admission is the real ``run_task`` of ``test_session_kanban_restart_resume``.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
++from tests.gateway import test_session_kanban_restart_resume as base
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++env = base.env  # the shared fixture, assigned locally (not imported by name)
++PRIOR, NEW = base.PRIOR, base.NEW
++BOARD, ME = 'owned', 'hub'
++
++
++@pytest.fixture(autouse=True)
++def _sync_installed(tmp_path):
++    """``kanban.sync.enabled`` is read when the board DB is created, so it precedes the shared ``env`` fixture."""
++    (tmp_path / 'config.yaml').write_text('kanban:\n  sync:\n    enabled: true\n')
++
++
++@pytest.fixture
++def svc():
++    service = FakeService(lease_runs=True)
++    previous = sync.set_lease_client(ksc.HubLeaseClient(service.hub(ME)))
++    ksc.reset_board_watch()
++    try:
++        yield service
++    finally:
++        sync.set_lease_client(previous)
++        ksc.reset_board_watch()
++
++
++def _round(svc):
++    res = ksc.sync_board(BOARD, kb.kanban_db_path(board=BOARD), svc.hub(ME), ME)
++    assert res.error is None and (res.push is None or res.push.rejected == 0), res
++    return res
++
++
++def _go_primary(env, svc, tid):
++    """Switch the board to a synced primary like production and let the Board learn the card and its history."""
++    with base._connect() as conn:
++        ksc.ensure_identity(conn, BOARD, ME)
++        sync.set_mode(conn, 'primary')
++    for _ in range(3):
++        _round(svc)
++    assert tid in svc.board(BOARD)['rows']['tasks']
++
++
++def _unused_grant(svc, tid, *, release_as_unused=True):
++    """One grant the gateway never used, as ``claim_gate`` + the final gate's refusal do: ``with gate: pass``."""
++    with base._connect() as conn:
++        gate = sync.claim_gate(conn, tid, int(time.time()) + 900)
++        assert gate.lease is not None and not gate.deferred
++        if release_as_unused:
++            with gate:
++                pass
++        else:  # an ordinary release of the same grant (no ``unused_grant``)
++            board_id, gateway_id, _ = gate._ids
++            sync._client().release(board_id=board_id, task_uid=tid, run_uid=gate.lease.run_uid, gateway_id=gateway_id)
++    _round(svc)  # the Board's run row and events reach this DB through the real pull/apply path
++
++
++def _imported_grants(tid):
++    with base._connect() as conn:
++        return [r['id'] for r in conn.execute(
++            "SELECT id FROM task_runs WHERE task_id=? AND metadata LIKE '%unused_grant%' ORDER BY id", (tid,))]
++
++
++def _lost_then_grants(env, svc, n, *, session_kwargs=None):
++    base._prior_session(env.db, **(session_kwargs or {}))
++    tid = base._task(env)
++    prior_run, outcome = base._lose_run(tid, code=KANBAN_OWNER_RESTART_EXIT_CODE, state_db=env.db.db_path,
++                                        monkeypatch=env.monkeypatch)
++    assert outcome == 'reclaimed'
++    _go_primary(env, svc, tid)
++    for _ in range(n):
++        _unused_grant(svc, tid)
++    grants = _imported_grants(tid)
++    assert len(grants) == n and all(g > prior_run for g in grants)
++    return tid, prior_run, grants
++
++
++def test_the_imported_grant_row_has_the_live_shape(env, svc):
++    """Anchor to the production rows (run 164239): released, ``{"unused_grant":true}``, claimed + released only."""
++    _tid, _prior, [grant] = _lost_then_grants(env, svc, 1)
++    with base._connect() as conn:
++        row = conn.execute('SELECT * FROM task_runs WHERE id=?', (grant,)).fetchone()
++        kinds = [k for (k,) in conn.execute('SELECT kind FROM task_events WHERE run_id=? ORDER BY id', (grant,))]
++    assert (row['status'], row['outcome'], json.loads(row['metadata'])) == ('released', 'released', {'unused_grant': True})
++    assert row['ended_at'] is not None and not row['claim_lock'] and not row['worker_pid']
++    assert kinds == ['claimed', 'released']
++
++
++@pytest.mark.parametrize('grants', [1, 3])
++def test_unused_grants_after_a_restart_loss_still_resume_the_exact_transcript(env, svc, grants):
++    from gateway.session_kanban_resume import worker_prompt_context
++    tid, prior_run, skipped = _lost_then_grants(env, svc, grants)
++    run = base._admit_next(env, tid)
++    assert [(m['role'], m.get('content')) for m in run.history] == [(m['role'], m['content'])
++                                                                    for m in base._work_transcript()]
++    assert run.history[2]['tool_call_id'] == 'call_edit1'
++    resume = run.events['restart_resume']
++    assert resume['resumed_session_id'] == PRIOR and resume['prior_run_id'] == prior_run
++    assert resume['copied_messages'] == 4 and 'fallback' not in resume
++    assert resume['skipped_unused_grant_runs'] == skipped
++    # New claim ownership: its own run, claim and session; the lost run's session is read, never written.
++    assert run.run_id not in (prior_run, *skipped)
++    assert run.events['owner_admitted']['session_id'] == NEW
++    assert run.events['owner_admitted']['resumed_session_id'] == PRIOR
++    assert len(env.db.get_messages_as_conversation(PRIOR)) == 4
++    prompt = worker_prompt_context(run.context, run.history)
++    assert 'Resumed after gateway restart' in prompt and f'run {prior_run}' in prompt
++    assert f'run {skipped[0]}' not in prompt
++    assert len(base._resume_events(tid, run.run_id)) == 1
++
++
++def test_a_pending_tool_call_still_gets_its_synthetic_result_after_grants(env, svc):
++    from gateway.session_kanban_resume import INTERRUPTED_TOOL_RESULT
++    calls = [{'id': 'call_push9', 'type': 'function', 'function': {'name': 'terminal', 'arguments': '{}'}}]
++    tid, _prior, _grants = _lost_then_grants(env, svc, 2, session_kwargs={'messages': [
++        {'role': 'user', 'content': 'work kanban task'},
++        {'role': 'assistant', 'content': 'Pushing.', 'tool_calls': calls}]})
++    run = base._admit_next(env, tid)
++    assert [m['role'] for m in run.history] == ['user', 'assistant', 'tool']
++    assert run.history[-1]['content'] == INTERRUPTED_TOOL_RESULT
++    assert run.events['restart_resume']['interrupted_calls'] == 1
++
++
++def test_an_over_threshold_transcript_resumes_and_compacts_after_grants(env, svc):
++    from gateway import session_kanban
++    base._tiny_threshold(env)
++    env.monkeypatch.setattr('agent.kanban_turn_recovery.recover_failed_kanban_turns', lambda *a, **kw: None)
++    tid, prior_run, skipped = _lost_then_grants(env, svc, 2)
++    run = base._admit_next(env, tid)
++    assert run.events['restart_resume']['compaction'] == 'pending'
++    assert run.events['restart_resume']['skipped_unused_grant_runs'] == skipped
++    agent = base._WorkerAgent(env.db)
++    session_kanban._run_task_turns(agent, {'text': f'work kanban task {tid}'}, run.history, run.context)
++    assert [c[0] for c in agent.calls] == ['compress', 'model']
++    outcome = base._resume_events(tid, run.run_id)[-1]
++    assert outcome['compacted'] is True and outcome['prior_run_id'] == prior_run
++    assert outcome['resumed_session_id'] == PRIOR
++
++
++@pytest.mark.parametrize('case', ['foreign_home', 'foreign_profile', 'missing'])
++def test_profile_and_home_isolation_still_falls_back_behind_grants(env, svc, case):
++    session, other_db, _patch, expected, _tail = base._FALLBACKS[case]
++    if session is not None:
++        base._prior_session(env.db, **session)
++    tid = base._task(env)
++    state_db = env.tmp / other_db if other_db else env.db.db_path
++    base._lose_run(tid, code=KANBAN_OWNER_RESTART_EXIT_CODE, state_db=state_db, monkeypatch=env.monkeypatch)
++    _go_primary(env, svc, tid)
++    _unused_grant(svc, tid)
++    run = base._admit_next(env, tid)
++    assert run.events['restart_resume']['fallback'] == expected
++    assert 'resumed_session_id' not in run.events['owner_admitted'] and run.history == []
++
++
++def _candidate(tid):
++    from gateway.session_kanban_resume import restart_candidate
++    with base._connect() as conn:
++        last = conn.execute('SELECT MAX(id) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0]
++        return restart_candidate(conn, tid, last + 1)
++
++
++def _tamper(tid, sql, *args):
++    with base._connect() as conn, kb.write_txn(conn):
++        conn.execute(sql, args)
++
++
++def _event(tid, run_id, kind, payload=None):
++    with base._connect() as conn, kb.write_txn(conn):
++        kb._append_event(conn, tid, kind, payload, run_id=run_id)
++
++
++# Every condition that makes a grant row an ordinary run again: each case alters the one imported grant row.
++_UNUSED = '{"unused_grant":true'
++_NOT_AN_UNUSED_GRANT = {
++    'no_unused_flag': ('metadata=?', ('{}',)),
++    'flag_false': ('metadata=?', ('{"unused_grant":false}',)),
++    'flag_string': ('metadata=?', ('{"unused_grant":"true"}',)),
++    'metadata_pid': ('metadata=?', (_UNUSED + ',"pid":7}',)),
++    'metadata_claimer': ('metadata=?', (_UNUSED + ',"claimer":"h:1"}',)),
++    'metadata_exit_code': ('metadata=?', (_UNUSED + ',"exit_code":0}',)),
++    'metadata_owner_restart': ('metadata=?', (_UNUSED + ',"owner_restart":true}',)),
++    'metadata_output': ('metadata=?', (_UNUSED + ',"worker_output":"x"}',)),
++    'metadata_note': ('metadata=?', (_UNUSED + ',"attempt_note":"x"}',)),
++    'metadata_unknown_key': ('metadata=?', (_UNUSED + ',"session_id":"s"}',)),
++    'not_ended': ('ended_at=NULL', ()),
++    'status_crashed': ('status=?', ('crashed',)),
++    'outcome_crashed': ('outcome=?', ('crashed',)),
++    'outcome_none': ('outcome=NULL', ()),
++    'error': ('error=?', ('boom',)),
++    'summary': ('summary=?', ('did things',)),
++    'worker_pid': ('worker_pid=?', (4242,)),
++    'heartbeat': ('last_heartbeat_at=?', (1794349800,)),
++    'claim_lock': ('claim_lock=?', ('hub:1',)),
++}
++
++
++@pytest.mark.parametrize('case', sorted(_NOT_AN_UNUSED_GRANT))
++def test_a_grant_row_altered_into_a_started_or_ordinary_run_blocks_the_resume(env, svc, case):
++    tid, _prior, [grant] = _lost_then_grants(env, svc, 1)
++    assert _candidate(tid) is not None  # control: the untouched row is skipped
++    assignment, params = _NOT_AN_UNUSED_GRANT[case]
++    _tamper(tid, f'UPDATE task_runs SET {assignment} WHERE id=?', *params, grant)
++    assert _candidate(tid) is None
++
++
++_EVIDENCE_EVENTS = {
++    'spawned': ('spawned', {'pid': 9}),
++    'owner_admitted': ('owner_admitted', {'db': 'x', 'session_id': 's', 'request_id': 'r'}),
++    'worker_bound': ('worker_bound', {'pid': 9}),
++    'heartbeat': ('heartbeat', None),
++    'worker_result': ('worker_result', {'exit_code': 1}),
++    'restart_resume': ('restart_resume', {'prior_run_id': 1}),
++    'model_tier': ('model_tier', {'model': 'm'}),
++    'local_claim': ('claimed', {'lock': 'hub:1', 'expires': 1, 'run_id': 1}),
++    'released_not_unused': ('released', {'unused_grant': False}),
++    'released_without_flag': ('released', {'error': None, 'retry_status': 'ready'}),
++}
++
++
++@pytest.mark.parametrize('case', sorted(_EVIDENCE_EVENTS))
++def test_execution_or_admission_evidence_on_a_grant_blocks_the_resume(env, svc, case):
++    tid, _prior, [grant] = _lost_then_grants(env, svc, 1)
++    assert _candidate(tid) is not None
++    kind, payload = _EVIDENCE_EVENTS[case]
++    _event(tid, grant, kind, payload)
++    assert _candidate(tid) is None
++
++
++def test_an_executed_run_between_two_unused_grants_blocks_the_resume(env, svc):
++    tid, _prior, _ = _lost_then_grants(env, svc, 1)
++    base._lose_run(tid, code=1, state_db=env.db.db_path, pid=81002, monkeypatch=env.monkeypatch)
++    with base._connect() as conn:
++        kb.recompute_ready(conn)
++    _unused_grant(svc, tid)
++    assert _candidate(tid) is None
++    run = base._admit_next(env, tid)
++    assert 'restart_resume' not in run.events and run.history == []
++
++
++@pytest.mark.parametrize('kind', ['crash', 'timeout', 'ordinary_release', 'reclaim'])
++def test_a_real_run_after_the_grants_blocks_the_resume(env, svc, kind):
++    tid, _prior, _ = _lost_then_grants(env, svc, 2)
++    if kind == 'crash':
++        base._lose_run(tid, code=1, state_db=env.db.db_path, pid=81002, monkeypatch=env.monkeypatch)
++    elif kind == 'ordinary_release':
++        _unused_grant(svc, tid, release_as_unused=False)  # released through the real wire, not as unused
++    else:
++        with base._connect() as conn:
++            kb.recompute_ready(conn)
++            assert kb.claim_task(conn, tid) is not None
++            if kind == 'timeout':
++                with kb.write_txn(conn):
++                    kb._end_run(conn, tid, outcome='timed_out', status='timed_out', error='max_runtime',
++                                metadata={'exit_code': 124})
++                    conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?", (tid,))
++            else:
++                assert kb.reclaim_task(conn, tid, reason='operator')
++    if kind == 'ordinary_release':
++        with base._connect() as conn:
++            row = conn.execute("SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        assert 'unused_grant' not in (row[0] or '')  # the imported ordinary release carries no unused flag
++    assert _candidate(tid) is None
++    run = base._admit_next(env, tid)
++    assert 'restart_resume' not in run.events and run.history == []
++
++
++def test_a_grant_that_has_not_ended_yet_blocks_the_resume(env, svc):
++    """A grant still held (the Board's run row not yet released) is somebody's live claim, never skipped."""
++    tid, _prior, _ = _lost_then_grants(env, svc, 0)
++    with base._connect() as conn:
++        gate = sync.claim_gate(conn, tid, int(time.time()) + 900)
++        assert gate.lease is not None
++        gate.consumed = True  # held: no release goes out
++    _round(svc)
++    assert _candidate(tid) is None
++
++
++def _insert_grants(tid, count):
++    with base._connect() as conn, kb.write_txn(conn):
++        for _ in range(count):
++            run_id = conn.execute("INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, metadata) "
++                                  "VALUES (?, 'released', 'released', 1, 2, '{\"unused_grant\":true}')",
++                                  (tid,)).lastrowid
++            kb._append_event(conn, tid, 'claimed', {'holder': 'hub', 'run_uid': f'u{run_id}'}, run_id=run_id)
++            kb._append_event(conn, tid, 'released', {'error': None, 'unused_grant': True}, run_id=run_id)
++
++
++def test_the_skip_is_bounded(env):
++    from gateway.session_kanban_resume import _MAX_UNUSED_GRANTS_SKIPPED as limit
++    base._prior_session(env.db)
++    tid = base._task(env)
++    base._lose_run(tid, code=KANBAN_OWNER_RESTART_EXIT_CODE, state_db=env.db.db_path, monkeypatch=env.monkeypatch)
++    _insert_grants(tid, limit)
++    assert len(_candidate(tid)['skipped_unused_grant_runs']) == limit
++    _insert_grants(tid, 1)
++    assert _candidate(tid) is None
++
++
++def test_a_card_with_only_unused_grants_has_no_candidate(env):
++    base._prior_session(env.db)
++    tid = base._task(env)
++    _insert_grants(tid, 2)
++    assert _candidate(tid) is None
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 061203d30d4..608896d4939 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -207,8 +207,20 @@ class FakeHub:
+             runs = b["rows"].get("task_runs", {})
+             if (self.svc.lease_runs and cur and cur["run_uid"] == run and run in runs
+                     and runs[run].get("ended_at") is None):
+-                self.svc._put(b, "task_runs", run, {"status": "released", "outcome": "released", "ended_at": 2},
++                unused = bool(body.get("unused_grant"))
++                # As the Board's releaseTask with ``unused_grant: true`` (live t_01a1a1dea9c64d6a run 164239): the
++                # run's metadata and the ``released`` event both say the grant never started anything.
++                self.svc._put(b, "task_runs", run, {"status": "released", "outcome": "released", "ended_at": 2,
++                                                    **({"metadata": json.dumps({"unused_grant": True},
++                                                                               separators=(",", ":"))}
++                                                       if unused else {})},
+                               gw, op_id, hlc)
++                if unused:
++                    self.svc._put(b, "task_events", f"ev-rel-{run}",
++                                  {"task_id": task, "run_uid": run, "kind": "released",
++                                   "payload": json.dumps({"error": None, "retry_status": "ready",
++                                                          "unused_grant": True}, separators=(",", ":")),
++                                   "created_at": int(time.time())}, gw, op_id, hlc)
+                 self.svc._put(b, "tasks", task, {"status": "ready", "current_run_uid": None, "lease_holder": None,
+                                                  "lease_expires": None}, gw, op_id, hlc)
+             return {"status": "applied", "lease": None}
+-- 
+2.55.0
+

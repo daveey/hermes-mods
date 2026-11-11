@@ -1,0 +1,586 @@
+From 9df7575e561d81dc777c739bf5b2e0914ff6f9bf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:36:17 +0000
+Subject: [PATCH] wt/desktop local recovery tc56 (#1014)
+
+* fix(desktop): observe returning owners and unblock routed opens [daveey]
+
+* test(desktop): prove owner-routed history during local restart [daveey]
+---
+ .../use-route-resume-owner-composed.test.tsx  | 241 ++++++++++++++++++
+ .../hooks/use-route-resume-owner.test.tsx     |  70 +++++
+ .../src/app/session/hooks/use-route-resume.ts |  25 +-
+ hermes_cli/gateway_runtime.py                 |  33 ++-
+ .../test_gateway_runtime_restart_gap.py       | 141 ++++++++++
+ 5 files changed, 508 insertions(+), 2 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-route-resume-owner-composed.test.tsx
+ create mode 100644 apps/desktop/src/app/session/hooks/use-route-resume-owner.test.tsx
+ create mode 100644 tests/hermes_cli/test_gateway_runtime_restart_gap.py
+
+diff --git a/apps/desktop/src/app/session/hooks/use-route-resume-owner-composed.test.tsx b/apps/desktop/src/app/session/hooks/use-route-resume-owner-composed.test.tsx
+new file mode 100644
+index 00000000000..c5e2305f2df
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-route-resume-owner-composed.test.tsx
+@@ -0,0 +1,241 @@
++import { useStore } from '@nanostores/react'
++import { cleanup, render, screen, waitFor } from '@testing-library/react'
++import { useRef } from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { HermesConnection } from '@/global'
++import { getLatestSessionMessages } from '@/hermes'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import * as gateways from '@/store/gateway'
++import { $activeGatewayProfile, $showAllProfiles } from '@/store/profile'
++import {
++  $activeSessionId,
++  $messages,
++  $selectedStoredSessionId,
++  _resetSessionOwnerHintsForTests,
++  setActiveSessionId,
++  setConnection,
++  setMessages,
++  setSelectedStoredSessionId,
++  setSessions
++} from '@/store/session'
++import { $sessionStates, clearAllSessionStates, publishSessionState } from '@/store/session-states'
++import { makeSessionInfo } from '@/test/session-info'
++
++import type { ClientSessionState } from '../../types'
++
++import { useRouteResume } from './use-route-resume'
++import { useSessionActions } from './use-session-actions'
++
++vi.mock('@/app/contrib/hooks/use-background-sync', () => ({ resetLiveRuntimeTracking: vi.fn() }))
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  getLatestSessionMessages: vi.fn(async () => ({
++    session_id: 'remote-session',
++    messages: [{ id: 1, role: 'assistant', content: 'History from the remote owner', timestamp: 1 }]
++  })),
++  HermesGateway: class {
++    connectionState = 'closed'
++    connect = vi.fn(async () => {
++      this.connectionState = 'open'
++    })
++    close = vi.fn(() => {
++      this.connectionState = 'closed'
++    })
++    onEvent = () => () => undefined
++    onState = () => () => undefined
++    request = vi.fn(async (method: string) => {
++      if (method !== 'session.resume') {
++        throw new Error(`Unexpected remote RPC: ${method}`)
++      }
++
++      return {
++        info: {},
++        messages: [],
++        messages_omitted: true,
++        resumed: 'remote-session',
++        session_id: 'remote-runtime',
++        running: false
++      }
++    })
++  }
++}))
++
++function descriptor(connectionId: string): HermesConnection {
++  return {
++    connectionId,
++    profile: 'default',
++    registryScoped: true,
++    mode: connectionId === 'local' ? 'local' : 'remote',
++    authMode: 'token',
++    token: 'test',
++    wsUrl: `ws://${connectionId}.invalid/ws`,
++    baseUrl: `http://${connectionId}.invalid`
++  } as HermesConnection
++}
++
++const local = { connectionState: 'closed', request: vi.fn(async () => ({}) as never) }
++const ambientRequest = vi.fn(async () => ({}) as never)
++
++function Harness({ requestSessionId = 'remote-session' }: { requestSessionId?: string }) {
++  const states = useRef(new Map<string, ClientSessionState>())
++  const activeSessionIdRef = useRef<string | null>(null)
++  const selectedStoredSessionIdRef = useRef<string | null>(null)
++  const creatingSessionRef = useRef(false)
++  const busyRef = useRef(false)
++  const runtimeIdByStoredSessionIdRef = useRef(new Map<string, string>())
++  const activeSessionId = useStore($activeSessionId)
++  const selectedStoredSessionId = useStore($selectedStoredSessionId)
++  const messages = useStore($messages)
++
++  const actions = useSessionActions({
++    activeSessionId,
++    activeSessionIdRef,
++    busyRef,
++    creatingSessionRef,
++    ensureSessionState: (id, storedId) => {
++      const state = states.current.get(id) ?? createClientSessionState(storedId ?? null)
++      states.current.set(id, state)
++
++      return state
++    },
++    getRouteToken: () => '/remote-session',
++    getRoutedStoredSessionId: () => 'remote-session',
++    navigate: vi.fn() as never,
++    requestGateway: ambientRequest,
++    resetViewSync: vi.fn(),
++    routedSessionId: 'remote-session',
++    runtimeIdByStoredSessionIdRef,
++    selectedStoredSessionId,
++    selectedStoredSessionIdRef,
++    sessionStateByRuntimeIdRef: states,
++    syncSessionStateToView: (_id, state) => setMessages(state.messages),
++    updateSessionState: (id, updater, storedId) => {
++      const next = updater(states.current.get(id) ?? createClientSessionState(storedId ?? null))
++      states.current.set(id, next)
++      publishSessionState(id, next)
++
++      return next
++    }
++  })
++
++  useRouteResume({
++    activeSessionId,
++    activeSessionIdRef,
++    creatingSessionRef,
++    currentView: 'chat',
++    freshDraftReady: false,
++    // The old gateway's boot state never recovers during this open.
++    gatewayState: local.connectionState,
++    locationPathname: '/remote-session',
++    resumeSession: actions.resumeSession,
++    resumeFailedSessionId: null,
++    resumeExhaustedSessionId: null,
++    sessionResumeRequest: {
++      sequence: 1,
++      sessionId: requestSessionId,
++      ownerRoute: { connectionId: 'remote', profile: 'default' }
++    },
++    routedSessionId: 'remote-session',
++    runtimeIdByStoredSessionIdRef,
++    selectedStoredSessionId,
++    selectedStoredSessionIdRef,
++    startFreshSessionDraft: actions.startFreshSessionDraft
++  })
++
++  return <output data-testid="transcript">{JSON.stringify(messages)}</output>
++}
++
++describe('route resume composed with session actions and the gateway registry', () => {
++  beforeEach(() => {
++    vi.clearAllMocks()
++    clearAllSessionStates()
++    _resetSessionOwnerHintsForTests()
++    setActiveSessionId(null)
++    setSelectedStoredSessionId(null)
++    setMessages([])
++    $showAllProfiles.set(false)
++    $activeGatewayProfile.set('default')
++    Object.defineProperty(window, 'hermesDesktop', {
++      configurable: true,
++      value: {
++        getConnectionFor: vi.fn(async ({ connectionId }: { connectionId: string }) => descriptor(connectionId)),
++        getGatewayWsUrlFor: vi.fn(async ({ connectionId }: { connectionId: string }) => ({
++          ok: true,
++          wsUrl: `ws://${connectionId}.invalid/ws`
++        }))
++      }
++    })
++    gateways.configureGatewayRegistry({ onEvent: vi.fn(), onActiveRouteChanged: p => $activeGatewayProfile.set(p) })
++    gateways.setPrimaryGateway(local as never, 'default')
++    gateways.setPrimaryGatewayConnection(descriptor('local'))
++    setConnection(descriptor('local'))
++    setSessions([makeSessionInfo({ id: 'remote-session', profile: 'default', connection_id: 'remote', message_count: 1 })])
++  })
++
++  afterEach(() => {
++    cleanup()
++    gateways.closeSecondaryGateways()
++    gateways.setPrimaryGateway(null)
++    gateways.setPrimaryGatewayConnection(null)
++    setConnection(null)
++    setSessions([])
++    setActiveSessionId(null)
++    setSelectedStoredSessionId(null)
++    setMessages([])
++    clearAllSessionStates()
++    _resetSessionOwnerHintsForTests()
++    Reflect.deleteProperty(window, 'hermesDesktop')
++    vi.restoreAllMocks()
++  })
++
++  it('opens the remote owner and publishes its history while the local gateway stays closed', async () => {
++    render(<Harness />)
++
++    await waitFor(() => expect($activeSessionId.get()).toBe('remote-runtime'))
++    const remote = gateways.activeGateway()!
++    expect(gateways.activeGatewayConnectionId()).toBe('remote')
++    expect(remote.request).toHaveBeenCalledExactlyOnceWith(
++      'session.resume',
++      expect.objectContaining({ session_id: 'remote-session' })
++    )
++    expect(remote.connectionState).toBe('open')
++    expect(getLatestSessionMessages).toHaveBeenCalledWith('remote-session', {
++      connectionId: 'remote',
++      profile: 'default'
++    })
++    expect($selectedStoredSessionId.get()).toBe('remote-session')
++    expect($sessionStates.get()['remote-runtime']).toMatchObject({
++      storedSessionId: 'remote-session',
++      messages: [expect.objectContaining({ parts: [expect.objectContaining({ text: 'History from the remote owner' })] })]
++    })
++    expect(screen.getByTestId('transcript').textContent).toContain('History from the remote owner')
++    expect(local.request).not.toHaveBeenCalled()
++    expect(ambientRequest).not.toHaveBeenCalled()
++    expect(local.connectionState).toBe('closed')
++  })
++
++  it('does not use an owner request for a different session to bypass the closed gateway', async () => {
++    const { rerender } = render(<Harness requestSessionId="another-session" />)
++    expect(window.hermesDesktop!.getConnectionFor).not.toHaveBeenCalled()
++    expect(getLatestSessionMessages).not.toHaveBeenCalled()
++    expect($activeSessionId.get()).toBeNull()
++    expect($sessionStates.get()).toEqual({})
++    expect(screen.getByTestId('transcript').textContent).toBe('[]')
++    expect(gateways.activeGateway()).toBe(local)
++    expect(local.request).not.toHaveBeenCalled()
++    expect(ambientRequest).not.toHaveBeenCalled()
++    expect(local.connectionState).toBe('closed')
++
++    // The ignored sequence must still be fresh once the request matches the route.
++    rerender(<Harness />)
++    await waitFor(() => expect($activeSessionId.get()).toBe('remote-runtime'))
++    expect(gateways.activeGateway()!.request).toHaveBeenCalledExactlyOnceWith(
++      'session.resume',
++      expect.objectContaining({ session_id: 'remote-session' })
++    )
++    expect(local.request).not.toHaveBeenCalled()
++    expect(ambientRequest).not.toHaveBeenCalled()
++    expect(local.connectionState).toBe('closed')
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-route-resume-owner.test.tsx b/apps/desktop/src/app/session/hooks/use-route-resume-owner.test.tsx
+new file mode 100644
+index 00000000000..483548928e7
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-route-resume-owner.test.tsx
+@@ -0,0 +1,70 @@
++import { cleanup, render } from '@testing-library/react'
++import { afterEach, expect, it, vi } from 'vitest'
++
++import { useRouteResume } from './use-route-resume'
++
++vi.mock('@/store/session-states', () => ({ markSelectionRestore: vi.fn() }))
++afterEach(cleanup)
++
++function Harness({
++  resume,
++  owner = true,
++  sequence = 1,
++  gatewayState = 'closed',
++  view = 'chat'
++}: {
++  resume: Parameters<typeof useRouteResume>[0]['resumeSession']
++  owner?: boolean
++  sequence?: number
++  gatewayState?: string
++  view?: string
++}) {
++  useRouteResume({
++    activeSessionId: null,
++    activeSessionIdRef: { current: null },
++    creatingSessionRef: { current: false },
++    currentView: view,
++    freshDraftReady: false,
++    gatewayState,
++    locationPathname: '/remote-session',
++    resumeSession: resume,
++    resumeFailedSessionId: null,
++    resumeExhaustedSessionId: null,
++    sessionResumeRequest: {
++      sequence,
++      sessionId: 'remote-session',
++      ...(owner ? { ownerRoute: { connectionId: 'remote', profile: 'default' } } : {})
++    },
++    routedSessionId: 'remote-session',
++    runtimeIdByStoredSessionIdRef: { current: new Map() },
++    selectedStoredSessionId: null,
++    selectedStoredSessionIdRef: { current: null },
++    startFreshSessionDraft: vi.fn()
++  })
++
++  return null
++}
++
++it('dispatches an explicit remote open while the previous local gateway remains closed', () => {
++  const resume = vi.fn(async () => undefined)
++  const { rerender } = render(<Harness resume={resume} />)
++  expect(resume).toHaveBeenCalledExactlyOnceWith('remote-session', true, { connectionId: 'remote', profile: 'default' })
++  rerender(<Harness gatewayState="connecting" resume={resume} />)
++  expect(resume).toHaveBeenCalledTimes(1)
++  rerender(<Harness gatewayState="connecting" resume={resume} sequence={2} />)
++  expect(resume).toHaveBeenCalledTimes(2)
++})
++
++it('still waits for the active gateway when the requested session has no explicit owner', () => {
++  const resume = vi.fn(async () => undefined)
++  const { rerender } = render(<Harness owner={false} resume={resume} />)
++  expect(resume).not.toHaveBeenCalled()
++  rerender(<Harness gatewayState="open" owner={false} resume={resume} />)
++  expect(resume).toHaveBeenCalledOnce()
++})
++
++it('does not resume from a background settings view even with an explicit owner', () => {
++  const resume = vi.fn(async () => undefined)
++  render(<Harness resume={resume} view="settings" />)
++  expect(resume).not.toHaveBeenCalled()
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-route-resume.ts b/apps/desktop/src/app/session/hooks/use-route-resume.ts
+index 68e501d3d48..eb523719215 100644
+--- a/apps/desktop/src/app/session/hooks/use-route-resume.ts
++++ b/apps/desktop/src/app/session/hooks/use-route-resume.ts
+@@ -89,6 +89,21 @@ function rawHashLooksLikeSession(): boolean {
+   )
+ }
+ 
++function canDispatchRouteResume(
++  currentView: string,
++  gatewayOpen: boolean,
++  request: SessionResumeRequest | null,
++  routedSessionId: string | null,
++  handledSequence: number
++): boolean {
++  // An explicit open dials its own owner. The previous gateway's restart
++  // must not strand it; consume each request only once while closed.
++  const ownerRoutedRequest =
++    request?.sessionId === routedSessionId && Boolean(request?.ownerRoute) && request.sequence > handledSequence
++
++  return currentView === 'chat' && (gatewayOpen || ownerRoutedRequest)
++}
++
+ export function useRouteResume({
+   activeSessionId,
+   activeSessionIdRef,
+@@ -141,7 +156,15 @@ export function useRouteResume({
+     seenGatewayStateRef.current = true
+     wasGatewayOpenRef.current = gatewayOpen
+ 
+-    if (currentView !== 'chat' || !gatewayOpen) {
++    if (
++      !canDispatchRouteResume(
++        currentView,
++        gatewayOpen,
++        sessionResumeRequest,
++        routedSessionId,
++        handledResumeRequestRef.current
++      )
++    ) {
+       return
+     }
+ 
+diff --git a/hermes_cli/gateway_runtime.py b/hermes_cli/gateway_runtime.py
+index b68940d1960..f2b97386ed3 100644
+--- a/hermes_cli/gateway_runtime.py
++++ b/hermes_cli/gateway_runtime.py
+@@ -441,6 +441,37 @@ def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -
+     return GatewayDiscovery("draining", reason_code="replaced")
+ 
+ 
++def _recover_start_refusal(home: Path, deadline: float, refusal: GatewayDiscovery) -> GatewayDiscovery:
++    if refusal.reason_code == "service_identity_unverified":
++        return _await_unverified_service_owner(home, deadline)
++    return refusal
++
++
++def _await_unverified_service_owner(home: Path, deadline: float) -> GatewayDiscovery:
++    """Observe only during a supervisor restart gap; never run an unverified definition.
++
++    A custom launcher cannot be safely interpreted, but its returning private
++    control owner can still prove identity exactly as on the ordinary attach path.
++    Keep the original refusal if it does not return, rather than misreport readiness.
++    """
++    import time
++    from hermes_cli.gateway_runtime_service import remaining
++    from hermes_constants import get_default_hermes_root, get_process_hermes_home
++
++    deadline = min(deadline, time.monotonic() + 30)
++    try:
++        while True:
++            budget = remaining(deadline)
++            if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
++                return _fenced_verdict(home, budget)
++            observed = discover_gateway_endpoint(home, timeout=budget)
++            if observed.state not in {"absent", "starting"}:
++                return observed
++            time.sleep(min(0.1, remaining(deadline)))
++    except TimeoutError:
++        return GatewayDiscovery("inaccessible", reason_code="service_identity_unverified")
++
++
+ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = None,
+                            idle_exit: bool = False) -> GatewayDiscovery:
+     """Ensure once; pending remains pending at deadline.
+@@ -560,7 +591,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None =
+     except TimeoutError:
+         return GatewayDiscovery("starting", reason_code="deadline")
+     except RuntimeStartError as exc:
+-        return GatewayDiscovery(exc.state, reason_code=exc.reason)
++        return _recover_start_refusal(home, deadline, GatewayDiscovery(exc.state, reason_code=exc.reason))
+     except PermissionError:
+         return _refused(home)
+     except OSError:
+diff --git a/tests/hermes_cli/test_gateway_runtime_restart_gap.py b/tests/hermes_cli/test_gateway_runtime_restart_gap.py
+new file mode 100644
+index 00000000000..d7329fe4eba
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_runtime_restart_gap.py
+@@ -0,0 +1,141 @@
++"""A supervisor definition refusal must not hide a returning private control owner."""
++import asyncio
++import time
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import gateway_runtime as runtime
++from hermes_cli import gateway_runtime_service as service
++from hermes_cli import gateway_runtime_start as start
++
++
++@pytest.mark.platforms("posix")
++def test_restart_gap_reverifies_returning_control_owner(tmp_path, monkeypatch):
++    from gateway.control_socket import GatewayControlServer
++
++    home = tmp_path / "home"
++    home.mkdir(mode=0o700)
++    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
++    monkeypatch.setattr(runtime, "_starting_multiplexer_root", lambda home: None)
++    monkeypatch.setattr(runtime, "_served_by_multiplexer", lambda *args, **kwargs: None)
++    from hermes_cli import gateway_runtime_multiplex as multiplex
++    monkeypatch.setattr(multiplex, "multiplexer_serves_home", lambda home: None)
++    monkeypatch.setattr(multiplex, "implied_host_root", lambda home: None)
++    spawn = Mock(side_effect=AssertionError("must not spawn an unverified owner"))
++    launch = Mock(side_effect=AssertionError("must not execute an unverified service"))
++    monkeypatch.setattr(start, "spawn_unmanaged_gateway", spawn)
++    monkeypatch.setattr(service, "start_existing_gateway_service", launch)
++
++    async def probe():
++        payload = {"runtime_protocol": 1, "state": "ready", "instance_id": "old",
++                   "authority_epoch": 1, "api_origin": "http://127.0.0.1:12345",
++                   "supervisor": "external", "capabilities": ["session-authority-v1"],
++                   "served_profiles": [{"profile_id": str(home), "home": str(home)}]}
++        server = GatewayControlServer(home, verb_handlers={"identify": lambda: payload})
++        assert await server.start()
++        initial = await asyncio.to_thread(runtime.ensure_gateway_runtime, home, timeout=5)
++        assert initial.endpoint is not None
++        assert initial.endpoint.instance_id == "old"
++        await server.stop()
++        refused = asyncio.Event()
++        loop = asyncio.get_running_loop()
++
++        def unsupported(*args, **kwargs):
++            loop.call_soon_threadsafe(refused.set)
++            raise service.RuntimeStartError("service_identity_unverified")
++
++        monkeypatch.setattr(service, "discover_existing_gateway_service", unsupported)
++        before = time.monotonic()
++        recovering = asyncio.create_task(asyncio.to_thread(runtime.ensure_gateway_runtime, home, timeout=5))
++        try:
++            await asyncio.wait_for(refused.wait(), 3)
++            payload.update(instance_id="replacement", authority_epoch=2)
++            assert await server.start()
++            result = await recovering
++            assert result.state == "ready", result
++            assert result.endpoint is not None
++            assert result.endpoint.instance_id == "replacement"
++            assert result.endpoint.authority_epoch == 2
++            assert time.monotonic() - before < 30
++            spawn.assert_not_called()
++            launch.assert_not_called()
++        finally:
++            await server.stop()
++            await recovering
++
++    asyncio.run(probe())
++
++
++def test_permanent_service_refusal_preserves_reason_and_deadline(tmp_path, monkeypatch):
++    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
++    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *args, **kwargs: runtime.GatewayDiscovery("absent"))
++    monkeypatch.setattr(runtime, "_starting_multiplexer_root", lambda home: None)
++    from hermes_cli import gateway_runtime_multiplex as multiplex
++    monkeypatch.setattr(multiplex, "multiplexer_serves_home", lambda home: None)
++    monkeypatch.setattr(multiplex, "implied_host_root", lambda home: None)
++    refused = Mock(side_effect=service.RuntimeStartError("service_identity_unverified"))
++    monkeypatch.setattr(service, "discover_existing_gateway_service", refused)
++    spawn = Mock(side_effect=AssertionError("unverified service is not absence"))
++    monkeypatch.setattr(start, "spawn_unmanaged_gateway", spawn)
++    before = time.monotonic()
++    result = runtime.ensure_gateway_runtime(tmp_path, timeout=2)
++    assert result.state == "inaccessible"
++    assert result.reason_code == "service_identity_unverified"
++    assert time.monotonic() - before < 5
++    refused.assert_called_once()
++    spawn.assert_not_called()
++
++
++def test_observation_caps_long_caller_budget_at_thirty_seconds(tmp_path, monkeypatch):
++    now = [100.0]
++    monkeypatch.setattr(time, "monotonic", lambda: now[0])
++    monkeypatch.setattr(time, "sleep", lambda duration: now.__setitem__(0, now[0] + duration))
++    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
++    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *args, **kwargs: runtime.GatewayDiscovery("absent"))
++    result = runtime._await_unverified_service_owner(tmp_path, 160.0)
++    assert result.reason_code == "service_identity_unverified"
++    assert now[0] == pytest.approx(130.0)
++
++
++@pytest.mark.parametrize("verdict", [
++    runtime.GatewayDiscovery("inaccessible", reason_code="profile_mismatch"),
++    runtime.GatewayDiscovery("incompatible", reason_code="runtime_protocol"),
++    runtime.GatewayDiscovery("draining", reason_code="update_paused"),
++])
++def test_returning_owner_refusal_is_not_readiness(tmp_path, monkeypatch, verdict):
++    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
++    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *args, **kwargs: verdict)
++    assert runtime._await_unverified_service_owner(tmp_path, time.monotonic() + 5) == verdict
++
++
++def test_update_fence_arriving_during_observation_blocks_attach(tmp_path, monkeypatch):
++    fence = Mock(side_effect=[False, True])
++    monkeypatch.setattr(runtime, "_update_fenced", fence)
++    discover = Mock(return_value=runtime.GatewayDiscovery("absent"))
++    monkeypatch.setattr(runtime, "discover_gateway_endpoint", discover)
++    monkeypatch.setattr(time, "sleep", lambda duration: None)
++    verdict = runtime.GatewayDiscovery("draining", reason_code="update_paused")
++    monkeypatch.setattr(runtime, "_fenced_verdict", lambda *args: verdict)
++    assert runtime._await_unverified_service_owner(tmp_path, time.monotonic() + 5) == verdict
++    discover.assert_called_once()
++
++
++
++@pytest.mark.parametrize("reason", ["service_unavailable", "service_failed", None])
++def test_other_start_refusals_are_not_observed_or_delayed(tmp_path, monkeypatch, reason):
++    discover = Mock(side_effect=AssertionError("only an unverified definition may await its owner"))
++    monkeypatch.setattr(runtime, "discover_gateway_endpoint", discover)
++    monkeypatch.setattr(time, "sleep", Mock(side_effect=AssertionError("must not wait")))
++    refusal = runtime.GatewayDiscovery("inaccessible", reason_code=reason)
++    assert runtime._recover_start_refusal(tmp_path, time.monotonic() + 5, refusal) is refusal
++    discover.assert_not_called()
++
++
++def test_observation_keeps_waiting_through_starting_until_owner_verdict(tmp_path, monkeypatch):
++    ready = runtime.GatewayDiscovery("ready")
++    seq = iter([runtime.GatewayDiscovery("absent"), runtime.GatewayDiscovery("starting"), ready])
++    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
++    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *args, **kwargs: next(seq))
++    monkeypatch.setattr(time, "sleep", lambda duration: None)
++    assert runtime._await_unverified_service_owner(tmp_path, time.monotonic() + 5) is ready
+-- 
+2.55.0
+

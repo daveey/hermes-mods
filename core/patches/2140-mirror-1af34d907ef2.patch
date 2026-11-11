@@ -1,0 +1,320 @@
+From 1af34d907ef24b9608ef1b308cbbf5e6868b9110 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:16:38 +0000
+Subject: [PATCH] fix(kanban): preserve courier creation identity and distinct
+ owners [daveey]
+
+---
+ hermes_cli/kanban_placement.py                |  53 ++++--
+ tests/hermes_cli/test_kanban_placement.py     |   7 +-
+ .../test_kanban_placement_identity.py         | 156 ++++++++++++++++++
+ tools/kanban_tools.py                         |   2 +-
+ 4 files changed, 203 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_identity.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index ba68bb4f2b6..c5cc7c4034b 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -157,9 +157,11 @@ UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "proje
+ # kanban_create options a hermes-hub client with `create-task --option KEY=JSON` carries to the card.
+ # (hermes-hub also allows reasoning_effort, but kanban_create has no such parameter.)
+ CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provider", "goal_mode",
+-                   "goal_max_turns", "completion_contract", "idempotency_key", "requires", "triage")
++                   "goal_max_turns", "completion_contract", "idempotency_key", "requires", "triage",
++                   "distinct_from", "distinct_reason")
++IDENTITY_OPTIONS = ("idempotency_key", "distinct_from", "distinct_reason")
+ # Of those, the ones an older client (no --option) cannot express at all: the card stays local.
+-LEGACY_UNCARRIED = ("model", "provider", "goal_mode", "triage")
++LEGACY_UNCARRIED = ("model", "provider", "goal_mode", "triage", *IDENTITY_OPTIONS)
+ HELP_CACHE_SECONDS = 600
+ # Profile tools (``requires`` entries) a target can satisfy when it does not publish its profiles'
+ # tools: what the hub's default profile has. host_repo never travels: it means a checkout on THIS host.
+@@ -544,14 +546,34 @@ def _bool(v) -> bool:
+     return bool(v)
+ 
+ 
++def _identity_options(args: dict) -> dict:
++    """Preserve safety metadata verbatim, validating the courier's create-option contract."""
++    out = {}
++    for key in IDENTITY_OPTIONS:
++        value = args.get(key)
++        if value is None or value == "" or (key == "distinct_from" and value == []):
++            continue
++        if key == "distinct_from":
++            valid = (isinstance(value, list) and 1 <= len(value) <= 32
++                     and all(isinstance(t, str) and re.fullmatch(r"t_[0-9a-f]{8,16}", t) for t in value))
++        else:
++            valid = isinstance(value, str) and bool(value.strip()) and len(value) <= 500
++        if not valid:
++            raise ValueError(f"create_option_invalid: {key}")
++        out[key] = value
++    if ("distinct_from" in out) != ("distinct_reason" in out):
++        raise ValueError("create_option_invalid: distinct_from and distinct_reason are required together")
++    return out
++
++
+ def carried_options(args: dict) -> dict:
+     """The set :data:`CARRIED_OPTIONS` of a kanban_create call, as JSON types hermes-hub accepts.
+     Defaults (False, 0, local-only, empty) are left out. Raises on a value kanban_create would refuse.
+-    ``idempotency_key`` is not sent: it already fixes the request id, which the hub dedupes on."""
+-    out: dict = {}
++    The caller's creation key is distinct from the transport ID and must reach the receiver."""
++    out: dict = _identity_options(args)
+     for k in CARRIED_OPTIONS:
+         v = args.get(k)
+-        if k == "idempotency_key":
++        if k in IDENTITY_OPTIONS:
+             continue
+         if v in (None, "", [], False):
+             continue
+@@ -848,14 +870,20 @@ def remote_body(args: dict, *, self_gw: str, target: str, carried: bool = False)
+ 
+ def create_remote(args: dict, *, target: str, origin_session: Optional[str], origin_profile: str,
+                   self_gw: str, cfg: Optional[dict] = None, hub_cli: str = "hermes-hub") -> dict:
+-    """Queue the card on ``target``. Returns ``{ok, request_id, rc, ...}``; ok False means create locally."""
++    """Queue on ``target``; a fatal refusal must not fall back to a second local card."""
+     c = _Cfg(config() if cfg is None else cfg)
+     carried = hub_carries_options(hub_cli)
+-    options = carried_options(args) if carried else {}
++    if not carried and any(args.get(k) not in (None, "", []) for k in IDENTITY_OPTIONS):
++        return {"ok": False, "fatal": True, "error": "create identity requires hermes-hub create-task --option"}
++    try:
++        options = carried_options(args) if carried else {}
++    except (TypeError, ValueError) as exc:
++        return {"ok": False, "fatal": True, "error": str(exc)}
+     rid = request_id(self_gw, args, origin_session or "", options)
+     prior = remote_state(rid)
+-    if prior in ("queued", "sent", "done"):
+-        # An identical earlier call already sent this request: never send it again, return it as is.
++    if prior in ("queued", "sent", "done") and not options.get("idempotency_key"):
++        # Content-addressed retries need no send. Explicit keys must let the courier compare
++        # the complete envelope: the same key can also name changed or formerly dropped metadata.
+         return {"ok": True, "request_id": rid, "queued_only": False, "retry": True}
+     argv = [hub_cli, "create-task", target, str(args.get("title") or "untitled").strip()[:300],
+             "--body", remote_body(args, self_gw=self_gw, target=target, carried=carried),
+@@ -869,10 +897,11 @@ def create_remote(args: dict, *, target: str, origin_session: Optional[str], ori
+         argv += ["--origin-session", ""]
+     rc, out, err = hub_runner(argv)
+     if rc == 0:
+-        return {"ok": True, "request_id": rid, "queued_only": False}
++        return {"ok": True, "request_id": rid, "queued_only": False, "retry": prior is not None}
+     if rc == 3:  # hub unreachable after the liveness check: queued, sent on the next sync (durable)
+-        return {"ok": True, "request_id": rid, "queued_only": True}
+-    return {"ok": False, "request_id": rid, "rc": rc, "error": (err or out)[-400:]}
++        return {"ok": True, "request_id": rid, "queued_only": prior != "done", "retry": prior is not None}
++    return {"ok": False, "request_id": rid, "rc": rc, "fatal": "request_id_conflict" in (err or out),
++            "error": (err or out)[-400:]}
+ 
+ 
+ def _sent_row(rid: str) -> Optional[tuple]:
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index bb07529df43..f104cd86a18 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -107,7 +107,7 @@ def test_carried_options_are_json_typed_and_skip_defaults():
+         "completion_contract": "local-only", "idempotency_key": "k", "requires": "ssh:mini",
+         "initial_status": "blocked"})
+     assert got == {"skills": ["x"], "goal_mode": True, "max_runtime_seconds": 900, "goal_max_turns": 3,
+-                   "model": "m", "provider": "p", "requires": ["ssh:mini"]}
++                   "model": "m", "provider": "p", "requires": ["ssh:mini"], "idempotency_key": "k"}
+     assert kp.carried_options({"title": "t"}) == {}
+     with pytest.raises(ValueError):
+         kp.carried_options({"max_runtime_seconds": "2h"})
+@@ -1086,6 +1086,9 @@ def _forwarder(conn, tid, mac, monkeypatch, *, check=(1, "x"), await_tid=HUB_TID
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_placement_forward as kpf
+     from hermes_cli import kanban_wait_check as kwait
++    # Forwarding carries an explicit creation key and requires a field-capable courier.
++    mac["result"]["help"] = NEW_HELP
++    monkeypatch.setattr(kp, "_help_cache", {})
+     monkeypatch.setattr(kwait, "check_remote", lambda gw, kind, tid_, **kw: (1, f"{tid_} ready"))
+     claimed = kb.claim_task(conn, tid)
+     assert claimed is not None
+@@ -1146,7 +1149,7 @@ def test_forwarder_sends_the_card_with_parent_handoffs_and_parks_until_the_hub_c
+         assert argv[argv.index("--origin-session") + 1] == "20261027_183000_abc123"
+         body = argv[argv.index("--body") + 1]
+         assert body.startswith("Push it.") and "fanned out; lint fix is the child" in body and child in body
+-        assert "Runtime budget asked by the creator: 900 s." in body  # options travel with the card
++        assert _options(mac["calls"][0])["max_runtime_seconds"] == 900  # options travel with the card
+         t = kb.get_task(conn, child)
+         assert t.status == "scheduled"
+         ev = [e for e in kb.list_events(conn, child) if e.kind == "scheduled"][-1]
+diff --git a/tests/hermes_cli/test_kanban_placement_identity.py b/tests/hermes_cli/test_kanban_placement_identity.py
+new file mode 100644
+index 00000000000..72f0238bb15
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_identity.py
+@@ -0,0 +1,156 @@
++"""Creation identity and distinct-owner declarations survive courier placement."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++from tests.hermes_cli import test_kanban_placement as helpers
++
++mac = helpers.mac
++IDENTITY = {
++    "idempotency_key": "original:create:identity",
++    "distinct_from": ["t_0123456789abcdef", "t_abcdef0123456789"],
++    "distinct_reason": "Serializer prevention, not immediate receipt repair.",
++}
++
++
++def test_carried_identity_is_exact_json_data():
++    assert kp.carried_options(IDENTITY) == IDENTITY
++    assert kp.carried_options({"distinct_from": [], "distinct_reason": None}) == {}
++
++
++@pytest.mark.parametrize("extra", [
++    {"distinct_from": "t_0123456789abcdef"},
++    {"distinct_from": ["not-a-task"]},
++    {"distinct_from": [42]},
++    {"distinct_from": ["t_0123456789abcdef"] * 33},
++    {"distinct_from": False},
++    {"distinct_reason": 42},
++    {"distinct_reason": " "},
++    {"distinct_reason": "x" * 501},
++    {"idempotency_key": 42},
++    {"idempotency_key": False},
++    {"idempotency_key": " "},
++    {"idempotency_key": "x" * 501},
++    {"distinct_from": []},
++    {"distinct_reason": None},
++])
++def test_invalid_identity_is_not_coerced_or_dropped(extra):
++    with pytest.raises(ValueError):
++        kp.carried_options({**IDENTITY, **extra})
++
++
++@pytest.mark.parametrize("field", list(IDENTITY))
++def test_legacy_client_never_drops_identity(mac, field):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Separate serializer work", "placement": "hub",
++                                        field: IDENTITY[field]}))
++    assert not out.get("ok"), out
++    assert out["code"] == "placement_unavailable"
++    assert mac["calls"] == [] and helpers._local_count() == 0
++
++
++@pytest.mark.parametrize("session", [None, "20261027_183000_abc123"])
++@pytest.mark.parametrize("target", ["hub", "macbook"])
++def test_full_tool_envelope_retains_identity(mac, monkeypatch, session, target):
++    from tools import kanban_tools as kt
++    if target == "macbook":
++        monkeypatch.setattr(kp.reg, "self_gateway", lambda: "hub")
++        monkeypatch.setattr(kp, "target_live", lambda *a, **kw: None)
++        monkeypatch.setattr(kp, "target_info", lambda *a, **kw: helpers.SILENT(target))
++    mac["result"]["help"] = helpers.NEW_HELP
++    out = json.loads(kt._handle_create({"title": "Separate serializer work", "placement": target,
++                                        "session_id": session, **IDENTITY}))
++    assert out["ok"] and out["placed"]["gateway"] == target, out
++    assert helpers._options(mac["calls"][0]) == IDENTITY
++    assert helpers._local_count() == 0
++
++
++def test_explicit_key_retry_revalidates_envelope_without_new_identity(mac, monkeypatch):
++    """A stored transport ID alone cannot establish that the caller's payload is identical."""
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = helpers.NEW_HELP
++    stored = {}
++
++    def courier(argv):
++        rid = argv[argv.index("--id") + 1]
++        envelope = list(argv)
++        if rid in stored and stored[rid] != envelope:
++            return 2, "", "request_id_conflict: different envelope"
++        stored[rid] = envelope
++        return 0, rid, ""
++
++    monkeypatch.setattr(kp, "hub_carries_options", lambda cli: True)
++    monkeypatch.setattr(kp, "hub_runner", courier)
++    monkeypatch.setattr(kp, "remote_state", lambda rid: "sent" if rid in stored else None)
++    args = {"title": "Separate serializer work", **IDENTITY}
++    first = json.loads(kt._handle_create(args))
++    again = json.loads(kt._handle_create(args))
++    assert first["ok"] and again["ok"]
++    assert first["placed"]["request_id"] == again["placed"]["request_id"]
++    assert again["placed"]["retry"] is True
++    conflict = json.loads(kt._handle_create({**args, "distinct_reason": "Changed scope"}))
++    assert not conflict.get("ok"), conflict
++    assert "request_id_conflict" in conflict["error"]
++    assert len(stored) == 1 and helpers._local_count() == 0
++
++
++def test_direct_create_refuses_legacy_safety_metadata(monkeypatch):
++    monkeypatch.setattr(kp, "hub_carries_options", lambda cli: False)
++    monkeypatch.setattr(kp, "hub_runner", lambda argv: pytest.fail("must not queue"))
++    out = kp.create_remote(IDENTITY, target="hub", self_gw="macbook", origin_session=None,
++                           origin_profile="default", cfg={})
++    assert not out["ok"]
++
++
++def test_distinct_scope_participates_in_implicit_request_identity():
++    args = {"title": "Separate serializer work", **IDENTITY}
++    args.pop("idempotency_key")
++    before = kp.request_id("macbook", args, "", kp.carried_options(args))
++    changed = {**args, "distinct_reason": "Different purpose"}
++    assert before != kp.request_id("macbook", changed, "", kp.carried_options(changed))
++    assert before == kp.request_id("macbook", args, "", kp.carried_options(args))
++
++
++def test_invalid_identity_refuses_auto_placement_without_local_fallback(mac):
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = helpers.NEW_HELP
++    out = json.loads(kt._handle_create({"title": "Separate work", **IDENTITY, "distinct_from": "bad"}))
++    assert not out.get("ok") and "create_option_invalid" in out["error"], out
++    assert mac["calls"] == [] and helpers._local_count() == 0
++
++
++@pytest.mark.parametrize("prior", [None, "sent", "done"])
++def test_explicit_key_offline_retry_keeps_prior_outcome(monkeypatch, prior):
++    monkeypatch.setattr(kp, "hub_carries_options", lambda cli: True)
++    monkeypatch.setattr(kp, "hub_runner", lambda argv: (3, "", "offline"))
++    monkeypatch.setattr(kp, "remote_state", lambda rid: prior)
++    out = kp.create_remote(IDENTITY, target="hub", self_gw="macbook", origin_session=None,
++                           origin_profile="default", cfg={})
++    assert out["ok"] and out["retry"] == (prior is not None)
++    assert out["queued_only"] == (prior != "done")
++
++
++def test_legacy_auto_create_keeps_explicit_key_locally(mac):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db_connect as kbc
++    args = {"title": "Separate work", "idempotency_key": IDENTITY["idempotency_key"]}
++    out = json.loads(kt._handle_create(args))
++    assert out["ok"] and "placed" not in out and mac["calls"] == []
++    with kbc.connect_closing() as conn:
++        assert conn.execute("SELECT idempotency_key FROM tasks WHERE id=?", (out["task_id"],)).fetchone()[0] == args["idempotency_key"]
++
++
++def test_legacy_forwarder_falls_back_without_sending_a_lossy_request(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = helpers._done_parent(kb, conn)
++        child = json.loads(kt._handle_create({"title": "Separate work", "parents": [parent]}))["task_id"]
++        kb.recompute_ready(conn)
++        forwarder = helpers._forwarder(conn, child, mac, monkeypatch)
++        monkeypatch.setattr(kp, "hub_carries_options", lambda cli: False)
++        assert forwarder.run() == "fallback"
++        assert kb.get_task(conn, child).status == "running"
++    assert mac["calls"] == []
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 78982cf628a..372237960c9 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1514,7 +1514,7 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         if not placed.get("ok"):
+             logger.warning("kanban placement: %s refused the card (%s)",
+                            target, placed.get("error"))
+-            if kp.explicit_foreign_pin(view, reg.self_gateway()):
++            if placed.get("fatal") or kp.explicit_foreign_pin(view, reg.self_gateway()):
+                 return _placement_refused(target, f"{target} refused the card: {placed.get('error')}"), None
+             return None, None
+         rid = placed["request_id"]
+-- 
+2.55.0
+
