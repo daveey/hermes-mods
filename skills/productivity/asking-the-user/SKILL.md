@@ -44,6 +44,10 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 - Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
+- `run_in_user_terminal` returning `ok:false` with "`<device>` claimed the request but sent no answer in time" is still
+  pending, not failed: call it again with only that `job_id` (and a wait); never resend the command, which would run it twice.
+- A hub `systemctl --user start|stop` of a gateway unit from the chat's own terminal is refused by the gateway
+  self-stop guard; put it in the same `ssh -t ubuntu@hermes-hub '...'` user-terminal command as the step that needs it.
 - The tool is eager on most hosts. Where it isn't in the tool list, call it through `tool_call` (name
   `run_in_user_terminal`); never fall back to pasting the command.
 - The window and `cwd` belong to the user's Mac, even from a hub chat. For a reviewed script already on the hub,
