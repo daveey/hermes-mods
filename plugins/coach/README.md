@@ -19,31 +19,50 @@ While an approved rollout contract freezes root `kanban.max_in_progress`, `pre_t
 terminal/`execute_code` mutation of that key (in that exact root home, not a profile home) that contradicts the
 frozen value. A queue notice, headroom or a generic go-ahead is not permission; the refusal names the contract and the
 queue alternatives (priority, re-placement, local work). Nothing else in config is restricted and no value is
-hardcoded: the freeze exists only as a registered record in `root_cap_contracts.json` in the coach store.
+hardcoded: the freeze exists only as a registered record.
 
+- **One root projection.** The record lives in `<root home>/coach/root_cap_contracts.json` (`root_cap.shared_dir`),
+  not in each profile's store: a profile agent running `HERMES_HOME=<root> hermes config set ...` meets the same
+  registration as a root session. A projection that exists but cannot be read or validated (corrupt JSON, a record
+  missing `frozen_value`, wrong types) is a *known-but-unreadable* contract: only a targeted write is refused. No
+  projection anywhere means no contract (nothing is frozen). A guard fault (`check` or the module failing to load)
+  likewise refuses only a call that names the key; unrelated config and tools keep working.
 - **Register** (`python3 root_cap.py register --store <coach dir> --target-home <root> --value N --contract-ref
   <approved artifact> --approval-session <chat> --approval-message <id> --owner-card <card>`; `list` shows state).
-  It needs the digest-pinned artifact to state the value, a native typed human approval row (same reader as
-  kanban-honest-done: not assistant/notice/worker rows, same chat lineage) naming the key and value, and an open
-  owner card. The freeze lapses when the owner card is done/archived; an unreadable owner, changed artifact digest
-  or two conflicting active revisions refuse only the targeted key (never unrelated config).
-- **Authorized change**: the user's own native turn (coach goal_scope capture) says `authorize ... max_in_progress
-  from <frozen> to <new>` (or cites the revision digest) and it survives later revocation. Permanent: provenance is
-  kept in `root_cap_exceptions.json` and the contract is superseded only after `post_tool_call` reads the new value
-  back. Temporary: the same decision must also name an existing open owner card, restore the original value and give a
-  restore trigger (owner completion and/or a future UTC expiry); provenance is persisted and read back before the
-  call is admitted, then the exception is marked active only after the config reads back the override.
-  `root_cap.due_restores()` lists exceptions whose trigger fired (compare-and-set: a value a later decision
-  changed is reported as `conflict`, and a restore write over it is refused). No timer or auto-restorer is installed.
-- **Parsing**: executable `hermes config set` (wrappers, `bash -c`, `eval`, `$(...)`, `-p/--profile`, `HERMES_HOME=`),
-  in-place `sed/yq/perl` or redirects onto the root `config.yaml` that name the key, and literal `terminal()`,
-  `subprocess`, `os.system` calls in `execute_code` (constants and simple assignments folded). echo/grep/heredoc/quoted
-  text is data. Dynamic commands or config-API writes that name the key are refused as ambiguous. This is not a
-  sandbox: scripts run from files and fully dynamic Python are not covered.
+  Needs the digest-pinned artifact to state the value, an open owner card and a native typed human approval row
+  (same reader as kanban-honest-done: human-opened session, user role, same chat lineage, **newer than the artifact
+  revision**) that is positive (no negation/withdrawal), names the key and the frozen value, and names the artifact
+  revision (digest prefix or file name) or the owner card. The freeze lapses when the owner card is done/archived; an
+  unreadable owner, changed artifact digest or two conflicting active revisions refuse only the targeted key.
+  Registration is the supported activation step: it is not performed by this plugin and no existing rollout is
+  protected until it has been run for it (a machine-wide approved-source index does not exist).
+- **Authorized change**: the user's own native turn (coach goal_scope capture, with its `message_uid`) says
+  `authorize ... max_in_progress from <frozen> to <new>` (or cites the revision digest). The deciding chat must be a
+  human-opened session (desktop/tui/cli/local); a Kanban/cron/subagent session's opening prompt is machine content.
+  Reported speech (`X said ...`, quotes, `> ...`) is not a decision, and any cancellation ("Cancel that", "Never mind",
+  "Revoke ...") withdraws the earlier decision, key or not. Authority is re-read at every admission. Permanent:
+  provenance (decision hash, native `message_uid`, tool and `tool_call_id`) is kept in `root_cap_exceptions.json` and
+  the contract is superseded only after `post_tool_call` reads the new value back, in the same locked transaction.
+  Temporary: the same decision must also name an existing open owner card whose run/profile (if named) match the
+  card's current run and assignee (an unverifiable gateway is rejected, never stored as verified), restore the original
+  value and give a restore trigger (owner completion and/or a future UTC expiry).
+- **Storage**: every read-modify-write holds an exclusive `flock` on `<store>/.root_cap.lock` (threads and processes),
+  writes a unique temp file, fsyncs, replaces atomically and reads back; completion is matched on tool + args + call id.
+- **Recovery**: `root_cap.due_restores()` lists temporary exceptions whose trigger fired. `restore` only when the
+  config still holds the override AND the contract revision it was granted against is still active; anything else is a
+  `conflict`. `pre_llm_call` calls `report_due`, which logs one `root_cap_restore_due` coach event per exception (the
+  existing coach log/notice path). No timer or auto-restorer is installed; the owner performs the restore.
+- **Parsing**: executable `hermes config set` (wrappers, `bash -c`, `eval`, `$(...)`/backticks in unquoted *and*
+  double-quoted words, heredocs that feed a shell or `python -`, `-p/--profile`, `HERMES_HOME=`), in-place
+  `sed/yq/perl` or redirects onto the root `config.yaml` that name the key, and literal `terminal()`, `subprocess`,
+  `os.system` calls in `execute_code` (constants and simple assignments folded). Single-quoted text, `echo`/`grep`
+  arguments and `cat <<'EOF'` bodies are data. Dynamic commands or config-API writes that name the key are refused as
+  ambiguous. This is not a sandbox: scripts run from files and fully dynamic Python are not covered.
 
-Tests: `tests/test_root_cap_guard.py` drives the real registered callbacks on both tool entry paths with fixture-owned
-contract registration, a fixture state.db/kanban db, adversarial parser variants and mutation-sensitive provenance
-cases. It is callback-level evidence, not live gateway activation proof.
+Tests: `tests/test_root_cap_guard.py` (matrix on both tool entry paths, native-session fixture) and
+`tests/test_root_cap_hardening.py` (independent-review findings R1-R6, distinct profile stores, concurrency race,
+real-bash grammar ground truth with a fixture-owned fake `hermes`) drive the real registered callbacks. They are
+callback-level evidence, not live gateway activation proof.
 
 ## Nonblocking profiler attachment
 
