@@ -44,7 +44,18 @@ The previous targeted examples all passed because no cross-product refusal
 contract preserved those forms. The new generated corpus makes that narrowing
 visible alongside the legitimate polling cases rather than trading one for the
 other. Run `python3 scripts/test-all -k cpu-load-guard` from the repository root;
-the direct suite is `tests_guard.py tests_runtime.py tests_worktree.py`.
+the direct suite is `tests_guard.py tests_runtime.py tests_worktree.py tests_comparison.py`.
+
+## Python argv evidence
+
+A burner-named list such as `["yes"]` counts as argv only in code that spawns
+processes. A list or tuple used directly as a comparison operand (`out == ["yes"]`,
+`x in [["yes"], ["no"]]`, or either branch of `(["yes"] if c else ["no"])` being
+compared) is expected data and is ignored, so a test that compares helper output
+while also using unrelated `subprocess` calls and long polling loops is not refused.
+Assigned, launched or otherwise used lists still count, and code that does not
+parse stays conservative. `tests_comparison.py` covers write_file, patch and
+execute_code for both sides.
 
 ## Safe maintenance in linked worktrees
 

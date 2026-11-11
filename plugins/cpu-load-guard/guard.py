@@ -359,8 +359,51 @@ def _check_shell_text(text: str) -> str | None:
     return None
 
 
+def _comparison_list_spans(code: str) -> list[tuple[int, int]] | None:
+    """Offsets of list/tuple literals that are only compared (`out == ["yes"]`, also through
+    `(["yes"] if c else ["no"])`). Such lists are expected data, never argv. None = unparseable."""
+    import ast
+
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return None
+    starts = [0]
+    for line in code.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line.encode("utf-8")))
+    raw = code.encode("utf-8")
+
+    def offset(line: int, col: int) -> int:
+        return len(raw[:starts[line - 1] + col].decode("utf-8", "replace"))
+
+    spans: list[tuple[int, int]] = []
+
+    def collect(node: ast.AST) -> None:
+        if isinstance(node, ast.IfExp):  # only the branches are values; the test is not compared
+            collect(node.body)
+            collect(node.orelse)
+        elif isinstance(node, (ast.List, ast.Tuple)) and node.end_lineno is not None:
+            spans.append((offset(node.lineno, node.col_offset), offset(node.end_lineno, node.end_col_offset or 0)))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            for operand in (node.left, *node.comparators):
+                collect(operand)
+    return spans
+
+
+def _argv_evidence(code: str) -> bool:
+    hits = [m.start() for m in PY_ARGV_RE.finditer(code)]
+    if not hits:
+        return False
+    spans = _comparison_list_spans(code)
+    if spans is None:  # unparseable snippet: stay conservative
+        return True
+    return any(not any(a <= h < b for a, b in spans) for h in hits)
+
+
 def _check_py_text(code: str) -> str | None:
-    spawns = bool(PY_SPAWN_CALL_RE.search(code)) or (bool(PY_ARGV_RE.search(code)) and bool(PY_SPAWNS_RE.search(code)))
+    spawns = bool(PY_SPAWN_CALL_RE.search(code)) or (_argv_evidence(code) and bool(PY_SPAWNS_RE.search(code)))
     if (spawns or PY_BUSY_RE.search(code)) and _fan_out_wide(code):
         return f"a Python/subprocess CPU burner fanned out to about one per core (>= {threshold()} of {ncpu()} cores)"
     return None
