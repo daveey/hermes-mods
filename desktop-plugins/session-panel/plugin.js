@@ -300,8 +300,9 @@ const pipStyle = (k, hub = false) => {
 }
 
 /** Per pip state, how many of its open cards are scheduled on the hub (session-tasks `runMachine`). */
+const onHub = i => i.kind === 'kanban' && i.chip?.runMachine === 'hub'
 export function hubCounts(sorted) {
-  const on = list => (list || []).filter(i => i.kind === 'kanban' && i.chip?.runMachine === 'hub').length
+  const on = list => (list || []).filter(onHub).length
   return { running: on(sorted.active), stuck: on(sorted.stuck), waiting: on(sorted.waiting), queued: on(sorted.queued) }
 }
 
@@ -317,9 +318,12 @@ export function Pips({ n, hub = {} }) {
   ] })
 }
 
-function Row({ i, color }) {
+// Each row leads with the same box as its header pip (shape + colour + hub "H"), not a bullet dot, so the
+// header and the list read as one legend. Centred on the 19px first line.
+function Row({ i, k }) {
+  const hub = onHub(i)
   return jsxs('div', { 'data-panel-row': i.key, style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr)', columnGap: 6, padding: '3px 0', fontSize: 13 }, children: [
-    jsx('span', { 'aria-hidden': true, style: { color, fontSize: 10, lineHeight: '19px' }, children: '●' }),
+    jsx('span', { 'aria-hidden': true, 'data-row-pip': k, ...(hub ? { 'data-row-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), justifySelf: 'center', marginTop: hub ? 3.5 : 5 }, children: hub ? 'H' : undefined }),
     jsxs('div', { style: { minWidth: 0 }, children: [
       jsx('div', { title: str(i.chip?.title) || i.label, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: i.label }),
       i.detail && jsx('div', { style: { ...muted, overflowWrap: 'anywhere' }, children: i.detail })
@@ -360,11 +364,11 @@ function StuckCard({ i, session, now }) {
   ] })
 }
 
-function Fold({ label, items, color }) {
+function Fold({ label, items, k }) {
   if (!items.length) return null
   return jsxs('details', { 'data-fold': label, children: [
     jsx('summary', { style: { cursor: 'pointer', minHeight: 28, display: 'flex', alignItems: 'center', ...muted }, children: label }),
-    ...items.map(i => jsx(Row, { i, color }, i.key))
+    ...items.map(i => jsx(Row, { i, k }, i.key))
   ] })
 }
 
@@ -442,12 +446,12 @@ export function Panel() {
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
       sorted.active.length > 0 && jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
-      ...sorted.active.map(i => jsx(Row, { i, color: C.running }, i.key)),
+      ...sorted.active.map(i => jsx(Row, { i, k: 'running' }, i.key)),
       sorted.waiting.length > 0 && jsx('h3', { 'data-section': 'waiting', style: heading('var(--muted-foreground)'), children: `Waiting · ${sorted.waiting.length}` }),
-      ...sorted.waiting.map(i => jsx(Row, { i, color: C.waiting }, i.key)),
+      ...sorted.waiting.map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
       (finished?.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
-        jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, color: C.queued }),
-        jsx(Fold, { label: `Done · ${finished?.length || 0}`, items: (finished || []).map(d => ({ key: d.key, label: d.label, detail: d.at ? `finished ${ago(d.at, now)}` : '' })), color: C.done })
+        jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),
+        jsx(Fold, { label: `Done · ${finished?.length || 0}`, items: (finished || []).map(d => ({ key: d.key, label: d.label, detail: d.at ? `finished ${ago(d.at, now)}` : '' })), k: 'done' })
       ] }) : null
     ] })
   ] })

@@ -433,3 +433,24 @@ test('hub-scheduled running and waiting cards carry an H in their box; worker ca
   assert.equal(el().querySelector('[data-progress-pips]').getAttribute('aria-label'), '2 running (1 on hub), 1 waiting (1 on hub), 2 not started (1 on hub)')
   assert.deepEqual(m.hubCounts(m.classify(window.__sessionTasks.snapshot.chips)), { running: 1, stuck: 0, waiting: 1, queued: 1 })
 })
+
+test('rows lead with their state box, not a dot; hub cards carry the H there too', async () => {
+  window.localStorage.clear()
+  const fresh = Date.now() / 1000 - 60
+  bridges({ chips: [
+    card('t_hub_run', 'running', { runMachine: 'hub', activityAt: fresh }),
+    card('t_w_run', 'running', { runMachine: 'worker-1', activityAt: fresh }),
+    card('t_hub_wait', 'scheduled', { runMachine: 'hub' }),
+    card('t_w_wait', 'scheduled', { runMachine: 'worker-1' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'row-pips' }))
+  const rows = [...el().querySelectorAll('[data-panel-row]')]
+  assert.ok(rows.length >= 4)
+  assert.ok(!rows.some(r => r.textContent.includes('●')), 'no bullet dots left in rows')
+  const marks = Object.fromEntries(rows.map(r => { const x = r.firstChild; return [r.getAttribute('data-panel-row'), [x.dataset.rowPip, x.hasAttribute('data-row-pip-hub'), x.textContent]] }))
+  assert.deepEqual(marks['kb:t_hub_run'], ['running', true, 'H'])
+  assert.deepEqual(marks['kb:t_w_run'], ['running', false, ''])
+  assert.deepEqual(marks['kb:t_hub_wait'], ['waiting', true, 'H'])
+  assert.deepEqual(marks['kb:t_w_wait'], ['waiting', false, ''])
+  assert.equal(el().querySelectorAll('[data-pip]').length, 4, 'header pips unchanged by row marks')
+})
