@@ -65,7 +65,7 @@ class DisabledApiTests(unittest.TestCase):
             api.set_account_disabled('gemini', 'X', True, st.tools())
         self.assertEqual(cm.exception.status_code, 400)
         orig = api._disable_tools
-        api._disable_tools = lambda: None
+        api._disable_tools = lambda **_: None
         try:
             self.assertEqual(api.disabled_accounts(), {'supported': False, 'accounts': {}})
             with self.assertRaises(HTTPException) as cm:
@@ -87,6 +87,51 @@ class DisabledApiTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as cm:
             api.set_account_disabled('openai-codex', 'X', True, (flaky, ident, is_off, set_off))
         self.assertEqual(cm.exception.status_code, 503)
+
+
+class RealCorePollTests(unittest.TestCase):
+    """GET /disabled against the real core module: read-only, and free while nothing is disabled."""
+
+    def setUp(self):
+        try:
+            import agent.credential_pool_disabled  # noqa: F401
+        except ImportError:
+            self.skipTest('core without credential_pool_disabled')
+        import json
+        import os
+        import tempfile
+        from unittest import mock
+        self.home = tempfile.mkdtemp(prefix='au-disabled-')
+        env = mock.patch.dict(os.environ, {'HERMES_HOME': self.home})
+        env.start()
+        self.addCleanup(env.stop)
+        rows = [{'id': 'row0', 'label': 'a@example.com', 'auth_type': 'api_key', 'priority': 0, 'source': 'manual',
+                 'access_token': 'fixture-a'}]
+        with open(os.path.join(self.home, 'auth.json'), 'w') as fh:
+            json.dump({'version': 1, 'providers': {}, 'credential_pool': {'anthropic': rows}}, fh)
+        import agent.credential_pool as cp
+        import agent.credential_pool_disabled as cpd
+        root = mock.patch.object(cpd, '_root_path', lambda: None)
+        root.start()
+        self.addCleanup(root.stop)
+        cpd._cache.clear()
+        self.cp, self.cpd = cp, cpd
+        no_load = mock.patch.object(cp, 'load_pool', side_effect=AssertionError('panel poll must not load_pool'))
+        no_load.start()
+        self.addCleanup(no_load.stop)
+
+    def test_poll_reads_persisted_rows_only_and_nothing_when_nothing_is_disabled(self):
+        from unittest import mock
+        import hermes_cli.auth as auth
+        with mock.patch.object(auth, 'read_credential_pool', wraps=auth.read_credential_pool) as reads:
+            self.assertEqual(api.disabled_accounts(), {'supported': True, 'accounts': {}})
+            self.assertEqual(reads.call_count, 0)
+        entry = self.cp.PooledCredential.from_dict('anthropic', auth.read_credential_pool('anthropic')[0])
+        self.assertTrue(self.cpd.set_credential_disabled('anthropic', entry, True))
+        self.cpd._cache.clear()
+        out = api.disabled_accounts()
+        self.assertEqual(list(out['accounts']), ['anthropic'])
+        self.assertEqual(len(out['accounts']['anthropic']), 1)
 
 
 if __name__ == '__main__':

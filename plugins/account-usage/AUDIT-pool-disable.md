@@ -1,11 +1,11 @@
 # Core `hermes auth disable` compatibility audit
 
-Candidate: daveey/hermes `8030b3ee106` (worktree `pool-disable-accounts`, 3 commits), parent
+Candidate: daveey/hermes `10c007a5706` (worktree `pool-disable-accounts`, 4 commits), parent
 `9df7575e561` (already accepted: every execution pin matches).
 
 | File | Candidate SHA256 |
 |---|---|
-| `agent/credential_pool.py` | `bda2c9ead42760d49282a2bf3c172748ce69faa0e59c32f742c9ed90e2bc1bb5` |
+| `agent/credential_pool.py` | `bbc6ef330a04a154f98ef0d6f128430ebe756fb945f56764db9d1ee18cce35eb` |
 | `agent/client_lifecycle.py` | `c3059954c25cc4decbacd2d4172a952f16368e1e062ea6bb8f57ccf1ff58f260` |
 
 ## Findings
@@ -18,6 +18,7 @@ Candidate: daveey/hermes `8030b3ee106` (worktree `pool-disable-accounts`, 3 comm
 - `credential_pool` also: `_try_refresh_current_unlocked` returns None for a disabled current row (so
   `try_refresh_current`/`try_refresh_matching` never refresh it; recovery then rotates through
   `select`), and `acquire_lease(id)` of a disabled row falls through to normal lease selection.
+  `_is_sole_credential` and `next_available_at` count/scan enabled rows only.
   No-disable behaviour is identical.
 - `client_lifecycle`: `_create_request_openai_client` first calls `rebind_off_disabled(self)`, a no-op
   unless the session is Codex/xAI, its pool has a disabled record, and the bound row is disabled; then it
