@@ -2014,7 +2014,7 @@ def validate_action(value):
     if type(value['revision']) is not int or value['revision'] < 1:
         raise ActionError('revision must be a positive integer')
     if value['kind'] not in ('approval', 'choice', 'input', 'external_step'):
-        raise ActionError('Invalid kind')
+        raise ActionError('Invalid kind: use approval, choice, input, or external_step; use choice for multi-option answers')
     _string(value['title'])
     scope = value['scope']; _object(scope, ('markdown', 'complete', 'sourceRefs'))
     if not isinstance(scope['markdown'], str) or type(scope['complete']) is not bool:

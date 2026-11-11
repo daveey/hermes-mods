@@ -65,7 +65,7 @@ class WithdrawBody(BaseModel):
 
 def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
                   cards=None, *, action_store=None, owner_resolver=None, receiver=None, kanban_boards=None,
-                  session_tasks=None):
+                  session_tasks=None, kanban_mirror=None):
     recovered = set()
     recovery_lock = threading.Lock()
 
@@ -97,9 +97,14 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return action_store if action_store is not None else _load('core').ActionStore(
             Path(ledger_dir) / 'actions.sqlite3' if ledger_dir else None)
 
+    def mirror():
+        return kanban_mirror if kanban_mirror is not None else _load('kanban_mirror').Mirror(
+            _load('core'), store(), boards=kanban_boards)
+
     def delivery():
-        return receiver if receiver is not None else _load('cards').DecisionDelivery(
+        ordinary = receiver if receiver is not None else _load('cards').DecisionDelivery(
             Path(ledger_dir) / 'decision-inbox.sqlite3' if ledger_dir else None)
+        return _load('kanban_mirror').Delivery(mirror(), ordinary)
 
     def owner(session):
         core = _load('core')
@@ -205,6 +210,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         # Withdrawn requests are omitted unless asked for: older Desktop builds reject unknown states.
         def action():
             own = owner(session)
+            mirror().reconcile(own)
             st = migrate(own)
             _load('chat').reconcile(_load('core'), st, own, db=state_db)
             retire_moot(st, own)
