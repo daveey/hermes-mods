@@ -2,6 +2,11 @@
 
 Refuses an agent's raw command that stops a service another card owns.
 
+Also refuses a bounded local shell foot-gun independent of ownership: an unscoped
+`pkill -f` / `--full` with a simple pattern that matches its own enclosing shell
+command. This check runs before owner lookup and smart approval. See
+[self-match safety and evidence](SELF-MATCH.md) for exact coverage and limits.
+
 An owner is marked by `HERMES_OWNER_CARD` (launchd plist `EnvironmentVariables`, systemd `Environment=`, or a
 process environment) or by an `OWNER.md` whose first line is `card: t_<hex>[@host]`, in the job's
 `WorkingDirectory`, the script's directory, a `cd <dir>` in its shell command, or an ancestor of those below `$HOME`.
@@ -37,7 +42,8 @@ Dry run: `python3 -c "import importlib.util as u;s=u.spec_from_file_location('g'
 
 ## Tests
 
-`/usr/bin/python3 -m unittest discover -s plugins/service-owner-guard/tests -v`
+The canonical runner below includes both the existing unittest cases and the
+pytest self-match regressions. `unittest discover` alone excludes the latter.
 
 Or use `HERMES_MODS_PYTHON=<Hermes runtime python> scripts/test-all -k service-owner-guard --hermes-core <core checkout>`.
 The Linux `/proc` fixture is skipped on macOS; run it on Linux with

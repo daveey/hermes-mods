@@ -226,6 +226,8 @@ def _kill(prog: str, args: list, host) -> list:
         match_args, i = [], 0
         while i < len(args):
             a = args[i]
+            if a in {"-0", "--signal=0"} or (a == "--signal" and args[i + 1:i + 2] == ["0"]):
+                return []  # existence probe, not a stop
             if a == "--signal":
                 i += 2
                 continue
@@ -318,6 +320,54 @@ def extract_actions(text: str, python: bool = False) -> list:
     return out
 
 
+def _self_matching_pkill(text: str) -> Optional[str]:
+    """Bounded shell foot-gun check, independent of service ownership.
+
+    Only plain unscoped full-command matches, with the same simple regex semantics
+    in Python and POSIX ERE. No arbitrary regex evaluation or host process probing.
+    Narrowing flags, remote commands and complex patterns retain existing policy.
+    """
+    for act in extract_actions(text):
+        if act.get("verb") != "pkill" or act.get("host"):
+            continue
+        flags = act.get("pgrep_args", [])
+        pattern = act["pattern"]
+        if flags not in (["-f", pattern], ["--full", pattern], ["-f", "--", pattern]):
+            continue
+        if len(pattern) > 512 or not re.fullmatch(r"[A-Za-z0-9_./ :\-]+", pattern):
+            continue
+        if re.search(pattern, text):
+            return ("Refused: pkill full-command pattern matches its own shell command; it can terminate "
+                    "the launcher before the remaining commands run. Use process_manage kill for a tracked job, "
+                    "or verify ownership/start time and terminate only the exact PID. Start long tests with "
+                    "background=True rather than retrying after a foreground timeout.")
+    return None
+
+
+def _literal_terminal_commands(code: str) -> list[str]:
+    """Only literal terminal(...) commands, not arbitrary Python strings/argv.
+
+    Dynamic Python, direct subprocess use and aliases are not claimed coverage.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else "")
+        if name != "terminal":
+            continue
+        value = next((kw.value for kw in node.keywords if kw.arg == "command"),
+                     node.args[0] if node.args else None)
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            out.append(value.value)
+    return out
+
+
 # ───────────── verdicts ─────────────
 def _log(host: str, act: dict, owner: str, decision: str) -> None:
     path = Path(os.environ.get("SERVICE_OWNER_GUARD_LOG") or Path.home() / ".hermes/logs/service-owner-guard.log")
@@ -389,9 +439,13 @@ def classify(tool_name: str, args: Any) -> Optional[str]:
     args = args if isinstance(args, dict) else {}
     if tool_name in SHELL_TOOLS:
         text = " ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
-        return _evaluate(text, extract_actions(text))
+        return _self_matching_pkill(text) or _evaluate(text, extract_actions(text))
     if tool_name in PY_TOOLS:
         text = str(args.get("code") or "")
+        for command in _literal_terminal_commands(text):
+            why = _self_matching_pkill(command)
+            if why:
+                return why
         return _evaluate(text, extract_actions(text, python=True))
     if tool_name in {"tool_call", "mcp__tool_call"}:
         for call in args.get("calls") or []:
