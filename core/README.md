@@ -16,6 +16,9 @@ The last public/private series reconciliation (what was already equivalent, what
 
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
+The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
+overlay** in the Applying recipe below. The immutable mails alone retain two invalid
+placement regexes; the original verifier proves historical fidelity, not regex validity.
 
 2253 patches, one entry per non-merge source commit through `9bc6ed6b6df403e0c80529753b9814d3ec119cba`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
@@ -1456,6 +1459,11 @@ git am -3 --empty=keep "${patches[@]:2082:4}"
 git apply --index --3way "$MODS/core/bridges/upstream-before-2087.diff"
 git commit -m 'Explicit upstream integration bridge before 2087'
 git am -3 --empty=keep "${patches[@]:2086:167}"
+# Mandatory additive repair: historical mails intentionally remain immutable.
+python3 -B "$MODS/core/repair_hostname_escapes.py" "$PWD"
+git add hermes_cli/kanban_placement.py
+git commit -m 'Repair historical hostname regex word boundaries'
+python3 -B "$MODS/core/check_hostname_escape_repair.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.
