@@ -781,6 +781,7 @@ export const ownerPhase = consumer => {
   if (!consumer || !OWNER_PHASES.includes(consumer.phase) || !Array.isArray(consumer.receipts)) return 'unknown'
   if (consumer.phase !== 'unknown' && consumer.phase !== 'uncertain' && !consumer.receipts.some(x => x?.phase === consumer.phase)) return 'unknown'
   if (consumer.phase === 'uncertain' && !consumer.receipts.some(x => x?.phase === 'reserved')) return 'unknown'
+  if (consumer.phase === 'not_applied' && consumer.receipts.some(x => x?.phase === 'reserved')) return 'uncertain' // a reservation is never shown as a denial
   if (consumer.phase === 'applied' && !consumer.receipts.some(x => x?.phase === 'applied' && Array.isArray(x.evidence) && x.evidence.length)) return 'unknown'
   return consumer.phase
 }
@@ -1185,6 +1186,14 @@ export function ActionQueue({ embedded = false } = {}) {
   ] })
 }
 
+/** An authorizing numbered option is answerable only when the list froze the COMPLETE request beside it. Older lists
+ * (no `display`) fail closed here; the server refuses them too. Presentation only: the server stays authoritative. */
+export const listDisplayComplete = e => {
+  const d = e?.display
+  return !!d && typeof d === 'object' && d.scopeComplete === true && typeof d.scopeMarkdown === 'string' && !!d.scopeMarkdown.trim()
+    && Array.isArray(d.limits) && Array.isArray(d.exclusions) && !!d.outcomes && typeof d.outcomes === 'object'
+}
+
 /** `::decision-list{id="<sourceId>" d="<digest>"}`: the numbered list frozen when the agent showed it. Buttons post the
  * DISPLAYED snapshot digest and number to the authenticated mounted route; a typed bare number is never trusted. */
 export function DecisionList({ attrs, deps }) {
@@ -1217,17 +1226,32 @@ export function DecisionList({ attrs, deps }) {
       if (!currentRoute(route)) return
       setState(st => ({ ...st, sent: { n, delivery: str(result?.operation?.dispatchState) || 'recorded' }, busy: false }))
     } catch (e) {
-      if (currentRoute(route)) setState(st => ({ ...st, busy: false, error: `Not recorded: ${e.message}. The list may be stale; use the decision queue.` }))
+      if (currentRoute(route)) setState(st => ({ ...st, busy: false, error: `Outcome unknown: ${e.message}. The answer may or may not have been recorded. Retry (the same request key is reused, so it cannot be applied twice) or check the decision queue.` }))
     } finally { busy.current = false }
   }
   return jsxs('div', {
     'data-decision-list': list.digest,
     style: { ...SELECTABLE, margin: '6px 0', padding: '8px 10px', borderRadius: 8, border: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 },
     children: [
-      ...list.entries.map(e => jsxs('div', { 'data-decision-list-entry': e.n, style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }, children: [
-        jsx('button', { type: 'button', style: actionStyle, disabled: state.busy || !!state.sent || e.open === false, 'aria-label': `Choose option ${e.n}: ${str(e.label)}`, onClick: () => void answer(e.n), children: String(e.n) }),
-        jsxs('span', { children: [e.title ? `${str(e.title)}: ` : '', str(e.label)] })
-      ] }, e.n)),
+      ...list.entries.map(e => {
+        const d = e.display, authorizing = ['approve', 'answer'].includes(e.effect)
+        // Everything shown is the FROZEN snapshot; the live request (possibly revised since) is never consulted.
+        const complete = listDisplayComplete(e)
+        const blocked = authorizing && !complete
+        const outcome = d && typeof d.outcomes === 'object' && d.outcomes ? str(d.outcomes[e.effect]).trim() : ''
+        return jsxs('div', { 'data-decision-list-entry': e.n, style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }, children: [
+          e.title && jsx('strong', { 'data-decision-list-title': '', style: { overflowWrap: 'anywhere' }, children: str(e.title) }),
+          d && typeof d.scopeMarkdown === 'string' && d.scopeMarkdown.trim() && jsx('div', { 'data-decision-list-scope': '', tabIndex: 0, 'aria-label': authorizing ? 'Complete plan' : 'Question', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.5, maxHeight: '30vh', overflowY: 'auto' }, children: jsx(MessageTextContent, { media: false, text: d.scopeMarkdown }) }),
+          d && Array.isArray(d.limits) && d.limits.length > 0 && jsxs('div', { 'data-decision-list-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: d.limits.map((l, i) => jsx('li', { children: `${str(l.key)}: ${str(l.value)}${permissionNote(l.permissionRequired)}` }, i)) })] }),
+          d && Array.isArray(d.exclusions) && d.exclusions.length > 0 && jsxs('div', { 'data-decision-list-exclusions': '', children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: d.exclusions.map((t, i) => jsx('li', { children: str(t) }, i)) })] }),
+          outcome && jsx('div', { 'data-decision-list-outcome': '', style: planStyle, children: `If you choose this: ${outcome}` }),
+          blocked && jsx('div', { 'data-decision-list-blocked': '', role: 'note', style: { color: AMBER, fontSize: 12 }, children: 'This list does not show the complete request, so this option cannot be answered here. Use the decision queue above the composer.' }),
+          jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }, children: [
+            jsx('button', { type: 'button', style: actionStyle, disabled: state.busy || !!state.sent || e.open === false || blocked, 'aria-label': `Choose option ${e.n}${e.title ? ` for ${str(e.title)}` : ''}: ${str(e.label)}`, onClick: () => void answer(e.n), children: String(e.n) }),
+            jsx('span', { children: str(e.label) })
+          ] })
+        ] }, e.n)
+      }),
       state.sent && jsx('small', { role: 'status', children: `Answered ${state.sent.n} \u2014 ${state.sent.delivery}` }),
       state.error && jsx('div', { role: 'alert', style: { fontSize: 11 }, children: state.error })
     ]

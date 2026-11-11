@@ -67,9 +67,11 @@ class PromptAdmission:
                      'effect, the same call with phase "reserved". Only reservation=new may act; use the returned '
                      'applicationKey as the downstream idempotency key and for readback. If reservation=existing '
                      '(mustVerify) read the downstream back by applicationKey: if the effect is absent or unknown and '
-                     'the work is not idempotent, never repeat it; report the uncertainty. After acting, phase '
-                     '"applied" with evidence refs (stored as agent-reported, unverified), or "not_applied" with a '
-                     'reason. Receipts grant nothing.'
+                     'the work is not idempotent, never repeat it; leave it uncertain and report the uncertainty to '
+                     'the user: do NOT record not_applied for a reserved operation (the server refuses it). After '
+                     'acting, phase "applied" with evidence refs (stored as agent-reported, unverified). '
+                     'not_applied (with a reason) is only for declining before reserving, when nothing has '
+                     'happened. Receipts grant nothing.'
                      % (op['operationId'], op['revision'], op['binding']['scopeDigest']))
         sid = op['owner']['storedSessionId']
         digest = hashlib.sha256(encode({'stored_session_id': sid, 'text': text}).encode()).hexdigest()

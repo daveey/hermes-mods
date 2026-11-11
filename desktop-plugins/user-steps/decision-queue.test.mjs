@@ -936,10 +936,12 @@ test('owner phase: delivery alone is not acknowledgment; only owner receipts cha
  await show(null)
 })
 
+const dsp=(md,extra={})=>({scopeMarkdown:md,scopeComplete:true,limits:[],exclusions:[],outcomes:{},...extra})
+
 test('::decision-list renders the frozen snapshot and posts the exact displayed digest and number', async () => {
  const snap={digest:'d'.repeat(64),owner,source:{type:'message',id:'msg-1'},entries:[
-  {n:1,requestId:'r1',revision:1,choiceId:'c0',title:'Runner?',label:'canary',effect:'answer'},
-  {n:2,requestId:'r2',revision:1,choiceId:'c1',title:'Region?',label:'eu-west-1',effect:'answer'}]}
+  {n:1,requestId:'r1',revision:1,choiceId:'c0',title:'Runner?',label:'canary',effect:'answer',display:dsp('Pick the runner for the canary job')},
+  {n:2,requestId:'r2',revision:1,choiceId:'c1',title:'Region?',label:'eu-west-1',effect:'answer',display:dsp('Pick the region for the canary job')}]}
  const calls=[]; let finish
  const call=async(path,opts={})=>{calls.push([path,opts]); if(opts.method==='POST') return new Promise(res=>{finish=res}); return {list:snap}}
  const attrs={id:'msg-1',d:snap.digest}
@@ -962,7 +964,7 @@ test('::decision-list renders the frozen snapshot and posts the exact displayed 
 })
 
 test('::decision-list never offers buttons when the marker digest differs from the fetched snapshot or the fetch fails', async () => {
- const snap={digest:'d'.repeat(64),entries:[{n:1,requestId:'r1',revision:1,choiceId:'c0',title:'Runner?',label:'canary',effect:'answer'}]}
+ const snap={digest:'d'.repeat(64),entries:[{n:1,requestId:'r1',revision:1,choiceId:'c0',title:'Runner?',label:'canary',effect:'answer',display:dsp('Pick the runner')}]}
  await show(React.createElement(m.DecisionList,{key:'dl-mismatch',attrs:{id:'msg-1',d:'e'.repeat(64)},deps:{call:async()=>({list:snap})}}))
  await React.act(async()=>{await flush();await flush()})
  assert.equal(el().querySelectorAll('button').length,0)
@@ -973,4 +975,78 @@ test('::decision-list never offers buttons when the marker digest differs from t
  await React.act(async()=>{await flush();await flush()})
  assert.equal(el().querySelectorAll('button').length,0)
  await show(null)
+})
+
+// ---- frozen request display next to numbered options ---------------------------------------------------------------
+const listOf=entries=>({digest:'f'.repeat(64),owner,source:{type:'message',id:'msg-9'},entries})
+const mount=async(snap,call)=>{
+ await show(React.createElement(m.DecisionList,{key:'dl-'+Math.random(),attrs:{id:'msg-9',d:snap.digest},deps:{call:call||(async()=>({list:snap}))}}))
+ await React.act(async()=>{await flush();await flush()})
+}
+const approveEntry=(extra={})=>({n:1,requestId:'r1',revision:2,choiceId:'approve',title:'Run the canary job',label:'Approve',effect:'approve',
+ display:dsp('Run canary on staging only; 10 minutes.',{limits:[{key:'spend',value:'none',permissionRequired:true},{key:'time',value:'10 min'}],exclusions:['No production traffic'],outcomes:{approve:'Runs exactly this plan',decline:'Nothing runs'}}),...extra})
+
+test('::decision-list shows the frozen plan, limits, exclusions and outcome beside an authorizing numbered button',async()=>{
+ await mount(listOf([approveEntry()]))
+ const entry=el().querySelector('[data-decision-list-entry]'), text=entry.textContent
+ assert.match(text,/Run the canary job/);assert.match(text,/Run canary on staging only; 10 minutes\./)
+ assert.match(text,/spend: none — needs separate permission/);assert.match(text,/time: 10 min/)
+ assert.match(text,/No production traffic/);assert.match(text,/Runs exactly this plan/)
+ const btn=entry.querySelector('button');assert.ok(btn);assert.equal(btn.disabled,false)
+ assert.match(btn.getAttribute('aria-label'),/Run the canary job.*Approve/)
+ assert.ok(entry.querySelector('[data-decision-list-scope]'),'scope sits in the same entry as its button')
+ await show(null)
+})
+
+test('::decision-list uses ONLY the frozen display, never a newer request revision from the queue',async()=>{
+ await show(React.createElement(m.DecisionList,{key:'dl-frozen',attrs:{id:'msg-9',d:'f'.repeat(64)},deps:{call:async()=>({list:listOf([approveEntry({revision:1})])})}}))
+ await React.act(async()=>{await flush();await flush()})
+ assert.match(el().textContent,/staging only; 10 minutes/);assert.doesNotMatch(el().textContent,/production traffic is included/)
+ await show(null)
+})
+
+test('::decision-list fails closed for an authorizing option whose list lacks a frozen complete display',async()=>{
+ for(const [name,e] of [['legacy',approveEntry({display:undefined})],['incomplete',approveEntry({display:dsp('plan',{scopeComplete:false})})],['blank',approveEntry({display:dsp('   ')})],['malformed',approveEntry({display:{scopeMarkdown:'x'}})],
+   ['answer-legacy',approveEntry({effect:'answer',display:undefined})]]){
+  await mount(listOf([e]))
+  const btn=el().querySelector('[data-decision-list-entry] button')
+  assert.equal(btn.disabled,true,name);assert.match(el().textContent,/does not show the complete request|cannot be answered here/i,name)
+  assert.ok(el().querySelector('[data-decision-list-blocked]'),name)
+ }
+ await show(null)
+})
+
+test('::decision-list keeps a legacy NONauthorizing option answerable and unambiguous',async()=>{
+ const calls=[]
+ await mount(listOf([{n:1,requestId:'r1',revision:1,choiceId:'decline',title:'Run the canary job',label:'Decline',effect:'decline'}]),async(p,o={})=>{calls.push(o.method||'GET');return o.method==='POST'?{operation:{dispatchState:'pending'}}:{list:listOf([{n:1,requestId:'r1',revision:1,choiceId:'decline',title:'Run the canary job',label:'Decline',effect:'decline'}])}})
+ const btn=el().querySelector('[data-decision-list-entry] button')
+ assert.equal(btn.disabled,false);assert.match(el().textContent,/Run the canary job/);assert.match(el().textContent,/Decline/)
+ await show(null)
+})
+
+test('::decision-list marks an entry the server reports as no longer open',async()=>{
+ await mount(listOf([approveEntry({open:false})]))
+ assert.equal(el().querySelector('[data-decision-list-entry] button').disabled,true)
+ await show(null)
+})
+
+test('::decision-list POST failure says the outcome is unknown, never "Not recorded", and a retry reuses the same key',async()=>{
+ const snap=listOf([approveEntry()]); const posts=[]; let fail=true
+ const call=async(p,o={})=>{if(o.method==='POST'){posts.push(o.body.idempotencyKey);if(fail)throw Error('network down');return {operation:{dispatchState:'pending'}}}return {list:snap}}
+ await mount(snap,call)
+ const click=async()=>{await React.act(async()=>{el().querySelector('[data-decision-list-entry] button').click();await flush();await flush()})}
+ await click()
+ assert.match(el().textContent,/Outcome unknown/);assert.doesNotMatch(el().textContent,/Not recorded/)
+ assert.match(el().textContent,/retry|try again/i)
+ fail=false;await click()
+ assert.equal(posts.length,2);assert.equal(posts[0],posts[1],'retry replays the same idempotency key')
+ assert.match(el().textContent,/Answered 1/)
+ await show(null)
+})
+
+test('owner phase: a reservation is never displayed as not applied, even if a payload claims it',async()=>{
+ const receipts=[{phase:'acknowledged'},{phase:'reserved'},{phase:'not_applied',reason:'x'}]
+ assert.equal(m.ownerPhase({phase:'not_applied',receipts}),'uncertain')
+ assert.match(m.ownerPhaseText({phase:'not_applied',receipts}),/uncertain/)
+ assert.equal(m.ownerPhase({phase:'not_applied',receipts:[{phase:'acknowledged'},{phase:'not_applied',reason:'x'}]}),'not_applied')
 })

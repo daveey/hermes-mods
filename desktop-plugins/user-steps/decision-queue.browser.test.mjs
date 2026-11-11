@@ -162,3 +162,43 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   assert.deepEqual(errors,[])
  } finally {await browser.close()}
 })
+
+test('real DOM: ::decision-list shows the frozen plan, limits and exclusions beside the authorizing button; legacy list is blocked',async()=>{
+ const here=dirname(fileURLToPath(import.meta.url))
+ const bundle=await build({stdin:{contents:`
+  import React from 'react';import {createRoot} from 'react-dom/client';import {DecisionList} from './plugin.js';
+  const dsp=(md,x={})=>({scopeMarkdown:md,scopeComplete:true,limits:[],exclusions:[],outcomes:{},...x});
+  const plan='**Frozen plan** '+('long-unbroken-identifier'.repeat(40))+'\\n'+('Plan line.\\n\\n'.repeat(40));
+  const entries=[
+   {n:1,requestId:'r1',revision:1,choiceId:'approve',title:'Run the canary',label:'Approve',effect:'approve',display:dsp(plan,{limits:[{key:'spend',value:'none',permissionRequired:true}],exclusions:['No production traffic'],outcomes:{approve:'Runs exactly this plan'}})},
+   {n:2,requestId:'r2',revision:1,choiceId:'approve',title:'Old list item',label:'Approve',effect:'approve'},
+   {n:3,requestId:'r1',revision:1,choiceId:'decline',title:'Run the canary',label:'Decline',effect:'decline'}];
+  window.posts=[];window.hermesDesktop={api:async({path,...o})=>{if(o.method==='POST'){window.posts.push(o.body);return {operation:{dispatchState:'pending'}}}return {list:{digest:'a'.repeat(64),entries}}}};
+  createRoot(document.getElementById('root')).render(React.createElement(DecisionList,{attrs:{id:'m1',d:'a'.repeat(64)}}));
+ `,resolveDir:here,sourcefile:'fixture2.mjs'},bundle:true,format:'esm',write:false,outdir:'fixture-output',nodePaths:[resolve(desktopDir,'node_modules'),resolve(desktopDir,'../../node_modules')],define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"PROD":true}'},plugins:[{name:'sdk-test-only',setup(b){b.onResolve({filter:/^@hermes\/plugin-sdk$/},()=>({path:'sdk',namespace:'test'}));b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:`const atom=v=>({get:()=>v});export const COMPOSER_AREAS={top:'composer.top'},TRANSCRIPT_DIRECTIVE_AREA='directives',host={state:{focusedStoredSessionId:atom('S1'),connectionId:atom('C1'),profile:atom('default'),focusedSessionOwner:atom({connectionId:'C1',profile:'default'})}},useValue=a=>a?.get();export {MessageTextContent} from ${JSON.stringify(resolve(desktopDir,'src/components/assistant-ui/markdown-text.tsx'))};`,loader:'js',resolveDir:desktopDir}))}}]})
+ const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH ? {executablePath:process.env.CHROME_PATH} : {}),args:['--no-sandbox']})
+ try {
+  const page=await browser.newPage({viewport:{width:640,height:900}})
+  const errors=[];page.on('pageerror',e=>{errors.push(e.message);console.error(e.stack)})
+  await page.route('http://localhost/**',route=>route.fulfill({body:'<!doctype html><html></html>',contentType:'text/html'}))
+  await page.goto('http://localhost/isolated-test')
+  await page.setContent('<style>body{margin:8px;background:#161618;color:#ddd;font:14px system-ui}button{font:inherit;color:inherit}#root{width:100%;min-width:0}</style><main id="root"></main>')
+  await page.addScriptTag({type:'module',content:bundle.outputFiles[0].text})
+  await page.waitForSelector('[data-decision-list-entry]')
+  for(const zoom of [1,2]){
+   await page.evaluate(z=>document.body.style.zoom=z,zoom)
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,`overflow at zoom ${zoom}`)
+  }
+  const first=page.locator('[data-decision-list-entry="1"]')
+  assert.match(await first.locator('[data-decision-list-scope]').innerText(),/Frozen plan/)
+  assert.doesNotMatch(await first.locator('[data-decision-list-scope]').innerText(),/\*\*/,'the real Markdown renderer drew the plan')
+  assert.match(await first.innerText(),/spend: none/);assert.match(await first.innerText(),/No production traffic/)
+  const order=await first.evaluate(el=>{const y=s=>el.querySelector(s).getBoundingClientRect().top;return {scope:y('[data-decision-list-scope]'),btn:y('button')}})
+  assert.ok(order.scope<order.btn,'plan is above its authorizing button')
+  assert.equal(await page.locator('[data-decision-list-entry="2"] button').isDisabled(),true)
+  assert.equal(await page.locator('[data-decision-list-entry="2"] [data-decision-list-blocked]').count(),1)
+  assert.equal(await page.locator('[data-decision-list-entry="3"] button').isDisabled(),false)
+  assert.ok((await page.locator('[data-decision-list-entry="1"] button').boundingBox()).height>=44)
+  assert.deepEqual(errors,[])
+ } finally {await browser.close()}
+})

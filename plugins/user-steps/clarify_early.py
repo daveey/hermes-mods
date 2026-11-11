@@ -55,7 +55,8 @@ def describe(op: dict) -> dict:
 
 RECEIPT_HINT = ('After validating each decision, acknowledge it with action_request {"receipt": {"operationId", '
                 '"phase": "acknowledged", "revision", "scopeDigest"}}; after acting, record phase "applied" with '
-                'evidence refs, or "not_applied" with a reason. Receipts grant nothing.')
+                'evidence refs. "not_applied" (with a reason) is only for declining before reserving; a reserved '
+                'operation stays uncertain, never not_applied. Receipts grant nothing.')
 
 
 def make_provider(*, store: Optional[Callable[[], Any]] = None, delivery: Optional[Callable[[], Any]] = None,

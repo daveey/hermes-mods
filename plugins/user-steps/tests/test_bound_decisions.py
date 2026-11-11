@@ -247,13 +247,53 @@ def test_receipts_require_confirmed_delivery_and_the_exact_revision_and_scope(tm
 
 def test_not_applied_needs_a_reason_and_excludes_applied(tmp_path):
     s, owner, r, op = delivered(tmp_path)
-    s.record_receipt(owner, ack(op)); s.record_receipt(owner, reserve(op))
+    s.record_receipt(owner, ack(op))  # before any reservation nothing can have happened: not_applied is honest
     with pytest.raises(core.ActionError): s.record_receipt(owner, dict(ack(op), phase='not_applied'))
     s.record_receipt(owner, dict(ack(op), phase='not_applied', reason='Superseded by a newer plan'))
     with pytest.raises(core.ActionError) as err:
         s.record_receipt(owner, dict(ack(op), phase='applied', evidence=EVIDENCE))
     assert err.value.status == 409
     assert s.receipts(owner, op['operationId'])['phase'] == 'not_applied'
+    with pytest.raises(core.ActionError) as err: s.record_receipt(owner, reserve(op))  # no reservation after a denial
+    assert err.value.status == 409
+
+
+def test_not_applied_after_reservation_is_refused_and_a_later_applied_stays_possible(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op)); s.record_receipt(owner, reserve(op))
+    with pytest.raises(core.ActionError) as err:
+        s.record_receipt(owner, dict(ack(op), phase='not_applied', reason='readback absent; uncertain'))
+    assert err.value.status == 409 and 'uncertain' in str(err.value).lower()
+    view = s.receipts(owner, op['operationId'])
+    assert view['phase'] == 'uncertain' and [x['phase'] for x in view['receipts']] == ['acknowledged', 'reserved']
+    s.record_receipt(owner, applied(op))  # the real effect may still be reported
+    assert s.receipts(owner, op['operationId'])['phase'] == 'applied'
+
+
+def test_non_holder_not_applied_cannot_block_the_holders_applied_after_the_real_effect(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    s.record_receipt(owner, ack(op)); assert s.record_receipt(owner, reserve(op))['reservation'] == 'new'
+    assert store(tmp_path).record_receipt(owner, reserve(op))['mustVerify'] is True  # non-holder
+    with pytest.raises(core.ActionError) as err:
+        store(tmp_path).record_receipt(owner, dict(ack(op), phase='not_applied', reason='readback absent; uncertain'))
+    assert err.value.status == 409
+    s.record_receipt(owner, applied(op))
+    assert s.receipts(owner, op['operationId'])['phase'] == 'applied'
+
+
+def test_reserved_row_with_a_legacy_not_applied_still_reads_uncertain(tmp_path):
+    # a8a9daec could store reserved + not_applied; reading such a row must never claim nothing happened
+    op = {'dispatchState': 'delivered'}
+    rows = [{'phase': 'acknowledged'}, {'phase': 'reserved'}, {'phase': 'not_applied', 'reason': 'x'}]
+    assert core.ActionStore.consumer_state(op, rows)['phase'] == 'uncertain'
+
+
+def test_prompt_tells_the_agent_to_leave_an_uncertain_reservation_alone(tmp_path):
+    s, owner, r, op = delivered(tmp_path)
+    text = prompt_delivery.PromptAdmission._params(op)['text']
+    low = text.lower()
+    assert 'leave it uncertain' in low and 'do not record not_applied' in low
+    assert 'before reservation' in low or 'before reserving' in low
 
 
 def test_decline_cannot_be_applied(tmp_path):
@@ -296,6 +336,7 @@ def test_concurrent_applied_versus_not_applied_has_exactly_one_winner(tmp_path):
     with ThreadPoolExecutor(8) as pool:
         out = list(pool.map(attempt, bodies))
     winners = {x for x in out if isinstance(x, str)}
+    assert winners == {'applied'}  # reserved: not_applied can never win
     assert len(winners) == 1 and all(x in winners or x == 409 for x in out)
 
 
@@ -353,7 +394,10 @@ def test_revised_request_rejects_stale_application_and_inherits_nothing(tmp_path
     with pytest.raises(core.ActionError) as err:
         s.record_receipt(owner, dict(ack(op), phase='applied', evidence=EVIDENCE))
     assert err.value.status == 409
-    s.record_receipt(owner, dict(ack(op), phase='not_applied', reason='Request was revised'))
+    with pytest.raises(core.ActionError) as err:  # reserved before the revision: outcome stays uncertain, never not_applied
+        s.record_receipt(owner, dict(ack(op), phase='not_applied', reason='Request was revised'))
+    assert err.value.status == 409
+    assert s.receipts(owner, op['operationId'])['phase'] == 'uncertain'
     assert s.history(owner, r['requestId'])[0]['title'] == 'Synthetic change'  # historical answer preserved
     assert s.operation(owner, oid=op['operationId'])['operation']['decision']['choiceId'] == 'approve'
     early = early_provider(s, tmp_path)
@@ -877,3 +921,94 @@ def test_numbered_tool_stays_non_authorizing_and_list_response_gives_marker_afte
     assert 'marker' not in bad  # no marker without persistence
     num = json.loads(plugin.publish_action_request({'numbered': {'sourceId': 'm1', 'n': 1}}, session_id='session-a'))
     assert num['authorizes'] is False
+
+
+# ---- 9. frozen request display in numbered lists --------------------------------------------------------------------
+
+def _legacy_list(tmp_path, s, entries, source='legacy-1'):
+    """A list recorded before entries carried display data (digest over the entries exactly as they were stored)."""
+    body = {'schemaVersion': core.BINDING_SCHEMA, 'owner': OWNER, 'source': {'type': 'message', 'id': source},
+            'entries': entries}
+    body['digest'] = core._sha(body)
+    with s._tx() as c:
+        c.execute('INSERT INTO list_snapshots VALUES (?,?,?,?,?)',
+                  (s._ns(OWNER), OWNER['storedSessionId'], source, body['digest'], core._json(body)))
+    return body
+
+
+def _legacy_entry(s, r, choice_id, n=1):
+    c = next(x for x in r['choices'] if x['id'] == choice_id)
+    b = s.binding(OWNER, r['requestId'])
+    return {'n': n, 'requestId': r['requestId'], 'revision': r['revision'], 'choiceId': c['id'], 'label': c['label'],
+            'effect': c['effect'], 'scopeDigest': b['scopeDigest'], 'title': r['title']}
+
+
+def test_numbered_entries_freeze_the_complete_request_display(tmp_path):
+    s = store(tmp_path); req = request(); req['limits'] = [dict(key='spend', value='none', permissionRequired=True)]
+    r = s.create(OWNER, req)
+    snap = s.record_list(OWNER, 'msg-d', [dict(requestId=r['requestId'], choiceId='approve')])
+    d = snap['entries'][0]['display']
+    assert d['scopeMarkdown'] == 'Change example.py; run correctness tests; deliver patch.' and d['scopeComplete'] is True
+    assert d['limits'] == [dict(key='spend', value='none', permissionRequired=True)] and d['exclusions'] == ['No training']
+    assert d['outcomes']['approve'] == 'Authorize this scope only'
+    assert d['outcomes']['decline'] == 'Cancel request'
+
+
+def test_display_is_part_of_the_snapshot_digest(tmp_path):
+    a = request(); b = dict(a, limits=[dict(key='spend', value='$100')])
+    (tmp_path / 'x').mkdir(); (tmp_path / 'y').mkdir()
+    sa, sb = store(tmp_path / 'x'), store(tmp_path / 'y')
+    ra, rb = sa.create(OWNER, a), sb.create(OWNER, dict(b, requestId=a['requestId']))
+    da = sa.record_list(OWNER, 'm', [dict(requestId=ra['requestId'], choiceId='approve')])
+    db = sb.record_list(OWNER, 'm', [dict(requestId=rb['requestId'], choiceId='approve')])
+    assert da['digest'] != db['digest']
+
+
+def test_frozen_display_survives_a_revision_and_the_stale_answer_authorizes_nothing(tmp_path):
+    s = store(tmp_path); r = s.create(OWNER, request())
+    snap = s.record_list(OWNER, 'msg-r', [dict(requestId=r['requestId'], choiceId='approve')])
+    s.revise(OWNER, r['requestId'], 1, dict(r, scope=dict(r['scope'], markdown='A much larger replacement scope'),
+                                            limits=[dict(key='spend', value='$10000')]))
+    shown = s.list_snapshot(OWNER, 'msg-r')['entries'][0]
+    assert shown['display']['scopeMarkdown'].startswith('Change example.py') and shown['display']['limits'] == [
+        dict(key='spend', value='none')] and shown['open'] is False  # the ORIGINAL data, never the revision
+    with pytest.raises(core.ActionError) as err: s.answer_numbered(OWNER, 'msg-r', snap['digest'], 1, str(uuid.uuid4()))
+    assert err.value.status == 409
+
+
+def test_legacy_list_without_display_fails_closed_for_authorizing_choices(tmp_path):
+    s = store(tmp_path); r = s.create(OWNER, request())
+    legacy = _legacy_list(tmp_path, s, [_legacy_entry(s, r, 'approve')])
+    with pytest.raises(core.ActionError) as err: s.answer_numbered(OWNER, 'legacy-1', legacy['digest'], 1, str(uuid.uuid4()))
+    assert err.value.status == 409 and 'display' in str(err.value).lower()
+    with pytest.raises(core.ActionError) as err: s.resolve_numbered(OWNER, 'legacy-1', 1)
+    assert err.value.status == 409
+    with s._read() as c:
+        assert c.execute('SELECT COUNT(*) FROM operations').fetchone()[0] == 0
+    assert s.get(OWNER, r['requestId'])['state'] == 'open'
+
+
+def test_legacy_authorizing_answer_choice_also_fails_closed(tmp_path):
+    s = store(tmp_path); r = s.create(OWNER, choice_request('Runner?', ('canary', 'aws')))
+    legacy = _legacy_list(tmp_path, s, [_legacy_entry(s, r, 'c0')])
+    with pytest.raises(core.ActionError) as err: s.answer_numbered(OWNER, 'legacy-1', legacy['digest'], 1, str(uuid.uuid4()))
+    assert err.value.status == 409
+
+
+def test_legacy_nonauthorizing_decline_stays_compatible(tmp_path):
+    s = store(tmp_path); r = s.create(OWNER, request())
+    legacy = _legacy_list(tmp_path, s, [_legacy_entry(s, r, 'decline')])
+    op = s.answer_numbered(OWNER, 'legacy-1', legacy['digest'], 1, str(uuid.uuid4()))['operation']
+    assert op['intent']['effect'] == 'decline' and op['intent']['executionAuthorized'] is False
+    assert s.list_snapshot(OWNER, 'legacy-1')['entries'][0].get('display') is None
+
+
+def test_list_snapshot_marks_legacy_authorizing_entries_unanswerable(tmp_path):
+    s = store(tmp_path); r = s.create(OWNER, request())
+    _legacy_list(tmp_path, s, [_legacy_entry(s, r, 'approve', 1), _legacy_entry(s, r, 'decline', 2)])
+    e = s.list_snapshot(OWNER, 'legacy-1')['entries']
+    assert e[0]['open'] is False and e[1]['open'] is True
+
+
+def test_prompt_and_hints_say_an_uncertain_reservation_is_left_alone():
+    assert 'uncertain' in early_mod.RECEIPT_HINT.lower() and 'not_applied' in early_mod.RECEIPT_HINT

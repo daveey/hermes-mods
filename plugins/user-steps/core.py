@@ -2152,6 +2152,25 @@ def scope_digest(revision_body: dict) -> str:
                  if k not in ('state', 'resolution', 'createdAt', 'withdrawal')})
 
 
+AUTHORIZING_EFFECTS = ('approve', 'answer')
+
+
+def request_display(r: dict) -> dict:
+    """Everything the person must see next to a numbered option, frozen at list time (part of the list digest)."""
+    return {'scopeMarkdown': (r.get('scope') or {}).get('markdown') or '',
+            'scopeComplete': (r.get('scope') or {}).get('complete') is True,
+            'limits': [dict(x) for x in r.get('limits') or []], 'exclusions': list(r.get('exclusions') or []),
+            'outcomes': dict(r.get('outcomes') or {})}
+
+
+def entry_displayable(entry: dict) -> bool:
+    """An authorizing entry is answerable only when its frozen display carries a complete, nonempty scope."""
+    d = entry.get('display')
+    return (isinstance(d, dict) and d.get('scopeComplete') is True and isinstance(d.get('scopeMarkdown'), str)
+            and bool(d['scopeMarkdown'].strip()) and isinstance(d.get('limits'), list)
+            and isinstance(d.get('exclusions'), list) and isinstance(d.get('outcomes'), dict))
+
+
 def _qnorm(text) -> str:
     return ' '.join(str(text or '').split()).casefold()
 
@@ -2483,7 +2502,7 @@ class ActionStore:
                 if b is None: raise ActionError('Request revision has no question binding', 409)
                 snap.append({'n': n, 'requestId': r['requestId'], 'revision': r['revision'], 'choiceId': choice['id'],
                              'label': choice['label'], 'effect': choice['effect'], 'scopeDigest': b['scopeDigest'],
-                             'title': r.get('title') or ''})
+                             'title': r.get('title') or '', 'display': request_display(r)})
             body = {'schemaVersion': BINDING_SCHEMA, 'owner': owner, 'source': {'type': 'message', 'id': source_id},
                     'entries': snap}
             body['digest'] = _sha(body)
@@ -2511,7 +2530,8 @@ class ActionStore:
                 try:
                     r = self._get(c, owner, e['requestId']); b = self._binding(c, owner, r['requestId'], r['revision'])
                     e['open'] = bool(r['revision'] == e['revision'] and r['state'] in ('open', 'needs_context')
-                                     and not r.get('resolution') and b is not None and b['scopeDigest'] == e['scopeDigest'])
+                                     and not r.get('resolution') and b is not None and b['scopeDigest'] == e['scopeDigest']
+                                     and (e['effect'] not in AUTHORIZING_EFFECTS or entry_displayable(e)))
                 except ActionError:
                     e['open'] = False
             return snap
@@ -2535,6 +2555,9 @@ class ActionStore:
             snap = json.loads(rows[0][0])
             entry = next((e for e in snap['entries'] if e['n'] == number), None)
             if entry is None: raise ActionError('No such option in that list', 422)
+            if entry['effect'] in AUTHORIZING_EFFECTS and not entry_displayable(entry):
+                raise ActionError('That list has no frozen display of the complete request for this option; nothing is '
+                                  'authorized. Ask for a new list.', 409)
             r = self._get(c, snap['owner'], entry['requestId'])
             b = self._binding(c, snap['owner'], r['requestId'], r['revision'])
             if (r['revision'] != entry['revision'] or r['state'] not in ('open', 'needs_context') or r.get('resolution')
@@ -2555,8 +2578,10 @@ class ActionStore:
         """Owner-side phase, separate from delivery. No receipt = unknown (rows before v1 are never backfilled)."""
         phases = {r['phase'] for r in receipts}
         # Reserved without an outcome is 'uncertain': the effect may or may not have happened.
-        phase = ('not_applied' if 'not_applied' in phases else 'applied' if 'applied' in phases
-                 else 'uncertain' if 'reserved' in phases
+        # A reservation is never overwritten by a denial: reserved without applied stays uncertain, even for a row
+        # written before not_applied was refused after reservation.
+        phase = ('applied' if 'applied' in phases else 'uncertain' if 'reserved' in phases
+                 else 'not_applied' if 'not_applied' in phases
                  else 'acknowledged' if 'acknowledged' in phases else 'unknown')
         out = {'phase': phase, 'delivery': op.get('dispatchState'), 'receipts': receipts, 'grants': []}
         keyed = next((r for r in receipts if r.get('applicationKey')), None)
@@ -2630,6 +2655,12 @@ class ActionStore:
             if phase != 'acknowledged':
                 other = 'not_applied' if phase == 'applied' else 'applied'
                 if other in existing: raise ActionError(f'Conflicting outcome: {other} is already recorded', 409)
+                if phase == 'not_applied' and 'reserved' in existing:
+                    raise ActionError('Reserved: the application may have started, so its outcome stays uncertain; '
+                                      'not_applied cannot be recorded. Read the downstream back by applicationKey '
+                                      'and report applied only with evidence', 409)
+                if phase == 'reserved' and 'not_applied' in existing:
+                    raise ActionError('not_applied is already recorded; this operation cannot be reserved', 409)
                 if 'acknowledged' not in existing:
                     raise ActionError('Acknowledge the exact revision before recording an outcome', 409)
             if phase == 'reserved' and not bound:
@@ -2685,6 +2716,9 @@ class ActionStore:
             if snap.get('owner') != owner: raise ActionError('List belongs to another owner', 403)
             entry = next((e for e in snap['entries'] if e['n'] == number), None)
             if entry is None: raise ActionError('No such option in that list', 422)
+            if entry['effect'] in AUTHORIZING_EFFECTS and not entry_displayable(entry):
+                raise ActionError('That list has no frozen display of the complete request for this option; nothing is '
+                                  'authorized. Ask for a new list.', 409)
             r = self._get(c, owner, entry['requestId'])
             b = self._binding(c, owner, r['requestId'], r['revision'])
             if (r['revision'] != entry['revision'] or r['state'] not in ('open', 'needs_context') or r.get('resolution')

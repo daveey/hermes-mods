@@ -618,8 +618,16 @@ core older than the descriptor the provider answers nothing (fail closed), so de
 Rows written before v1 have no binding and are never early-answered.
 
 **Numbered replies (v1).** `ActionStore.record_list(owner, source_id, entries)` freezes a numbered list exactly as
-shown in message `source_id` (`list_snapshots`: `[{n, requestId, revision, choiceId, label, effect, scopeDigest}]`;
-free text and change requests cannot be numbered; re-recording a source with another list is 409).
+shown in message `source_id` (`list_snapshots`: `[{n, requestId, revision, choiceId, label, effect, scopeDigest, title, display}]`;
+free text and change requests cannot be numbered; re-recording a source with another list is 409). `display` is the
+request exactly as the person must see it beside the option, frozen into the list digest: `{scopeMarkdown,
+scopeComplete, limits (with permissionRequired), exclusions, outcomes}`. It is read once at list time; a later revision
+never rewrites it and makes the old list stale (409). Lists recorded before `display` existed fail closed: their
+approve/answer entries are refused (`answer_numbered` / `resolve_numbered` 409; `open: false` in the readback), while a
+nonauthorizing entry (decline) stays answerable. Desktop's `::decision-list` renders that frozen plan (existing
+Markdown renderer), limits, exclusions and outcome inside each entry next to its numbered button, and disables an
+authorizing button lacking a complete frozen display. A failed answer POST reads "Outcome unknown" (the server may have
+recorded it); a retry reuses the same idempotency key.
 `resolve_numbered(owner, source_id, n)` maps a reply only against that list: no source is 422 (ambiguous, never the
 newest list), an unknown list 404, a revised/decided request or changed scope 409. Its result is input to `decide()`,
 which still enforces revision CAS; it authorizes nothing by itself. Agent entry path: `action_request {"list":
@@ -631,7 +639,9 @@ transport only. The owning agent records what it did with `action_request {"rece
 scopeDigest, evidence?, reason?}}` (`owner_receipts`, one row per operation+phase): `acknowledged` (no evidence) needs
 confirmed delivery and the exact delivered revision + scope digest; `applied` needs a prior acknowledgment, nonempty
 evidence refs (`{type: message|tool_call|commit|pr|kanban|file|url|operation, id}`), an approve/answer effect and a
-request still resolved at that revision; `not_applied` needs a reason; applied and not_applied exclude each other.
+request still resolved at that revision; `not_applied` needs a reason and is accepted only BEFORE a reservation
+(after `reserved` it is 409: the effect may have happened, so the outcome stays `uncertain` and a true later `applied`
+remains possible); applied and not_applied exclude each other.
 The owner is server-derived (`server_owner(session)`), and the session must be the operation's owner or a compression
 continuation of it (`lineage`); another session is 403, another gateway 404. Same phase + same body is idempotent
 (lost replies, restarts, concurrent writers keep one row); same phase + different body is 409. Receipts grant
@@ -652,13 +662,16 @@ cannot reserve). The server returns `applicationKey = sha256(canonical [namespac
 (never caller-supplied; extra receipt fields are 422). Exactly one caller gets `reservation: "new"` (`mustVerify: false`);
 every repeat or concurrent caller gets `reservation: "existing"`, `mustVerify: true` and must read the downstream back by
 that key. A reservation without an outcome reads as consumer phase `uncertain`; the store never says a repeat is safe, so
-non-idempotent work whose result cannot be read back is not repeated. For bound operations `applied` is denied without a
+non-idempotent work whose result cannot be read back is not repeated, and the agent is told to leave it uncertain and
+report that, never to record `not_applied`. A reservation after `not_applied` is also 409; a legacy row holding both
+reads `uncertain`. For bound operations `applied` is denied without a
 reservation (existing stale rejection still applies, so an effect landing after a revision stays unrecorded as applied
 rather than inherited). Applied receipts carry server-set `evidenceSource: "agent_reported"`, `evidenceVerified: false`
 and the `applicationKey`; no generic external verification is claimed. Desktop shows reserved-only as "whether it was
 applied is uncertain" and applied as "agent-reported, unverified". Tests: `tests/test_bound_decisions.py` (fake durable
 sink keyed by applicationKey counts real effects across crash-before-effect and crash-after-effect restarts and
-concurrent consumers). Not covered: the sink is a fixture; no live consumer or Desktop packaged run.
+concurrent consumers). Not covered: the sink is a fixture; no live consumer or Desktop packaged run. Real-DOM Chromium covers the
+numbered-list display at 640px/200% zoom (`decision-queue.browser.test.mjs`).
 
 ## Tests
 
