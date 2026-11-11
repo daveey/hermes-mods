@@ -413,7 +413,6 @@ function GatewayRow({ m, now, investigator, route }) {
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const meta = [
-    m.labels.filter((l) => !l.startsWith('machine:')).join(', '),
     m.pinned_only ? 'pinned only' : null,
     m.slots == null ? 'slots not set' : m.slots_source === 'local' ? 'slots from local cap' : null
   ].filter(Boolean).join(' · ')

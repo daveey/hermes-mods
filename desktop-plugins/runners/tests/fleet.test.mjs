@@ -58,6 +58,9 @@ test('registry: gateway machines show fixed slots, flags and unset slot counts',
   assert.match(hub.textContent, /1\/4/)
   const mini = ui.container.querySelector('[data-machine="mini"]')
   assert.match(mini.textContent, /pinned only · slots not set · not seen for 30 min/)
+  // Labels (capabilities) are not shown on gateway rows.
+  assert.doesNotMatch(mini.textContent, /macos/)
+  assert.doesNotMatch(hub.textContent, /linux/)
   assert.equal(mini.querySelectorAll('.is-lost').length, 0)
   assert.match(ui.container.textContent, /1 \/ 7 slots busy/)
   await ui.close()
