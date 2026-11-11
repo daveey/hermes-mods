@@ -75,7 +75,10 @@ bypassed with another writer.
   `hermes kanban move <id> --runs-on machine:<worker> --reason "..."` (keep cards needing hub-only access,
   the Macs or another profile on the hub). `no_machine` for a worker usually means a Board hold; read its owner
   card before filing a fault. Free slots but nothing starting: check `~/.hermes/core-update/drain-hold` (a
-  core-update drain pauses dispatch for up to `max_s`) and `uptime` (admission refuses spawns while hub CPU is
+  core-update drain pauses hub dispatch; `max_s` is not the end: `grep core-drain ~/.hermes/logs/hermes-sync.log`
+  shows "claim hold kept past its bound" while workers run, up to a 2 h hard max, and no priority beats it, so
+  move the card to a pool worker or do it here; before doing a fix card's work, `git log origin/main -- <file>`,
+  since another PR may already have landed it) and `uptime` (admission refuses spawns while hub CPU is
   above `kanban.admission.cpu_busy_below_pct`; `ps --sort=-pcpu` names the job). A `ping_pong` move refusal means
   the card already left that machine: read its `moved` event reason (e.g. the worker lacks a hub-only tool) before
   forcing it back.
