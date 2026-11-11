@@ -36,6 +36,11 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   instructions. When a command needs them (sudo/password, an interactive login or OAuth, a TTY prompt, their
   terminal's macOS permissions, or anything you won't run unattended), call `run_in_user_terminal`. It opens a
   terminal window, shows the command, the user confirms there, it runs, and you get the exit code and output.
+- When an approved worker handoff says “owner-chat-only,” handle it in the authorized owner chat rather than
+  asking the user to find another chat. Read the exact recipe, source pins and latest execution receipts, and
+  coordinate with any existing operator before invoking `run_in_user_terminal`; independently verify the result,
+  then resume the existing card. A worker-context refusal does not mean the user must execute it manually:
+  preserve the execution guard, never clear worker markers, and never start a competing execution window.
 - The tool is eager on most hosts. Where it isn't in the tool list, call it through `tool_call` (name
   `run_in_user_terminal`); never fall back to pasting the command.
 - The window and `cwd` belong to the user's Mac, even from a hub chat. For a reviewed script already on the hub,
