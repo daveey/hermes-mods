@@ -209,6 +209,49 @@ class ExactRunWaitTests(unittest.TestCase):
                 self.assertIn("--head-sha", out)
         self.assertEqual(self.calls(), [])
 
+    def test_duplicate_expected_job_name_rejected_in_either_order(self):
+        for first, second in (("failure", "success"), ("success", "failure"), ("success", "success")):
+            with self.subTest(order=(first, second)):
+                args = self.required_fixture()
+                jobs = self.runs["11"][0]["jobs"]
+                jobs[0]["conclusion"] = first
+                jobs.append(dict(jobs[0], conclusion=second))
+                rc, out = self.wait(*args)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("ambiguous", out)
+
+    def test_duplicate_unexpected_job_name_is_ignored(self):
+        args = self.required_fixture()
+        jobs = self.runs["11"][0]["jobs"]
+        jobs.append(dict(jobs[2]))
+        rc, out = self.wait(*args)
+        self.assertEqual(rc, 0, out)
+
+    def test_conflicting_repeated_expectation_rejected_before_gh(self):
+        name = "All required checks pass (v2)"
+        for a, b in (("success", "failure"), ("failure", "success")):
+            with self.subTest(order=(a, b)):
+                rc, out = self.wait("--expect", f"11:{name}={a}", "--expect", f"11:{name}={b}", "--once")
+                self.assertEqual(rc, 1, out)
+                self.assertIn("conflict", out)
+        self.assertEqual(self.calls(), [])
+
+    def test_identical_repeated_expectation_is_harmless(self):
+        args = self.required_fixture()
+        rc, out = self.wait(*args, "--expect", f"11:{self.required[0]}=success")
+        self.assertEqual(rc, 0, out)
+
+    def test_missing_context_and_moved_head_keep_failing_with_pin(self):
+        args = self.required_fixture()
+        del self.runs["11"][0]["jobs"][1]
+        rc, out = self.wait(*args, "--head-sha", "a" * 40)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no job", out)
+        args = self.required_fixture()
+        rc, out = self.wait(*args, "--head-sha", "b" * 40)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("head mismatch", out)
+
     def test_gh_calls_name_the_repo(self):
         self.runs = {"11": [run("11", [job("plan")])]}
         self.wait("--run-id", "11")

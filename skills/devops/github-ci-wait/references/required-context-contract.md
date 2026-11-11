@@ -53,6 +53,13 @@ Run from the skill directory:
 python3 -B -m unittest discover -s tests
 ```
 
+- Manifest hygiene: the probe cannot know which contexts are required, so an incomplete `--expect` set passes
+  silently; the caller must enumerate all of them. A repeated `RUN:JOB` with differing conclusions exits 1 before any
+  gh call, and duplicate job names matching an expected name fail in either order. Proof:
+  `test_duplicate_expected_job_name_rejected_in_either_order`,
+  `test_conflicting_repeated_expectation_rejected_before_gh`,
+  `test_missing_context_and_moved_head_keep_failing_with_pin`.
+
 This remains an exact-run job probe, not automatic branch policy discovery, PR-head tracking,
 review approval, app-identity verification or merge authorization. Required contexts outside the
 listed run(s) still need explicit separate proof. A green required gate does not prove that an
