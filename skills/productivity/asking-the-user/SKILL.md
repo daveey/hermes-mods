@@ -22,8 +22,12 @@ The one-line rules stay in the user's `~/AGENTS.md` ("Commands That Need Me", "P
 skill is how to carry them out. A decision or approval that should wait on the board is a blocked Kanban card
 (`kanban-orchestrator`, "Card mechanics for this user"), not anything here.
 
-**Look first:** can an agent do this step itself (a broker token, `remote_approve_dialog`, the browser tools)?
-Hand it over only when it can't.
+**Look first:** exhaust supported agent paths (broker credentials, existing authenticated sessions, browser tools)
+before handing over a step. When the user says “use your judgement” or “do it yourself,” remove discretionary
+choice blockers and resume the existing owner; don't repeat the same ask as a status update. For an ambiguous
+acceptance tolerance, pursue a stricter sufficient bound without declaring it the original requirement or selecting
+a tolerance to pass observed results. Keep genuine identity/permission boundaries separate: delegated judgement
+is not an authenticated login or authority to bypass a deny.
 
 ## Commands that need the user
 
