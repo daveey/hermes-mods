@@ -32,6 +32,8 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 
 ## What isn't a plugin
 
+- **[Fleet scheduling regressions](tests/fleet_scheduling/)**: bounded, isolated provider/crash/OOM/wake/update/remote recovery scenarios with mutation controls and JSON receipts; explicit core and optional private updater sources.
+
 - **[Process safety](tools/process-safety/)**: Linux owned-session scheduling fault injection and an opt-in systemd user GPG SSH-agent health timer, with regression tests.
 - **[Skill trigger eval](tools/skill-trigger-eval/)**: replays natural asks against the real skills index (rendered by core's own prompt builder) and scores whether the right skill loads: recall, false loads, collisions; compares description formats and their prompt cost.
 

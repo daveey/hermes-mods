@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""Run bounded fleet regressions in a disposable loopback-only Linux netns.
+
+The required Python is the selected core's managed test interpreter. No package
+installation, network credentials, production dispatch, or active backend restart.
+
+Lifecycle: from fixture-root creation onward every exit path (exception, timeout,
+launcher SIGTERM/SIGINT, cleanup or diagnostic-write failure) ends in a structured
+receipt and an identity-checked sweep of fixture descendants and published cgroups.
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+SCENARIOS = ("provider", "crash", "wake", "update", "remote")
+ROOT = Path(__file__).resolve().parent.parent
+TEST_DIR = ROOT / "tests/fleet_scheduling"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+GROUP_NAME = re.compile(r"fleet-oom-[0-9a-f]{32}")
+KILL_AFTER = 5
+OUTER_GRACE = 20
+
+
+class LauncherTerminated(BaseException):
+    """SIGTERM/SIGINT delivered to the launcher; unwinds into the receipt/cleanup path."""
+
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def revision(path):
+    return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+
+
+def child(manifest):
+    data = json.loads(Path(manifest).read_text(encoding="utf-8"))
+    root, core = Path(data["fixture_root"]), Path(data["core_source"])
+    sys.path.insert(0, str(TEST_DIR))
+    from conftest import fixture_env
+    env = fixture_env(root, core)
+    for key in ("HOME", "HERMES_HOME", "HERMES_KANBAN_HOME", "HERMES_HUB_STATE", "TMPDIR"):
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
+    env.update({"FLEET_CORE_SOURCE": str(core), "FLEET_SYNC_SOURCE": data["sync_source"],
+                "FLEET_OUTPUT": data["output"], "FLEET_SCENARIO": data["scenario"]})
+    os.environ.clear()
+    os.environ.update(env)
+    os.chdir(root)
+    sys.path.insert(0, str(core))
+    import pytest
+    tests = TEST_DIR
+    args = ["-q", "-p", "no:cacheprovider", "--confcutdir=" + str(tests),
+            str(tests / "test_isolation.py")]
+    if data["scenario"] != "isolation":
+        args += [str(tests / "test_scenarios.py"), "-k", "isolation or " + data["scenario"]]
+    reports = []
+
+    class Reporter:
+        def pytest_runtest_logreport(self, report):
+            reports.append({"name": report.nodeid, "phase": report.when, "result": report.outcome,
+                            "evidence": str(report.longrepr) if report.failed else ""})
+    rc = pytest.main(args, plugins=[Reporter()])
+    out = Path(data["output"])
+    (out / (data["scenario"] + ".tests.json")).write_text(json.dumps(reports, indent=2), encoding="utf-8")
+    paths = {name: str(Path(module.__file__).resolve()) for name, module in tuple(sys.modules.items())
+             if name.startswith(("hermes_cli", "tui_gateway", "hermes_state", "agent", "fleet_core", "conftest", "test_"))
+             and getattr(module, "__file__", None)}
+    (out / (data["scenario"] + ".modules.json")).write_text(json.dumps(paths, indent=2), encoding="utf-8")
+    return rc
+
+
+def inventory(root):
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal() or int(entry.name) in (os.getpid(), os.getppid()):
+            continue
+        try:
+            raw = (entry / "environ").read_bytes().split(b"\0")
+            env = dict(part.split(b"=", 1) for part in raw if b"=" in part)
+            home = Path(os.fsdecode(env.get(b"HERMES_HOME", b"/"))).resolve()
+            if home.is_relative_to(root):
+                found.append((int(entry.name), env))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def cleanup_processes(root):
+    """Signal only fixture-tagged processes whose PID start identity was observed."""
+    sys.path.insert(0, str(TEST_DIR))
+    from conftest import OwnedProcesses
+    root = Path(root).resolve()
+    signalled, errors = [], []
+    for _ in range(5):
+        found = inventory(root)
+        if not found:
+            break
+        for pid, env in found:
+            marker = Path(os.fsdecode(env.get(b"FLEET_FIXTURE_ROOT", b"/"))).resolve()
+            if not marker.is_relative_to(root):
+                errors.append(f"fixture descendant {pid} lost ownership marker; not signalled")
+                continue
+            registry = OwnedProcesses(marker)
+            try:
+                registry.register(pid)
+                registry.send(pid, signal.SIGKILL)
+                signalled.append({"pid": pid, "start_identity": registry.births[pid]})
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            except PermissionError as exc:
+                errors.append(f"pid {pid} refused: {exc}")
+        deadline = time.monotonic() + 2
+        while inventory(root) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    survivors = sorted({pid for pid, _ in inventory(root)})
+    if survivors:
+        errors.append(f"fixture descendants remain: {survivors}")
+    return {"fixture_processes_remaining": survivors, "signalled": signalled, "errors": errors}
+
+
+def validate_group(value):
+    """Return (Path, None) for an owned, unspoofed group name, else (None, reason)."""
+    if not isinstance(value, str) or not value.startswith("/") or "\0" in value:
+        return None, "not an absolute path string"
+    path = Path(value)
+    if ".." in path.parts:
+        return None, "path traversal"
+    if not GROUP_NAME.fullmatch(path.name):
+        return None, "name is not a fixture-owned group"
+    if not path.is_relative_to(CGROUP_ROOT) or path.parent == CGROUP_ROOT:
+        return None, "outside delegated cgroup tree"
+    if path.is_symlink():
+        return None, "symlink refused"
+    if path.exists() and (not path.is_dir() or path.resolve() != path):
+        return None, "not a real directory"
+    return path, None
+
+
+def read_procs(group):
+    try:
+        return [int(x) for x in (group / "cgroup.procs").read_text(encoding="utf-8").split()]
+    except FileNotFoundError:
+        return []
+
+
+def cleanup_cgroups(root):
+    """Reap groups published in any fleet-cgroups.json below the fixture root."""
+    sys.path.insert(0, str(TEST_DIR))
+    from conftest import OwnedProcesses
+    root = Path(root).resolve()
+    result = {"registries": [], "groups": [], "errors": []}
+    for current, dirs, files in os.walk(root, followlinks=False):
+        if "fleet-cgroups.json" not in files:
+            continue
+        registry_path = Path(current) / "fleet-cgroups.json"
+        result["registries"].append(str(registry_path))
+        try:
+            data = json.loads(registry_path.read_text(encoding="utf-8"))
+            if data.get("version") != 1 or not isinstance(data.get("groups"), list):
+                raise ValueError("unsupported registry shape")
+        except (OSError, ValueError, AttributeError) as exc:
+            result["errors"].append(f"{registry_path}: unreadable registry: {exc}")
+            continue
+        registry = OwnedProcesses(Path(current))
+        for value in data["groups"]:
+            group, reason = validate_group(value)
+            entry = {"group": value, "state": None}
+            result["groups"].append(entry)
+            if reason:
+                entry["state"] = "rejected"
+                result["errors"].append(f"{value}: {reason}")
+                continue
+            if not group.exists():
+                entry["state"] = "already_clean"
+                continue
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pids = read_procs(group)
+                    if not pids:
+                        break
+                    foreign = []
+                    for pid in pids:
+                        try:
+                            if pid not in registry.births:
+                                registry.register(pid)
+                            registry.send(pid, signal.SIGKILL)
+                        except (FileNotFoundError, ProcessLookupError):
+                            pass
+                        except PermissionError:
+                            foreign.append(pid)
+                    if len(foreign) == len(pids):
+                        break
+                    time.sleep(0.05)
+                remaining = read_procs(group)
+                if remaining:
+                    raise RuntimeError(f"group populated; unregistered/foreign pids not signalled: {remaining}")
+                for attempt in range(100):
+                    try:
+                        group.rmdir()
+                        break
+                    except FileNotFoundError:
+                        break
+                    except OSError:
+                        if attempt == 99:
+                            raise
+                        time.sleep(0.05)
+                entry["state"] = "removed"
+            except Exception as exc:  # noqa: BLE001 - recorded; remaining groups still reaped
+                entry["state"] = "failed"
+                result["errors"].append(f"{value}: {exc}")
+    return result
+
+
+def sha_map(extra=()):
+    paths = [*sorted(TEST_DIR.glob("*.py")), *extra]
+    return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
+def write_json(path, data):
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(data, indent=2, default=str) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def build_command(options, manifest, root, timeout):
+    # Root privileges set up only an ephemeral network namespace. Tests run as the
+    # caller. timeout owns the namespace's process group; no host policy changes.
+    script = ('mount --bind "$7/ipc" "/run/user/$2" && mount --bind "$7/ipc" /run/dbus && ip link set lo up'
+              ' && { [ "$8" != hide-cgroupfs ] || mount -t tmpfs tmpfs /sys/fs/cgroup; }'
+              f' && exec timeout --signal=TERM --kill-after={KILL_AFTER} "$1" setpriv --reuid="$2" --regid="$3"'
+              ' --clear-groups "$4" "$5" --child "$6"')
+    return ["sudo", "-n", "--preserve-env=HERMES_DELEGATED_CHILD_CONTEXT,HERMES_DELEGATED_CHILD_OWNER",
+            "unshare", "--mount", "--propagation", "private", "--net", "--", "sh", "-c", script,
+            "fleet-netns", str(timeout), str(os.getuid()), str(os.getgid()), sys.executable,
+            str(Path(__file__).resolve()), str(manifest), str(root), getattr(options, "fixture_fault", None) or "none"]
+
+
+def stop(proc):
+    for sig, wait in ((signal.SIGTERM, 8), (signal.SIGKILL, 5)):
+        try:
+            proc.send_signal(sig)  # sudo relays same-user signals; root-owned failures tolerated
+            proc.wait(timeout=wait)
+            return
+        except (subprocess.TimeoutExpired, PermissionError, ProcessLookupError):
+            continue
+
+
+def drain(proc):
+    try:
+        return proc.communicate(timeout=5)
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+
+def run_child(command, timeout, record):
+    """Run and bound the launcher-side child; stop it on timeout or launcher signal."""
+    outer = timeout + KILL_AFTER + OUTER_GRACE
+    started = time.monotonic()
+    record["wait_bound"] = {"scenario_timeout_s": timeout, "kill_after_s": KILL_AFTER,
+                            "outer_wait_s": outer, "timed_out": False, "terminated": False}
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=outer)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        record["wait_bound"]["timed_out"] = True
+        stop(proc)
+        out, err = drain(proc)
+        return None, out, err
+    except LauncherTerminated:
+        record["wait_bound"]["terminated"] = True
+        stop(proc)
+        raise
+    finally:
+        record["wait_bound"]["elapsed_s"] = round(time.monotonic() - started, 3)
+
+
+def evaluate(record, scenario, core, output, root, proc_rc):
+    """Fill the record from child artifacts. Returns (failures, unverified)."""
+    fails, unverified = [], []
+    if proc_rc is None:
+        fails.append("scenario timed out")
+    elif proc_rc != 0:
+        fails.append(f"child exit status {proc_rc}")
+    modules = output / f"{scenario}.modules.json"
+    if modules.exists():
+        record["runtime_module_paths"] = json.loads(modules.read_text(encoding="utf-8"))
+    paths = record["runtime_module_paths"]
+    if not any(name.startswith("hermes_cli") for name in paths):
+        fails.append("child module provenance missing")
+    for name, value in paths.items():
+        path = Path(value)
+        if not (path.is_relative_to(core) or path.is_relative_to(TEST_DIR)):
+            fails.append(f"module {name} loaded from outside selected core/tests: {value}")
+    reports = output / f"{scenario}.tests.json"
+    if reports.exists():
+        record["test_reports"] = json.loads(reports.read_text(encoding="utf-8"))
+        if not record["test_reports"]:
+            fails.append("no tests were collected")
+        bad = [row["name"] for row in record["test_reports"] if row["result"] != "passed"]
+        if bad:
+            fails.append(f"non-passing/skipped tests: {bad}")
+    else:
+        fails.append("child test report missing")
+    pre = output / f"{scenario}-preflight.json"
+    if pre.exists():
+        record["preflight"] = json.loads(pre.read_text(encoding="utf-8"))
+        record["preflight_file"] = pre.name
+        if record["preflight"].get("scenario") != scenario or record["preflight"].get("fixture_root") != str(root):
+            fails.append("preflight receipt is stale or from another scenario")
+    else:
+        fails.append("per-scenario preflight receipt missing")
+    if scenario != "isolation":
+        proof_path = output / f"{scenario}.proof.json"
+        proof = json.loads(proof_path.read_text(encoding="utf-8")) if proof_path.exists() else {}
+        if proof.get("fixture_root") != str(root) or not proof.get("assertions"):
+            fails.append("missing, stale or empty scenario proof")
+        else:
+            record.update({key: proof[key] for key in ("assertions", "transitions", "injected_fault") if key in proof})
+            if "unverified" in proof:
+                record["unverified"] = proof["unverified"]
+            if proof.get("result") == "UNVERIFIED":
+                unverified.append("proof result UNVERIFIED")
+            elif proof.get("result") not in (None, "PASS"):
+                fails.append(f"proof result {proof.get('result')!r}")
+            for item in proof["assertions"]:
+                if item.get("result") == "UNVERIFIED":
+                    unverified.append(f"assertion {item.get('name')} UNVERIFIED")
+                elif item.get("result") != "PASS":
+                    fails.append(f"assertion {item.get('name')} {item.get('result')}")
+    return fails, unverified
+
+
+def run_scenario(scenario, options, core, sync, output, shas, timeout, command_factory=build_command):
+    record = {"schema_version": 1, "scenario": scenario, "source_shas": shas, "runtime_module_paths": {},
+              "fixture_root": None, "injected_fault": None, "transitions": [], "assertions": [],
+              "cleanup": {}, "failures": [], "result": "FAIL", "started_at": stamp(),
+              "runner_fault": getattr(options, "fixture_fault", None)}
+    root, terminated, reraise = None, False, None
+    unverified = []
+    try:
+        record["test_source_sha256"] = sha_map([Path(__file__).resolve()])
+        if scenario == "update" and (not sync or not (sync / "tests/test_fleet_update_resume.py").is_file()):
+            record["failures"].append("required_private_adapter: tests/test_fleet_update_resume.py absent")
+            record["assertions"].append({"name": "required_private_adapter", "result": "FAIL",
+                                         "evidence": "tests/test_fleet_update_resume.py absent"})
+        else:
+            root = Path(tempfile.mkdtemp(prefix="fleet-fixture-", dir=options.fixture_parent)).resolve()
+            record["fixture_root"] = str(root)
+            (root / "ipc").mkdir()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"fixture_root": str(root), "core_source": str(core),
+                "sync_source": str(sync) if sync else "", "output": str(output), "scenario": scenario}), encoding="utf-8")
+            for stale in [*output.glob(f"{scenario}.*"), *output.glob(f"{scenario}-preflight.json")]:
+                stale.unlink()
+            command = command_factory(options, manifest, root, timeout)
+            record["command"] = command
+            rc, out, err = run_child(command, timeout, record)
+            record["exit_status"] = rc
+            (output / f"{scenario}.stdout").write_text(out or "", encoding="utf-8")
+            (output / f"{scenario}.stderr").write_text(err or "", encoding="utf-8")
+            fails, unverified = evaluate(record, scenario, core, output, root, rc)
+            record["failures"] += fails
+    except LauncherTerminated:
+        terminated = True
+        record["failures"].append("launcher terminated by signal")
+    except BaseException as exc:  # noqa: BLE001 - every lifecycle error becomes a FAIL receipt
+        if not isinstance(exc, Exception):
+            reraise = exc
+        record["failures"].append(f"runner exception {type(exc).__name__}: {exc}")
+    finally:
+        cleanup, cleanup_errors = {}, []
+        if root is not None:
+            for key, step in (("processes", cleanup_processes), ("cgroups", cleanup_cgroups)):
+                try:
+                    cleanup[key] = step(root)
+                    cleanup_errors += cleanup[key].get("errors", [])
+                except BaseException as exc:  # noqa: BLE001
+                    cleanup[key] = {"errors": [f"{type(exc).__name__}: {exc}"]}
+                    cleanup_errors.append(f"{key} cleanup raised {type(exc).__name__}: {exc}")
+            try:  # a survivor can appear while cgroups drain
+                final = cleanup_processes(root)
+                cleanup["processes_final"] = final
+                cleanup_errors += final["errors"]
+                cleanup["fixture_processes_remaining"] = final["fixture_processes_remaining"]
+            except BaseException as exc:  # noqa: BLE001
+                cleanup["fixture_processes_remaining"] = ["unknown"]
+                cleanup_errors.append(f"final process sweep raised {exc}")
+            if cleanup_errors:
+                cleanup["fixture_removed"] = False
+                cleanup["root_preserved_for_diagnosis"] = str(root)
+                record["failures"].append("cleanup failed: " + "; ".join(cleanup_errors))
+            else:
+                try:
+                    shutil.rmtree(root)
+                except OSError as exc:
+                    record["failures"].append(f"fixture removal failed: {exc}")
+                cleanup["fixture_removed"] = not root.exists()
+                if root.exists():
+                    record["failures"].append("fixture root still exists")
+        record["cleanup"] = cleanup
+        try:
+            after = sha_map([Path(__file__).resolve()])
+            if after != record.get("test_source_sha256"):
+                record["failures"].append("test/runner source changed during run")
+                record["test_source_sha256_after"] = after
+        except BaseException as exc:  # noqa: BLE001
+            record["failures"].append(f"source hash recheck failed: {exc}")
+        if record["failures"]:
+            record["result"] = "FAIL"
+        elif unverified:
+            record["result"], record["unverified_reasons"] = "UNVERIFIED", unverified
+        else:
+            record["result"] = "PASS"
+        record["ended_at"] = stamp()
+        try:
+            write_json(output / f"{scenario}.json", record)
+        except BaseException as exc:  # noqa: BLE001 - diagnostics must never turn into success
+            record["result"] = "FAIL"
+            record["failures"].append(f"receipt write failed: {exc}")
+            try:
+                write_json(output / f"{scenario}.receipt-fallback.json",
+                           {"scenario": scenario, "result": "FAIL", "failures": record["failures"]})
+            except BaseException:  # noqa: BLE001
+                pass
+            print(json.dumps({"scenario": scenario, "result": "FAIL", "failures": record["failures"]}),
+                  file=sys.stderr, flush=True)
+    if reraise is not None:
+        raise reraise
+    return record, terminated
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) == 2 and argv[0] == "--child":
+        return child(argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--core-source", required=True, type=Path)
+    parser.add_argument("--sync-source", type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--scenario", choices=(*SCENARIOS, "all", "isolation"), default="all")
+    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--fixture-parent", type=Path, default=Path.home())
+    parser.add_argument("--fixture-fault", choices=("hide-cgroupfs",),
+                        help="fixture-local fault: private tmpfs over /sys/fs/cgroup inside the disposable mount namespace")
+    options = parser.parse_args(argv)
+    if not 10 <= options.timeout <= 600 and not os.environ.get("FLEET_RUNNER_TEST_TIMEOUT"):
+        parser.error("timeout must be bounded to 10..600 seconds per scenario")
+    state = {"count": 0}
+
+    def on_signal(signum, frame):
+        state["count"] += 1
+        if state["count"] == 1:
+            raise LauncherTerminated(signum)
+    previous = [signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGINT)]
+    scenarios = SCENARIOS if options.scenario == "all" else (options.scenario,)
+    results, terminated = {}, False
+    output = options.output.resolve()
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        output.chmod(0o700)
+        core = options.core_source.resolve()
+        sync = options.sync_source.resolve() if options.sync_source else None
+        shas = {"core": revision(core), "public": revision(ROOT), "sync": revision(sync) if sync else None}
+        for scenario in scenarios:
+            if terminated:
+                write_json(output / f"{scenario}.json", {"schema_version": 1, "scenario": scenario, "result": "FAIL",
+                           "failures": ["not run: launcher terminated"], "source_shas": shas})
+                results[scenario] = "FAIL"
+                print(f"{scenario}: FAIL (not run)", flush=True)
+                continue
+            record, terminated = run_scenario(scenario, options, core, sync, output, shas, options.timeout,
+                                              COMMAND_FACTORY)
+            results[scenario] = record["result"]
+            print(f"{scenario}: {record['result']}", flush=True)
+    except LauncherTerminated:
+        terminated = True
+    except BaseException as exc:  # noqa: BLE001
+        print(f"launcher failure {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    finally:
+        for sig, old in zip((signal.SIGTERM, signal.SIGINT), previous):
+            signal.signal(sig, old)
+    if terminated:
+        return 143
+    return int(len(results) != len(scenarios) or any(value != "PASS" for value in results.values()))
+
+
+COMMAND_FACTORY = build_command
+
+if __name__ == "__main__":
+    raise SystemExit(main())
