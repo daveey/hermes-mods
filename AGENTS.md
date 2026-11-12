@@ -37,7 +37,11 @@ git -C ~/code/hermes-mods worktree remove ~/code/mods-work
 
 Sync deploys published commits; a manual `git merge --ff-only origin/main` is allowed only on a clean
 live checkout. `live-checkout-guard` enforces common file/shell tool paths (not an OS sandbox).
-`skill_manage` remains allowed; persistent uncommitted edits are detected by hermes-sync.
+`skill_manage` remains allowed. With `live-checkout-guard` loaded, successful documentation-only
+writes are published from an isolated worktree through the normal privacy hooks and reconciled with
+an archive; main CI must be green. Failures preserve the live edit and log the reason. Scripts and
+plugin/code edits are never auto-published. Sync itself still never commits: skill-only edits blocking
+a fast-forward for over 30 minutes get a host/path recovery card.
 To reconcile archived leftovers, use `plugins/live-checkout-guard/reconcile.py --help`: it requires
 an applicable archive, unchanged archived bytes, and a target commit already on origin/main.
 A new guard also belongs in private `home/plugins-every-host.txt`; export must never rewrite that policy.
