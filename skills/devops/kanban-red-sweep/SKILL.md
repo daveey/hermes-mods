@@ -84,7 +84,7 @@ The user's rule: for each card blocked on him, first ask yourself whether you ca
 unblock it. He will usually just take your recommendation, so take it for him; ask only when really unsure.
 A guess must still follow the card's own limits (scope, exclusions, normal review and landing gates). Physical and
 sign-in steps, protected-file Allows and test/threshold/target changes are never guessed: a guessed waiver of a
-failed check reaches the owner as if it were acceptance (an energy-filter card, 2026-11-12), and the
+failed check reaches the owner as if it were acceptance, and the
 kanban-honest-done plugin refuses a worker handoff that waives a failed threshold without a body waiver David
 gave (Gate G). A rejected guard is never bypassed with another writer.
 
@@ -101,6 +101,8 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
+  Any card comment (unblock, move, correction) cites only facts you checked this turn. Another card's "PR landed" is a
+  self-report until `gh pr view <N> -R <repo> --json state,mergedAt` shows it merged, and the owner acts on your comment as fact.
 - A PR completion contract runs `pr_acceptance` with the **assignee profile's** `gh` login, not yours, so wrapping
   your command in token-broker doesn't help. Verify the merge yourself (`token-broker exec --scope user/github -- gh pr view`),
   then `hermes kanban edit <id> --completion-contract local-only --reason "<PR> merged at <sha>, verified"` and complete.
@@ -113,11 +115,13 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   it its own hold first (`hermes kanban schedule <child> --wake-check 'test -f <approval marker>' --check-every 3600
   --awaiting external:<decision> --awaiting-why "..." "<reason + how to resume>"`; awaiting kinds are card, ci,
   deploy, external, clock, human, resource), read back `scheduled`, then `hermes kanban unlink <parent> <child>`.
-- A card you unblock may sit `ready` behind a full worker pool. Read the queue head first
-  (`select id,priority from tasks where status='ready' order by priority desc limit 10`) and set
-  `hermes kanban edit <id> --priority <above the head of that list>` in the same turn, for every card you
-  unblock (guessed decisions too). A bump below the head (e.g. 11000 under a 20000+ head) leaves the card
-  unstarted and the board flags it to the chat after 30 min. If the hub or a worker is full, move a portable card to the whole pool, never to one named worker:
+- A card you unblock may sit `ready` behind a full worker pool. First read where it really is: `hermes kanban show <id>`
+  prints the dispatcher's own queue line (`waiting for a local slot: ~N ahead (k on other boards sharing these slots),
+  r/limit running`). Don't go by a priority-sorted `ready` list: cards that other cards wait on run ahead of any
+  priority, and boards on one host share its slots. Then, in the same turn, set
+  `hermes kanban edit <id> --priority <above the ready head>` for every card you unblock (guessed decisions too).
+  A bump below the head leaves the card unstarted, and the board flags it to the chat after 30 min. No priority
+  gets past cards that others wait on: move a portable card instead, or do its step here. If the hub or a worker is full, move a portable card to the whole pool, never to one named worker:
   `hermes kanban move <id> --runs-on <a label every worker carries and the hub/Macs don't, e.g.
   capability:token-broker; check `hermes-mail admin machines`> --reason "..."` (`--pool` once the pool:worker
   queue ships). A `machine:<worker>` pin waits again as soon as that worker fills or is held. Pin one worker only
@@ -130,12 +134,13 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   required worker labels`; `kanban edit` can't change requirements): archive it unstarted and recreate it without the pin.
   If you do a queued card's work in the chat instead, comment the evidence and archive the card the same turn,
   or a worker repeats it. `no_machine` for a worker usually means a Board hold; read its owner
-  card before filing a fault. Free slots but nothing starting: check `~/.hermes/core-update/drain-hold` (a
+  card before filing a fault. Free slots but nothing starting: after the queue line, check `~/.hermes/core-update/drain-hold` (a
   core-update drain pauses hub dispatch; `max_s` is not the end: `grep core-drain ~/.hermes/logs/hermes-sync.log`
   shows "claim hold kept past its bound" while workers run, up to a 2 h hard max, and no priority beats it, so
   move the card to a pool worker or do it here; before doing a fix card's work, `git log origin/main -- <file>`,
   since another PR may already have landed it) and `uptime` (admission refuses spawns while hub CPU is
-  above `kanban.admission.cpu_busy_below_pct`; `ps --sort=-pcpu` names the job). A `ping_pong` move refusal means
+  above `kanban.admission.cpu_busy_below_pct`; `ps --sort=-pcpu` names the job. A `python3 -` with ppid 1 is an ssh-piped probe that outlived its client,
+  because a local timeout kills only ssh: put `timeout N` inside the remote command of your own probes). A `ping_pong` move refusal means
   the card already left that machine: read its `moved` event reason (e.g. the worker lacks a hub-only tool) before
   forcing it back.
 - A "ready, no worker" notice is not proof the card never started. Read its last events first
@@ -215,24 +220,9 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
 
 ## 6. Unattended runs (cron `kanban-red-sweep`, hub, every 30 min)
 
-The cron's monitor is `red_cards.py list`: the agent wakes when fleet cards, blocked events,
-decision-session open items or explicit coverage failures change. Its output is sorted and excludes
-read timestamps, so unchanged asks cost nothing. The same inventory and classifications apply to
-interactive and unattended runs. Before accepting a monitor deployment, run its actual wrapper and
-verify a remote card and a decision session appear; fixture tests alone are not deployment proof. Cron `monitor`/`script` paths must be
-a bare filename under `~/.hermes/scripts/`, so the job points at the thin wrapper `kanban_red_monitor.py`
-there, which execs the skill script.
-
-- Follow steps 1-3 and 5. Skip step 4: a cron run can't show a form. A card you are really unsure about stays
-  blocked (its ask is already in the user's For-you queue); log it `--action left-blocked` and don't comment on
-  it again unless its state changed. Don't re-link it to a chat.
-- Read state first and record last with recurring-job-state (`job_state.py show|record kanban-red-sweep`).
-- The cron overdue with no run: a core-update drain (`~/.hermes/core-update/drain-hold`) holds ALL cron dispatch, not
-  only card starts; deferred jobs fire once on release. Don't cut the drain short; note the overdue count on the
-  card that owns the drain. Parked until a date days away instead: the cron route's quota is out
-  (claude-usage-diagnostics §3c).
-- Final response: only decisions you guessed (card title, pick, how to reverse) and cards still waiting on the
-  user, a few lines. Nothing cleared, guessed or newly waiting: reply `[SILENT]`.
+Follow steps 1-3 and 5. Skip step 4, because a cron run can't show a form. Before acting, read
+`references/unattended-runs.md`. It covers the monitor wrapper, left-blocked logging, job state, overdue runs
+and the final response.
 
 ## Pitfalls
 
@@ -279,9 +269,10 @@ there, which execs the skill script.
   approved PR's card, intersect `git diff --name-only $(git merge-base HEAD origin/main) HEAD` with the same diff
   against `origin/main`. On overlap, the card needs a rebase plus a new review, so review custody no longer pins it to
   the old host: move it to a worker with free slots, and have the new review pinned to that worker.
-- Find a PR's owner card by its branch name (`headRefName`, e.g. `wt/<slug>`) and the card ids in the PR body, matched
-  against card bodies and comments on every host. Searching only for `PR<n>`/`#<n>` misses owners that published the
-  PR after their body was written.
+- To find a PR's owner card, start from the review card the notice names: the owner is usually its child link
+  (`cross_task read <review id>`, or the Mac's `kanban/sync-shadow/*.db`). Otherwise match its branch name
+  (`headRefName`, e.g. `wt/<slug>`) and the card ids in the PR body against card bodies and comments on every host.
+  Searching only for `PR<n>`/`#<n>` misses owners that published the PR after their body was written.
 - Count a worker's free slots before moving cards to it: `max_in_progress` minus running, and check
   `kanban_pickup_skips` for recent `budget_exhausted` rows. One free slot with several contenders is not capacity.
 - A burst of `rate_limited` runs (`HTTP 429 ... quota unavailable for openai-codex/...`) is not an outage by itself.
@@ -289,7 +280,8 @@ there, which execs the skill script.
   already go to another provider. A host whose core predates first-spawn wall routing wastes only the first spawn of
   each new card; the quota-wall alert card names the fix commit, so check it with `git merge-base --is-ancestor`. Count
   `gave_up` events and check the fallback pool's weekly headroom (resetwatch `probe.py --fresh`) before calling it harm.
-- A decision chat's card that's missing from the local board isn't absent: `cross_task read <id>` finds it on its owner gateway.
+- A card missing from a board isn't absent. Its row, events and run results live on the gateway that created it, not
+  on the machine that ran it; `cross_task read <id>` finds it there.
 - `notify-subscribe` from a Desktop chat warns "binding a different chat" and suggests `agent:main:local:dm:<id>`.
   Ignore that suggestion and keep the bare session id: following it writes a shepherd row for an id that is not a chat.
 - A sweep report that relays an ask owned by another surface (BB Inbox, another chat) gets turned into a new For-you
@@ -298,8 +290,7 @@ there, which execs the skill script.
 - An old ask missing what unblock and archive mean: amend it in place with `hermes kanban block <id> "<same reason>"
   --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
   current human_request and block reason first (tasks row or last block event payload), so only the action changes.
-- Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read
-  (the Echo Dot "keep it off or turn it back on?" card was answered in Desktop and closed itself).
+- Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read.
 
 ## Done means
 - [ ] Every board was inventoried, and the count per board and status was reported?
