@@ -235,3 +235,27 @@ def test_plugin_hooks_block_and_record_and_never_raise(plugin, tmp_path):
     assert plugin._post_tool_call(tool_name="terminal", args=None, result=object()) is None
     (tmp_path / "denial-ledger.jsonl").write_text("not json\n")
     assert plugin._pre_tool_call(tool_name="terminal", args={"command": AMBIENT_CMD})["action"] == "block"
+
+
+def test_plugin_holds_aws_text_when_classify_and_is_mutating_both_fail(plugin):
+    # review-cumulative-2 A note: a second failure must not escape the hook.
+    def boom(*a, **k):
+        raise RuntimeError("synthetic analysis failure")
+    plugin.guard.classify = boom
+    plugin.guard.is_mutating = boom
+    out = plugin._pre_tool_call(tool_name="terminal", args={"command": AMBIENT_CMD})
+    assert out["action"] == "block"
+    assert plugin._pre_tool_call(tool_name="terminal", args={"command": "git status"}) is None
+    assert plugin._pre_tool_call(tool_name="execute_code", args={"code": "import boto3"})["action"] == "block"
+
+
+def test_plugin_holds_when_args_repr_also_fails(plugin):
+    def boom(*a, **k):
+        raise RuntimeError("synthetic analysis failure")
+
+    class BadRepr:
+        def __repr__(self):
+            raise RuntimeError("synthetic repr failure")
+    plugin.guard.classify = boom
+    plugin.guard.is_mutating = boom
+    assert plugin._pre_tool_call(tool_name="terminal", args=BadRepr())["action"] == "block"
