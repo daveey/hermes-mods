@@ -198,6 +198,9 @@ SCHEMA = {
         '{"kind": "done", "summary": "..."} when the work is finished (one or two sentences: what was done and '
         'the result). {"kind": "decide", "items": [{"question": "...", "choices": [{"label", "value"}, ...]}]} '
         "when the user must choose: each question becomes a decision tile with buttons (at least 2 choices). "
+        "The result's `requests` gives each tile's `sourceRef` and requestId: a choice authorizes nothing, so to "
+        "get approval of exact text/plan for that same decision, cite the sourceRef in action_request "
+        "scope.sourceRefs (it upgrades that tile in place); never publish a second ask for it. "
         '{"kind": "wait", "on": [{"kind": "card|process|cron|time|capacity|subagent", "id": "...", '
         '"label": "...", "eta": <unix seconds>}]} when the chat waits on named work. '
         "The sidebar shows this outcome; without it the chat may show as unresolved."),
@@ -362,6 +365,43 @@ def _rollback_steps(us, session_id: str, ids: list[str]) -> None:
         log.exception("session-outcome: rolling back decide steps failed")
 
 
+UPGRADE_NOTE = (
+    "Each entry in `requests` is one open decision. Picking one of its choices authorizes nothing. If you need the "
+    "user's approval of an exact plan or text for one of these decisions, do NOT publish a second ask: call "
+    "action_request with that entry's `sourceRef` in request.scope.sourceRefs (no requestId); it revises that same "
+    "request in place, so the user sees one tile. An entry with identity \"unavailable\" has no canonical request "
+    "yet: do not invent a ref or requestId for it.")
+
+
+def _step_identities(us, session_id: str, steps: list[dict]) -> list[dict]:
+    """Each declared step's qualified sourceRef and canonical requestId/revision, created now (idempotent: the
+    next turn's pre_llm_call migration finds the same alias). Without a server identity the entry carries only
+    the step id and ``identity: unavailable``: a ref is never fabricated."""
+    out: list[dict] = []
+    owner = None
+    try:
+        owner = us.server_owner(session_id) if us is not None else None
+    except Exception:
+        log.info("session-outcome: no server identity for decide steps", exc_info=True)
+    for step in steps:
+        entry: dict[str, Any] = {"stepId": step["id"]}
+        if owner is None or not callable(getattr(us, "ActionStore", None)):
+            out.append({**entry, "identity": "unavailable"})
+            continue
+        try:
+            req = us.ActionStore().migrate_step(owner, step)
+        except Exception:
+            log.warning("session-outcome: canonical request for step %s not created", step.get("id"), exc_info=True)
+            out.append({**entry, "identity": "unavailable"})
+            continue
+        ref = {"gatewayId": owner["gatewayId"], "profile": owner["profile"], "type": "user_step", "id": step["id"]}
+        if ref not in (req.get("aliases") or []):
+            out.append({**entry, "identity": "unavailable"})
+            continue
+        out.append({**entry, "sourceRef": ref, "requestId": req["requestId"], "revision": req["revision"]})
+    return out
+
+
 def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -> str:
     try:
         if not session_id:
@@ -375,6 +415,7 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
         api = _outcome_api()
         result: dict[str, Any] = {"ok": True}
         added: list[str] = []
+        made_steps: list[dict] = []
         if spec["kind"] == "done":
             outcome = dict(spec)
         elif spec["kind"] == "wait":
@@ -392,6 +433,7 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
                     except Exception as exc:
                         _rollback_steps(us, session_id, added)
                         return _err(f"decide not recorded (nothing written): {exc}")
+                    made_steps.append(step)
                     sid = step["id"]
                     if sid not in before:
                         added.append(sid)
@@ -425,6 +467,11 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
             return _err(f"outcome rejected (nothing kept): {exc}")
         _note_call(session_id, _current_tool_call_id(tool_call_id))
         result.update(declared=True, outcome=outcome)
+        if spec["kind"] == "decide" and made_steps:
+            # Hand the agent each step's exact identity so a later approval UPGRADES this request instead of
+            # publishing a second ask for the same decision (agent-d5fb2ec9c4: two Post tiles, one reply).
+            result["requests"] = _step_identities(_user_steps(), session_id, made_steps)
+            result["upgrade"] = UPGRADE_NOTE
         if spec["kind"] == "wait":
             cards = [w["id"] for w in spec["on"] if w["kind"] == "card"]
             if cards:

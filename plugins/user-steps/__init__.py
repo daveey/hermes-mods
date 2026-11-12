@@ -9,6 +9,7 @@ Skipped: Kanban workers, subagents, cron/webhook. Off switch: HERMES_USER_STEPS_
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -98,6 +99,46 @@ def aux_llm(system: str, user: str) -> str:
 
 def _ledger():
     return core.Ledger()
+
+
+def _declared_steps(session_id: str) -> list[dict]:
+    """This chat's open session_outcome(decide) ledger steps (explicitly declared decisions), oldest first."""
+    try:
+        steps = _ledger().read(session_id).get('steps', [])
+    except Exception:
+        return []
+    return sorted((s for s in steps if s.get('status') == 'open' and s.get('session') == session_id
+                   and s.get('source') == 'session_outcome' and s.get('id')), key=lambda s: s.get('created', 0))
+
+
+def _uncited_hint(owner: dict, declared: list[dict], cited: set, requests: list[dict], skip: set) -> str:
+    """Name the chat's open declared decisions this publication did not cite (agent-d5fb2ec9c4: a decide then an
+    uncited approval asked the user twice). A hint only: it grants, merges and withdraws nothing; only an exact
+    sourceRef citation upgrades a request."""
+    by_step: dict[str, dict] = {}
+    for r in requests:
+        for a in r.get('aliases') or []:
+            if (a.get('type') == 'user_step' and a.get('gatewayId') == owner['gatewayId']
+                    and a.get('profile') == owner['profile']):
+                by_step[str(a.get('id'))] = r
+    listed = []
+    for step in declared:
+        ref = {'gatewayId': owner['gatewayId'], 'profile': owner['profile'], 'type': 'user_step', 'id': step['id']}
+        if tuple(ref.values()) in cited:
+            continue
+        r = by_step.get(step['id'])
+        if r is not None and (r['requestId'] in skip or r['state'] not in ('open', 'needs_context')
+                              or r.get('resolution')):
+            continue  # the target of this very publication, or already decided/withdrawn
+        ident = f"request {r['requestId']} revision {r['revision']}, " if r is not None else ''
+        listed.append(f"step {step['id']} ({ident}sourceRef {json.dumps(ref, sort_keys=True)}): "
+                      f"{str(step.get('text') or '')[:80]!r}")
+    if not listed:
+        return ''
+    return ('This chat also has open declared decision(s) this request does not cite: ' + '; '.join(listed)
+            + '. If this request asks for the same decision, do not leave two asks: publish it again with that '
+            'sourceRef in request.scope.sourceRefs (it revises that request in place), then withdraw the extra one. '
+            'Unrelated decisions stay separate. This note authorizes nothing.')
 
 
 def _trace(**kw: Any) -> None:
@@ -519,6 +560,13 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
             cited = {qualified(ref) for ref in list(payload.get('aliases') or []) + list((scope_obj or {}).get('sourceRefs') or [])
                      if isinstance(ref, dict) and ref.get('type') == 'user_step'
                      and ref.get('gatewayId') == owner['gatewayId'] and ref.get('profile') == owner['profile']}
+            declared = _declared_steps(session_id)
+            for step in declared:
+                # A cited declared step (session_outcome decide) that is still only a ledger step gets its
+                # canonical request now, so the citation folds into it instead of minting a request that the next
+                # turn's migration would duplicate. Same session, exact id only.
+                if (owner['gatewayId'], owner['profile'], 'user_step', step['id']) in cited:
+                    st.migrate_step(owner, step)
             undecided = [] if 'decisionCard' in args else [
                 r for r in st.requests(owner)
                 if r['state'] in ('open', 'needs_context') and not r.get('resolution')
@@ -539,6 +587,7 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
                                    f"{out['requestId']} revision {out['revision']}. Nothing new was published."})
             key = core.ask_key(payload.get('title'))
             others = [r for r in undecided if r not in fold and len(key) >= 20 and core.ask_key(r['title']) == key]
+            hint = _uncited_hint(owner, declared, cited, st.requests(owner), {r['requestId'] for r in fold})
             note = None
             if fold:
                 target = fold[0]
@@ -572,12 +621,16 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
                     if others:
                         note += (' Also open with the same title (separate requests): '
                                  + ', '.join(r['requestId'] for r in others) + '; withdraw any this replaces.')
+                    if hint:
+                        note += ' ' + hint
                     return json.dumps({'request': _published(owner, out), 'note': note})
             if others:
                 note = ('Published as a separate request. Also open with the same title: '
                         + ', '.join(r['requestId'] for r in others) + '. A matching title does not make them one '
                         'request: if this replaces one, withdraw it (or revise it by its requestId and '
                         'expectedRevision instead of publishing a new one).')
+            if hint and not fold:
+                note = (note + ' ' if note else 'Published as a separate request. ') + hint
             payload = core.validate_action(payload)
             if 'decisionCard' in args:
                 core._object(args['decisionCard'], ('board',))

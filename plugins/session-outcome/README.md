@@ -48,6 +48,14 @@ not claimed by this plugin section.
     question; without it, narrowing scope does not imply start-now. Omitted flags use user-steps'
     clear go/approve-label fallback. Tests: `test_decide_preserves_explicit_authorization_through_real_migration`
     and `test_decide_invalid_authorizes_writes_nothing` in `tests/test_session_outcome.py`.
+    After declaring, the result's `requests` lists each step's qualified `sourceRef`
+    (`{gatewayId, profile, type: "user_step", id}`) and the canonical `requestId`/`revision` it created now
+    (idempotent with the next turn's migration), plus an `upgrade` instruction: to ask approval of exact
+    text for the same decision, cite that `sourceRef` in `action_request` `scope.sourceRefs`, which revises the
+    request in place instead of adding a second tile. With no server identity an entry is
+    `{stepId, identity: "unavailable"}`; no ref is fabricated. user-steps' `action_request` names any open
+    declared decision of the chat a new publication does not cite (a hint; nothing merged by wording).
+    Tests: `plugins/user-steps/tests/test_cross_producer_ask.py`.
   - `{"kind": "wait", "on": [{"kind": "card|process|cron|time|capacity|subagent", "id", "label"?, "state"?,
     "eta"?}]}` declares `{"kind": "waiting", "on": [...]}`. Each `card` found on this gateway's boards also gets a
     `tui` shepherd subscription for the chat (`delivery_metadata.via = "outcome-wait"`), so the chat's task list and
