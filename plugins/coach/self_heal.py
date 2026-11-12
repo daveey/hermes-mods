@@ -1881,6 +1881,7 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
 {home_pin_note(PIN_FIX)}
 
 ## Approved proposal (evidence)
+{fence_evidence(st.get('symptom') or '')}
 {fence_evidence(text)}
 
 ## Acceptance (all of it, in order)
