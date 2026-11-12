@@ -243,6 +243,73 @@ def _stop_plugin_loops(threads):
         if stop is not None:
             stop.set()
 
+
+# Core keeps process-wide per-file handles that are bounded (or deliberately never closed) for a gateway watching a
+# few homes: read-only SQLite readers (kanban_session_activity._RO_CACHE up to 32, notification_idle._SIGS up to 64
+# pinning a reader, kanban_replica_observer up to 16 observers; ~3 fds each with WAL), one O_RDONLY header-probe fd per
+# state.db path (hermes_state_dbfile._HEADER_PROBE_FDS, never closed in production: closing it while SQLite owns the
+# inode would cancel its POSIX locks), and routed per-profile log files (hermes_logging._ProfileRoutingFileHandler).
+# Here every test has its own tmp home, so they pile up: the hub's coach run reached ~1000 fds before
+# test_root_cap_topic_lexicon and ~20 tests then failed with EMFILE (soft RLIMIT_NOFILE 1024), a different set every
+# run. Release them after each test, readers first, then this test's routed logs and probe fds (only paths under its
+# tmp_path, as core's own private_db_probe_cleanup does). Only modules a test already imported are touched.
+_CORE_READER_RESETS = (
+    ("tui_gateway.notification_idle", "reset_board_signatures"),
+    ("hermes_cli.kanban_reader_retention", "close_all"),
+    ("tui_gateway.kanban_replica_observer", "reset"),
+)
+
+
+def _under(path, roots):
+    try:
+        return any(Path(path).is_relative_to(root) for root in roots)
+    except (TypeError, ValueError):
+        return False
+
+
+def _release_test_home_logs(logging_mod, root):
+    release = getattr(logging_mod, "release_profile_log_handlers", None)
+    if release is None:
+        return
+    homes = set()
+    for router in list(getattr(logging_mod, "_queued_file_handlers", ())):
+        homes.update(h for h in list(getattr(router, "_profile_handlers", {})) if _under(h, root))
+    for home in homes:
+        release(home)
+
+
+def _close_test_probe_fds(dbfile, root):
+    lock = getattr(dbfile, "_HEADER_PROBE_LOCK", None)
+    probes = getattr(dbfile, "_HEADER_PROBE_FDS", None)
+    if lock is None or probes is None:
+        return
+    with lock:
+        for key in [k for k in probes if _under(k, root)]:
+            fd = probes.pop(key)[0]
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+@pytest.fixture(autouse=True)
+def _release_core_handles(tmp_path):
+    yield
+    for module, name in _CORE_READER_RESETS:
+        reset = getattr(sys.modules.get(module), name, None)
+        if reset is not None:
+            try:
+                reset()
+            except Exception:  # a reader still borrowed by a straggler is left for its owner; never fail teardown
+                pass
+    root = {tmp_path, tmp_path.resolve()}
+    for module, release in (("hermes_logging", _release_test_home_logs), ("hermes_state_dbfile", _close_test_probe_fds)):
+        if module in sys.modules:
+            try:
+                release(sys.modules[module], root)
+            except Exception:
+                pass
+
 # Tests set HERMES_HOME=tmp_path. The first lazy import of hermes_bootstrap under that home (e.g. SessionDB.append_message
 # -> agent.conversation_loop -> hermes_bootstrap) otherwise runs a full dependency sync into the tmp home: ~400MB
 # (cache/uv/archive-v0 + installs/<id>/environments) per test basetemp. When the interpreter already has Hermes'
