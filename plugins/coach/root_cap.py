@@ -1193,13 +1193,19 @@ _PERM_NEG = re.compile(r"(?:\bnot\b|n['\u2019]t\b|\bnever\b|\bno longer\b|\bnon[
 # was used, so the owner/restore provenance is demanded and (when valid) persisted as a temporary exception.
 _BOUND_RESTORE = re.compile(r"\b(?:restor\w*|revert\w*|roll(?:ed|ing)?[- ]?back|roll (?:it|this|that) back|put (?:it|this|that) back|"
                             r"set (?:it|this|that) back|change (?:it|this|that) back|go(?:ing)? back to)\b")
+_UNIT = r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|nights?|weeks?)"
+_QTY = (r"(?:\d+(?:\.\d+)?|(?:a\s+)?(?:few|couple(?:\s+of)?|several)|half\s+an?|half|a|an|one|two|three|four|five|"
+        r"six|seven|eight|nine|ten|twenty|thirty)")
 _BOUND_TIME = re.compile(
-    r"\b(?:only|just|solely)\s+(?:for|until|till|while|during|to)\b|"
-    r"\bfor\s+(?:the\s+next\s+|another\s+|about\s+|roughly\s+|up to\s+)?(?:\d+|a|an|one|two|three|four|five|six|"
-    r"ten|few|couple(?:\s+of)?|several)\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?)\b|"
+    r"\b(?:only|just|solely|merely)\s+(?:for|until|till|while|during|to)\b|"
+    # a duration with any run of qualifiers in front of the number: "for only 10 minutes", "for just a couple of
+    # hours", "for the next 5 min", "for up to an hour", "within 10 minutes", "10 minutes only"
+    r"\b(?:for|within|in)\s+(?:(?:only|just|merely|solely|the\s+next|the\s+first|next|another|a\s+further|about|"
+    r"roughly|approximately|around|up\s+to|at\s+most|at\s+least)\s+)*" + _QTY + r"[\s-]*" + _UNIT + r"\b|"
+    r"\b" + _QTY + r"[\s-]*" + _UNIT + r"\s+(?:only|max|maximum|at\s+most|tops)\b|"
     r"\b(?:until|till|expires?|expiry|expiring|time[- ]?boxed|time[- ]?limited|one[- ]?off|one[- ]?time|short[- ]?term|"
-    r"for now|for today|for tonight|for the (?:moment|day|night|time being|meantime|duration)|while (?:it|this|that) "
-    r"(?:runs|finishes|completes|drains))\b")
+    r"for now|for today|for tonight|for the (?:moment|day|night|time being|meantime|duration)|for a (?:bit|while)|"
+    r"just this once|this once|briefly|while (?:it|this|that) (?:runs|finishes|completes|drains))\b")
 _BOUND_OWNER = re.compile(r"\bowner\s+(?:card|run|session|task)\b|\bthis (?:session|run) only\b")
 # A bound signal is cancelled only by a negator right in front of it (within two words): "Don't restore it",
 # "not only for an hour", "this is not time-boxed". A negation elsewhere in the sentence ("Don't forget to restore
@@ -1227,10 +1233,12 @@ def _temporary_intent(own_text):
             continue
         if _PERM_NEG.search(low):
             return True
-        if "temporar" in low and not _NOT_TEMP.search(low):
+        # Negation is scoped to the one signal it governs: "not temporary" blanks only that span (same length, so
+        # positions stay valid) and every other signal of the sentence still counts ("This is not temporary, but
+        # restore it on owner completion." / "..., but it expires tomorrow." remain bounded).
+        low = _NOT_TEMP.sub(lambda m: " " * len(m.group(0)), low)
+        if "temporar" in low:
             return True
-        if _NOT_TEMP.search(low):
-            continue
         for pat in (_BOUND_RESTORE, _BOUND_TIME, _BOUND_OWNER):
             if any(not _negated_before(low, m.start()) for m in pat.finditer(low)):
                 return True
