@@ -94,13 +94,27 @@ def _call_texts(tool_calls):
             yield str(args["command"])
 
 
+def _ro_connect(path, timeout=2):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows or creates the db."""
+    uri = Path(path).resolve().as_uri()
+    try:
+        c = sqlite3.connect(uri + "?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(uri + "?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 @functools.lru_cache(maxsize=512)
 def _tool_call_hit(prefix, db):
     words = sorted(set(re.findall(r"[A-Za-z0-9_]{5,}", prefix)), key=len, reverse=True)[:3]
     if len(words) < 2 or not os.path.exists(db):
         return False
     try:
-        con = sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        con = _ro_connect(db, timeout=2)
     except Exception:
         return False
     try:
