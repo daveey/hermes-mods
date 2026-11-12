@@ -266,6 +266,38 @@ authorization does not authenticate the OS. For a verified authentication step, 
 flow with the precise command/host and step; never request passwords or secret codes/tokens in chat. Metadata
 neither authorizes execution, bypasses security denials, completes work nor automatically unblocks a card.
 
+### Scoped access evidence and worker-tool escalations
+
+`access_scope.py` adds two **bounded evidence-quality nudges** before create/block asks:
+- `regional_access_scope`: an observed AWS SSM denial with a region cannot justify an unscoped
+  "SSM is refused" premise in a new card. Name the failed principal/action/resource/region;
+  discover the intended target from trusted configuration or read-only inventory. Do not probe
+  access with `send-command` or search arbitrary regions for a permissive route. A different
+  regional endpoint's availability does not confer write authorization.
+- `tool_policy_escalation`: a `user_terminal` ask justified solely by worker instructions
+  prohibiting CLI use belongs in a supported supervisor/operator handoff, not a human
+  authentication flow. Keep the worker prohibition; never bypass it through SSH/SSM. Mixed
+  requests mentioning an actual human-only boundary still go through existing ask checks.
+
+Each unchanged premise is held at most twice per session/tool; release only continues the
+existing gates. These are not an execution guard, an AWS permission evaluator, or proof that
+an operation is authorized. Historical corrections and precisely region-scoped denials are
+allowed. Coverage is deliberately narrow (SSM denial wording and worker CLI-policy wording),
+not arbitrary capability claims or every natural-language paraphrase.
+
+**When recovering a mistaken ask:** read why it was filed and the actual consent/tool evidence.
+An agent-generated `user_terminal` label alone neither proves that authentication is needed nor
+provides execution consent. For real user restrictions/authentication, preserve the supported
+flow. A notice, unblock, archive, or withdrawal is never execution consent. Recover already
+agent-owned work only under independently established authority and supported tools, then
+retire a stale ask with evidence; do not call retirement itself an approval or proof of success.
+
+`tests/test_access_scope.py` reproduces the regional-overclaim filing path, precise scopes,
+historical corrections and bounded release. `tests/test_tool_policy_escalation.py` reproduces
+the unnecessary escalation and preserves human-boundary handling, authoritative pending
+approval despite notices, and veto handling after nudge exhaustion. All use isolated fixtures;
+they do not execute remote commands or establish live user-terminal authorization.
+
 `tests/test_human_request.py` exercises create/block hooks, required fields, supported interactions, unrelated
 prose/evidence, operational failures, open-asks marker smuggling, malformed verdicts, and ordinary clarification
 preservation; `tests/test_judge_unavailable.py` covers outages (class fallback, `judge_unavailable` acceptance,
