@@ -142,7 +142,7 @@ export function observationView(obs, nowSec, sdk = observationSdk(), sourceClass
     ageSec: obsNum(obsOwn(obs, 'age_seconds')),
     source: obsText(obsOwn(obs, 'source')) || null,
     id: identityText(obsOwn(obs, 'identity')),
-    owner: qual(obsOwn(obs, 'owner')) || null,
+    owner: [qual(obsOwn(obs, 'owner')), obsText(obsOwn(obsOwn(obs, 'owner'), 'session')) || obsText(obsOwn(obsOwn(obs, 'owner'), 'assignee'))].filter(Boolean).join('/') || null,
     progress: progressAt == null ? null : { ageSec: Math.max(0, nowSec - progressAt), kind: obsOwn(obs, 'last_progress_kind') || null, ref: obsOwn(obs, 'last_progress_ref') || null },
     activity: activityAt == null ? null : { ageSec: Math.max(0, nowSec - activityAt), kind: obsText(obsOwn(obs, 'last_activity_kind')) || null },
     wait: waitView(obsOwn(obs, 'wait'), nowSec),
@@ -186,7 +186,9 @@ export function chipObservation(chip, nowSec, { sdk = observationSdk(), sourceCl
   if (!split.present) return missingView('producer_sent_no_observations')
   const candidates = split.work.filter(r => {
     const id = obsOwn(r, 'identity')
-    if (obsOwn(id, 'kind') !== 'card' || obsOwn(id, 'work_id') !== chip.id) return false
+    const kind = chip.kind === 'bg' ? 'process' : chip.kind === 'sub' ? 'subagent' : 'card'
+    if (obsOwn(id, 'kind') !== kind || obsOwn(id, 'work_id') !== chip.id) return false
+
     for (const [k, mine] of [['board', chip.board], ['profile', chip.profile], ['gateway', chip.gateway]]) {
       const theirs = obsOwn(id, k)
       if (obsText(mine) && theirs !== undefined && theirs !== mine) return false
@@ -230,6 +232,8 @@ export function observationLine(v, nowSec) {
   parts.push(v.progress ? `progress ${[v.progress.kind, `${span(v.progress.ageSec)} ago`, v.progress.ref && `(${v.progress.ref})`].filter(Boolean).join(' ')}` : 'progress unknown')
   if (v.receipts) parts.push(v.state === 'done' ? 'verified completion receipt' : `${v.receipts} historical completion receipt${v.receipts === 1 ? '' : 's'}`)
   if (v.id) parts.push(v.id)
+  if (v.source) parts.push(`source ${v.source}`)
+  if (v.owner) parts.push(`owner ${v.owner}`)
   return parts.join(' · ')
 }
 
@@ -286,7 +290,7 @@ export function processChips(processes) {
       const since = up >= 0 && Number.isFinite(up) && p.uptime_seconds != null
         ? Date.now() / 1000 - up
         : Number(p.started_at) || (Date.parse(str(p.started_at)) || 0) / 1000
-      return { key: `bg:${str(p.session_id) || cmd}`, kind: 'bg', state: 'running', label: cmd, title: str(p.command) || cmd, since }
+      return { key: `bg:${str(p.session_id) || cmd}`, id: str(p.session_id), kind: 'bg', state: 'unknown', observations: Array.isArray(p.execution_observations) ? p.execution_observations : null, label: cmd, title: str(p.command) || cmd, since }
     })
 }
 
@@ -298,11 +302,13 @@ export function subagentChips(subagents) {
       return {
         key: `sub:${str(s.subagent_id) || `${str(s.delegation_id)}:${str(s.task_index)}:${goal}`}`,
         kind: 'sub',
-        state: 'running',
+        id: str(s.subagent_id),
+        observations: Array.isArray(s.execution_observations) ? s.execution_observations : null,
+        state: 'unknown',
         label: goal,
         title: str(s.goal) || goal,
         since: Number(s.started_at) || 0,
-        // The session panel judges a sub-agent stuck when this stops changing (subagent.list has no activity time).
+        // Display-only activity counters; not substantive progress or a stall verdict.
         toolCount: Number(s.tool_count) || 0,
         lastTool: str(s.last_tool) || null
       }
@@ -887,7 +893,9 @@ export async function refresh() {
       if (!stillFocused()) return
       snapshot = {
         runtime, stored, scope, fresh: true,
-        chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes)]
+        chips: [...kanbanCache, ...machineCache, ...subagentChips(subagents?.subagents), ...processChips(procs?.processes),
+          ...(!procs && runtime ? [{ key: 'process-status', kind: 'kanban-status', state: 'unknown', label: 'Process status unknown', title: 'Process source unavailable or not read yet.' }] : []),
+          ...(!subagents && runtime ? [{ key: 'subagent-status', kind: 'kanban-status', state: 'unknown', label: 'Subagent status unknown', title: 'Subagent source unavailable or not read yet.' }] : [])]
       }
       emit()
     }
@@ -997,7 +1005,9 @@ export function openTaskChip(chip) {
   return openQualifiedTask(chip)
 }
 
-function Chip({ chip, now }) {
+export function Chip({ chip: rawChip, now }) {
+  const ev = ['bg', 'sub'].includes(rawChip.kind) ? chipObservation(rawChip, now / 1000) : null
+  const chip = ev ? { ...rawChip, state: ev.state, title: `${rawChip.title}\n${observationLine(ev, now / 1000)}` } : rawChip
   const color = chipColor(chip.look || chip.state)
   const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
   const taskClickable = chip.kind === 'kanban' && !!chip.connectionId && !!chip.profile

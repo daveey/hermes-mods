@@ -51,24 +51,26 @@ test('classify sorts cards, sub-agents and processes into sections', () => {
   ]
   const out = m.classify(chips, { nowMs: NOW, silence, isAsked: c => c.id === 't_asked' })
   const ids = list => list.map(i => i.key)
-  assert.deepEqual(ids(out.active), ['kb:t_run', 'kb:t_rev', 'bg:1'])
-  assert.deepEqual(ids(out.stuck), ['kb:t_old', 'kb:t_stall', 'sub:a'])
-  assert.deepEqual(ids(out.waiting), ['kb:t_park'])
+  assert.deepEqual(ids(out.active), ['kb:t_run', 'kb:t_rev'])
+  assert.deepEqual(ids(out.stuck), ['kb:t_old', 'kb:t_stall'])
+  assert.deepEqual(ids(out.waiting), ['kb:t_park', 'sub:a', 'bg:1'])
   assert.deepEqual(ids(out.queued), ['kb:t_todo'])
   assert.deepEqual(ids(out.unasked), ['kb:t_unasked'], 'a card an ask already covers is not listed twice')
   assert.match(out.stuck[0].detail, /^running, no progress since \d\d:\d\d \(2 h ago\) · last event: heartbeat$/)
   assert.match(out.waiting[0].detail, /^waiting on a timer since \d\d:\d\d$/)
-  assert.match(out.stuck[2].detail, /^sub-agent · no new tool call for 30 min \(3 tool calls, last terminal\)$/)
-  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 3, needsYou: 2, stuck: 3, waiting: 1, queued: 1 },
+  assert.match(out.waiting[1].detail, /unknown \(sdk projector unavailable\)/)
+  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 2, needsYou: 2, stuck: 2, waiting: 3, queued: 1 },
     'sub-agents and processes count like the rows listed under each section')
 })
 
-test('a lone running sub-agent shows one running pip, matching In progress · 1', async () => {
+test('a legacy sub-agent without evidence shows one waiting pip, never running', async () => {
   const out = m.classify([{ key: 'sub:solo', kind: 'sub', label: 'Fix it', toolCount: 70, lastTool: 'terminal' }], { nowMs: NOW })
   const n = m.counts(out, { done: 4 })
-  assert.equal(n.running, 1)
+  assert.equal(n.running, 0)
+  assert.equal(n.waiting, 1)
   await show(React.createElement(m.Pips, { n }))
-  assert.equal(el().querySelectorAll('[data-pip="running"]').length, 1)
+  assert.equal(el().querySelectorAll('[data-pip="running"]').length, 0)
+  assert.equal(el().querySelectorAll('[data-pip="waiting"]').length, 1)
   assert.equal(el().querySelectorAll('[data-pip="done"]').length, 4)
 })
 
@@ -137,7 +139,8 @@ test('unblock steps and the nudge draft name what is stuck and since when', () =
   assert.match(m.nudgeText(old, NOW), /^Card t_old \("Card t_old"\) has had no progress since \d\d:\d\d \(last event: ssh timeout\)\. Check it, then either get it moving or tell me exactly what you need from me\.\n$/)
   assert.match(m.nudgeText(stall, NOW), /has been waiting on card t_x on hub since \d\d:\d\d with nothing producing it/)
   const sub = { key: 'sub:a', kind: 'sub', label: 'Drain', toolCount: 0 }
-  const s = m.classify([sub], { nowMs: NOW, silence: new Map([['sub:a', 45 * 60_000]]) }).stuck[0]
+  // Test wording only: the classifier no longer infers a stall from tool-count silence.
+  const s = { ...sub, quietMin: 45 }
   assert.equal(m.nudgeText(s, NOW), 'Sub-agent "Drain" has made no tool call for 45 min. Check on it: let it finish, restart it, or stop it, and tell me if you need anything from me.\n')
 })
 
