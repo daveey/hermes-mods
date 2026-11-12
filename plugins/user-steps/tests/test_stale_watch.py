@@ -73,6 +73,7 @@ def test_retired_request_opens_no_card(tmp_path):
 def test_cli_uses_kanban_create_with_idempotency_key(tmp_path, monkeypatch):
     st, r, db = make(tmp_path, 7200)
     seen = []
+    monkeypatch.setattr(sw.placement_evidence, 'home_runs_on_argv', lambda: [])  # pinning is covered elsewhere
     monkeypatch.setattr(sw.subprocess, 'run', lambda cmd, **k: seen.append((cmd, k['input'])) or
                         type('P', (), {'returncode': 0, 'stdout': '{}', 'stderr': ''})())
     sw.run(core, chat, st, db, now=NOW)

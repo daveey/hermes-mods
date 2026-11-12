@@ -65,44 +65,63 @@ def _load(name):
     return mod
 
 
+def _load_placement():
+    """The one shared coach placement helper (never copied here), loaded by path like chat-closeout does."""
+    path = HERE.parent / 'coach' / 'placement_evidence.py'
+    spec = importlib.util.spec_from_file_location('us_coach_placement_evidence', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+placement_evidence = _load_placement()
+fence_evidence = placement_evidence.fence_evidence
+home_pin_note = placement_evidence.home_pin_note
+incident_title = placement_evidence.incident_title
+_PIN = "the repair reads and changes this gateway's own user-steps action store and chat state"
+
+
 def card(item):
     rid = item['requestId']
+    evidence = (f"- Request id: {rid}\n- Session: {item['session']}\n"
+                f"- Question:\n{item['question']}\n\n- User reply:\n{item['reply']}")
     body = (f"A user-steps panel request is still open although its question was already answered in chat.\n\n"
-            f"- Request id: {rid}\n- Session: {item['session']}\n"
-            f"- Question:\n{item['question']}\n\n- User reply:\n{item['reply']}\n\n"
+            f"{fence_evidence(evidence)}\n\n"
             f"Retire it: POST /api/plugins/user-steps/requests/{rid}/reconcile-chat (the judge re-reads the "
             f"transcript; no answer text is accepted from the caller). If the judge returns unmatched for a "
             f"genuine answer, fix the judge prompt (SYSTEM) in plugins/user-steps/chat.py instead.\n"
-            f"Source: plugins/user-steps/stale_watch.py. Done when the id is gone from /ping stale.answeredOpenIds.")
+            f"Source: plugins/user-steps/stale_watch.py. Done when the id is gone from /ping stale.answeredOpenIds.\n\n"
+            f"{home_pin_note(_PIN)}")
     return {'title': f'user-steps: request {rid} still open after its question was answered',
             'body': body, 'idempotency_key': 'user-steps-stale:' + rid, 'assignee': 'default'}
 
 
 def dup_card(d):
     lines = '\n'.join('- ' + ', '.join(g) for g in d['groups'])
+    evidence = (f"- Namespace: {d['namespace']}\n- Session: {d['session']}\n"
+                f"- Possible duplicate groups (request ids, oldest first):\n{lines}")
     body = (f"A session holds more than one open user-steps request that look like the same decision (the "
             f"core.restates_open_ask detector: title, word or menu overlap). Overlap is NOT identity: two requests "
-            f"with the same title can be different decisions.\n\n- Namespace: {d['namespace']}\n"
-            f"- Session: {d['session']}\n- Possible duplicate groups (request ids, oldest first):\n{lines}\n\n"
+            f"with the same title can be different decisions.\n\n{fence_evidence(evidence)}\n\n"
             f"Trace each request to its source (originating reply, tool call, notice). Withdraw a newer one with a "
             f"reason only when that source proves it re-asks the same decision; otherwise leave both open. "
             f"This watcher never withdraws anything.\n"
             f"Source: plugins/user-steps/stale_watch.py. Done when /ping stale.duplicateOpen no longer counts "
-            f"this session.")
-    return {'title': f"user-steps: duplicate open requests in session {d['session']}", 'body': body,
+            f"this session.\n\n{home_pin_note(_PIN)}")
+    return {'title': f"user-steps: duplicate open requests in session {incident_title(d['session'])}", 'body': body,
             'idempotency_key': f"user-steps:dup:{d['namespace']}:{d['session']}", 'assignee': 'default'}
 
 
 def cross_dup_card(p):
     a, b = p['ids']
     sessions = ', '.join(p['sessions'])
+    evidence = f"- Namespace: {p['namespace']}\n- Sessions: {sessions}\n- Request ids: {a}, {b}"
     body = (f"Two sessions on this gateway hold open user-steps requests that look like the same decision "
-            f"(the core.restates_open_ask detector; overlap is not identity).\n\n- Namespace: {p['namespace']}\n"
-            f"- Sessions: {sessions}\n- Request ids: {a}, {b}\n\n"
+            f"(the core.restates_open_ask detector; overlap is not identity).\n\n{fence_evidence(evidence)}\n\n"
             f"Trace both to their source. Withdraw the newer one with a reason only when its source proves it "
             f"relays the other's ask (e.g. a notice relay); otherwise leave both open. "
             f"This watcher never withdraws anything.\n"
-            f"Source: plugins/user-steps/stale_watch.py.")
+            f"Source: plugins/user-steps/stale_watch.py.\n\n{home_pin_note(_PIN)}")
     return {'title': 'user-steps: duplicate open requests across sessions', 'body': body,
             'idempotency_key': f"user-steps:dup:{p['namespace']}:{a}:{b}", 'assignee': 'default'}
 
@@ -164,14 +183,16 @@ def failed_decisions(core, store, db=None, now=None, min_age=FAILED_DECISION_MIN
 def failed_decision_card(f):
     oid = f['operationId']
     when = time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(f['failedAt']))
+    evidence = (f"A failed-turn boundary at {when} ended the turn before any tool ran.\n"
+                f"- Operation id: {oid}\n- Request id: {f['requestId']}\n- Session: {f['session']}\n"
+                f"- Admitted user row: {f['userRowId']}")
     body = (f"A For-you decision was delivered (prompt admission accepted, tile closed) but the turn it started "
-            f"ended in a failed-turn boundary at {when} before any tool ran, and nothing continued it: neither "
+            f"ended in a failed-turn boundary before any tool ran, and nothing continued it: neither "
             f"restart recovery (auto-continue / startup resume) nor a later user message.\n\n"
-            f"- Operation id: {oid}\n- Request id: {f['requestId']}\n- Session: {f['session']}\n"
-            f"- Admitted user row: {f['userRowId']}\n\n"
+            f"{fence_evidence(evidence)}\n\n"
             f"Carry out the decision in that chat (read the admitted row; no tool ran, so nothing was done), then find "
             f"why recovery skipped it: agent.log 'startup resume: marker ... skipped: <reason>' around that time.\n"
-            f"Source: plugins/user-steps/stale_watch.py (self-heal desktop-3a6213ce74).")
+            f"Source: plugins/user-steps/stale_watch.py (self-heal desktop-3a6213ce74).\n\n{home_pin_note(_PIN)}")
     return {'title': f'user-steps: decision {oid[:8]} was admitted but its turn failed and never ran',
             'body': body, 'idempotency_key': 'user-steps-failed-decision:' + oid, 'assignee': 'default'}
 
@@ -221,21 +242,22 @@ def undelivered_card(u):
     last = u.get('lastError') or {}
     last_line = (f"{last.get('class')}: {last.get('message')} (at {last.get('at')})" if last
                  else 'not recorded (attempts predate error capture)')
+    evidence = (f"- Operation id: {oid}\n- Request id: {u['requestId']}\n- Request: {u['title']}\n"
+                f"- Choice: {u['choiceId']} (effect {u['effect']}), recorded {u['recordedAt']}\n"
+                f"- Owner: {json.dumps(u['owner'], sort_keys=True)}\n"
+                f"- State: {u['dispatchState']}; counted attempts {u['attempts']}, closed-chat waits "
+                f"{u['ownerWaits']}, busy refusals {u['busyRefusals']}\n- Last error: {last_line}")
     body = (f"David decided a For-you request but the decision was never delivered to its chat, so the chat still "
-            f"treats it as pending.\n\n"
-            f"- Operation id: {oid}\n- Request id: {u['requestId']}\n- Request: {u['title']}\n"
-            f"- Choice: {u['choiceId']} (effect {u['effect']}), recorded {u['recordedAt']}\n"
-            f"- Owner: {json.dumps(u['owner'], sort_keys=True)}\n"
-            f"- State: {u['dispatchState']}; counted attempts {u['attempts']}, closed-chat waits {u['ownerWaits']}, "
-            f"busy refusals {u['busyRefusals']}\n- Last error: {last_line}\n\n"
+            f"treats it as pending.\n\n{fence_evidence(evidence)}\n\n"
             f"Fix the cause the last error names (plugins/user-steps: cards.py receivers, prompt_delivery.py, "
             f"core.py ActionStore.dispatch), then retry it from the For-you tile or POST "
             f"/api/plugins/user-steps/operations/{oid}/retry?session=<owner session>. Before redelivering, read the "
             f"chat: if it moved on, replaying a days-old approval would act on stale intent. Then retire it instead:\n"
             f"`python3 ~/.hermes/plugins/user-steps/stale_watch.py --retire-operation {oid} --reason '...' "
             f"--evidence '...'`\nDone when the operation reads dispatchState delivered or cancelled (retired).\n"
-            f"Source: plugins/user-steps/stale_watch.py (t_01a199c0a2e3ea8b).")
-    return {'title': f"user-steps: decision {oid[:8]} undelivered ({u['attempts']} attempts): {u['title'][:60]}",
+            f"Source: plugins/user-steps/stale_watch.py (t_01a199c0a2e3ea8b).\n\n{home_pin_note(_PIN)}")
+    return {'title': f"user-steps: decision {oid[:8]} undelivered ({u['attempts']} attempts): "
+                     f"{incident_title(u['title'])}",
             'body': body, 'idempotency_key': 'user-steps-undelivered:' + oid, 'assignee': 'default'}
 
 
@@ -302,8 +324,14 @@ def close_retired_cards(store, cards, local_gateway=None):
 
 
 def create_card(c):
+    # Every detector card is home-bound: pin it to this board's configured gateway (explicit machine label) and
+    # fail closed when a synced board's identity cannot be read: an unpinned card would silently become portable.
+    try:
+        pin = placement_evidence.home_runs_on_argv()
+    except placement_evidence.HomePinUnresolved as exc:
+        raise RuntimeError(f"refusing to file {c['idempotency_key']}: {exc}") from exc
     cmd = ['hermes', 'kanban', 'create', c['title'], '--body-file', '-', '--assignee', c['assignee'],
-           '--idempotency-key', c['idempotency_key'], '--json']
+           '--idempotency-key', c['idempotency_key'], *pin, '--json']
     p = subprocess.run(cmd, input=c['body'], text=True, capture_output=True, timeout=120)
     if p.returncode:
         raise RuntimeError(p.stderr.strip() or p.stdout.strip())
@@ -530,7 +558,8 @@ def review_card(items, now, gateway=None):
     script = '~/.hermes/plugins/user-steps/stale_watch.py'
     listing = '\n'.join(line for it in items for line in _item_lines(it)) or '- (none)'
     body = (f"User-steps requests still undecided more than 72 h after they were asked, not reviewed in the last "
-            f"7 days (action store on this host). The watcher withdrew and decided nothing.\n\n{listing}\n\n"
+            f"7 days (action store on this host). The watcher withdrew and decided nothing.\n\n"
+            f"{fence_evidence(listing)}\n\n"
             f"For EACH request, read the owner chat and the cards above, then do exactly one:\n"
             f"1. Withdraw it only with evidence, one of: a linked or named card is done or archived and the ask was "
             f"about it; it was decided elsewhere (quote the user's words and where); its time window expired (say "
@@ -544,7 +573,7 @@ def review_card(items, now, gateway=None):
             f"do not record a kept review because of that error. "
             f"Never decide a request for the user. Withdrawal is refused for recorded decisions and card-bound "
             f"requests. A chat that is on another gateway, unknown or unreadable is not evidence: keep those.\n"
-            f"Source: plugins/user-steps/stale_watch.py (old-ask review).")
+            f"Source: plugins/user-steps/stale_watch.py (old-ask review).\n\n{home_pin_note(_PIN)}")
     where = f' ({gateway})' if gateway else ''
     return {'title': f'user-steps{where}: review {len(items)} undecided request(s) older than 72 h', 'body': body,
             'idempotency_key': REVIEW_KEY + _pt(now, '%Y-%m-%d'), 'assignee': 'default',
