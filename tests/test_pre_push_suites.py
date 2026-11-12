@@ -13,7 +13,7 @@ import runpy
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class PushGate(unittest.TestCase):
+class GateFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='push-test-')
         self.addCleanup(self.tmp.cleanup)
@@ -58,6 +58,8 @@ class PushGate(unittest.TestCase):
     def tip(self):
         return self.git('--git-dir', str(self.remote), 'rev-parse', 'main').stdout.strip()
 
+
+class PushGate(GateFixture):
     def test_failed_push_stays_local_even_if_dirty_tree_repairs_it(self):
         self.test.write_text('def test_contract():\n    assert False, "contract failure"\n')
         self.commit()
@@ -162,6 +164,100 @@ def test_contract():
         self.commit()
         self.git('push', 'origin', 'HEAD:topic')
         self.assertEqual(self.tip(), self.base)
+
+
+class DocOnlyPushGate(GateFixture):
+    """A docs-only skill publication must not wait for that skill's code suite (live-checkout-guard
+    skill_publish has a 45 s budget); any code path, or a suite that reads documents, still runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.git('config', '--unset', 'core.hooksPath')
+        # Both suites fail whenever they run, so a pushed tip proves the suite was not run.
+        self.skill = self.repo / 'skills/testing/coded'
+        (self.skill / 'scripts').mkdir(parents=True)
+        (self.skill / 'SKILL.md').write_text('---\nname: coded\n---\nbase\n')
+        (self.skill / 'scripts/helper.py').write_text('VALUE = 1\n')
+        (self.skill / 'scripts/test_coded.py').write_text(
+            'def test_contract():\n    assert False, "coded suite ran"\n')
+        self.reader = self.repo / 'skills/testing/reader'
+        (self.reader / 'tests').mkdir(parents=True)
+        (self.reader / 'SKILL.md').write_text('---\nname: reader\n---\nbase\n')
+        (self.reader / 'tests/test_reader.py').write_text(
+            'from pathlib import Path\n\ndef test_contract():\n'
+            '    text = (Path(__file__).parents[1] / "SKILL.md").read_text()\n'
+            '    assert "never" in text, "reader suite ran"\n')
+        self.commit()
+        self.git('push', 'origin', 'HEAD:main')
+        self.base = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.git('config', 'core.hooksPath', '.githooks')
+
+    def push(self):
+        return self.git('push', 'origin', 'HEAD:main', check=False)
+
+    def test_docs_only_edit_of_skill_with_suite_publishes_without_running_it(self):
+        (self.skill / 'SKILL.md').write_text('---\nname: coded\n---\nedited\n')
+        (self.skill / 'references').mkdir()
+        (self.skill / 'references/topic.md').write_text('new reference\n')
+        self.commit()
+        started = time.monotonic()
+        result = self.push()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('doc-fast-path: skills/testing/coded', result.stdout)
+        self.assertIn('0 suites', result.stdout)
+        self.assertNotIn('coded suite ran', result.stdout)
+        self.assertEqual(self.tip(), self.git('rev-parse', 'HEAD').stdout.strip())
+        self.assertLess(time.monotonic() - started, 45)
+
+    def test_code_path_in_the_same_range_still_runs_the_suite(self):
+        (self.skill / 'SKILL.md').write_text('---\nname: coded\n---\nedited\n')
+        self.commit()
+        (self.skill / 'scripts/helper.py').write_text('VALUE = 2\n')
+        self.commit()
+        result = self.push()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('coded suite ran', result.stdout)
+        self.assertEqual(self.tip(), self.base)
+
+    def test_docs_only_edit_still_runs_a_suite_that_reads_documents(self):
+        (self.reader / 'SKILL.md').write_text('---\nname: reader\n---\nedited\n')
+        self.commit()
+        result = self.push()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('reader suite ran', result.stdout)
+        self.assertEqual(self.tip(), self.base)
+
+    def test_executable_document_keeps_the_full_selection(self):
+        (self.skill / 'SKILL.md').chmod(0o755)
+        self.commit()
+        result = self.push()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('not a regular document', result.stdout)
+        self.assertIn('coded suite ran', result.stdout)
+        self.assertEqual(self.tip(), self.base)
+
+
+class DocOnlyPaths(unittest.TestCase):
+    def setUp(self):
+        self.mod = runpy.run_path(str(ROOT / 'scripts/ci-plugin-suites'))
+
+    def test_only_skill_markdown_documents_qualify(self):
+        doc_only = self.mod['doc_only']
+        for path in ('skills/cat/n/SKILL.md', 'skills/cat/n/references/a.md',
+                     'skills/cat/n/templates/deep/b.md', 'skills/cat/n/assets/c.md', 'skills/n/references/d.md'):
+            self.assertTrue(doc_only(path), path)
+        for path in ('skills/cat/n/scripts/SKILL.md', 'skills/cat/n/tests/references/a.md',
+                     'skills/cat/n/references/test_doctest.md', 'skills/cat/n/references/conftest.md',
+                     'skills/cat/n/references/a.py', 'skills/cat/n/references/a.json',
+                     'skills/cat/n/references/a.txt', 'skills/cat/n/lifecycle.md', 'skills/cat/n/skill.MD',
+                     'skills/cat/n/.hidden/SKILL.md', 'plugins/p/SKILL.md', 'plugins/p/references/a.md',
+                     'scripts/pre-push-suites', 'skills/cat/n/plugins/references/a.md'):
+            self.assertFalse(doc_only(path), path)
+
+    def test_ci_selection_never_uses_the_fast_path(self):
+        workflow = (ROOT / '.github/workflows/plugin-suites.yml').read_text()
+        self.assertNotIn('--doc-fast-path', workflow)
+        self.assertIn('--doc-fast-path', (ROOT / 'scripts/pre-push-suites').read_text())
 
 
 class GateEdges(unittest.TestCase):

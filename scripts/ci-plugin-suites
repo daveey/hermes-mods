@@ -19,6 +19,14 @@ Suite names and dirs come from `scripts/test-all --list` (the source of truth). 
     `plugins.<n_>`, `"plugins" / "<n>"`), repeated until nothing new is added: coach imports ask-gate, so
     an ask-gate change runs coach too.
 tests/ and repo-guards are never added as dependents: repo-guards.yml runs tests/ on every push and PR.
+
+  scripts/ci-plugin-suites select --base <sha> --head <sha> --doc-fast-path
+      Push gate only (.githooks/pre-push via scripts/pre-push-suites); CI never passes it, so CI still runs the
+      full selection after the push. When EVERY path in the range is a skill document (<skill>/SKILL.md, or a
+      .md file below references/, templates/ or assets/; regular non-executable blob at head, not under
+      scripts/ or tests/, not named test*/conftest*), a skill suite that owns changed documents is dropped unless
+      any of its non-markdown files can read documents (mentions `.md`, `SKILL`, references/templates/assets).
+      Dependent suites always stay. One code, config, executable or unknown path keeps the full selection.
 """
 from __future__ import annotations
 
@@ -85,6 +93,68 @@ def suite_text(root: Path, suite: str) -> str:
     return "\n".join(texts)
 
 
+def owner_of(path: str, suites: list[str]) -> str | None:
+    owned = sorted((s for s in suites if s not in REPO_WIDE), key=len, reverse=True)
+    owner = next((s for s in owned if path.startswith(s + "/")), None)
+    if owner is None and path.startswith("desktop-plugins/"):
+        cand = "plugins/" + path.split("/")[1]
+        owner = cand if cand in suites else None
+    return owner
+
+
+DOC_DIRS = {"references", "templates", "assets"}
+CODE_DIRS = {"scripts", "tests", "plugins", "node_modules", "__pycache__"}
+# Any of these in a suite's non-markdown file means it may read skill documents: keep it.
+READS_DOCS = re.compile(r"\.md|SKILL|\b(?:references|templates|assets)\b")
+
+
+def doc_only(path: str) -> bool:
+    """A skill document no test runner executes: <skill>/SKILL.md, or a .md below references/templates/assets."""
+    parts = path.split("/")
+    name = parts[-1]
+    if (len(parts) < 3 or parts[0] != "skills" or any(not p or p.startswith(".") for p in parts)
+            or CODE_DIRS & set(parts) or not name.endswith(".md")
+            or name.lower().startswith(("test", "conftest"))):
+        return False
+    return name == "SKILL.md" or bool(DOC_DIRS & set(parts[2:-1]))
+
+
+def suite_code_text(root: Path, suite: str) -> str:
+    """Every non-markdown file of the suite (code, fixtures, runner config), not only Python."""
+    texts = []
+    for p in sorted((root / suite).rglob("*")):
+        if p.suffix != ".md" and p.is_file() and not {"node_modules", "__pycache__", ".git"} & set(p.parts):
+            try:
+                texts.append(p.read_text(errors="replace"))
+            except OSError:
+                pass
+    return "\n".join(texts)
+
+
+def doc_fast_path(root: Path, suites: list[str], paths: list[str] | None, head: str,
+                  selected: list[str]) -> tuple[list[str], list[str]]:
+    """Push-gate filter: drop owning skill suites that cannot read the documents a docs-only range changed."""
+    if not paths or not all(doc_only(p) for p in paths):
+        return selected, []
+    for path in paths:
+        entry = subprocess.run(["git", "-C", str(root), "ls-tree", head, "--", path],
+                               check=True, capture_output=True, text=True).stdout
+        if entry and not entry.startswith("100644 blob "):
+            return selected, [f"doc-fast-path: {path}: not a regular document at head: full selection"]
+    keep, reasons = [], []
+    for suite in selected:
+        docs = [p for p in paths if owner_of(p, suites) == suite]
+        if not docs or not suite.startswith("skills/"):
+            keep.append(suite)
+        elif READS_DOCS.search(suite_code_text(root, suite)):
+            keep.append(suite)
+            reasons.append(f"doc-fast-path: {suite}: its files may read documents: kept")
+        else:
+            reasons.append(f"doc-fast-path: {suite}: documents only ({', '.join(docs)}) and no suite file "
+                           "reads documents: skipped at push (CI still runs it)")
+    return keep, reasons
+
+
 def select(root: Path, suites: list[str], paths: list[str] | None) -> tuple[list[str], list[str]]:
     """(selected suites in --list order, reasons)."""
     if paths is None:
@@ -95,10 +165,7 @@ def select(root: Path, suites: list[str], paths: list[str] | None) -> tuple[list
             return suites, [f"{path}: shared runner/helper changed: every suite"]
     owned = sorted((s for s in suites if s not in REPO_WIDE), key=len, reverse=True)
     for path in paths:
-        owner = next((s for s in owned if path.startswith(s + "/")), None)
-        if owner is None and path.startswith("desktop-plugins/"):
-            cand = "plugins/" + path.split("/")[1]
-            owner = cand if cand in suites else None
+        owner = owner_of(path, suites)
         if owner and owner not in picked:
             picked.add(owner)
             reasons.append(f"{path} -> {owner}")
@@ -161,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--base")
     sp.add_argument("--head", default="HEAD")
     sp.add_argument("--root", default=str(ROOT), help=argparse.SUPPRESS)
+    sp.add_argument("--doc-fast-path", action="store_true", help="push gate only; see module docstring")
     sm = sub.add_parser("summary")
     sm.add_argument("results")
     a = ap.parse_args(argv)
@@ -171,7 +239,11 @@ def main(argv: list[str] | None = None) -> int:
     if a.all:
         chosen, why = suites, ["--all: every suite"]
     else:
-        chosen, why = select(root, suites, changed_paths(root, a.base, a.head))
+        paths = changed_paths(root, a.base, a.head)
+        chosen, why = select(root, suites, paths)
+        if a.doc_fast_path:
+            chosen, fast = doc_fast_path(root, suites, paths, a.head, chosen)
+            why += fast
     for line in why:
         print("select: " + line, file=sys.stderr)
     print(f"select: {len(chosen)} of {len(suites)} suites", file=sys.stderr)
