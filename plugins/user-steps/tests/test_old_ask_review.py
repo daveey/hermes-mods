@@ -70,7 +70,10 @@ class Board:
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
+    # These tests cover the local-card route; the hub's pool route is test_producer_hub_route.py. Pin it so the
+    # suite does not depend on which gateway runs it (on the hub remote_home() is True).
+    monkeypatch.setattr(sw, 'remote_home', lambda: False)
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
     db = state_db(tmp_path / 'state.db', [('chat-1', 'Pricing chat')],
                   [('chat-1', 'user', NOW - 80 * H), ('chat-1', 'assistant', NOW - 79 * H)])
