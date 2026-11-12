@@ -1296,6 +1296,60 @@ def consent_relay(reply: str) -> Optional[str]:
     return " ".join(text[max(0, m.start() - 40):m.end() + 40].split()) if m else None
 
 
+# ---- command_copy_relay: a command to paste into another Hermes chat after run_in_user_terminal refused -------------
+# (self-heal agent-4a7a452688: on a non-owner surface the tool refused, and the reply then told the user to "open a new
+# Hermes chat ... and send: Use run_in_user_terminal to run `python3 script.py`". The refusal allows only a plain
+# statement that the owner must ask from their own chat; it forbids handing the command over as something to paste.)
+_CC_CHAT_RE = re.compile(
+    r"\b(?:open|start|begin|use|go\s+to|in|into|from|to)\s+(?:a|an|another|your|the)\s+"
+    r"(?:(?:new|fresh|existing|own|different|separate|other)\s+)*(?:Hermes\s+)?(?:chat|session|conversation)\b", re.I)
+# What the user is told to do there, then the payload: in the same sentence (a colon or paragraph break is not one).
+_CC_VERB_RE = re.compile(r"\b(?:paste|send|run|type|enter|(?:ask|tell)\s+(?:it|Hermes)\s+to|use)\b", re.I)
+_CC_COMMAND_RE = re.compile(r"\brun_in_user_terminal\b|`[^`\n]{2,}`|\b[\w./-]+\.(?:py|sh)\b", re.I)
+_CC_SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+# A report or a prohibition ("my earlier reply told you to", "do not ask them to"), not an instruction.
+_CC_NOT_ASK_RE = re.compile(
+    r"(?:\bnot\b|\bnever\b|n't\b|\bwithout\b|\binstead\s+of\b|\bstop\b|\bwrong\b|\bearlier\b|\bprevious(?:ly)?\b|"
+    r"\b(?:told|said|asked|wrote|read|tells|says)\b|\bshould\s+not\b|\bmust\s+not\b)[^.\n]{0,60}$", re.I)
+COMMAND_COPY_NUDGE_OWNER = (
+    "[coach] command_copy_relay: your message tells the user to open or use another Hermes chat and hands them a "
+    "command to paste (\"{evidence}\"). Never hand over a command to run elsewhere. If this chat is the owner's own "
+    "(Desktop, CLI, TUI, API), call run_in_user_terminal yourself now. If the tool refused (the refusal names the "
+    "surface), that refusal stands: say in plain language that this needs the owner to ask from their own Hermes "
+    "chat, naming the goal only, with no command, script path or tool name to copy.")
+COMMAND_COPY_NUDGE_WORKER = (
+    "[coach] command_copy_relay: your message tells the user to open another Hermes chat and paste a command "
+    "(\"{evidence}\"). The run_in_user_terminal refusal stands on this worker/non-owner surface: do not hand over "
+    "the command and never ask the user to inject it into a chat. If the user must act, call kanban_block with a "
+    "human_request describing the needed step and its context in plain language (what is blocked, why only the "
+    "owner can do it), with no command, script path or tool name to copy. Otherwise drop the step.")
+
+
+def command_copy_relay(reply: str) -> Optional[str]:
+    """The phrase when the reply tells the user to open/use another Hermes chat AND supplies a command or
+    run_in_user_terminal invocation to paste there, else None. Reports and prohibitions of an old
+    ask pass; plain "ask from your own chat" without a command passes."""
+    text = reply or ""
+    for m in _CC_CHAT_RE.finditer(text):
+        before = text[max(0, m.start() - 80):m.start()].rsplit("\n", 1)[-1]
+        if _CC_NOT_ASK_RE.search(before):
+            continue
+        tail = text[m.end():m.end() + 500]
+        v = _CC_VERB_RE.search(tail)
+        if not v or _CC_SENTENCE_END.search(tail[:v.start()]):
+            continue  # no transfer verb in this sentence ("open a new chat for the next topic")
+        rest = tail[v.end():]
+        c = _CC_COMMAND_RE.search(rest)
+        if c and not _CC_SENTENCE_END.search(rest[:c.start()]):  # the payload belongs to that same instruction
+            return " ".join(text[max(0, m.start() - 20):m.end() + v.end() + c.end() + 20].split())
+    return None
+
+
+def command_copy_nudge(evidence: str, user_ask: str = "") -> str:
+    tmpl = COMMAND_COPY_NUDGE_WORKER if KANBAN_PROMPT_RE.match(user_ask or "") else COMMAND_COPY_NUDGE_OWNER
+    return tmpl.format(evidence=evidence[:160])
+
+
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
          "laptop_job", "skipped_live")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
@@ -2686,6 +2740,9 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
     phrase = consent_relay(reply)
     if phrase:
         return {"p": 1.0, "resolved": False, "evidence": phrase, "judged": False, "src": "consent_relay"}
+    phrase = command_copy_relay(reply)
+    if phrase:
+        return {"p": 1.0, "resolved": False, "evidence": phrase, "judged": False, "src": "command_copy_relay"}
     if "handoff" not in prefilter(reply):
         return {"p": 0.0, "resolved": True, "evidence": "no handoff language left", "judged": False}
     try:
@@ -2862,6 +2919,11 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "handoff", "p": 1.0, "evidence": phrase, "reason": "consent_relay",
                     "verdict": {"handoff": 1.0, "handoff_src": "consent_relay", "evidence": phrase},
                     "nudge": CONSENT_RELAY_NUDGE.format(evidence=phrase[:160])}
+        phrase = command_copy_relay(reply)
+        if phrase:  # deterministic: a command to paste into another Hermes chat after a refusal (agent-4a7a452688)
+            return {"rule": "handoff", "p": 1.0, "evidence": phrase, "reason": "command_copy_relay",
+                    "verdict": {"handoff": 1.0, "handoff_src": "command_copy_relay", "evidence": phrase},
+                    "nudge": command_copy_nudge(phrase, user_ask)}
     if not only or "credit_ask" in only:
         phrase = credit_ask(reply, tool_log)
         if phrase:  # deterministic: asking the user for money while the account pool sat unused
@@ -3100,6 +3162,10 @@ def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[
     if phrase:
         return {"p": 1.0, "evidence": phrase[:200], "src": "consent_relay",
                 "nudge": CONSENT_RELAY_NUDGE.format(evidence=phrase[:160])}
+    phrase = command_copy_relay(text)
+    if phrase:
+        return {"p": 1.0, "evidence": phrase[:200], "src": "command_copy_relay",
+                "nudge": COMMAND_COPY_NUDGE_WORKER.format(evidence=phrase[:160])}
     msg = ("[The agent is about to block its Kanban card on the user with this ask; nothing else will reach the "
            "user this turn.]\n" + (text or ""))
     try:
