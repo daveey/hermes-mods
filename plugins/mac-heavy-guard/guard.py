@@ -125,13 +125,54 @@ def _drop_fd_prefixes(text: str) -> str:
     return "".join(out)
 
 
+_QUOTE_MASK = {"<": "\ue03c", ">": "\ue03e"}
+_QUOTE_UNMASK = str.maketrans({v: k for k, v in _QUOTE_MASK.items()})
+
+
+class _Quoted(str):
+    """A word whose `<`/`>` were quoted or escaped (`'>>'`, `"2>x"`, `\\>`): an argument, never a redirect."""
+
+
+def _mask_quoted_redirects(text: str) -> str:
+    """Mark each quoted or backslash-escaped `<`/`>` so it survives shlex as data: shlex drops the quotes, so
+    `grep -c '>' f` would lex like `grep -c > f`. `text` comes back unchanged when its quotes do not balance."""
+    out, quote, i, n = [], "", 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(c + _QUOTE_MASK.get(text[i + 1], text[i + 1]))
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+                out.append(c)
+            else:
+                out.append(_QUOTE_MASK.get(c, c))
+        elif c == "\\" and i + 1 < n:
+            out.append(_QUOTE_MASK.get(text[i + 1]) or text[i:i + 2])
+            i += 2
+            continue
+        else:
+            if c in "'\"":
+                quote = c
+            out.append(c)
+        i += 1
+    return text if quote else "".join(out)
+
+
+def _unmask_quoted(tokens: list) -> list:
+    """Tokens lexed from `_mask_quoted_redirects` text, each word that held a quoted `<`/`>` as `_Quoted`."""
+    return [_Quoted(t.translate(_QUOTE_UNMASK)) if any(m in t for m in _QUOTE_MASK.values()) else t for t in tokens]
+
+
 def _drop_redirects(tokens: list[str]) -> list[str]:
     """Drop each redirect operator and the word after it (target, fd or heredoc tag) from tokens lexed with `<>` as
     punctuation. `<(`/`>(` (process substitution) stays a command boundary."""
     out: list[str] = []
     skip = False
     for t in tokens:
-        if t and set(t) <= set(";&|()<>\n") and set(t) & set("<>"):
+        if t and set(t) <= set(";&|()<>\n") and set(t) & set("<>") and not isinstance(t, _Quoted):
             for part in _REDIR_PART.findall(t):
                 if part.endswith("("):
                     out.append("(")
@@ -155,13 +196,13 @@ def _command_tokens(text: str) -> Optional[list[str]]:
     `pytest` with a test path `2>` or `2>/dev/null` (that hid whole-suite runs)."""
     if _tokens(text) is None:
         return None
-    lex = shlex.shlex(_drop_fd_prefixes(_strip_comments(text.replace("\\\n", " "))), posix=True,
-                      punctuation_chars=";&|()<>\n")
+    lex = shlex.shlex(_mask_quoted_redirects(_drop_fd_prefixes(_strip_comments(text.replace("\\\n", " ")))),
+                      posix=True, punctuation_chars=";&|()<>\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     lex.commenters = ""
     try:
-        return _drop_redirects(list(lex))
+        return _drop_redirects(_unmask_quoted(list(lex)))
     except ValueError:
         return None
 

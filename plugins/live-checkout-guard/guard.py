@@ -189,15 +189,58 @@ def _drop_fd_prefixes(cmd: str) -> str:
     return "".join(out)
 
 
+_QUOTE_MASK = {"<": "\ue03c", ">": "\ue03e"}
+_QUOTE_UNMASK = str.maketrans({v: k for k, v in _QUOTE_MASK.items()})
+
+
+class _Quoted(str):
+    """A word whose `<`/`>` were quoted or escaped (`'>>'`, `"2>x"`, `\\>`): an argument, never a redirect."""
+
+
+def _mask_quoted_redirects(cmd: str) -> str:
+    """Mark each quoted or backslash-escaped `<`/`>` so it survives shlex as data.
+
+    shlex drops the quotes, so `grep -c '>' README.md` lexes exactly like `grep -c > README.md` and README.md
+    read as a redirect target. Returns `cmd` unchanged when its quotes do not balance (shlex then fails and the
+    caller's fallback judges the raw text, as before)."""
+    out, quote, i, n = [], "", 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(c + _QUOTE_MASK.get(cmd[i + 1], cmd[i + 1]))
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+                out.append(c)
+            else:
+                out.append(_QUOTE_MASK.get(c, c))
+        elif c == "\\" and i + 1 < n:
+            out.append(_QUOTE_MASK.get(cmd[i + 1]) or cmd[i:i + 2])
+            i += 2
+            continue
+        else:
+            if c in "'\"":
+                quote = c
+            out.append(c)
+        i += 1
+    return cmd if quote else "".join(out)
+
+
+def _unmask_quoted(toks: list[str]) -> list[str]:
+    return [_Quoted(t.translate(_QUOTE_UNMASK)) if any(m in t for m in _QUOTE_MASK.values()) else t for t in toks]
+
+
 def _tokens(cmd: str) -> list[str]:
     cmd = cmd.replace("\r", "")
     cmd = re.sub(r"\n", " ; ", cmd)  # heredoc bodies get scanned as commands too (documented over-approximation)
     cmd = _drop_fd_prefixes(cmd)
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(_mask_quoted_redirects(cmd), posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         lex.commenters = ""
-        return list(lex)
+        return _unmask_quoted(list(lex))
     except ValueError:
         return cmd.split()
 
@@ -217,11 +260,11 @@ def _segments(toks: list[str]) -> list[list[str]]:
 
 
 def _redirect_targets(seg: list[str]) -> tuple[list[str], list[str]]:
-    """Split a segment into (words, redirect targets that are written)."""
+    """Split a segment into (words, redirect targets that are written). A quoted `'>'` is a word (`_Quoted`)."""
     words, targets, i = [], [], 0
     while i < len(seg):
         t = seg[i]
-        m = re.match(r"^(\d*)(&>>?|>&|>\||>>?)(.*)$", t)
+        m = None if isinstance(t, _Quoted) else re.match(r"^(\d*)(&>>?|>&|>\||>>?)(.*)$", t)
         if m and not t.startswith("<"):
             op, rest = m.group(2), m.group(3)
             if not rest and i + 1 < len(seg):
@@ -231,9 +274,9 @@ def _redirect_targets(seg: list[str]) -> tuple[list[str], list[str]]:
                 pass
             elif rest:
                 targets.append(rest)
-        elif re.match(r"^\d*<", t) and not t.startswith("<<"):
-            if re.match(r"^\d*<$", t):
-                i += 1  # input redirect target: read only
+        elif not isinstance(t, _Quoted) and re.match(r"^\d*<", t) and not t.startswith("<<"):
+            if re.fullmatch(r"\d*<&?", t):
+                i += 1  # input redirect target (read only) or input-dup fd (`2<&1`, `<&-`): not an operand
         else:
             words.append(t)
         i += 1

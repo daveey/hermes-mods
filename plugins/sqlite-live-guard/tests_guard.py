@@ -604,3 +604,23 @@ def test_redirect_is_not_an_operand(cmd):
                                  "rm -f /tmp/x.db 2>/dev/null", "sqlite3 ~/.hermes/state.db 'select 1' 2>/dev/null"])
 def test_redirect_controls_allowed(cmd):
     assert not blocked("terminal", command=cmd), cmd
+
+
+# A quoted `<`/`>` is an argument, not a redirect: `grep -c '>' ~/.hermes/state.db` was refused as a `>` redirect
+# onto the db, and `rm -f '>' ~/.hermes/kanban.db` was judged by that phantom redirect instead of as an rm.
+@pytest.mark.parametrize("cmd", ["grep -c '>' ~/.hermes/state.db", 'grep -c ">>" ~/.hermes/kanban.db',
+                                 "grep -c \\> ~/.hermes/state.db", "cp ~/.hermes/state.db /tmp/b.db 2<&1",
+                                 "cp ~/.hermes/state.db /tmp/b.db <&-"])
+def test_quoted_redirect_and_input_dup_allowed(cmd):
+    assert not blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", ["rm -f '>' ~/.hermes/kanban.db", "echo '>' > ~/.hermes/state.db",
+                                 "cp /tmp/b.db ~/.hermes/state.db 2<&1", "cp /tmp/b.db ~/.hermes/state.db <&-"])
+def test_quoted_redirect_and_input_dup_refused(cmd):
+    assert blocked("terminal", command=cmd), cmd
+
+
+def test_quoted_redirect_is_an_rm_operand():
+    why = plugin.guard.check_shell("rm -f '>' ~/.hermes/kanban.db")
+    assert why == "`rm` would delete or truncate live database file ~/.hermes/kanban.db"

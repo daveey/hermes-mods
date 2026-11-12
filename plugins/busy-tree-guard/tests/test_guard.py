@@ -200,6 +200,20 @@ def test_fd_prefix_versus_spaced_digit_operand(env):
                            task_id=TASK), cmd
 
 
+# A quoted `<`/`>` is an argument, not a redirect: `grep -c '>' f` in a busy tree read `f` as a write, and
+# `echo '>' > <tree>/f` from elsewhere wrote `<cwd>/>` instead of `<tree>/f`. An input dup has no file operand.
+def test_quoted_redirect_and_input_dup(env):
+    env["reg"].add("python -m pytest", env["fix2"])
+    for cmd in ("grep -c '>' retention_policy.py", 'grep -rn ">>" .', "grep -c \\> retention_policy.py",
+                "mkdir -p /tmp/x 2<&1", "touch /tmp/x <&-", "cat retention_policy.py 2<&1 | grep -c '<'"):
+        assert env["hook"](tool_name="terminal", args={"workdir": str(env["fix2"]), "command": cmd},
+                           task_id=TASK) is None, cmd
+    for cmd in (f"echo '>' > {env['fix2']}/retention_policy.py", f"echo \">>\" >> {env['fix2']}/retention_policy.py",
+                f"rm -f {env['fix2']}/retention_policy.py 2<&1"):
+        assert env["hook"](tool_name="terminal", args={"workdir": str(env["other"]), "command": cmd},
+                           task_id=TASK), cmd
+
+
 def test_cd_resolves_pwd_test_argument(env):
     child = _repo(env["other"] / "nested")
     env["reg"].add(f"cd {env['other']} && bash t.sh $PWD/nested", env["fix2"])

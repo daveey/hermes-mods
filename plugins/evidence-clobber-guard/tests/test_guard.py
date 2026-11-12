@@ -149,3 +149,14 @@ def test_fd_prefix_versus_spaced_digit_operand(env):
     for cmd in ("echo x | tee 2 > /dev/null", "python3 mutate.py 2>mutation-v2.log",
                 "( python3 mutate.py 2>&1 ) > mutation-v2.log", "echo x | tee mutation-v2.log 2>/dev/null"):
         assert_blocked(run(env, cmd, env["ev"]), cmd)
+
+
+# A quoted `<`/`>` is an argument, not a redirect: `grep -c '>' mutation-v2.log` was refused as a truncation of the
+# evidence file, and `echo '>' > mutation-v2.log` wrote to a phantom file `>` and passed. An input dup has no target.
+def test_quoted_redirect_and_input_dup(env):
+    for cmd in ("grep -c '>' mutation-v2.log", 'grep -rn ">" .', "grep -c \\> mutation-v2.log",
+                "python3 mutate.py 2<&1 | tee -a mutation-v2.log", "python3 mutate.py <&- >> mutation-v2.log"):
+        assert run(env, cmd, env["ev"]) is None, cmd
+    for cmd in ("echo '>' > mutation-v2.log", 'echo ">>" > mutation-v2.log', "echo x | tee '>' mutation-v2.log",
+                "python3 mutate.py 2<&1 > mutation-v2.log"):
+        assert_blocked(run(env, cmd, env["ev"]), cmd)

@@ -662,3 +662,16 @@ def test_redirect_is_not_a_test_path(cmd):
                                  "pytest tests/test_x.py < /dev/null"])
 def test_redirect_targeted_runs_allowed(cmd):
     assert not blocked("terminal", command=cmd), cmd
+
+
+# A quoted `<`/`>` is a test argument, not a redirect: `pytest '<' tests/test_x.py` dropped `<` and the path after it
+# and read a whole-suite run. An input dup (`2<&1`) is a redirect with no path.
+@pytest.mark.parametrize("cmd", ["pytest '<' tests/test_x.py", "pytest \">>\" tests/test_x.py 2>&1",
+                                 "pytest tests/test_x.py 2<&1", "pytest tests/test_x.py <&- | tail"])
+def test_quoted_redirect_and_input_dup_targeted(cmd):
+    assert not blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", ["pytest 2<&1", "pytest <&- | tail", "pytest -q 0<&- 2>&1 | grep -c '>'"])
+def test_input_dup_whole_suite_still_blocked(cmd):
+    assert blocked("terminal", command=cmd), cmd

@@ -265,6 +265,24 @@ class Systemd(Base):
         # a spaced digit stays an argument, as in the shell
         self.assertEqual([a.get("unit") for a in self.g.extract_actions("systemctl stop a 2 > /dev/null")], ["a", "2"])
 
+    # A quoted `<`/`>` is an argument, not a redirect: `stop '>' my-collector.service` dropped `>` and the unit after
+    # it, so the stop went unchecked. An input dup (`2<&1`, `<&-`) is a redirect with no unit.
+    def test_quoted_redirect_and_input_dup(self):
+        def run(argv, timeout=5):
+            if argv[:2] == ["systemctl", "--user"] and "show" in argv:
+                return 0, f"Environment=FOO=1 HERMES_OWNER_CARD={OWNER}\nWorkingDirectory=/nonexistent\nExecStart=\n"
+            return (1, "") if argv[0] in ("launchctl", "systemctl") else real(argv, timeout)
+        real = self.g.run_cmd
+        self.g.run_cmd = run
+        units = [a.get("unit") for a in self.g.extract_actions("systemctl --user stop '>' my-collector.service")]
+        self.assertEqual(units, [">", "my-collector.service"])
+        self.assertIn(f"card {OWNER}", self.verdict("systemctl --user stop \">\" my-collector.service"))
+        self.assertEqual([a.get("pid") for a in self.g.extract_actions("kill '<' 4242")], [4242])
+        for cmd in ("systemctl --user stop my-collector.service 2<&1",
+                    "systemctl --user stop my-collector.service <&- 0<&-"):
+            self.assertEqual([a.get("unit") for a in self.g.extract_actions(cmd)], ["my-collector.service"], cmd)
+            self.assertIn(f"card {OWNER}", self.verdict(cmd))
+
 
 class ExecuteCode(Base):
     def test_python_subprocess_bootout_refused(self):

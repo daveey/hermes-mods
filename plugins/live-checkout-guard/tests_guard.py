@@ -232,6 +232,44 @@ def test_fd_redirect_controls_still_refuse(env):
         assert blocked(term(c, env.live)), c
 
 
+# A quoted or escaped `<`/`>` is an argument, not a redirect: shlex drops the quotes, so `grep -rn '>>' plugins/`
+# run in the live checkout was refused as "output redirection to plugins/" (2026-11-12 false refusal). An input
+# dup (`2<&1`, `<&-`) has no file operand: `mkdir -p /tmp/x 2<&1` was refused as "mkdir on 1".
+@pytest.mark.parametrize("cmd", ["grep -rn '>>' plugins/", "grep -c '>' README.md", 'grep -rn ">>" plugins/',
+                                 'grep -c ">" README.md', "echo '2>x' > /tmp/q", "grep -rn '2>&1' plugins/",
+                                 "grep -c '<' a.txt", "grep -c \"2<&1\" a.txt", "grep -c \\> a.txt",
+                                 "echo hi '>'a.txt", "echo \"a > b\" '>|' '&>' \">>a.txt\"", "mkdir -p /tmp/x 2<&1",
+                                 "mkdir -p /tmp/x <&-", "touch /tmp/x 0<&- 2<&1", "cat a.txt 2<&1 | grep -c '>'",
+                                 "bash -c \"grep -c '>' a.txt\"", "( grep -rn '>>' plugins/ )"])
+def test_quoted_redirect_and_input_dup_are_not_writes(env, cmd):
+    assert guard.check_shell(cmd, str(env.live)) is None, cmd
+    assert not term(cmd, env.live), cmd
+
+
+def test_quoted_redirect_and_input_dup_controls_still_refuse(env):
+    live = str(env.live)
+    out = "output redirection to plugins/foo.py, inside the live checkout"
+    assert guard.check_shell("rm -f plugins/foo.py 2<&1", live) == "rm on plugins/foo.py, inside the live checkout"
+    assert guard.check_shell("rm -f a.txt <&-", live) == "rm on a.txt, inside the live checkout"
+    for c in ["echo hi > plugins/foo.py", "echo hi >> plugins/foo.py", "echo hi 2>plugins/foo.py",
+              "echo '>' > plugins/foo.py", 'echo ">>" >> plugins/foo.py', "echo '>' 2<&1 >plugins/foo.py",
+              "grep -c '>' a.txt > plugins/foo.py"]:
+        assert guard.check_shell(c, live) == out, c
+    assert guard.check_shell("rm -r /tmp/x 2 > /dev/null", live) == "rm on 2, inside the live checkout"
+    # the quoted word is still an operand of a write command
+    assert guard.check_shell("rm -f '>'", live) == "rm on >, inside the live checkout"
+    assert guard.check_shell("touch 'a>b'", live) == "touch on a>b, inside the live checkout"
+    for c in ["rm -f plugins/foo.py 2<&1", "echo '>' > plugins/foo.py", "echo hi >> plugins/foo.py"]:
+        assert blocked(term(c, env.live)), c
+
+
+def test_quoted_redirect_unbalanced_quote_keeps_fallback(env):
+    # unbalanced quotes: the mask is skipped, shlex fails and the whitespace fallback judges the raw text as before
+    assert guard._mask_quoted_redirects("echo 'a > b") == "echo 'a > b"
+    why = guard.check_shell("echo 'x > a.txt", str(env.live))
+    assert why == "output redirection to a.txt, inside the live checkout"
+
+
 # ---- execute_code ------------------------------------------------------------------------------
 
 def code(src):
