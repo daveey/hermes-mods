@@ -91,7 +91,10 @@ class FleetTests(unittest.TestCase):
         self.config({'broken': {'argv': 'not-a-list'}})
         (self.home / 'state.db').unlink()
         def connect(path):
-            return sqlite3.connect(Path(path).as_uri() + '?mode=ro', uri=True)
+            # Match the reader's fallback: read-only queries, no missing DB creation.
+            conn = sqlite3.connect(Path(path).as_uri() + '?mode=rw', uri=True)
+            conn.execute('PRAGMA query_only=ON')
+            return conn
         out = fleet.render(fleet.inventory(str(self.home), connect))
         self.assertIn('unreachable broken', out)
         self.assertIn('unreachable local sessions', out)
