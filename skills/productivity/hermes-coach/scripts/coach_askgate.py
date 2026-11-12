@@ -649,6 +649,41 @@ def row_is_review_brief(row, data=None):
     return False
 
 
+def _note_body(text):
+    """A turn's card-note text as the weekly run quoted it: the top-level steering envelope unwrapped."""
+    if re.match(r"^\s*\[OUT-OF-BAND USER MESSAGE", text):
+        m = OOB.search(text)
+        if m:
+            return m.group(1)
+    return text
+
+
+def row_is_agent_note(row, data=None):
+    """True when a queued row's turn was a live card note whose every stamped line an agent wrote. The row quote is
+    hit_defect's squashed, clipped copy, so the line-start stamps drop_agent_notes needs are gone from it
+    (agent-c761a2fac9); the session digest's turn near the hit time that starts with the quote still has them."""
+    s, t = row.get("session_id"), row_hit_t(row)
+    q = _ws(str(row.get("quote") or "")).rstrip("…").strip()
+    if not s or t is None or not q or not NOTE_HEADER.match(q):
+        return False
+    for base in coach_data_dirs(data):
+        for f in glob.glob(str(base / "*" / "*" / f"{glob.escape(s)}.json")):
+            try:
+                with open(f) as fh:
+                    d = json.load(fh)
+            except Exception:
+                continue
+            for u in (d.get("user_turns") or []) if isinstance(d, dict) else ():
+                if not isinstance(u, dict) or abs((u.get("t") or 0) - t) > DOIT_NEAR:
+                    continue
+                raw = u.get("text") or ""
+                body = _note_body(raw).strip()
+                if (NOTE_HEADER.match(body) and _ws(re.sub(r"\[Image attached[^\]]*\]", "", body)).startswith(q)
+                        and not clean(raw)):
+                    return True
+    return False
+
+
 def still_flags(row, homes=None, data=None):
     """Why the ask-gate monitor no longer stands by a row it queued earlier, else None. The drain re-checks a queued
     row with today's full verdict, in route_hits' order, so any later rule fix retracts the rows it would not have
@@ -661,6 +696,8 @@ def still_flags(row, homes=None, data=None):
         q = row.get("quote") or ""
         if q and (generated(clean(q)) or (NOTE_HEADER.match(q) and not clean(q))):
             return "monitor no longer flags (ask-gate): quote is a generated prompt, not David"
+        if row_is_agent_note(row, data):
+            return "monitor no longer flags (ask-gate): card note written by an agent, not David"
         if row_is_review_brief(row, data):
             return "monitor no longer flags (ask-gate): one-shot review brief, not a correction"
         if row_is_doit(row, data):

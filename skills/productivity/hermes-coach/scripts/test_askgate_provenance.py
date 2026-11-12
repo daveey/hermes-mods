@@ -206,6 +206,51 @@ class InboxDoit(unittest.TestCase):
             self.assertIsNone(g.still_flags(real, homes=[home], data=directory))
             self.assertIsNone(g.still_flags(dict(row, session_id='missing'), homes=[home], data=directory))
 
+    # agent-c761a2fac9: a row queued while AGENT_STAMP missed "- Subagent:" was filed at drain, because still_flags
+    # re-checked hit_defect's squashed, clipped quote, where the line-start stamp no longer exists.
+    SUBAGENT_NOTE = ("New note on your kanban task from the operator (delivered mid-run). "
+                     "Take it into account for the work you're doing right now:\n"
+                     "- Subagent: Close CI coverage gap at 03:44 UTC: The coverage job is red on main.\n"
+                     "Do not edit validate.yml yourself; hand the workflow change to the owner card and "
+                     "finish the remaining test fixtures, then report back with the run link.")
+
+    def _queued(self, text, t=1000):
+        """The real queue path: a weekly hit on the full turn -> hit_defect -> the row route_hits stores."""
+        h = {'t': t, 'session': 's', 'host': 'host', 'class': g.ASK_CLASS, 'pattern': 'do-it-yourself',
+             'quote': text}
+        m = g.hit_defect(h)
+        return {'monitor': 'ask-gate', 'session_id': m['session_id'], 'quote': m['quote'], 'hit_t': h['t']}
+
+    def _drain(self, text, quoted=None):
+        import json, tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            p = Path(directory) / 'host' / 'default'
+            p.mkdir(parents=True)
+            (p / 's.json').write_text(json.dumps({'id': 's', 'source': 'desktop', 'user_turns': [
+                {'t': 1000, 'text': text}]}))
+            home = Path(directory) / 'home'
+            home.mkdir()
+            return g.still_flags(self._queued(quoted or text), homes=[home], data=directory)
+
+    def test_still_flags_withdraws_a_queued_agent_note_row(self):
+        self.assertIsNone(g.classify(g.clean(self.SUBAGENT_NOTE)))  # today's rules: not David's words
+        self.assertIn('agent', self._drain(self.SUBAGENT_NOTE) or '')
+        wrapped = '[OUT-OF-BAND USER MESSAGE — steering]\n' + self.SUBAGENT_NOTE + '\n[/OUT-OF-BAND USER MESSAGE]'
+        # The weekly run quoted clean(turn): the envelope was already unwrapped when the row was queued.
+        self.assertIn('agent', self._drain(wrapped, quoted=self.SUBAGENT_NOTE) or '')
+
+    def test_still_flags_keeps_mixed_and_unstamped_note_rows(self):
+        mixed = self.SUBAGENT_NOTE + "\n- default (another session) at 03:50 UTC: do it yourself"
+        self.assertIsNone(self._drain(mixed))
+        legacy = ("New note on your kanban task from the operator (delivered mid-run).\n"
+                  "- operator: do it yourself")
+        self.assertIsNone(self._drain(legacy))
+
+    def test_still_flags_needs_the_digest_turn_for_an_agent_note(self):
+        """No digest turn matching the quote (other text at that time) -> no positive evidence -> row stays."""
+        self.assertIsNone(self._drain('do it yourself', quoted=self.SUBAGENT_NOTE))
+
 
 def runners_brief():
     """The real opener the runners plugin writes into a 'Repair runner' chat (plugins/runners/repairs.py)."""
