@@ -153,7 +153,8 @@ export function chipObservation(chip, nowSec, { sdk = observationSdk(), sourceCl
   const candidates = split.work.filter(r => {
     const id = obsOwn(r, 'identity')
     const kind = chip.kind === 'bg' ? 'process' : chip.kind === 'sub' ? 'subagent' : 'card'
-    if (obsOwn(id, 'kind') !== kind || obsOwn(id, 'work_id') !== chip.id) return false
+    // A sub-agent's canonical work id is its child session id (never the registry/delegation id).
+    if (obsOwn(id, 'kind') !== kind || obsOwn(id, 'work_id') !== (chip.kind === 'sub' ? chip.workId : chip.id)) return false
 
     for (const [k, mine] of [['board', chip.board], ['profile', chip.profile], ['gateway', chip.gateway]]) {
       const theirs = obsOwn(id, k)
