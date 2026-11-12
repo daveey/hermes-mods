@@ -117,11 +117,12 @@ Test successful-probe recovery through select → persisted auth row → fresh p
 
 ### 3e. Revoked-token burst leaves false quota walls
 
-The symptom is many cards crashing within a minute or two on several hosts with `HTTP 401: OAuth access token has been revoked`, while every hub account answers `/api/oauth/profile`; a Mac's chat turns and notice replays fail meanwhile with `Subscription OAuth credential is unavailable; no selected pool entry`. The workers are holding hub-minted rows that the hub's refresh already rotated, and they only pull new rows on their own timer.
+The symptom is many cards crashing within a minute or two on several hosts with `HTTP 401: OAuth access token has been revoked`, while every hub account answers `/api/oauth/profile`; a Mac's chat turns and notice replays fail meanwhile with `Subscription OAuth credential is unavailable; no selected pool entry`. The workers are holding hub-minted rows that the hub's refresh already rotated, and they only pull new rows on their own timer. On one host the same false wall shows as that 401 burst in agent.log just before a `SubscriptionQuotaUnavailable`, while `/api/oauth/usage` shows headroom on other accounts: `quota_unavailable()` skips accounts benched for auth and judges the pool from the walled rest.
 1. Force the pull on every worker now: over instance-role SSM, run `sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user start hermes-oauth-relay.service`. Don't wait for the timer.
-2. **Fresh tokens alone don't finish the fix.** Retries during that window fail at start with `SubscriptionQuotaUnavailable … resets at <days away>`, and that failure persists in two places:
+2. **Fresh tokens alone don't finish the fix.** Retries during that window fail at start with `SubscriptionQuotaUnavailable … resets at <days away>`, and that failure persists in three places:
    - an `anthropic` entry in each affected host's `~/.hermes/provider_walls.json`. If another provider is genuinely walled, that host then runs no LLM work at all.
    - a `quota_episode` event on each card, which holds it with the `subscription_quota_reset` guard even after it's unblocked to ready.
+   - a Kanban notice to a chat that failed then with `HTTP 429 … Retrying once at <that reset>`: its only retry is days away. Act now on each card such a notice names.
    Read every gateway's walls file (Macs included), and query each board's DB (the hub's, and each Mac's local `kanban.db`) for `quota_episode` events with provider `anthropic` from the window.
 3. Disprove the wall before removing it:
    - `/api/oauth/usage` should show accounts under 100 on `seven_day`;
@@ -160,7 +161,6 @@ Grep transcripts for 429 `task-notification` storms — each names a dead subage
   find entries sharing an account, check live with `GET https://chatgpt.com/backend-api/wham/usage` (Bearer token +
   `ChatGPT-Account-Id`; `rate_limit.limit_reached`, `primary_window.used_percent`), then `hermes auth remove
   openai-codex <stale id>` and prove with a one-line `hermes chat -q ... --provider openai-codex`. No re-auth needed.
-- **A `SubscriptionQuotaUnavailable … resets at <days away>` can be a false wall.** `quota_unavailable()` skips accounts on a 401/auth bench and judges the pool from the walled ones. A burst of `OAuth access token has been revoked` in agent.log just before the failure, plus usage-endpoint headroom on other accounts, means auth, not quota. The Kanban `quota_episode` it records then holds the card until that far reset. Check `/api/oauth/usage` per account before believing the reset time.
 - **Grey / "0/N" usage chips (any usage widget) usually mean expired tokens, not no capacity.** The pool only refreshes a token when it selects that entry, and every usage fetcher (core and community plugins alike) is read-only, so idle accounts' ~8h access tokens lapse → state `unknown`. Check `expires_at_ms` in auth.json first; `hermes auth refresh anthropic <n>` fixes it now (model cooldowns survive the refresh). The `oauth-keepalive` user plugin (`~/.hermes/plugins/oauth-keepalive`) prevents recurrence; if chips grey out again, confirm it's enabled (`hermes plugins list`).
 
 - **`hermes auth refresh anthropic` requires a target** when the pool holds more than one credential — pass an index, entry id, or exact label (`hermes auth refresh anthropic 1`); the bare command just prints usage. Loop `for i in 1 2 3 4 5; do hermes auth refresh anthropic $i; done` to refresh all.
