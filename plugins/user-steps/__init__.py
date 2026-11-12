@@ -124,6 +124,63 @@ def _framed(session_id: str) -> bool:
     return core.session_source(session_id) == "desktop"
 
 
+# ---- open-asks index -----------------------------------------------------------------------------------
+
+INDEX_MAX_ENTRIES = 5
+INDEX_TITLE_CHARS = 60
+
+
+def _head_budget() -> int | None:
+    """Chars of an oversized hook context core keeps visible at the head (tools/hook_output_spill.py,
+    hooks.output_spill.preview_head). None when core's spill is unavailable or shows no head."""
+    try:
+        from tools.hook_output_spill import get_spill_config
+        cfg = get_spill_config()
+        if not cfg.get("enabled", True):
+            return None
+        return int(cfg.get("preview_head") or 0) or None
+    except Exception:
+        return None
+
+
+def _age(seconds: float) -> str:
+    m = max(0, int(seconds // 60))
+    if m < 60:
+        return f"{m} min"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} h {m} min"
+    d, h = divmod(h, 24)
+    return f"{d} d {h} h"
+
+
+def _open_asks_index(pending: list, created: dict, *, now: float, budget: int | None) -> str:
+    """One compact line naming every open ask, placed first so core's head/tail spill can't hide it.
+
+    The full note puts a long header and the full request JSON (scope markdown included) first; above
+    hooks.output_spill.max_chars core keeps only ``preview_head`` chars of head, so the ids/titles landed in
+    the hidden middle. Entries are dropped into ``+N more`` until the line fits ``budget``."""
+    if not pending:
+        return ""
+    import json
+
+    def entry(r):
+        title = str(r.get("title") or "")
+        cut = title[:INDEX_TITLE_CHARS] + ("…" if len(title) > INDEX_TITLE_CHARS else "")
+        part = f"{str(r.get('requestId') or '')[:8]} {json.dumps(cut, ensure_ascii=False)} rev {r.get('revision')}"
+        ts = created.get(r.get("requestId"))
+        return part + (f", open {_age(now - float(ts))}" if ts is not None else "")
+
+    entries = [entry(r) for r in pending[:INDEX_MAX_ENTRIES]]
+    while True:
+        more = len(pending) - len(entries)
+        line = (f"[Open asks from this chat ({len(pending)}): " + "; ".join(entries)
+                + (f"; +{more} more" if more and entries else f"+{more} more" if more else "") + "]")
+        if budget is None or len(line) <= budget or not entries:
+            return line
+        entries.pop()
+
+
 # ---- hooks ---------------------------------------------------------------------------------------------
 
 # Runtime-written user rows (Kanban notices, auto-continue): a turn they start was not started by the user.
@@ -184,6 +241,10 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
                 'action_request {"withdraw": {"requestId": "<id>", "reason": "<why>"}} so it leaves the '
                 'user\'s For you queue.]\n'
                 + json.dumps(pending)) if pending else ''
+        if pending:
+            import time
+            created = {r['requestId']: st.created_at(own, r['requestId']) for r in pending}
+            note = _open_asks_index(pending, created, now=time.time(), budget=_head_budget()) + '\n' + note
         incomplete = [r for r in pending if r['kind'] == 'approval' and not r['scope']['complete']]
         if incomplete:
             # Missing plans are agent work: the user has no button for them.
