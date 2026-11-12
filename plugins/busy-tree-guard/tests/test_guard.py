@@ -477,3 +477,39 @@ def test_stored_heredoc_data_allowed_at_hook(env, shape):
     # git commit targets the idle other tree; only the INERT body names the busy tree.
     assert env["hook"](tool_name="terminal", args={"command": command, "workdir": str(env["other"])},
                        task_id=TASK) is None, command
+
+
+# Variables named like shell keywords: an active expansion stays visible, quoted text stays inert.
+def _kw_assigned(name):
+    return "%s=$(cat <<'EOF'\n{c}\nEOF\n)\n" % name
+
+
+KEYWORD_NAME_RUNS = [
+    pytest.param(_kw_assigned("if") + 'eval "$if"', id="eval-dollar-if"),
+    pytest.param(_kw_assigned("if") + 'eval "${{if}}"', id="eval-brace-if"),
+    pytest.param(_kw_assigned("do") + 'bash -c "$do"', id="bash-c-dollar-do"),
+    pytest.param(_kw_assigned("then") + 'bash -c "${{then}}"', id="bash-c-brace-then"),
+]
+KEYWORD_NAME_CONTROLS = [
+    pytest.param(STORED_ASSIGNMENT + 'echo "if $x"', id="echo-if-word"),
+    pytest.param(STORED_ASSIGNMENT + 'echo "do $x; then $x"', id="echo-do-then-words"),
+    pytest.param(_kw_assigned("if") + 'echo "if $if"', id="echo-expands-if-var"),
+]
+
+
+@pytest.mark.parametrize("shape", KEYWORD_NAME_RUNS)
+def test_keyword_named_variable_run_refused_at_hook(env, shape):
+    env["reg"].add("python -m pytest", env["fix2"])
+    command = shape.format(c=f"rm -f {env['fix2']}/retention_policy.py")
+    result = env["hook"](tool_name="terminal", args={"command": command, "workdir": str(env["other"])},
+                         task_id=TASK)
+    assert result and result["action"] == "block", (command, result)
+    assert "busy-tree-guard" in result["message"]
+
+
+@pytest.mark.parametrize("shape", KEYWORD_NAME_CONTROLS)
+def test_keyword_words_in_quotes_stay_allowed_at_hook(env, shape):
+    env["reg"].add("python -m pytest", env["fix2"])
+    command = shape.format(c=f"rm -f {env['fix2']}/retention_policy.py")
+    assert env["hook"](tool_name="terminal", args={"command": command, "workdir": str(env["other"])},
+                       task_id=TASK) is None, command

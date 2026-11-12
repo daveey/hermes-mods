@@ -593,7 +593,7 @@ def _hd_mask(code: str, keep: tuple = ()) -> str:
     """`code` (same length) with what bash does not expand made inert for pattern matching: the text of '...'
     (unless it is one plain path-like word or one of the `keep` paths), backslash pairs, and in "..." (outside a
     `$(...)`) the command separators `;` `&` `|` `(` `{` newline and keywords (`echo "do $x"` is not a loop), so a
-    quoted argument stays one word. `$x` in "..." stays visible, `$x` in '...' or after `\\` does not."""
+    quoted argument stays one word. `$x` in "..." stays visible (even named like a keyword: `"$if"`, `"${do}"`), `$x` in '...' or after `\\` does not."""
     out, i, n, dq, depth = [], 0, len(code), False, 0
     while i < n:
         c = code[i]
@@ -614,7 +614,8 @@ def _hd_mask(code: str, keep: tuple = ()) -> str:
                 out.append(c)
             elif c in ";&|\n({" and not (c == "{" and code[i - 1:i] == "$") and not (c == "(" and code[i - 1:i] == "$"):
                 out.append(" ")
-            elif (m := _HD_DQ_WORD.match(code, i)) and not code[i - 1:i].isalnum():
+            elif (m := _HD_DQ_WORD.match(code, i)) and not code[i - 1:i].isalnum() \
+                    and code[i - 1:i] != "$" and code[i - 2:i] != "${":  # `$if`/`${if}` is a variable, not a keyword
                 out.append("_" * len(m.group()))
                 i += len(m.group())
                 continue
@@ -701,7 +702,7 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
     if "<<" not in text and "#" not in text:
         return text, []
     out, bodies, pending, stack, subs, written, assigned = [], [], [], [], [], [], []
-    n, i, line_start, emitted = len(text), 0, 0, 0  # `emitted`: length of `code` before the current operator
+    n, i, line_start = len(text), 0, 0
 
     def take_bodies(i: int) -> int:
         for delim, strip_tabs, quoted, op_start, nl, openers, at in pending:
