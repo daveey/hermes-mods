@@ -738,6 +738,59 @@ def test_gateway_shutdown_cron_kill_never_files_even_at_threshold(home):
     assert sg.collect_cron(home, cur, NOW + 60, "macbook") == []
 
 
+# Producer-message contract (cron-70b179cf31): the exact last_failure.detail forms core writes with
+# shutdown_interrupted=True. cron/restart_cut.py RESTART_CUT_REASON (+ " (<error>)"), and
+# gateway/run_shutdown.py's mark_running_jobs_interrupted reason. A new core wording must be added here.
+RESTART_CUT = ("Interrupted by a gateway restart before the run finished (CronShutdownInterrupted: Cron job "
+               "'kanban-red-sweep' was stopped: Gateway shutdown interrupted the run)")
+LIFECYCLE_DETAILS = [
+    RESTART_CUT,
+    "Interrupted by a gateway restart before the run finished (interrupted)",  # cron-01cfd2fd26
+    "Interrupted by a gateway restart before the run finished",
+    "Gateway shutdown (post-interrupt) killed the job's tool subprocess before the run finished.",
+]
+
+
+@pytest.mark.parametrize("detail", LIFECYCLE_DETAILS)
+@pytest.mark.parametrize("streak", [0, 5])
+def test_cron_lifecycle_interruption_never_counts_or_files(home, detail, streak):
+    k = "default:a397f7ea6543"
+    cur = {"cron": {k: NOW - 7200}, "cron_fails": {k: [NOW - 7200, NOW - 3600]}}
+    _write_jobs(home, {"id": "a397f7ea6543", "name": "kanban-red-sweep", "last_status": "ok",
+                       "failure_streak": streak, "last_failure": {"at": _iso(NOW - 600), "detail": detail}})
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == []
+    assert cur["cron_fails"][k] == [NOW - 7200, NOW - 3600]  # ordinary history kept, interruption not added
+    assert cur["cron"][k] == pytest.approx(NOW - 600)  # cursor advanced: no re-read next pass
+    assert sg.collect_cron(home, cur, NOW + 60, "hubhost") == []
+
+
+@pytest.mark.parametrize("detail", [
+    "RuntimeError: service restart failed: exit 1",
+    "Interrupted by a gateway restart",  # truncated/near-miss wording is not the producer's form
+    "Script exited with code 1 (Interrupted by a gateway restart before the run finished)",
+    "gateway shutdown (post-interrupt) killed something",
+])
+def test_cron_real_error_mentioning_restart_still_counts(home, detail):
+    k = "default:x"
+    cur = {"cron": {k: NOW - 7200}, "cron_fails": {k: [NOW - 7200, NOW - 3600]}}
+    _write_jobs(home, _cron_job("x", 0, "ok", _iso(NOW - 600), detail))
+    got = sg.collect_cron(home, cur, NOW, "hubhost")
+    assert len(got) == 1 and "3 failures in 24h" in got[0]["details"]
+
+
+def test_cron_mixed_real_failures_and_interruptions(home):
+    cur = {}
+    seq = [("Script exited with code 1", NOW - 9000), (RESTART_CUT, NOW - 7200),
+           ("Script exited with code 1", NOW - 5400), (RESTART_CUT, NOW - 3600)]
+    for detail, t in seq:
+        _write_jobs(home, _cron_job("m", 0, "ok", _iso(t), detail))
+        assert sg.collect_cron(home, cur, t + 300, "hubhost") == []
+    assert len(cur["cron_fails"]["default:m"]) == 2  # only the two real failures
+    _write_jobs(home, _cron_job("m", 0, "ok", _iso(NOW - 600)))
+    got = sg.collect_cron(home, cur, NOW, "hubhost")
+    assert len(got) == 1 and "3 failures in 24h" in got[0]["details"]
+
+
 def test_kanban_cards_failed_twice(home):
     ks = kinds(sg.collect(home, {}, "hubhost", NOW), "kanban")
     assert [s["symptom"].split()[2] for s in ks] == ["t_crash2"]  # once is not enough; self-heal's own cards skip

@@ -990,6 +990,20 @@ def collect_worker(home: Path, cur: dict, now: float, host: str = "") -> List[di
 
 CRON_WINDOW_S = 86400
 
+# The last_failure.detail forms core writes with shutdown_interrupted=True (cron/jobs.py mark_job_run): the
+# owner's own restart/shutdown stopped the run, the job's streak is untouched and the run is rerun once. Anchored
+# on the producers' exact prefixes, never on "restart" anywhere in an error:
+#   cron/restart_cut.py _detail():  RESTART_CUT_REASON, or RESTART_CUT_REASON + " (<run error>)"
+#   gateway/run_shutdown.py:        "Gateway shutdown (<phase>) killed the job's tool subprocess before ..."
+# A new core wording must be added here and to tests/test_signals.py LIFECYCLE_DETAILS (cron-70b179cf31).
+_CRON_RESTART_CUT = "Interrupted by a gateway restart before the run finished"
+_CRON_LIFECYCLE_RE = re.compile(rf"(?:{re.escape(_CRON_RESTART_CUT)}(?:$| \()|Gateway shutdown \()")
+
+
+def cron_lifecycle_interrupt(detail: str) -> bool:
+    """True when a cron last_failure detail is the owner gateway's restart/shutdown cut, not a job failure."""
+    return bool(_CRON_LIFECYCLE_RE.match(detail or ""))
+
 
 def _cron_threshold(h: Path) -> int:
     """cron.failure_nudge_threshold from <home>/config.yaml (core's own streak warning); default 3, 0/bad -> 3."""
@@ -1039,8 +1053,8 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                 continue  # core parked this failure behind a closed provider window (cron.quota_hold): not counted
             name = job.get("name") or job.get("id")
             detail = str(lf.get("detail") or job.get("last_error") or "run failed")
-            if detail.startswith("Gateway shutdown ("):
-                continue  # owner's lifecycle interrupt is never a job defect, even with an old inflated streak
+            if cron_lifecycle_interrupt(detail):
+                continue  # owner's restart/shutdown cut is never a job defect, even with an old inflated streak
             streak = int(job.get("failure_streak") or 0)
             recent = [t for t in fails.get(k, []) if t > at - CRON_WINDOW_S]
             recent.append(at)
