@@ -427,6 +427,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         coach.hint_report(session_id, text)
         if isinstance(text, str) and text.strip() and session_id in wait_turns:
             wait_turns[session_id]["replied"] = True
+            try:  # live_chat_sleep: how fresh the user's last status is
+                wait_turns[session_id]["replied_at"] = _load("long_wait").now()
+            except Exception as exc:
+                log.debug("coach long_wait interim: %s", exc)
 
     def pre_tool_call(tool_name="", args=None, session_id="", **_):
         coach.hint_tool_start(session_id, _.get("tool_call_id"))
@@ -438,7 +442,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         if msg:
             return {"action": "block", "message": msg}
         try:  # one long foreground wait while the live user has had no reply this turn (long_wait.py)
-            msg = _load("long_wait").check(wait_turns, session_id, tool_name, args, store.log)
+            lw = _load("long_wait")
+            msg = lw.check(wait_turns, session_id, tool_name, args, store.log)
+            # ...or no fresh status for a while (live_chat_sleep; a loop with sleep is unbounded)
+            msg = msg or lw.check_stale(wait_turns, session_id, tool_name, args, store.log)
         except Exception as exc:
             log.debug("coach long_wait: %s", exc)
             msg = None

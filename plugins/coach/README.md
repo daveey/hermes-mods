@@ -149,6 +149,15 @@ did not see, and an ask that requests the delay (`wait`, `later`, `after`, `in N
 wait again goes through, logged `long_wait_repeat`. Origin: self-heal agent-f1f8b24e9d (a `sleep 135` "waiting for
 telemetry" after the update had already finished). Tests: `tests/test_agent_channel.py -k long_wait`.
 
+`live_chat_sleep` (same module, `check_stale`) covers what that rule leaves: a foreground `terminal` wait of ≥ 60 s,
+or any loop with `sleep` (unbounded), in a live chat whose last status (interim message, or assistant text in
+`state.db` when that hook lags) is older than 120 s. The message: reply with the status (what is done, what you are
+waiting for, until when), then wait with `terminal(background=true, notify=true)` or a scheduled card and end the
+turn. Same quiet cases; skipped in a turn `long_wait_pending_reply` already held (one redirect per turn); held once
+per turn itself, the repeat logged `live_chat_sleep_repeat`. Origin: self-heal agent-57d0cd6941 / agent-9dd87a311d
+(one early interim line, ~25 tool calls, then a foreground `sleep 200; … ship` after a quota brake, and "why are you
+not answering me"). Tests: `tests/test_live_chat_sleep.py`.
+
 ## Traceback attribution
 
 Bug detection decodes JSON tool envelopes before inspecting frame paths and exception tails.
