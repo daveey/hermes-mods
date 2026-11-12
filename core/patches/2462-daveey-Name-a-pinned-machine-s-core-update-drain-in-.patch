@@ -1,0 +1,318 @@
+From 3ea3e88ece6af6c65cf967020fcfb9b41f44d968 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:49:24 +0000
+Subject: [PATCH] [daveey] Name a pinned machine's core-update drain in create,
+ queue and chat-wait notes
+
+t_01a1cca8ed755919: a MacBook card pinned to hub at 21:49:38 UTC (11-11) landed inside the
+hub's core-update drain (claims stopped 21:48:56, drain hold 21:50:01, claims resumed 22:14:20).
+The create reply said it runs on hub and kanban_show said 'queued, not stuck', so the chat
+archived it at 22:08 as lost. The body's local marker was not the cause (pickup test included).
+
+The origin now reads the target machine's Board registry drain_active/drain_until_ms metrics
+(ignored when the sample is older than 15 min): the create note, kanban_show queue note and the
+chat-wait notice say DRAINING with the announced bound instead of promising a start.
+---
+ hermes_cli/kanban_parent_unclaimed.py         |   5 +
+ hermes_cli/kanban_queue_position.py           |  61 ++++++++-
+ .../test_kanban_draining_machine_pin.py       | 124 ++++++++++++++++++
+ tools/kanban_tools.py                         |   4 +-
+ tools/kanban_tools_placement.py               |  19 +++
+ 5 files changed, 210 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_draining_machine_pin.py
+
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 9439de36e0..d71df57a11 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -51,6 +51,11 @@ def _place(conn, parent_id: str) -> dict[str, Any]:
+ def _queue_words(place: dict[str, Any]) -> str:
+     if place.get("lane") == "worker_pool":
+         return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'})"
++    if place.get("lane") in ("machine", "unplaceable"):
++        # A card that runs on another machine has no local queue place; "queue place unknown" hid a drain or a
++        # hold on that machine from the chat (t_01a1cca8ed755919). [daveey]
++        from hermes_cli import kanban_queue_position as kqp
++        return kqp.headline(place) if place["lane"] == "machine" else str(kqp.describe(place))
+     ahead = place.get("ahead")
+     words = f"{ahead} card(s) ahead of it" if ahead is not None else "queue place unknown"
+     if place.get("running") is not None and place.get("limit") is not None:
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index fd8b74d907..c4016bea1a 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -57,6 +57,28 @@ def _runs_on(conn: sqlite3.Connection, task_id: str) -> Optional[list[str]]:
+     return _parse(row[0]) if row is not None else None
+ 
+ 
++# A drain flag older than this is not evidence: the machine stopped reporting, and a stale flag would hide that.
++DRAIN_SAMPLE_MAX_AGE_S = 15 * 60
++
++
++def draining(entry: Optional[dict[str, Any]], *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
++    """``{}`` or ``{"until_ms": <announced bound>}`` when the machine's latest Board metrics sample (at most
++    :data:`DRAIN_SAMPLE_MAX_AGE_S` old) says a core-update drain holds its dispatcher; None otherwise. [daveey]
++
++    t_01a1cca8ed755919: the hub's dispatcher held every claim for a core-update drain from 13:49 to 14:14 PST
++    (11-11). A MacBook card pinned ``machine:hub`` at 13:49:38 read "queued, not stuck" for 20 min, then was
++    archived as lost. Each machine reports ``drain_active`` (``machine_drain_metrics``) while a drain-hold file
++    exists, so the origin can say why instead."""
++    import time
++    metrics = (entry or {}).get("metrics") or {}
++    at, until = metrics.get("at"), metrics.get("drain_until_ms")
++    if metrics.get("drain_active") != 1 or not isinstance(at, (int, float)):
++        return None
++    if ((time.time() if now is None else now) * 1000 - at) > DRAIN_SAMPLE_MAX_AGE_S * 1000:
++        return None
++    return {"until_ms": int(until)} if isinstance(until, (int, float)) and until > 0 else {}
++
++
+ def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+     """For a card whose ``runs_on`` this machine does not satisfy, on a synced board with a readable machine
+     registry: ``{"lane": "unplaceable", runs_on, missing, machines}`` when no known machine satisfies it (``missing``
+@@ -91,6 +113,12 @@ def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]
+         held = [name for name in fits if (machines.get(name) or {}).get("hold")]
+         if held:  # a held machine imports and leases nothing: the wait has no end until an operator releases it
+             place["held"] = held
++        drains = {name: d for name in fits if (d := draining(machines.get(name))) is not None}
++        if drains:  # a draining machine's dispatcher imports and claims nothing until its drain ends
++            place["draining"] = sorted(drains)
++            until = [d["until_ms"] for d in drains.values() if "until_ms" in d]
++            if until:
++                place["drain_until_ms"] = max(until)
+         return place
+     every = set().union(*carried.values())
+     return {"lane": "unplaceable", "runs_on": labels, "missing": [lb for lb in labels if lb not in every],
+@@ -151,6 +179,32 @@ _NOT_STUCK = ("queued, not stuck: check placement and available capacity first;
+               "Only consider a bounded relative priority bump when below the lane median")
+ 
+ 
++def _all_draining(place: dict[str, Any]) -> bool:
++    return bool(place.get("draining")) and set(place["draining"]) >= set(place.get("machines") or [])
++
++
++def headline(place: dict[str, Any]) -> str:
++    """The wait itself for a ``machine`` lane, without advice: ``describe`` and the chat-wait notice share it."""
++    machines, runs_on = ", ".join(place.get("machines") or []), ", ".join(place.get("runs_on") or [])
++    if _all_draining(place):
++        until = place.get("drain_until_ms")
++        bound = (f"announced bound {_stamp_ms(until)}, not guaranteed" if until else "end time unknown")
++        return (f"waiting for {machines} (runs_on {runs_on}), which is DRAINING for a core update (Board registry "
++                f"metrics; {bound}): its dispatcher imports and claims no cards until the drain ends")
++    words = f"waiting for {machines} (runs_on {runs_on}); this machine cannot lease it"
++    if place.get("draining"):
++        words += f" ({', '.join(place['draining'])} draining for a core update)"
++    return words
++
++
++def _stamp_ms(ms: Any) -> str:
++    from datetime import UTC, datetime
++    try:
++        return datetime.fromtimestamp(int(ms) / 1000, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++    except (TypeError, ValueError, OverflowError, OSError):
++        return "unknown"
++
++
+ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+     """One line for card reads (``kanban_show`` ``queue_note``, ``hermes kanban show``) saying what the card waits
+     for, so "ready, no run" never reads as stuck. [daveey] kanban-7d720d4ab8: a chat saw only a null
+@@ -178,9 +232,12 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+                 f"machine-audit {place['held'][0]}` shows who set it and when). Not started by waiting: re-place it "
+                 "(`hermes kanban move <id> --runs-on <label> --reason ...`) or wait for the release; do not clear "
+                 "a hold to start a card")
++    if lane == "machine" and _all_draining(place):
++        return (headline(place) + ". Not lost and not refused: it starts when the drain ends. If it cannot wait, "
++                "re-place it (`hermes kanban move <id> --runs-on <label> --reason ...`); do not re-create it, "
++                "clear the drain, or run its work outside the dispatcher")
+     if lane == "machine":
+-        return (f"waiting for {', '.join(place.get('machines') or [])} (runs_on "
+-                f"{', '.join(place.get('runs_on') or [])}); this machine cannot lease it. " + _NOT_STUCK)
++        return headline(place) + ". " + _NOT_STUCK
+     if lane == "worker_pool":
+         return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'}). " + _NOT_STUCK
+     ahead = place.get("ahead")
+diff --git a/tests/hermes_cli/test_kanban_draining_machine_pin.py b/tests/hermes_cli/test_kanban_draining_machine_pin.py
+new file mode 100644
+index 0000000000..f09551cb17
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_draining_machine_pin.py
+@@ -0,0 +1,124 @@
++"""A card pinned to a machine that is draining for a core update says so at create and in its queue read. [daveey]
++
++t_01a1cca8ed755919, 11-11 (UTC): a MacBook chat ran ``kanban_create(placement="hub")`` at 21:49:38. The hub's
++dispatcher had claimed its last card at 21:48:56; at 21:50:01 it logged "kanban dispatch held for a core update
++drain" and claimed nothing more until 22:14:20. The create reply said "it runs on hub ... do not re-create it" and
++``kanban_show`` said "queued, not stuck", so the chat archived the card at 22:08 as lost. The control card made the
++same way at 21:46 was claimed at 21:47:13, before the drain. The body's local marker played no part: the marker test
++below passes on core before this fix too, and the hub picks the card up once it is not draining.
++
++Every machine reports ``drain_active`` / ``drain_until_ms`` in its Board registry metrics
++(``machine_drain_metrics``). The origin now reads them, so the create note, the ``kanban_show`` queue note and the
++chat-wait notice name the drain instead of promising a start.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_capability_registry as reg
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_parent_unclaimed as kpu
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, Gateway, _tool_create
++
++MAC = "macbook"
++BODY = "Inspect the Desktop backend's ~/.hermes/state.db and ~/.hermes/logs/gateway.log on the MacBook."
++
++
++@pytest.fixture
++def mac(tmp_path, monkeypatch):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    gw = Gateway(tmp_path, MAC, FakeService(lease_runs=True, machines=MACHINES), monkeypatch, pickup=False)
++    gw.enter()
++    monkeypatch.setattr(reg, "self_gateway", lambda: MAC)
++    yield gw
++    gw.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _registry(**metrics):
++    """The hub (picking up every card, as live) with the given metrics sample beside the MacBook and the rest."""
++    hub = {**MACHINES[HUB], "pickup": "all", "metrics": metrics}
++    others = [entry for name, entry in MACHINES.items() if name != HUB]
++    wn.set_registry_fetch(lambda: {"me": MAC, "machines": [hub, *others]})
++
++
++def _now_ms():
++    return int(time.time() * 1000)
++
++
++def _create():
++    return _tool_create({"title": "Async subagent results", "placement": "hub", "assignee": "default",
++                         "requires": ["terminal", "file", "git"], "body": BODY})
++
++
++def test_create_pinned_to_a_draining_hub_names_the_drain(mac):
++    until = _now_ms() + 20 * 60_000
++    _registry(at=_now_ms(), drain_active=1, drain_until_ms=until)
++    out = _create()
++    assert "error" not in out and out["runs_on"] == ["machine:hub"], out
++    assert "DRAINING for a core update" in out["note"] and "do not re-create it" in out["note"], out["note"]
++    place = kqp.placement(mac.conn, out["task_id"])
++    assert place == {"lane": "machine", "runs_on": ["machine:hub"], "machines": ["hub"], "draining": ["hub"],
++                     "drain_until_ms": until}, place
++    note = kqp.describe(place) or ""
++    assert "DRAINING" in note and "starts when the drain ends" in note, note
++    assert "queued, not stuck" not in note, note
++
++
++def test_chat_wait_notice_names_the_drain_not_an_unknown_queue_place(mac):
++    _registry(at=_now_ms(), drain_active=1)
++    tid = kb.create_task(mac.conn, title="pinned to hub", assignee="default", runs_on=["machine:hub"])
++    words = kpu._queue_words(kqp.placement(mac.conn, tid) or {})
++    assert "DRAINING" in words and "end time unknown" in words and "queue place unknown" not in words, words
++
++
++@pytest.mark.parametrize("metrics", [{"drain_active": 0}, {"drain_active": 1, "stale": True}],
++                         ids=["not_draining", "stale_drain_sample"])
++def test_no_drain_or_a_stale_sample_keeps_the_plain_wait(mac, metrics):
++    at = _now_ms() - (kqp.DRAIN_SAMPLE_MAX_AGE_S + 60) * 1000 if metrics.pop("stale", False) else _now_ms()
++    _registry(at=at, **metrics)
++    out = _create()
++    assert "DRAINING" not in out["note"], out["note"]
++    place = kqp.placement(mac.conn, out["task_id"])
++    assert place == {"lane": "machine", "runs_on": ["machine:hub"], "machines": ["hub"]}, place
++    assert "queued, not stuck" in (kqp.describe(place) or "")
++
++
++def test_local_marker_hub_pin_is_offered_and_claimed_when_the_hub_is_not_draining(tmp_path, monkeypatch):
++    """The original hypothesis, ruled out: a local-marker body does not keep the hub from leasing the card."""
++    service = FakeService(lease_runs=True)
++    monkeypatch.setitem(MACHINES, HUB, {**MACHINES[HUB], "pickup": "all"})
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    origin = Gateway(tmp_path, MAC, service, monkeypatch, pickup=False)
++    hub = Gateway(tmp_path, HUB, service, monkeypatch, pickup="true")
++    try:
++        origin.enter()
++        monkeypatch.setattr(reg, "self_gateway", lambda: MAC)
++        out = _create()
++        assert "error" not in out and out["runs_on"] == ["machine:hub"], out
++        tid = out["task_id"]
++        payload = origin.conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()[0]
++        assert json.loads(payload)["portable_reason"] == "local marker"
++        origin.round()
++        assert tid in service.board("default")["rows"]["tasks"]
++        hub.round()
++        hub.tick()
++        task = kb.get_task(hub.conn, tid)
++        assert task is not None and task.status == "running"
++        assert hub.conn.execute("SELECT lease_holder FROM tasks WHERE id=?", (tid,)).fetchone()[0] == HUB
++    finally:
++        origin.conn.close()
++        hub.conn.close()
++        sync.set_lease_client(None)
++        wn.set_registry_fetch(None)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index e331631981..ed24f26b46 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -25,7 +25,7 @@ from hermes_cli.kanban_capabilities import check_tool_create, declaration_requir
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+                                           _create_session_id, _placement_origin, _placement_refused, _runs_where,
+-                                          _effective_board_args, _origin_enrollment)
++                                          _effective_board_args, _origin_enrollment, _pin_drain_note)
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import (_blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard,
+                                           _wake_check_args, _wake_check_echo)
+@@ -1732,6 +1732,8 @@ def _handle_create(args: dict, **kw) -> str:
+                 extra["placement"] = _machine_placement(pinned_machine, runs_on)
+                 extra["note"] = (f"Created here as {new_tid}; it runs on {pinned_machine} via the board lease "
+                                  f"(runs_on={runs_on}). The pin was honoured: do not re-create it.")
++                if drain := _pin_drain_note(conn, new_tid):  # the target can't claim it yet (t_01a1cca8ed755919)
++                    extra["note"] += " " + drain
+         # Every result says where the card runs (a caller that can't tell re-creates it or never learns it is stranded)
+         extra.update(runs_where=_runs_where(runs_on, pinned_machine, marker_placement),  # + contract advisory [daveey]
+                      **_contract_cli.create_warning_fields(kb.get_task(conn, new_tid)))
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index ba1e7a7959..6de7a61e31 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -149,6 +149,25 @@ def _machine_placement(machine: str, runs_on: list[str]) -> dict:
+     return {"where": "local", "runs_on": runs_on, "machine": machine, "why": why}
+ 
+ 
++def _pin_drain_note(conn, task_id: str):
++    """One sentence when every machine the new card can run on is draining for a core update; else None.
++
++    The create reply promised "it runs on hub" while the hub's dispatcher held all claims for a drain, and the
++    caller archived the card as lost (t_01a1cca8ed755919). Never raises. [daveey]"""
++    try:
++        from hermes_cli import kanban_queue_position as kqp
++        place = kqp.placement(conn, task_id)
++        if place is None or place.get("lane") != "machine" or not place.get("draining"):
++            return None
++        if not set(place["draining"]) >= set(place.get("machines") or []):
++            return None
++        return (kqp.headline(place) + ". It starts when the drain ends; `kanban_show` reports the wait. "
++                "Re-place it only if it cannot wait.")
++    except Exception:
++        logger.debug("drain note for %s failed", task_id, exc_info=True)
++        return None
++
++
+ def _runs_where(runs_on, pinned_machine, marker_placement) -> str:
+     """Where a card created on this board runs, for the kanban_create result. Never raises."""
+     if marker_placement and marker_placement.get("placement_policy"):
+-- 
+2.43.0
+

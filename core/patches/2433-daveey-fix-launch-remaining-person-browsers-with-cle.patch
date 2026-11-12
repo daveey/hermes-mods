@@ -1,0 +1,923 @@
+From 23837b1ee7bd82dcb743180717dcace1d96ada58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:49:29 +0000
+Subject: [PATCH] [daveey] fix: launch remaining person browsers with clean
+ agent environment
+
+---
+ agent/anthropic_credentials.py                |   4 +-
+ evals/openrouter_pkce_ab/harness.py           |   9 +-
+ hermes_cli/anon_challenge.py                  |   6 +-
+ hermes_cli/auth_codex_browser.py              |   4 +-
+ hermes_cli/auth_device_flow.py                |   3 +-
+ hermes_cli/auth_oauth_pkce_plugin.py          |   4 +-
+ hermes_cli/auth_openrouter.py                 |   4 +-
+ hermes_cli/cli_billing_mixin.py               |   4 +-
+ hermes_cli/cli_modal_mixin.py                 |   4 +-
+ hermes_cli/kanban_http_comment_writer.py      |   8 +-
+ hermes_cli/portal_cli.py                      |   4 +-
+ hermes_cli/top_level_env.py                   |  21 +-
+ plugins/platforms/photon/auth.py              |   4 +-
+ scripts/boundary_lint_baseline.json           |   1 +
+ tests/agent/test_anthropic_oauth_pkce.py      |   6 +-
+ tests/hermes_cli/test_anon_challenge.py       |  12 +-
+ .../test_auth_codex_browser_login.py          |   2 +-
+ tests/hermes_cli/test_auth_commands.py        |   2 +-
+ tests/hermes_cli/test_clean_person_openers.py | 326 ++++++++++++++++++
+ tests/hermes_cli/test_open_url_for_person.py  |  10 +-
+ tests/hermes_cli/test_plugin_oauth.py         |   2 +-
+ tests/hermes_cli/test_subscription_cli.py     |   7 +-
+ tests/providers/test_oauth_pkce_plugin.py     |   6 +-
+ tests/tools/test_mcp_oauth.py                 |   2 +-
+ tools/mcp_oauth.py                            |   4 +-
+ 25 files changed, 393 insertions(+), 66 deletions(-)
+ create mode 100644 tests/hermes_cli/test_clean_person_openers.py
+
+diff --git a/agent/anthropic_credentials.py b/agent/anthropic_credentials.py
+index 033802622b..bf8929f273 100644
+--- a/agent/anthropic_credentials.py
++++ b/agent/anthropic_credentials.py
+@@ -773,7 +773,6 @@ def _generate_pkce() -> tuple:
+ 
+ def run_hermes_oauth_login_pure() -> Optional[dict[str, Any]]:
+     """Run Hermes-native OAuth PKCE flow and return credential state."""
+-    import webbrowser
+     from urllib.parse import urlencode
+     verifier, challenge = _generate_pkce()
+     oauth_state = secrets.token_urlsafe(32)
+@@ -796,7 +795,8 @@ def run_hermes_oauth_login_pure() -> Optional[dict[str, Any]]:
+         _can_open_gui = lambda: True
+     if _can_open_gui():
+         with contextlib.suppress(Exception):
+-            webbrowser.open(auth_url)
++            from hermes_cli import top_level_env  # late: the clean opener
++            top_level_env.open_url_for_person(auth_url)
+             print("  (Browser opened automatically)")
+     print("\nAfter authorizing, you'll see a code. Paste it below.\n")
+     try:
+diff --git a/evals/openrouter_pkce_ab/harness.py b/evals/openrouter_pkce_ab/harness.py
+index 419af945f3..e84b87ab80 100644
+--- a/evals/openrouter_pkce_ab/harness.py
++++ b/evals/openrouter_pkce_ab/harness.py
+@@ -2,8 +2,8 @@
+ """Local A/B harness for `hermes auth add openrouter --type oauth` against a FAKE OpenRouter.
+ 
+ Runs the REAL entry point (``hermes_cli.auth_commands.auth_add_command``) with a temp HERMES_HOME.
+-Only the network authority is replaced: ``webbrowser.open`` is swapped for a scripted "browser"
+-that follows the auth URL's ``callback_url`` the way openrouter.ai would (redirecting the loopback
++Only the network authority is replaced: ``top_level_env.open_url_for_person_checked`` is swapped for a
++scripted "browser" that follows the auth URL's ``callback_url`` the way openrouter.ai would (redirecting the loopback
+ listener with ``?code=``), and ``OPENROUTER_AUTH_KEYS_URL`` points at a local fake code-exchange
+ server that enforces OpenRouter's documented contract (S256 verifier check, single-use code, 403).
+ 
+@@ -84,7 +84,7 @@ class _Handler(BaseHTTPRequestHandler):
+ 
+ 
+ def scripted_browser(fake: FakeOpenRouter, *, tamper_path=False, pre_consume=False):
+-    """Return a ``webbrowser.open`` stand-in that behaves like openrouter.ai/auth after user consent."""
++    """Return a person-browser opener stand-in that behaves like openrouter.ai/auth after user consent."""
+     def _open(url):
+         q = parse_qs(urlparse(url).query)
+         callback = q["callback_url"][0]
+@@ -128,9 +128,10 @@ def run(scenario: str, fake: FakeOpenRouter, home: str) -> dict:
+     try:  # BEFORE (origin/main) has no auth_openrouter sibling; the flow itself must then fail.
+         import hermes_cli.auth_openrouter as orm
+         import hermes_cli.auth_device_flow as dfl
++        import hermes_cli.top_level_env as tle
+         orm.OPENROUTER_AUTH_KEYS_URL = fake.url
+         dfl._can_open_graphical_browser = lambda: True
+-        orm.webbrowser.open = browser
++        tle.open_url_for_person_checked = browser  # the clean person-browser opener auth_openrouter calls
+     except ImportError:
+         pass
+     args = SimpleNamespace(provider="openrouter", auth_type="oauth", label="pkce-test", api_key=None,
+diff --git a/hermes_cli/anon_challenge.py b/hermes_cli/anon_challenge.py
+index 0d4292197c..731dd18537 100644
+--- a/hermes_cli/anon_challenge.py
++++ b/hermes_cli/anon_challenge.py
+@@ -345,10 +345,10 @@ def _present_in_terminal(challenge: BrowserChallenge) -> None:
+     already_open = challenge.url in _opened_urls
+     if (not already_open and client_surface() != "gateway"
+             and not _is_remote_session() and _can_open_graphical_browser()):
+-        import webbrowser
++        from hermes_cli import top_level_env  # late: the clean opener, not an in-process webbrowser.open
+         try:
+-            opened = bool(webbrowser.open(challenge.url))
+-        except (webbrowser.Error, OSError) as exc:
++            opened = bool(top_level_env.open_url_for_person_checked(challenge.url))
++        except OSError as exc:
+             logger.debug("could not open the challenge in a browser: %s", exc)
+         if opened:
+             _opened_urls.add(challenge.url)
+diff --git a/hermes_cli/auth_codex_browser.py b/hermes_cli/auth_codex_browser.py
+index 2915676292..72c740137c 100644
+--- a/hermes_cli/auth_codex_browser.py
++++ b/hermes_cli/auth_codex_browser.py
+@@ -19,7 +19,6 @@ from __future__ import annotations
+ import hmac
+ import logging
+ import secrets
+-import webbrowser
+ from typing import Any, Dict, Optional
+ from urllib.parse import urlencode
+ 
+@@ -133,8 +132,9 @@ def _codex_browser_login(
+     print(f"Open this URL to authorize Hermes:\n  {auth_url}\n")
+     _print_loopback_ssh_hint(redirect_uri)
+     if open_browser and _can_open_graphical_browser():
++        from hermes_cli import top_level_env  # late: the clean opener, not an in-process webbrowser.open
+         try:
+-            opened = webbrowser.open(auth_url)
++            opened = top_level_env.open_url_for_person_checked(auth_url)
+         except Exception:
+             opened = False
+         print("Browser opened for OpenAI authorization." if opened
+diff --git a/hermes_cli/auth_device_flow.py b/hermes_cli/auth_device_flow.py
+index 54737c5e1e..3a342e786b 100644
+--- a/hermes_cli/auth_device_flow.py
++++ b/hermes_cli/auth_device_flow.py
+@@ -306,8 +306,9 @@ def _print_device_code_instructions(
+     print(f"  2. If prompted, enter code: {user_code}")
+     if not open_browser:
+         return
++    from hermes_cli import top_level_env  # late: the clean opener, not an in-process webbrowser.open
+     try:
+-        opened = webbrowser.open(verification_url)
++        opened = top_level_env.open_url_for_person_checked(verification_url)
+     except Exception:
+         if not swallow_open_errors:
+             raise
+diff --git a/hermes_cli/auth_oauth_pkce_plugin.py b/hermes_cli/auth_oauth_pkce_plugin.py
+index 5f4b09c5db..b8a39dae47 100644
+--- a/hermes_cli/auth_oauth_pkce_plugin.py
++++ b/hermes_cli/auth_oauth_pkce_plugin.py
+@@ -26,7 +26,6 @@ import logging
+ import secrets
+ import time
+ import uuid
+-import webbrowser
+ from dataclasses import dataclass, field
+ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+ from urllib.parse import urlencode, urlparse
+@@ -189,8 +188,9 @@ def login(provider: str, cfg: OAuthPKCEConfig, *, open_browser: bool = True) ->
+     print(f"Waiting for callback on {redirect_uri} (timeout {int(cfg.timeout_seconds)}s, Ctrl+C to cancel)...")
+     _print_loopback_ssh_hint(redirect_uri)
+     if open_browser and _can_open_graphical_browser():
++        from hermes_cli import top_level_env  # late: the clean opener, not an in-process webbrowser.open
+         try:
+-            webbrowser.open(authorize_url)
++            top_level_env.open_url_for_person(authorize_url)
+         except Exception:
+             print("Could not open the browser automatically; use the URL above.")
+     try:
+diff --git a/hermes_cli/auth_openrouter.py b/hermes_cli/auth_openrouter.py
+index a363d01eb0..ea3bfec14d 100644
+--- a/hermes_cli/auth_openrouter.py
++++ b/hermes_cli/auth_openrouter.py
+@@ -11,7 +11,6 @@ path is a 404 and never reaches the exchange.
+ from __future__ import annotations
+ 
+ import secrets
+-import webbrowser
+ from typing import Any, Dict
+ from urllib.parse import urlencode
+ 
+@@ -78,8 +77,9 @@ def _openrouter_loopback_code(auth_url_params: dict[str, str], *, open_browser:
+ 
+     print(f"Open this URL to authorize Hermes with OpenRouter:\n  {auth_url}\n\nDocs: {OPENROUTER_OAUTH_DOCS_URL}")
+     if open_browser and _can_open_graphical_browser():
++        from hermes_cli import top_level_env  # late: the clean opener, not an in-process webbrowser.open
+         try:
+-            opened = webbrowser.open(auth_url)
++            opened = top_level_env.open_url_for_person_checked(auth_url)
+         except Exception:
+             opened = False
+         print("Browser opened for OpenRouter authorization." if opened
+diff --git a/hermes_cli/cli_billing_mixin.py b/hermes_cli/cli_billing_mixin.py
+index b11047de93..488a361d74 100644
+--- a/hermes_cli/cli_billing_mixin.py
++++ b/hermes_cli/cli_billing_mixin.py
+@@ -238,8 +238,8 @@ class CLIBillingMixin:
+         except Exception:
+             pass  # guard unavailable → plain best-effort open
+         try:
+-            import webbrowser
+-            return bool(webbrowser.open(url))
++            from hermes_cli import top_level_env  # late: the clean opener, not an in-process webbrowser.open
++            return bool(top_level_env.open_url_for_person_checked(url))
+         except Exception:
+             return False
+ 
+diff --git a/hermes_cli/cli_modal_mixin.py b/hermes_cli/cli_modal_mixin.py
+index 8924726dda..0bdf734a2d 100644
+--- a/hermes_cli/cli_modal_mixin.py
++++ b/hermes_cli/cli_modal_mixin.py
+@@ -12,7 +12,6 @@ import queue
+ import sys
+ import threading
+ import time as _time
+-import webbrowser
+ 
+ from agent.i18n import t
+ from hermes_cli.callbacks import prompt_for_secret
+@@ -775,7 +774,8 @@ class CLIModalMixin:
+     def _connection_open_url(self) -> None:
+         state = self._connection_state
+         if state and state.get("phase") == "url" and state["target"].get("connect_url"):
+-            webbrowser.open(state["target"]["connect_url"])
++            from hermes_cli import top_level_env  # late: the clean opener
++            top_level_env.open_url_for_person(state["target"]["connect_url"])
+ 
+     def _connection_cancel(self) -> None:
+         self._connection_answer(approve=False)
+diff --git a/hermes_cli/kanban_http_comment_writer.py b/hermes_cli/kanban_http_comment_writer.py
+index 8e6db616b7..eef9fd2221 100644
+--- a/hermes_cli/kanban_http_comment_writer.py
++++ b/hermes_cli/kanban_http_comment_writer.py
+@@ -11,10 +11,10 @@ Known limits (each records the legacy ``human``, never a false ``agent`` for a p
+   a marker set only on such a process is invisible; a readable marked ancestor still counts;
+ - an agent-started local proxy/relay presents its own (possibly clean) ancestry.
+ A GUI launched from an agent terminal inherits its markers and records ``agent``. Hermes's
+-own dashboard/webapp auto-open drops them (``top_level_env.open_url_for_person``); other
+-in-process ``webbrowser.open`` callers (OAuth/device-flow sign-ins) can still cold-start a
+-marked browser. macOS denies the global socket inventory, so each bare comment scans
+-same-user processes there.
++own browser launchers, including OAuth/device-flow sign-ins, drop them through the
++``top_level_env.open_url_for_person`` helpers. External launchers can still propagate
++markers. macOS denies the global socket inventory, so each bare comment scans same-user
++processes there.
+ Resolved peers use the CLI ancestry policy: unreadable ordinary ancestors fail closed to
+ ``agent``, while root supervisors and access-denied same-uid ``systemd --user`` managers
+ with permitted capabilities beyond the reader's are skipped. This preserves clean Linux
+diff --git a/hermes_cli/portal_cli.py b/hermes_cli/portal_cli.py
+index 3a56f5d7a8..90f6cb26cd 100644
+--- a/hermes_cli/portal_cli.py
++++ b/hermes_cli/portal_cli.py
+@@ -2,7 +2,6 @@
+ from __future__ import annotations
+ 
+ import sys
+-import webbrowser
+ 
+ from hermes_cli.colors import Colors, color
+ from hermes_cli.config import load_config
+@@ -92,7 +91,8 @@ def _cmd_open(args) -> int:
+     """Open the Portal subscription page in the default browser."""
+     print(f"Opening {SUBSCRIPTION_URL}")
+     try:
+-        opened = webbrowser.open(SUBSCRIPTION_URL)
++        from hermes_cli import top_level_env  # late: the clean opener
++        opened = top_level_env.open_url_for_person_checked(SUBSCRIPTION_URL)
+     except Exception:
+         opened = False
+     if opened:
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index ac15832db3..94a8902a9d 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -57,14 +57,17 @@ def clean_launch_env(base: Optional[MutableMapping[str, str]] = None) -> dict[st
+     return drop_agent_attribution(env)
+ 
+ 
+-def url_opener_command(url: str) -> list[str]:
+-    """argv that opens ``url`` with the stdlib browser registry in a fresh interpreter (exit 0 = opened)."""
++def url_opener_command(url: str, new: int = 0) -> list[str]:
++    """argv that opens ``url`` with the stdlib browser registry in a fresh interpreter (exit 0 = opened).
++
++    ``new`` is ``webbrowser.open``'s window hint (0 same window, 1 new window, 2 new tab)."""
+     import sys
+     return [sys.executable, "-I", "-c",
+-            "import sys, webbrowser; sys.exit(0 if webbrowser.open(sys.argv[1]) else 1)", url]
++            "import sys, webbrowser; sys.exit(0 if webbrowser.open(sys.argv[1], new=int(sys.argv[2])) else 1)",
++            url, str(int(new))]
+ 
+ 
+-def open_url_for_person(url: str) -> None:
++def open_url_for_person(url: str, new: int = 0) -> None:
+     """Open ``url`` in the person's browser without handing it the agent markers. [daveey]
+ 
+     main() advertises ``HERMES_AGENT``/``AI_AGENT`` in ``os.environ`` for every command, so an
+@@ -73,16 +76,16 @@ def open_url_for_person(url: str) -> None:
+     ancestry (``kanban_http_comment_writer``): notes a person typed in that browser would be
+     recorded as an agent's. The opener runs in a child with :func:`clean_launch_env` instead of
+     mutating this (multi-threaded) process's environment."""
+-    _spawn_clean_url_opener(url)
++    _spawn_clean_url_opener(url, new)
+ 
+ 
+-def open_url_for_person_checked(url: str, timeout: float = 15.0) -> bool:
++def open_url_for_person_checked(url: str, timeout: float = 15.0, new: int = 0) -> bool:
+     """:func:`open_url_for_person` for callers that report whether a browser opened.
+ 
+     True when the child's ``webbrowser.open`` succeeded, or is still running at ``timeout``
+     (a browser being launched); False on its failure or a spawn error."""
+     try:
+-        proc = _spawn_clean_url_opener(url)
++        proc = _spawn_clean_url_opener(url, new)
+     except OSError:
+         return False
+     try:
+@@ -91,8 +94,8 @@ def open_url_for_person_checked(url: str, timeout: float = 15.0) -> bool:
+         return True
+ 
+ 
+-def _spawn_clean_url_opener(url: str) -> subprocess.Popen:
+-    return subprocess.Popen(url_opener_command(url), env=clean_launch_env(), stdin=subprocess.DEVNULL,
++def _spawn_clean_url_opener(url: str, new: int = 0) -> subprocess.Popen:
++    return subprocess.Popen(url_opener_command(url, new), env=clean_launch_env(), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console flash
+ 
+diff --git a/plugins/platforms/photon/auth.py b/plugins/platforms/photon/auth.py
+index 9727562a85..92ef0ba6a8 100644
+--- a/plugins/platforms/photon/auth.py
++++ b/plugins/platforms/photon/auth.py
+@@ -464,8 +464,8 @@ def login_device_flow(
+         _safe(lambda: on_user_code(code))
+     if open_browser:
+         with contextlib.suppress(Exception):
+-            import webbrowser
+-            webbrowser.open(code.verification_uri_complete or code.verification_uri, new=2)
++            from hermes_cli import top_level_env  # late: the clean opener
++            top_level_env.open_url_for_person(code.verification_uri_complete or code.verification_uri, new=2)
+     first_token = poll_for_token(code, client_id=client_id)
+     token = _validated_dashboard_token([_DeviceTokenCandidate(source="poll", token=first_token)])
+     store_photon_token(token)
+diff --git a/scripts/boundary_lint_baseline.json b/scripts/boundary_lint_baseline.json
+index be6d6b11b4..7605e0c96e 100644
+--- a/scripts/boundary_lint_baseline.json
++++ b/scripts/boundary_lint_baseline.json
+@@ -521,6 +521,7 @@
+     "plugins/platforms/photon/adapter.py gateway.status._pid_exists": 1,
+     "plugins/platforms/photon/adapter.py hermes_cli._subprocess_compat.windows_hide_flags": 2,
+     "plugins/platforms/photon/auth.py hermes_cli.auth._auth_store_lock": 1,
++    "plugins/platforms/photon/auth.py hermes_cli.top_level_env": 1,
+     "plugins/platforms/photon/cli.py hermes_cli.colors.Colors": 1,
+     "plugins/platforms/photon/cli.py hermes_cli.colors.color": 1,
+     "plugins/platforms/qqbot/adapter.py gateway.platforms.media_cache.ext_for_mime": 1,
+diff --git a/tests/agent/test_anthropic_oauth_pkce.py b/tests/agent/test_anthropic_oauth_pkce.py
+index 4c002b8fc7..f37af5043c 100644
+--- a/tests/agent/test_anthropic_oauth_pkce.py
++++ b/tests/agent/test_anthropic_oauth_pkce.py
+@@ -51,11 +51,11 @@ def _patch_oauth_flow(
+             capture_auth_url["url"] = url
+         return True
+ 
+-    monkeypatch.setattr("webbrowser.open", fake_open)
+-    # The flow now gates webbrowser.open() behind a graphical-browser check so
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person", fake_open)
++    # The flow now gates the person-browser opener behind a graphical-browser check so
+     # it never launches a console browser (w3m/lynx) inside the terminal. Tests
+     # run headless, so force the GUI path to True — the URL capture relies on
+-    # webbrowser.open() being invoked.
++    # the opener being invoked.
+     monkeypatch.setattr(
+         "hermes_cli.auth._can_open_graphical_browser", lambda: True
+     )
+diff --git a/tests/hermes_cli/test_anon_challenge.py b/tests/hermes_cli/test_anon_challenge.py
+index 750d569dca..6c0b5907a6 100644
+--- a/tests/hermes_cli/test_anon_challenge.py
++++ b/tests/hermes_cli/test_anon_challenge.py
+@@ -227,8 +227,7 @@ class TestWhoWaits:
+         assert "/api/anonymous/challenge/status" not in [p for _, p in nas.calls]
+ 
+     def test_a_background_caller_never_prints_or_opens_a_browser(self, monkeypatch, capsys):
+-        import webbrowser
+-        monkeypatch.setattr(webbrowser, "open", lambda _url: pytest.fail("opened a browser in the background"))
++        monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person_checked", lambda _url: pytest.fail("opened a browser in the background"))
+         challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "A quick check.")
+         with anon_challenge.background_caller():
+             anon_challenge.present(challenge)
+@@ -255,11 +254,10 @@ class TestWhoWaits:
+     def test_an_inherited_desktop_flag_is_not_the_desktop_surface(self, nas, monkeypatch, capsys):
+         """A ``hermes`` run in the desktop's terminal pane inherits HERMES_DESKTOP but not the spawn
+         credential: it reports ``cli`` to the service and prints the link where its user is."""
+-        import webbrowser
+         monkeypatch.setenv("HERMES_DESKTOP", "1")
+         monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+         monkeypatch.setenv("SSH_TTY", "/dev/pts/0")
+-        monkeypatch.setattr(webbrowser, "open", lambda _url: False)
++        monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person_checked", lambda _url: False)
+         _connectors_token()
+         assert nas.token_requests[-1]["body"]["client"]["surface"] == "cli"
+         anon_challenge.present(anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "m"))
+@@ -411,12 +409,11 @@ class TestPresenting:
+         assert opened == [challenge]
+ 
+     def test_a_terminal_opens_one_tab_per_ticket_however_many_attempts_resume_it(self, monkeypatch, capsys):
+-        import webbrowser
+         from hermes_cli import auth_device_flow
+         opened = []
+         monkeypatch.setattr(auth_device_flow, "_is_remote_session", lambda: False)
+         monkeypatch.setattr(auth_device_flow, "_can_open_graphical_browser", lambda: True)
+-        monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url) or True)
++        monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person_checked", lambda url: opened.append(url) or True)
+         challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=once", True, 600, 2, "m")
+         anon_challenge.present(challenge)
+         anon_challenge.present(challenge)
+@@ -424,9 +421,8 @@ class TestPresenting:
+         assert capsys.readouterr().err.count(challenge.url) == 2     # the link is always shown
+ 
+     def test_a_terminal_prints_the_link_and_skips_the_browser_over_ssh(self, monkeypatch, capsys):
+-        import webbrowser
+         monkeypatch.setenv("SSH_TTY", "/dev/pts/0")
+-        monkeypatch.setattr(webbrowser, "open", lambda _url: pytest.fail("opened a browser over SSH"))
++        monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person_checked", lambda _url: pytest.fail("opened a browser over SSH"))
+         challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "A quick check.")
+         anon_challenge.present(challenge)
+         err = capsys.readouterr().err
+diff --git a/tests/hermes_cli/test_auth_codex_browser_login.py b/tests/hermes_cli/test_auth_codex_browser_login.py
+index 10145aeb51..01b9294c36 100644
+--- a/tests/hermes_cli/test_auth_codex_browser_login.py
++++ b/tests/hermes_cli/test_auth_codex_browser_login.py
+@@ -99,7 +99,7 @@ def test_browser_flag_runs_loopback_pkce_and_stores_loopback_source(tmp_path, mo
+     def _browser(url):  # the "browser": follow the authorize redirect back to the loopback listener
+         threading.Thread(target=lambda: urllib.request.urlopen(url, timeout=5).read(), daemon=True).start()
+         return True
+-    monkeypatch.setattr(browser_mod.webbrowser, "open", _browser)
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person_checked", _browser)
+ 
+     auth_add_command(_args(browser=True, no_browser=False))
+ 
+diff --git a/tests/hermes_cli/test_auth_commands.py b/tests/hermes_cli/test_auth_commands.py
+index 6ea7755d54..23b6e6f90b 100644
+--- a/tests/hermes_cli/test_auth_commands.py
++++ b/tests/hermes_cli/test_auth_commands.py
+@@ -1028,7 +1028,7 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
+         return True
+ 
+     monkeypatch.setattr(orm, "_can_open_graphical_browser", lambda: True)
+-    monkeypatch.setattr(orm.webbrowser, "open", _browser)
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person_checked", _browser)
+ 
+     with ThreadPoolExecutor(max_workers=1) as executor:
+         try:
+diff --git a/tests/hermes_cli/test_clean_person_openers.py b/tests/hermes_cli/test_clean_person_openers.py
+new file mode 100644
+index 0000000000..4a826e0451
+--- /dev/null
++++ b/tests/hermes_cli/test_clean_person_openers.py
+@@ -0,0 +1,326 @@
++"""Browser sign-in/portal openers reach a person's browser through the clean helper. [daveey]
++
++main() advertises HERMES_AGENT/AI_AGENT in os.environ, so an in-process ``webbrowser.open`` hands a
++freshly started browser those markers and the dashboard comment endpoint would record a person's
++notes as an agent's. Every caller therefore goes through ``hermes_cli.top_level_env``
++(``open_url_for_person_checked`` when it reports success, ``open_url_for_person`` otherwise); the
++raw stdlib opener is a tripwire here, and a failed open keeps each caller's fallback behaviour.
++"""
++from __future__ import annotations
++
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import top_level_env
++
++URL = "https://example.test/authorize?x=1"
++
++
++class _Stop(Exception):
++    """Ends a flow right after its browser open (the callback wait is not under test)."""
++
++
++class _Opener:
++    def __init__(self):
++        self.raw: list = []
++        self.checked: list = []
++        self.unchecked: list = []
++        self.result = True
++
++
++@pytest.fixture
++def opener(monkeypatch):
++    import webbrowser
++
++    o = _Opener()
++
++    def raw(url=None, *args, **kwargs):
++        o.raw.append(url)
++        return True
++
++    for name in ("open", "open_new", "open_new_tab"):
++        monkeypatch.setattr(webbrowser, name, raw, raising=False)
++
++    def checked(url, *args, **kwargs):
++        o.checked.append((url, kwargs))
++        if isinstance(o.result, BaseException):
++            raise o.result
++        return o.result
++
++    def unchecked(url, *args, **kwargs):
++        o.unchecked.append((url, kwargs))
++
++    monkeypatch.setattr(top_level_env, "open_url_for_person_checked", checked)
++    monkeypatch.setattr(top_level_env, "open_url_for_person", unchecked)
++    return o
++
++
++def _stop(*_a, **_k):
++    raise _Stop
++
++
++def _loopback_stubs(monkeypatch, module):
++    monkeypatch.setattr(module, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr(module, "_bind_loopback_callback_server",
++                        lambda *a, **k: SimpleNamespace(server_address=("127.0.0.1", 4242)))
++    monkeypatch.setattr(module, "_serve_loopback_callback", _stop)
++
++
++# ── loopback PKCE sign-ins ────────────────────────────────────────────────────────────────────
++
++@pytest.mark.parametrize("result, expected", [(True, "Browser opened for OpenAI"), (False, "Could not open the browser")])
++def test_codex_browser_login_opens_via_checked_helper(monkeypatch, opener, capsys, result, expected):
++    from hermes_cli import auth_codex_browser as mod
++    _loopback_stubs(monkeypatch, mod)
++    opener.result = result
++    with pytest.raises(_Stop):
++        mod._codex_browser_login()
++    assert opener.raw == [] and len(opener.checked) == 1
++    assert opener.checked[0][0].startswith(mod.CODEX_OAUTH_AUTHORIZE_URL)
++    assert expected in capsys.readouterr().out
++
++
++def test_codex_browser_login_open_error_keeps_manual_fallback(monkeypatch, opener, capsys):
++    from hermes_cli import auth_codex_browser as mod
++    _loopback_stubs(monkeypatch, mod)
++    opener.result = RuntimeError("no browser")
++    with pytest.raises(_Stop):
++        mod._codex_browser_login()
++    assert "Could not open the browser" in capsys.readouterr().out and opener.raw == []
++
++
++def test_codex_browser_login_respects_no_browser(monkeypatch, opener):
++    from hermes_cli import auth_codex_browser as mod
++    _loopback_stubs(monkeypatch, mod)
++    with pytest.raises(_Stop):
++        mod._codex_browser_login(open_browser=False)
++    assert opener.raw == [] and opener.checked == [] and opener.unchecked == []
++
++
++@pytest.mark.parametrize("result, expected", [(True, "Browser opened for OpenRouter"), (False, "Could not open the browser")])
++def test_openrouter_loopback_opens_via_checked_helper(monkeypatch, opener, capsys, result, expected):
++    from hermes_cli import auth_openrouter as mod
++    _loopback_stubs(monkeypatch, mod)
++    opener.result = result
++    with pytest.raises(_Stop):
++        mod._openrouter_loopback_code({"code_challenge": "c"}, open_browser=True, timeout_seconds=1)
++    assert opener.raw == [] and len(opener.checked) == 1
++    assert opener.checked[0][0].startswith(mod.OPENROUTER_AUTH_URL)
++    assert expected in capsys.readouterr().out
++
++
++def test_openrouter_loopback_headless_does_not_open(monkeypatch, opener):
++    from hermes_cli import auth_openrouter as mod
++    _loopback_stubs(monkeypatch, mod)
++    monkeypatch.setattr(mod, "_can_open_graphical_browser", lambda: False)
++    with pytest.raises(_Stop):
++        mod._openrouter_loopback_code({}, open_browser=True, timeout_seconds=1)
++    assert opener.raw == [] and opener.checked == []
++
++
++def test_generic_pkce_plugin_login_opens_via_clean_helper(monkeypatch, opener):
++    from hermes_cli import auth_device_flow as flow
++    from hermes_cli import auth_oauth_pkce_plugin as mod
++    monkeypatch.setattr(mod, "validate_config", lambda *a, **k: None)
++    monkeypatch.setattr(flow, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr(flow, "_bind_loopback_callback_server",
++                        lambda *a, **k: SimpleNamespace(server_address=("127.0.0.1", 4242)))
++    monkeypatch.setattr(flow, "_serve_loopback_callback", _stop)
++    cfg = SimpleNamespace(redirect_path="/cb", redirect_port=0, label="Voice", extra_authorize_params={},
++                          client_id="cid", scopes=("a",), audience=None, authorize_url="https://idp.test/authorize",
++                          timeout_seconds=1)
++    with pytest.raises(_Stop):
++        mod.login("voice", cfg)
++    assert opener.raw == [] and opener.checked == []
++    assert [u.startswith("https://idp.test/authorize?") for u, _ in opener.unchecked] == [True]
++
++
++def test_generic_pkce_plugin_open_failure_is_not_fatal(monkeypatch, opener):
++    """A raising opener keeps the loopback wait going (the URL is already printed)."""
++    from hermes_cli import auth_device_flow as flow
++    from hermes_cli import auth_oauth_pkce_plugin as mod
++    monkeypatch.setattr(mod, "validate_config", lambda *a, **k: None)
++    monkeypatch.setattr(flow, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr(flow, "_bind_loopback_callback_server",
++                        lambda *a, **k: SimpleNamespace(server_address=("127.0.0.1", 4242)))
++    monkeypatch.setattr(flow, "_serve_loopback_callback", _stop)
++    monkeypatch.setattr(top_level_env, "open_url_for_person", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
++    cfg = SimpleNamespace(redirect_path="/cb", redirect_port=0, label="Voice", extra_authorize_params={},
++                          client_id="cid", scopes=(), audience=None, authorize_url="https://idp.test/authorize",
++                          timeout_seconds=1)
++    with pytest.raises(_Stop):  # reached the callback wait, i.e. the open error was swallowed
++        mod.login("voice", cfg)
++    assert opener.raw == []
++
++
++# ── device-code / challenge / portal / billing / modal / MCP / Anthropic / Photon ─────────────
++
++@pytest.mark.parametrize("result, expected", [(True, "Opened browser"), (False, "Could not open browser")])
++def test_device_code_instructions_report_checked_outcome(opener, capsys, result, expected):
++    from hermes_cli.auth_device_flow import _print_device_code_instructions
++    opener.result = result
++    _print_device_code_instructions(URL, "ABCD", open_browser=True)
++    assert opener.raw == [] and [u for u, _ in opener.checked] == [URL]
++    assert expected in capsys.readouterr().out
++
++
++def test_device_code_instructions_swallow_flag_controls_open_errors(opener, capsys):
++    from hermes_cli.auth_device_flow import _print_device_code_instructions
++    opener.result = OSError("spawn")
++    _print_device_code_instructions(URL, "ABCD", open_browser=True, swallow_open_errors=True)
++    assert "Could not open browser" in capsys.readouterr().out
++    with pytest.raises(OSError):
++        _print_device_code_instructions(URL, "ABCD", open_browser=True)
++    assert opener.raw == []
++
++
++def test_device_code_instructions_no_browser_opens_nothing(opener):
++    from hermes_cli.auth_device_flow import _print_device_code_instructions
++    _print_device_code_instructions(URL, "ABCD", open_browser=False)
++    assert opener.raw == [] and opener.checked == []
++
++
++@pytest.mark.parametrize("result", [True, False])
++def test_anon_challenge_tracks_the_checked_result(monkeypatch, opener, capsys, result):
++    from hermes_cli import anon_challenge, auth_device_flow
++    monkeypatch.setattr(anon_challenge, "client_surface", lambda: "cli")
++    monkeypatch.setattr(auth_device_flow, "_is_remote_session", lambda: False)
++    monkeypatch.setattr(auth_device_flow, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr(anon_challenge, "_opened_urls", set())
++    opener.result = result
++    challenge = anon_challenge.BrowserChallenge(url=URL, required=True, expires_in=60, interval=1, message="Verify")
++    anon_challenge._present_in_terminal(challenge)
++    assert opener.raw == [] and [u for u, _ in opener.checked] == [URL]
++    assert (URL in anon_challenge._opened_urls) is result
++    assert ("(Opened in your browser.)" in capsys.readouterr().err) is result
++
++
++@pytest.mark.parametrize("result, code", [(True, 0), (False, 1)])
++def test_portal_open_returns_the_checked_result(opener, capsys, result, code):
++    from hermes_cli import portal_cli
++    opener.result = result
++    assert portal_cli._cmd_open(None) == code
++    assert opener.raw == [] and [u for u, _ in opener.checked] == [portal_cli.SUBSCRIPTION_URL]
++    assert ("Could not launch a browser" in capsys.readouterr().out) is (not result)
++
++
++@pytest.mark.parametrize("result", [True, False, OSError("spawn")])
++def test_billing_open_returns_the_checked_result(monkeypatch, opener, result):
++    from hermes_cli import auth
++    from hermes_cli.cli_billing_mixin import CLIBillingMixin
++    monkeypatch.setattr(auth, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr(auth, "_is_remote_session", lambda: False)
++    opener.result = result
++    assert CLIBillingMixin._open_url_in_browser(SimpleNamespace(), URL) is (result is True)
++    assert opener.raw == [] and [u for u, _ in opener.checked] == [URL]
++
++
++def test_billing_open_keeps_remote_and_headless_refusal(monkeypatch, opener):
++    from hermes_cli import auth
++    from hermes_cli.cli_billing_mixin import CLIBillingMixin
++    monkeypatch.setattr(auth, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr(auth, "_is_remote_session", lambda: True)
++    assert CLIBillingMixin._open_url_in_browser(SimpleNamespace(), URL) is False
++    assert opener.raw == [] and opener.checked == []
++
++
++def test_modal_connection_open_uses_clean_helper(opener):
++    from hermes_cli.cli_modal_mixin import CLIModalMixin
++    state = {"phase": "url", "target": {"connect_url": URL}}
++    CLIModalMixin._connection_open_url(SimpleNamespace(_connection_state=state))
++    assert opener.raw == [] and [u for u, _ in opener.unchecked] == [URL]
++
++
++@pytest.mark.parametrize("result, expected", [(True, "Browser opened automatically"), (False, "Could not open browser")])
++def test_mcp_oauth_announce_reports_checked_outcome(monkeypatch, opener, capsys, result, expected):
++    from tools import mcp_oauth
++    monkeypatch.setattr(mcp_oauth, "_can_open_browser", lambda: True)
++    opener.result = result
++    mcp_oauth._announce_authorization_url(URL, 1234, None)
++    assert opener.raw == [] and [u for u, _ in opener.checked] == [URL]
++    assert expected in capsys.readouterr().err
++
++
++def test_mcp_oauth_announce_headless_does_not_open(monkeypatch, opener, capsys):
++    from tools import mcp_oauth
++    monkeypatch.setattr(mcp_oauth, "_can_open_browser", lambda: False)
++    mcp_oauth._announce_authorization_url(URL, 1234, None)
++    assert opener.raw == [] and opener.checked == []
++    assert "Headless environment detected" in capsys.readouterr().err
++
++
++def test_anthropic_oauth_login_opens_via_clean_helper(monkeypatch, opener):
++    from agent import anthropic_credentials
++    from hermes_cli import auth
++    monkeypatch.setattr(auth, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr("builtins.input", lambda *_a: (_ for _ in ()).throw(EOFError))
++    assert anthropic_credentials.run_hermes_oauth_login_pure() is None
++    assert opener.raw == [] and opener.checked == []
++    assert [u.startswith("https://claude.ai/oauth/authorize?") for u, _ in opener.unchecked] == [True]
++
++
++def test_anthropic_oauth_login_headless_does_not_open(monkeypatch, opener):
++    from agent import anthropic_credentials
++    from hermes_cli import auth
++    monkeypatch.setattr(auth, "_can_open_graphical_browser", lambda: False)
++    monkeypatch.setattr("builtins.input", lambda *_a: (_ for _ in ()).throw(EOFError))
++    assert anthropic_credentials.run_hermes_oauth_login_pure() is None
++    assert opener.raw == [] and opener.unchecked == []
++
++
++def test_photon_device_login_opens_a_new_window_via_clean_helper(monkeypatch, opener):
++    from plugins.platforms.photon import auth
++    code = SimpleNamespace(device_code="d", user_code="U", verification_uri="https://p.test/v",
++                           verification_uri_complete="https://p.test/v?c=U", expires_in=60, interval=1)
++    monkeypatch.setattr(auth, "request_device_code", lambda **k: code)
++    monkeypatch.setattr(auth, "poll_for_token", _stop)
++    with pytest.raises(_Stop):
++        auth.login_device_flow(open_browser=True)
++    assert opener.raw == [] and opener.checked == []
++    assert opener.unchecked == [("https://p.test/v?c=U", {"new": 2})]
++
++
++# ── the helper itself: ``new`` reaches the child interpreter's webbrowser.open ─────────────────
++
++def test_url_opener_command_forwards_new_window_flag():
++    argv = top_level_env.url_opener_command("http://x/", new=2)
++    assert argv[-2:] == ["http://x/", "2"]
++    assert top_level_env.url_opener_command("http://x/")[-2:] == ["http://x/", "0"]
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX BROWSER script")
++def test_child_opener_passes_new_to_webbrowser(monkeypatch, tmp_path):
++    """The child must call ``webbrowser.open(url, new=N)``; an observer controller records ``new``."""
++    import subprocess
++    dump = tmp_path / "new.txt"
++    code = ("import sys, webbrowser\n"
++            "class C(webbrowser.BaseBrowser):\n"
++            "    def open(self, url, new=0, autoraise=True):\n"
++            f"        open({str(dump)!r}, 'w').write(f'{{url}} {{new}}'); return True\n"
++            "webbrowser.register('probe', None, C(), preferred=True)\n")
++    argv = top_level_env.url_opener_command("http://x/", new=2)
++    # same child body, preceded by the probe registration
++    body = argv[argv.index("-c") + 1]
++    assert subprocess.run([sys.executable, "-I", "-c", code + body, "http://x/", "2"], check=False).returncode == 0
++    assert dump.read_text() == "http://x/ 2"
++
++
++@pytest.mark.parametrize("fn", ["open_url_for_person", "open_url_for_person_checked"])
++def test_helpers_pass_new_to_the_spawn(monkeypatch, fn):
++    seen = []
++
++    class _P:
++        def wait(self, timeout):
++            return 0
++
++    monkeypatch.setattr(top_level_env, "_spawn_clean_url_opener", lambda url, new=0: seen.append((url, new)) or _P())
++    # conftest replaced the module attributes with recorders; resolve the real functions.
++    real = _REAL[fn]
++    real("http://x/", new=2)
++    assert seen == [("http://x/", 2)]
++
++
++_REAL = {"open_url_for_person": top_level_env.open_url_for_person,
++         "open_url_for_person_checked": top_level_env.open_url_for_person_checked}
+diff --git a/tests/hermes_cli/test_open_url_for_person.py b/tests/hermes_cli/test_open_url_for_person.py
+index 5c7e618e38..63300ffb98 100644
+--- a/tests/hermes_cli/test_open_url_for_person.py
++++ b/tests/hermes_cli/test_open_url_for_person.py
+@@ -23,7 +23,7 @@ REAL_CHECKED = top_level_env.open_url_for_person_checked
+ 
+ def test_unchecked_opener_spawns_the_clean_child(monkeypatch):
+     spawned = []
+-    monkeypatch.setattr(top_level_env, "_spawn_clean_url_opener", spawned.append)
++    monkeypatch.setattr(top_level_env, "_spawn_clean_url_opener", lambda url, new=0: spawned.append(url))
+     REAL_OPEN("http://127.0.0.1:9119")
+     assert spawned == ["http://127.0.0.1:9119"]
+ 
+@@ -75,10 +75,10 @@ class _Proc:
+ 
+ 
+ @pytest.mark.parametrize("spawn, expected", [
+-    (lambda url: _Proc(0), True),
+-    (lambda url: _Proc(1), False),
+-    (lambda url: _Proc(__import__("subprocess").TimeoutExpired("opener", 15)), True),
+-    (lambda url: (_ for _ in ()).throw(OSError("no interpreter")), False),
++    (lambda url, new=0: _Proc(0), True),
++    (lambda url, new=0: _Proc(1), False),
++    (lambda url, new=0: _Proc(__import__("subprocess").TimeoutExpired("opener", 15)), True),
++    (lambda url, new=0: (_ for _ in ()).throw(OSError("no interpreter")), False),
+ ])
+ def test_checked_opener_reports_the_childs_outcome(monkeypatch, spawn, expected):
+     monkeypatch.setattr(top_level_env, "_spawn_clean_url_opener", spawn)
+diff --git a/tests/hermes_cli/test_plugin_oauth.py b/tests/hermes_cli/test_plugin_oauth.py
+index 2c1f984546..b218a10cf3 100644
+--- a/tests/hermes_cli/test_plugin_oauth.py
++++ b/tests/hermes_cli/test_plugin_oauth.py
+@@ -133,7 +133,7 @@ def idp(monkeypatch, tmp_path):
+         threading.Thread(target=lambda: urlopen(url, timeout=10, context=trust).close(), daemon=True).start()
+         return True
+ 
+-    monkeypatch.setattr(pkce.webbrowser, "open", browser)
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person", browser)
+     monkeypatch.setattr("hermes_cli.auth_device_flow._can_open_graphical_browser", lambda: True)
+     yield server
+     server.stop()
+diff --git a/tests/hermes_cli/test_subscription_cli.py b/tests/hermes_cli/test_subscription_cli.py
+index e2933c3a2a..8a58141039 100644
+--- a/tests/hermes_cli/test_subscription_cli.py
++++ b/tests/hermes_cli/test_subscription_cli.py
+@@ -126,8 +126,7 @@ def test_free_prints_catalog_and_deep_links_with_plan(cli, monkeypatch, capsys):
+ 
+ 
+ def test_open_url_in_browser_refuses_remote_session(cli, monkeypatch):
+-    # (4): a remote/SSH session must NOT auto-open — webbrowser.open is never called.
+-    import webbrowser
++    # (4): a remote/SSH session must NOT auto-open — the opener is never called.
+ 
+     from hermes_cli import auth
+     from hermes_cli import auth_device_flow
+@@ -135,10 +134,10 @@ def test_open_url_in_browser_refuses_remote_session(cli, monkeypatch):
+     monkeypatch.setattr(auth, "_is_remote_session", lambda: True, raising=False)
+     monkeypatch.setattr(auth_device_flow, "_is_remote_session", lambda: True, raising=False)
+     called = {"n": 0}
+-    monkeypatch.setattr(webbrowser, "open", lambda url: called.update(n=called["n"] + 1) or True)
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person_checked", lambda url: called.update(n=called["n"] + 1) or True)
+ 
+     assert cli._open_url_in_browser("https://x.example") is False
+-    assert called["n"] == 0  # guard short-circuits before webbrowser.open
++    assert called["n"] == 0  # guard short-circuits before the opener
+ 
+ 
+ 
+diff --git a/tests/providers/test_oauth_pkce_plugin.py b/tests/providers/test_oauth_pkce_plugin.py
+index 92c01d6b24..d81f35b8a2 100644
+--- a/tests/providers/test_oauth_pkce_plugin.py
++++ b/tests/providers/test_oauth_pkce_plugin.py
+@@ -45,7 +45,7 @@ def _browser_hits(url: str) -> bool:
+ def test_pkce_handler_add_status_refresh_logout_against_fake_idp(idp, monkeypatch, tmp_path, request):
+     from agent.credential_pool import load_pool
+ 
+-    monkeypatch.setattr(pkce.webbrowser, "open", _browser_hits)
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person", _browser_hits)
+     monkeypatch.setattr("hermes_cli.auth_device_flow._can_open_graphical_browser", lambda: True)
+     cfg = _config(idp)
+     handler, refresh = pkce.pkce_auth_handler(cfg), pkce.pkce_refresh_credential(cfg)
+@@ -111,7 +111,7 @@ def test_spent_refresh_token_is_grant_dead_and_marks_the_pool_row_dead(idp, monk
+     """RFC 6749 invalid_grant on refresh is terminal. The pool must DEAD the row, not EXHAUST it."""
+     from agent.credential_pool import STATUS_DEAD, load_pool
+ 
+-    monkeypatch.setattr(pkce.webbrowser, "open", _browser_hits)
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person", _browser_hits)
+     monkeypatch.setattr("hermes_cli.auth_device_flow._can_open_graphical_browser", lambda: True)
+     cfg = _config(idp)
+     handler, refresh = pkce.pkce_auth_handler(cfg), pkce.pkce_refresh_credential(cfg)
+@@ -143,7 +143,7 @@ def test_alias_login_stores_the_row_under_the_canonical_profile_name(idp, monkey
+     from agent.credential_pool import load_pool
+ 
+     alias = "example-pkce-alias"
+-    monkeypatch.setattr(pkce.webbrowser, "open", _browser_hits)
++    monkeypatch.setattr("hermes_cli.top_level_env.open_url_for_person", _browser_hits)
+     monkeypatch.setattr("hermes_cli.auth_device_flow._can_open_graphical_browser", lambda: True)
+     cfg = _config(idp)
+     handler = pkce.pkce_auth_handler(cfg)
+diff --git a/tests/tools/test_mcp_oauth.py b/tests/tools/test_mcp_oauth.py
+index 0597cf742c..80fd2be4c7 100644
+--- a/tests/tools/test_mcp_oauth.py
++++ b/tests/tools/test_mcp_oauth.py
+@@ -827,7 +827,7 @@ class TestNonInteractiveFailFastAtCallbackBoundary:
+ 
+         monkeypatch.setattr(mod, "_is_interactive", lambda: False)
+         monkeypatch.setattr(
+-            "webbrowser.open", MagicMock(side_effect=AssertionError("must not open browser"))
++            "hermes_cli.top_level_env.open_url_for_person_checked", MagicMock(side_effect=AssertionError("must not open browser"))
+         )
+ 
+         with pytest.raises(OAuthNonInteractiveError, match="browser authorization"):
+diff --git a/tools/mcp_oauth.py b/tools/mcp_oauth.py
+index 9f63bfaddc..45f7099481 100644
+--- a/tools/mcp_oauth.py
++++ b/tools/mcp_oauth.py
+@@ -24,7 +24,6 @@ import stat
+ import sys
+ import threading
+ import time
+-import webbrowser
+ from functools import partialmethod
+ 
+ # Cross-process advisory file locking for the refresh fence. Mirrors
+@@ -789,7 +788,8 @@ def _announce_authorization_url(
+     else:
+         opened = False
+         with contextlib.suppress(Exception):
+-            opened = webbrowser.open(authorization_url)
++            from hermes_cli import top_level_env  # late: the clean opener
++            opened = top_level_env.open_url_for_person_checked(authorization_url)
+         note = "Browser opened automatically." if opened else "Could not open browser — please open the URL manually."
+     print(f"  ({note})\n", file=sys.stderr)
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,514 @@
+From 94190a1374d77c8f781db4b24fc6bdce47ec337c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:14:22 +0000
+Subject: [PATCH] [daveey] Fence failure observers against board relocation
+ independently of dispatch
+
+---
+ docs/failed-result-reconciliation.md          |  22 +-
+ hermes_cli/kanban_db_boards.py                |   8 +-
+ hermes_cli/kanban_dispatch_owner.py           |   8 +-
+ hermes_cli/kanban_failed_result_observer.py   |  71 ++++-
+ .../test_kanban_failed_result_generation.py   | 297 ++++++++++++++++++
+ 5 files changed, 392 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_generation.py
+
+diff --git a/docs/failed-result-reconciliation.md b/docs/failed-result-reconciliation.md
+index 6234d76d3b..e650ed8c8d 100644
+--- a/docs/failed-result-reconciliation.md
++++ b/docs/failed-result-reconciliation.md
+@@ -33,7 +33,20 @@ On Linux, the writer starts a transient user-manager service outside the worker
+ cgroup and waits for the observer's board-open acknowledgment before committing
+ the result. The service uses `Restart=on-failure`, a 500ms restart delay and a
+ 500ms read-only observation interval. Board connections use a 250ms busy timeout
+-without creating or migrating a board. A removed target terminates observation.
++without creating or migrating a board.
++
++### Board generation safety
++
++The observer pins the board file's device/inode under a separate short generation
++lock when it opens (retrying contention for up to two seconds). Every poll checks,
++lock-free, that this inode remains at its path; archive, deletion or replacement
++ends observation. Closure takes only the generation lock, revalidates the inode,
++and retains the lock through finalization. Native removal takes dispatch then
++generation, both non-blocking, before changing the current pointer or moving files.
++An observer never takes the dispatch lock and holds no generation lock while idle.
++A dispatcher stalled holding its tick lock therefore does not delay independent
++closure. If removal wins first, revalidation refuses closure on the stale handle.
++The observer never closes a run in an archived board or on a recreated board.
+ 
+ The real-child regression and separate-cgroup natural-teardown test require
+ closure within **five seconds after both processes exit**, with the owner
+@@ -62,3 +75,10 @@ Forced observer restart, Mac/Windows behavior, a production owner-lock fault,
+ and production deployment are not established by these fixtures. Merely reading
+ `Restart=on-failure` is not a successful restart test. The live hub's loaded
+ `code_sha` must be verified separately after landing.
++
++## Owner-only restart before bootstrap
++
++An owner-only witnessed restart (recorded before the worker bootstrap binds its
++own process) can be closed by the dispatcher once the outer worker and every bound
++process are dead, but it does **not** arm an observer. Its guarantee is
++dispatcher-only: while the dispatcher is stalled there is no independent bound.
+diff --git a/hermes_cli/kanban_db_boards.py b/hermes_cli/kanban_db_boards.py
+index 78d4b30743..4aabbefe02 100644
+--- a/hermes_cli/kanban_db_boards.py
++++ b/hermes_cli/kanban_db_boards.py
+@@ -186,7 +186,13 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
+     with _dispatch_tick_lock(path, create_parent=False) as held:
+         if not held:
+             raise ValueError("board dispatcher is busy; retry removal")
+-        return _remove_board_locked(normed, archive=archive)
++        # Lock order is dispatch -> generation. Observers only take generation,
++        # so a stalled dispatcher never prevents independent result closure.
++        key = path.with_name(path.name + '.generation')
++        with _dispatch_tick_lock(key, create_parent=False) as generation_held:
++            if not generation_held:
++                raise ValueError("board generation is busy; retry removal")
++            return _remove_board_locked(normed, archive=archive)
+ 
+ 
+ def _remove_board_locked(slug: str, *, archive: bool = True) -> dict:
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 2d8429b640..7e7622a142 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -9,7 +9,7 @@ import sqlite3
+ import tempfile
+ 
+ 
+-def connect_with_identity(path, *, existing_only=False, **kwargs):
++def connect_with_identity(path, *, existing_only=False, generation_only=False, **kwargs):
+     """Capture the opened inode while native archive/delete cannot relocate it.
+ 
+     Ordinary clients may still connect during a tick. Such handles cannot later
+@@ -28,7 +28,11 @@ def connect_with_identity(path, *, existing_only=False, **kwargs):
+     timeout = kwargs.get("timeout", 5.0)
+ 
+     def open_once(remaining):
+-        with lifecycle_access(canonical, remaining) as lock, _dispatch_tick_lock(canonical) as held:
++        key = canonical.with_name(canonical.name + '.generation') if generation_only else canonical
++        with lifecycle_access(canonical, remaining) as lock, _dispatch_tick_lock(
++                key, create_parent=not generation_only) as held:
++            if generation_only and not held:
++                raise sqlite3.OperationalError('database is locked: board generation busy')
+             recover(str(canonical))
+             # Observer opens must never resurrect an archived/deleted board.
+             database = canonical.as_uri() + '?mode=rw' if existing_only else str(canonical)
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index 58a3308c5b..437e97a150 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -18,6 +18,8 @@ from pathlib import Path
+ READY = b'failed-result-observer-ready\n'
+ POLL_SECONDS = 0.5
+ START_SECONDS = 5.0
++# Bound retries for the short relocation fence, never the dispatcher tick lock.
++OPEN_SECONDS = 2.0
+ 
+ 
+ def arm(context):
+@@ -80,8 +82,17 @@ def connect_existing(path):
+ 
+     path = Path(path)
+     ensure_kanban_test_isolation(path)
+-    with contextlib.closing(connect_with_identity(
+-            path, existing_only=True, isolation_level=None, timeout=.25)) as conn:
++    deadline = time.monotonic() + OPEN_SECONDS
++    while True:
++        try:
++            conn = connect_with_identity(path, existing_only=True, generation_only=True,
++                                         isolation_level=None, timeout=.25)
++            break
++        except sqlite3.OperationalError:
++            if time.monotonic() >= deadline:
++                raise
++            time.sleep(.05)
++    with contextlib.closing(conn):
+         conn.row_factory = sqlite3.Row
+         conn.text_factory = kb._lossy_text
+         conn.execute('PRAGMA busy_timeout=250')
+@@ -95,9 +106,47 @@ def connect_existing(path):
+         yield conn
+ 
+ 
+-def observe(context):
++def _generation(conn):
++    """The board path iff this handle's inode is still the one at that path."""
++    from hermes_cli.kanban_dispatch_owner import connection_db_path
++    try:
++        return connection_db_path(conn)
++    except (OSError, ValueError):
++        # Archived, deleted, replaced or never pinned: not ours to touch.
++        return None
++
++
++def _finalize(conn, context, path):
++    """Close a proven failed run only inside its own board generation.
++
++    ``path`` comes from the caller's lock-free generation check. Returns False
++    when the generation changed under the lock (terminate). The independent
++    generation lock is a single non-blocking attempt. Native archive/delete take
++    the same fence after dispatch, excluding relocation through closure without
++    depending on dispatcher progress.
++    """
+     from hermes_cli import kanban_db_dispatch as dispatch
+-    from hermes_cli.kanban_failed_result import failed_result_proof, process_gone
++    from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    from hermes_cli.kanban_failed_result import failed_result_proof
++
++    if not failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']):
++        return True
++    key = path.with_name(path.name + '.generation')
++    with _dispatch_tick_lock(key, create_parent=False) as held:
++        if not held:
++            return True
++        # The path may have changed between the lock-free check and the lock.
++        if _generation(conn) is None:
++            return False
++        # The sweep revalidates the exact run/claim under its write transaction
++        # (a dispatcher may have ended it). Batch all proven local failures to
++        # retain the existing systemic-crash policy.
++        dispatch.detect_crashed_workers(conn, board=context.get('board'), failed_results_only=True)
++    return True
++
++
++def observe(context):
++    from hermes_cli.kanban_failed_result import process_gone
+ 
+     path = Path(context['db'])
+     if not path.is_file():
+@@ -115,6 +164,11 @@ def observe(context):
+             sys.stdout.buffer.write(READY)
+             sys.stdout.buffer.flush()
+         while True:
++            # Lock-free and cheap: leave as soon as this inode is not the board at
++            # its path (archived, deleted or replaced), instead of polling it forever.
++            path = _generation(conn)
++            if path is None:
++                return
+             row = conn.execute('SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?',
+                                (context['task_id'],)).fetchone()
+             if (row is None or row['status'] != 'running' or row['current_run_id'] != context['run_id']
+@@ -128,12 +182,9 @@ def observe(context):
+                 # observer to reconcile. Ordinary crash recovery still owns it.
+                 return
+             try:
+-                # Idle/live polls are read-only. Revalidate under the sweep's
+-                # write transaction before any closure; a competing dispatcher
+-                # may have ended/replaced this claim meanwhile. Batch all proven
+-                # local failures to retain the existing systemic-crash policy.
+-                if failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']):
+-                    dispatch.detect_crashed_workers(conn, board=context.get('board'), failed_results_only=True)
++                # Idle/live polls are read-only and hold no lock.
++                if not _finalize(conn, context, path):
++                    return
+             except sqlite3.OperationalError:
+                 # Committed results are the queue; retry transient board locks.
+                 pass
+diff --git a/tests/hermes_cli/test_kanban_failed_result_generation.py b/tests/hermes_cli/test_kanban_failed_result_generation.py
+new file mode 100644
+index 0000000000..ff2658fecb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_generation.py
+@@ -0,0 +1,297 @@
++"""The observer must never act on a board generation that is no longer at its path.
++
++Archive, delete and archive+recreate are driven through the real native
++``remove_board``/``create_board`` APIs after the readiness acknowledgement, at
++three points: while polling, before proof, and between proof and closure.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import os
++import sqlite3
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Callable
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_dispatch_owner as owner
++from hermes_cli import kanban_failed_result as reconcile
++from hermes_cli import kanban_failed_result_observer as observer
++from hermes_cli.kanban_db_connect import _dispatch_tick_lock, connect_closing
++from tools.environments.local import build_subprocess_env
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++SLUG = 'generation'
++REPO = Path(__file__).resolve().parents[2]
++_RECREATE = '''
++import sys
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect_closing
++kb.create_board(sys.argv[1])
++with connect_closing(kb.kanban_db_path(board=sys.argv[1])) as conn:
++    print(kb.create_task(conn, title='new generation', assignee='default'))
++'''
++ACTIONS = ['archive', 'delete', 'archive_recreate']
++
++
++class Stuck(Exception):
++    pass
++
++
++@pytest.fixture
++def gen(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path / 'kanban'))
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    monkeypatch.setenv('HERMES_KANBAN_BOARD', SLUG)
++    kb.create_board(SLUG)
++    path = kb.kanban_db_path(board=SLUG)
++    with connect_closing(path) as conn:
++        tid = kb.create_task(conn, title='generation fixture', assignee='default')
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        assert task is not None
++        context = {'db': str(path), 'task_id': tid, 'run_id': task.current_run_id,
++                   'claim_lock': task.claim_lock, 'board': SLUG,
++                   'writer_pid': os.getpid(), 'writer_birth': kbd._process_fingerprint(os.getpid())}
++        yield SimpleNamespace(conn=conn, context=context, path=path, tmp=tmp_path)
++
++
++def _failed(gen):
++    fixtures._failed_child(gen.conn, gen.context)
++
++
++class Drive:
++    """Shared hooks: spy on closure, relocate on demand, bound the poll loop."""
++
++    def __init__(self, gen, monkeypatch, action, polls=6):
++        self.gen, self.action, self.moved, self.outcome = gen, action, False, None
++        self.closures, self.closures_after_move, self.sleeps = 0, 0, 0
++        self.polls = polls
++        self.on_sleep: Callable[[int], None] | None = None
++        real_detect = kbd.detect_crashed_workers
++
++        def detect(*args, **kwargs):
++            self.closures += 1
++            self.closures_after_move += self.moved
++            return real_detect(*args, **kwargs)
++        monkeypatch.setattr(kbd, 'detect_crashed_workers', detect)
++        real_time = observer.time
++
++        def sleep(seconds):
++            self.sleeps += 1
++            if self.sleeps > self.polls:
++                raise Stuck('observer kept polling a stale generation')
++            if self.on_sleep:
++                self.on_sleep(self.sleeps)
++        monkeypatch.setattr(observer, 'time', SimpleNamespace(
++            sleep=sleep, monotonic=real_time.monotonic, time=real_time.time))
++
++    def relocate(self):
++        """One archive/delete/recreate attempt; busy refusal is also correct."""
++        if self.moved:
++            return
++        try:
++            kb.remove_board(SLUG, archive=self.action != 'delete')
++        except ValueError as exc:
++            assert 'busy' in str(exc), exc
++            self.outcome = 'refused'
++            return
++        self.moved, self.outcome = True, 'moved'
++        if self.action == 'archive_recreate':
++            # A separate process, like the real observer's peers: recreating in
++            # this process would make native recovery close the observer's handle.
++            done = subprocess.run(
++                [sys.executable, '-c', _RECREATE, SLUG], capture_output=True, text=True,
++                encoding='utf-8', env=build_subprocess_env(), cwd=str(REPO), timeout=60, check=False)
++            assert done.returncode == 0, done.stderr
++            self.new_task = done.stdout.strip()
++
++    def at_ack(self, monkeypatch):
++        outer = self
++
++        class Out:
++            class buffer:
++                @staticmethod
++                def write(data):
++                    outer.relocate()
++
++                @staticmethod
++                def flush():
++                    pass
++        monkeypatch.setattr(sys, 'stdout', Out)
++
++    def new_generation_untouched(self):
++        if self.action != 'archive_recreate' or not self.moved:
++            return
++        with connect_closing(self.gen.path) as fresh:
++            assert fresh.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0] == 0
++            kinds = [r[0] for r in fresh.execute('SELECT kind FROM task_events')]
++            assert 'crashed' not in kinds and 'worker_result' not in kinds, kinds
++            assert fresh.execute('SELECT status FROM tasks WHERE id=?', (self.new_task,)).fetchone()[0] == 'ready'
++
++    def old_generation_untouched(self):
++        if self.moved and self.action != 'delete':
++            assert self.gen.conn.execute('SELECT status FROM task_runs WHERE id=?',
++                                         (self.gen.context['run_id'],)).fetchone()[0] == 'running'
++
++
++@pytest.mark.parametrize('action', ACTIONS)
++def test_observer_stops_polling_when_board_leaves_its_path(gen, monkeypatch, action):
++    drive = Drive(gen, monkeypatch, action)
++    drive.at_ack(monkeypatch)  # relocated immediately after the acknowledgement
++    observer.observe(gen.context)  # a stale poller never returns -> Stuck
++    assert drive.moved and drive.closures == 0
++    drive.new_generation_untouched()
++
++
++@pytest.mark.parametrize('action', ACTIONS)
++def test_observer_stops_when_board_leaves_during_polling(gen, monkeypatch, action):
++    drive = Drive(gen, monkeypatch, action)
++    drive.on_sleep = lambda n: drive.relocate() if n == 1 else None
++    observer.observe(gen.context)
++    assert drive.moved and drive.sleeps <= 2 and drive.closures == 0
++    drive.new_generation_untouched()
++
++
++@pytest.mark.parametrize('action', ACTIONS)
++def test_failed_run_is_not_closed_in_a_relocated_generation(gen, monkeypatch, action):
++    _failed(gen)
++    drive = Drive(gen, monkeypatch, action)
++    drive.at_ack(monkeypatch)
++    observer.observe(gen.context)
++    assert drive.moved and drive.closures_after_move == 0
++    drive.old_generation_untouched()
++    drive.new_generation_untouched()
++
++
++@pytest.mark.parametrize('action', ACTIONS)
++def test_relocation_between_proof_and_closure_never_closes_stale_generation(gen, monkeypatch, action):
++    _failed(gen)
++    drive = Drive(gen, monkeypatch, action)
++    real_proof = reconcile.failed_result_proof
++
++    def proof(*args, **kwargs):
++        result = real_proof(*args, **kwargs)
++        if result is not None:
++            drive.relocate()  # the writer proved failure; now the board vanishes
++        return result
++    monkeypatch.setattr(reconcile, 'failed_result_proof', proof)
++    observer.observe(gen.context)
++    assert drive.outcome in ('refused', 'moved')
++    assert drive.closures_after_move == 0
++    drive.old_generation_untouched()
++    drive.new_generation_untouched()
++    if drive.outcome == 'refused':  # exclusion kept the generation: closure happened exactly once
++        assert drive.closures == 1
++        assert gen.conn.execute('SELECT status FROM task_runs WHERE id=?',
++                                (gen.context['run_id'],)).fetchone()[0] != 'running'
++
++
++@pytest.mark.parametrize('action', ACTIONS)
++def test_relocation_between_pre_lock_check_and_lock_is_revalidated(gen, monkeypatch, action):
++    """Move the board right after the lock-free generation check passes."""
++    _failed(gen)
++    drive = Drive(gen, monkeypatch, action)
++    real_check = owner.connection_db_path
++    calls = []
++
++    def check(conn, **kwargs):
++        value = real_check(conn, **kwargs)
++        calls.append(value)
++        if len(calls) == 1:
++            drive.relocate()
++        return value
++    monkeypatch.setattr(owner, 'connection_db_path', check)
++    observer.observe(gen.context)
++    assert drive.moved and drive.closures_after_move == 0
++    drive.old_generation_untouched()
++    drive.new_generation_untouched()
++
++
++def test_closure_excludes_native_archive_by_holding_the_generation_lock(gen, monkeypatch):
++    _failed(gen)
++    Drive(gen, monkeypatch, 'archive')  # installs the polling bound
++    real_detect = kbd.detect_crashed_workers
++    seen = []
++
++    def detect(*args, **kwargs):
++        with pytest.raises(ValueError, match='busy'):
++            kb.remove_board(SLUG)
++        seen.append(True)
++        return real_detect(*args, **kwargs)
++    monkeypatch.setattr(kbd, 'detect_crashed_workers', detect)
++    observer.observe(gen.context)
++    assert seen == [True]
++    assert gen.conn.execute('SELECT status FROM task_runs WHERE id=?',
++                            (gen.context['run_id'],)).fetchone()[0] != 'running'
++
++
++def test_polling_does_not_hold_the_dispatch_lock_between_polls(gen, monkeypatch):
++    drive = Drive(gen, monkeypatch, 'archive')
++    drive.on_sleep = lambda n: drive.relocate()  # native archive needs the lock free while idle
++    observer.observe(gen.context)
++    assert drive.outcome == 'moved'
++
++
++@pytest.mark.parametrize('lock_before_open', [True, False])
++def test_stalled_real_dispatch_process_does_not_prevent_closure(gen, monkeypatch, lock_before_open):
++    _failed(gen)
++    Drive(gen, monkeypatch, 'archive', polls=6)
++    command = """
++import sys
++from pathlib import Path
++from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++with _dispatch_tick_lock(Path(sys.argv[1])) as held:
++    assert held
++    print('locked', flush=True)
++    sys.stdin.read()
++"""
++    proc = None
++
++    def stall():
++        nonlocal proc
++        proc = subprocess.Popen([sys.executable, '-c', command, str(gen.path)],
++                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                                text=True, env=build_subprocess_env(), cwd=str(REPO))
++        assert proc.stdout.readline().strip() == 'locked'
++
++    if lock_before_open:
++        stall()
++    else:
++        class Out:
++            class buffer:
++                write = staticmethod(lambda data: stall())
++                flush = staticmethod(lambda: None)
++        monkeypatch.setattr(sys, 'stdout', Out)
++    start = time.monotonic()
++    try:
++        observer.observe(gen.context)
++        assert proc.poll() is None
++        assert gen.conn.execute('SELECT status FROM task_runs WHERE id=?',
++                                (gen.context['run_id'],)).fetchone()[0] != 'running'
++        assert time.monotonic() - start < 5
++    finally:
++        if proc:
++            proc.communicate(input='', timeout=10)
++
++
++@pytest.mark.parametrize('archive', [True, False])
++def test_generation_lock_refuses_native_relocation_without_pointer_change(gen, archive):
++    kb.set_current_board(SLUG)
++    key = gen.path.with_name(gen.path.name + '.generation')
++    with _dispatch_tick_lock(key, create_parent=False) as held:
++        assert held
++        with pytest.raises(ValueError, match='busy'):
++            kb.remove_board(SLUG, archive=archive)
++        assert kb.get_current_board() == SLUG
++        assert gen.path.is_file()
+-- 
+2.43.0
+

@@ -1,0 +1,174 @@
+From 874b9e1169a24103a239f9842c70a23fc3f2eea3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:57:40 +0000
+Subject: [PATCH] [daveey] Exercise persisted completion dispatch across
+ producer interpreter exit
+
+---
+ .../tools/test_process_readopt_output_log.py  | 120 +++++++++++++++++-
+ 1 file changed, 117 insertions(+), 3 deletions(-)
+
+diff --git a/tests/tools/test_process_readopt_output_log.py b/tests/tools/test_process_readopt_output_log.py
+index 989cf62280..66fe9baee7 100644
+--- a/tests/tools/test_process_readopt_output_log.py
++++ b/tests/tools/test_process_readopt_output_log.py
+@@ -1,6 +1,13 @@
+ """A Desktop restart must route file-backed completions to unopened chats."""
+ import json
++import os
++from pathlib import Path
++import shlex
++import signal
++import subprocess
++import sys
+ import threading
++import time
+ 
+ import pytest
+ 
+@@ -15,14 +22,16 @@ procs = helpers.procs
+ 
+ 
+ @pytest.mark.parametrize("exit_before_recovery", [False, True])
++@pytest.mark.parametrize("owner,notify", [("tui", True), ("gateway", True), ("tui", False)])
+ def test_readopted_log_wakes_owning_chat_once(
+-    checkpoint, procs, tmp_path, monkeypatch, exit_before_recovery,
++    checkpoint, procs, tmp_path, monkeypatch, exit_before_recovery, owner, notify,
+ ):
+     child = procs()
+     log = tmp_path / "proc_restart.log"
+     log.write_text("finished persisted work\n")
+     monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
+-    entry = _entry("proc_restart", child.pid, TUI_KEY)
++    key = TUI_KEY if owner == "tui" else helpers.GW_KEY
++    entry = _entry("proc_restart", child.pid, key, notify=notify)
+     entry.update(output_log=str(log), persist_on_release=True)
+     checkpoint.write_text(json.dumps([entry]))
+     if exit_before_recovery:
+@@ -37,13 +46,19 @@ def test_readopted_log_wakes_owning_chat_once(
+         ready.set()
+ 
+     registry.on_unknown_exit = wake
+-    assert registry.recover_from_checkpoint(owner="tui") == 1
++    assert registry.recover_from_checkpoint(owner=owner) == 1
+     session = registry.get("proc_restart")
+     assert session is not None
+     if not exit_before_recovery:
+         log.with_suffix(".exit").write_text("0\n")
+         _kill(child)
+     assert session._completion_event.wait(5)
++    if owner != "tui" or not notify:
++        assert delivered == []
++        if notify:
++            assert registry.completion_queue.get_nowait()["session_key"] == key
++        assert registry.completion_queue.empty()
++        return
+     assert ready.wait(1), "completion never reached the unopened chat's wake sink"
+     assert len(delivered) == 1
+     assert delivered[0]["session_key"] == TUI_KEY
+@@ -53,3 +68,102 @@ def test_readopted_log_wakes_owning_chat_once(
+     registry.recover_from_checkpoint(owner="tui")
+     assert len(delivered) == 1
+     assert registry.completion_queue.empty()
++
++
++# A real producer interpreter writes the checkpoint, then exits without its reader.
++# The replacement below uses the real Desktop sink/parking/batch dispatch; only the
++# model-turn submit boundary is recorded rather than invoking a model.
++_SPAWNER = '''
++import json, os, sys
++from pathlib import Path
++import tools.process_registry as pr
++from tools import process_registry_output_log as logs
++pr.CHECKPOINT_PATH = Path(sys.argv[1])
++logs.output_dir = lambda: Path(sys.argv[2])
++registry = pr.ProcessRegistry()
++session = registry.spawn_local(sys.argv[3], cwd=sys.argv[2], session_key=sys.argv[4],
++                              owner_task_id=sys.argv[4], persist_on_release=True)
++session.notify_on_complete = True
++registry._write_checkpoint()
++print(json.dumps(dict(id=session.id, pid=session.pid, log=session.output_log)), flush=True)
++os._exit(0)
++'''
++
++
++@pytest.mark.skipif(os.name != "posix", reason="persisted shell trap is POSIX-only")
++@pytest.mark.parametrize("exit_while_down", [False, True])
++def test_interpreter_restart_dispatches_one_completion_turn(
++    checkpoint, tmp_path, monkeypatch, exit_while_down,
++):
++    from tools.environments.local import build_subprocess_env
++    from tui_gateway import server
++    from tools.process_registry_notifications import format_process_notification
++
++    gate = tmp_path / "release"
++    command = f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.02; done; printf "restart-proof\\n"; exit 7'
++    producer = subprocess.run(
++        [sys.executable, "-c", _SPAWNER, str(checkpoint), str(tmp_path), command, TUI_KEY],
++        cwd=str(Path(__file__).resolve().parents[2]), env=build_subprocess_env(),
++        capture_output=True, text=True, encoding="utf-8", timeout=20, check=True,
++    )
++    job = json.loads(producer.stdout.strip().splitlines()[-1])
++    registry = ProcessRegistry()
++    session = None
++    wake_threads = []
++    resumed = []
++    turns = []
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    monkeypatch.setattr(server, "_notif_live_session_matches", lambda keys, exclude=None: False)
++    monkeypatch.setitem(server._methods, "session.resume",
++                        lambda rid, params: resumed.append(params) or {"result": {"session_id": TUI_KEY}})
++    monkeypatch.setattr(server, "_session_owns_notification_event",
++                        lambda sid, state, evt: sid == evt.get("session_key"))
++    monkeypatch.setattr(server, "_notification_event_belongs_elsewhere", lambda *args: False)
++    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
++    monkeypatch.setattr(server, "_notif_submit",
++                        lambda rid, sid, state, text, *args, **kwargs: turns.append((sid, text, kwargs)) or True)
++    registry.on_unknown_exit = lambda event: wake_threads.append(
++        server._readopted_exit_deliver(event, registry=registry))
++    entries = json.loads(checkpoint.read_text())
++    try:
++        assert entries[0]["persist_on_release"] and entries[0]["notify_on_complete"]
++        assert not registry._writer_alive(entries[0]), "producer must really be gone"
++        if exit_while_down:
++            gate.touch()
++            deadline = time.monotonic() + 5
++            while registry._detached_host_fate(job["pid"], entries[0]["host_start_time"]) == "running":
++                assert time.monotonic() < deadline
++                time.sleep(0.02)
++        assert registry.recover_from_checkpoint(owner="tui") == 1
++        session = registry.get(job["id"])
++        assert session is not None
++        gate.touch()
++        assert session._completion_event.wait(5)
++        assert wake_threads, "file-backed exit bypassed Desktop wake sink"
++        for thread in wake_threads:
++            if thread:
++                thread.join(5)
++                assert not thread.is_alive()
++        assert [item["session_id"] for item in resumed] == [TUI_KEY]
++        state = {"history_lock": threading.RLock(), "running": False,
++                 "history": [], "agent": None, "profile_home": None}
++        handle = lambda events, deferred: server._notif_handle_ready(
++            TUI_KEY, state, events, set(), registry, format_process_notification, deferred)
++        assert server._notif_take_parked(TUI_KEY, state, registry, handle) == 1
++        assert len(turns) == 1
++        assert turns[0][0] == TUI_KEY
++        assert turns[0][2]["display_kind"] == "process_complete"
++        assert "restart-proof" in turns[0][1]
++        assert session.exit_code == 7
++        registry.sweep_detached_once()
++        registry.recover_from_checkpoint(owner="tui")
++        assert server._notif_take_parked(TUI_KEY, state, registry, handle) == 0
++        assert len(turns) == 1
++        assert registry.completion_queue.empty()
++    finally:
++        gate.touch()
++        if session and session._reader_thread:
++            session._reader_thread.join(5)
++        if registry._detached_host_fate(job["pid"], entries[0]["host_start_time"]) == "running":
++            os.kill(job["pid"], signal.SIGKILL)
++
+-- 
+2.43.0
+

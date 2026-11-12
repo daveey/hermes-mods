@@ -1,0 +1,454 @@
+From 24992d05d25ec1878b4189f4259af188ee7192b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:58:41 +0000
+Subject: [PATCH] [daveey] Refill worker copies an older newest-200 pickup
+ truncated; hermes kanban sync refill-history
+
+kanban_worker_node._changes_for used to import only the newest 200 task_events (EVENT_TAIL). Main
+now copies the whole history (c4b8359b8f), but copies picked up before that stay truncated: a long
+hub card re-picked-up by worker-1 (t_01a1ccf95e85a6f1, 17 runs, 382 events) lost its early
+owner_admitted rows, so hermes-core-wt ship refused to land PR #1204: 'run N started an agent but
+recorded no session'.
+
+- kanban_pickup_history.refill fills the missing event prefix of an open foreign copy from the
+  replica by uid: never invents rows, skips events whose run is not local, suppresses capture.
+  Refilled rows take negative local ids below every existing id, so they sort first, are never
+  'the latest X', and never cross a notifier cursor (no re-sent notifications). Safe on running cards.
+- Runs on every pickup tick and on demand: hermes kanban sync refill-history [TASK_ID ...] [--json].
+- Regression test: a card with >200 events keeps early-run admissions through pickup.
+
+Verified against the real hermes-core-wt-land landing_sessions(): full and refilled copies
+accepted; truncated copy and a Board-missing admission still refused.
+---
+ hermes_cli/kanban_parser.py                   |   4 +
+ hermes_cli/kanban_pickup_history.py           | 105 ++++++++++
+ hermes_cli/kanban_sync_cli.py                 |  38 +++-
+ hermes_cli/kanban_worker_node.py              |  21 ++
+ .../hermes_cli/test_kanban_pickup_history.py  | 187 ++++++++++++++++++
+ 5 files changed, 353 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_history.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_history.py
+
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 709a663d46..f67eeec547 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -646,6 +646,10 @@ _SPECS = [
+         _cmd("reconcile", [_json_flag()],
+              help="After the board file lost rows (a recovery): upload rows the service lacks, restore this "
+                   "gateway's rows the file lost from the service snapshot, then diff (exit 1 if not clean)"),
++        _cmd("refill-history", [_json_flag(), _arg("task_ids", nargs="*", metavar="TASK_ID",
++                                                   help="Cards to refill (default: every open copied card)")],
++             help="Refill events an older pickup cut off local copies of other gateways' cards, from the replica "
++                  "(by uid; never invents rows; safe on running cards)"),
+     ]), help="Central Kanban sync (kanban.sync.*): attach, import, status, diff"),
+     _cmd("recover", [
+         _json_flag(help="Emit the recovery report as JSON"),
+diff --git a/hermes_cli/kanban_pickup_history.py b/hermes_cli/kanban_pickup_history.py
+new file mode 100644
+index 0000000000..79e08c5394
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_history.py
+@@ -0,0 +1,105 @@
++"""Refill a picked-up card's truncated event history from the replica. [daveey]
++
++Before the full-history pickup, ``kanban_worker_node._changes_for`` copied only a card's newest 200 ``task_events``.
++A long card re-picked-up by a worker node then held its runs but not their early events, so the run's
++``owner_admitted`` (the session that ran it) was gone and ``hermes-core-wt ship`` refused to land:
++``run N started an agent but recorded no session`` (t_01a1ccf95e85a6f1, 2026-11-12).
++
++:func:`refill` repairs such a copy from this board's replica (the Board's full mirror), never inventing a row:
++
++* Only a foreign copy (``created_on`` another gateway) is refilled; this gateway's own cards are authoritative here.
++* Only the missing *prefix* is filled: replica events older than the earliest event the copy already holds, matched
++  by ``uid``. A newer gap is not a truncation and the feed delivers it; refilling it could race that feed.
++* Every refilled row keeps its replica ``uid``, ``kind``, ``payload`` and ``created_at``; its run is the local run
++  with the same run uid. An event whose run is not here is skipped (reported ``unresolved``), never re-homed.
++* A refilled row takes a negative local id below every existing one, oldest lowest. It therefore sorts before the
++  copy's live history, is never "the latest X" (``ORDER BY id DESC``), and never crosses a notifier cursor
++  (``id > last_event_id``), so no subscriber is re-sent old events. Rows are inserted with capture suppressed, so
++  nothing is pushed back to the Board.
++
++It is idempotent and safe on a running card (one write transaction). The dispatcher's pickup runs it for every
++local copy each tick; ``hermes kanban sync refill-history`` runs it on demand.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Iterable, Optional
++
++from hermes_cli import kanban_db_sync as sync
++
++
++def foreign_copies(conn: sqlite3.Connection, own: str) -> list[str]:
++    """Ids of the local copies of other gateways' cards that are still open (gc trims terminal cards' events)."""
++    return [r[0] for r in conn.execute(
++        "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ? AND status NOT IN ('done', 'archived') "
++        "ORDER BY id", (own,))]
++
++
++def _missing_prefix(conn: sqlite3.Connection, replica: sqlite3.Connection, tid: str) -> Optional[list[sqlite3.Row]]:
++    """Replica events older than the copy's earliest held one (oldest first); None when the copy holds none."""
++    held = {r[0] for r in conn.execute("SELECT uid FROM task_events WHERE task_id = ? AND uid IS NOT NULL", (tid,))}
++    if not held:
++        return None
++    out: list[sqlite3.Row] = []
++    for row in replica.execute("SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)):
++        if row["uid"] in held:
++            return out
++        if row["uid"] is not None:
++            out.append(row)
++    return None  # the replica has none of the copy's events: no anchor, nothing provably older
++
++
++def refill(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str,
++           ids: Optional[Iterable[str]] = None) -> dict[str, dict]:
++    """Fill each copy's missing event prefix from the replica. ``{task_id: {"filled", "unresolved", "reason"?}}``;
++    with ``ids`` None every foreign copy is checked and only cards with something to report are returned."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_db_connect import write_txn
++    explicit = ids is not None
++    targets = list(ids) if explicit else foreign_copies(conn, own)
++    report: dict[str, dict] = {}
++    for tid in targets:
++        card = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (tid,)).fetchone()
++        if card is None or card[0] in (None, own):
++            if explicit:
++                report[tid] = {"filled": 0, "unresolved": 0,
++                               "reason": "not here" if card is None else "this gateway's own card (authoritative)"}
++            continue
++        missing = _missing_prefix(conn, replica, tid)
++        if not missing:
++            if explicit:
++                report[tid] = {"filled": 0, "unresolved": 0,
++                               **({"reason": "no anchor event in the replica"} if missing is None else {})}
++            continue
++        wire = [(row["uid"], ksc._row_fields(replica, "task_events", row)) for row in missing]
++        filled = unresolved = 0
++        with write_txn(conn):
++            conn.execute("UPDATE kanban_sync_state SET applying = 1")
++            try:
++                held = {r[0] for r in conn.execute("SELECT uid FROM task_events WHERE task_id = ?", (tid,))}
++                low = conn.execute("SELECT MIN(id) FROM task_events").fetchone()[0]
++                next_id = min(0, low or 0) - 1
++                for uid, fields in reversed(wire):  # newest first: the oldest gets the lowest id
++                    if uid in held or sync._tombstoned(conn, "task_events", uid):
++                        continue
++                    run_uid = fields.get(sync._wire_name("task_events", "run_id"))
++                    if run_uid is not None and not conn.execute(
++                            "SELECT 1 FROM task_runs WHERE uid = ? AND task_id = ?", (run_uid, tid)).fetchone():
++                        unresolved += 1  # its run is not here: never re-home it or mint a placeholder run
++                        continue
++                    cols = sync._local_fields(conn, "task_events", fields, tid)
++                    cols.pop("id", None)
++                    cols.pop("uid", None)
++                    if cols.get("task_id", tid) != tid:
++                        unresolved += 1
++                        continue
++                    cols["task_id"] = tid
++                    names = ["id", "uid", *cols]
++                    conn.execute(f"INSERT INTO task_events ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
++                                 (next_id, uid, *cols.values()))
++                    next_id -= 1
++                    filled += 1
++            finally:
++                conn.execute("UPDATE kanban_sync_state SET applying = 0")
++        report[tid] = {"filled": filled, "unresolved": unresolved}
++    return report
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 70918d7692..7794c015f7 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -182,14 +182,48 @@ def _machine_links(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _refill_history(args: argparse.Namespace) -> int:
++    """Refill the event prefix a pre-full-history pickup cut off local copies of other gateways' cards, from this
++    board's replica (``kanban_pickup_history``). Exit 1 when a named card could not be refilled completely."""
++    from hermes_cli import kanban_worker_node as wn
++    from hermes_cli.kanban_pickup_history import refill
++    slug = _board(args)
++    conn = kbc.connect(_path(slug))
++    try:
++        if sync.board_mode(conn) == "off":
++            print(f"kanban sync: {slug} does not sync to the Board service; nothing to refill")
++            return 2
++        replica = wn.open_replica(conn)
++        if replica is None:
++            print(f"kanban sync: {slug} has no replica yet (run `hermes kanban sync run` first)")
++            return 2
++        try:
++            report = refill(conn, replica, wn._own(conn), args.task_ids or None)
++        finally:
++            replica.close()
++    finally:
++        conn.close()
++    if args.json:
++        print(json.dumps(report, indent=2))
++    elif not report:
++        print(f"kanban sync: {slug}: every open copied card already holds its full history")
++    else:
++        for tid, r in report.items():
++            print(f"{tid}: filled={r['filled']} unresolved={r['unresolved']}"
++                  + (f" ({r['reason']})" if r.get("reason") else ""))
++    return 1 if any(r["unresolved"] or r.get("reason") for r in report.values()) else 0
++
++
+ _ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
+-            "links": _links, "links-diff": _links_diff, "reconcile": _reconcile, "machine-links": _machine_links}
++            "links": _links, "links-diff": _links_diff, "reconcile": _reconcile, "machine-links": _machine_links,
++            "refill-history": _refill_history}
+ 
+ 
+ def cmd_sync(args: argparse.Namespace) -> int:
+     action = getattr(args, "sync_action", None)
+     if action not in _ACTIONS:
+-        print("usage: hermes kanban sync {status,attach,import,diff,run,links,links-diff,reconcile} [--board B]")
++        print("usage: hermes kanban sync {status,attach,import,diff,run,links,links-diff,reconcile,machine-links,"
++              "refill-history} [--board B]")
+         return 2
+     try:
+         return _ACTIONS[action](args)
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index ea8e617d9c..0251f144e5 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -43,6 +43,8 @@ REGISTRY_RETRY_S = 5
+ # Copy at most this many cards per tick when the dispatcher has no cap.
+ DEFAULT_PICKUP_BATCH = 4
+ # Import runs before events so portable run UIDs resolve to the copied runs.
++# [daveey] Copies truncated by the old newest-200 event tail (t_01a1ccf95e85a6f1 lost its early ``owner_admitted``
++# rows, so ship's land gate refused) are refilled by kanban_pickup_history.
+ _CHILD_TABLES = ("task_runs", "task_comments", "task_attachments", "task_events")
+ 
+ _REGISTRY: dict[str, Any] = {"at": None, "value": None, "retry": False}
+@@ -534,6 +536,7 @@ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+     if sync.board_mode(conn) != "primary" or mode is None:
+         return []
+     evict(conn)
++    _refill_copies(conn)
+     limit = DEFAULT_PICKUP_BATCH if budget is None else budget
+     if limit <= 0:
+         note_capped(conn, profile_exists)
+@@ -554,6 +557,24 @@ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+     return imported
+ 
+ 
++def _refill_copies(conn: sqlite3.Connection) -> None:
++    """Refill the event prefix a pre-full-history pickup cut off each local copy (``kanban_pickup_history``)."""
++    try:
++        replica = open_replica(conn)
++        if replica is None:
++            return
++        try:
++            from hermes_cli.kanban_pickup_history import refill
++            filled = {t: r for t, r in refill(conn, replica, _own(conn)).items() if r["filled"]}
++        finally:
++            replica.close()
++    except Exception:  # health: allow BLE001 -- a history repair must never stop a pickup
++        _log.warning("kanban worker node: could not refill copied card history", exc_info=True)
++        return
++    if filled:
++        _log.info("kanban worker node: refilled truncated history from the replica: %s", filled)
++
++
+ def _record_skips(conn: sqlite3.Connection, skips: dict[str, tuple[str, Optional[str]]]) -> None:
+     from hermes_cli import kanban_pickup_stall as kps
+     try:
+diff --git a/tests/hermes_cli/test_kanban_pickup_history.py b/tests/hermes_cli/test_kanban_pickup_history.py
+new file mode 100644
+index 0000000000..5a4e0f1ca3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_history.py
+@@ -0,0 +1,187 @@
++"""A picked-up card carries its whole event history, and a copy an older pickup truncated is refilled from the
++replica (``kanban_worker_node._changes_for``, ``kanban_pickup_history``). [daveey]
++
++Production 11-12: worker-1 re-picked-up the long hub card t_01a1ccf95e85a6f1 with only its newest 200 events, so its
++early runs' ``owner_admitted`` rows were gone and ``hermes-core-wt ship`` refused to land PR #1204 (``run N started
++an agent but recorded no session``). The land gate's rule is mirrored by :func:`_unadmitted_runs`."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sqlite3
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_pickup_history as kph
++from hermes_cli import kanban_sync_cli
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as fixtures
++
++BOARD = fixtures.BOARD
++gws, svc = fixtures.gws, fixtures.svc  # the shared hub + worker-1 gateways on one fake Board
++
++LONG = 260  # more than the old 200-event pickup tail
++EXECUTION = ("spawned", "owner_admitted", "worker_bound", "heartbeat", "completed")
++
++
++def _unadmitted_runs(conn, tid):
++    """Runs with execution events but no ``owner_admitted`` session: what ship's ``landing_sessions`` refuses."""
++    events = kb.list_events(conn, tid)
++    return sorted({e.run_id for e in events if e.kind in EXECUTION and e.run_id is not None}
++                  - {e.run_id for e in events if e.kind == "owner_admitted" and (e.payload or {}).get("session_id")})
++
++
++def _admissions(conn, tid):
++    return {r["uid"]: r["session"] for r in conn.execute(
++        "SELECT r.uid, json_extract(e.payload, '$.session_id') AS session FROM task_events e "
++        "JOIN task_runs r ON r.id = e.run_id WHERE e.task_id = ? AND e.kind = 'owner_admitted'", (tid,))}
++
++
++def _long_card_repicked_up(hub, worker):
++    """A hub card run once on the worker (admitted, then LONG heartbeats), blocked, evicted, unblocked on the hub
++    and picked up again by the worker: the production shape."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="long card", assignee="default", runs_on=["linux"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    worker.enter()
++    run1 = worker.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert run1 is not None
++    with worker.conn:
++        kb._append_event(worker.conn, tid, "owner_admitted", {"session_id": "sess-run1"}, run_id=run1)
++        for _ in range(LONG):
++            kb._append_event(worker.conn, tid, "heartbeat", None, run_id=run1)
++    assert kb.block_task(worker.conn, tid, reason="needs a decision", expected_run_id=run1)
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None  # evicted once pushed
++    hub.round()
++    hub.enter()
++    assert kb.unblock_task(hub.conn, tid)
++    hub.round()
++    worker.round()
++    worker.tick()
++    worker.enter()
++    task = kb.get_task(worker.conn, tid)
++    assert task is not None and task.status == "running" and task.current_run_id != run1
++    with worker.conn:  # the new run's own admission, as a real spawn records it
++        kb._append_event(worker.conn, tid, "owner_admitted", {"session_id": "sess-run2"}, run_id=task.current_run_id)
++    return tid
++
++
++def _replica(worker) -> sqlite3.Connection:
++    worker.enter()
++    replica = wn.open_replica(worker.conn)
++    assert replica is not None
++    return replica
++
++
++def test_pickup_copies_the_whole_history_so_early_admissions_survive(gws):
++    hub, worker = gws
++    tid = _long_card_repicked_up(hub, worker)
++    replica = _replica(worker)
++    try:
++        want = {r[0] for r in replica.execute("SELECT uid FROM task_events WHERE task_id = ?", (tid,))}
++        run1_uid = replica.execute("SELECT uid FROM task_runs WHERE task_id = ? ORDER BY id LIMIT 1",
++                                   (tid,)).fetchone()[0]
++    finally:
++        replica.close()
++    assert len(want) > LONG
++    have = {r[0] for r in worker.conn.execute("SELECT uid FROM task_events WHERE task_id = ?", (tid,))}
++    assert want <= have
++    assert _admissions(worker.conn, tid)[run1_uid] == "sess-run1"
++    assert worker.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND id < 0", (tid,)).fetchone()[0] == 0
++    # Copied oldest first: local ids follow the card's own order.
++    created = [r[0] for r in worker.conn.execute("SELECT created_at FROM task_events WHERE task_id = ? ORDER BY id",
++                                                 (tid,))]
++    assert created == sorted(created)
++
++
++def _truncate(worker, tid, keep):
++    """What a pre-fix pickup left: only the newest ``keep`` events of the card (deleted without capture)."""
++    conn = worker.conn
++    with conn:
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        conn.execute("DELETE FROM task_events WHERE task_id = ? AND id NOT IN (SELECT id FROM task_events "
++                     "WHERE task_id = ? ORDER BY id DESC LIMIT ?)", (tid, tid, keep))
++        conn.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++def test_refill_restores_a_truncated_running_copy_from_the_replica(gws):
++    hub, worker = gws
++    tid = _long_card_repicked_up(hub, worker)
++    conn = worker.conn
++    _truncate(worker, tid, 200)
++    run1 = conn.execute("SELECT id FROM task_runs WHERE task_id = ? ORDER BY id LIMIT 1", (tid,)).fetchone()[0]
++    assert run1 in _unadmitted_runs(conn, tid)  # the land gate would refuse this copy
++    before = {r["id"]: tuple(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id = ?", (tid,))}
++    top = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
++    outbox = conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0]
++    replica = _replica(worker)
++    try:
++        held = {r[0] for r in conn.execute("SELECT uid FROM task_events WHERE task_id = ?", (tid,))}
++        order = [r[0] for r in replica.execute("SELECT uid FROM task_events WHERE task_id = ? ORDER BY id", (tid,))
++                 if r[0] not in held]
++        missing = len(order)
++        report = kph.refill(conn, replica, wn._own(conn))
++        assert kph.refill(conn, replica, wn._own(conn)) == {}  # idempotent
++    finally:
++        replica.close()
++    assert missing > 0 and report[tid]["filled"] == missing and report[tid]["unresolved"] == 0
++    assert _unadmitted_runs(conn, tid) == []
++    assert _admissions(conn, tid)
++    # Existing rows untouched; refilled rows sort before them and never cross a notifier cursor (id > MAX).
++    assert {r["id"]: tuple(r) for r in conn.execute(
++        "SELECT * FROM task_events WHERE task_id = ? AND id > 0", (tid,))} == before
++    assert conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] == top
++    refilled = [r[0] for r in conn.execute("SELECT uid FROM task_events WHERE task_id = ? AND id < 0 ORDER BY id",
++                                           (tid,))]
++    assert refilled == order  # the card's own order, oldest lowest
++    assert conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == outbox  # nothing pushed
++    task = kb.get_task(conn, tid)
++    assert task is not None and task.status == "running"
++
++
++def test_refill_never_invents_a_missing_admission(gws):
++    """An admission the Board itself lacks stays missing, so the land gate still refuses."""
++    hub, worker = gws
++    tid = _long_card_repicked_up(hub, worker)
++    _truncate(worker, tid, 200)
++    worker.enter()
++    path = wn._replica_path(worker.conn)
++    raw = sqlite3.connect(path)
++    with raw:
++        raw.execute("DELETE FROM task_events WHERE task_id = ? AND kind = 'owner_admitted'", (tid,))
++    raw.close()
++    replica = _replica(worker)
++    try:
++        report = kph.refill(worker.conn, replica, wn._own(worker.conn), [tid])
++    finally:
++        replica.close()
++    assert report[tid]["filled"] > 0
++    run1 = worker.conn.execute("SELECT id FROM task_runs WHERE task_id = ? ORDER BY id LIMIT 1", (tid,)).fetchone()[0]
++    assert run1 in _unadmitted_runs(worker.conn, tid)
++
++
++def test_refill_history_cli(gws, capsys):
++    hub, worker = gws
++    tid = _long_card_repicked_up(hub, worker)
++    _truncate(worker, tid, 200)
++    worker.enter()
++    args = argparse.Namespace(board=BOARD, task_ids=[tid, "t_missing"], json=True)
++    assert kanban_sync_cli.cmd_sync(argparse.Namespace(sync_action="refill-history", **vars(args))) == 1
++    out = json.loads(capsys.readouterr().out)
++    assert out[tid]["filled"] > 0 and out["t_missing"]["reason"] == "not here"
++    assert _unadmitted_runs(worker.conn, tid) == []
++    args.task_ids = [tid]
++    assert kanban_sync_cli.cmd_sync(argparse.Namespace(sync_action="refill-history", **vars(args))) == 0
++    assert json.loads(capsys.readouterr().out) == {tid: {"filled": 0, "unresolved": 0}}
++
++
++def test_pickup_tick_refills_open_copies(gws):
++    hub, worker = gws
++    tid = _long_card_repicked_up(hub, worker)
++    _truncate(worker, tid, 200)
++    worker.tick()
++    assert _unadmitted_runs(worker.conn, tid) == []
+-- 
+2.43.0
+

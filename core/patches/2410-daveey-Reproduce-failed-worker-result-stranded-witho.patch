@@ -1,0 +1,117 @@
+From f8f8ba3cd8fab96167c535ebca89c8872bf25478 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:20:37 +0000
+Subject: [PATCH] [daveey] Reproduce failed worker result stranded without
+ dispatcher
+
+---
+ .../test_kanban_failed_result_reconcile.py    | 97 +++++++++++++++++++
+ 1 file changed, 97 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_reconcile.py
+
+diff --git a/tests/hermes_cli/test_kanban_failed_result_reconcile.py b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+new file mode 100644
+index 0000000000..bcb376dcd6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+@@ -0,0 +1,97 @@
++"""Failed managed results must settle even with no owner dispatcher ticks."""
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_connect import connect_closing
++from tools.environments.local import build_subprocess_env
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path / 'kanban'))
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    monkeypatch.setenv('HERMES_KANBAN_BOARD', 'default')
++    path = kb.kanban_db_path(board='default')
++    kb.init_db()
++    with connect_closing(path) as conn:
++        tid = kb.create_task(conn, title='failed result fixture', assignee='default')
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        assert task is not None
++        yield conn, {'db': str(path), 'task_id': tid, 'run_id': task.current_run_id,
++                     'claim_lock': task.claim_lock}
++
++
++# stdin is a barrier: the parent records the real child's spawn identity first.
++_CHILD = '''
++import json, os, sys
++from pathlib import Path
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_connect import connect_closing
++from gateway.session_kanban import _record_worker_result
++context = json.loads(sys.argv[1])
++sys.stdin.read(1)
++with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
++    kb._append_event(conn, context['task_id'], 'worker_bound',
++        {'pid': os.getpid(), 'started_at': kbd._process_fingerprint(os.getpid()),
++         'claim_lock': context['claim_lock']}, run_id=context['run_id'])
++_record_worker_result(context, 1, 'fixture worker_receipt_timeout')
++raise SystemExit(1)
++'''
++
++
++def _failed_child(conn, context):
++    proc = subprocess.Popen(
++        [sys.executable, '-c', _CHILD, json.dumps(context)],
++        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        text=True, encoding='utf-8', env=build_subprocess_env(),
++        cwd=str(Path(__file__).resolve().parents[2]),
++    )
++    try:
++        kbd._set_worker_pid(conn, context['task_id'], proc.pid)
++        stdout, stderr = proc.communicate('x', timeout=30)
++        assert proc.returncode == 1, (stdout, stderr)
++        result = conn.execute(
++            "SELECT id, created_at, payload FROM task_events WHERE run_id=? AND kind='worker_result'",
++            (context['run_id'],)).fetchone()
++        assert result is not None, (stdout, stderr)
++        assert json.loads(result['payload'])['exit_code'] == 1
++        return result
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++
++
++@pytest.mark.parametrize('entry', ['stalled_owner', 'dispatcher'])
++def test_failed_child_reconciles_without_owner_progress(board, entry):
++    conn, context = board
++    result = _failed_child(conn, context)
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline:
++        if entry == 'dispatcher':
++            kbd.detect_crashed_workers(conn)
++        run = conn.execute('SELECT status, ended_at FROM task_runs WHERE id=?',
++                           (context['run_id'],)).fetchone()
++        if run['status'] != 'running':
++            break
++        time.sleep(.05)
++    assert run['status'] != 'running', dict(run)
++    assert run['ended_at'] >= result['created_at']
++    # A subsequent healthy tick cannot close/account the same failed run twice.
++    kbd.detect_crashed_workers(conn)
++    crashes = conn.execute("SELECT id FROM task_events WHERE run_id=? AND kind='crashed'",
++                           (context['run_id'],)).fetchall()
++    assert len(crashes) == 1
+-- 
+2.43.0
+

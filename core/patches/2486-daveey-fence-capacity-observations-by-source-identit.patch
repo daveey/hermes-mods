@@ -1,0 +1,739 @@
+From 6b466547d5887c8d187f65fdf5815d13e689926b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:10:11 +0000
+Subject: [PATCH] [daveey] fence capacity observations by source identity and
+ lifecycle
+
+---
+ docs/execution-observations-v1.md             |  26 ++-
+ hermes_cli/execution_observations.py          |  21 +-
+ hermes_cli/kanban_capacity_evidence.py        |  76 +++++--
+ schemas/execution-observation-v1.schema.json  |   5 +-
+ .../kanban-capacity-evidence-v1.schema.json   |  49 +++++
+ .../hermes_cli/test_execution_observations.py |  37 ++++
+ .../test_kanban_capacity_evidence.py          | 187 +++++++++++++++---
+ .../test_kanban_capacity_integration.py       |  18 +-
+ 8 files changed, 367 insertions(+), 52 deletions(-)
+ create mode 100644 schemas/kanban-capacity-evidence-v1.schema.json
+
+diff --git a/docs/execution-observations-v1.md b/docs/execution-observations-v1.md
+index a5a540c8e5..302cd4a855 100644
+--- a/docs/execution-observations-v1.md
++++ b/docs/execution-observations-v1.md
+@@ -19,7 +19,11 @@ Capacity-event fields named `*_ms` are milliseconds and must be explicitly conve
+ `observed_at` and `valid_until` belong to the producer. Consumer age is derived;
+ fetch, copy and file mtime never renew validity. Apply separate existing upper
+ bounds: sidebar 180 seconds, imported-owner 600 seconds. Validity cannot exceed
+-any required source's validity. Missing identity/timing, skew or unavailable data
++any required source's validity. Each required source may specify its original
++`source_class`; absent that field it inherits the envelope's class, never the
++consumer's fetch age. Its own observed time plus that class's TTL also bounds
++validity. Missing owner or nonempty evidence references, invalid attempt identity,
++missing identity/timing, skew or unavailable data
+ means unknown, not capacity, success, failure or stalled work. Preserve
+ `last_known_state` separately. Expired evidence is stale and current state unknown.
+ 
+@@ -48,6 +52,26 @@ semantics. Sibling status projectors may reuse this contract independently.
+ 
+ ## Tests and delivery state
+ 
++The task-detail `capacity_evidence` schema is
++`schemas/kanban-capacity-evidence-v1.schema.json`. Observation storage holds one
++bounded, local latest-dispatch snapshot, not replicated admission authority.
++Board identity comes from the actual connection, including pinned DBs; an
++explicit foreign read remains unknown. Changes to assignee, placement labels,
++attempt or parent state invalidate the previous observation. Reads never write.
++The 128-task bound exposes truncated coverage instead of inventing a complete
++fleet census. Native unmapped restrictions remain explicit alongside namespaced
++reasons; notes include the causal phase.
++
++`kanban_capacity_metrics.attempts` consumes ordered durable event histories.
++Missing ready transitions stay missing: created time is never substituted, and
++native retry events without an explicit ready status cannot establish readiness.
++Its summary preserves samples and censored attempts; p50 needs two samples and
++p95 needs twenty. `idle_coverage` unions shared machine/slot-pool intervals across
++boards. Only same-interval fresh complete backlog/slot/restriction coverage can
++produce unexplained idle slot-seconds. Unknown coverage is machine-seconds, not
++invented unknown slot-seconds. Current dispatch snapshots deliberately leave
++admissible slot counts unknown; configured limits are not measured free slots.
++
+ `tests/hermes_cli/test_execution_observations.py` exercises the pure adapter.
+ `tests/hermes_cli/test_kanban_capacity_harness.py` exercises actual isolated
+ four-card dispatch with fake spawn and a dependency control, capped at 120 seconds.
+diff --git a/hermes_cli/execution_observations.py b/hermes_cli/execution_observations.py
+index db710a63ec..5d55ce5c55 100644
+--- a/hermes_cli/execution_observations.py
++++ b/hermes_cli/execution_observations.py
+@@ -31,16 +31,21 @@ def capacity_reason(code, *, native_code, phase, evidence_ref):
+             "phase": phase, "evidence_ref": evidence_ref}
+ 
+ 
++def _attempt_valid(value):
++    return (type(value) is int and value > 0) or (isinstance(value, str) and bool(value))
++
++
+ def _identity_valid(identity):
+     if not isinstance(identity, dict):
+         return False
+     required = ["gateway", "profile", "kind", "work_id"]
+     if identity.get("kind") == "card":
+         required.append("board")
+-    elif not (identity.get("session") or identity.get("lineage")):
++    elif not any(isinstance(identity.get(k), str) and identity[k] for k in ("session", "lineage")):
+         return False
+     return (all(isinstance(identity.get(k), str) and identity[k] for k in required)
+-            and any(type(identity.get(k)) in (str, int) and bool(identity[k]) for k in ("run_id", "generation")))
++            and any(k in identity for k in ("run_id", "generation"))
++            and all(_attempt_valid(identity[k]) for k in ("run_id", "generation") if k in identity))
+ 
+ 
+ def _unknown(out, reason, *, freshness="unknown"):
+@@ -68,6 +73,13 @@ def adapt(value, *, now, source_class):
+         return _unknown(out, "legacy_or_unsupported_version")
+     if not _identity_valid(raw.get("identity")):
+         return _unknown(out, "missing_qualified_identity")
++    owner = raw.get("owner")
++    if not isinstance(owner, dict) or not all(isinstance(owner.get(k), str) and owner[k]
++                                             for k in ("gateway", "profile")):
++        return _unknown(out, "missing_qualified_owner")
++    refs = raw.get("evidence_refs")
++    if not isinstance(refs, list) or not refs or not all(isinstance(v, str) and v for v in refs):
++        return _unknown(out, "missing_evidence_references")
+     if not all(isinstance(raw.get(k), str) and raw[k] for k in ("source", "source_revision")):
+         return _unknown(out, "missing_source_identity")
+     ttl = SOURCE_TTLS.get(source_class)
+@@ -88,7 +100,10 @@ def adapt(value, *, now, source_class):
+             return _unknown(out, "missing_required_source_timing")
+         if end < at or now < at:
+             return _unknown(out, "clock_inconsistent")
+-        until = min(until, end)
++        source_ttl = SOURCE_TTLS.get(source.get("source_class", source_class))
++        if source_ttl is None:
++            return _unknown(out, "invalid_required_source_class")
++        until = min(until, end, at + source_ttl)
+     out.update(valid_until=until, age_seconds=now - observed)
+     if now >= until:
+         return _unknown(out, "source_expired", freshness="stale")
+diff --git a/hermes_cli/kanban_capacity_evidence.py b/hermes_cli/kanban_capacity_evidence.py
+index ff4087bf21..bf3d9e95e2 100644
+--- a/hermes_cli/kanban_capacity_evidence.py
++++ b/hermes_cli/kanban_capacity_evidence.py
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import re
+ import sqlite3
+ import time
+ import uuid
+@@ -19,13 +20,21 @@ TASK_LIMIT = 128
+ 
+ 
+ def _lifecycle(conn, task_id):
++    from hermes_cli import kanban_db as kb
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+     if row is None:
+         return None
+     row = dict(row)
+     count = conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
+     return {"status": row["status"], "run_id": row["current_run_id"],
+-            "runs_on": row.get("runs_on"), "run_count": count}
++            "runs_on": row.get("runs_on"), "run_count": count, "assignee": row.get("assignee"),
++            "parents": [list(p) for p in kb.parent_states(conn, task_id)]}
++
++
++def _board(conn):
++    from hermes_cli import kanban_db_sync as sync
++    path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
++    return sync.board_slug_for_path(path)
+ 
+ 
+ def _reason(code, native, reference, phase="pre_claim"):
+@@ -36,11 +45,16 @@ def _native_restrictions(result, tid, reference):
+     """Keep unmapped admission restrictions without inventing a capacity category."""
+     rows = []
+     if result.at_capacity:
+-        rows.append({"native_code": "at_capacity", "evidence_ref": reference})
++        rows.append({"source_field": "at_capacity", "native_code": result.at_capacity, "evidence_ref": reference})
+     for name in ("claim_deferred", "capsule_refused", "owner_down", "skipped_per_profile_capped", "respawn_guarded"):
+         for item in getattr(result, name):
+             if item[0] == tid:
+-                rows.append({"native_code": name, "evidence_ref": reference})
++                native = item[2] if name == "owner_down" else item[1]
++                if name == "skipped_per_profile_capped":
++                    native = name
++                # Native diagnostic tokens only, never arbitrary error text.
++                native = native if isinstance(native, str) and re.fullmatch(r"[A-Za-z0-9_.:/=-]{1,160}", native) else name
++                rows.append({"source_field": name, "native_code": native, "evidence_ref": reference})
+     return rows
+ 
+ 
+@@ -49,6 +63,9 @@ def _task_reasons(result, tid, reference):
+     for task, native in result.skipped_ineligible:
+         if task == tid:
+             reasons.append(_reason("placement", native, reference))
++    for task, native in result.claim_deferred:
++        if task == tid and native in {"labels_mismatch", "pinned_only", "offline"}:
++            reasons.append(_reason("placement", native, reference))
+     if tid in result.rate_limited:
+         # A reaped submitter can refuse before its managed worker ever starts.
+         reasons.append(_reason("provider_limit", "rate_limited", reference, "post_claim"))
+@@ -64,6 +81,31 @@ def _task_reasons(result, tid, reference):
+     return reasons
+ 
+ 
++def _provider_phase(conn, tid, reasons, now):
++    """A reaped rate-limit result is post-start only with its own bound receipt."""
++    if not any(r["native_code"] == "rate_limited" for r in reasons):
++        return
++    from hermes_cli.kanban_capacity_metrics import attempts
++    refusal = conn.execute("SELECT id, run_id, created_at FROM task_events "
++                           "WHERE task_id=? AND kind='rate_limited' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++    if refusal is None or refusal["run_id"] is None:
++        return
++    events = [dict(e) for e in conn.execute(
++        "SELECT id, kind, created_at, run_id, payload FROM task_events "
++        "WHERE task_id=? AND run_id=? AND id<=? ORDER BY id DESC LIMIT 256",
++        (tid, refusal["run_id"], refusal["id"])).fetchall()][::-1]
++    rows = attempts(events, board=_board(conn), task_id=tid, now=now)
++    matched = next((r for r in rows if r["run_id"] == refusal["run_id"]
++                    and r["claim_to_process_start_s"] is not None
++                    and r["process_start_at"] <= refusal["created_at"] <= now), None)
++    if matched:
++        for reason in reasons:
++            if reason["native_code"] == "rate_limited":
++                reason.update(phase="post_start", run_id=refusal["run_id"],
++                              evidence_ref=f"task_event:{_board(conn)}:{tid}:{refusal['id']}",
++                              process_ref=matched["process_ref"])
++
++
+ def record(conn, result, *, board, machine, now=None, update_drain=False, dry_run=False):
+     """Record only genuine dispatch observations; a failed diagnostic cannot stop dispatch.
+ 
+@@ -75,6 +117,7 @@ def record(conn, result, *, board, machine, now=None, update_drain=False, dry_ru
+     from hermes_cli import kanban_db as kb
+ 
+     now = time.time() if now is None else now
++    board = _board(conn)
+     revision = str(uuid.uuid4())
+     reference = f"dispatch:{machine}:{board}:{revision}"
+     common = []
+@@ -90,11 +133,12 @@ def record(conn, result, *, board, machine, now=None, update_drain=False, dry_ru
+             rows = conn.execute(
+                 "SELECT id, assignee, status, current_run_id, claim_lock FROM tasks "
+                 "WHERE status IN ('ready','todo','running','review','scheduled','blocked') "
+-                "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, id LIMIT ?", (TASK_LIMIT,)).fetchall()
++                "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, id LIMIT ?", (TASK_LIMIT + 1,)).fetchall()
+             tasks = {}
+-            for row in rows:
++            for row in rows[:TASK_LIMIT]:
+                 tid = row["id"]
+                 reasons = _task_reasons(result, tid, reference)
++                _provider_phase(conn, tid, reasons, now)
+                 parents = kb.unsatisfied_parents(conn, tid)
+                 if parents:
+                     reasons.append(_reason("dependency", "unsatisfied_parents", reference))
+@@ -108,7 +152,7 @@ def record(conn, result, *, board, machine, now=None, update_drain=False, dry_ru
+                      "source": "kanban.dispatch", "source_revision": revision, "machine": machine,
+                      "board": board, "evidence_ref": reference, "tasks": tasks,
+                      "machine_reasons": common,
+-                     "coverage_truncated": len(rows) == TASK_LIMIT}
++                     "coverage_truncated": len(rows) > TASK_LIMIT}
+         finally:
+             conn.execute("RELEASE capacity_snapshot")
+         with kb.write_txn(conn):
+@@ -127,7 +171,7 @@ def observe_dispatch(conn, result, *, board, dry_run=False, update_drain=False):
+         import socket
+         from hermes_cli import kanban_db_sync as sync
+         machine = (sync.sync_state(conn) or {}).get("gateway_id") or socket.gethostname()
+-        record(conn, result, board=board or "default", machine=machine,
++        record(conn, result, board=_board(conn), machine=machine,
+                dry_run=dry_run, update_drain=update_drain)
+     except Exception:  # health: allow BLE001 -- optional evidence cannot control admission
+         _log.warning("capacity observation unavailable", exc_info=True)
+@@ -141,10 +185,10 @@ def _unknown(reason, **fields):
+ 
+ def read(conn, task, *, board=None, now=None):
+     """Read a lifecycle-qualified observation without manufacturing freshness."""
+-    if board is None:
+-        from hermes_cli import kanban_db_sync as sync
+-        path = conn.execute("PRAGMA database_list").fetchone()[2]
+-        board = sync.board_slug_for_path(path)
++    actual_board = _board(conn)
++    if board is not None and board != actual_board:
++        return _unknown("missing_or_foreign_observation")
++    board = actual_board
+     now = time.time() if now is None else now
+     if task is None:
+         return _unknown("missing_task")
+@@ -157,7 +201,9 @@ def read(conn, task, *, board=None, now=None):
+         return _unknown("missing_or_foreign_observation")
+     stored = value.get("tasks", {}).get(task.id)
+     if not stored:
+-        return _unknown("task_not_observed")
++        truncated = value.get("coverage_truncated", False)
++        return _unknown("task_coverage_truncated" if truncated else "task_not_observed",
++                        coverage_truncated=truncated)
+     source = {k: value[k] for k in ("observed_at_ms", "valid_until_ms", "source", "source_revision",
+                                    "machine", "board", "evidence_ref")}
+     if stored["lifecycle"] != _lifecycle(conn, task.id):
+@@ -181,6 +227,7 @@ def read(conn, task, *, board=None, now=None):
+     if all(epoch(v) for v in (at, until, now)) and at <= now and until >= at:
+         freshness = "current" if now < min(until, at + 180) else "stale"
+     out = {"version": 1, **source, "task_id": task.id, "lifecycle": stored["lifecycle"],
++           "coverage_truncated": value.get("coverage_truncated", False),
+            "freshness": freshness, "reasons": stored["reasons"],
+            "native_restrictions": stored.get("native_restrictions", []),
+            "machine_reasons": value.get("machine_reasons", []),
+@@ -194,8 +241,9 @@ def read(conn, task, *, board=None, now=None):
+ 
+ def describe(value):
+     """Never turn an incomplete restriction list into an assertion of availability."""
+-    codes = ", ".join(r["code"] + " (" + r["native_code"] + ")" for r in value.get("reasons", []))
+-    native = ", ".join(r["native_code"] for r in value.get("native_restrictions", []))
++    codes = ", ".join(r["code"] + " (" + r["native_code"] + "; " + r["phase"] + ")" for r in value.get("reasons", []))
++    native = ", ".join(r.get("source_field", "restriction") + " (" + r["native_code"] + ")"
++                       for r in value.get("native_restrictions", []))
+     codes = "; ".join(v for v in (codes, native) if v)
+     return (f"{value.get('freshness', 'unknown')}: {codes or 'restriction coverage incomplete'}; "
+             "admissible capacity unknown")
+diff --git a/schemas/execution-observation-v1.schema.json b/schemas/execution-observation-v1.schema.json
+index 135e882550..e32564ec04 100644
+--- a/schemas/execution-observation-v1.schema.json
++++ b/schemas/execution-observation-v1.schema.json
+@@ -32,7 +32,7 @@
+     "last_known_state": {"type": ["string", "null"]},
+     "source": {"type": "string", "minLength": 1},
+     "source_revision": {"type": "string", "minLength": 1},
+-    "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
++    "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+     "observed_at": {"$ref": "#/$defs/epoch"},
+     "valid_until": {"$ref": "#/$defs/epoch"},
+     "last_activity": {"anyOf": [{"$ref": "#/$defs/epoch"}, {"type": "null"}]},
+@@ -47,7 +47,8 @@
+       }
+     }},
+     "required_sources": {"type": "array", "items": {"type": "object", "required": ["observed_at", "valid_until"], "properties": {
+-      "observed_at": {"$ref": "#/$defs/epoch"}, "valid_until": {"$ref": "#/$defs/epoch"}
++      "observed_at": {"$ref": "#/$defs/epoch"}, "valid_until": {"$ref": "#/$defs/epoch"},
++      "source_class": {"enum": ["sidebar", "imported_owner"]}
+     }}}
+   },
+   "$defs": {"epoch": {"type": "number", "minimum": 0, "maximum": 8640000000000}},
+diff --git a/schemas/kanban-capacity-evidence-v1.schema.json b/schemas/kanban-capacity-evidence-v1.schema.json
+new file mode 100644
+index 0000000000..5b5da11517
+--- /dev/null
++++ b/schemas/kanban-capacity-evidence-v1.schema.json
+@@ -0,0 +1,49 @@
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "$id": "urn:hermes:kanban-capacity-evidence:v1",
++  "title": "Advisory task capacity evidence v1",
++  "type": "object",
++  "required": ["version", "freshness", "reasons", "eligible_backlog", "admissible_slots", "unknown_coverage"],
++  "properties": {
++    "version": {"const": 1},
++    "freshness": {"enum": ["current", "stale", "unknown"]},
++    "unknown_reason": {"type": "string", "minLength": 1},
++    "observed_at_ms": {"type": "number", "minimum": 0},
++    "valid_until_ms": {"type": "number", "minimum": 0},
++    "source": {"const": "kanban.dispatch"},
++    "source_revision": {"type": "string", "minLength": 1},
++    "machine": {"type": "string", "minLength": 1},
++    "board": {"type": "string", "minLength": 1},
++    "task_id": {"type": "string", "minLength": 1},
++    "evidence_ref": {"type": "string", "minLength": 1},
++    "lifecycle": {"type": "object", "required": ["status", "run_id", "run_count", "assignee", "parents"], "properties": {
++      "status": {"type": "string"}, "run_id": {"type": ["integer", "null"]},
++      "run_count": {"type": "integer", "minimum": 0}, "assignee": {"type": ["string", "null"]},
++      "parents": {"type": "array"}
++    }},
++    "reasons": {"type": "array", "items": {"$ref": "#/$defs/reason"}},
++    "machine_reasons": {"type": "array", "items": {"$ref": "#/$defs/reason"}},
++    "native_restrictions": {"type": "array", "items": {
++      "type": "object", "required": ["source_field", "native_code", "evidence_ref"],
++      "properties": {"source_field": {"type": "string"}, "native_code": {"type": "string"}, "evidence_ref": {"type": "string"}}
++    }},
++    "eligible_backlog": {"type": ["boolean", "null"]},
++    "admissible_slots": {"type": ["integer", "null"], "minimum": 0},
++    "unknown_coverage": {"type": "array", "items": {"type": "string"}},
++    "coverage_truncated": {"type": "boolean"},
++    "execution_observation": {"type": "object"}
++  },
++  "allOf": [{"if": {"properties": {"freshness": {"enum": ["current", "stale"]}}}, "then": {
++    "required": ["observed_at_ms", "valid_until_ms", "source", "source_revision", "machine", "board", "task_id", "evidence_ref", "lifecycle"]
++  }}],
++  "$defs": {"reason": {
++    "type": "object", "required": ["code", "native_code", "phase", "evidence_ref"],
++    "properties": {
++      "code": {"enum": ["capacity.memory_pressure", "capacity.provider_limit", "capacity.placement", "capacity.dependency", "capacity.update_drain"]},
++      "native_code": {"type": "string", "minLength": 1},
++      "phase": {"enum": ["pre_claim", "post_claim", "post_start"]},
++      "evidence_ref": {"type": "string", "minLength": 1}
++    }
++  }},
++  "$comment": "Optional additive evidence only. Unknown/stale is never admissible capacity. An unknown execution adapter may lack a producer-complete identity. Current capacity evidence does not imply current execution or complete admission coverage."
++}
+diff --git a/tests/hermes_cli/test_execution_observations.py b/tests/hermes_cli/test_execution_observations.py
+index 75628c47af..b17db4b39d 100644
+--- a/tests/hermes_cli/test_execution_observations.py
++++ b/tests/hermes_cli/test_execution_observations.py
+@@ -113,5 +113,42 @@ def test_provider_after_start_stays_after_start():
+     assert reason["phase"] == "post_start"
+ 
+ 
++@pytest.mark.parametrize("field,value", [
++    ("owner", None), ("owner", {}), ("owner", {"gateway": "g"}),
++    ("owner", {"gateway": "g", "profile": False}),
++    ("evidence_refs", None), ("evidence_refs", []), ("evidence_refs", [""]),
++    ("evidence_refs", "event:31"), ("evidence_refs", [True]),
++])
++def test_missing_owner_or_evidence_is_unknown(field, value):
++    raw = observation()
++    raw[field] = value
++    out = adapt(raw, now=1100, source_class="sidebar")
++    assert out["state"] == "unknown"
++    assert out["last_known_state"] == "queued"
++
++
++@pytest.mark.parametrize("attempt", [-1, 0, True, "", [], {}])
++def test_invalid_attempt_identity_is_unknown(attempt):
++    raw = observation()
++    raw["identity"]["run_id"] = attempt
++    assert adapt(raw, now=1100, source_class="sidebar")["state"] == "unknown"
++
++
++def test_required_source_retains_its_own_shorter_ttl():
++    raw = observation()
++    raw["valid_until"] = 1600
++    raw["required_sources"] = [{"observed_at": 990, "valid_until": 5000,
++                                "source_class": "sidebar"}]
++    out = adapt(raw, now=1200, source_class="imported_owner")
++    assert out["state"] == "unknown" and out["valid_until"] == 1170
++
++
++def test_unknown_required_source_class_is_unknown():
++    raw = observation()
++    raw["required_sources"] = [{"observed_at": 990, "valid_until": 1180,
++                                "source_class": "invented"}]
++    assert adapt(raw, now=1100, source_class="sidebar")["state"] == "unknown"
++
++
+ def test_unknown_source_class_cannot_manufacture_validity():
+     assert adapt(observation(), now=1100, source_class="invented")["state"] == "unknown"
+diff --git a/tests/hermes_cli/test_kanban_capacity_evidence.py b/tests/hermes_cli/test_kanban_capacity_evidence.py
+index faa2ae74dd..f86964d9cb 100644
+--- a/tests/hermes_cli/test_kanban_capacity_evidence.py
++++ b/tests/hermes_cli/test_kanban_capacity_evidence.py
+@@ -32,8 +32,8 @@ def test_native_dispatch_result_persists_without_mutation(board, field, value, c
+         value = [tid if x == "TASK" else (tid, x[1]) for x in value]
+     result = dispatch.DispatchResult(**{field: value})
+     before = asdict(result)
+-    evidence.record(board, result, board="sample", machine="machine-a", now=1000)
+-    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    evidence.record(board, result, board="default", machine="machine-a", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="default", now=1001)
+     assert code in [r["code"] for r in out["reasons"]]
+     assert asdict(result) == before
+     if field == "rate_limited":
+@@ -44,12 +44,12 @@ def test_multiple_reasons_dependency_and_update_drain(board):
+     parent = kb.create_task(board, title="parent", assignee="alice")
+     child = kb.create_task(board, title="child", assignee="alice", parents=[parent])
+     result = dispatch.DispatchResult(memory_pressure="critical")
+-    evidence.record(board, result, board="sample", machine="machine-a", now=1000, update_drain=True)
+-    out = evidence.read(board, kb.get_task(board, child), board="sample", now=1001)
++    evidence.record(board, result, board="default", machine="machine-a", now=1000, update_drain=True)
++    out = evidence.read(board, kb.get_task(board, child), board="default", now=1001)
+     assert {r["code"] for r in out["reasons"]} == {"capacity.dependency"}
+     assert {r["code"] for r in out["machine_reasons"]} == {
+         "capacity.memory_pressure", "capacity.update_drain"}
+-    ready = evidence.read(board, kb.get_task(board, parent), board="sample", now=1001)
++    ready = evidence.read(board, kb.get_task(board, parent), board="default", now=1001)
+     assert {r["code"] for r in ready["reasons"]} == {
+         "capacity.memory_pressure", "capacity.update_drain"}
+     assert out["eligible_backlog"] is False
+@@ -58,11 +58,11 @@ def test_multiple_reasons_dependency_and_update_drain(board):
+ def test_read_does_not_renew_timestamp_or_create_table(board):
+     tid = kb.create_task(board, title="one", assignee="alice")
+     task = kb.get_task(board, tid)
+-    assert evidence.read(board, task, board="sample", now=1000)["freshness"] == "unknown"
++    assert evidence.read(board, task, board="default", now=1000)["freshness"] == "unknown"
+     assert not board.execute("SELECT name FROM sqlite_master WHERE name='kanban_capacity_observation'").fetchall()
+-    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"), board="sample", machine="m", now=1000)
+-    current = evidence.read(board, task, board="sample", now=1001)
+-    stale = evidence.read(board, task, board="sample", now=1180)
++    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"), board="default", machine="m", now=1000)
++    current = evidence.read(board, task, board="default", now=1001)
++    stale = evidence.read(board, task, board="default", now=1180)
+     assert current["observed_at_ms"] == stale["observed_at_ms"] == 1000000
+     assert stale["freshness"] == "stale"
+     assert stale["eligible_backlog"] is None
+@@ -71,19 +71,19 @@ def test_read_does_not_renew_timestamp_or_create_table(board):
+ 
+ def test_retry_or_board_mismatch_cannot_reuse_restrictions(board):
+     tid = kb.create_task(board, title="one", assignee="alice")
+-    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"), board="sample", machine="m", now=1000)
++    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"), board="default", machine="m", now=1000)
+     assert evidence.read(board, kb.get_task(board, tid), board="other", now=1001)["freshness"] == "unknown"
+     kb.claim_task(board, tid)
+-    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    out = evidence.read(board, kb.get_task(board, tid), board="default", now=1001)
+     assert out["freshness"] == "unknown" and out["unknown_reason"] == "lifecycle_changed"
+ 
+ 
+ def test_clock_skew_and_missing_admission_coverage_are_unknown(board):
+     tid = kb.create_task(board, title="one", assignee="alice")
+-    evidence.record(board, dispatch.DispatchResult(), board="sample", machine="m", now=1000)
+-    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=999)
++    evidence.record(board, dispatch.DispatchResult(), board="default", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="default", now=999)
+     assert out["freshness"] == "unknown"
+-    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    out = evidence.read(board, kb.get_task(board, tid), board="default", now=1001)
+     assert out["admissible_slots"] is None and out["eligible_backlog"] is None
+     assert out["unknown_coverage"]
+ 
+@@ -91,9 +91,9 @@ def test_clock_skew_and_missing_admission_coverage_are_unknown(board):
+ def test_dry_or_skipped_tick_never_manufactures_evidence(board):
+     tid = kb.create_task(board, title="one", assignee="alice")
+     for result in [dispatch.DispatchResult(skipped_locked=True), dispatch.DispatchResult(skipped_owned=True)]:
+-        assert evidence.record(board, result, board="sample", machine="m", now=1000) is False
+-    assert evidence.record(board, dispatch.DispatchResult(), board="sample", machine="m", now=1000, dry_run=True) is False
+-    assert evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)["freshness"] == "unknown"
++        assert evidence.record(board, result, board="default", machine="m", now=1000) is False
++    assert evidence.record(board, dispatch.DispatchResult(), board="default", machine="m", now=1000, dry_run=True) is False
++    assert evidence.read(board, kb.get_task(board, tid), board="default", now=1001)["freshness"] == "unknown"
+ 
+ 
+ @pytest.mark.parametrize("native,is_provider", [
+@@ -103,8 +103,8 @@ def test_dry_or_skipped_tick_never_manufactures_evidence(board):
+ def test_native_provider_clocks_are_preclaim_and_deduplicated(board, native, is_provider):
+     tid = kb.create_task(board, title="clock", assignee="alice")
+     result = dispatch.DispatchResult(clock_held={tid: (native, 1100)}, respawn_guarded=[(tid, native)])
+-    evidence.record(board, result, board="sample", machine="m", now=1000)
+-    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    evidence.record(board, result, board="default", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="default", now=1001)
+     assert len(out["reasons"]) == int(is_provider)
+     if is_provider:
+         assert out["reasons"][0]["native_code"] == native
+@@ -115,17 +115,158 @@ def test_claim_does_not_prove_execution_or_inherit_preclaim_pressure(board):
+     tid = kb.create_task(board, title="claimed", assignee="alice")
+     kb.claim_task(board, tid)
+     evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"),
+-                    board="sample", machine="m", now=1000)
+-    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++                    board="default", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="default", now=1001)
+     assert out["reasons"] == []
+     assert out["execution_observation"]["state"] == "unknown"
+     assert out["execution_observation"]["last_progress"] is None
+ 
+ 
++def test_parent_transition_invalidates_dependency_before_ttl(board):
++    parent = kb.create_task(board, title="parent", assignee="alice")
++    child = kb.create_task(board, title="child", assignee="alice", parents=[parent])
++    evidence.record(board, dispatch.DispatchResult(), board="default", machine="m", now=1000)
++    # Model the interval after a parent's terminal transition, before promotion.
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++    out = evidence.read(board, kb.get_task(board, child), now=1001)
++    assert out["freshness"] == "unknown" and out["unknown_reason"] == "lifecycle_changed"
++    assert out["eligible_backlog"] is None
++
++
++@pytest.mark.parametrize("field,value,native", [
++    ("at_capacity", "max_spawn=3/3", "max_spawn=3/3"),
++    ("claim_deferred", [("TASK", "lease_held")], "lease_held"),
++    ("capsule_refused", [("TASK", "missing_capsule")], "missing_capsule"),
++    ("owner_down", [("TASK", "alice", "owner_unavailable")], "owner_unavailable"),
++    ("respawn_guarded", [("TASK", "recent_success")], "recent_success"),
++])
++def test_native_restriction_subcodes_retained(board, field, value, native):
++    tid = kb.create_task(board, title="one", assignee="alice")
++    if isinstance(value, list):
++        value = [(tid, *item[1:]) for item in value]
++    evidence.record(board, dispatch.DispatchResult(**{field: value}), board="default", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), now=1001)
++    assert any(r["native_code"] == native and r["source_field"] == field for r in out["native_restrictions"])
++
++
++@pytest.mark.parametrize("native", ["labels_mismatch", "pinned_only", "offline"])
++def test_board_claim_placement_is_namespaced(board, native):
++    tid = kb.create_task(board, title="one", assignee="alice")
++    evidence.record(board, dispatch.DispatchResult(claim_deferred=[(tid, native)]),
++                    board="default", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), now=1001)
++    assert any(r["code"] == "capacity.placement" and r["native_code"] == native for r in out["reasons"])
++
++
++def test_observer_uses_actual_nondefault_connection_not_argument(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    path = tmp_path / "kanban" / "boards" / "named" / "kanban.db"
++    path.parent.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
++    with closing(kbc.connect(path)) as conn:
++        tid = kb.create_task(conn, title="one", assignee="alice")
++        task = kb.get_task(conn, tid)
++        for supplied in (None, "wrong"):
++            evidence.observe_dispatch(conn, dispatch.DispatchResult(memory_pressure="critical"), board=supplied)
++            out = evidence.read(conn, task)
++            assert out["freshness"] == "current" and out["board"] == "named"
++            assert evidence.read(conn, task, board="wrong")["freshness"] == "unknown"
++
++
++@pytest.mark.parametrize("binding,expected", [("matching", "post_start"), ("wrong_lock", "post_claim"),
++                                           ("missing", "post_claim"), ("prior_attempt", "post_claim")])
++def test_provider_phase_uses_matching_real_attempt_receipts(board, binding, expected):
++    import time
++    tid = kb.create_task(board, title="provider", assignee="alice")
++    kb.claim_task(board, tid)
++    task = kb.get_task(board, tid)
++    run = task.current_run_id
++    with kb.write_txn(board):
++        if binding != "missing":
++            kb._append_event(board, tid, "worker_bound", {
++                "pid": 222, "started_at": "birth|2",
++                "claim_lock": "foreign" if binding == "wrong_lock" else task.claim_lock,
++            }, run_id=run)
++        if binding == "prior_attempt":
++            kb._append_event(board, tid, "rate_limited", {"retry_status": "ready"}, run_id=run + 1)
++        else:
++            kb._append_event(board, tid, "rate_limited", {"retry_status": "ready"}, run_id=run)
++    now = time.time()
++    evidence.record(board, dispatch.DispatchResult(rate_limited=[tid]), board="default", machine="m", now=now)
++    out = evidence.read(board, kb.get_task(board, tid), now=now)
++    assert out["reasons"][0]["phase"] == expected
++    if expected == "post_start":
++        assert out["reasons"][0]["run_id"] == run
++        assert out["reasons"][0]["process_ref"] is not None
++
++
++@pytest.mark.parametrize("column,value", [("assignee", "bob"), ("runs_on", '["linux"]')])
++def test_routing_identity_change_invalidates_evidence(board, column, value):
++    if column == "runs_on":
++        from hermes_cli import kanban_db_sync as sync
++        sync._add_column_if_missing(board, "tasks", "runs_on", "runs_on TEXT")
++    tid = kb.create_task(board, title="one", assignee="alice")
++    evidence.record(board, dispatch.DispatchResult(skipped_ineligible=[(tid, "labels_mismatch")]),
++                    board="default", machine="m", now=1000)
++    with kb.write_txn(board):
++        board.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, tid))
++    out = evidence.read(board, kb.get_task(board, tid), now=1001)
++    assert out["freshness"] == "unknown" and out["unknown_reason"] == "lifecycle_changed"
++
++
++def test_truncated_task_coverage_is_explicit(board, monkeypatch):
++    monkeypatch.setattr(evidence, "TASK_LIMIT", 1)
++    ids = [kb.create_task(board, title="one", assignee="alice") for _ in range(2)]
++    evidence.record(board, dispatch.DispatchResult(), board="default", machine="m", now=1000)
++    outs = [evidence.read(board, kb.get_task(board, tid), now=1001) for tid in ids]
++    assert all(o["coverage_truncated"] for o in outs)
++    missing = next(o for o in outs if o["freshness"] == "unknown")
++    assert missing["unknown_reason"] == "task_coverage_truncated"
++
++
++def test_snapshot_assembly_does_not_hold_writer_lock(board, monkeypatch):
++    import sqlite3
++    tid = kb.create_task(board, title="one", assignee="alice")
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    with kb.write_txn(board):
++        board.execute("CREATE TABLE fixture_marker (n INTEGER)")
++        board.execute("INSERT INTO fixture_marker VALUES(0)")
++    original = evidence._lifecycle
++    writes = []
++    def observe(conn, task_id):
++        with closing(sqlite3.connect(path, timeout=.5)) as other, other:
++            other.execute("UPDATE fixture_marker SET n=n+1")
++        writes.append(task_id)
++        return original(conn, task_id)
++    monkeypatch.setattr(evidence, "_lifecycle", observe)
++    assert evidence.record(board, dispatch.DispatchResult(), board="default", machine="m", now=1000)
++    assert writes == [tid]
++    assert board.execute("SELECT n FROM fixture_marker").fetchone()[0] == 1
++
++
++def test_capacity_schema_covers_current_stale_missing_and_changed(board):
++    import json
++    from pathlib import Path
++    from jsonschema import Draft202012Validator
++    schema = json.loads((Path(__file__).parents[2] / "schemas" /
++                         "kanban-capacity-evidence-v1.schema.json").read_text())
++    validator = Draft202012Validator(schema)
++    tid = kb.create_task(board, title="schema", assignee="alice")
++    task = kb.get_task(board, tid)
++    validator.validate(evidence.read(board, task, now=1000))
++    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"), board="default", machine="m", now=1000)
++    for now in (1001, 1180):
++        validator.validate(evidence.read(board, task, now=now))
++    kb.claim_task(board, tid)
++    validator.validate(evidence.read(board, kb.get_task(board, tid), now=1001))
++
++
+ def test_read_never_invents_generation_from_an_event_or_poll(board):
+     tid = kb.create_task(board, title="unclaimed", assignee="alice")
+-    evidence.record(board, dispatch.DispatchResult(), board="sample", machine="m", now=1000)
+-    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    evidence.record(board, dispatch.DispatchResult(), board="default", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="default", now=1001)
+     assert out["freshness"] == "current"
+     observation = out["execution_observation"]
+     assert "generation" not in observation["identity"]
+diff --git a/tests/hermes_cli/test_kanban_capacity_integration.py b/tests/hermes_cli/test_kanban_capacity_integration.py
+index dc6523731e..ccf9ea7251 100644
+--- a/tests/hermes_cli/test_kanban_capacity_integration.py
++++ b/tests/hermes_cli/test_kanban_capacity_integration.py
+@@ -15,9 +15,9 @@ def test_dispatch_publishes_pressure_without_changing_decision(capacity_board, a
+     monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda sample=None: "critical")
+     seen = []
+     result = dispatch.dispatch_once(conn, spawn_fn=lambda *a: seen.append(a),
+-                                    max_in_progress=4, reconcile_orphans=False, board="sample")
++                                    max_in_progress=4, reconcile_orphans=False, board="default")
+     assert seen == [] and result.memory_pressure == "critical"
+-    out = evidence.read(conn, kb.get_task(conn, ids[0]), board="sample")
++    out = evidence.read(conn, kb.get_task(conn, ids[0]), board="default")
+     assert out["freshness"] == "current"
+     assert out["reasons"][0]["code"] == "capacity.memory_pressure"
+     assert kb.get_task(conn, child).status == "todo"
+@@ -26,12 +26,12 @@ def test_dispatch_publishes_pressure_without_changing_decision(capacity_board, a
+ def test_drain_is_explicit_not_inferred_from_zero_budget(capacity_board, all_assignees_spawnable, monkeypatch):
+     conn, ids, _ = capacity_board
+     monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda sample=None: "ok")
+-    dispatch.dispatch_once(conn, max_spawn=0, reconcile_orphans=False, board="sample",
++    dispatch.dispatch_once(conn, max_spawn=0, reconcile_orphans=False, board="default",
+                            observation_update_drain=True)
+-    out = evidence.read(conn, kb.get_task(conn, ids[0]), board="sample")
++    out = evidence.read(conn, kb.get_task(conn, ids[0]), board="default")
+     assert [r["code"] for r in out["reasons"]] == ["capacity.update_drain"]
+-    dispatch.dispatch_once(conn, max_spawn=0, reconcile_orphans=False, board="sample")
+-    assert evidence.read(conn, kb.get_task(conn, ids[0]), board="sample")["reasons"] == []
++    dispatch.dispatch_once(conn, max_spawn=0, reconcile_orphans=False, board="default")
++    assert evidence.read(conn, kb.get_task(conn, ids[0]), board="default")["reasons"] == []
+ 
+ 
+ def test_observer_exception_cannot_change_dispatch_return(capacity_board, monkeypatch):
+@@ -39,7 +39,7 @@ def test_observer_exception_cannot_change_dispatch_return(capacity_board, monkey
+     expected = dispatch.DispatchResult(memory_pressure="critical")
+     monkeypatch.setattr(dispatch, "_dispatch_once_locked", lambda *a, **kw: expected)
+     monkeypatch.setattr(evidence, "record", lambda *a, **kw: (_ for _ in ()).throw(ValueError("fixture")))
+-    result = dispatch.dispatch_once(conn, board="sample")
++    result = dispatch.dispatch_once(conn, board="default")
+     assert result is expected and asdict(result) == asdict(expected)
+ 
+ 
+@@ -47,8 +47,8 @@ def test_existing_queue_read_adds_optional_fields(capacity_board, monkeypatch):
+     conn, ids, _ = capacity_board
+     task = kb.get_task(conn, ids[0])
+     monkeypatch.setattr(queue, "_running_and_limit", lambda *a: (0, 4))
+-    evidence.record(conn, dispatch.DispatchResult(memory_pressure="critical"), board="sample", machine="m")
+-    fields = queue.detail_fields(conn, task, "sample")
++    evidence.record(conn, dispatch.DispatchResult(memory_pressure="critical"), board="default", machine="m")
++    fields = queue.detail_fields(conn, task, "default")
+     place = fields["queue"]
+     assert fields["capacity_evidence"]["freshness"] == "current"
+     assert fields["execution_observations"][0]["state"] == "unknown"
+-- 
+2.43.0
+

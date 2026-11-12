@@ -1,0 +1,144 @@
+From e40985f29580008facbb69a44ad1fed85714f48c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:01:30 +0000
+Subject: [PATCH] [daveey] Keep malformed modern result evidence fail-closed
+
+---
+ hermes_cli/kanban_failed_result.py            | 40 ++++++++++++++-----
+ .../test_kanban_failed_result_reconcile.py    | 40 +++++++++++++++++++
+ 2 files changed, 69 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_failed_result.py b/hermes_cli/kanban_failed_result.py
+index d511c3fe98..3721f17da3 100644
+--- a/hermes_cli/kanban_failed_result.py
++++ b/hermes_cli/kanban_failed_result.py
+@@ -8,10 +8,17 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import re
+ import sys
+ from pathlib import Path
+ 
+ 
++def valid_birth(birth) -> bool:
++    """Accept only a nonempty epoch and positive canonical start components."""
++    return isinstance(birth, str) and re.fullmatch(
++        r'[^|\s]+\|[1-9][0-9]*(?:@[1-9][0-9]*)?', birth) is not None
++
++
+ def process_gone(pid, birth) -> bool:
+     """Prove the recorded incarnation gone; fail closed on live/recycled PIDs.
+ 
+@@ -23,13 +30,7 @@ def process_gone(pid, birth) -> bool:
+ 
+     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+         return False
+-    if not isinstance(birth, str) or '|' not in birth:
+-        return False
+-    if birth == dispatch.UNVERIFIED_WORKER_FINGERPRINT:
+-        return False
+-    try:
+-        dispatch._start_components(birth.split('|', 1)[1])
+-    except ValueError:
++    if not valid_birth(birth):
+         return False
+     try:
+         os.kill(pid, 0)
+@@ -68,7 +69,7 @@ def recorded_process_witnesses(conn, context):
+         birth = json.loads(bound['payload']).get('started_at')
+     except (TypeError, ValueError, AttributeError):
+         return False
+-    return all(isinstance(value, str) and '|' in value for value in (row['worker_started_at'], birth))
++    return all(valid_birth(value) for value in (row['worker_started_at'], birth))
+ 
+ 
+ def failed_result_receipt(conn, task_id, run_id, claim_lock):
+@@ -120,13 +121,30 @@ def failed_result_receipt(conn, task_id, run_id, claim_lock):
+             'bound': (bound.get('pid'), bound.get('started_at'))}
+ 
+ 
++def modern_result_recorded(conn, task_id, run_id):
++    """A modern run cannot downgrade to legacy recovery when proof is damaged.
++
++    This is a veto, never authority to close. Do not require a valid bound event:
++    precisely that missing or malformed evidence must keep recovery fail-closed.
++    Keep the marker across later result events (including malformed imports).
++    """
++    events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++                          "AND kind='worker_result'", (task_id, run_id))
++    for event in events:
++        try:
++            payload = json.loads(event['payload'])
++        except (TypeError, ValueError):
++            continue
++        if isinstance(payload, dict) and payload.get('death_proof_version') == 1:
++            return True
++    return False
++
++
+ def reclaim_proof(conn, row, *, failed_results_only=False):
+     """Keep strict receipt vetoes distinct from unsupported legacy recovery."""
+     identity = (row['id'], row['current_run_id'], row['claim_lock'])
+     proof = failed_result_proof(conn, *identity)
+-    receipt = failed_result_receipt(conn, *identity)
+-    hold = proof is None and (failed_results_only or (
+-        receipt is not None and receipt['result'].get('death_proof_version') == 1))
++    hold = proof is None and (failed_results_only or modern_result_recorded(conn, *identity[:2]))
+     return proof, hold
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_failed_result_reconcile.py b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+index 28abb9d336..8d8aea9345 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_reconcile.py
++++ b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+@@ -282,6 +282,46 @@ def test_failed_receipt_veto_cannot_fall_back_to_legacy_reclaim(board, monkeypat
+                             (context['run_id'],)).fetchone()
+ 
+ 
++@pytest.mark.parametrize('entry', ['dispatcher', 'observer'])
++@pytest.mark.parametrize('damage', ['missing_bound', 'malformed_bound', 'wrong_claim', 'wrong_pid'])
++def test_modern_receipt_invalid_binding_still_vetoes_reclaim(board, monkeypatch, entry, damage):
++    from hermes_cli import kanban_owner_recovery as owner
++    conn, context = board
++    _failed_child(conn, context)
++    with kb.write_txn(conn):
++        if damage == 'missing_bound':
++            conn.execute("DELETE FROM task_events WHERE run_id=? AND kind='worker_bound'",
++                         (context['run_id'],))
++        else:
++            row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND kind='worker_bound'",
++                               (context['run_id'],)).fetchone()
++            payload = json.loads(row['payload'])
++            if damage == 'wrong_claim':
++                payload['claim_lock'] = 'foreign:1'
++            elif damage == 'wrong_pid':
++                payload['pid'] = 1
++            else:
++                payload = []
++            conn.execute("UPDATE task_events SET payload=? WHERE run_id=? AND kind='worker_bound'",
++                         (json.dumps(payload), context['run_id']))
++    monkeypatch.setattr(kbd, '_worker_alive', lambda *a: False)
++    monkeypatch.setattr(owner, 'owner_reclaim_blocked', lambda *a, **k: False)
++    monkeypatch.setattr(owner, 'apply_attempt_note', lambda *a, **k: None)
++    kbd.detect_crashed_workers(conn, failed_results_only=entry == 'observer')
++    assert conn.execute('SELECT status FROM task_runs WHERE id=?',
++                        (context['run_id'],)).fetchone()[0] == 'running'
++
++
++@pytest.mark.parametrize('birth', ['|1', 'epoch|-1', 'epoch|0', 'epoch|+1',
++                                  'epoch| 1', 'epoch|1@-2', 'epoch|1|2'])
++def test_malformed_birth_never_queries_process(monkeypatch, birth):
++    from hermes_cli import kanban_failed_result as reconcile
++    def unexpected(*args):
++        pytest.fail('malformed birth must fail before querying process')
++    monkeypatch.setattr(reconcile.os, 'kill', unexpected)
++    assert not reconcile.process_gone(123, birth)
++
++
+ @pytest.mark.skipif(sys.platform != 'linux', reason='Linux zombie identity proof')
+ def test_real_zombie_is_dead_only_with_matching_birth():
+     from hermes_cli.kanban_failed_result import process_gone
+-- 
+2.43.0
+

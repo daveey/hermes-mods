@@ -1,0 +1,1343 @@
+From c90395a43bcfb51a5cfed859bfa87c8003841f2c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:10:10 +0000
+Subject: [PATCH] [daveey] checkpoint advisory capacity evidence and receipt
+ metrics
+
+---
+ docs/execution-observations-v1.md             |  64 ++++++
+ gateway/kanban_watchers_dispatcher.py         |   1 +
+ hermes_cli/execution_observations.py          | 102 +++++++++
+ hermes_cli/kanban.py                          |   6 +-
+ hermes_cli/kanban_capacity_evidence.py        | 201 ++++++++++++++++++
+ hermes_cli/kanban_capacity_metrics.py         | 165 ++++++++++++++
+ hermes_cli/kanban_db_dispatch.py              |   7 +-
+ hermes_cli/kanban_queue_position.py           |  16 +-
+ plugins/kanban/dashboard/plugin_api.py        |   4 +-
+ schemas/execution-observation-v1.schema.json  |  55 +++++
+ .../hermes_cli/test_execution_observations.py | 117 ++++++++++
+ .../test_kanban_capacity_evidence.py          | 133 ++++++++++++
+ .../test_kanban_capacity_harness.py           |  54 +++++
+ .../test_kanban_capacity_integration.py       |  96 +++++++++
+ .../test_kanban_capacity_metrics.py           | 112 ++++++++++
+ tools/kanban_show.py                          |   6 +-
+ 16 files changed, 1129 insertions(+), 10 deletions(-)
+ create mode 100644 docs/execution-observations-v1.md
+ create mode 100644 hermes_cli/execution_observations.py
+ create mode 100644 hermes_cli/kanban_capacity_evidence.py
+ create mode 100644 hermes_cli/kanban_capacity_metrics.py
+ create mode 100644 schemas/execution-observation-v1.schema.json
+ create mode 100644 tests/hermes_cli/test_execution_observations.py
+ create mode 100644 tests/hermes_cli/test_kanban_capacity_evidence.py
+ create mode 100644 tests/hermes_cli/test_kanban_capacity_harness.py
+ create mode 100644 tests/hermes_cli/test_kanban_capacity_integration.py
+ create mode 100644 tests/hermes_cli/test_kanban_capacity_metrics.py
+
+diff --git a/docs/execution-observations-v1.md b/docs/execution-observations-v1.md
+new file mode 100644
+index 0000000000..a5a540c8e5
+--- /dev/null
++++ b/docs/execution-observations-v1.md
+@@ -0,0 +1,64 @@
++# Execution observations v1 (capacity adapter)
++
++Optional `execution_observations[]` is additive advisory evidence. Existing outcomes,
++completion/origin release receipts, admission and structured human requests remain
++authoritative and unchanged. Missing optional fields never erase outstanding work.
++The producer schema is `schemas/execution-observation-v1.schema.json`; the pure
++legacy/freshness adapter is `hermes_cli/execution_observations.py`.
++
++## Identity and validity
++
++`identity` qualifies gateway, profile, kind and work_id. Cards also require board.
++Sessions require session or lineage. Preserve an actual run_id or generation; never
++invent an attempt from the current fetch. `owner` is qualified accountability, not
++proof of process liveness. `source_revision` identifies the observed source (for
++example its durable event), not merely the adapter build.
++
++All execution-envelope timestamps are finite nonnegative epoch **seconds**.
++Capacity-event fields named `*_ms` are milliseconds and must be explicitly converted.
++`observed_at` and `valid_until` belong to the producer. Consumer age is derived;
++fetch, copy and file mtime never renew validity. Apply separate existing upper
++bounds: sidebar 180 seconds, imported-owner 600 seconds. Validity cannot exceed
++any required source's validity. Missing identity/timing, skew or unavailable data
++means unknown, not capacity, success, failure or stalled work. Preserve
++`last_known_state` separately. Expired evidence is stale and current state unknown.
++
++States: running, queued, waiting, needs_user, done, failed, cancelled, unknown.
++Archive, containment and supersession are not delivered success. Stale current
++execution evidence does not revoke historical delivery evidence. `last_activity`
++and nullable `last_progress` are independent: claim, heartbeat, poll and comment
++alone never establish substantive progress. Missing progress does not mean stalled.
++A wait, when present, carries qualified target, predicate, since, due_at and owner.
++
++## Diagnostics
++
++Concurrent diagnostics carry `code`, `native_code`, `phase`, `evidence_ref`.
++Codes: capacity.memory_pressure, capacity.provider_limit, capacity.placement,
++capacity.dependency, capacity.update_drain. Phases: pre_claim, post_claim,
++post_start. Provider refusal after process start cannot explain pre-claim waiting.
++Dependency-held work is not eligible ready backlog. Unknown coverage must remain
++explicit; multiple placement candidates or boards do not multiply shared slots.
++
++## Compatibility and scope
++
++Legacy consumers ignore this optional envelope. `adapt` accepts a legacy record
++and returns unknown without fabricating timestamps or losing embedded human
++requests/receipts. This adapter does not write outcome_json or change receipt
++semantics. Sibling status projectors may reuse this contract independently.
++
++## Tests and delivery state
++
++`tests/hermes_cli/test_execution_observations.py` exercises the pure adapter.
++`tests/hermes_cli/test_kanban_capacity_harness.py` exercises actual isolated
++four-card dispatch with fake spawn and a dependency control, capped at 120 seconds.
++The isolated integration suite exercises persisted evidence through the actual
++show tool, CLI JSON/text handler and FastAPI task-detail route, including the
++non-ready dependency control. Legacy queue fields remain unchanged; capacity
++and execution fields are optional siblings. Dispatch instrumentation runs after
++the admission result and does not feed scheduling decisions. Receipt latency
++uses matching `worker_bound` events, not submitter `spawned` events, with the
++existing event clock's one-second resolution; it is not exact launch timing.
++
++This implementation checkpoint is not delivery: final review, additional
++lifecycle coverage, CI, publication/deployment and bounded live readback remain
++outstanding. Complete admission coverage is currently unknown, never idle.
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index cf2cb8e1f8..dc6ae7f17b 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -222,6 +222,7 @@ class _KanbanDispatcher:
+         kwargs["max_in_progress"] = self.live_max_in_progress()
+         if suppress_spawn:
+             kwargs["max_spawn"] = 0  # budget gate refuses every claim; bookkeeping phases still run
++            kwargs["observation_update_drain"] = True  # diagnostic only, never an admission input
+         try:
+             # No explicit init_db(): connect() runs the migration once per
+             # process (see the matching note in the notifier collector).
+diff --git a/hermes_cli/execution_observations.py b/hermes_cli/execution_observations.py
+new file mode 100644
+index 0000000000..db710a63ec
+--- /dev/null
++++ b/hermes_cli/execution_observations.py
+@@ -0,0 +1,102 @@
++"""Optional execution evidence v1, not admission, work outcomes or delivery authority.
++
++See docs/execution-observations-v1.md. All timestamps here are source epoch
++seconds; capacity event producers explicitly convert their *_ms fields.
++"""
++from __future__ import annotations
++
++from copy import deepcopy
++import math
++
++VERSION = 1
++STATES = frozenset({"running", "queued", "waiting", "needs_user", "done", "failed", "cancelled", "unknown"})
++SOURCE_TTLS = {"sidebar": 180, "imported_owner": 600}
++CAPACITY_CODES = frozenset({"memory_pressure", "provider_limit", "placement", "dependency", "update_drain"})
++
++
++def epoch(value):
++    """Finite nonnegative epoch seconds, rejecting bools and pathological integers."""
++    if type(value) not in (int, float):
++        return False
++    return 0 <= value <= 8.64e12 and math.isfinite(value)
++
++
++def capacity_reason(code, *, native_code, phase, evidence_ref):
++    """Retain concurrent native diagnostics and their causal phase, never a work state."""
++    if code not in CAPACITY_CODES or phase not in {"pre_claim", "post_claim", "post_start"}:
++        raise ValueError("unknown capacity diagnostic or phase")
++    if not all(isinstance(v, str) and v for v in (native_code, evidence_ref)):
++        raise ValueError("native code and evidence reference required")
++    return {"code": "capacity." + code, "native_code": native_code,
++            "phase": phase, "evidence_ref": evidence_ref}
++
++
++def _identity_valid(identity):
++    if not isinstance(identity, dict):
++        return False
++    required = ["gateway", "profile", "kind", "work_id"]
++    if identity.get("kind") == "card":
++        required.append("board")
++    elif not (identity.get("session") or identity.get("lineage")):
++        return False
++    return (all(isinstance(identity.get(k), str) and identity[k] for k in required)
++            and any(type(identity.get(k)) in (str, int) and bool(identity[k]) for k in ("run_id", "generation")))
++
++
++def _unknown(out, reason, *, freshness="unknown"):
++    out.update(state="unknown", freshness=freshness, unknown_reason=reason)
++    return out
++
++
++def adapt(value, *, now, source_class):
++    """Copy a v1 observation, bounding its original validity; legacy input is unknown.
++
++    Unknown fields (including human requests and historical delivery receipts) are
++    retained verbatim. The adapter neither creates an observation timestamp nor
++    infers progress from activity. A read never extends source validity.
++    """
++    raw = value if isinstance(value, dict) else {}
++    out = deepcopy(raw)
++    out.setdefault("observed_at", None)
++    out.setdefault("valid_until", None)
++    out.setdefault("last_activity", None)
++    out.setdefault("last_progress", None)
++    out["age_seconds"] = None
++    out["last_known_state"] = (raw.get("state") if raw.get("state") in STATES - {"unknown"}
++                               else raw.get("last_known_state"))
++    if raw.get("version") != VERSION:
++        return _unknown(out, "legacy_or_unsupported_version")
++    if not _identity_valid(raw.get("identity")):
++        return _unknown(out, "missing_qualified_identity")
++    if not all(isinstance(raw.get(k), str) and raw[k] for k in ("source", "source_revision")):
++        return _unknown(out, "missing_source_identity")
++    ttl = SOURCE_TTLS.get(source_class)
++    observed, until = raw.get("observed_at"), raw.get("valid_until")
++    if ttl is None or not all(epoch(v) for v in (now, observed, until)):
++        return _unknown(out, "missing_or_invalid_source_timing")
++    if until < observed or now < observed:
++        return _unknown(out, "clock_inconsistent")
++    until = min(until, observed + ttl)
++    sources = raw.get("required_sources", [])
++    if not isinstance(sources, list):
++        return _unknown(out, "invalid_required_sources")
++    for source in sources:
++        if not isinstance(source, dict):
++            return _unknown(out, "missing_required_source_timing")
++        at, end = source.get("observed_at"), source.get("valid_until")
++        if not all(epoch(v) for v in (at, end)):
++            return _unknown(out, "missing_required_source_timing")
++        if end < at or now < at:
++            return _unknown(out, "clock_inconsistent")
++        until = min(until, end)
++    out.update(valid_until=until, age_seconds=now - observed)
++    if now >= until:
++        return _unknown(out, "source_expired", freshness="stale")
++    if raw.get("state") not in STATES:
++        return _unknown(out, "unsupported_state")
++    # A previous unknown read is not new producer evidence and cannot revive.
++    if raw.get("state") == "unknown":
++        return _unknown(out, raw.get("unknown_reason") or "source_unknown")
++    out.update(freshness="current")
++    out.pop("unknown_reason", None)
++    return out
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index d7181ea1c7..2a1460f367 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -758,7 +758,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         queue_reason = kqr.latest(conn, args.task_id)
+         # Same ``queue`` as kanban_show and the REST read (kanban-7d720d4ab8): a ready card says where it waits. [daveey]
+         from hermes_cli import kanban_queue_position as kqp
+-        queue = kqp.read(conn, task, getattr(args, "board", None))
++        details = kqp.detail_fields(conn, task, getattr(args, "board", None))
++        queue = details.get("queue")
+         if not want_json:
+             graph = kb.task_graph_context(conn, task.id)
+ 
+@@ -770,7 +771,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+             "wake_check": wake_check,
+             "queue_reason": queue_reason,
+-            **kqp.fields(queue),
++            **details,
+         })
+         return 0
+ 
+@@ -781,6 +782,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+     field("status", task.status)
+     field("assignee", task.assignee or "-")
+     kqr.print_field(queue_reason, field)
++    field("capacity", details["capacity_note"])
+     kqp.print_field(queue, queue_reason, field)
+     if task.tenant:
+         field("tenant", task.tenant)
+diff --git a/hermes_cli/kanban_capacity_evidence.py b/hermes_cli/kanban_capacity_evidence.py
+new file mode 100644
+index 0000000000..ff4087bf21
+--- /dev/null
++++ b/hermes_cli/kanban_capacity_evidence.py
+@@ -0,0 +1,201 @@
++"""Advisory dispatch evidence; never read by admission or scheduling decisions.
++
++One bounded latest snapshot per local board, not a replicated authority. Reads
++never write or renew source validity. Unknown admission coverage is explicit.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++import uuid
++
++from hermes_cli.execution_observations import adapt, capacity_reason, epoch
++
++_log = logging.getLogger(__name__)
++TABLE = "kanban_capacity_observation"
++TASK_LIMIT = 128
++
++
++def _lifecycle(conn, task_id):
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if row is None:
++        return None
++    row = dict(row)
++    count = conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
++    return {"status": row["status"], "run_id": row["current_run_id"],
++            "runs_on": row.get("runs_on"), "run_count": count}
++
++
++def _reason(code, native, reference, phase="pre_claim"):
++    return capacity_reason(code, native_code=native, phase=phase, evidence_ref=reference)
++
++
++def _native_restrictions(result, tid, reference):
++    """Keep unmapped admission restrictions without inventing a capacity category."""
++    rows = []
++    if result.at_capacity:
++        rows.append({"native_code": "at_capacity", "evidence_ref": reference})
++    for name in ("claim_deferred", "capsule_refused", "owner_down", "skipped_per_profile_capped", "respawn_guarded"):
++        for item in getattr(result, name):
++            if item[0] == tid:
++                rows.append({"native_code": name, "evidence_ref": reference})
++    return rows
++
++
++def _task_reasons(result, tid, reference):
++    reasons = []
++    for task, native in result.skipped_ineligible:
++        if task == tid:
++            reasons.append(_reason("placement", native, reference))
++    if tid in result.rate_limited:
++        # A reaped submitter can refuse before its managed worker ever starts.
++        reasons.append(_reason("provider_limit", "rate_limited", reference, "post_claim"))
++    # Only explicit provider quota clocks; generic cooldowns are not provider limits.
++    held = result.clock_held.get(tid)
++    if held and held[0] in {"subscription_quota_reset", "rate_limit_cooldown"}:
++        reasons.append(_reason("provider_limit", held[0], reference))
++    for task, native in result.respawn_guarded:
++        if task == tid and native in {"subscription_quota_reset", "rate_limit_cooldown"}:
++            reason = _reason("provider_limit", native, reference)
++            if reason not in reasons:
++                reasons.append(reason)
++    return reasons
++
++
++def record(conn, result, *, board, machine, now=None, update_drain=False, dry_run=False):
++    """Record only genuine dispatch observations; a failed diagnostic cannot stop dispatch.
++
++    No free-slot or ready-eligibility inference from registry caps/status counts.
++    Coverage stays unknown until a same-interval producer proves those facts.
++    """
++    if dry_run or result.skipped_locked or result.skipped_owned:
++        return False
++    from hermes_cli import kanban_db as kb
++
++    now = time.time() if now is None else now
++    revision = str(uuid.uuid4())
++    reference = f"dispatch:{machine}:{board}:{revision}"
++    common = []
++    if result.memory_pressure:
++        common.append(_reason("memory_pressure", result.memory_pressure, reference))
++    if update_drain:
++        common.append(_reason("update_drain", "suppress_spawn", reference))
++    try:
++        # A deferred snapshot keeps multi-query reads coherent without taking
++        # the writer lock. Release it before the single-row write transaction.
++        conn.execute("SAVEPOINT capacity_snapshot")
++        try:
++            rows = conn.execute(
++                "SELECT id, assignee, status, current_run_id, claim_lock FROM tasks "
++                "WHERE status IN ('ready','todo','running','review','scheduled','blocked') "
++                "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, id LIMIT ?", (TASK_LIMIT,)).fetchall()
++            tasks = {}
++            for row in rows:
++                tid = row["id"]
++                reasons = _task_reasons(result, tid, reference)
++                parents = kb.unsatisfied_parents(conn, tid)
++                if parents:
++                    reasons.append(_reason("dependency", "unsatisfied_parents", reference))
++                elif row["status"] == "ready" and not row["claim_lock"]:
++                    reasons = common + reasons
++                event = conn.execute("SELECT max(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++                tasks[tid] = {"lifecycle": _lifecycle(conn, tid), "reasons": reasons,
++                              "native_restrictions": _native_restrictions(result, tid, reference) if row["status"] == "ready" else [],
++                              "parents": parents, "assignee": row["assignee"], "source_event": event}
++            value = {"version": 1, "observed_at_ms": now * 1000, "valid_until_ms": (now + 180) * 1000,
++                     "source": "kanban.dispatch", "source_revision": revision, "machine": machine,
++                     "board": board, "evidence_ref": reference, "tasks": tasks,
++                     "machine_reasons": common,
++                     "coverage_truncated": len(rows) == TASK_LIMIT}
++        finally:
++            conn.execute("RELEASE capacity_snapshot")
++        with kb.write_txn(conn):
++            conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL)")
++            conn.execute(f"INSERT INTO {TABLE} (id,payload) VALUES(1,?) "
++                         "ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", (json.dumps(value),))
++        return True
++    except (sqlite3.Error, RuntimeError, TypeError, ValueError):
++        _log.warning("capacity observation write unavailable", exc_info=True)
++        return False
++
++
++def observe_dispatch(conn, result, *, board, dry_run=False, update_drain=False):
++    """Best-effort post-result seam; diagnostics never change dispatch's return."""
++    try:
++        import socket
++        from hermes_cli import kanban_db_sync as sync
++        machine = (sync.sync_state(conn) or {}).get("gateway_id") or socket.gethostname()
++        record(conn, result, board=board or "default", machine=machine,
++               dry_run=dry_run, update_drain=update_drain)
++    except Exception:  # health: allow BLE001 -- optional evidence cannot control admission
++        _log.warning("capacity observation unavailable", exc_info=True)
++
++
++def _unknown(reason, **fields):
++    return {"version": 1, "freshness": "unknown", "unknown_reason": reason,
++            "reasons": [], "eligible_backlog": None, "admissible_slots": None,
++            "unknown_coverage": [reason], **fields}
++
++
++def read(conn, task, *, board=None, now=None):
++    """Read a lifecycle-qualified observation without manufacturing freshness."""
++    if board is None:
++        from hermes_cli import kanban_db_sync as sync
++        path = conn.execute("PRAGMA database_list").fetchone()[2]
++        board = sync.board_slug_for_path(path)
++    now = time.time() if now is None else now
++    if task is None:
++        return _unknown("missing_task")
++    try:
++        row = conn.execute(f"SELECT payload FROM {TABLE} WHERE id=1").fetchone()
++        value = json.loads(row[0]) if row else None
++    except (sqlite3.Error, TypeError, ValueError):
++        return _unknown("observation_unavailable")
++    if not isinstance(value, dict) or value.get("version") != 1 or value.get("board") != board:
++        return _unknown("missing_or_foreign_observation")
++    stored = value.get("tasks", {}).get(task.id)
++    if not stored:
++        return _unknown("task_not_observed")
++    source = {k: value[k] for k in ("observed_at_ms", "valid_until_ms", "source", "source_revision",
++                                   "machine", "board", "evidence_ref")}
++    if stored["lifecycle"] != _lifecycle(conn, task.id):
++        return _unknown("lifecycle_changed", **source)
++    identity = {"gateway": value["machine"], "profile": stored["assignee"], "board": board,
++                "kind": "card", "work_id": task.id}
++    if stored["lifecycle"]["run_id"] is not None:
++        identity["run_id"] = stored["lifecycle"]["run_id"]
++    # Neither a poll/event id nor task.status is an execution generation or a
++    # live process receipt. An unclaimed card's optional envelope is unknown.
++    state = {"ready": "queued", "todo": "waiting"}.get(task.status, "unknown")
++    observation = adapt({"version": 1, "identity": identity,
++                         "owner": {"gateway": value["machine"], "profile": stored["assignee"]},
++                         "state": state, "source": value["source"], "source_revision": value["source_revision"],
++                         "observed_at": value["observed_at_ms"] / 1000,
++                         "valid_until": value["valid_until_ms"] / 1000,
++                         "evidence_refs": [value["evidence_ref"]], "diagnostics": stored["reasons"],
++                         "last_activity": None, "last_progress": None}, now=now, source_class="sidebar")
++    at, until = source["observed_at_ms"] / 1000, source["valid_until_ms"] / 1000
++    freshness = "unknown"
++    if all(epoch(v) for v in (at, until, now)) and at <= now and until >= at:
++        freshness = "current" if now < min(until, at + 180) else "stale"
++    out = {"version": 1, **source, "task_id": task.id, "lifecycle": stored["lifecycle"],
++           "freshness": freshness, "reasons": stored["reasons"],
++           "native_restrictions": stored.get("native_restrictions", []),
++           "machine_reasons": value.get("machine_reasons", []),
++           "eligible_backlog": False if stored["parents"] and freshness == "current" else None,
++           "admissible_slots": None, "unknown_coverage": ["admission_not_fully_observed"],
++           "execution_observation": observation}
++    if observation.get("unknown_reason"):
++        out["execution_unknown_reason"] = observation["unknown_reason"]
++    return out
++
++
++def describe(value):
++    """Never turn an incomplete restriction list into an assertion of availability."""
++    codes = ", ".join(r["code"] + " (" + r["native_code"] + ")" for r in value.get("reasons", []))
++    native = ", ".join(r["native_code"] for r in value.get("native_restrictions", []))
++    codes = "; ".join(v for v in (codes, native) if v)
++    return (f"{value.get('freshness', 'unknown')}: {codes or 'restriction coverage incomplete'}; "
++            "admissible capacity unknown")
+diff --git a/hermes_cli/kanban_capacity_metrics.py b/hermes_cli/kanban_capacity_metrics.py
+new file mode 100644
+index 0000000000..6127721939
+--- /dev/null
++++ b/hermes_cli/kanban_capacity_metrics.py
+@@ -0,0 +1,165 @@
++"""Pure bounded-window receipt metrics. Never used to admit, retry or declare progress.
++
++Event order is producer order, not sorted wall time: sorting clocks would conceal
++skew. ``spawned`` is a submitter, not the owner-bound executing interpreter.
++Callers must pass a complete ordered task history (or report truncated coverage).
++"""
++from __future__ import annotations
++
++import json
++from itertools import pairwise
++import math
++import statistics
++
++from hermes_cli.execution_observations import epoch
++
++METRICS = ("ready_to_claim_s", "claim_to_process_start_s", "ready_to_process_start_s")
++
++
++def _payload(event):
++    raw = event.get("payload")
++    if isinstance(raw, dict):
++        return raw
++    try:
++        value = json.loads(raw) if isinstance(raw, str) else {}
++    except ValueError:
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _ready(event, payload):
++    # Creation is not readiness. Only explicit ready transitions qualify.
++    if event.get("kind") == "promoted":
++        return payload.get("status", "ready") == "ready"
++    if event.get("kind") in {"released", "reclaimed", "owner_unavailable", "crashed", "rate_limited",
++                              "timed_out", "stale", "reconciled", "owner_restart_lost",
++                              "protocol_violation", "oom_killed", "signaled"}:
++        return payload.get("retry_status") == "ready"
++    return event.get("kind") in {"continued", "unblocked", "status", "continuation_woken"} and payload.get("status") == "ready"
++
++
++def _delta(start, end):
++    return end - start if epoch(start) and epoch(end) and end >= start else None
++
++
++def _attempt(board, task_id, ready, claim=None):
++    return {"board": board, "task_id": task_id,
++            "run_id": claim.get("run_id") if claim else None,
++            "ready_at": ready.get("created_at") if ready else None,
++            "claim_at": claim.get("created_at") if claim else None,
++            "ready_ref": ready.get("id") if ready else None,
++            "claim_ref": claim.get("id") if claim else None,
++            "claim_lock": _payload(claim).get("lock") if claim else None,
++            "process_start_at": None, "process_ref": None, "process_pid": None,
++            "last_progress": None}
++
++
++def attempts(events, *, board, task_id, now):
++    """One record per observed claim, plus a right-censored unclaimed ready interval.
++
++    Binding must match the actual run and claim, with process birth evidence.
++    Timestamp is the durable binding receipt time, NOT the OS fingerprint (which
++    is not an epoch). This measures time-to-process-start-receipt, an upper bound
++    on actual launch latency. Missing/skewed receipts produce null metrics.
++    """
++    rows, ready, current = [], None, None
++    for event in events:
++        payload, kind = _payload(event), event.get("kind")
++        if _ready(event, payload):
++            ready, current = event, None
++        elif kind == "claimed" and event.get("run_id") is not None:
++            # A Board lease event followed by local claim may share the run.
++            # Only the local lock-bearing claim binds the interpreter receipt.
++            if not payload.get("lock"):
++                continue
++            if current and current["run_id"] == event["run_id"]:
++                continue
++            current = _attempt(board, task_id, ready, event)
++            rows.append(current)
++            ready = None
++        elif kind == "worker_bound" and current:
++            if (event.get("run_id") == current["run_id"] and current["claim_lock"]
++                    and payload.get("claim_lock") == current["claim_lock"]
++                    and type(payload.get("pid")) is int and payload["pid"] > 0
++                    and payload.get("started_at") not in (None, "", "unverified")
++                    and current["process_ref"] is None):
++                current.update(process_start_at=event.get("created_at"), process_ref=event.get("id"),
++                               process_pid=payload["pid"])
++        elif kind in {"dependency_wait", "blocked", "scheduled", "completed", "archived", "changes_requested"}:
++            ready, current = None, None
++    if ready is not None:
++        rows.append(_attempt(board, task_id, ready))
++    for row in rows:
++        r, c, s = row["ready_at"], row["claim_at"], row["process_start_at"]
++        unknown = []
++        for label, value in (("ready", r), ("claim", c), ("process_start", s)):
++            if not epoch(value):
++                unknown.append("missing_" + label + "_receipt")
++        skew = (not epoch(now) or any(epoch(v) and v > now for v in (r, c, s))
++                or (epoch(r) and epoch(c) and c < r) or (epoch(c) and epoch(s) and s < c))
++        if skew:
++            unknown.append("clock_inconsistent")
++        values = (_delta(r, c), _delta(c, s), _delta(r, s) if epoch(c) else None)
++        row.update(zip(METRICS, (None, None, None) if skew else values))
++        row.update(unknown=unknown, censored=s is None,
++                   process_start_semantics="owner_bound_receipt_not_progress")
++    return rows
++
++
++def summarize(rows):
++    """Retain raw samples; p50 needs two, p95 twenty (nearest-rank) samples."""
++    out = {"attempt_count": len(rows), "censored_count": sum(bool(r["censored"]) for r in rows),
++           "receipt_resolution_seconds": 1, "latency_semantics": "durable_receipt_delta_not_exact_launch"}
++    for key in METRICS:
++        values = sorted(r[key] for r in rows if r[key] is not None)
++        out[key] = {"samples": values, "sample_count": len(values),
++                    "p50": statistics.median(values) if len(values) >= 2 else None,
++                    "p95": values[math.ceil(.95 * len(values)) - 1] if len(values) >= 20 else None}
++    return out
++
++
++def _valid_interval(row, left, right):
++    at, until = row.get("observed_at"), row.get("valid_until")
++    return (epoch(at) and epoch(until) and at <= left and until >= right and until <= at + 180
++            and row.get("coverage_complete") is True
++            and type(row.get("eligible_backlog")) is int and row["eligible_backlog"] >= 0
++            and type(row.get("admissible_slots")) is int and row["admissible_slots"] >= 0
++            and isinstance(row.get("restrictions"), list))
++
++
++def idle_coverage(intervals):
++    """Integrate aligned complete observations, unioning shared host slots.
++
++    ``slot_scope`` identifies the actual shared slot pool, NOT the candidate or
++    board. Incomplete/conflicting evidence contributes unknown machine-seconds,
++    never fabricated unknown slot-seconds. Each input is an explicitly observed
++    interval; point snapshots must not be extended to fill observation gaps.
++    """
++    out = {"unexplained_idle_slot_seconds": 0, "unknown_seconds": 0,
++           "explained_seconds": 0, "observed_seconds": 0, "invalid_intervals": 0}
++    groups = {}
++    for row in intervals:
++        start, end = row.get("start"), row.get("end")
++        if (not epoch(start) or not epoch(end) or end <= start
++                or not row.get("machine") or not row.get("slot_scope")):
++            out["invalid_intervals"] += 1
++            continue
++        groups.setdefault((row["machine"], row["slot_scope"]), []).append(row)
++    for rows in groups.values():
++        points = sorted({r[k] for r in rows for k in ("start", "end")})
++        for left, right in pairwise(points):
++            active = [r for r in rows if r["start"] <= left and r["end"] >= right]
++            if not active:
++                # The bounding observation window contains a telemetry gap.
++                out["unknown_seconds"] += right - left
++                continue
++            width = right - left
++            out["observed_seconds"] += width
++            if (not all(_valid_interval(r, left, right) for r in active)
++                    or len({r.get("admissible_slots") for r in active}) != 1):
++                out["unknown_seconds"] += width
++            elif any(r["restrictions"] for r in active) or not any(r["eligible_backlog"] for r in active):
++                out["explained_seconds"] += width
++            else:
++                out["unexplained_idle_slot_seconds"] += width * active[0]["admissible_slots"]
++    return out
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index d51294a088..44d948cf0a 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2005,6 +2005,7 @@ def dispatch_once(
+     max_in_progress_per_profile: Optional[int] = None,
+     reconcile_orphans: bool = True,
+     dispatcher_id: Optional[str] = None,
++    observation_update_drain: bool = False,
+ ) -> DispatchResult:
+     """Run one dispatcher tick under the board's single-writer lock.
+ 
+@@ -2015,7 +2016,7 @@ def dispatch_once(
+     resolved DB path so unrelated boards tick in parallel.
+     """
+     def _locked_tick() -> DispatchResult:
+-        return _dispatch_once_locked(
++        result = _dispatch_once_locked(
+             conn,
+             spawn_fn=spawn_fn,
+             ttl_seconds=ttl_seconds,
+@@ -2029,6 +2030,10 @@ def dispatch_once(
+             max_in_progress_per_profile=max_in_progress_per_profile,
+             reconcile_orphans=reconcile_orphans,
+         )
++        from hermes_cli.kanban_capacity_evidence import observe_dispatch
++        observe_dispatch(conn, result, board=board, dry_run=dry_run,
++                         update_drain=observation_update_drain)
++        return result
+ 
+     from hermes_cli.kanban_dispatch_owner import run_owned_tick
+     return run_owned_tick(conn, _locked_tick, dispatcher_id, board, dry_run)
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 1c90cee58c..cf681fa9ab 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -261,7 +261,21 @@ def fields(place: Optional[dict[str, Any]]) -> dict[str, Any]:
+     return {"queue": place, "queue_note": describe(place)} if place else {}
+ 
+ 
++def detail_fields(conn, task, board=None):
++    """Additive card-read fields for every state; legacy queue shape is unchanged."""
++    from hermes_cli import kanban_capacity_evidence as evidence
++    out = fields(read(conn, task, board))
++    try:
++        capacity = evidence.read(conn, task, board=board)
++    except Exception:  # health: allow BLE001 -- diagnostics cannot fail a card read
++        capacity = evidence._unknown("observation_unavailable")
++    observation = capacity.get("execution_observation")
++    out.update(capacity_evidence=capacity, execution_observations=[observation] if observation else [])
++    out["capacity_note"] = evidence.describe(capacity)
++    return out
++
++
+ def print_field(place: Optional[dict[str, Any]], queue_reason: Any, field) -> None:
+     """The text ``queue:`` line, unless the worker-pool ``queue_reason`` line already took it."""
+     if place and not queue_reason:
+-        field("queue", describe(place))
++        field("queue", fields(place)["queue_note"])
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 93b1004bb8..73f31393ed 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -402,9 +402,7 @@ def get_task(
+         if task is not None:
+             out = _task_detail(conn, task, run_state_type, run_state_name)
+             from hermes_cli import kanban_queue_position as kqp
+-            queue = kqp.position(conn, task, board)  # [daveey] a long wait reads as queued, not stuck
+-            if queue is not None:
+-                out["queue"] = queue
++            out.update(kqp.detail_fields(conn, task, board))
+             return {**out, "source": "live", "wait_observation": owner_proof(conn, task)}
+         live_file = kbc._main_db_file(conn)
+     # [daveey] A synced board's live file holds only this gateway's own cards; a card another gateway created
+diff --git a/schemas/execution-observation-v1.schema.json b/schemas/execution-observation-v1.schema.json
+new file mode 100644
+index 0000000000..135e882550
+--- /dev/null
++++ b/schemas/execution-observation-v1.schema.json
+@@ -0,0 +1,55 @@
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "$id": "urn:hermes:execution-observation:v1",
++  "title": "Source execution observation v1 (consumer unknown adapters may be incomplete)",
++  "type": "object",
++  "required": ["version", "identity", "owner", "state", "source", "source_revision", "evidence_refs", "observed_at", "valid_until"],
++  "properties": {
++    "version": {"const": 1},
++    "identity": {
++      "type": "object",
++      "required": ["gateway", "profile", "kind", "work_id"],
++      "properties": {
++        "gateway": {"type": "string", "minLength": 1},
++        "profile": {"type": "string", "minLength": 1},
++        "kind": {"type": "string", "minLength": 1},
++        "work_id": {"type": "string", "minLength": 1},
++        "board": {"type": "string", "minLength": 1},
++        "session": {"type": "string", "minLength": 1},
++        "lineage": {"type": "string", "minLength": 1},
++        "run_id": {"oneOf": [{"type": "integer", "minimum": 1}, {"type": "string", "minLength": 1}]},
++        "generation": {"oneOf": [{"type": "integer", "minimum": 1}, {"type": "string", "minLength": 1}]}
++      },
++      "anyOf": [{"required": ["run_id"]}, {"required": ["generation"]}],
++      "if": {"properties": {"kind": {"const": "card"}}},
++      "then": {"required": ["board"]},
++      "else": {"anyOf": [{"required": ["session"]}, {"required": ["lineage"]}]}
++    },
++    "owner": {"type": "object", "required": ["gateway", "profile"], "properties": {
++      "gateway": {"type": "string", "minLength": 1}, "profile": {"type": "string", "minLength": 1}
++    }},
++    "state": {"enum": ["running", "queued", "waiting", "needs_user", "done", "failed", "cancelled", "unknown"]},
++    "last_known_state": {"type": ["string", "null"]},
++    "source": {"type": "string", "minLength": 1},
++    "source_revision": {"type": "string", "minLength": 1},
++    "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
++    "observed_at": {"$ref": "#/$defs/epoch"},
++    "valid_until": {"$ref": "#/$defs/epoch"},
++    "last_activity": {"anyOf": [{"$ref": "#/$defs/epoch"}, {"type": "null"}]},
++    "last_progress": {"anyOf": [{"$ref": "#/$defs/epoch"}, {"type": "null"}]},
++    "diagnostics": {"type": "array", "items": {
++      "type": "object", "required": ["code", "native_code", "phase", "evidence_ref"],
++      "properties": {
++        "code": {"enum": ["capacity.memory_pressure", "capacity.provider_limit", "capacity.placement", "capacity.dependency", "capacity.update_drain"]},
++        "native_code": {"type": "string", "minLength": 1},
++        "phase": {"enum": ["pre_claim", "post_claim", "post_start"]},
++        "evidence_ref": {"type": "string", "minLength": 1}
++      }
++    }},
++    "required_sources": {"type": "array", "items": {"type": "object", "required": ["observed_at", "valid_until"], "properties": {
++      "observed_at": {"$ref": "#/$defs/epoch"}, "valid_until": {"$ref": "#/$defs/epoch"}
++    }}}
++  },
++  "$defs": {"epoch": {"type": "number", "minimum": 0, "maximum": 8640000000000}},
++  "$comment": "Consumers also check valid_until >= observed_at, now >= observed_at, separate source TTL bounds and min(required_sources.valid_until)."
++}
+diff --git a/tests/hermes_cli/test_execution_observations.py b/tests/hermes_cli/test_execution_observations.py
+new file mode 100644
+index 0000000000..75628c47af
+--- /dev/null
++++ b/tests/hermes_cli/test_execution_observations.py
+@@ -0,0 +1,117 @@
++"""Source-owned validity; no consumer read turns history into live execution."""
++from copy import deepcopy
++
++import pytest
++
++from hermes_cli.execution_observations import adapt, capacity_reason
++
++
++def observation():
++    return {
++        "version": 1,
++        "identity": {"gateway": "gateway-a", "profile": "default", "board": "sample",
++                     "kind": "card", "work_id": "task-a", "run_id": 7},
++        "owner": {"gateway": "gateway-a", "profile": "default"},
++        "state": "queued", "source": "dispatcher", "source_revision": "event:31",
++        "evidence_refs": ["event:31"], "observed_at": 1000, "valid_until": 1180,
++        "last_activity": 1000, "last_progress": None, "diagnostics": [],
++    }
++
++
++def test_current_preserves_source_and_separates_progress():
++    raw = observation()
++    before = deepcopy(raw)
++    out = adapt(raw, now=1100, source_class="sidebar")
++    assert out["state"] == "queued" and out["freshness"] == "current"
++    assert out["observed_at"] == 1000 and out["valid_until"] == 1180
++    assert out["age_seconds"] == 100
++    assert out["last_progress"] is None
++    assert raw == before
++
++
++@pytest.mark.parametrize("now,expected", [(1180, "stale"), (1200, "stale"), (999, "unknown")])
++def test_stale_and_clock_skew_never_mean_idle_or_failed(now, expected):
++    out = adapt(observation(), now=now, source_class="sidebar")
++    assert out["state"] == "unknown"
++    assert out["last_known_state"] == "queued"
++    assert out["freshness"] == expected
++    assert out["observed_at"] == 1000
++
++
++@pytest.mark.parametrize("field", ["identity", "source", "source_revision", "observed_at", "valid_until"])
++def test_missing_required_source_is_unknown_without_fabrication(field):
++    raw = observation()
++    del raw[field]
++    out = adapt(raw, now=1100, source_class="sidebar")
++    assert out["state"] == "unknown" and out["unknown_reason"]
++    assert out["observed_at"] == raw.get("observed_at")
++
++
++@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, "1000", -1])
++def test_invalid_clock_is_unknown(value):
++    raw = observation()
++    raw["observed_at"] = value
++    assert adapt(raw, now=1100, source_class="sidebar")["state"] == "unknown"
++
++
++def test_board_and_attempt_identity_required_for_card():
++    for key in ("board", "run_id"):
++        raw = observation()
++        del raw["identity"][key]
++        out = adapt(raw, now=1100, source_class="sidebar")
++        assert out["state"] == "unknown"
++        assert key not in out["identity"]
++
++
++def test_generation_is_valid_without_invented_run():
++    raw = observation()
++    del raw["identity"]["run_id"]
++    raw["identity"]["generation"] = "ready-event:4"
++    out = adapt(raw, now=1100, source_class="sidebar")
++    assert out["state"] == "queued" and "run_id" not in out["identity"]
++
++
++def test_source_validity_is_minimum_and_upper_bounds_are_separate():
++    raw = observation()
++    raw["valid_until"] = 5000
++    assert adapt(raw, now=1200, source_class="sidebar")["state"] == "unknown"
++    imported = adapt(raw, now=1200, source_class="imported_owner")
++    assert imported["valid_until"] == 1600 and imported["state"] == "queued"
++    raw["required_sources"] = [{"observed_at": 990, "valid_until": 1050}]
++    assert adapt(raw, now=1100, source_class="imported_owner")["state"] == "unknown"
++
++
++def test_fetch_never_renews_ttl():
++    first = adapt(observation(), now=1100, source_class="sidebar")
++    second = adapt(first, now=1200, source_class="sidebar")
++    assert second["state"] == "unknown" and second["valid_until"] == 1180
++    assert second["last_known_state"] == "queued"
++
++
++def test_legacy_unknown_retains_human_request_and_delivery_receipt():
++    legacy = {"state": "running", "human_request": {"action": "answer"},
++              "completion_receipt": {"verified": True}}
++    out = adapt(legacy, now=1100, source_class="sidebar")
++    assert out["state"] == "unknown" and out["observed_at"] is None
++    assert out["human_request"] == legacy["human_request"]
++    assert out["completion_receipt"] == legacy["completion_receipt"]
++
++
++@pytest.mark.parametrize("code", ["memory_pressure", "provider_limit", "placement", "dependency", "update_drain"])
++def test_namespaced_concurrent_native_diagnostics(code):
++    reason = capacity_reason(code, native_code="native_hold", phase="pre_claim", evidence_ref="event:2")
++    assert reason == {"code": "capacity." + code, "native_code": "native_hold",
++                      "phase": "pre_claim", "evidence_ref": "event:2"}
++    raw = observation()
++    raw["diagnostics"] = [reason, capacity_reason("placement", native_code="missing_labels",
++                                                 phase="pre_claim", evidence_ref="event:3")]
++    assert adapt(raw, now=1100, source_class="sidebar")["diagnostics"] == raw["diagnostics"]
++
++
++def test_provider_after_start_stays_after_start():
++    reason = capacity_reason("provider_limit", native_code="rate_limited", phase="post_start", evidence_ref="event:8")
++    assert reason["phase"] == "post_start"
++
++
++def test_unknown_source_class_cannot_manufacture_validity():
++    assert adapt(observation(), now=1100, source_class="invented")["state"] == "unknown"
+diff --git a/tests/hermes_cli/test_kanban_capacity_evidence.py b/tests/hermes_cli/test_kanban_capacity_evidence.py
+new file mode 100644
+index 0000000000..faa2ae74dd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capacity_evidence.py
+@@ -0,0 +1,133 @@
++"""Capacity evidence is concurrent, durable, lifecycle fenced and advisory only."""
++from contextlib import closing
++from dataclasses import asdict
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_capacity_evidence as evidence
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    assert kb.kanban_db_path().is_relative_to(tmp_path)
++    with closing(kbc.connect()) as conn:
++        yield conn
++
++
++@pytest.mark.parametrize("field,value,code", [
++    ("memory_pressure", "critical", "capacity.memory_pressure"),
++    ("rate_limited", ["TASK"], "capacity.provider_limit"),
++    ("skipped_ineligible", [("TASK", "labels_mismatch")], "capacity.placement"),
++])
++def test_native_dispatch_result_persists_without_mutation(board, field, value, code):
++    tid = kb.create_task(board, title="one", assignee="alice")
++    if isinstance(value, list):
++        value = [tid if x == "TASK" else (tid, x[1]) for x in value]
++    result = dispatch.DispatchResult(**{field: value})
++    before = asdict(result)
++    evidence.record(board, result, board="sample", machine="machine-a", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    assert code in [r["code"] for r in out["reasons"]]
++    assert asdict(result) == before
++    if field == "rate_limited":
++        assert out["reasons"][0]["phase"] == "post_claim"
++
++
++def test_multiple_reasons_dependency_and_update_drain(board):
++    parent = kb.create_task(board, title="parent", assignee="alice")
++    child = kb.create_task(board, title="child", assignee="alice", parents=[parent])
++    result = dispatch.DispatchResult(memory_pressure="critical")
++    evidence.record(board, result, board="sample", machine="machine-a", now=1000, update_drain=True)
++    out = evidence.read(board, kb.get_task(board, child), board="sample", now=1001)
++    assert {r["code"] for r in out["reasons"]} == {"capacity.dependency"}
++    assert {r["code"] for r in out["machine_reasons"]} == {
++        "capacity.memory_pressure", "capacity.update_drain"}
++    ready = evidence.read(board, kb.get_task(board, parent), board="sample", now=1001)
++    assert {r["code"] for r in ready["reasons"]} == {
++        "capacity.memory_pressure", "capacity.update_drain"}
++    assert out["eligible_backlog"] is False
++
++
++def test_read_does_not_renew_timestamp_or_create_table(board):
++    tid = kb.create_task(board, title="one", assignee="alice")
++    task = kb.get_task(board, tid)
++    assert evidence.read(board, task, board="sample", now=1000)["freshness"] == "unknown"
++    assert not board.execute("SELECT name FROM sqlite_master WHERE name='kanban_capacity_observation'").fetchall()
++    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"), board="sample", machine="m", now=1000)
++    current = evidence.read(board, task, board="sample", now=1001)
++    stale = evidence.read(board, task, board="sample", now=1180)
++    assert current["observed_at_ms"] == stale["observed_at_ms"] == 1000000
++    assert stale["freshness"] == "stale"
++    assert stale["eligible_backlog"] is None
++    assert stale["execution_observation"]["state"] == "unknown"
++
++
++def test_retry_or_board_mismatch_cannot_reuse_restrictions(board):
++    tid = kb.create_task(board, title="one", assignee="alice")
++    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"), board="sample", machine="m", now=1000)
++    assert evidence.read(board, kb.get_task(board, tid), board="other", now=1001)["freshness"] == "unknown"
++    kb.claim_task(board, tid)
++    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    assert out["freshness"] == "unknown" and out["unknown_reason"] == "lifecycle_changed"
++
++
++def test_clock_skew_and_missing_admission_coverage_are_unknown(board):
++    tid = kb.create_task(board, title="one", assignee="alice")
++    evidence.record(board, dispatch.DispatchResult(), board="sample", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=999)
++    assert out["freshness"] == "unknown"
++    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    assert out["admissible_slots"] is None and out["eligible_backlog"] is None
++    assert out["unknown_coverage"]
++
++
++def test_dry_or_skipped_tick_never_manufactures_evidence(board):
++    tid = kb.create_task(board, title="one", assignee="alice")
++    for result in [dispatch.DispatchResult(skipped_locked=True), dispatch.DispatchResult(skipped_owned=True)]:
++        assert evidence.record(board, result, board="sample", machine="m", now=1000) is False
++    assert evidence.record(board, dispatch.DispatchResult(), board="sample", machine="m", now=1000, dry_run=True) is False
++    assert evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)["freshness"] == "unknown"
++
++
++@pytest.mark.parametrize("native,is_provider", [
++    ("subscription_quota_reset", True), ("rate_limit_cooldown", True),
++    ("infrastructure_cooldown", False), ("owner_restart_cooldown", False),
++])
++def test_native_provider_clocks_are_preclaim_and_deduplicated(board, native, is_provider):
++    tid = kb.create_task(board, title="clock", assignee="alice")
++    result = dispatch.DispatchResult(clock_held={tid: (native, 1100)}, respawn_guarded=[(tid, native)])
++    evidence.record(board, result, board="sample", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    assert len(out["reasons"]) == int(is_provider)
++    if is_provider:
++        assert out["reasons"][0]["native_code"] == native
++        assert out["reasons"][0]["phase"] == "pre_claim"
++
++
++def test_claim_does_not_prove_execution_or_inherit_preclaim_pressure(board):
++    tid = kb.create_task(board, title="claimed", assignee="alice")
++    kb.claim_task(board, tid)
++    evidence.record(board, dispatch.DispatchResult(memory_pressure="critical"),
++                    board="sample", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    assert out["reasons"] == []
++    assert out["execution_observation"]["state"] == "unknown"
++    assert out["execution_observation"]["last_progress"] is None
++
++
++def test_read_never_invents_generation_from_an_event_or_poll(board):
++    tid = kb.create_task(board, title="unclaimed", assignee="alice")
++    evidence.record(board, dispatch.DispatchResult(), board="sample", machine="m", now=1000)
++    out = evidence.read(board, kb.get_task(board, tid), board="sample", now=1001)
++    assert out["freshness"] == "current"
++    observation = out["execution_observation"]
++    assert "generation" not in observation["identity"]
++    assert "run_id" not in observation["identity"]
++    assert observation["state"] == "unknown"
+diff --git a/tests/hermes_cli/test_kanban_capacity_harness.py b/tests/hermes_cli/test_kanban_capacity_harness.py
+new file mode 100644
+index 0000000000..fb8274c614
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capacity_harness.py
+@@ -0,0 +1,54 @@
++"""Bounded isolated baseline: four cards, fake spawn, no provider or host load."""
++from contextlib import closing
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++
++
++@pytest.fixture
++def capacity_board(tmp_path, monkeypatch):
++    home = tmp_path / "capacity-home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    path = kb.kanban_db_path()
++    assert path.is_relative_to(home)
++    # No synthetic PID may resolve to an unrelated host process.
++    monkeypatch.setattr(dispatch, "_pid_alive", lambda pid: False)
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *args: False)
++    monkeypatch.setattr(dispatch, "_process_fingerprint", lambda pid: "fixture|1")
++    monkeypatch.setattr(dispatch, "count_running_tasks_other_boards", lambda board=None: 0)
++    with closing(kbc.connect(path)) as conn:
++        ids = [kb.create_task(conn, title=f"capacity fixture {i}", assignee="alice") for i in range(3)]
++        child = kb.create_task(conn, title="dependency control", assignee="alice", parents=[ids[0]])
++        yield conn, ids, child
++
++
++@pytest.mark.parametrize("pressure,max_spawn,expected", [
++    ("critical", 3, 0), ("elevated", 3, 1), ("ok", 3, 3), ("unknown", 3, 3), ("ok", 0, 0),
++])
++def test_bounded_fake_spawn_baseline(capacity_board, all_assignees_spawnable, monkeypatch,
++                                     pressure, max_spawn, expected):
++    start = time.monotonic()
++    conn, ids, child = capacity_board
++    monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda sample=None: pressure)
++    seen = []
++
++    def fake_spawn(task, workspace, board=None):
++        seen.append(task.id)
++        return 424242
++
++    result = dispatch.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=max_spawn,
++                                    max_in_progress=4, reconcile_orphans=False)
++    assert len(seen) == expected
++    assert set(seen) <= set(ids)
++    assert child not in seen
++    assert kb.get_task(conn, child).status == "todo"
++    assert len(result.spawned) == expected
++    assert time.monotonic() - start < 120
+diff --git a/tests/hermes_cli/test_kanban_capacity_integration.py b/tests/hermes_cli/test_kanban_capacity_integration.py
+new file mode 100644
+index 0000000000..dc6523731e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capacity_integration.py
+@@ -0,0 +1,96 @@
++"""Actual dispatch/read seams, isolated four-card harness; no model calls."""
++from dataclasses import asdict
++
++from hermes_cli import kanban_capacity_evidence as evidence
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_queue_position as queue
++from tests.hermes_cli import test_kanban_capacity_harness as harness
++
++capacity_board = harness.capacity_board
++
++
++def test_dispatch_publishes_pressure_without_changing_decision(capacity_board, all_assignees_spawnable, monkeypatch):
++    conn, ids, child = capacity_board
++    monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda sample=None: "critical")
++    seen = []
++    result = dispatch.dispatch_once(conn, spawn_fn=lambda *a: seen.append(a),
++                                    max_in_progress=4, reconcile_orphans=False, board="sample")
++    assert seen == [] and result.memory_pressure == "critical"
++    out = evidence.read(conn, kb.get_task(conn, ids[0]), board="sample")
++    assert out["freshness"] == "current"
++    assert out["reasons"][0]["code"] == "capacity.memory_pressure"
++    assert kb.get_task(conn, child).status == "todo"
++
++
++def test_drain_is_explicit_not_inferred_from_zero_budget(capacity_board, all_assignees_spawnable, monkeypatch):
++    conn, ids, _ = capacity_board
++    monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda sample=None: "ok")
++    dispatch.dispatch_once(conn, max_spawn=0, reconcile_orphans=False, board="sample",
++                           observation_update_drain=True)
++    out = evidence.read(conn, kb.get_task(conn, ids[0]), board="sample")
++    assert [r["code"] for r in out["reasons"]] == ["capacity.update_drain"]
++    dispatch.dispatch_once(conn, max_spawn=0, reconcile_orphans=False, board="sample")
++    assert evidence.read(conn, kb.get_task(conn, ids[0]), board="sample")["reasons"] == []
++
++
++def test_observer_exception_cannot_change_dispatch_return(capacity_board, monkeypatch):
++    conn, _, _ = capacity_board
++    expected = dispatch.DispatchResult(memory_pressure="critical")
++    monkeypatch.setattr(dispatch, "_dispatch_once_locked", lambda *a, **kw: expected)
++    monkeypatch.setattr(evidence, "record", lambda *a, **kw: (_ for _ in ()).throw(ValueError("fixture")))
++    result = dispatch.dispatch_once(conn, board="sample")
++    assert result is expected and asdict(result) == asdict(expected)
++
++
++def test_existing_queue_read_adds_optional_fields(capacity_board, monkeypatch):
++    conn, ids, _ = capacity_board
++    task = kb.get_task(conn, ids[0])
++    monkeypatch.setattr(queue, "_running_and_limit", lambda *a: (0, 4))
++    evidence.record(conn, dispatch.DispatchResult(memory_pressure="critical"), board="sample", machine="m")
++    fields = queue.detail_fields(conn, task, "sample")
++    place = fields["queue"]
++    assert fields["capacity_evidence"]["freshness"] == "current"
++    assert fields["execution_observations"][0]["state"] == "unknown"
++    assert "capacity.memory_pressure" in fields["capacity_note"]
++    assert "capacity_evidence" not in place
++    assert place["limit"] == 4 and place["running"] == 0
++
++
++def test_tool_cli_rest_read_actual_persisted_evidence(capacity_board, monkeypatch, capsys):
++    import json
++    from argparse import Namespace
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from hermes_cli import kanban as cli
++    from tools.kanban_show import show
++    from tests.plugins.test_kanban_foreign_card_api import _load_plugin_router
++
++    conn, ids, child = capacity_board
++    monkeypatch.setattr(queue, "_running_and_limit", lambda *a: (0, 4))
++    evidence.record(conn, dispatch.DispatchResult(memory_pressure="critical"), board="default", machine="m")
++    app = FastAPI()
++    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
++    with TestClient(app) as client:
++        for tid, reason in ((ids[0], "capacity.memory_pressure"), (child, "capacity.dependency")):
++            tool = json.loads(show({"task_id": tid}))
++            assert cli._cmd_show(Namespace(task_id=tid, json=True, board=None)) == 0
++            command = json.loads(capsys.readouterr().out)
++            response = client.get(f"/api/plugins/kanban/tasks/{tid}")
++            assert response.status_code == 200
++            for payload in (tool, command, response.json()):
++                assert reason in [r["code"] for r in payload["capacity_evidence"]["reasons"]]
++                assert payload["capacity_evidence"]["observed_at_ms"] == tool["capacity_evidence"]["observed_at_ms"]
++                if tid == child:
++                    assert "queue" not in payload
++                    assert payload["capacity_evidence"]["eligible_backlog"] is False
++    assert cli._cmd_show(Namespace(task_id=child, json=False, board=None)) == 0
++    assert "capacity.dependency" in capsys.readouterr().out
++
++
++def test_unmapped_restriction_remains_explicit(capacity_board):
++    conn, ids, _ = capacity_board
++    evidence.record(conn, dispatch.DispatchResult(at_capacity="max_in_progress"), board="default", machine="m")
++    out = queue.detail_fields(conn, kb.get_task(conn, ids[0]))
++    assert "at_capacity" in out["capacity_note"]
++    assert "no restriction observed" not in out["capacity_note"]
+diff --git a/tests/hermes_cli/test_kanban_capacity_metrics.py b/tests/hermes_cli/test_kanban_capacity_metrics.py
+new file mode 100644
+index 0000000000..741cfe58d0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capacity_metrics.py
+@@ -0,0 +1,112 @@
++"""Latency is receipt evidence, never readiness inference or liveness."""
++import pytest
++
++from hermes_cli.kanban_capacity_metrics import attempts, idle_coverage, summarize
++
++
++def event(n, kind, at, run=None, **payload):
++    return {"id": n, "kind": kind, "created_at": at, "run_id": run, "payload": payload}
++
++
++def history():
++    return [event(1, "promoted", 10), event(2, "claimed", 12, 7, lock="host:1"),
++            event(3, "spawned", 13, 7, pid=111),
++            event(4, "worker_bound", 15, 7, pid=222, claim_lock="host:1", started_at="birth|2")]
++
++
++def test_actual_interpreter_not_submitter_and_no_progress_inference():
++    out = attempts(history(), board="one", task_id="t", now=20)
++    assert len(out) == 1
++    assert out[0]["ready_to_claim_s"] == 2
++    assert out[0]["claim_to_process_start_s"] == 3
++    assert out[0]["ready_to_process_start_s"] == 5
++    assert out[0]["process_pid"] == 222
++    assert out[0]["last_progress"] is None
++
++
++def test_creation_time_and_claim_do_not_substitute_for_missing_receipts():
++    events = [event(1, "created", 1, status="ready"), event(2, "claimed", 12, 7, lock="h")]
++    out = attempts(events, board="one", task_id="t", now=20)[0]
++    assert out["ready_to_claim_s"] is None
++    assert out["claim_to_process_start_s"] is None
++    assert out["censored"] is True
++    assert "missing_ready_receipt" in out["unknown"]
++
++
++@pytest.mark.parametrize("change", ["wrong_run", "wrong_lock", "missing_birth", "skew"])
++def test_start_requires_matching_attempt_and_consistent_clock(change):
++    events = history()
++    if change == "wrong_run":
++        events[-1]["run_id"] = 8
++    elif change == "wrong_lock":
++        events[-1]["payload"]["claim_lock"] = "other"
++    elif change == "missing_birth":
++        events[-1]["payload"].pop("started_at")
++    else:
++        events[-1]["created_at"] = 11
++    out = attempts(events, board="one", task_id="t", now=20)[0]
++    assert out["claim_to_process_start_s"] is None
++    assert out["ready_to_process_start_s"] is None
++
++
++def test_retry_does_not_reuse_previous_ready_or_process_start():
++    events = history() + [event(5, "released", 16, 7, retry_status="ready"),
++                          event(6, "claimed", 18, 8, lock="h:2")]
++    out = attempts(events, board="one", task_id="t", now=20)
++    assert len(out) == 2
++    assert out[1]["ready_to_claim_s"] == 2
++    assert out[1]["process_pid"] is None
++    assert out[1]["censored"]
++
++
++def test_dependency_and_observation_activity_do_not_establish_ready_or_progress():
++    events = [event(1, "created", 1, status="todo"), event(2, "dependency_wait", 2),
++              event(3, "heartbeat", 3), event(4, "commented", 4)]
++    assert attempts(events, board="one", task_id="t", now=20) == []
++
++
++def test_summary_keeps_pending_and_small_sample_percentiles_unknown():
++    out = attempts(history(), board="one", task_id="t", now=20)
++    out += attempts([event(1, "promoted", 16)], board="two", task_id="t", now=20)
++    report = summarize(out)
++    assert report["attempt_count"] == 2
++    assert report["censored_count"] == 1
++    assert report["claim_to_process_start_s"]["sample_count"] == 1
++    assert report["claim_to_process_start_s"]["p50"] is None
++    assert report["claim_to_process_start_s"]["samples"] == [3]
++
++
++def interval(board="one", **overrides):
++    return {"machine": "m", "slot_scope": "host", "board": board,
++            "start": 10, "end": 20, "observed_at": 10, "valid_until": 20,
++            "eligible_backlog": 2, "admissible_slots": 3, "restrictions": [],
++            "coverage_complete": True, **overrides}
++
++
++def test_idle_shared_slots_never_sum_across_boards():
++    result = idle_coverage([interval(), interval("two")])
++    assert result["unexplained_idle_slot_seconds"] == 30
++    assert result["unknown_seconds"] == 0
++
++
++@pytest.mark.parametrize("overrides", [
++    {"observed_at": None}, {"valid_until": 15}, {"eligible_backlog": None},
++    {"admissible_slots": None}, {"coverage_complete": False}, {"observed_at": 11},
++])
++def test_missing_stale_skewed_telemetry_is_unknown_not_idle(overrides):
++    result = idle_coverage([interval(**overrides)])
++    assert result["unexplained_idle_slot_seconds"] == 0
++    assert result["unknown_seconds"] == 10
++
++
++def test_restrictions_and_no_backlog_are_not_unexplained_idle():
++    for sample in [interval(restrictions=["capacity.memory_pressure"]), interval(eligible_backlog=0)]:
++        result = idle_coverage([sample])
++        assert result["unexplained_idle_slot_seconds"] == 0
++        assert result["explained_seconds"] == 10
++
++
++def test_conflicting_shared_slot_readings_are_unknown():
++    result = idle_coverage([interval(), interval("two", admissible_slots=4)])
++    assert result["unknown_seconds"] == 10
++    assert result["unexplained_idle_slot_seconds"] == 0
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index ee08f6fe44..5f1e438a0e 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -44,7 +44,7 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+     tid = task.id
+     worker_context = kb.build_worker_context(conn, tid)
+     capsule = {}
+-    queue = None
++    details = {}
+     queue_hint = None
+     if not replica:
+         worker_context, capsule = own_card_view(task, tid, worker_context)
+@@ -55,13 +55,13 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+             queue_hint = ready_hint(conn, task)
+         except Exception:  # health: allow BLE001 -- an advisory hint must never fail the read
+             queue_hint = None
+-        queue = kqp.read(conn, task, args.get("board"))
++        details = kqp.detail_fields(conn, task, args.get("board"))
+     return {
+         "task": kt._fields(task, kt._TASK_FIELDS),
+         "source": "replica" if replica else "live",
+         **capsule,
+         "queue_reason": kqr.latest(conn, tid),
+-        **kqp.fields(queue),
++        **details,
+         **({"queue_hint": queue_hint} if queue_hint else {}),
+         "parents": kb.parent_ids(conn, tid),
+         "unsatisfied_parents": [
+-- 
+2.43.0
+

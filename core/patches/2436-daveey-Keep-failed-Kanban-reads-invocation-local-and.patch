@@ -1,0 +1,309 @@
+From ccabe82758416f4c0402133191a37d4eee22c6a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:58:29 +0000
+Subject: [PATCH] [daveey] Keep failed Kanban reads invocation-local and fail
+ closed on done
+
+Replace the shared per-sid failure marker with an explicit card_read_failed
+return flag from _card_items through _live_work. Before derived completion,
+retain stored waiting/decision outcomes on a failed read, otherwise emit
+unresolved/card_read_failed. Valid declarations and provider decisions retain
+precedence, and successful silent cron completion cannot bypass the guard.
+
+P2 choice: remove the card-id/cue-word heuristic, rather than trying to infer
+negation and historical tense from keyword co-occurrence. The explicit read
+failure guard covers the observed board-busy bug without demoting completed
+replies containing 'No remaining work' or historical 'not yet running'.
+Successful-but-incomplete projection is a separate ownership/projection seam,
+not evidence this prose heuristic can safely establish.
+
+Five whys (owner card t_01a1cd4e2e9d1304 comment 189496):
+1. The chat was green because its stored outcome was done/derived; Desktop
+   logged waiting->done while still listing the open card t_c850e0f6.
+2. _derive_current saw no waits because _guarded("kanban cards") returned
+   empty lists after logging the unavailable card source at 00:54:50Z.
+3. BoardLifecycleBusy reported database is locked while update admission
+   was paused (backend_retirement).
+4. The judge failed with UnscopedSecretError, then looks_like_summary accepted
+   the closing-looking reply as done.
+5. _guarded's empty fallback conflated failed reads with confirmed no work.
+Root happened: derived done lacked affirmative live-work evidence.
+Root not caught: tests covered successful reads, not session_tasks failures;
+PR1136 remained changes-requested without an owner. Earlier false-green
+occurrences included t_088df457 and t_01a1cba407f15223.
+Countermeasures: explicit per-invocation status, parent-RED regressions, and
+hub owner t_01a1cd4e2e9d1304 for exact-head review, ship, and live lock replay.
+
+Proof: the eight BoardLifecycleBusy cases fail on 78c57a02's parent
+7026994c9b80916b094add04c640da3131173e3c. Rebased old implementation fails
+12 new cases including deterministic same-sid interleaving and P2 controls.
+After repair, test_session_outcome.py: 102 passed, 0 failed; health: zero
+blocking/advisory findings. No merge or deployment performed in this task.
+---
+ hermes_state_outcome.py                    | 50 ++++--------
+ tests/hermes_state/test_session_outcome.py | 88 ++++++++++++++++++----
+ 2 files changed, 91 insertions(+), 47 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index d843cf7bbe..4039ff4198 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -22,7 +22,6 @@ from __future__ import annotations
+ import contextlib
+ import json
+ import logging
+-import re
+ import sqlite3
+ import time
+ from pathlib import Path
+@@ -49,14 +48,6 @@ _NOTICE_KIND = "kanban_notice"
+ _TYPED_KINDS = frozenset({None, "steer"})
+ _PROGRESS_OPENERS = ("let me ", "i'll ", "i will ", "now i", "next, i", "next i ", "working on")
+ 
+-# A reply that names a Kanban card and, in the same message, says work remains. Judge and heuristic both read
+-# "the remaining items are owned by a card" as a closing report, which is only safe while that card is counted as
+-# live work. This is consulted only when no card is counted, so the claim is unverified (or the read failed): never done.
+-_CARD_REF = re.compile(r"\bt_[0-9a-f]{8,}\b")
+-_UNFINISHED_CUE = re.compile(
+-    r"\b(remaining|remains|not yet|not (?:yet )?(?:running|started|built|verified|complete[d]?)|unverified|pending"
+-    r"|still (?:open|unfinished|pending|running|queued|ready)|awaiting)\b", re.IGNORECASE)
+-
+ ProviderFn = Callable[[str], Optional[dict]]
+ # ``fn(sid, text, *, source=None)``; a judge without the ``source`` keyword is called as ``fn(sid, text)``.
+ JudgeFn = Callable[..., Optional[bool]]
+@@ -314,8 +305,8 @@ def _gateway_running(home: Path) -> bool:
+     return get_running_pid(home / "gateway.pid", cleanup_stale=False) is not None
+ 
+ 
+-def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+-    """(decision items, waits) from the cards these chats created or shepherd: a card parked on a
++def _card_items(ids: list[str]) -> tuple[list[dict], list[dict], bool]:
++    """(decision items, waits, read failed) from the cards these chats created or shepherd: a card parked on a
+     validated ``human_request`` is a decision, every other open card is a wait."""
+     from hermes_cli.kanban_human_request import needs_human
+     from hermes_cli.kanban_session_activity import LISTED_STATUSES, session_tasks
+@@ -341,7 +332,7 @@ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+         if isinstance(eta, (int, float)) and not isinstance(eta, bool):
+             item["eta"] = float(eta)
+         waits.append(item)
+-    return decisions, waits
++    return decisions, waits, False
+ 
+ 
+ def _cron_items(ids: list[str]) -> list[dict]:
+@@ -405,14 +396,12 @@ def _provider_items(sid: str) -> tuple[list[dict], list[dict]]:
+     return decisions, waits
+ 
+ 
+-def _guarded(label: str, sid: str, fn: Callable[[], Any], empty: Any, on_fail: Optional[Callable[[], None]] = None) -> Any:
+-    """One live-work source; a failed read is logged and counts as nothing from that source."""
++def _guarded(label: str, sid: str, fn: Callable[[], Any], empty: Any) -> Any:
++    """One live-work source; a failed read is logged and returns its explicit fallback."""
+     try:
+         return fn()
+     except Exception:
+         logger.warning("session outcome: %s unavailable for %s", label, sid, exc_info=True)
+-        if on_fail is not None:
+-            on_fail()
+         return empty
+ 
+ 
+@@ -562,16 +551,16 @@ def _outcome(kind: str, now: float, **fields: Any) -> dict[str, Any]:
+     return {"kind": kind, "source": "derived", "at": now, **fields}
+ 
+ 
+-def _live_work(db: Any, sid: str, ids: list[str]) -> tuple[list[dict], list[dict]]:
+-    """(open decision items, named waits) across every live-work source. A recurring cron is not one: it never
++def _live_work(db: Any, sid: str, ids: list[str]) -> tuple[list[dict], list[dict], bool]:
++    """(open decision items, named waits, card read failed). A recurring cron is not live work: it never
+     ends, so a chat that owns one would wait forever (see ``_derive``, which names it on the outcome instead)."""
+-    card_decisions, card_waits = _guarded("kanban cards", sid, lambda: _card_items(ids), ([], []),
+-                                          on_fail=lambda: _CARD_READ_FAILED.add(sid))
++    card_decisions, card_waits, card_read_failed = _guarded(
++        "kanban cards", sid, lambda: _card_items(ids), ([], [], True))
+     prov_decisions, prov_waits = _provider_items(sid)
+     waits = (card_waits + _guarded("processes", sid, lambda: _process_items(sid, ids), [])
+              + _guarded("subagents", sid, lambda: _subagent_items(db, ids), [])
+              + _guarded("goal", sid, lambda: _goal_items(sid, ids), []) + prov_waits)
+-    return prov_decisions + card_decisions, waits
++    return prov_decisions + card_decisions, waits, card_read_failed
+ 
+ 
+ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+@@ -593,14 +582,6 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     return {**historical, **current}
+ 
+ 
+-_CARD_READ_FAILED: set[str] = set()  # sids whose card read failed in the current derivation (single-threaded per call)
+-
+-
+-def _names_unverified_card(text: str, card_read_failed: bool) -> bool:
+-    """The reply names a card id and says work remains (or the card read failed, so any named card is unverified)."""
+-    return bool(_CARD_REF.search(text)) and (card_read_failed or bool(_UNFINISHED_CUE.search(text)))
+-
+-
+ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+                     pending_reply: Optional[str] = None) -> dict[str, Any]:
+     now = time.time()
+@@ -610,9 +591,7 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+         return _outcome("muted", now, **({"declared": _declared(stored)} if _declared(stored) else {}))
+     if not ignore_live_turn and _live_turn(db, sid):
+         return _outcome("running", now)
+-    decisions, waits = _live_work(db, sid, _lineage_ids(db, sid))
+-    card_unknown = sid in _CARD_READ_FAILED
+-    _CARD_READ_FAILED.discard(sid)
++    decisions, waits, card_read_failed = _live_work(db, sid, _lineage_ids(db, sid))
+     tail = _without_finished_notes(_tail(db, sid))
+     if pending_reply is not None:  # the unsaved final reply is the last assistant message
+         tail.insert(0, {"role": "assistant", "content": pending_reply, "timestamp": now})
+@@ -631,6 +610,11 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     if holds and declared.get("kind") in ("done", "waiting"):
+         return {**{k: v for k, v in declared.items() if k != "crons"},
+                 **(named if declared.get("kind") == "done" else {})}
++    if card_read_failed:
++        # Unknown card state is not evidence of completion, regardless of the reply.
++        if stored and stored.get("kind") in ("waiting", "decision"):
++            return stored
++        return _outcome("unresolved", now, reason="card_read_failed", **carry)
+     if not tail:
+         return _outcome("unresolved", now, reason="empty", **carry)
+     reason = _tail_reason(tail)
+@@ -652,8 +636,6 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     judged = {"judged": True, "judged_msg": msg_id} if verdict is not None and msg_id is not None else {}
+     if verdict is None:
+         verdict = looks_like_summary(text)
+-    if verdict and _names_unverified_card(text, card_unknown):
+-        verdict = False  # an unfinished card the reader does not count is unknown remote state, never done
+     if verdict:
+         return _outcome("done", now, summary=text[:SUMMARY_CHARS], **judged, **named, **carry)
+     return _outcome("unresolved", now, reason="no_summary", **judged, **carry)
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 51c0794997..550c63fb88 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -622,7 +622,7 @@ def test_unfinished_agrees_with_the_title_producer(result, unfinished):
+     for evt in ({"goal": "g", **result}, {"is_batch": True, "goals": ["g"], "results": [{"task_index": 0, **result}]}):
+         assert async_delegation_display_unfinished(async_delegation_display_text(evt)) is unfinished
+ 
+-# ── a reply naming an unfinished card the reader does not count is never done ──
++# ── failed card reads are unknown, not evidence of completion ────────────────
+ 
+ REAL_UNFINISHED = (
+     "Resumed and cleared the placement blocker: refreshed the registry and moved the existing owner back.\n\n"
+@@ -632,11 +632,26 @@ REAL_UNFINISHED = (
+ 
+ 
+ @pytest.mark.parametrize("verdict", [True, None])
+-def test_reply_naming_unfinished_uncounted_card_is_not_done(db, verdict):
++@pytest.mark.parametrize("prior_kind", [None, "waiting", "decision", "done"])
++def test_busy_card_read_cannot_derive_done(db, board, monkeypatch, verdict, prior_kind):
++    from hermes_cli.kanban_generation import BoardLifecycleBusy
++
++    add_card(board, "t_open", "chat", "ready")
++    turn(db)
++    prior = {"kind": prior_kind, "source": "derived", "at": 1}
++    if prior_kind:
++        so._write(db, "chat", prior)
++
++    def busy(*args, **kwargs):
++        raise BoardLifecycleBusy("database is locked: board lifecycle is busy")
++
++    monkeypatch.setattr(ksa, "session_tasks", busy)
+     so.register_outcome_judge(lambda sid, text: verdict)
+-    turn(db, REAL_UNFINISHED)
+     out = so.refresh_outcome("chat", "turn_end", db=db)
+-    assert (out["kind"], out["reason"]) == ("unresolved", "no_summary")
++    if prior_kind in ("waiting", "decision"):
++        assert out == prior
++    else:
++        assert (out["kind"], out["reason"]) == ("unresolved", "card_read_failed")
+ 
+ 
+ def test_same_unfinished_reply_with_the_card_counted_is_waiting(db, board):
+@@ -649,6 +664,8 @@ def test_same_unfinished_reply_with_the_card_counted_is_waiting(db, board):
+ 
+ @pytest.mark.parametrize("reply", [
+     SUMMARY,  # no card named
++    "Completed t_01a1c7b8ebe8316f; all tests pass. No remaining work.",
++    "Earlier t_01a1c7b8ebe8316f was not yet running; it has now completed and all tests pass.",
+     "Shipped the fix in t_01a1c7b8ebe8316f, which merged; all 12 tests pass and nothing else is open.",  # card done
+     "Nothing else to do. The explanation: stale cache, cleared, verified by running the suite twice.",
+ ])
+@@ -658,16 +675,33 @@ def test_truly_done_replies_stay_done(db, reply):
+     assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "done"
+ 
+ 
+-def test_card_read_failure_never_vouches_for_a_named_card(db, monkeypatch):
+-    def boom(*a, **k):
+-        raise sqlite3.OperationalError("database is locked")
+-    monkeypatch.setattr(ksa, "session_tasks", boom)
+-    so.register_outcome_judge(lambda sid, text: True)
++@pytest.mark.parametrize("failed_outer", [True, False])
++def test_same_sid_interleaved_card_reads_are_invocation_local(db, monkeypatch, failed_outer):
++    from hermes_cli.kanban_generation import BoardLifecycleBusy
++
+     turn(db, "Fixed and merged via t_01a1c7b8ebe8316f; all 12 tests pass.")
+-    assert so.refresh_outcome("chat", "turn_end", db=db)["reason"] == "no_summary"
+-    say(db, "user", "and the other one?")
+-    say(db, "assistant", SUMMARY)  # no card named: a failed read alone does not downgrade a done report
+-    assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "done"
++    so.register_outcome_judge(lambda sid, text: True)
++    nested = []
++    reading_outer = True
++
++    def cards(*args, **kwargs):
++        if reading_outer == failed_outer:
++            raise BoardLifecycleBusy("database is locked: board lifecycle is busy")
++        return []
++
++    def provider(sid):
++        nonlocal reading_outer
++        if reading_outer:
++            reading_outer = False
++            nested.append(so.derive_outcome(sid, db=db))
++        return {}
++
++    monkeypatch.setattr(ksa, "session_tasks", cards)
++    so.register_outcome_provider("interleave", provider)
++    outer = so.derive_outcome("chat", db=db)
++    failed, succeeded = (outer, nested[0]) if failed_outer else (nested[0], outer)
++    assert succeeded["kind"] == "done"
++    assert (failed["kind"], failed["reason"]) == ("unresolved", "card_read_failed")
+ 
+ 
+ def test_human_decision_card_still_outranks_the_reply(db, board):
+@@ -675,3 +709,31 @@ def test_human_decision_card_still_outranks_the_reply(db, board):
+     so.register_outcome_judge(lambda sid, text: True)
+     turn(db, REAL_UNFINISHED)
+     assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "decision"
++
++
++@pytest.mark.parametrize("precedence", ["declared", "provider", "silent_cron"])
++def test_busy_card_read_preserves_authority_but_not_silent_completion(db, monkeypatch, precedence):
++    from hermes_cli.kanban_generation import BoardLifecycleBusy
++
++    turn(db)
++    declared = None
++    if precedence == "declared":
++        declared = so.declare_outcome("chat", {"kind": "done", "summary": SUMMARY}, db=db)
++    elif precedence == "provider":
++        so.register_outcome_provider("approval", lambda sid: {
++            "decision_items": [{"id": "approval", "question": "Deploy?"}]})
++    else:
++        db._write_rowcount("UPDATE sessions SET source='cron', end_reason='cron_complete' WHERE id='chat'", ())
++        say(db, "assistant", "[SILENT]")
++
++    def busy(*args, **kwargs):
++        raise BoardLifecycleBusy("database is locked: board lifecycle is busy")
++
++    monkeypatch.setattr(ksa, "session_tasks", busy)
++    out = so.refresh_outcome("chat", "manual", db=db)
++    if precedence == "declared":
++        assert out == declared
++    elif precedence == "provider":
++        assert out["kind"] == "decision" and out["items"][0]["id"] == "approval"
++    else:
++        assert (out["kind"], out["reason"]) == ("unresolved", "card_read_failed")
+-- 
+2.43.0
+

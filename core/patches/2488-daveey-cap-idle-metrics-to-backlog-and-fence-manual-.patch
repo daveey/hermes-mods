@@ -1,0 +1,129 @@
+From b44ca334e3f74d6950ff992ccbf3de8fc9c9c29a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:10:12 +0000
+Subject: [PATCH] [daveey] cap idle metrics to backlog and fence manual
+ readiness transitions
+
+---
+ docs/execution-observations-v1.md             |  4 ++-
+ hermes_cli/kanban_capacity_metrics.py         | 16 +++++++---
+ .../test_kanban_capacity_metrics.py           | 31 ++++++++++++++++++-
+ 3 files changed, 44 insertions(+), 7 deletions(-)
+
+diff --git a/docs/execution-observations-v1.md b/docs/execution-observations-v1.md
+index 302cd4a855..70f77de591 100644
+--- a/docs/execution-observations-v1.md
++++ b/docs/execution-observations-v1.md
+@@ -68,7 +68,9 @@ native retry events without an explicit ready status cannot establish readiness.
+ Its summary preserves samples and censored attempts; p50 needs two samples and
+ p95 needs twenty. `idle_coverage` unions shared machine/slot-pool intervals across
+ boards. Only same-interval fresh complete backlog/slot/restriction coverage can
+-produce unexplained idle slot-seconds. Unknown coverage is machine-seconds, not
++produce unexplained idle slot-seconds, capped at the lesser of eligible backlog
++and admissible slots. Backlog is a deduplicated whole-slot-pool count, never a
++per-board sum; disagreeing pool counts make coverage unknown. Unknown coverage is machine-seconds, not
+ invented unknown slot-seconds. Current dispatch snapshots deliberately leave
+ admissible slot counts unknown; configured limits are not measured free slots.
+ 
+diff --git a/hermes_cli/kanban_capacity_metrics.py b/hermes_cli/kanban_capacity_metrics.py
+index 6127721939..0d3233079a 100644
+--- a/hermes_cli/kanban_capacity_metrics.py
++++ b/hermes_cli/kanban_capacity_metrics.py
+@@ -29,7 +29,7 @@ def _payload(event):
+ 
+ def _ready(event, payload):
+     # Creation is not readiness. Only explicit ready transitions qualify.
+-    if event.get("kind") == "promoted":
++    if event.get("kind") in {"promoted", "promoted_manual", "unblocked"}:
+         return payload.get("status", "ready") == "ready"
+     if event.get("kind") in {"released", "reclaimed", "owner_unavailable", "crashed", "rate_limited",
+                               "timed_out", "stale", "reconciled", "owner_restart_lost",
+@@ -85,7 +85,9 @@ def attempts(events, *, board, task_id, now):
+                     and current["process_ref"] is None):
+                 current.update(process_start_at=event.get("created_at"), process_ref=event.get("id"),
+                                process_pid=payload["pid"])
+-        elif kind in {"dependency_wait", "blocked", "scheduled", "completed", "archived", "changes_requested"}:
++        elif kind in {"dependency_wait", "blocked", "scheduled", "completed", "archived", "changes_requested",
++                      "status", "auto_blocked", "gave_up", "block_loop_detected", "agent_block_escalated",
++                      "supervisor_escalated", "continuation_exhausted", "unblocked"}:
+             ready, current = None, None
+     if ready is not None:
+         rows.append(_attempt(board, task_id, ready))
+@@ -131,7 +133,9 @@ def idle_coverage(intervals):
+     """Integrate aligned complete observations, unioning shared host slots.
+ 
+     ``slot_scope`` identifies the actual shared slot pool, NOT the candidate or
+-    board. Incomplete/conflicting evidence contributes unknown machine-seconds,
++    board. ``eligible_backlog`` is the deduplicated count for that whole pool,
++    not a per-board count; disagreeing observations are unknown, never summed.
++    Incomplete/conflicting evidence contributes unknown machine-seconds,
+     never fabricated unknown slot-seconds. Each input is an explicitly observed
+     interval; point snapshots must not be extended to fill observation gaps.
+     """
+@@ -156,10 +160,12 @@ def idle_coverage(intervals):
+             width = right - left
+             out["observed_seconds"] += width
+             if (not all(_valid_interval(r, left, right) for r in active)
+-                    or len({r.get("admissible_slots") for r in active}) != 1):
++                    or len({r.get("admissible_slots") for r in active}) != 1
++                    or len({r.get("eligible_backlog") for r in active}) != 1):
+                 out["unknown_seconds"] += width
+             elif any(r["restrictions"] for r in active) or not any(r["eligible_backlog"] for r in active):
+                 out["explained_seconds"] += width
+             else:
+-                out["unexplained_idle_slot_seconds"] += width * active[0]["admissible_slots"]
++                out["unexplained_idle_slot_seconds"] += width * min(
++                    active[0]["eligible_backlog"], active[0]["admissible_slots"])
+     return out
+diff --git a/tests/hermes_cli/test_kanban_capacity_metrics.py b/tests/hermes_cli/test_kanban_capacity_metrics.py
+index 51b61c7339..926b6c874b 100644
+--- a/tests/hermes_cli/test_kanban_capacity_metrics.py
++++ b/tests/hermes_cli/test_kanban_capacity_metrics.py
+@@ -85,7 +85,7 @@ def interval(board="one", **overrides):
+ 
+ def test_idle_shared_slots_never_sum_across_boards():
+     result = idle_coverage([interval(), interval("two")])
+-    assert result["unexplained_idle_slot_seconds"] == 30
++    assert result["unexplained_idle_slot_seconds"] == 20
+     assert result["unknown_seconds"] == 0
+ 
+ 
+@@ -125,6 +125,35 @@ def test_summary_receipt_resolution_and_percentile_minima():
+     assert summarize(rows * 20)["ready_to_claim_s"]["p95"] == 2
+ 
+ 
++@pytest.mark.parametrize("kind", ["status", "auto_blocked", "gave_up", "block_loop_detected",
++                                  "agent_block_escalated", "supervisor_escalated", "continuation_exhausted"])
++def test_leaving_ready_invalidates_old_receipt(kind):
++    rows = attempts([event(1, "promoted", 1), event(2, kind, 2, status="triage"),
++                     event(3, "claimed", 52, 1, lock="h")], board="one", task_id="t", now=60)
++    assert rows[0]["ready_to_claim_s"] is None
++
++
++@pytest.mark.parametrize("kind", ["promoted_manual", "unblocked"])
++def test_native_manual_ready_receipts(kind):
++    ready = event(3, kind, 50)
++    if kind == "unblocked":
++        ready["payload"] = None
++    rows = attempts([event(1, "promoted", 1), event(2, "auto_blocked", 2), ready,
++                     event(4, "claimed", 52, 1, lock="h")], board="one", task_id="t", now=60)
++    assert rows[0]["ready_to_claim_s"] == 2
++
++
++def test_idle_is_capped_by_deduplicated_pool_backlog():
++    result = idle_coverage([interval(eligible_backlog=1, admissible_slots=5)] * 2)
++    assert result["unexplained_idle_slot_seconds"] == 10
++
++
++def test_conflicting_pool_backlog_is_unknown_not_summed():
++    result = idle_coverage([interval(), interval("two", eligible_backlog=1)])
++    assert result["unknown_seconds"] == 10
++    assert result["unexplained_idle_slot_seconds"] == 0
++
++
+ def test_conflicting_shared_slot_readings_are_unknown():
+     result = idle_coverage([interval(), interval("two", admissible_slots=4)])
+     assert result["unknown_seconds"] == 10
+-- 
+2.43.0
+

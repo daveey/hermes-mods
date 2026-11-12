@@ -1,0 +1,434 @@
+From 3baa03052c45eb31ea69fa0a31199f59d44d5761 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:41:20 +0000
+Subject: [PATCH] [daveey] kanban: waive one owner-death repeat on a
+ root-attested host manager SIGKILL
+
+hermes-worker-1's user@1000.service was SIGKILLed at 02:34Z and 03:03Z (2026-11-12); every card in
+flight at both deaths was charged by the owner_death_repeat crash-loop guard, bystanders included.
+
+The worker's root recovery watchdog (state a8a98768e, worker_manager_loss.py) now writes a
+manager_loss record into its root-owned incident receipt before restarting a SIGKILLed manager,
+naming the exact gateway pid/birth it saw descend from that manager <=60s earlier.
+
+kanban_host_manager_loss validates such a receipt fail-closed (root-owned, non-symlink, not
+group/other-writable file and ancestors, <=8 KiB, this boot and host, SIGKILL, exact admitted
+owner pid and boot-relative birth, monotonic ordering). kanban_owner_death waives a repeat only
+with that evidence, and at most once per card: a card that keeps killing its own manager is
+charged on the next repeat. Legacy/missing/unmatched receipts change nothing.
+---
+ hermes_cli/kanban_host_manager_loss.py        | 148 ++++++++++++++
+ hermes_cli/kanban_owner_death.py              |  31 ++-
+ .../test_kanban_host_manager_loss.py          | 182 ++++++++++++++++++
+ 3 files changed, 359 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_host_manager_loss.py
+ create mode 100644 tests/hermes_cli/test_kanban_host_manager_loss.py
+
+diff --git a/hermes_cli/kanban_host_manager_loss.py b/hermes_cli/kanban_host_manager_loss.py
+new file mode 100644
+index 0000000000..e2640879c2
+--- /dev/null
++++ b/hermes_cli/kanban_host_manager_loss.py
+@@ -0,0 +1,148 @@
++"""Root-attested loss of a worker host's systemd user manager. [daveey]
++
++2026-11-12 02:34Z and 03:03Z, hermes-worker-1: ``user@1000.service`` was SIGKILLed twice (a test
++fixture's ``killpg(1, 9)`` broadcast). Every card in flight both times was charged by the
++``owner_death_repeat`` crash-loop guard, although for the bystanders the host, not the card, failed.
++
++The worker's root ``hermes-worker-recovery`` watchdog (hermes-sync ``state``:
++``hosts/hermes-workers/bin/worker_manager_loss.py``) snapshots the healthy gateway's live ancestry to
++the user manager and, before restarting a SIGKILLed manager, writes a ``manager_loss`` record into its
++root-owned incident receipt when the retained ExecMain data matches that snapshot. This module reads
++those receipts and answers one question: did THIS owner (exact pid + boot-relative birth, this boot,
++this host) die with a user manager that was SIGKILLed?
++
++That is operational cohort evidence, NOT proof of who sent the signal: a card can still kill its own
++manager. ``kanban_owner_death`` therefore waives at most :data:`MAX_WAIVERS` repeats per card.
++Anything missing, unreadable, writable by a non-root user, oversized, from another boot/host, or not
++naming this owner exactly returns ``None`` (charged as before).
++"""
++from __future__ import annotations
++
++import json
++import os
++import socket
++import stat
++import sys
++import time
++from pathlib import Path
++from typing import Optional
++
++RECOVERY_DIR = Path("/var/lib/hermes-worker-recovery")
++MAX_RECEIPT_BYTES = 8192
++RECEIPT_SCAN_LIMIT = 16
++MAX_COHORT_AGE = 60  # seconds between the healthy snapshot and the manager's exit (producer bound)
++BIRTH_TOLERANCE = 0.005  # half a 100 Hz clock tick: births are kernel start ticks / CLK_TCK
++MAX_WAIVERS = 1  # repeats a card may have waived for host manager loss (scan window of its runs)
++MANAGER_UNIT = "user@1000.service"
++
++
++def _number(value) -> bool:
++    return isinstance(value, (int, float)) and not isinstance(value, bool)
++
++
++def _trusted_node(path: Path, *, uid: int, directory: bool) -> bool:
++    """``path`` is a non-symlink regular file/dir owned by ``uid`` that no other user can write."""
++    try:
++        st = os.lstat(path)
++    except OSError:
++        return False
++    kind = stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)
++    if not kind or st.st_uid != uid or st.st_mode & 0o022:
++        return False
++    return directory or st.st_size <= MAX_RECEIPT_BYTES
++
++
++def trusted_tree(root: Path, *, uid: int = 0) -> bool:
++    """``root`` and every ancestor are root-owned, non-symlink and not group/other-writable."""
++    path = Path(os.path.abspath(root))
++    for node in (path, *path.parents):
++        if not _trusted_node(node, uid=uid, directory=True):
++            return False
++    return True
++
++
++def _read(path: Path, uid: int) -> Optional[dict]:
++    if not _trusted_node(path, uid=uid, directory=False):
++        return None
++    try:
++        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
++        with os.fdopen(fd, "rb") as fh:
++            st = os.fstat(fh.fileno())
++            if st.st_uid != uid or st.st_mode & 0o022 or not stat.S_ISREG(st.st_mode):
++                return None
++            raw = fh.read(MAX_RECEIPT_BYTES + 1)
++    except OSError:
++        return None
++    if len(raw) > MAX_RECEIPT_BYTES:
++        return None
++    try:
++        data = json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError):
++        return None
++    return data if isinstance(data, dict) else None
++
++
++def _candidates(root: Path, uid: int) -> list[Path]:
++    paths = [root / "status.json"]
++    incidents = root / "incidents"
++    if _trusted_node(incidents, uid=uid, directory=True):
++        try:
++            entries = [(e.stat(follow_symlinks=False).st_mtime, Path(e.path)) for e in os.scandir(incidents)
++                       if e.name.endswith(".json")]
++        except OSError:
++            entries = []
++        entries.sort(reverse=True)
++        paths += [p for _, p in entries[:RECEIPT_SCAN_LIMIT]]
++    return paths
++
++
++def _matches(data: dict, *, owner_pid: int, birth: float, boot_id: str, host: str, now: float) -> bool:
++    loss = data.get("manager_loss")
++    if not isinstance(loss, dict) or data.get("unit") != MANAGER_UNIT or data.get("machine") != host:
++        return False
++    owner, manager = loss.get("owner"), loss.get("manager")
++    if not isinstance(owner, dict) or not isinstance(manager, dict):
++        return False
++    observed, ended, owner_birth = loss.get("observed_monotonic"), loss.get("exit_monotonic"), owner.get("birth")
++    if not (_number(observed) and _number(ended) and _number(owner_birth)):
++        return False
++    observed, ended, owner_birth = float(observed), float(ended), float(owner_birth)  # type: ignore[arg-type]
++    return (loss.get("schema") == 1 and loss.get("boot_id") == boot_id and loss.get("host") == host
++            and loss.get("unit") == MANAGER_UNIT and loss.get("exit_code") == "killed"
++            and loss.get("exit_status") == 9 and type(owner.get("pid")) is int and owner["pid"] == owner_pid
++            and abs(owner_birth - birth) <= BIRTH_TOLERANCE
++            and owner_birth <= observed <= ended <= now and ended - observed <= MAX_COHORT_AGE)
++
++
++def manager_loss_incident(receipt: dict, *, root: Path = RECOVERY_DIR, uid: int = 0,
++                          boot_id: Optional[str] = None, host: Optional[str] = None,
++                          now: Optional[float] = None, check_ancestors: bool = True) -> Optional[str]:
++    """The root incident id attesting that ``receipt``'s owner died with its SIGKILLed user manager.
++
++    ``receipt`` is the run's ``owner_admitted`` payload (``pid`` + boot-relative ``birth``). Linux only;
++    every failure is ``None``.
++    """
++    if not sys.platform.startswith("linux") and boot_id is None:
++        return None
++    pid, birth = receipt.get("pid"), receipt.get("birth")
++    if type(pid) is not int or pid <= 1 or not _number(birth):
++        return None
++    birth = float(birth)  # type: ignore[arg-type]
++    try:
++        if boot_id is None:
++            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
++        host = host if host is not None else socket.gethostname()
++    except OSError:
++        return None
++    now = time.monotonic() if now is None else now
++    if check_ancestors and not trusted_tree(root, uid=uid):
++        return None
++    if not _trusted_node(root, uid=uid, directory=True):
++        return None
++    for path in _candidates(root, uid):
++        data = _read(path, uid)
++        if data and _matches(data, owner_pid=pid, birth=birth, boot_id=boot_id, host=host, now=now):
++            incident = data.get("incident_id")
++            if isinstance(incident, str) and 0 < len(incident) <= 64:
++                return incident
++    return None
+diff --git a/hermes_cli/kanban_owner_death.py b/hermes_cli/kanban_owner_death.py
+index 15b0c8e3cc..c8c9c3b170 100644
+--- a/hermes_cli/kanban_owner_death.py
++++ b/hermes_cli/kanban_owner_death.py
+@@ -14,7 +14,9 @@ spaced by ``check_respawn_guard``) when BOTH hold:
+   (``logs/gateway-exit-diag.log``) records that pid's life as UNCLEAN, or the pid is dead/recycled.
+ 
+ Crash-loop guard: a card that was also in flight at the owner's PREVIOUS unclean death is charged normally
+-(``owner_death_repeat``), because a card whose own work kills the gateway has to stop.
++(``owner_death_repeat``), because a card whose own work kills the gateway has to stop. Exception: the
++worker host's root watchdog attests this exact owner died with its SIGKILLed systemd user manager
++(``kanban_host_manager_loss``); that waives one repeat per card, never more.
+ """
+ from __future__ import annotations
+ 
+@@ -100,6 +102,26 @@ def _previous_death_seen(conn, task_id: str, owner_pid: int, deaths: list[int])
+     return None
+ 
+ 
++def _host_manager_loss_waiver(conn, task_id: str, receipt: dict) -> Optional[str]:
++    """Root incident id when this repeat is a verified host user-manager SIGKILL and the card has not
++    already used its waiver (``MAX_WAIVERS`` in the scanned runs): a card that keeps killing its own
++    manager is charged again on the next repeat."""
++    from hermes_cli import kanban_host_manager_loss as hml
++    used = 0
++    for row in conn.execute(
++        "SELECT metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT ?",
++        (task_id, _RUN_SCAN_LIMIT),
++    ):
++        try:
++            meta = json.loads(row[0]) if row[0] else {}
++        except (TypeError, ValueError):
++            meta = {}
++        used += isinstance(meta, dict) and bool(meta.get("host_manager_loss"))
++    if used >= hml.MAX_WAIVERS:
++        return None
++    return hml.manager_loss_incident(receipt)
++
++
+ def note(dead, conn, task_id: Optional[str], run_id) -> None:
+     """Rebook ``dead`` (``_DeadWorker``) lost to its owner's death as ``owner_restart_lost``. No-op for
+     any other death; a crash-loop repeat stays a crash and is tagged so the systemic rule skips it."""
+@@ -127,7 +149,10 @@ def note(dead, conn, task_id: Optional[str], run_id) -> None:
+     payload["owner_death_pid"] = owner_pid
+     payload["owner_exit"] = "unclean" if unclean else "pid_changed"
+     repeat = _previous_death_seen(conn, task_id, owner_pid, deaths)
+-    if repeat is not None:
++    waived = repeat is not None and _host_manager_loss_waiver(conn, task_id, receipt)
++    if waived:
++        payload["host_manager_loss"], payload["owner_death_repeat_waived"] = waived, repeat
++    elif repeat is not None:
+         payload["owner_death_repeat"] = repeat
+         dead.error_text = (
+             f"{dead.error_text} (owner pid {owner_pid} died with this card in flight, as pid {repeat} did "
+@@ -137,6 +162,8 @@ def note(dead, conn, task_id: Optional[str], run_id) -> None:
+     dead.kind, dead.owner_restart, dead.event_kind = "owner_restart", True, "owner_restart_lost"
+     payload.update(exit_kind="owner_restart", owner_restart=True, infrastructure=True)
+     how = "an unclean exit" if unclean else "its pid changed since the claim"
++    if waived:
++        how += f"; root watchdog incident {waived} attests its user manager was SIGKILLed"
+     dead.error_text = (
+         f"pid {payload.get('pid')} lost its turn to the death of its profile owner (pid {owner_pid}, {how}) — "
+         f"requeued without counting a failure; worker said: {original}")
+diff --git a/tests/hermes_cli/test_kanban_host_manager_loss.py b/tests/hermes_cli/test_kanban_host_manager_loss.py
+new file mode 100644
+index 0000000000..0ce8c7d37f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_host_manager_loss.py
+@@ -0,0 +1,182 @@
++"""A root-attested host user-manager SIGKILL waives one owner-death repeat, never more. [daveey]
++
++2026-11-12 02:34Z and 03:03Z, hermes-worker-1: ``user@1000.service`` was SIGKILLed twice and every card
++in flight both times was charged by the ``owner_death_repeat`` guard (t_01a1cc39958aa6f9,
++t_01a1ccf95e85a6f1, t_01a1cca130e69774). The worker's root recovery watchdog now attests the manager
++loss with the exact gateway pid/birth it saw descend from that manager; only such evidence waives.
++"""
++
++import functools
++import json
++import os
++import uuid
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_host_manager_loss as hml
++from tests.hermes_cli.test_kanban_owner_death import (
++    DEAD_OWNER, _claim, _kinds, _last_payload, _ledger, _reaped, _task)
++from tests.hermes_cli.test_kanban_owner_death import board as owner_board  # fixture, registered by this name
++
++_FIXTURES = (owner_board,)  # used here, so the test parameters below do not read as shadowing it
++BOOT, HOST, BIRTH = "boot-a", "hermes-worker-1", 1432.33
++NOW = 5000.0
++
++
++def _incident(owner_pid=DEAD_OWNER, birth=BIRTH, **over):
++    loss = dict(schema=1, boot_id=BOOT, host=HOST, observed_monotonic=4000.0, exit_monotonic=4010.0,
++                exit_code="killed", exit_status=9, unit="user@1000.service", owner_unit="hermes-gateway.service",
++                manager=dict(pid=900, ticks=100, invocation="a" * 32),
++                owner=dict(pid=owner_pid, ticks=int(birth * 100), birth=birth))
++    loss.update(over.pop("loss", {}))
++    data = dict(incident_id=str(uuid.uuid4()), machine=HOST, status="recovered", unit="user@1000.service",
++                down_at=1.0, observed_at=2.0, manager_loss=loss)
++    data.update(over)
++    return data
++
++
++def _root(tmp_path, *records, name="status.json"):
++    root = tmp_path / "recovery"
++    (root / "incidents").mkdir(parents=True, exist_ok=True)
++    for path in (root, root / "incidents"):
++        path.chmod(0o755)
++    for record in records:
++        target = root / name if name == "status.json" else root / "incidents" / f"{record['incident_id']}.json"
++        target.write_text(json.dumps(record))
++        target.chmod(0o644)
++    return root
++
++
++def _check(root, receipt=None, **kw):
++    kw = dict(root=root, uid=os.getuid(), boot_id=BOOT, host=HOST, now=NOW, check_ancestors=False) | kw
++    receipt = {"pid": DEAD_OWNER, "birth": BIRTH} if receipt is None else receipt
++    return hml.manager_loss_incident(receipt, **kw)
++
++
++def test_an_exact_root_receipt_names_its_incident(tmp_path):
++    record = _incident()
++    assert _check(_root(tmp_path, record)) == record["incident_id"]
++    queued = _incident()
++    assert _check(_root(tmp_path / "q", queued, name="incidents")) == queued["incident_id"]
++
++
++@pytest.mark.parametrize("mutate", [
++    lambda d: d.update(unit="hermes-gateway.service"),          # gateway-only incident
++    lambda d: d.pop("manager_loss"),                            # legacy receipt
++    lambda d: d.update(machine="hermes-worker-2"),
++    lambda d: d["manager_loss"].update(boot_id="boot-b"),      # previous boot
++    lambda d: d["manager_loss"].update(host="other"),
++    lambda d: d["manager_loss"].update(schema=2),
++    lambda d: d["manager_loss"].update(exit_status=15),         # not SIGKILL
++    lambda d: d["manager_loss"].update(exit_code="exited"),
++    lambda d: d["manager_loss"]["owner"].update(pid=DEAD_OWNER + 1),   # another gateway
++    lambda d: d["manager_loss"]["owner"].update(pid=float(DEAD_OWNER)),
++    lambda d: d["manager_loss"]["owner"].update(birth=BIRTH + 0.01),   # recycled pid
++    lambda d: d["manager_loss"].update(observed_monotonic=3900.0),     # snapshot older than 60s
++    lambda d: d["manager_loss"].update(exit_monotonic=NOW + 1),        # exit in the future
++    lambda d: d["manager_loss"]["owner"].update(birth=4005.0),         # owner born after the snapshot
++    lambda d: d["manager_loss"].update(exit_status=True),
++    lambda d: d.update(incident_id=None),
++])
++def test_anything_short_of_an_exact_match_fails_closed(tmp_path, mutate):
++    record = _incident()
++    mutate(record)
++    receipt = {"pid": DEAD_OWNER, "birth": BIRTH}
++    if record.get("manager_loss", {}).get("owner", {}).get("birth") == 4005.0:
++        receipt["birth"] = 4005.0  # the admitted owner itself, born after the snapshot
++    assert _check(_root(tmp_path, record), receipt) is None
++
++
++@pytest.mark.parametrize("receipt", [{}, {"pid": DEAD_OWNER}, {"pid": True, "birth": BIRTH},
++                                     {"pid": 1, "birth": BIRTH}, {"pid": DEAD_OWNER, "birth": "1432.33"}])
++def test_an_unusable_admission_receipt_fails_closed(tmp_path, receipt):
++    assert _check(_root(tmp_path, _incident()), receipt) is None
++
++
++def test_untrusted_files_fail_closed(tmp_path):
++    record = _incident()
++    root = _root(tmp_path, record)
++    assert _check(root, uid=os.getuid() + 1) is None             # not owned by the trusted (root) uid
++    (root / "status.json").chmod(0o666)
++    assert _check(root) is None                                  # writable by others
++    (root / "status.json").chmod(0o644)
++    root.chmod(0o775)
++    assert _check(root) is None                                  # group-writable directory
++    root.chmod(0o755)
++    (root / "status.json").write_text(json.dumps(record) + " " * hml.MAX_RECEIPT_BYTES)
++    assert _check(root) is None                                  # oversized
++    target = tmp_path / "elsewhere.json"
++    target.write_text(json.dumps(record))
++    (root / "status.json").unlink()
++    (root / "status.json").symlink_to(target)
++    assert _check(root) is None                                  # symlink
++    (root / "status.json").unlink()
++    (root / "status.json").write_text("{not json")
++    assert _check(root) is None
++
++
++def test_ancestors_must_not_be_writable_by_other_users(tmp_path):
++    parent = tmp_path / "var"
++    root = parent / "recovery"
++    root.mkdir(parents=True)
++    root.chmod(0o755)
++    parent.chmod(0o777)
++    assert not hml.trusted_tree(root, uid=os.getuid())
++    assert not hml.trusted_tree(root)  # the default trusted uid is root; a test tree is never root-owned
++
++
++def test_production_defaults_ignore_a_missing_watchdog_dir(tmp_path):
++    assert hml.manager_loss_incident({"pid": DEAD_OWNER, "birth": BIRTH}, root=tmp_path / "absent") is None
++
++
++_ORIGINAL = hml.manager_loss_incident
++
++
++def _attested(monkeypatch, tmp_path, owner_pid):
++    root = _root(tmp_path / str(owner_pid), _incident(owner_pid=owner_pid))
++    monkeypatch.setattr(hml, "manager_loss_incident", functools.partial(
++        _ORIGINAL, root=root, uid=os.getuid(), boot_id=BOOT, host=HOST, now=NOW, check_ancestors=False))
++
++
++def test_a_repeat_at_an_attested_manager_loss_is_waived_once_then_charged(owner_board, monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", "0")
++    owners = [DEAD_OWNER, 50001, 50002]
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="card", assignee="default")
++        for n, owner in enumerate(owners):
++            _ledger(owner_board, owner)
++            _attested(monkeypatch, tmp_path, owner)
++            pid = 88001 + n
++            _claim(conn, tid, pid, owner_board, owner_pid=owner, birth=BIRTH)
++            _reaped(monkeypatch, [pid])
++            crashed = kbd.detect_crashed_workers(conn)
++            if n < 2:
++                # 1st: an ordinary first owner death. 2nd: a repeat, waived by the root receipt.
++                assert crashed == [] and _task(conn, tid).consecutive_failures == 0
++            else:
++                # 3rd: the card already used its waiver; a card that keeps killing its host stops.
++                assert crashed == [tid] and _task(conn, tid).consecutive_failures == 1
++        waived = _last_payload(conn, tid, "owner_restart_lost")
++        assert waived["owner_death_pid"] == owners[1] and waived["owner_death_repeat_waived"] == DEAD_OWNER
++        assert waived["host_manager_loss"] and waived["infrastructure"] is True
++        charged = _last_payload(conn, tid, "crashed")
++        assert charged["owner_death_repeat"] == owners[1] and "host_manager_loss" not in charged
++        assert "gave_up" not in _kinds(conn, tid)
++
++
++def test_a_repeat_without_root_evidence_is_still_charged(owner_board, monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", "0")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="card", assignee="default")
++        for n, owner in enumerate([DEAD_OWNER, 50001]):
++            _ledger(owner_board, owner)
++            # Evidence names a DIFFERENT gateway: an unrelated manager loss on this host.
++            _attested(monkeypatch, tmp_path, owner + 7)
++            _claim(conn, tid, 89001 + n, owner_board, owner_pid=owner, birth=BIRTH)
++            _reaped(monkeypatch, [89001 + n])
++            kbd.detect_crashed_workers(conn)
++        assert _task(conn, tid).consecutive_failures == 1
++        assert _last_payload(conn, tid, "crashed")["owner_death_repeat"] == DEAD_OWNER
+-- 
+2.43.0
+

@@ -1,0 +1,348 @@
+From 91cd62e30b2621b1a3ee9411a74993e3b0cfd54a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:07:24 +0000
+Subject: [PATCH] [daveey] Pre-arm independent failed-result observer before
+ result commit
+
+---
+ gateway/session_kanban.py                     |  13 +++
+ hermes_cli/kanban_db_dispatch.py              |   7 +-
+ hermes_cli/kanban_failed_result.py            |  24 ++++-
+ hermes_cli/kanban_failed_result_observer.py   | 102 ++++++++++++++++++
+ .../test_kanban_failed_result_reconcile.py    |  61 ++++++++++-
+ 5 files changed, 195 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_failed_result_observer.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 33b6dffac3..0b7d6d5bdd 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -406,8 +406,21 @@ def _record_worker_result(context, code, last_output, failure=None, extra=None,
+     from hermes_cli.kanban_db_connect import connect_closing
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_quota_receipt import quota_fields, route_fields
++    observer_error = None
++    if code and not (extra or {}).get('continuable'):
++        with connect_closing(Path(context['db'])) as conn:
++            if not _bound_worker_matches(conn, context):
++                return
++        from hermes_cli.kanban_failed_result_observer import arm
++        try:
++            arm(context)
++        except (OSError, RuntimeError) as exc:
++            observer_error = str(exc)[:300]
+     with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+         if _bound_worker_matches(conn, context):
++            if observer_error:
++                kb._append_event(conn, context['task_id'], 'worker_result_observer_failed',
++                                 {'error': observer_error}, run_id=context['run_id'])
+             # Closing a run clears its claim/PID and replaces metadata; keep the
+             # result in the immutable attempt event stream instead.
+             kb._append_event(conn, context['task_id'], 'worker_result',
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 5cde5a96f0..4fb7b6d610 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1322,7 +1322,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+             # Launch-window grace so a freshly-spawned worker isn't reclaimed
+             # before its PID is visible on /proc.
+             started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
+-            if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
++            if not failed_results_only and started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
+                 continue
+             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+                 continue
+@@ -1404,7 +1404,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+     return sweep
+ 
+ 
+-def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
++def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None,
++                           *, failed_results_only: bool = False) -> list[str]:
+     """Reclaim ``running`` tasks whose worker PID is no longer alive.
+ 
+     Restores the source phase immediately (no waiting for the claim TTL), for
+@@ -1414,7 +1415,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
+     wall, released WITHOUT counting a failure and surfaced via the
+     ``_last_rate_limited`` attribute (the return stays crashed-only).
+     """
+-    sweep = _reclaim_dead_workers(conn, board=board)
++    sweep = _reclaim_dead_workers(conn, board=board, failed_results_only=failed_results_only)
+     # Closure and accounting committed together; only external observers remain.
+     auto_blocked = sweep.auto_blocked
+     for _, _, _, dead in sweep.crash_details:
+diff --git a/hermes_cli/kanban_failed_result.py b/hermes_cli/kanban_failed_result.py
+index e7aeba6043..4ca553e77d 100644
+--- a/hermes_cli/kanban_failed_result.py
++++ b/hermes_cli/kanban_failed_result.py
+@@ -8,14 +8,16 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import sys
++from pathlib import Path
+ 
+ 
+ def process_gone(pid, birth) -> bool:
+     """Prove the recorded incarnation gone; fail closed on live/recycled PIDs.
+ 
+     A birth witness is required even for an absent PID, rejecting legacy and
+-    unverified bindings. A currently occupied PID is never acted on, including
+-    one recycled since the recorded birth. Permission failures remain unknown.
++    unverified bindings. An occupied live or recycled PID is never acted on.
++    An exact-identity Linux zombie is exited; permission failures stay unknown.
+     """
+     from hermes_cli import kanban_db_dispatch as dispatch
+ 
+@@ -25,15 +27,27 @@ def process_gone(pid, birth) -> bool:
+         return False
+     if birth == dispatch.UNVERIFIED_WORKER_FINGERPRINT:
+         return False
++    try:
++        dispatch._start_components(birth.split('|', 1)[1])
++    except ValueError:
++        return False
+     try:
+         os.kill(pid, 0)
+     except ProcessLookupError:
+         return True
+     except (PermissionError, OSError):
+         return False
+-    # Read birth even though both a matching live process and a recycled PID
+-    # veto closure. Never treat an unreadable birth as evidence of death.
+-    dispatch._process_fingerprint(pid)
++    # A matching Linux zombie has exited even if its wedged parent has not
++    # reaped it. Read identity on both sides of the state observation; an
++    # occupied recycled PID and unreadable identity always remain vetoes.
++    if sys.platform == 'linux' and dispatch._process_fingerprint(pid) == birth:
++        try:
++            stat = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8')
++            fields = stat.rsplit(')', 1)[1].split()
++            if fields[0] == 'Z' and dispatch._process_fingerprint(pid) == birth:
++                return True
++        except (OSError, IndexError):
++            return False
+     return False
+ 
+ 
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+new file mode 100644
+index 0000000000..ffb29fdf9c
+--- /dev/null
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -0,0 +1,102 @@
++"""Independent board-only failed-result observer. [daveey]
++
++Pre-armed before the result commit, so a dying writer cannot strand a committed
++result in a commit-to-launch gap. Never reads the owner's session store.
++"""
++from __future__ import annotations
++
++import json
++import os
++import select
++import sqlite3
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++READY = b'failed-result-observer-ready\n'
++POLL_SECONDS = 0.5
++START_SECONDS = 5.0
++
++
++def arm(context):
++    """Wait for a detached observer to open this board before recording failure.
++
++    Scope-unavailable/startup errors are reported by the caller, not hidden as
++    a successful arm. No model/provider credentials are needed by the child.
++    """
++    from tools.environments.local import build_subprocess_env
++    from tools.process_registry import restart_safe_gateway_child_argv, systemd_user_bus_env
++    from hermes_cli.kanban_db_dispatch import _process_fingerprint
++
++    context = {key: context[key] for key in ('db', 'task_id', 'run_id', 'claim_lock', 'board') if key in context}
++    context.update(writer_pid=os.getpid(), writer_birth=_process_fingerprint(os.getpid()))
++    command = [sys.executable, '-m', __name__, json.dumps(context)]
++    launch = restart_safe_gateway_child_argv(
++        command, unit_suffix=f'failed-result-{os.getpid()}-{time.monotonic_ns()}',
++        require_restart_safe_scope=True, outlives_parent=True)
++    if launch.mode == 'degraded':
++        raise RuntimeError('independent failed-result observer scope unavailable')
++    proc = subprocess.Popen(
++        launch.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++        start_new_session=True, close_fds=True,
++        env=build_subprocess_env(extra=systemd_user_bus_env()),
++        cwd=str(Path(__file__).resolve().parents[1]),
++    )
++    assert proc.stdout is not None
++    deadline = time.monotonic() + START_SECONDS
++    received = b''
++    try:
++        while time.monotonic() < deadline:
++            readable, _, _ = select.select([proc.stdout], [], [], max(0, deadline - time.monotonic()))
++            if readable:
++                chunk = os.read(proc.stdout.fileno(), 4096)
++                if not chunk:
++                    break
++                received += chunk
++                if READY in received:
++                    return proc.pid
++            if proc.poll() is not None:
++                break
++    finally:
++        proc.stdout.close()
++    raise RuntimeError('independent failed-result observer did not acknowledge startup')
++
++
++def observe(context):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.kanban_failed_result import failed_result_proof, process_gone
++
++    with connect_closing(Path(context['db'])) as conn:
++        # The acknowledgement precedes the writer's result transaction.
++        sys.stdout.buffer.write(READY)
++        sys.stdout.buffer.flush()
++        while True:
++            row = conn.execute('SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?',
++                               (context['task_id'],)).fetchone()
++            if (row is None or row['status'] != 'running' or row['current_run_id'] != context['run_id']
++                    or row['claim_lock'] != context['claim_lock']):
++                return
++            result = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
++                                  "AND kind='worker_result' LIMIT 1",
++                                  (context['task_id'], context['run_id'])).fetchone()
++            if result is None and process_gone(context.get('writer_pid'), context.get('writer_birth')):
++                # Writer died before commit: there is no failed result for this
++                # observer to reconcile. Ordinary crash recovery still owns it.
++                return
++            try:
++                # Idle/live polls are read-only. Revalidate under the sweep's
++                # write transaction before any closure; a competing dispatcher
++                # may have ended/replaced this claim meanwhile. Batch all proven
++                # local failures to retain the existing systemic-crash policy.
++                if failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']):
++                    dispatch.detect_crashed_workers(conn, board=context.get('board'), failed_results_only=True)
++            except sqlite3.OperationalError:
++                # Committed results are the queue; retry transient board locks.
++                pass
++            time.sleep(POLL_SECONDS)
++
++
++if __name__ == '__main__':
++    observe(json.loads(sys.argv[1]))
+diff --git a/tests/hermes_cli/test_kanban_failed_result_reconcile.py b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+index 40bb3f15d4..1258c085b9 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_reconcile.py
++++ b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import subprocess
+ import sys
+ import time
+@@ -42,6 +43,9 @@ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli.kanban_db_connect import connect_closing
+ from gateway.session_kanban import _record_worker_result
+ context = json.loads(sys.argv[1])
++if sys.argv[2] != 'observe':
++    import hermes_cli.kanban_failed_result_observer as observer
++    observer.arm = lambda context: None
+ sys.stdin.read(1)
+ with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+     kb._append_event(conn, context['task_id'], 'worker_bound',
+@@ -52,15 +56,15 @@ raise SystemExit(1)
+ '''
+ 
+ 
+-def _failed_child(conn, context):
++def _failed_child(conn, context, *, observe=False, outer_pid=None):
+     proc = subprocess.Popen(
+-        [sys.executable, '-c', _CHILD, json.dumps(context)],
++        [sys.executable, '-c', _CHILD, json.dumps(context), 'observe' if observe else 'unit'],
+         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+         text=True, encoding='utf-8', env=build_subprocess_env(),
+         cwd=str(Path(__file__).resolve().parents[2]),
+     )
+     try:
+-        kbd._set_worker_pid(conn, context['task_id'], proc.pid)
++        kbd._set_worker_pid(conn, context['task_id'], outer_pid or proc.pid)
+         stdout, stderr = proc.communicate('x', timeout=30)
+         assert proc.returncode == 1, (stdout, stderr)
+         result = conn.execute(
+@@ -78,7 +82,7 @@ def _failed_child(conn, context):
+ @pytest.mark.parametrize('entry', ['stalled_owner', 'dispatcher'])
+ def test_failed_child_reconciles_without_owner_progress(board, entry):
+     conn, context = board
+-    result = _failed_child(conn, context)
++    result = _failed_child(conn, context, observe=entry == 'stalled_owner')
+     deadline = time.monotonic() + 5
+     while time.monotonic() < deadline:
+         if entry == 'dispatcher':
+@@ -117,6 +121,7 @@ def test_process_proof_fails_closed(monkeypatch, state):
+         if state == 'denied':
+             raise PermissionError()
+     monkeypatch.setattr(reconcile.os, 'kill', probe)
++    monkeypatch.setattr(reconcile.Path, 'read_text', lambda *args, **kwargs: '123 (fixture) S')
+     monkeypatch.setattr(kbd, '_process_fingerprint',
+                         lambda pid: {'live': 'epoch|1', 'recycled': 'epoch|2'}.get(state))
+     assert reconcile.process_gone(123, 'epoch|1') is (state == 'gone')
+@@ -149,3 +154,51 @@ def test_proof_rejects_changed_identity(board, monkeypatch, change):
+         with kb.write_txn(conn):
+             kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
+     assert reconcile.failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']) is None
++
++
++def test_observer_waits_for_distinct_outer_process(board):
++    conn, context = board
++    outer = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
++                             stdin=subprocess.PIPE, env=build_subprocess_env())
++    try:
++        _failed_child(conn, context, observe=True, outer_pid=outer.pid)
++        time.sleep(1)
++        assert conn.execute('SELECT status FROM task_runs WHERE id=?',
++                            (context['run_id'],)).fetchone()[0] == 'running'
++        assert outer.stdin is not None
++        outer.stdin.close()
++        outer.wait(timeout=5)
++        deadline = time.monotonic() + 5
++        state = 'running'
++        while time.monotonic() < deadline:
++            state = conn.execute('SELECT status FROM task_runs WHERE id=?',
++                                 (context['run_id'],)).fetchone()[0]
++            if state != 'running':
++                break
++            time.sleep(.05)
++        assert state == 'crashed'
++    finally:
++        if outer.poll() is None:
++            outer.kill()
++            outer.wait()
++
++
++@pytest.mark.skipif(sys.platform != 'linux', reason='Linux zombie identity proof')
++def test_real_zombie_is_dead_only_with_matching_birth():
++    from hermes_cli.kanban_failed_result import process_gone
++    proc = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read(1)'],
++                            stdin=subprocess.PIPE, env=build_subprocess_env())
++    try:
++        birth = kbd._process_fingerprint(proc.pid)
++        assert birth is not None
++        assert not process_gone(proc.pid, birth)
++        assert proc.stdin is not None
++        proc.stdin.write(b'x')
++        proc.stdin.flush()
++        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
++        assert not process_gone(proc.pid, 'foreign|1')
++        assert process_gone(proc.pid, birth)
++    finally:
++        if proc.stdin:
++            proc.stdin.close()
++        proc.wait(timeout=5)
+-- 
+2.43.0
+

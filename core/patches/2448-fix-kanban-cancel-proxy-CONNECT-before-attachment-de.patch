@@ -1,0 +1,131 @@
+From c2b5952cca73cbc5b9f4ce4030566089796a09ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:07:08 +0000
+Subject: [PATCH] fix(kanban): cancel proxy CONNECT before attachment deadline
+ [daveey]
+
+Register tunnel sockets before CONNECT reads and SSL sockets before handshake. Proof: real trickling CONNECT regression fails before fix; 156 HTTP, custody, client and worker tests pass afterward.
+---
+ hermes_cli/kanban_sync_attachment_deadline.py | 24 ++++++-
+ .../test_kanban_sync_attachment_http.py       | 63 +++++++++++++++++++
+ 2 files changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_attachment_deadline.py b/hermes_cli/kanban_sync_attachment_deadline.py
+index ffdc73208c..6cd14a2718 100644
+--- a/hermes_cli/kanban_sync_attachment_deadline.py
++++ b/hermes_cli/kanban_sync_attachment_deadline.py
+@@ -33,8 +33,7 @@ class Transfer:
+         transfer = self
+ 
+         class Connection(base):
+-            def connect(self):
+-                super().connect()
++            def register_socket(self):
+                 with transfer.lock:
+                     if transfer.expired:
+                         transfer.cut(self.sock)
+@@ -42,6 +41,27 @@ class Transfer:
+                         raise TimeoutError("attachment transfer deadline exceeded")
+                     transfer.sockets.append(self.sock)
+ 
++            def _tunnel(self):
++                # CONNECT reads occur inside HTTPConnection.connect, before the
++                # outer connect returns. Own the raw socket before those reads.
++                self.register_socket()
++                return super()._tunnel()
++
++            def connect(self):
++                if issubclass(base, http.client.HTTPSConnection):
++                    http.client.HTTPConnection.connect(self)
++                    self.register_socket()
++                    # Register the SSL socket before its blocking handshake:
++                    # wrap_socket detaches the raw descriptor we registered.
++                    self.sock = self._context.wrap_socket(
++                        self.sock, server_hostname=self._tunnel_host or self.host,
++                        do_handshake_on_connect=False)
++                    self.register_socket()
++                    self.sock.do_handshake()
++                else:
++                    super().connect()
++                self.register_socket()
++
+         return Connection
+ 
+     def handlers(self):
+diff --git a/tests/hermes_cli/test_kanban_sync_attachment_http.py b/tests/hermes_cli/test_kanban_sync_attachment_http.py
+index 8bd408f29c..608c67ece5 100644
+--- a/tests/hermes_cli/test_kanban_sync_attachment_http.py
++++ b/tests/hermes_cli/test_kanban_sync_attachment_http.py
+@@ -158,6 +158,69 @@ def test_connection_finishing_after_expiry_cannot_send():
+         right.close()
+ 
+ 
++@pytest.mark.parametrize("phase", ["proxy", "tls"])
++def test_https_setup_deadline_closes_socket_and_reader(monkeypatch, phase):
++    import socket
++    from hermes_cli.kanban_sync_attachment_deadline import Transfer
++
++    listener = socket.socket()
++    listener.bind(("127.0.0.1", 0))
++    listener.listen()
++    listener.settimeout(2)
++    finished = threading.Event()
++    stop = threading.Event()
++    readers = []
++    original_run = Transfer.run
++
++    def record_run(self, operation):
++        def recorded():
++            readers.append(threading.current_thread())
++            return operation()
++        return original_run(self, recorded)
++
++    monkeypatch.setattr(Transfer, "run", record_run)
++
++    def peer():
++        try:
++            conn, _ = listener.accept()
++            with conn:
++                conn.settimeout(2)
++                conn.recv(4096)
++                if phase == "proxy":
++                    try:
++                        for byte in b"HTTP/1.1 200 Connection established\r\nX-Slow: " + b"a" * 100:
++                            conn.sendall(bytes([byte]))
++                            if stop.wait(0.02):
++                                break
++                    except (BrokenPipeError, ConnectionResetError):
++                        pass
++                else:
++                    assert conn.recv(4096) == b""
++        finally:
++            finished.set()
++
++    thread = threading.Thread(target=peer, daemon=True)
++    thread.start()
++    port = listener.getsockname()[1]
++    monkeypatch.setattr(transport.urllib.request, "getproxies", lambda: (
++        {"https": f"http://127.0.0.1:{port}"} if phase == "proxy" else {}))
++    monkeypatch.setattr(transport.urllib.request, "proxy_bypass", lambda host: False)
++    url = "https://example.invalid" if phase == "proxy" else f"https://127.0.0.1:{port}"
++    hub = Hub(Identity(url, "fixture-key", "worker"))
++    hub.deadline = time.monotonic() + 0.3
++    try:
++        with pytest.raises(TimeoutError):
++            hub.get_attachment_blob("board", "uid")
++        readers[0].join(0.8)
++        assert not readers[0].is_alive(), "expired transfer left a live reader"
++        assert finished.wait(0.8), "expired transfer left a live peer socket"
++    finally:
++        stop.set()
++        thread.join(3)
++        listener.close()
++        hub.close()
++
++
+ def test_body_size_is_capped_without_content_length(server, monkeypatch):
+     hub, state = server
+     monkeypatch.setattr(transport, "KANBAN_ATTACHMENT_MAX_BYTES", 2)
+-- 
+2.43.0
+

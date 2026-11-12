@@ -1,0 +1,216 @@
+From 9ed0c9a7b2720961ada636ceec1097dc63e22645 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:14:00 +0000
+Subject: [PATCH] [daveey] Expire a gateway's boot-snapshot rows once it
+ answers a live list
+
+An archived hub chat (20261102_175427_594451, "Add DoorDash to Babybear")
+kept disappearing and coming back in the MacBook sidebar. The hub's state.db
+and replica both said archived=1.
+
+Evidence (MacBook desktop.log, Desktop pid started Nov 11 00:55 PT, archive
+override hlc 1794454508520 = 19:35 PT):
+- every `stripe-transition 20261102_175427_594451 ... source=fallback` line
+  (20:06:58-20:07:05, 21:45:37) sits inside a hub-stale window
+  (`[session-freshness] hermes-hub/*:true->false reason=gateway-unavailable`
+  at 20:06:32 / 21:44:54, back to true at 20:07:05 / 21:45:46);
+- `source=fallback` = a row carrying offline_synced_at (replica/boot row),
+  which is why host.sessions.rows ($sessions) never held it;
+- the MacBook hub.db replica row and hub-sync /sessions exclude it
+  (archived=1), so the only copy left was the launch-time boot snapshot.
+
+Five whys:
+1. Why did the archived row reappear? mergeOfflineFallback added a
+   fallback row for it whenever the hub's list freshness was not true.
+2. Why was there a fallback row for an archived chat? $sidebarFallbackSessions
+   appends every boot-snapshot row the hub-sync plugin does not carry, and
+   the plugin (correctly) drops archived rows.
+3. Why did the boot snapshot still list it? It is read once from hub.db at
+   launch (00:55) and never updated; the chat was archived at 19:35.
+4. Why were stale boot rows still eligible 19 h after launch? Only the
+   primary's own boot rows expire once their backend answers
+   (ownBackendAnswered); a remote owner's boot rows never expire, so each
+   time the hub went stale (busy backend during turns/notices: dispatch
+   probe timeouts, failed lists) they filled the gap again.
+5. Why no guard? The boot snapshot was designed as a cold-start stand-in,
+   but "cold start is over for this owner" was only encoded for the primary.
+
+Fix: record every owner whose live list was fresh at least once this launch
+($answeredSessionOwners, fed by publishFreshness). Boot rows of an answered
+owner are dropped from the fallback inputs for good; its live rows and the
+hub-sync replica are newer truth. Owners that never answered keep their
+boot rows, so the cold-start paint is unchanged.
+
+Tests: boot-snapshot.test.ts covers the reappearance path (answered, then
+stale via a failed list and via gateway-unavailable: row stays out; red on
+the old source) and the never-answered control (boot row kept).
+---
+ apps/desktop/src/store/boot-snapshot.test.ts | 42 ++++++++++++++++++++
+ apps/desktop/src/store/boot-snapshot.ts      | 31 ++++++++++-----
+ apps/desktop/src/store/offline-sessions.ts   | 27 +++++++++++++
+ 3 files changed, 90 insertions(+), 10 deletions(-)
+
+diff --git a/apps/desktop/src/store/boot-snapshot.test.ts b/apps/desktop/src/store/boot-snapshot.test.ts
+index 90641b558f..22c5baca53 100644
+--- a/apps/desktop/src/store/boot-snapshot.test.ts
++++ b/apps/desktop/src/store/boot-snapshot.test.ts
+@@ -18,6 +18,7 @@ import {
+   $offlineSessions,
+   _resetOfflineSessionsForTests,
+   mergeOfflineFallback,
++  recordSessionGatewayUnavailable,
+   recordSessionListResult
+ } from './offline-sessions'
+ import { $projectTree } from './project-tree'
+@@ -169,6 +170,47 @@ describe('boot rows in the sidebar fallback', () => {
+ 
+     expect(mergeOfflineFallback(live, $sidebarFallbackSessions.get()).map(row => row.id)).toEqual(['s_new'])
+   })
++
++  // [daveey] An archived hub chat kept coming back: the launch-time snapshot still listed it, the replica (which drops
++  // archived rows) did not, and every time the hub went stale (its backend busy with a turn or a notice) the frozen
++  // boot copy filled the gap until the next good hub list.
++  it("drops another gateway's boot rows once that gateway answered a live list, even when it goes stale again", () => {
++    $connectionsRegistry.set(registry())
++    rememberHubGatewayName('mac-mini', 'mini')
++    $connectionsRegistry.set(registry())
++    applyBootSnapshot(() => snapshot(), NOW_S * 1000)
++
++    const fallbackIds = (live: SessionInfo[]) =>
++      mergeOfflineFallback(live, $sidebarFallbackSessions.get()).map(row => row.id)
++
++    // Cold start, before the mini answers: its boot row is the sidebar's copy.
++    expect(fallbackIds([])).toContain('s_mini')
++
++    // The mini's live list answers without s_mini (archived after launch); the replica has dropped it too.
++    const live = [{ connection_id: 'mac-mini', id: 's_other', profile: 'default', title: 'Live' } as SessionInfo]
++    recordSessionListResult([], live, 'mac-mini', 'all')
++    $offlineSessions.set([])
++    expect(fallbackIds(live)).not.toContain('s_mini')
++
++    // The mini goes stale (a failed list while it is busy): the frozen boot copy must not come back.
++    recordSessionListResult(live, [], 'mac-mini', 'all', [], true)
++    expect(fallbackIds(live)).not.toContain('s_mini')
++
++    // ... or the reachability probe calls it unavailable (the desktop.log `gateway-unavailable` flips).
++    recordSessionGatewayUnavailable('mac-mini')
++    expect(fallbackIds(live)).not.toContain('s_mini')
++  })
++
++  it("keeps another gateway's boot rows while that gateway has never answered this launch", () => {
++    $connectionsRegistry.set(registry())
++    rememberHubGatewayName('mac-mini', 'mini')
++    $connectionsRegistry.set(registry())
++    applyBootSnapshot(() => snapshot(), NOW_S * 1000)
++
++    recordSessionListResult([], [], 'mac-mini', 'all', [], true)
++
++    expect(mergeOfflineFallback([], $sidebarFallbackSessions.get()).map(row => row.id)).toContain('s_mini')
++  })
+ })
+ 
+ describe('saveBootTree', () => {
+diff --git a/apps/desktop/src/store/boot-snapshot.ts b/apps/desktop/src/store/boot-snapshot.ts
+index 0e27bb3c72..ba70bd4502 100644
+--- a/apps/desktop/src/store/boot-snapshot.ts
++++ b/apps/desktop/src/store/boot-snapshot.ts
+@@ -23,10 +23,12 @@ import type { SessionInfo } from '@/hermes'
+ import { $connectionsRegistry } from './connection-registry-state'
+ import { connectionForHubGateway, hubReplicaConnectionId } from './hub-sync'
+ import {
++  $answeredSessionOwners,
+   $offlineSessions,
+   offlineIdentity,
+   type OfflineReplicaRecord,
+-  offlineSessionsFromReplica
++  offlineSessionsFromReplica,
++  sessionOwnerAnswered
+ } from './offline-sessions'
+ import { $projectTree } from './project-tree'
+ 
+@@ -72,17 +74,26 @@ export const $bootSessions = computed([$bootSnapshot, $connectionsRegistry], (bo
+   )
+ })
+ 
+-/** The sidebar's fallback inputs: the hub-sync plugin's rows, then boot rows it does not have (plugin rows win). */
+-export const $sidebarFallbackSessions = computed([$offlineSessions, $bootSessions], (offline, boot): SessionInfo[] => {
+-  if (!boot.length) {
+-    return offline
+-  }
++/** The sidebar's fallback inputs: the hub-sync plugin's rows, then boot rows it does not have (plugin rows win).
++ *  [daveey] A boot row is a cold-start stand-in only: it is frozen at launch, so once its owner has answered a live
++ *  list it is dropped for good. Kept, it resurrected chats archived after launch every time that owner went stale
++ *  (the replica drops archived rows, so the boot copy was the only one left to fill the gap). */
++export const $sidebarFallbackSessions = computed(
++  [$offlineSessions, $bootSessions, $answeredSessionOwners],
++  (offline, boot, answered): SessionInfo[] => {
++    if (!boot.length) {
++      return offline
++    }
+ 
+-  const have = new Set(offline.map(offlineIdentity))
+-  const extra = boot.filter(row => !have.has(offlineIdentity(row)))
++    const have = new Set(offline.map(offlineIdentity))
+ 
+-  return extra.length ? [...offline, ...extra] : offline
+-})
++    const extra = boot.filter(
++      row => !have.has(offlineIdentity(row)) && !sessionOwnerAnswered(row.connection_id, row.profile, answered)
++    )
++
++    return extra.length ? [...offline, ...extra] : offline
++  }
++)
+ 
+ /** Read and apply the snapshot. Main window only; a no-op without the bridge or on any failure. */
+ export function applyBootSnapshot(
+diff --git a/apps/desktop/src/store/offline-sessions.ts b/apps/desktop/src/store/offline-sessions.ts
+index 016448fcce..2440ffc4a4 100644
+--- a/apps/desktop/src/store/offline-sessions.ts
++++ b/apps/desktop/src/store/offline-sessions.ts
+@@ -83,8 +83,34 @@ function logFreshnessFlips(previous: Record<string, boolean>, next: Record<strin
+   }
+ }
+ 
++/** [daveey] Owner keys (`connection\0profile`, profile `*` = every profile there) whose live list was fresh at least
++ *  once this launch. Never cleared: once an owner has answered, its live rows and the hub-sync replica are newer than
++ *  the launch-time boot snapshot, so that snapshot's copies of its chats must not come back when it goes stale. */
++export const $answeredSessionOwners = atom<ReadonlySet<string>>(new Set())
++
++function noteAnsweredOwners(next: Record<string, boolean>): void {
++  const answered = $answeredSessionOwners.get()
++  const fresh = Object.keys(next).filter(key => next[key] === true && !answered.has(key))
++
++  if (fresh.length) {
++    $answeredSessionOwners.set(new Set([...answered, ...fresh]))
++  }
++}
++
++/** True once `connection`/`profile` (or every profile on `connection`) answered a live list this launch. */
++export function sessionOwnerAnswered(
++  connection: null | string | undefined,
++  profile?: null | string,
++  answered: ReadonlySet<string> = $answeredSessionOwners.get()
++): boolean {
++  const conn = connection ?? undefined
++
++  return answered.has(ownerKey(conn, profile ?? undefined)) || answered.has(ownerKey(conn, '*'))
++}
++
+ function publishFreshness(next: Record<string, boolean>, reason: string): void {
+   const previous = $sessionListFreshness.get()
++  noteAnsweredOwners(next)
+ 
+   if (
+     Object.keys(previous).length !== Object.keys(next).length ||
+@@ -457,6 +483,7 @@ export function hideOfflineSession(row: SessionInfo): void {
+ export function _resetOfflineSessionsForTests(): void {
+   archivedWhileOffline.clear()
+   listStaleOwners.clear()
++  $answeredSessionOwners.set(new Set())
+   $sessionListFreshness.set({})
+   $offlineSessions.set([])
+ }
+-- 
+2.43.0
+

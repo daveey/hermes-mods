@@ -1,0 +1,581 @@
+From 4366734c3afbbc9d3fc9d64ccdfb1c5c6721d1d6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:30:27 +0000
+Subject: [PATCH] [daveey] Skip unchanged cursor-eligible partition repair
+ scans
+
+Preserve scan ordering and remote-parent refresh. Memoize pre-scan content revisions with handle/file fences; refuse publication when either cursor changes during the pass.
+
+Proof: sync-level primary/shadow regression failed on parent; 182 focused tests passed. Deterministic 1200-task/1199-link/300-chat live+replica replay exactly matches repeated parent stores, schemas, outbox, service, results and wakes. Primary event-only median 8.714/8.967 ms parent/control vs 4.250 ms candidate; shadow 3.393/3.506 vs 3.184. Not whole-gateway or Mac acceptance.
+---
+ hermes_cli/kanban_sync_client.py              |  13 +-
+ hermes_cli/kanban_sync_partition_content.py   | 100 +++++
+ .../test_kanban_sync_partition_content.py     | 360 ++++++++++++++++++
+ .../test_kanban_sync_repair_content.py        |  23 +-
+ 4 files changed, 490 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_partition_content.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_partition_content.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index b160d78524..d21bf5e32a 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1004,8 +1004,11 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                 deferred = not rebuilt and _defer_repair(key, inputs)
+                 from hermes_cli.kanban_sync_partition_repair import repair_partition_chat_links, repair_partition_links
+                 if not deferred:
+-                    repair_partition_links(live, replica, gateway)
+-                    repair_partition_chat_links(live, replica, gateway)
++                    from hermes_cli import kanban_sync_partition_content as partition_content
++                    decision = partition_content.prepare(live, replica, path=path, inputs=inputs, rebuilt=rebuilt)
++                    if not decision.skip:
++                        repair_partition_links(live, replica, gateway)
++                        repair_partition_chat_links(live, replica, gateway)
+                 # The remote-parent mirror is cheap and gates child promotion, so a deferral never delays it.
+                 if mode == "primary" and sync.refresh_remote_parents(live, replica):
+                     sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+@@ -1014,7 +1017,9 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                 else:
+                     from hermes_cli.kanban_sync_repair_content import run
+                     result.repaired = run(live, replica, gateway, path=path, inputs=inputs, rebuilt=rebuilt)
+-                    retire_lost_placeholder_links(live, replica, gateway)
++                    if not decision.skip:
++                        retire_lost_placeholder_links(live, replica, gateway)
++                        partition_content.commit(decision, live, replica, inputs=inputs)
+                     if inputs is not None:
+                         _REPAIRED[key] = inputs
+                         _REPAIRED_AT[key] = _repair_clock()
+@@ -1371,7 +1376,9 @@ def _repair_clock() -> float:
+ def reset_board_watch() -> None:
+     """Tests: close the kept connections and forget completed repair passes."""
+     from hermes_cli.kanban_sync_repair_content import reset
++    from hermes_cli import kanban_sync_partition_content
+     reset()
++    kanban_sync_partition_content.reset()
+     _WATCH.reset()
+     _REPAIRED.clear()
+     _REPAIRED_AT.clear()
+diff --git a/hermes_cli/kanban_sync_partition_content.py b/hermes_cli/kanban_sync_partition_content.py
+new file mode 100644
+index 0000000000..61bcafe302
+--- /dev/null
++++ b/hermes_cli/kanban_sync_partition_content.py
+@@ -0,0 +1,100 @@
++"""Reuse successful partition scans only for unchanged, cursor-eligible content."""
++from __future__ import annotations
++
++from collections import OrderedDict
++from dataclasses import dataclass
++from pathlib import Path
++import sqlite3
++import threading
++
++from hermes_cli.kanban_sync_repair_revision import ensure_revision
++
++_LIMIT = 32
++_done: OrderedDict[str, tuple] = OrderedDict()
++_lock = threading.Lock()
++
++
++@dataclass(frozen=True)
++class Decision:
++    key: str
++    stamp: tuple | None
++    skip: bool
++
++
++def reset() -> None:
++    with _lock:
++        _done.clear()
++
++
++def _snapshot(conn: sqlite3.Connection) -> tuple | None:
++    if conn.in_transaction:
++        return None
++    name = conn.execute("PRAGMA database_list").fetchone()[2]
++    if not name:
++        return None
++    stat = Path(name).stat()
++    # Cursor eligibility and content MUST describe the same SQLite snapshot.
++    rows = conn.execute(
++        "SELECT revision, schema_version, cursor, mode FROM kanban_repair_revision, "
++        "pragma_schema_version, kanban_sync_state WHERE id = 1"
++    ).fetchall()
++    if len(rows) != 1:
++        return None
++    revision, schema, cursor, mode = rows[0]
++    if any(type(value) is not int or value < 0 for value in (revision, schema, cursor)):
++        return None
++    if mode not in ("primary", "shadow"):
++        return None
++    # Match content repair's handle + main-file fences, including checkpoints
++    # and same-inode rewrites. Cursor movement itself is NOT content.
++    stamp = (conn, name, stat.st_dev, stat.st_ino, stat.st_ctime_ns,
++             stat.st_mtime_ns, stat.st_size, (revision, schema), mode)
++    return stamp, cursor
++
++
++def _stamp(live, replica, inputs) -> tuple | None:
++    if inputs is None or len(inputs) < 5 or inputs[2] not in ("primary", "shadow"):
++        return None
++    left, right = _snapshot(live), _snapshot(replica)
++    if left is None or right is None or right[1] < left[1] or left[0][-1] != inputs[2]:
++        return None
++    return (left[0], right[0], tuple(inputs[2:])), (left[1], right[1])
++
++
++def prepare(live, replica, *, path, inputs, rebuilt=False) -> Decision:
++    stamp = None
++    try:
++        if not replica.in_transaction:
++            ensure_revision(replica)
++        stamp = _stamp(live, replica, inputs)
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        pass  # Unknown metadata must run the original scans, not hide their errors.
++    key = str(path)
++    with _lock:
++        previous = _done.pop(key, None)
++        skip = not rebuilt and stamp is not None and previous == stamp[0]
++        if skip and stamp is not None:
++            _done[key] = stamp[0]
++    return Decision(key, stamp, skip)
++
++
++def commit(decision: Decision, live, replica, *, inputs) -> None:
++    if decision.skip or decision.stamp is None:
++        return
++    try:
++        current = _stamp(live, replica, inputs)
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        return
++    # A live cursor can advance during the scans and make chat repair a no-op.
++    # Never publish that ineligible pass. Keep the PRE-scan key: own writes and
++    # concurrent content commits must re-arm, even when both cursors caught up.
++    # Even eligible -> ineligible -> eligible can hide a skipped chat scan.
++    # Cursor movement DURING a pass refuses publication, but movement between
++    # successful passes is excluded from the semantic memo key.
++    if current is None or current[1] != decision.stamp[1]:
++        return
++    with _lock:
++        _done[decision.key] = decision.stamp[0]
++        _done.move_to_end(decision.key)
++        while len(_done) > _LIMIT:
++            _done.popitem(last=False)
+diff --git a/tests/hermes_cli/test_kanban_sync_partition_content.py b/tests/hermes_cli/test_kanban_sync_partition_content.py
+new file mode 100644
+index 0000000000..468d6af3ee
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_partition_content.py
+@@ -0,0 +1,360 @@
++"""Partition memo custody: eligibility is not evidence a skipped scan completed."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_partition_content as content
++from hermes_cli import kanban_sync_partition_repair as repair
++from hermes_cli.kanban_sync_repair_revision import ensure_revision
++from tests.hermes_cli import test_kanban_sync_repair_window as window
++
++kanban_home = window.kanban_home
++svc = window.svc
++live = window.live
++clock = window.clock
++
++
++@pytest.fixture
++def pair(live, svc, kanban_home):
++    parent, child = window._settle(live, svc, kanban_home, "primary")
++    replica = ksc.open_shadow(window.BOARD, window.ME)
++    for conn in (live, replica):
++        conn.execute("PRAGMA wal_autocheckpoint=0")
++        ensure_revision(conn)
++    path = kanban_home / "kanban.db"
++    inputs = ksc._repair_inputs(path, replica, "primary", window.ME)
++    content.reset()
++    def prepare(**kwargs):
++        return content.prepare(live, replica, path=path, inputs=inputs, **kwargs)
++    def commit(decision):
++        content.commit(decision, live, replica, inputs=inputs)
++    try:
++        yield SimpleNamespace(live=live, replica=replica, path=path, inputs=inputs,
++                              parent=parent, child=child, prepare=prepare, commit=commit)
++    finally:
++        replica.close()
++        content.reset()
++
++
++def test_catchup_during_pass_cannot_cache_skipped_chat_repair(pair):
++    # A replica-only chat is recoverable after pickup. No content writes happen
++    # during the pass: the two cursor commits below represent event-only pulls.
++    with kbc.write_txn(pair.live):
++        pair.live.execute("UPDATE tasks SET created_on='foreign' WHERE id=?", (pair.parent,))
++        pair.live.execute("DELETE FROM kanban_sync_outbox")
++    with kbc.write_txn(pair.replica):
++        pair.replica.execute(
++            "INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_session,kind,created_at) "
++            "VALUES ('recoverable', ?, ?, 'real-chat', 'shepherd', 1)", (pair.parent, window.ME))
++        pair.replica.execute("UPDATE kanban_sync_state SET cursor=100")
++    with kbc.write_txn(pair.live):
++        pair.live.execute("UPDATE kanban_sync_state SET cursor=100")
++    decision = pair.prepare()
++    assert not decision.skip and decision.stamp is not None
++    with kbc.write_txn(pair.live):
++        pair.live.execute("UPDATE kanban_sync_state SET cursor=101")
++    assert repair.repair_partition_chat_links(pair.live, pair.replica, window.ME) == []
++    with kbc.write_txn(pair.replica):
++        pair.replica.execute("UPDATE kanban_sync_state SET cursor=101")
++    pair.commit(decision)
++    next_decision = pair.prepare()
++    assert not next_decision.skip
++    assert repair.repair_partition_chat_links(pair.live, pair.replica, window.ME) == ["recoverable"]
++
++
++def _warm(pair):
++    decision = pair.prepare()
++    assert not decision.skip and decision.stamp is not None
++    pair.commit(decision)
++    assert pair.prepare().skip
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++@pytest.mark.parametrize("change", ["task", "link", "chat", "outbox", "tombstone", "omission", "trigger"])
++def test_relevant_mutations_rearm_partition(pair, side, change):
++    _warm(pair)
++    conn = getattr(pair, side)
++    statements = {
++        "task": "UPDATE tasks SET title='changed' WHERE id=?",
++        "link": "DELETE FROM task_links WHERE parent_id=?",
++        "chat": "INSERT INTO task_chat_links "
++                "(uid,task_id,chat_gateway,chat_session,kind,created_at) "
++                "VALUES ('chat', ?, 'peer', 'session', 'shepherd', 1)",
++        "outbox": "INSERT INTO kanban_sync_outbox "
++                  "(op_id,table_name,row_uid,op,fields,hlc,created_at,state) "
++                  "VALUES ('held','tasks',?,'delete','{}','',1,'pending')",
++        "tombstone": "INSERT INTO kanban_sync_tombstones VALUES ('tasks', ?, 1)",
++        "omission": "INSERT INTO kanban_sync_omissions "
++                    "(original_op_id,table_name,row_uid,field,compat_op_id) "
++                    "VALUES ('original','tasks',?,'title','compat')",
++        "trigger": "DROP TRIGGER kanban_repair_tasks_update",
++    }
++    with kbc.write_txn(conn):
++        conn.execute(statements[change], () if change == "trigger" else (pair.parent,))
++    assert not pair.prepare().skip
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++def test_transaction_rollback_evicts_memo(pair, side):
++    _warm(pair)
++    conn = getattr(pair, side)
++    conn.execute("BEGIN")
++    try:
++        decision = pair.prepare()
++        assert not decision.skip and decision.stamp is None
++        pair.commit(decision)
++        assert not pair.prepare().skip
++    finally:
++        conn.rollback()
++    assert not pair.prepare().skip
++
++
++def test_cursor_lag_then_catchup_without_revision_change(pair):
++    _warm(pair)
++    cursor = pair.replica.execute("SELECT cursor FROM kanban_sync_state").fetchone()[0]
++    with kbc.write_txn(pair.live):
++        pair.live.execute("UPDATE kanban_sync_state SET cursor=?", (cursor + 1,))
++    decision = pair.prepare()
++    assert not decision.skip and decision.stamp is None
++    pair.commit(decision)
++    with kbc.write_txn(pair.replica):
++        pair.replica.execute("UPDATE kanban_sync_state SET cursor=?", (cursor + 1,))
++    _warm(pair)
++    # Cursor-only movement between successful passes retains the semantic key.
++    for conn in (pair.replica, pair.live):
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE kanban_sync_state SET cursor=?", (cursor + 2,))
++    assert pair.prepare().skip
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++@pytest.mark.parametrize("other_connection", [False, True])
++def test_pre_scan_stamp_rearms_for_own_or_concurrent_write(pair, side, other_connection):
++    from pathlib import Path
++    conn = getattr(pair, side)
++    writer = kbc.connect(Path(conn.execute("PRAGMA database_list").fetchone()[2])) if other_connection else conn
++    decision = pair.prepare()
++    try:
++        with kbc.write_txn(writer):
++            writer.execute("UPDATE tasks SET title='during pass' WHERE id=?", (pair.parent,))
++        pair.commit(decision)
++        assert not pair.prepare().skip
++    finally:
++        if other_connection:
++            writer.close()
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++@pytest.mark.parametrize("field,value", [("cursor", "bad"), ("cursor", -1), ("mode", "bad")])
++def test_unknown_cursor_or_mode_never_caches(pair, side, field, value):
++    _warm(pair)
++    with kbc.write_txn(getattr(pair, side)):
++        getattr(pair, side).execute(f"UPDATE kanban_sync_state SET {field}=?", (value,))
++    for _ in range(2):
++        decision = pair.prepare()
++        assert not decision.skip and decision.stamp is None
++        pair.commit(decision)
++
++
++def test_rebuilt_reset_and_lru_bound(pair, monkeypatch):
++    _warm(pair)
++    assert not pair.prepare(rebuilt=True).skip
++    pair.commit(pair.prepare())
++    monkeypatch.setattr(content, "_LIMIT", 2)
++    for path in ("other-a", "other-b"):
++        decision = content.prepare(pair.live, pair.replica, path=path, inputs=pair.inputs)
++        pair.commit(decision)
++    assert len(content._done) == 2
++    assert not pair.prepare().skip
++    pair.commit(pair.prepare())
++    ksc.reset_board_watch()
++    assert not content._done
++
++
++@pytest.mark.parametrize("name", ["repair_partition_links", "repair_partition_chat_links",
++                                  "retire_lost_placeholder_links", "repair_divergence"])
++def test_sync_scan_exception_does_not_publish_partition_success(
++    live, svc, kanban_home, monkeypatch, clock, name,
++):
++    from hermes_cli.kanban_sync_connections import connection_scope
++    with connection_scope():
++        window._settle(live, svc, kanban_home, "primary")
++        content.reset()
++        clock[0] += ksc.REPLICA_REPAIR_MIN_S + 1
++        window._remote(svc)
++        owner = repair if hasattr(repair, name) else ksc
++        real = getattr(owner, name)
++        def broken(*args, **kwargs):
++            raise RuntimeError("partition scan failed")
++        monkeypatch.setattr(owner, name, broken)
++        with pytest.raises(RuntimeError, match="partition scan failed"):
++            window._round(kanban_home, svc)
++        assert str(kanban_home / "kanban.db") not in content._done
++        monkeypatch.setattr(owner, name, real)
++        calls = window._spy(monkeypatch, ("repair_partition_links", "repair_partition_chat_links",
++                                         "retire_lost_placeholder_links"))
++        assert window._round(kanban_home, svc).error is None
++        assert all(count == 1 for count in calls.values())
++
++
++@pytest.mark.parametrize("barrier", ["pending", "rejected", "tombstone"])
++def test_cached_barrier_removal_restores_chat_without_echo(pair, barrier):
++    with kbc.write_txn(pair.live):
++        pair.live.execute("UPDATE tasks SET created_on='foreign' WHERE id=?", (pair.parent,))
++        pair.live.execute("DELETE FROM kanban_sync_outbox")
++        pair.live.execute("UPDATE kanban_sync_state SET cursor=100")
++        if barrier == "tombstone":
++            pair.live.execute("INSERT INTO kanban_sync_tombstones VALUES ('task_chat_links','held-chat',1)")
++        else:
++            pair.live.execute("INSERT INTO kanban_sync_outbox "
++                              "(op_id,table_name,row_uid,op,fields,hlc,created_at,state) "
++                              "VALUES ('held','task_chat_links','held-chat','delete','{}','',1,?)", (barrier,))
++    with kbc.write_txn(pair.replica):
++        pair.replica.execute("UPDATE kanban_sync_state SET cursor=100")
++        pair.replica.execute("INSERT INTO task_chat_links "
++                             "(uid,task_id,chat_gateway,chat_session,kind,created_at) "
++                             "VALUES ('held-chat',?,?,'real-chat','shepherd',1)", (pair.parent, window.ME))
++    decision = pair.prepare()
++    assert repair.repair_partition_chat_links(pair.live, pair.replica, window.ME) == []
++    pair.commit(decision)
++    assert pair.prepare().skip
++    with kbc.write_txn(pair.live):
++        if barrier == "tombstone":
++            pair.live.execute("DELETE FROM kanban_sync_tombstones")
++        else:
++            pair.live.execute("DELETE FROM kanban_sync_outbox")
++    assert not pair.prepare().skip
++    assert repair.repair_partition_chat_links(pair.live, pair.replica, window.ME) == ["held-chat"]
++    assert not pair.live.execute("SELECT * FROM kanban_sync_outbox").fetchall()
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++def test_new_handle_and_checkpoint_cannot_reuse_memo(pair, side):
++    from pathlib import Path
++    _warm(pair)
++    conn = getattr(pair, side)
++    other = kbc.connect(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
++    try:
++        args = [pair.live, pair.replica]
++        args[0 if side == "live" else 1] = other
++        assert not content.prepare(*args, path=pair.path, inputs=pair.inputs).skip
++    finally:
++        other.close()
++    with kbc.write_txn(conn):
++        conn.execute("CREATE TABLE checkpoint_payload(value TEXT)")
++        conn.execute("INSERT INTO checkpoint_payload VALUES (?)", ("x" * 10000,))
++    pair.commit(pair.prepare())
++    assert pair.prepare().skip
++    assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
++    assert not pair.prepare().skip
++
++
++@pytest.mark.parametrize("change", ["row", "table", "corrupt"])
++def test_unknown_live_revision_never_publishes(pair, change):
++    _warm(pair)
++    with kbc.write_txn(pair.live):
++        if change == "corrupt":
++            pair.live.execute("UPDATE kanban_repair_revision SET revision='unknown'")
++        else:
++            pair.live.execute("DELETE FROM kanban_repair_revision" if change == "row"
++                              else "DROP TABLE kanban_repair_revision")
++    for _ in range(2):
++        decision = pair.prepare()
++        assert not decision.skip and decision.stamp is None
++        pair.commit(decision)
++
++
++@pytest.mark.parametrize("index,value", [(2, "shadow"), (3, "other"), (4, '{"policy":1}')])
++def test_scope_change_never_reuses_memo(pair, index, value):
++    _warm(pair)
++    inputs = list(pair.inputs)
++    inputs[index] = value
++    assert not content.prepare(pair.live, pair.replica, path=pair.path, inputs=inputs).skip
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++def test_trigger_reinstallation_tracks_subsequent_write(pair, side):
++    conn = getattr(pair, side)
++    _warm(pair)
++    with kbc.write_txn(conn):
++        conn.execute("DROP TRIGGER kanban_repair_tasks_update")
++    assert not pair.prepare().skip
++    ensure_revision(conn)
++    pair.commit(pair.prepare())
++    assert pair.prepare().skip
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET title='after reinstall' WHERE id=?", (pair.parent,))
++    assert not pair.prepare().skip
++
++
++def test_post_scan_cursor_ineligible_never_publishes(pair):
++    decision = pair.prepare()
++    with kbc.write_txn(pair.live):
++        pair.live.execute("UPDATE kanban_sync_state SET cursor=cursor+100")
++    pair.commit(decision)
++    assert str(pair.path) not in content._done
++
++
++@pytest.mark.parametrize("side", ["live", "replica"])
++@pytest.mark.parametrize("replace", [False, True])
++def test_same_content_file_rewrite_or_replacement_rearms(pair, side, replace):
++    from pathlib import Path
++    conn = getattr(pair, side)
++    assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
++    _warm(pair)
++    path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
++    before = path.stat()
++    if replace:
++        # The retained handle still sees the old inode: pathname fencing must
++        # nevertheless reject its memo before the next opener also fences it.
++        copy = path.with_suffix(".replacement")
++        copy.write_bytes(path.read_bytes())
++        copy.replace(path)
++        assert path.stat().st_ino != before.st_ino
++    else:
++        with path.open("r+b") as handle:
++            data = handle.read()
++            handle.seek(0)
++            handle.write(data)
++            handle.flush()
++        assert path.stat().st_ino == before.st_ino
++        assert path.stat().st_ctime_ns != before.st_ctime_ns
++    assert not pair.prepare().skip
++
++
++def test_replica_rebuild_with_retained_handles_runs_partition_scans(
++    live, svc, kanban_home, monkeypatch, clock,
++):
++    from hermes_cli.kanban_sync_connections import connection_scope
++    with connection_scope():
++        window._settle(live, svc, kanban_home, "primary")
++        calls = window._spy(monkeypatch, ("repair_partition_links", "repair_partition_chat_links",
++                                         "retire_lost_placeholder_links"))
++        window._remote(svc)
++        svc.compact(window.BOARD)
++        result = window._round(kanban_home, svc)
++        assert result.error is None and not result.repair_deferred
++        assert all(count == 1 for count in calls.values())
++
++
++def test_unknown_inputs_and_snapshot_error_evict(pair, monkeypatch):
++    import sqlite3
++    _warm(pair)
++    decision = content.prepare(pair.live, pair.replica, path=pair.path, inputs=None)
++    assert not decision.skip and decision.stamp is None
++    _warm(pair)
++    real = content._snapshot
++    def broken(conn):
++        raise sqlite3.OperationalError("cannot observe")
++    monkeypatch.setattr(content, "_snapshot", broken)
++    decision = pair.prepare()
++    assert not decision.skip and decision.stamp is None
++    monkeypatch.setattr(content, "_snapshot", real)
++    _warm(pair)
++    decision = pair.prepare(rebuilt=True)
++    monkeypatch.setattr(content, "_snapshot", broken)
++    pair.commit(decision)
++    monkeypatch.setattr(content, "_snapshot", real)
++    assert not pair.prepare().skip
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_content.py b/tests/hermes_cli/test_kanban_sync_repair_content.py
+index 75cafaae30..cb60e3a4bb 100644
+--- a/tests/hermes_cli/test_kanban_sync_repair_content.py
++++ b/tests/hermes_cli/test_kanban_sync_repair_content.py
+@@ -22,7 +22,7 @@ clock = window.clock
+ 
+ 
+ @pytest.mark.parametrize("mode", ["shadow", "primary"])
+-def test_event_only_feed_skips_content_but_keeps_partition_repairs(
++def test_event_only_feed_skips_content_and_partition_repairs(
+     live, svc, kanban_home, monkeypatch, clock, mode,
+ ):
+     # Checkpoints deliberately invalidate file identity. This case isolates
+@@ -41,6 +41,14 @@ def test_event_only_feed_skips_content_but_keeps_partition_repairs(
+             "repair_divergence", "repair_missing_children", "repair_partition_links",
+             "repair_partition_chat_links", "retire_lost_placeholder_links",
+         ))
++        assert window._round(kanban_home, svc).error is None
++        assert not any(calls.values())  # Warm unchanged ticks also do no scans.
++        refreshes = []
++        refresh = window.sync.refresh_remote_parents
++        def refreshed(*args):
++            refreshes.append(True)
++            return refresh(*args)
++        monkeypatch.setattr(window.sync, "refresh_remote_parents", refreshed)
+         clock[0] += ksc.REPLICA_REPAIR_MIN_S + 1
+         window._remote(svc, table="task_events", uid="event-foreign", fields={
+             "task_id": parent, "kind": "commented", "created_at": 1, "payload": "{}",
+@@ -50,9 +58,18 @@ def test_event_only_feed_skips_content_but_keeps_partition_repairs(
+         assert not result.repair_deferred
+         assert calls == {
+             "repair_divergence": 0, "repair_missing_children": 0,
+-            "repair_partition_links": 1, "repair_partition_chat_links": 1,
+-            "retire_lost_placeholder_links": 1,
++            # Event cursors do not change eligible partition repair content.
++            "repair_partition_links": 0, "repair_partition_chat_links": 0,
++            "retire_lost_placeholder_links": 0,
+         }
++        assert refreshes == ([True] if mode == "primary" else [])
++        # A relevant local edit is visible on the very next tick, even inside
++        # the outer repair window that just admitted the event-only pass.
++        with kbc.write_txn(live):
++            live.execute("UPDATE tasks SET title='next tick' WHERE id=?", (parent,))
++        assert not window._round(kanban_home, svc).repair_deferred
++        assert all(count == 1 for count in calls.values())
++        assert svc.board(window.BOARD)["rows"]["tasks"][parent]["title"] == "next tick"
+ 
+ 
+ @pytest.fixture
+-- 
+2.43.0
+

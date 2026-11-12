@@ -1,0 +1,126 @@
+From 095237047b1ef771dbb2d0e739883630f0658cce Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:10:11 +0000
+Subject: [PATCH] [daveey] verify capacity entry paths and preserve dispatcher
+ size budget
+
+---
+ .../test_kanban_capacity_integration.py       | 38 +++++++++++++++++++
+ .../test_kanban_capacity_metrics.py           | 19 ++++++++++
+ .../test_kanban_dispatch_spawn_call.py        | 25 ++++++++++++
+ 3 files changed, 82 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_spawn_call.py
+
+diff --git a/tests/hermes_cli/test_kanban_capacity_integration.py b/tests/hermes_cli/test_kanban_capacity_integration.py
+index ccf9ea7251..e28c43bcd8 100644
+--- a/tests/hermes_cli/test_kanban_capacity_integration.py
++++ b/tests/hermes_cli/test_kanban_capacity_integration.py
+@@ -88,6 +88,44 @@ def test_tool_cli_rest_read_actual_persisted_evidence(capacity_board, monkeypatc
+     assert "capacity.dependency" in capsys.readouterr().out
+ 
+ 
++def test_provider_phase_visible_through_tool_cli_and_rest(capacity_board, monkeypatch, capsys):
++    import json
++    from argparse import Namespace
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from hermes_cli import kanban as cli
++    from tools.kanban_show import show
++    from tests.plugins.test_kanban_foreign_card_api import _load_plugin_router
++
++    conn, ids, _ = capacity_board
++    monkeypatch.setattr(queue, "_running_and_limit", lambda *a: (0, 4))
++    app = FastAPI()
++    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
++    with TestClient(app) as client:
++        for tid, started in zip(ids[:2], (False, True), strict=True):
++            kb.claim_task(conn, tid)
++            task = kb.get_task(conn, tid)
++            if started:
++                with kb.write_txn(conn):
++                    kb._append_event(conn, tid, "worker_bound", {
++                        "pid": 222, "started_at": "fixture|birth", "claim_lock": task.claim_lock,
++                    }, run_id=task.current_run_id)
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "rate_limited", {"exit_code": 75}, run_id=task.current_run_id)
++            evidence.record(conn, dispatch.DispatchResult(rate_limited=[tid]), board="default", machine="m")
++            tool = json.loads(show({"task_id": tid}))
++            assert cli._cmd_show(Namespace(task_id=tid, json=True, board=None)) == 0
++            command = json.loads(capsys.readouterr().out)
++            response = client.get(f"/api/plugins/kanban/tasks/{tid}")
++            assert response.status_code == 200
++            phase = "post_start" if started else "post_claim"
++            for payload in (tool, command, response.json()):
++                reason = payload["capacity_evidence"]["reasons"][0]
++                assert reason["code"] == "capacity.provider_limit" and reason["phase"] == phase
++            assert cli._cmd_show(Namespace(task_id=tid, json=False, board=None)) == 0
++            assert phase in capsys.readouterr().out
++
++
+ def test_unmapped_restriction_remains_explicit(capacity_board):
+     conn, ids, _ = capacity_board
+     evidence.record(conn, dispatch.DispatchResult(at_capacity="max_in_progress"), board="default", machine="m")
+diff --git a/tests/hermes_cli/test_kanban_capacity_metrics.py b/tests/hermes_cli/test_kanban_capacity_metrics.py
+index 741cfe58d0..51b61c7339 100644
+--- a/tests/hermes_cli/test_kanban_capacity_metrics.py
++++ b/tests/hermes_cli/test_kanban_capacity_metrics.py
+@@ -106,6 +106,25 @@ def test_restrictions_and_no_backlog_are_not_unexplained_idle():
+         assert result["explained_seconds"] == 10
+ 
+ 
++@pytest.mark.parametrize("kind", ["released", "reclaimed", "owner_unavailable", "crashed", "rate_limited",
++                                  "timed_out", "stale", "reconciled", "owner_restart_lost",
++                                  "protocol_violation", "oom_killed", "signaled"])
++def test_explicit_retry_ready_receipt_is_required(kind):
++    for payload, expected in (({}, None), ({"retry_status": "review"}, None),
++                              ({"retry_status": "ready"}, 2)):
++        rows = attempts([event(1, kind, 10, 7, **payload), event(2, "claimed", 12, 8, lock="h")],
++                        board="one", task_id="t", now=20)
++        assert rows[0]["ready_to_claim_s"] == expected
++
++
++def test_summary_receipt_resolution_and_percentile_minima():
++    rows = attempts(history(), board="one", task_id="t", now=20)
++    assert summarize(rows)["receipt_resolution_seconds"] == 1
++    assert summarize(rows * 2)["ready_to_claim_s"]["p50"] == 2
++    assert summarize(rows * 19)["ready_to_claim_s"]["p95"] is None
++    assert summarize(rows * 20)["ready_to_claim_s"]["p95"] == 2
++
++
+ def test_conflicting_shared_slot_readings_are_unknown():
+     result = idle_coverage([interval(), interval("two", admissible_slots=4)])
+     assert result["unknown_seconds"] == 10
+diff --git a/tests/hermes_cli/test_kanban_dispatch_spawn_call.py b/tests/hermes_cli/test_kanban_dispatch_spawn_call.py
+new file mode 100644
+index 0000000000..b2194ae40c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_spawn_call.py
+@@ -0,0 +1,25 @@
++"""The dispatcher keeps its compatibility export after helper extraction."""
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli.kanban_db_dispatch_spawn_call import call_spawn_fn as _call_spawn_fn
++
++
++def test_dispatcher_export_is_same_helper():
++    assert dispatch._call_spawn_fn is _call_spawn_fn
++
++
++def test_legacy_callable_gets_two_arguments():
++    calls = []
++    def spawn(task, workspace):
++        calls.append((task, workspace))
++        return 123
++    assert _call_spawn_fn(spawn, "task", "workspace", "board") == 123
++    assert calls == [("task", "workspace")]
++
++
++def test_board_aware_callable_retains_board():
++    calls = []
++    def spawn(task, workspace, board=None):
++        calls.append((task, workspace, board))
++        return 456
++    assert _call_spawn_fn(spawn, "task", "workspace", "board") == 456
++    assert calls == [("task", "workspace", "board")]
+-- 
+2.43.0
+

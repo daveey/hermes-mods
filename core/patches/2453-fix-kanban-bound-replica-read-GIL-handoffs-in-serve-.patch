@@ -1,0 +1,307 @@
+From f87109e1202829c7920b96470340fad6ec2b489a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:28:40 +0000
+Subject: [PATCH] fix(kanban): bound replica read GIL handoffs in serve
+ [daveey]
+
+---
+ hermes_cli/kanban_session_activity.py         |   8 +-
+ hermes_cli/web_server.py                      |   2 +
+ .../test_kanban_replica_read_memo.py          |   2 +-
+ tests/hermes_cli/test_serve_gil_budget.py     |  23 ++++
+ .../test_kanban_remote_observations.py        |   8 +-
+ .../tui_gateway/test_replica_bounded_reads.py | 122 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |   7 +-
+ tui_gateway/kanban_remote_observations.py     |   8 +-
+ tui_gateway/remote_index_projection.py        |   8 +-
+ 9 files changed, 176 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_serve_gil_budget.py
+ create mode 100644 tests/tui_gateway/test_replica_bounded_reads.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 933fdb3756..a7896e9d17 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -651,7 +651,7 @@ def _decode_replica_task(record_key: str, data: Any) -> tuple[dict[str, Any], st
+ # [daveey] Last live (``now=None``) replica read: (key, read_at, None, cards, qualified, owners). The remote
+ # projection rebuilds on every local board write (its fingerprint covers every kanban.db), and hub.db itself is
+ # written ~45 times a minute (outbox, ledger, cursor), but its task rows change only when a pull lands. Re-reading
+-# ~6k replica rows (~23 MB of JSON) cost ~0.1 s CPU per sidebar poll for an unchanged answer. hermes-hub stamps
++# thousands of replica rows (tens of MB of JSON) wastes CPU per sidebar poll for an unchanged answer. hermes-hub stamps
+ # every replica write with the hub feed's monotonic ``seq``, so an insert or update raises ``max(seq)`` and a
+ # delete lowers ``count``: ``_REPLICA_PROBE`` (index-only, ~6 ms) plus the small identity/heartbeat rows is the
+ # whole input. Reused while that key (scope heartbeats as their freshness verdicts at read time), the origin
+@@ -709,7 +709,11 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                 if moved_out is not None:
+                     moved_out.update(memo[9])
+                 return list(memo[3])  # cards are read-only, as in ``_links_cache``
+-        rows = conn.execute(f"SELECT gw, key, data, updated_at, {version_column} FROM replica WHERE coll = 'tasks'").fetchall()
++        # Aggregate raw text, not json(data): malformed task JSON retains its per-row decode semantics.
++        # sqlite3 releases/reacquires the GIL per fetched row; under contention 12k rows can stall for 90s.
++        packed = conn.execute(f"SELECT json_group_array(json_array(gw, key, data, updated_at, {version_column})) "
++                              "FROM replica WHERE coll = 'tasks'").fetchone()[0]
++        rows = [tuple(row) for row in json.loads(packed)]
+     finally:
+         conn.close()
+     if key is None:
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 6e268fe7a9..dd20dc8de0 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1621,7 +1621,9 @@ def _run_serve(serve, config, host: str, port: int) -> None:
+ 
+ def start_server(*args, **kwargs):
+     """Run the dashboard/serve backend; no lazy install may prompt on an inherited TTY (#125607)."""
++    from gateway.gil_budget import apply_gateway_switch_interval
+     from pm.extras import suppress_interactive_install_prompts
++    apply_gateway_switch_interval()
+     with suppress_interactive_install_prompts():
+         return _start_server_runtime(*args, **kwargs)
+ 
+diff --git a/tests/hermes_cli/test_kanban_replica_read_memo.py b/tests/hermes_cli/test_kanban_replica_read_memo.py
+index 2eaf7c8388..a3125fbc9f 100644
+--- a/tests/hermes_cli/test_kanban_replica_read_memo.py
++++ b/tests/hermes_cli/test_kanban_replica_read_memo.py
+@@ -12,7 +12,7 @@ import pytest
+ from hermes_cli import kanban_session_activity as activity
+ from hermes_cli import profiles
+ 
+-ROWS_SQL = 'SELECT gw, key, data, updated_at'
++ROWS_SQL = 'SELECT json_group_array(json_array(gw, key, data, updated_at'
+ 
+ 
+ def card(tid, **extra):
+diff --git a/tests/hermes_cli/test_serve_gil_budget.py b/tests/hermes_cli/test_serve_gil_budget.py
+new file mode 100644
+index 0000000000..a94567dbd2
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_gil_budget.py
+@@ -0,0 +1,23 @@
++"""Serve and dashboard share the gateway's interpreter fairness policy."""
++import sys
++
++import pytest
++
++from hermes_cli import web_server
++
++
++@pytest.mark.parametrize(('override', 'expected'), [(None, .001), ('0.5', .0005), ('0', .005)])
++def test_serve_applies_switch_interval_before_runtime(monkeypatch, override, expected):
++    if override is None:
++        monkeypatch.delenv('HERMES_GATEWAY_SWITCH_INTERVAL_MS', raising=False)
++    else:
++        monkeypatch.setenv('HERMES_GATEWAY_SWITCH_INTERVAL_MS', override)
++    previous = sys.getswitchinterval()
++    observed = []
++    monkeypatch.setattr(web_server, '_start_server_runtime', lambda **kw: observed.append(sys.getswitchinterval()))
++    try:
++        sys.setswitchinterval(.005)
++        web_server.start_server(open_browser=False)
++        assert observed == [pytest.approx(expected)]
++    finally:
++        sys.setswitchinterval(previous)
+diff --git a/tests/tui_gateway/test_kanban_remote_observations.py b/tests/tui_gateway/test_kanban_remote_observations.py
+index 5d88f45207..6348186002 100644
+--- a/tests/tui_gateway/test_kanban_remote_observations.py
++++ b/tests/tui_gateway/test_kanban_remote_observations.py
+@@ -74,6 +74,12 @@ def test_changed_snapshot_decodes_only_the_rows_whose_seq_moved(tmp_path, monkey
+     with sqlite3.connect(replica) as conn:
+         conn.execute("UPDATE replica SET data=?, seq=seq+1000 WHERE key=?", (json.dumps(moved["task"]), moved["key"]))
+     second = obs.observe(replica, ledger, now + 10)
+-    assert len(decoded) == 1
++    # The identity scan is one JSON array envelope; only one task payload decodes.
++    assert len(decoded) == 2
++    assert real_loads(decoded[0]) == [
++        ['hub', card['key'], i + 1 + (1000 if i == 3 else 0), None]
++        for i, card in enumerate(cards)
++    ]
++    assert real_loads(decoded[1]) == moved['task']
+     assert any(state.startswith("blocked@") for (_gw, key, state) in second if key == moved["key"])
+     assert len(second) == len(first)
+diff --git a/tests/tui_gateway/test_replica_bounded_reads.py b/tests/tui_gateway/test_replica_bounded_reads.py
+new file mode 100644
+index 0000000000..45044479cf
+--- /dev/null
++++ b/tests/tui_gateway/test_replica_bounded_reads.py
+@@ -0,0 +1,122 @@
++"""Large replicas must not cross the SQLite/Python boundary once per task."""
++import json
++import sqlite3
++
++import pytest
++
++from tui_gateway import kanban_remote_notices as remote
++
++
++class CountingCursor(sqlite3.Cursor):
++    def fetchall(self):
++        rows = super().fetchall()
++        self.connection.fetched += len(rows)
++        return rows
++
++    def fetchone(self):
++        row = super().fetchone()
++        self.connection.fetched += row is not None
++        return row
++
++    def __next__(self):
++        row = super().__next__()
++        self.connection.fetched += 1
++        return row
++
++
++class CountingConnection(sqlite3.Connection):
++    fetched = 0
++
++    def execute(self, sql, parameters=()):
++        return self.cursor(CountingCursor).execute(sql, parameters)
++
++
++@pytest.mark.parametrize('modern', [False, True])
++@pytest.mark.parametrize('me', [None, 'local'])
++def test_task_rows_preserve_raw_values_with_bounded_fetches(modern, me):
++    conn = sqlite3.connect(':memory:', factory=CountingConnection)
++    try:
++        extra = ', seq INTEGER, version INTEGER' if modern else ''
++        conn.execute('CREATE TABLE replica (gw TEXT, key TEXT, data TEXT, updated_at INTEGER, coll TEXT' + extra + ')')
++        rows = [('local' if i % 3 == 0 else 'remote', f'default/default/t_{i}',
++                 '{bad json' if i == 1 else json.dumps({'id': f't_{i}', 'body': 'quote " slash \\ café\n'}),
++                 i, 'tasks') + ((i + 1, i) if modern else ()) for i in range(12000)]
++        conn.executemany('INSERT INTO replica VALUES (' + ','.join('?' for _ in rows[0]) + ')', rows)
++        seq = 'seq' if modern else '0'
++        sql = f"SELECT gw, key, {seq}, data FROM replica WHERE coll = 'tasks'"
++        expected = conn.execute(sql + ' AND gw != ?', (me,)).fetchall() if me else conn.execute(sql).fetchall()
++        conn.fetched = 0
++        actual = remote._task_rows(conn, me)
++        assert actual == expected
++        assert conn.fetched <= 12, f'{conn.fetched} result rows crossed the SQLite/Python boundary'
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('modern', [False, True])
++def test_remote_links_miss_preserves_rows_with_bounded_fetches(tmp_path, monkeypatch, modern):
++    from hermes_cli import kanban_session_activity as activity
++
++    path = tmp_path / 'hub.db'
++    conn = sqlite3.connect(path, factory=CountingConnection)
++    extra = ', seq INTEGER, version INTEGER' if modern else ''
++    conn.execute('CREATE TABLE replica (gw TEXT, key TEXT, data TEXT, updated_at INTEGER, coll TEXT' + extra + ')')
++    rows = [('remote', f'default/default/t_{i}', '{bad' if i == 1 else json.dumps({'id': f't_{i}'}),
++             i, 'tasks') + ((i + 1, i) if modern else ()) for i in range(12000)]
++    conn.executemany('INSERT INTO replica VALUES (' + ','.join('?' for _ in rows[0]) + ')', rows)
++    conn.commit()
++    version = 'version' if modern else 'NULL'
++    expected = conn.execute(f"SELECT gw, key, data, updated_at, {version} FROM replica WHERE coll = 'tasks'").fetchall()
++    conn.fetched = 0
++    monkeypatch.setattr(activity, '_open_ro', lambda path: conn)
++    monkeypatch.setattr(activity, '_self_gateway', lambda conn: 'local')
++    monkeypatch.setattr(activity, '_meta_float', lambda conn, key: None)
++    monkeypatch.setattr(activity, '_remote_read_memo', None)
++    monkeypatch.setattr(activity, '_project_replica', lambda path, now, me, rows, *args, **kwargs: rows)
++    assert activity._read_remote_links(path) == expected
++    assert conn.fetched <= 12
++
++
++def test_warm_observation_identity_scan_is_bounded(tmp_path, monkeypatch):
++    from tui_gateway import kanban_remote_observations as observations
++
++    conn = sqlite3.connect(':memory:', factory=CountingConnection)
++    replica = tmp_path / 'replica.db'
++    rows = [('remote', f'default/default/t_{i}', i + 1, '{}', 'tasks') for i in range(12000)]
++    monkeypatch.setattr(observations, '_decoded', {
++        (str(replica), owner, key): (seq, {'status': 'done'})
++        for owner, key, seq, _, _ in rows
++    })
++    try:
++        conn.execute('CREATE TABLE replica (gw TEXT, key TEXT, seq INTEGER, data TEXT, coll TEXT)')
++        conn.executemany('INSERT INTO replica VALUES (?,?,?,?,?)', rows)
++        conn.execute("DELETE FROM replica WHERE key='default/default/t_1'")
++        conn.execute("UPDATE replica SET seq=13000, data='{bad' WHERE key='default/default/t_2'")
++        conn.fetched = 0
++        result = observations._changed_rows_cards(conn, replica, 'local')
++        assert result == [(owner, key, {'status': 'done'}) for owner, key, seq, _, _ in rows if seq not in (2, 3)]
++        assert (str(replica), 'remote', 'default/default/t_1') not in observations._decoded
++        assert conn.fetched <= 3
++    finally:
++        conn.close()
++
++
++def test_warm_notice_identity_scan_is_bounded_and_detects_deletes():
++    from tui_gateway.remote_index_projection import _read_rows
++
++    conn = sqlite3.connect(':memory:', factory=CountingConnection)
++    try:
++        conn.execute('CREATE TABLE replica (gw TEXT, key TEXT, seq INTEGER, data TEXT, coll TEXT)')
++        rows = [('remote', f'default/default/t_{i}', i + 1, '{}', 'tasks') for i in range(12000)]
++        conn.executemany('INSERT INTO replica VALUES (?,?,?,?,?)', rows)
++        previous = {(owner, key): (seq,) for owner, key, seq, _, _ in rows}
++        conn.execute("DELETE FROM replica WHERE key='default/default/t_1'")
++        conn.execute("UPDATE replica SET seq=13000, data='new' WHERE key='default/default/t_2'")
++        conn.commit()
++        expected = [(owner, key, 13000 if seq == 3 else seq, 'new' if seq == 3 else None)
++                    for owner, key, seq, _, _ in rows if seq != 2]
++        conn.fetched = 0
++        assert _read_rows(conn, 'local', previous) == expected
++        assert conn.fetched <= 3
++    finally:
++        conn.close()
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index dfd45201d9..8bffc92a23 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -102,8 +102,11 @@ def _task_rows(conn: sqlite3.Connection, me: Optional[str] = None) -> list[tuple
+     """``(gw, key, seq, data)`` task rows of the replica, other gateways only when ``me`` is given."""
+     cols = {row[1] for row in conn.execute("PRAGMA table_info(replica)")}
+     seq = "seq" if "seq" in cols else "0"
+-    sql = f"SELECT gw, key, {seq}, data FROM replica WHERE coll = 'tasks'"
+-    return conn.execute(sql + " AND gw != ?", (me,)).fetchall() if me else conn.execute(sql).fetchall()
++    # Keep data as text: json(data) would let one malformed task poison the entire read.
++    # A single result avoids one GIL reacquisition per task in sqlite3_step.
++    sql = f"SELECT json_group_array(json_array(gw, key, {seq}, data)) FROM replica WHERE coll = 'tasks'"
++    row = conn.execute(sql + " AND gw != ?", (me,)).fetchone() if me else conn.execute(sql).fetchone()
++    return [tuple(values) for values in json.loads(row[0])]
+ 
+ 
+ def _canonical(rows: list[tuple]) -> list[tuple]:
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index dfa5c6ce17..2984f6ed26 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -84,9 +84,11 @@ def _terminal_states():
+ def _changed_rows_cards(conn, replica: Path, me) -> list[tuple]:
+     from tui_gateway.kanban_remote_notices import _canonical
+ 
+-    sql = "SELECT gw, key, seq, NULL FROM replica WHERE coll = 'tasks'"
+-    rows = conn.execute(sql + " AND gw != ?", (me,)).fetchall() if me else conn.execute(sql).fetchall()
+-    rows = _canonical(rows)
++    # One SQLite result row avoids a GIL reacquisition per task while observe's
++    # shared lock is held; payload point reads remain proportional to changes.
++    sql = "SELECT json_group_array(json_array(gw, key, seq, NULL)) FROM replica WHERE coll = 'tasks'"
++    row = conn.execute(sql + " AND gw != ?", (me,)).fetchone() if me else conn.execute(sql).fetchone()
++    rows = _canonical([tuple(item) for item in json.loads(row[0])])
+     tag = str(replica)
+     seen = set()
+     cards = []
+diff --git a/tui_gateway/remote_index_projection.py b/tui_gateway/remote_index_projection.py
+index bd035964db..bdf15db2a4 100644
+--- a/tui_gateway/remote_index_projection.py
++++ b/tui_gateway/remote_index_projection.py
+@@ -24,9 +24,11 @@ def _read_rows(conn, me, previous):
+         return remote._canonical(remote._task_rows(conn, me))
+     conn.execute("BEGIN")
+     try:
+-        rows = remote._canonical(conn.execute(
+-            "SELECT gw, key, seq, NULL FROM replica WHERE coll='tasks' AND gw != ?", (me,)
+-        ).fetchall())
++        packed = conn.execute(
++            "SELECT json_group_array(json_array(gw, key, seq, NULL)) "
++            "FROM replica WHERE coll='tasks' AND gw != ?", (me,)
++        ).fetchone()[0]
++        rows = remote._canonical([tuple(row) for row in json.loads(packed)])
+         result = []
+         for owner, key, seq, _ in rows:
+             hit = previous.get((owner, key))
+-- 
+2.43.0
+

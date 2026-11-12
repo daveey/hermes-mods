@@ -1,0 +1,342 @@
+From 239b11e0a72f76af59156773310bf23eda966f2e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:43:41 +0000
+Subject: [PATCH] fix(kanban): metadata-only ask amendments no longer re-send a
+ blocked notice [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`hermes kanban block <id> ... --human-request <json> --metadata-only` records
+a `blocked` event with `metadata_only: true` on a card that is already
+parked. Both notice paths (gateway notifier `_fmt_blocked` and the TUI/Desktop
+`_format_kanban_event_text`) rendered it as a fresh "⏸ ... blocked — actor"
+notice, including to the chat that made the edit, so the user saw a new block
+and a repeated ask (t_01a1ce412fbf6e7f).
+
+- The subscriber chat that is the event's actor gets nothing: no ping and no
+  wake; the claimed cursor still passes the event. The actor label carries the
+  gateway DM session key `agent:<ns>:<platform>:dm:<id>` or the raw session id,
+  and the subscription stores the bare `<id>`; `actor_is_chat` matches both and
+  never reduces group/thread keys.
+- Other subscribers get one line: "ask updated (card still blocked): <new
+  action> — open task: <link>", no "blocked —" notice. A card no longer
+  parked at delivery reports its current state, as block_notice does.
+- Real block transitions are unchanged, including to the actor's own chat.
+
+Tests: notifier end-to-end through the real metadata-only writer
+(classify_parked_request) for (a) silent + cursor passed, (b) ask-updated
+line, (c) real block unchanged; renderer tests on both entry paths and the
+(d) id-matching table in test_actionable_block_notices.
+---
+ gateway/kanban_watchers_notifier.py           | 17 +++-
+ hermes_cli/kanban_block_notice.py             | 53 +++++++++++++
+ tests/gateway/test_kanban_notifier.py         | 77 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_cli_actor.py     | 12 ++-
+ .../test_actionable_block_notices.py          | 62 +++++++++++++++
+ tui_gateway/session_notifications.py          |  5 +-
+ 6 files changed, 222 insertions(+), 4 deletions(-)
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 2ccb859a71..c414983210 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -467,8 +467,19 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
+     return msg, None, None
+ 
+ 
++def _own_ask_amend(ev, chat_id) -> bool:
++    """A metadata-only ask amendment made by the subscriber chat itself."""
++    from hermes_cli.kanban_block_notice import actor_is_chat, is_metadata_only
++    return ev.kind == "blocked" and is_metadata_only(ev.payload) and actor_is_chat(ev.payload.get("actor"), chat_id)
++
++
+ def _fmt_blocked(ev, n) -> tuple:
+-    from hermes_cli.kanban_block_notice import block_notice
++    from hermes_cli.kanban_block_notice import ask_update_notice, block_notice, is_metadata_only
++    if is_metadata_only(ev.payload):
++        # An ask amendment on a card already parked, not a new block. [daveey]
++        chat_id = (getattr(n, "sub", None) or {}).get("chat_id")
++        body = ask_update_notice(n.task, n.task_id, n.board_slug, ev.payload, chat_id=chat_id)
++        return (f"⏸ {n.head} {body}", body, None) if body is not None else (None, None, None)
+     body = block_notice(n.task, n.task_id, n.board_slug, reason=str(_payload(ev, "reason") or ""), actor=str(_payload(ev, "actor") or ""))
+     return f"⏸ {n.head} {body}", body, None
+ 
+@@ -558,6 +569,10 @@ class _KanbanNotification:
+         self.platform_cls = platform_cls
+         self.sub_fail_counts = sub_fail_counts
+         self.sub = sub = d["sub"]
++        # The chat that amended an ask metadata-only already knows it: no ping and no wake for it,
++        # while the claimed cursor still passes the event. [daveey]
++        if any(_own_ask_amend(ev, sub.get("chat_id")) for ev in d["events"]):
++            self.d = d = {**d, "events": [ev for ev in d["events"] if not _own_ask_amend(ev, sub.get("chat_id"))]}
+         self.task = task = d["task"]
+         self.board_slug = d.get("board")
+         self.platform_str = (sub["platform"] or "").lower()
+diff --git a/hermes_cli/kanban_block_notice.py b/hermes_cli/kanban_block_notice.py
+index 8414a86a31..99854e27bc 100644
+--- a/hermes_cli/kanban_block_notice.py
++++ b/hermes_cli/kanban_block_notice.py
+@@ -13,6 +13,59 @@ def blocked_actor_fields(conn, task_id: str) -> dict:
+     return {"block_actor": actor} if isinstance(actor, str) and actor else {}
+ 
+ 
++def _actor_session(actor) -> str:
++    """The chat session id an ``agent (chat <id>)`` audit label names, else ``""``."""
++    if not isinstance(actor, str) or not actor.startswith("agent (chat ") or not actor.endswith(")"):
++        return ""
++    return actor[len("agent (chat "):-1].strip()
++
++
++def actor_is_chat(actor, chat_id) -> bool:
++    """Whether the audit actor is the subscriber chat ``chat_id``.
++
++    The actor carries either the raw session id or the gateway session key
++    (``agent:<ns>:<platform>:dm:<id>``); subscriptions store the bare ``<id>``.
++    Only DM keys are reduced to their chat id: group/thread keys append thread
++    and participant segments, so they never match by suffix. [daveey]
++    """
++    session, chat = _actor_session(actor), str(chat_id or "").strip()
++    if not session or not chat:
++        return False
++    if session == chat:
++        return True
++    parts = session.split(":")
++    return len(parts) >= 5 and parts[0] == "agent" and parts[3] == "dm" and ":".join(parts[4:]) == chat
++
++
++def is_metadata_only(payload) -> bool:
++    """A ``blocked`` event that amended a parked card's ask without a new block transition."""
++    return isinstance(payload, dict) and payload.get("metadata_only") is True
++
++
++def ask_update_notice(task, task_id: str, board: str, payload, *, chat_id: str | None = "", gateway: str = "") -> str | None:
++    """Notice text for a metadata-only ask amendment; ``None`` = silent for this chat.
++
++    The chat that made the edit already knows it, so it gets nothing. Other
++    subscribers get one line with the new action, not a fresh "blocked —"
++    notice: the card did not block again. [daveey]
++    """
++    if actor_is_chat(payload.get("actor"), chat_id):
++        return None
++
++    def get(key, default=None):
++        return task.get(key, default) if isinstance(task, dict) else getattr(task, key, default)
++
++    status = get("status")
++    if status and status not in {"blocked", "triage"}:
++        return block_notice(task, task_id, board, gateway=gateway, reason=str(payload.get("reason") or ""),
++                            actor=str(payload.get("actor") or ""))
++    request = payload.get("human_request")
++    action = request.get("action") if isinstance(request, dict) else None
++    link = f"@task:{board or 'default'}{'@' + gateway if gateway else ''}/{task_id}"
++    text = " ".join(str(action).split()) if action else "no human action recorded"
++    return f"ask updated (card still blocked): {text} — open task: {link}"
++
++
+ def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: str = "", actor: str = "") -> str:
+     """Use current card evidence, never event prose, to assign a human action.
+ 
+diff --git a/tests/gateway/test_kanban_notifier.py b/tests/gateway/test_kanban_notifier.py
+index 6cb9054057..1fa1172b3a 100644
+--- a/tests/gateway/test_kanban_notifier.py
++++ b/tests/gateway/test_kanban_notifier.py
+@@ -796,3 +796,80 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
+     assert adapter.handled == [], (
+         "notify-only subscriptions must not be woken by a review handoff"
+     )
++
++
++_ASK = dict(action="Choose A. Unblock = proceed; archive = drop it.", why_human="Owner decision",
++            interaction="reply", scope="Fixture", evidence="Fixture decision")
++_EDITOR = "agent (chat agent:main:telegram:dm:chat-1)"
++
++
++def _amend_fixture(monkeypatch, tmp_path, *, metadata_only):
++    """Two notify+wake subs on a parked card; chat-1 then amends (or really blocks) it."""
++    from hermes_cli.kanban_human_request_migration import classify_parked_request
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ask-amend.db"))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="ask amend", assignee="worker")
++        for chat in ("chat-1", "chat-2"):
++            kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id=chat,
++                               chat_type="dm", delivery_mode="notify+wake")
++        if not metadata_only:
++            assert kb.block_task(conn, tid, reason="decide", kind="needs_input", human_request=_ASK, actor=_EDITOR)
++        else:
++            assert kb.block_task(conn, tid, reason="decide", kind="needs_input",
++                                 human_request={**_ASK, "action": "Choose A."}, actor="user")
++    finally:
++        conn.close()
++    adapter = RecordingAdapter()
++    runner = _make_runner(adapter)
++    if metadata_only:
++        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))  # drain the original block
++        adapter.sent.clear()
++        adapter.handled.clear()
++        conn = kbc.connect()
++        try:
++            assert classify_parked_request(conn, tid, human_request=_ASK, actor=_EDITOR, reason="decide")
++        finally:
++            conn.close()
++        runner._running = True
++    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
++    return tid, adapter
++
++
++def _cursor_passes_last_event(tid, chat):
++    conn = kbc.connect()
++    try:
++        _, events = kbn.unseen_events_for_sub(conn, task_id=tid, platform="telegram", chat_id=chat, kinds=["blocked"])
++        return events == []
++    finally:
++        conn.close()
++
++
++def test_metadata_only_ask_amend_is_silent_for_the_editing_chat(tmp_path, monkeypatch):
++    """(a) The chat that amended the ask gets no ping and no wake; its cursor still passes the event."""
++    tid, adapter = _amend_fixture(monkeypatch, tmp_path, metadata_only=True)
++    assert [m["chat_id"] for m in adapter.sent] == ["chat-2"]
++    assert all(e.source.chat_id != "chat-1" for e in adapter.handled)
++    assert _cursor_passes_last_event(tid, "chat-1")
++
++
++def test_metadata_only_ask_amend_tells_other_subscribers_ask_updated(tmp_path, monkeypatch):
++    """(b) Another subscriber gets one "ask updated" line carrying the new action, no "blocked —" notice."""
++    tid, adapter = _amend_fixture(monkeypatch, tmp_path, metadata_only=True)
++    (text,) = [m["text"] for m in adapter.sent if m["chat_id"] == "chat-2"]
++    assert "ask updated (card still blocked): " + _ASK["action"] in text
++    assert "blocked —" not in text and "Next action for the user" not in text
++    assert len(text.splitlines()) == 1
++    assert _cursor_passes_last_event(tid, "chat-2")
++
++
++def test_real_block_by_the_same_chat_still_notifies_it(tmp_path, monkeypatch):
++    """(c) Current policy: a real block transition notifies every subscriber, its own actor chat included."""
++    _, adapter = _amend_fixture(monkeypatch, tmp_path, metadata_only=False)
++    assert sorted(m["chat_id"] for m in adapter.sent) == ["chat-1", "chat-2"]
++    for m in adapter.sent:
++        assert f"blocked — actor: {_EDITOR}" in m["text"]
++        assert "Next action for the user: " + _ASK["action"] in m["text"]
++    assert sorted(e.source.chat_id for e in adapter.handled) == ["chat-1", "chat-2"]
+diff --git a/tests/hermes_cli/test_kanban_cli_actor.py b/tests/hermes_cli/test_kanban_cli_actor.py
+index 7852c319d1..91f70dbecd 100644
+--- a/tests/hermes_cli/test_kanban_cli_actor.py
++++ b/tests/hermes_cli/test_kanban_cli_actor.py
+@@ -46,14 +46,22 @@ def test_cli_block_actor_and_notice(monkeypatch, marker, metadata_only):
+     if marker in {"HERMES_SESSION_ID", "HERMES_SESSION_KEY"}:
+         assert "chat fixture-chat-123" in actor
+     text = _format_kanban_event_text({"task_id": tid}, task, event, "default")
+-    assert f"actor: {actor}" in text
++    if metadata_only:  # an ask amendment reads as one "ask updated" line, never a fresh block [daveey]
++        assert text.endswith(f"Kanban {tid} ask updated (card still blocked): {REQUEST['action']} "
++                             f"— open task: @task:default/{tid}")
++        assert "blocked —" not in text
++        chat = actor[len("agent (chat "):-1] if actor.startswith("agent (chat ") else None
++        if chat:
++            assert _format_kanban_event_text({"task_id": tid, "chat_id": chat}, task, event, "default") is None
++    else:
++        assert f"actor: {actor}" in text
+     from hermes_cli.kanban_origin_ledger import observe_owner_task
+     from tui_gateway.kanban_remote_notices import format_notice
+     with connect_closing() as conn, db.write_txn(conn):
+         projected = observe_owner_task(conn, {"id": tid, "status": "blocked", "human_request": REQUEST}, now=0)
+     remote = format_notice("other-host", "default/" + tid, projected)
+     assert f"actor: {actor}" in remote
+-    assert "Next action for the user:" in text
++    assert "Next action for the user:" in text or metadata_only
+     if marker:
+         assert "actor: user" not in text
+     assert cli("unblock", tid) == 0
+diff --git a/tests/tui_gateway/test_actionable_block_notices.py b/tests/tui_gateway/test_actionable_block_notices.py
+index 6182770725..d22ad4138e 100644
+--- a/tests/tui_gateway/test_actionable_block_notices.py
++++ b/tests/tui_gateway/test_actionable_block_notices.py
+@@ -82,3 +82,65 @@ def test_outcome_decision_keeps_full_validated_action(monkeypatch):
+     decisions, waits = outcome._card_items(["chat"])
+     assert waits == []
+     assert decisions[0]["question"] == ASK["action"]
++
++
++@pytest.mark.parametrize("actor,chat,match", [
++    ("agent (chat agent:main:local:dm:20261026_235722_bef6c6)", "20261026_235722_bef6c6", True),
++    ("agent (chat 20261026_235722_bef6c6)", "20261026_235722_bef6c6", True),
++    ("agent (chat agent:writer:telegram:dm:chat-1)", "chat-1", True),
++    ("agent (chat agent:main:local:dm:20261026_235722_bef6c6)", "20261026_235722_other1", False),
++    ("agent (chat agent:main:telegram:group:chat-1:u9)", "u9", False),
++    ("agent (chat agent:main:telegram:group:chat-1)", "chat-1", False),
++    ("agent (task t_1)", "t_1", False),
++    ("user", "user", False),
++    ("agent (chat x)", "", False),
++    (None, "x", False),
++])
++def test_actor_chat_matches_bare_sub_chat_id(actor, chat, match):
++    """(d) The actor's gateway DM session key matches the bare chat id a subscription stores."""
++    from hermes_cli.kanban_block_notice import actor_is_chat
++    assert actor_is_chat(actor, chat) is match
++
++
++AMEND = {"metadata_only": True, "classified_in_place": True, "kind": "needs_input", "reason": "Opaque identity boundary",
++         "actor": "agent (chat agent:main:local:dm:20261026_235722_bef6c6)", "human_request": dict(ASK)}
++
++
++def render_amend(path, card, chat_id):
++    ev = SimpleNamespace(kind="blocked", payload=dict(AMEND))
++    task = SimpleNamespace(**card)
++    if path == "gateway":
++        from gateway.kanban_watchers_notifier import _fmt_blocked
++        return _fmt_blocked(ev, SimpleNamespace(task=task, task_id=card["id"], board_slug="ops", head="Kanban t_example",
++                                                sub={"chat_id": chat_id}))[0]
++    from tui_gateway import server
++    return server._format_kanban_event_text({"task_id": card["id"], "chat_id": chat_id}, task, ev, "ops")
++
++
++@pytest.mark.parametrize("path", ["local", "gateway"])
++def test_metadata_only_amend_entry_paths(path):
++    """(a) silent for the chat that amended the ask; (b) one "ask updated" line for any other subscriber."""
++    card = dict(id="t_example", title="Activation", status="blocked", assignee="worker", block_kind="needs_input",
++                human_request=dict(ASK))
++    assert render_amend(path, card, "20261026_235722_bef6c6") is None
++    text = render_amend(path, card, "other-chat")
++    assert text.endswith(f"Kanban t_example ask updated (card still blocked): {ASK['action']} — open task: @task:ops/t_example")
++    assert "blocked —" not in text and len(text.splitlines()) == 1
++    # A card unblocked before delivery reports its current state instead.
++    assert "Earlier block resolved; current state: ready." in render_amend(path, {**card, "status": "ready"}, "other-chat")
++
++
++@pytest.mark.parametrize("path", ["local", "gateway"])
++def test_real_block_by_the_same_chat_is_unchanged(path):
++    """(c) Current policy: a real block notifies its own actor chat with the full notice."""
++    from tui_gateway import server
++    from gateway.kanban_watchers_notifier import _fmt_blocked
++    card = dict(id="t_example", title="Activation", status="blocked", assignee="worker", block_kind="needs_input",
++                human_request=dict(ASK))
++    payload = {k: v for k, v in AMEND.items() if k not in ("metadata_only", "classified_in_place")}
++    ev, task, chat = SimpleNamespace(kind="blocked", payload=payload), SimpleNamespace(**card), "20261026_235722_bef6c6"
++    text = (_fmt_blocked(ev, SimpleNamespace(task=task, task_id="t_example", board_slug="ops", head="Kanban t_example",
++                                             sub={"chat_id": chat}))[0] if path == "gateway" else
++            server._format_kanban_event_text({"task_id": "t_example", "chat_id": chat}, task, ev, "ops"))
++    assert f"t_example blocked — actor: {AMEND['actor']}" in text
++    assert f"Next action for the user: {ASK['action']}" in text
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index af6982d568..c08e81b28b 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -644,7 +644,10 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
+     prefix = f"{glyph} " + (f"[{board_slug}] " if board_slug else "") + (f"@{who} " if who else "")
+     payload = getattr(ev, "payload", None) or {}
+     if getattr(ev, "kind", "") == "blocked":
+-        from hermes_cli.kanban_block_notice import block_notice
++        from hermes_cli.kanban_block_notice import ask_update_notice, block_notice, is_metadata_only
++        if is_metadata_only(payload):  # an ask amendment, not a new block; silent for the editing chat [daveey]
++            body = ask_update_notice(task, task_id, board_slug, payload, chat_id=sub.get("chat_id"))
++            return f"{prefix}Kanban {task_id} {body}" if body is not None else None
+         return f"{prefix}Kanban {task_id} " + block_notice(task, task_id, board_slug, reason=str(payload.get("reason") or ""), actor=str(payload.get("actor") or ""))
+     if getattr(ev, "kind", "") == "completed":
+         # A worker refused a send into this chat put its message in the summary as a FINAL SEND line. [daveey]
+-- 
+2.43.0
+

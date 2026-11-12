@@ -1,0 +1,127 @@
+From a30be81055ae6ad3f75f9e243840a80d390872a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:33:53 +0000
+Subject: [PATCH] [daveey] Judge CLI create placement on the resolved assignee
+
+`hermes kanban create` without --assignee built cli_policy/cli_audit fields
+from vars(args), where assignee is None, so portable_reason judged the card
+as "default" while kb.create_task persisted the resolved assignee
+(_profile_author() in worker/agent shells, else the board default). A
+non-allowlisted resolved assignee was audited portable and, with
+worker_pools, enrolled into worker-first-v1.
+
+Pass the same resolved assignee given to kb.create_task into _cli_fields.
+Explicit --assignee is unchanged.
+---
+ hermes_cli/kanban.py                          |  4 +-
+ hermes_cli/kanban_worker_placement.py         | 12 +++---
+ .../test_kanban_cli_resolved_assignee.py      | 40 +++++++++++++++++++
+ 3 files changed, 48 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_cli_resolved_assignee.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index dcad654cea..d7181ea1c7 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -524,9 +524,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True, runs_on=getattr(args, "runs_on", None),
+-                placement_policy=cli_policy(args, body, ws_kind, ws_path, board),
++                placement_policy=cli_policy(args, body, ws_kind, ws_path, board, assignee=assignee),
+                 placement_checked=True, board=board,
+-                placement_audit=cli_audit(args, body, ws_kind, ws_path, board),
++                placement_audit=cli_audit(args, body, ws_kind, ws_path, board, assignee=assignee),
+                 insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+             )
+         except kanban_overlap.OverlapRefused as exc:  # landed under the write lock after the first check
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 9deb0375bb..dd22a49963 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -115,15 +115,15 @@ def _db_fields(fields):
+     return args
+ 
+ 
+-def _cli_fields(args, body, workspace_kind, workspace_path, board):
++def _cli_fields(args, body, workspace_kind, workspace_path, board, *, assignee):
+     fields = {**vars(args), "body": body, "workspace_kind": workspace_kind,
+-              "workspace_path": workspace_path, "board": board}
++              "workspace_path": workspace_path, "board": board, "assignee": assignee}
+     if fields.get("initial_status") == "running":
+         fields.pop("initial_status")  # argparse's ordinary create default, not a requested hold
+     return fields
+ 
+ 
+-def cli_policy(args, body, workspace_kind, workspace_path, board):
++def cli_policy(args, body, workspace_kind, workspace_path, board, *, assignee):
+     """CLI creation uses the same enrollment boundary, without changing legacy routes."""
+     from hermes_cli import kanban_placement as placement
+ 
+@@ -131,14 +131,14 @@ def cli_policy(args, body, workspace_kind, workspace_path, board):
+     if not cfg.get("worker_pools"):
+         return None
+     gateway = placement.reg.self_gateway()
+-    result = creation_decision(_cli_fields(args, body, workspace_kind, workspace_path, board), cfg, gateway,
++    result = creation_decision(_cli_fields(args, body, workspace_kind, workspace_path, board, assignee=assignee), cfg, gateway,
+                                "auto", None)
+     return (result or {}).get("placement_policy")
+ 
+ 
+-def cli_audit(args, body, workspace_kind, workspace_path, board):
++def cli_audit(args, body, workspace_kind, workspace_path, board, *, assignee):
+     """:func:`creation_audit` over the same fields :func:`cli_policy` judged."""
+-    return creation_audit(_cli_fields(args, body, workspace_kind, workspace_path, board))
++    return creation_audit(_cli_fields(args, body, workspace_kind, workspace_path, board, assignee=assignee))
+ 
+ 
+ def validate_creation(policy, *, runs_on, workspace_kind, workspace_path, project, origin_intent, board):
+diff --git a/tests/hermes_cli/test_kanban_cli_resolved_assignee.py b/tests/hermes_cli/test_kanban_cli_resolved_assignee.py
+new file mode 100644
+index 0000000000..5bfb8b4f6b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_cli_resolved_assignee.py
+@@ -0,0 +1,40 @@
++"""CLI placement must judge the assignee persisted on the card."""
++import json
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import test_kanban_portable_reason_audit as audit
++
++kanban_home = audit.kanban_home
++
++
++@pytest.mark.parametrize("pooled", [False, True])
++@pytest.mark.parametrize("explicit", [False, True])
++@pytest.mark.parametrize("agent", [False, True])
++def test_cli_placement_uses_resolved_assignee(kanban_home, monkeypatch, pooled, explicit, agent):
++    profile = kanban_home / "profiles" / "specialist"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("toolsets: [terminal]\n")
++    cfg = {"assignees": ["default"]}
++    if pooled:
++        cfg["worker_pools"] = {"hub": ["worker-1"]}
++    monkeypatch.setattr(placement, "config", lambda: cfg)
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(cli, "_agent_invoked", lambda: agent)
++    monkeypatch.setattr(cli, "_profile_author", lambda: "specialist" if agent else "default")
++    monkeypatch.setattr(kb, "_default_ready_assignee", lambda: "specialist")
++    extra = " --assignee default" if explicit else ""
++    result = json.loads(cli.run_slash("create 'Analyze public data' --requires terminal --json" + extra))
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, result["id"])
++        payload = next(e.payload for e in kb.list_events(conn, task.id) if e.kind == "created")
++    assert task.assignee == ("default" if explicit else "specialist")
++    assert payload["portable_reason"] == (None if explicit else "assignee not allowlisted")
++    expected_policy = "worker-first-v1" if pooled and explicit else None
++    assert task.placement_policy == expected_policy
++    assert payload["placement_policy"] == expected_policy
+-- 
+2.43.0
+

@@ -1,0 +1,242 @@
+From bd7f81f97daded6d179d6908b5dc41f7af8b6954 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:30:59 +0000
+Subject: [PATCH] [daveey] Give Linux failed-result observers independent
+ manager custody
+
+---
+ hermes_cli/kanban_failed_result_observer.py   | 32 ++++++-
+ hermes_cli/kanban_failed_result_service.py    | 63 ++++++++++++
+ .../test_kanban_failed_result_service.py      | 95 +++++++++++++++++++
+ 3 files changed, 186 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_failed_result_service.py
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_service.py
+
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index ffb29fdf9c..74265dffb9 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -31,6 +31,9 @@ def arm(context):
+ 
+     context = {key: context[key] for key in ('db', 'task_id', 'run_id', 'claim_lock', 'board') if key in context}
+     context.update(writer_pid=os.getpid(), writer_birth=_process_fingerprint(os.getpid()))
++    if sys.platform == 'linux':
++        from hermes_cli.kanban_failed_result_service import arm_service
++        return arm_service(context, startup_seconds=START_SECONDS)
+     command = [sys.executable, '-m', __name__, json.dumps(context)]
+     launch = restart_safe_gateway_child_argv(
+         command, unit_suffix=f'failed-result-{os.getpid()}-{time.monotonic_ns()}',
+@@ -68,10 +71,21 @@ def observe(context):
+     from hermes_cli.kanban_db_connect import connect_closing
+     from hermes_cli.kanban_failed_result import failed_result_proof, process_gone
+ 
+-    with connect_closing(Path(context['db'])) as conn:
++    path = Path(context['db'])
++    if not path.is_file():
++        # A removed board has no run to reconcile. Never recreate it on restart.
++        return
++    with connect_closing(path) as conn:
++        if conn.execute('SELECT 1 FROM tasks WHERE id=? AND current_run_id=?',
++                        (context['task_id'], context['run_id'])).fetchone() is None:
++            return
+         # The acknowledgement precedes the writer's result transaction.
+-        sys.stdout.buffer.write(READY)
+-        sys.stdout.buffer.flush()
++        conn.execute('PRAGMA busy_timeout=250')
++        if context.get('ready_path'):
++            Path(context['ready_path']).write_text(context['observer_unit'], encoding='utf-8')
++        else:
++            sys.stdout.buffer.write(READY)
++            sys.stdout.buffer.flush()
+         while True:
+             row = conn.execute('SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?',
+                                (context['task_id'],)).fetchone()
+@@ -99,4 +113,14 @@ def observe(context):
+ 
+ 
+ if __name__ == '__main__':
+-    observe(json.loads(sys.argv[1]))
++    context = json.loads(sys.argv[1])
++    observe(context)
++    # Only a successful terminal observation releases the readiness artifact.
++    # Unexpected errors retain it and exit nonzero for manager restart.
++    if context.get('ready_path'):
++        ready = Path(context['ready_path'])
++        ready.unlink(missing_ok=True)
++        try:
++            ready.parent.rmdir()
++        except FileNotFoundError:
++            pass
+diff --git a/hermes_cli/kanban_failed_result_service.py b/hermes_cli/kanban_failed_result_service.py
+new file mode 100644
+index 0000000000..718a855512
+--- /dev/null
++++ b/hermes_cli/kanban_failed_result_service.py
+@@ -0,0 +1,63 @@
++"""Linux manager custody for failed-result observers, outside worker cgroups."""
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++
++def arm_service(context, *, startup_seconds=5.0):
++    """Acknowledge initialized board access only after systemd takes custody.
++
++    No provider credentials are transferred to the user manager. An unavailable
++    manager raises rather than claiming that a detached process is supervised.
++    """
++    from tools.environments.local import build_subprocess_env
++    from tools.process_registry import systemd_user_bus_env
++
++    binary = shutil.which('systemd-run')
++    if not binary:
++        raise RuntimeError('failed-result observer needs systemd-run')
++    directory = Path(tempfile.mkdtemp(prefix='failed-result-', dir=Path(context['db']).parent))
++    ready = directory / 'ready'
++    context = {**context, 'ready_path': str(ready)}
++    unit = f'hermes-failed-result-{os.getpid()}-{time.monotonic_ns()}.service'
++    context['observer_unit'] = unit
++    env = build_subprocess_env(extra=systemd_user_bus_env())
++    command = [binary, '--user', '--quiet', '--collect', f'--unit={unit}',
++               '--property=Type=exec', '--property=Slice=app.slice',
++               '--property=Restart=on-failure', '--property=RestartSec=500ms',
++               '--property=RestartForceExitStatus=SIGTERM SIGHUP SIGINT SIGPIPE',
++               '--property=StartLimitIntervalSec=0',
++               f'--working-directory={Path(__file__).resolve().parents[1]}']
++    # A manager-created service does not inherit its submitter's environment.
++    # Keep profile/path resolution, without forwarding secrets or worker pins.
++    for key in ('PATH', 'PYTHONPATH', 'HERMES_HOME', 'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BOARD',
++                'HOME', 'LANG', 'TZ', 'TMPDIR'):
++        if key in env:
++            command.append(f'--setenv={key}={env[key]}')
++    command += ['--', sys.executable, '-m', 'hermes_cli.kanban_failed_result_observer', json.dumps(context)]
++    try:
++        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
++                                text=True, encoding='utf-8', timeout=startup_seconds, env=env, check=False)
++    except subprocess.TimeoutExpired as exc:
++        # Submission may have succeeded: do not destroy the acknowledgment path.
++        raise RuntimeError('failed-result observer service submission timed out') from exc
++    if result.returncode:
++        ready.unlink(missing_ok=True)
++        directory.rmdir()
++        raise RuntimeError(f'failed-result observer service refused: {result.stderr[:200]}')
++    deadline = time.monotonic() + startup_seconds
++    while time.monotonic() < deadline:
++        try:
++            if ready.read_text(encoding='utf-8') == unit:
++                return unit
++        except FileNotFoundError:
++            pass
++        time.sleep(.05)
++    raise RuntimeError('failed-result observer service did not acknowledge startup')
+diff --git a/tests/hermes_cli/test_kanban_failed_result_service.py b/tests/hermes_cli/test_kanban_failed_result_service.py
+new file mode 100644
+index 0000000000..7698fa52a5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_service.py
+@@ -0,0 +1,95 @@
++"""Real manager custody proofs; no production units or boards are touched."""
++from __future__ import annotations
++
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_failed_result_observer import arm
++from tools.environments.local import build_subprocess_env
++from tools.process_registry import systemd_user_bus_env
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++board = fixtures.board
++
++
++def _systemctl(*args):
++    return subprocess.run(['systemctl', '--user', *args], capture_output=True,
++                          text=True, encoding='utf-8', timeout=10, check=False,
++                          env=build_subprocess_env(extra=systemd_user_bus_env()))
++
++
++def _property(unit, name):
++    result = _systemctl('show', unit, f'--property={name}', '--value')
++    assert result.returncode == 0, result.stderr
++    return result.stdout.strip()
++
++
++def _wait_for(check, seconds=10):
++    deadline = time.monotonic() + seconds
++    while time.monotonic() < deadline:
++        result = check()
++        if result:
++            return result
++        time.sleep(.05)
++    raise AssertionError('condition did not become true within deadline')
++
++
++@pytest.mark.parametrize('missing', ['board', 'run'])
++def test_observer_does_not_recreate_removed_target(board, missing, tmp_path):
++    from hermes_cli.kanban_failed_result_observer import observe
++    _conn, context = board
++    context = dict(context)
++    if missing == 'board':
++        context['db'] = str(tmp_path / 'removed' / 'board.db')
++    else:
++        context['run_id'] = -1
++    context['ready_path'] = str(tmp_path / 'absent-ready-dir' / 'ready')
++    context['observer_unit'] = 'fixture.service'
++    observe(context)
++    assert not Path(context['ready_path']).exists()
++    if missing == 'board':
++        assert not Path(context['db']).exists()
++
++
++@pytest.mark.skipif(sys.platform != 'linux', reason='real Linux systemd custody')
++def test_observer_survives_worker_cgroup_teardown(board):
++    if _systemctl('show-environment').returncode:
++        pytest.skip('no reachable user manager')
++    conn, context = board
++    # A disposable finite service is a real owner cgroup with teardown semantics.
++    # It expires naturally; this fixture never stops/signals any systemd unit.
++    outer_unit = f'hermes-fixture-failed-result-{time.monotonic_ns()}.service'
++    env = build_subprocess_env(extra=systemd_user_bus_env())
++    launch = subprocess.run(['systemd-run', '--user', '--quiet', '--collect',
++                             f'--unit={outer_unit}', '--', '/bin/sleep', '10'],
++                            capture_output=True, text=True, encoding='utf-8', timeout=10,
++                            env=env, check=False)
++    assert launch.returncode == 0, launch.stderr
++    outer_pid = int(_wait_for(lambda: (pid := _property(outer_unit, 'MainPID')) not in ('', '0') and pid))
++    kbd._set_worker_pid(conn, context['task_id'], outer_pid)
++    unit = arm(context)
++    assert isinstance(unit, str) and unit.endswith('.service')
++    observer_pid = int(_property(unit, 'MainPID'))
++    observer_group = _property(unit, 'ControlGroup')
++    outer_group = _property(outer_unit, 'ControlGroup')
++    assert observer_group != outer_group
++    assert '/app.slice/' in observer_group
++    assert 'hermes-kanban.slice' not in observer_group
++    assert _property(unit, 'Restart') == 'on-failure'
++    assert Path(f'/proc/{observer_pid}/cgroup').read_text(encoding='utf-8').strip().endswith(observer_group)
++    fixtures._failed_child(conn, context, outer_pid=outer_pid)
++    assert conn.execute('SELECT status FROM task_runs WHERE id=?',
++                        (context['run_id'],)).fetchone()[0] == 'running'
++    _wait_for(lambda: not Path(f'/proc/{outer_pid}').exists(), seconds=15)
++    _wait_for(lambda: conn.execute('SELECT status FROM task_runs WHERE id=?',
++                                  (context['run_id'],)).fetchone()[0] == 'crashed', seconds=5)
++    assert len(conn.execute("SELECT 1 FROM task_events WHERE run_id=? AND kind='crashed'",
++                            (context['run_id'],)).fetchall()) == 1
++    kbd.detect_crashed_workers(conn)
++    assert len(conn.execute("SELECT 1 FROM task_events WHERE run_id=? AND kind='crashed'",
++                            (context['run_id'],)).fetchall()) == 1
+-- 
+2.43.0
+

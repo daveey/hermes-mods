@@ -1,0 +1,321 @@
+From 1fa968b5a60f83b34e5b7605f7ee55c89f6e8aac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:24:06 +0000
+Subject: [PATCH] [daveey] Terminate identity-verified bound processes on
+ expiry after failed receipts
+
+TTL/max-runtime now terminate every live exact-identity worker_bound witness of a modern-result run (not only the outer), after verifying all witnesses first: any recycled, unknown or malformed witness holds the whole plan and nothing is signalled. Dead outer with hung bound is covered. Post-kill gate still reserves closure/accounting for the strict atomic finalizer.
+
+Proof: real distinct hung outer/bound, dead-outer/hung-bound and historical-bound processes; RED 14 pass/12 fail against outer-only b9a593c341.
+---
+ hermes_cli/kanban_db.py                       |  6 +-
+ hermes_cli/kanban_db_dispatch.py              | 10 +-
+ hermes_cli/kanban_failed_result.py            | 36 +++++++
+ hermes_cli/kanban_owner_recovery.py           | 34 +++++--
+ .../test_kanban_failed_result_runtime.py      | 93 +++++++++++++++----
+ 5 files changed, 146 insertions(+), 33 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 18d66aa1a6..01f7dc5d44 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2310,7 +2310,7 @@ def release_stale_claims(
+         "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+         "  AND t.claim_expires < ?", (now,),
+     ).fetchall()
+-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
++    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error, terminate_modern_bindings
+     for row in stale:
+         if owner_reclaim_blocked(conn, row["id"], for_termination=True):
+             continue
+@@ -2328,9 +2328,9 @@ def release_stale_claims(
+         started_at = _row_get(row, "worker_started_at")
+         live = host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at) and not heartbeat_stale
+         lease_lost = _sync.lease_lost(conn, row["id"], now, _resolve_claim_ttl_seconds() if live else None)  # [daveey] asks the Board
+-        if _stale_claim_kept(conn, row, now, live=live and not lease_lost, host_local=host_local, started_at=started_at):
++        if (_stale_claim_kept(conn, row, now, live=live and not lease_lost, host_local=host_local, started_at=started_at)
++                or not terminate_modern_bindings(conn, row["id"], signal_fn)):
+             continue
+-
+         termination = _terminate_reclaimed_worker(
+             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+         )
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index d80e70013c..7f43fbc14f 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -755,7 +755,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
+         "  AND t.worker_pid IS NOT NULL"
+     ).fetchall()
+-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
++    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, terminate_modern_bindings
+     for row in rows:
+         if owner_reclaim_blocked(conn, row["id"], for_termination=True):
+             continue
+@@ -779,9 +779,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
+                              "identity; not signalled", tid, pid)
+             continue
+-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
+-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
+-        # mismatch) is never signalled: the worker is already gone.
++        # SIGTERM, then SIGKILL after 5 s; a recycled PID is never signalled (already gone).
+         killed = False
+         kill = _kill_fn(signal_fn)
+         if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
+@@ -792,6 +790,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+             if _worker_alive(pid, started_at):
+                 killed = _sigkill(kill, pid)
+ 
++        if not terminate_modern_bindings(conn, tid, signal_fn):
++            continue
+         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+         with _kb.write_txn(conn):
+             # Again under the write lock, after the kill wait: an interpreter that bound
+@@ -871,7 +871,7 @@ def detect_stale_running(
+         "WHERE t.status = 'running'" + _kb._sync.held_elsewhere_sql(conn, "t")
+     ).fetchall()
+ 
+-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
++    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, terminate_modern_bindings
+     for row in rows:
+         if owner_reclaim_blocked(conn, row["id"]):
+             continue
+diff --git a/hermes_cli/kanban_failed_result.py b/hermes_cli/kanban_failed_result.py
+index 74775a7e71..9b98e26ab1 100644
+--- a/hermes_cli/kanban_failed_result.py
++++ b/hermes_cli/kanban_failed_result.py
+@@ -51,6 +51,42 @@ def process_gone(pid, birth) -> bool:
+     return False
+ 
+ 
++def termination_targets(conn, task_id):
++    """Plan expiry termination for a modern-result run, or ``None`` to hold.
++
++    Witnesses are the outer worker plus EVERY historical ``worker_bound`` incarnation of the
++    run. All must carry a valid birth and be either exited or the exact recorded process; one
++    recycled, unreadable or unverified witness holds the whole plan so nothing is signalled.
++    Returns the live exact-identity ``(pid, birth, is_outer)`` targets (may be empty).
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as dispatch
++    row = conn.execute('SELECT current_run_id, claim_lock, worker_pid, worker_started_at '
++                       'FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if row is None or not kb._claim_is_local(row['claim_lock'] or '', kb._host_prefix()):
++        return None
++    witnesses = [(row['worker_pid'], row['worker_started_at'], True)]
++    for event in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++                              "AND kind='worker_bound'", (task_id, row['current_run_id'])):
++        try:
++            bound = json.loads(event['payload'])
++        except (TypeError, ValueError):
++            return None
++        if not isinstance(bound, dict) or bound.get('claim_lock') != row['claim_lock']:
++            return None
++        witnesses.append((bound.get('pid'), bound.get('started_at'), False))
++    targets = {}
++    for pid, birth, outer in witnesses:
++        if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not valid_birth(birth)):
++            return None
++        if process_gone(pid, birth):
++            continue
++        if dispatch._process_fingerprint(pid) != birth:
++            return None
++        targets[(pid, birth)] = targets.get((pid, birth), False) or outer
++    return [(pid, birth, outer) for (pid, birth), outer in targets.items()]
++
++
+ def recorded_process_witnesses(conn, context):
+     """Whether this claim was launched with the modern two-process identity contract.
+ 
+diff --git a/hermes_cli/kanban_owner_recovery.py b/hermes_cli/kanban_owner_recovery.py
+index 5abfee40ea..353cf89668 100644
+--- a/hermes_cli/kanban_owner_recovery.py
++++ b/hermes_cli/kanban_owner_recovery.py
+@@ -255,17 +255,16 @@ def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False, for_termination=F
+     the shape that used to be unreclaimable forever, because ``bound_interpreter_gone`` was the
+     only override and it needs the ``worker_bound`` event that run never wrote.
+     """
+-    from hermes_cli.kanban_failed_result import modern_result_recorded, valid_birth
++    from hermes_cli.kanban_failed_result import modern_result_recorded
+     run = conn.execute('SELECT current_run_id, worker_pid, worker_started_at FROM tasks WHERE id=?',
+                        (task_id,)).fetchone()
+     if run is not None and modern_result_recorded(conn, task_id, run['current_run_id']):
+-        # Expiry may still terminate the verified outer worker. It must never
+-        # close/account here: even after signalling, all historical bindings
+-        # remain the strict atomic finalizer's responsibility.
+-        if (for_termination and run['worker_pid'] is not None and run['worker_pid'] > 0
+-                and valid_birth(run['worker_started_at'])):
+-            from hermes_cli.kanban_db_dispatch import _process_fingerprint
+-            return _process_fingerprint(run['worker_pid']) != run['worker_started_at']
++        # Expiry may still terminate verified processes (outer and every bound witness).
++        # It must never close/account here: all historical bindings remain the strict
++        # atomic finalizer's responsibility.
++        if for_termination and run['worker_pid'] is not None and run['worker_pid'] > 0:
++            from hermes_cli.kanban_failed_result import termination_targets
++            return not termination_targets(conn, task_id)
+         return True
+     if not owner_reclaim_paused(conn, task_id):
+         return False
+@@ -274,6 +273,25 @@ def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False, for_termination=F
+     return not owner_attempt_provably_over(conn, task_id)
+ 
+ 
++def terminate_modern_bindings(conn, task_id, signal_fn=None) -> bool:
++    """Terminate every identity-verified live bound witness of a modern-result run, except the
++    outer (the caller's own termination step handles it). False when the plan is held or a
++    bound process survived; nothing is signalled unless every witness verifies first."""
++    from hermes_cli.kanban_db_dispatch import _terminate_reclaimed_worker
++    from hermes_cli.kanban_failed_result import modern_result_recorded, termination_targets
++    row = conn.execute("SELECT current_run_id, claim_lock FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if row is None or not modern_result_recorded(conn, task_id, row["current_run_id"]):
++        return True
++    targets = termination_targets(conn, task_id)
++    if targets is None:
++        return False
++    for pid, birth, outer in targets:
++        if not outer and not _terminate_reclaimed_worker(
++                pid, row["claim_lock"], signal_fn=signal_fn, started_at=birth).get("terminated"):
++            return False
++    return True
++
++
+ def owner_reclaim_blocked_after_kill(conn, task_id, *, signalled: bool) -> bool:
+     """The under-lock re-check for a reclaim path, after its termination step.
+ 
+diff --git a/tests/hermes_cli/test_kanban_failed_result_runtime.py b/tests/hermes_cli/test_kanban_failed_result_runtime.py
+index 94a9b65cff..7d6f13ad78 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_runtime.py
++++ b/tests/hermes_cli/test_kanban_failed_result_runtime.py
+@@ -19,7 +19,7 @@ board = fixtures.board
+ 
+ 
+ @contextmanager
+-def _hung_writer(conn, context, *, code=1, output='fixture worker_receipt_timeout'):
++def _hung_writer(conn, context, *, code=1, output='fixture worker_receipt_timeout', outer_pid=None):
+     script = fixtures._CHILD.replace(
+         "_record_worker_result(context, 1, 'fixture worker_receipt_timeout')",
+         f'_record_worker_result(context, {code!r}, {output!r})').replace(
+@@ -30,7 +30,7 @@ def _hung_writer(conn, context, *, code=1, output='fixture worker_receipt_timeou
+         text=True, encoding='utf-8', env=build_subprocess_env(),
+         cwd=str(Path(__file__).resolve().parents[2]))
+     try:
+-        kbd._set_worker_pid(conn, context['task_id'], proc.pid)
++        kbd._set_worker_pid(conn, context['task_id'], outer_pid or proc.pid)
+         assert proc.stdin is not None and proc.stdout is not None
+         proc.stdin.write('x')
+         proc.stdin.flush()
+@@ -74,25 +74,20 @@ def _assert_open(conn, context):
+ @pytest.mark.parametrize('entry', ['ttl', 'max_runtime'])
+ def test_failed_result_expiry_terminates_but_only_strict_finalizer_accounts(board, entry):
+     conn, context = board
+-    # An older binding remains live after the failed writer exits: killing the
+-    # outer must not authorize TTL/max-runtime to close or charge the attempt.
+-    historical = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+-                                  stdin=subprocess.PIPE, env=build_subprocess_env())
++    # An older binding is also hung: expiry terminates it too, but still must not
++    # close/account; only the strict finalizer does, once every witness is gone.
++    historical = _idle()
+     try:
+-        with kb.write_txn(conn):
+-            kb._append_event(conn, context['task_id'], 'worker_bound',
+-                             {'pid': historical.pid, 'started_at': kbd._process_fingerprint(historical.pid),
+-                              'claim_lock': context['claim_lock']}, run_id=context['run_id'])
++        _bind(conn, context, historical)
+         with _hung_writer(conn, context) as writer:
+             _expire(conn, context, entry)
+             _enforce(conn, entry)
+             assert writer.poll() is not None, 'expired verified writer was left alive'
++            assert historical.poll() is not None, 'hung historical bound was left alive'
+             _assert_open(conn, context)
+-            assert kbd.detect_crashed_workers(conn, failed_results_only=True) == []
++            for _ in range(2):
++                _enforce(conn, entry)
+             _assert_open(conn, context)
+-            assert historical.stdin is not None
+-            historical.stdin.close()
+-            historical.wait(timeout=10)
+             assert kbd.detect_crashed_workers(conn, failed_results_only=True) == [context['task_id']]
+             for _ in range(2):
+                 _enforce(conn, entry)
+@@ -104,9 +99,73 @@ def test_failed_result_expiry_terminates_but_only_strict_finalizer_accounts(boar
+             assert kinds.count('crashed') == 1
+             assert 'timed_out' not in kinds and 'reclaimed' not in kinds
+     finally:
+-        if historical.poll() is None:
+-            historical.kill()
+-        historical.wait(timeout=10)
++        _reap(historical)
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('entry', ['ttl', 'max_runtime'])
++@pytest.mark.parametrize('outer_dead', [False, True])
++def test_expiry_terminates_distinct_hung_outer_and_bound(board, entry, outer_dead):
++    conn, context = board
++    outer = _idle()
++    try:
++        kbd._set_worker_pid(conn, context['task_id'], outer.pid)
++        with _hung_writer(conn, context, outer_pid=outer.pid) as bound:
++            assert bound.pid != outer.pid
++            if outer_dead:  # real outer died; the hung bound must still be reaped
++                _reap(outer)
++            _expire(conn, context, entry)
++            _enforce(conn, entry)
++            assert outer.poll() is not None
++            assert bound.poll() is not None, 'hung bound process survived expiry'
++            _assert_open(conn, context)
++            assert kbd.detect_crashed_workers(conn, failed_results_only=True) == [context['task_id']]
++    finally:
++        _reap(outer)
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('entry', ['ttl', 'max_runtime'])
++@pytest.mark.parametrize('bad', ['recycled', 'unknown', 'malformed'])
++def test_expiry_signals_nothing_when_any_historical_witness_unverified(board, entry, bad):
++    conn, context = board
++    stranger = _idle()
++    try:
++        birth = {'recycled': 'fixture-old-epoch|1', 'unknown': None, 'malformed': 'junk'}[bad]
++        with kb.write_txn(conn):
++            kb._append_event(conn, context['task_id'], 'worker_bound',
++                             {'pid': stranger.pid, 'started_at': birth,
++                              'claim_lock': context['claim_lock']}, run_id=context['run_id'])
++        with _hung_writer(conn, context) as writer:
++            _expire(conn, context, entry)
++            signals = []
++            _enforce(conn, entry, signal_fn=lambda pid, sig: signals.append((pid, sig)))
++            assert signals == []
++            _enforce(conn, entry)
++            assert writer.poll() is None and stranger.poll() is None
++            _assert_open(conn, context)
++    finally:
++        _reap(stranger)
++
++
++def _idle():
++    return subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
++                            stdin=subprocess.PIPE, env=build_subprocess_env())
++
++
++def _bind(conn, context, proc):
++    with kb.write_txn(conn):
++        kb._append_event(conn, context['task_id'], 'worker_bound',
++                         {'pid': proc.pid, 'started_at': kbd._process_fingerprint(proc.pid),
++                          'claim_lock': context['claim_lock']}, run_id=context['run_id'])
++
++
++def _reap(proc):
++    if proc.poll() is None:
++        proc.kill()
++    proc.wait(timeout=10)
++    if proc.stdin is not None:
++        proc.stdin.close()
+ 
+ 
+ @pytest.mark.platforms('posix')
+-- 
+2.43.0
+

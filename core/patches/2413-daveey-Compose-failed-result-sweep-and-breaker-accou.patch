@@ -1,0 +1,238 @@
+From 837f03ff1093aa84ec890aa0379923defe88126a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:57:27 +0000
+Subject: [PATCH] [daveey] Compose failed-result sweep and breaker accounting
+ atomically
+
+---
+ hermes_cli/kanban_db.py                       |  3 +-
+ hermes_cli/kanban_db_dispatch.py              | 23 +++++--
+ .../kanban_db_dispatch_crash_accounting.py    |  9 ++-
+ hermes_cli/kanban_systemic_crash.py           |  4 +-
+ tests/hermes_cli/test_kanban_run_finalizer.py | 62 +++++++++++++++++++
+ 5 files changed, 90 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index f6c03201a9..5fb0f9503f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1569,6 +1569,7 @@ def link_tasks(
+     child_id: str,
+     *,
+     expected_child_run_id: Optional[int] = None,
++    allow_nested: bool = False,
+ ) -> bool:
+     """Link ``parent_id -> child_id``. Returns True when the link gated a
+     ``ready`` child back to ``todo`` (the new parent is not yet terminal), so
+@@ -1582,7 +1583,7 @@ def link_tasks(
+     if parent_id == child_id:
+         raise ValueError("a task cannot depend on itself")
+     gated = False
+-    with write_txn(conn):
++    with write_txn(conn, allow_nested=allow_nested):
+         from hermes_cli.kanban_dependency_validation import check_link_parent, missing_dependency_error
+         missing = _missing_task_ids(conn, [parent_id, child_id])
+         if missing:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index f3f74a4a86..5cde5a96f0 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1298,9 +1298,11 @@ class _CrashSweep:
+     # Worker-exit observer payloads, fired only after every reclaim/accounting
+     # txn has committed.
+     exited_hook_payloads: list[dict] = field(default_factory=list)
++    auto_blocked: list[str] = field(default_factory=list)
+ 
+ 
+-def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
++def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
++                          *, failed_results_only: bool = False) -> _CrashSweep:
+     """Release every host-local ``running`` task whose worker PID is dead."""
+     sweep = _CrashSweep()
+     with _kb.write_txn(conn):
+@@ -1326,7 +1328,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                 continue
+             # An ambiguous receipt holds the card while the attempt may still run; once nothing
+             # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
+-            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
++            from hermes_cli.kanban_failed_result import failed_result_proof
++            proof = failed_result_proof(conn, row['id'], row['current_run_id'], row['claim_lock'])
++            if failed_results_only and proof is None:
++                continue
++            if proof is None and owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+                 continue
+ 
+             pid = int(row["worker_pid"])
+@@ -1335,7 +1341,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board,
+                                          run_id=row["current_run_id"], conn=conn)
+             _host_reboot.note(dead, row, now_boot, reboot_victims)  # [daveey]
+-            apply_attempt_note(conn, row["id"], pid, dead)
++            if proof is None:
++                apply_attempt_note(conn, row["id"], pid, dead)
++            else:
++                dead.event_payload.update({k: v for k, v in proof.items() if k != 'result'})
++                dead.event_payload['reconciled_at'] = int(time.time())
++                dead.event_payload['reconciled_by'] = 'observer' if failed_results_only else 'dispatcher'
+             _owner_death.note(dead, conn, row["id"], row["current_run_id"])  # owner died under it [daveey]
+             from hermes_cli.kanban_run_finalizer import close_dead_run
+             closed = close_dead_run(conn, row, dead)
+@@ -1388,6 +1399,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+             else:
+                 sweep.crashed.append(row["id"])
+                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
++        if sweep.crash_details:
++            sweep.auto_blocked = _account_crashes(conn, sweep.crash_details, allow_nested=True)
+     return sweep
+ 
+ 
+@@ -1402,8 +1415,8 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
+     ``_last_rate_limited`` attribute (the return stays crashed-only).
+     """
+     sweep = _reclaim_dead_workers(conn, board=board)
+-    # Outside the main txn: account each crash and maybe trip the breaker.
+-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
++    # Closure and accounting committed together; only external observers remain.
++    auto_blocked = sweep.auto_blocked
+     for _, _, _, dead in sweep.crash_details:
+         _worker_scope.release_failure(dead.event_payload)
+     # Side-channel attributes keep the public ``list[str]`` return stable;
+diff --git a/hermes_cli/kanban_db_dispatch_crash_accounting.py b/hermes_cli/kanban_db_dispatch_crash_accounting.py
+index e9fe1d0348..a143bed81c 100644
+--- a/hermes_cli/kanban_db_dispatch_crash_accounting.py
++++ b/hermes_cli/kanban_db_dispatch_crash_accounting.py
+@@ -11,7 +11,7 @@ from typing import Optional
+ from hermes_cli import kanban_systemic_crash as _systemic
+ 
+ 
+-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
++def _account_crashes(conn: sqlite3.Connection, crash_details: list, *, allow_nested: bool = False) -> list[str]:
+     """Count each crash against the breaker; returns the task ids it tripped.
+ 
+     Protocol violations get a BOUNDED violation-only budget independent of
+@@ -64,6 +64,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                 force_trip=True,
+                 release_claim=False,
+                 end_run=False,
++                allow_nested=allow_nested,
+                 event_payload_extra={
+                     "pid": pid,
+                     "claimer": claimer,
+@@ -83,6 +84,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                 force_trip=True,
+                 release_claim=False,
+                 end_run=False,
++                allow_nested=allow_nested,
+                 event_payload_extra={"pid": pid, "claimer": claimer, flag: dead.reboot_culprit or True},
+                 block_kind="transient" if dead.terminal_provider else "capability" if dead.reboot_culprit else "assignment",
+             )
+@@ -108,10 +110,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                 failure_limit=1 if is_systemic else None,
+                 release_claim=False,
+                 end_run=False,
++                allow_nested=allow_nested,
+                 event_payload_extra=extra,
+             )
+-            if tripped and fix_id and not _systemic.attach(conn, fix_id, tid):
+-                with _d._kb.write_txn(conn):  # unlinked: never let recompute_ready respawn it into the same wall
++            if tripped and fix_id and not _systemic.attach(conn, fix_id, tid, allow_nested=allow_nested):
++                with _d._kb.write_txn(conn, allow_nested=allow_nested):  # unlinked: keep it held
+                     _d._kb._append_event(conn, tid, "gave_up", {**extra, "sticky": True, "fix_card_link_failed": True})
+         if tripped:
+             auto_blocked.append(tid)
+diff --git a/hermes_cli/kanban_systemic_crash.py b/hermes_cli/kanban_systemic_crash.py
+index dfb0377d5e..4dc1b03355 100644
+--- a/hermes_cli/kanban_systemic_crash.py
++++ b/hermes_cli/kanban_systemic_crash.py
+@@ -70,11 +70,11 @@ def ensure_fix_card(conn: sqlite3.Connection, fingerprint: str, task_ids: list[s
+     return None
+ 
+ 
+-def attach(conn: sqlite3.Connection, fix_id: str, task_id: str) -> bool:
++def attach(conn: sqlite3.Connection, fix_id: str, task_id: str, *, allow_nested: bool = False) -> bool:
+     """Link a tripped card under its fix card and say so on the card. False when the link failed."""
+     from hermes_cli import kanban_db as kb
+     try:
+-        kb.link_tasks(conn, fix_id, task_id)
++        kb.link_tasks(conn, fix_id, task_id, **({'allow_nested': True} if allow_nested else {}))
+     except (sqlite3.Error, ValueError):
+         _log.warning("kanban: linking %s under systemic fix card %s failed", task_id, fix_id, exc_info=True)
+         return False
+diff --git a/tests/hermes_cli/test_kanban_run_finalizer.py b/tests/hermes_cli/test_kanban_run_finalizer.py
+index 8f1cf00cf4..56e1021cd6 100644
+--- a/tests/hermes_cli/test_kanban_run_finalizer.py
++++ b/tests/hermes_cli/test_kanban_run_finalizer.py
+@@ -1,4 +1,6 @@
+ """Exact-run CAS and atomic accounting composition for failed results."""
++import json
++
+ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+@@ -61,3 +63,63 @@ def test_close_requires_transaction(board):
+     row, dead = _inputs(conn, context)
+     with pytest.raises(RuntimeError, match='caller-owned'):
+         close_dead_run(conn, row, dead)
++
++
++def test_failed_result_sweep_avoids_owner_store_and_preserves_times(board, monkeypatch):
++    from hermes_cli import kanban_owner_recovery as owner
++    conn, context = board
++    result = fixtures._failed_child(conn, context)
++    def forbidden(*args, **kwargs):
++        pytest.fail('failed-result reconciliation must not consult owner state.db')
++    monkeypatch.setattr(owner, 'owner_reclaim_blocked', forbidden)
++    monkeypatch.setattr(owner, 'apply_attempt_note', forbidden)
++    sweep = kbd._reclaim_dead_workers(conn, failed_results_only=True)
++    assert sweep.crashed == [context['task_id']]
++    row = conn.execute('SELECT metadata FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()
++    metadata = json.loads(row[0])
++    assert metadata['source_result_event_id'] == result['id']
++    assert metadata['result_recorded_at'] == result['created_at']
++    assert metadata['reconciled_at'] >= result['created_at']
++    assert metadata['reconciled_by'] == 'observer'
++    assert kbd._reclaim_dead_workers(conn, failed_results_only=True).crashed == []
++    assert conn.execute('SELECT consecutive_failures FROM tasks WHERE id=?',
++                        (context['task_id'],)).fetchone()[0] == 1
++
++
++def test_sweep_accounting_exception_rolls_back_real_closure(board, monkeypatch):
++    conn, context = board
++    fixtures._failed_child(conn, context)
++    real_account = kbd._account_crashes
++    def fail_after_account(*args, **kwargs):
++        real_account(*args, **kwargs)
++        raise RuntimeError('after accounting')
++    monkeypatch.setattr(kbd, '_account_crashes', fail_after_account)
++    with pytest.raises(RuntimeError, match='after accounting'):
++        kbd._reclaim_dead_workers(conn, failed_results_only=True)
++    assert conn.execute('SELECT status, consecutive_failures FROM tasks WHERE id=?',
++                        (context['task_id'],)).fetchone()[:] == ('running', 0)
++    assert conn.execute('SELECT status, ended_at FROM task_runs WHERE id=?',
++                        (context['run_id'],)).fetchone()[:] == ('running', None)
++
++
++def test_systemic_batch_preserves_one_fix_owner_inside_transaction(board):
++    conn, context = board
++    contexts = [context]
++    for index in range(2):
++        tid = kb.create_task(conn, title=f'additional failed result {index}', assignee='default')
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        assert task is not None
++        contexts.append({**context, 'task_id': tid, 'run_id': task.current_run_id,
++                         'claim_lock': task.claim_lock})
++    for item in contexts:
++        fixtures._failed_child(conn, item)
++    sweep = kbd._reclaim_dead_workers(conn, failed_results_only=True)
++    assert set(sweep.auto_blocked) == {item['task_id'] for item in contexts}
++    fixes = conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE 'systemic-crash:%'").fetchall()
++    assert len(fixes) == 1
++    children = conn.execute('SELECT child_id FROM task_links WHERE parent_id=?', (fixes[0][0],)).fetchall()
++    assert {row[0] for row in children} == {item['task_id'] for item in contexts}
++    assert kbd._reclaim_dead_workers(conn, failed_results_only=True).crashed == []
++    for item in contexts:
++        assert conn.execute('SELECT consecutive_failures FROM tasks WHERE id=?',
++                            (item['task_id'],)).fetchone()[0] == 1
+-- 
+2.43.0
+

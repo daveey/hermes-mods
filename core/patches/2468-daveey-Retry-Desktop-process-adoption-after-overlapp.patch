@@ -1,0 +1,124 @@
+From a48855983087103f31cca3c8fdc3f08665548abd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:07:16 +0000
+Subject: [PATCH] [daveey] Retry Desktop process adoption after overlapping
+ backend exits
+
+---
+ ...test_process_checkpoint_keeper_recovery.py | 56 +++++++++++++++++++
+ .../tools/test_process_readopt_output_log.py  |  4 +-
+ tools/process_registry_readopt.py             | 12 +++-
+ 3 files changed, 68 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tools/test_process_checkpoint_keeper_recovery.py
+
+diff --git a/tests/tools/test_process_checkpoint_keeper_recovery.py b/tests/tools/test_process_checkpoint_keeper_recovery.py
+new file mode 100644
+index 0000000000..17397167e6
+--- /dev/null
++++ b/tests/tools/test_process_checkpoint_keeper_recovery.py
+@@ -0,0 +1,56 @@
++"""A replacement backend retries ownership after an overlapping writer exits."""
++import json
++import threading
++
++import pytest
++
++from tools import process_registry_readopt as readopt
++from tools.process_registry import ProcessRegistry
++from tests.tools import test_process_orphan_readopt_tui as helpers
++
++checkpoint = helpers.checkpoint
++procs = helpers.procs
++
++
++@pytest.mark.parametrize("desktop", [True, False])
++def test_keeper_recovers_after_previous_writer_exits(checkpoint, procs, tmp_path, monkeypatch, desktop):
++    monkeypatch.setattr("hermes_cli.process_identity.is_desktop_owned_backend", lambda: desktop)
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    writer, child = procs(), procs()
++    log = tmp_path / "proc_overlap.log"
++    log.write_text("overlapping restart completed\n")
++    entry = helpers._entry("proc_overlap", child.pid, helpers.TUI_KEY)
++    entry.update(writer_pid=writer.pid,
++                 writer_start_time=ProcessRegistry._safe_host_start_time(writer.pid),
++                 output_log=str(log), persist_on_release=True)
++    checkpoint.write_text(json.dumps([entry]))
++    registry = ProcessRegistry()
++    events = []
++    ready = threading.Event()
++
++    def wake(event):
++        events.append(event)
++        ready.set()
++
++    registry.on_unknown_exit = wake
++    assert readopt.recover_tui_orphaned_processes(registry) == 0
++    readopt._checkpoint_keeper_tick(registry)
++    assert registry.get("proc_overlap") is None
++    helpers._kill(writer)
++    # The job also exits before the next keeper tick. Its log/exit trap survives.
++    log.with_suffix(".exit").write_text("0\n")
++    helpers._kill(child)
++    readopt._checkpoint_keeper_tick(registry)
++    if not desktop:
++        assert registry.get("proc_overlap") is None
++        assert events == []
++        return
++    assert ready.wait(5), "a one-shot startup scan stranded the late orphan"
++    session = registry.get("proc_overlap")
++    assert session is not None
++    assert session._completion_event.wait(5)
++    readopt._checkpoint_keeper_tick(registry)
++    assert len(events) == 1
++    assert events[0]["session_key"] == helpers.TUI_KEY
++    assert events[0]["exit_code"] == 0
++    assert "overlapping restart completed" in events[0]["output"]
+diff --git a/tests/tools/test_process_readopt_output_log.py b/tests/tools/test_process_readopt_output_log.py
+index 66fe9baee7..47f152e282 100644
+--- a/tests/tools/test_process_readopt_output_log.py
++++ b/tests/tools/test_process_readopt_output_log.py
+@@ -100,7 +100,9 @@ def test_interpreter_restart_dispatches_one_completion_turn(
+     from tools.process_registry_notifications import format_process_notification
+ 
+     gate = tmp_path / "release"
+-    command = f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.02; done; printf "restart-proof\\n"; exit 7'
++    command = (f'n=0; while [ ! -f {shlex.quote(str(gate))} ]; do '
++               'n=$((n+1)); [ "$n" -lt 1500 ] || exit 124; sleep 0.02; done; '
++               'printf "restart-proof\\n"; exit 7')
+     producer = subprocess.run(
+         [sys.executable, "-c", _SPAWNER, str(checkpoint), str(tmp_path), command, TUI_KEY],
+         cwd=str(Path(__file__).resolve().parents[2]), env=build_subprocess_env(),
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index 5b3354e0a8..a3d36a245c 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -277,9 +277,15 @@ _keeper_lock = threading.Lock()
+ _keeper_thread: Optional[threading.Thread] = None
+ 
+ 
++def _checkpoint_keeper_tick(registry) -> None:
++    """Reassert our entries and revisit jobs whose previous writer outlived startup."""
++    registry.reassert_checkpoint()
++    recover_tui_orphaned_processes(registry)
++
++
+ def start_checkpoint_keeper(registry=None, interval: float = CHECKPOINT_KEEPER_SECONDS) -> bool:
+-    """Desktop backend: every *interval* s, put back any live entry another writer dropped from
+-    processes.json (``reassert_checkpoint``). Idempotent; one file read per tick. [daveey]"""
++    """Desktop backend: reassert live entries and recover late orphans every *interval* s.
++    Idempotent; recovery retains the live-writer and Desktop-owner fences. [daveey]"""
+     global _keeper_thread
+     if registry is None:
+         from tools.process_registry import process_registry as registry
+@@ -288,7 +294,7 @@ def start_checkpoint_keeper(registry=None, interval: float = CHECKPOINT_KEEPER_S
+         while True:
+             time.sleep(interval)
+             try:
+-                registry.reassert_checkpoint()
++                _checkpoint_keeper_tick(registry)
+             except Exception:
+                 logger.debug("checkpoint keeper tick failed", exc_info=True)
+ 
+-- 
+2.43.0
+

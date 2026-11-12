@@ -1,0 +1,217 @@
+From 6e3f554db55ae99d8fa0bca9cb32683b39ae83f5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:24:13 +0000
+Subject: [PATCH] [daveey] Fix failed-result observer process and launch source
+ guards
+
+Use the non-signalling psutil existence probe while retaining birth and zombie identity vetoes. Resolve both launch working directories through the canonical install-root helper and accept BOM-prefixed readiness acknowledgements. Document the intentional outlives-writer detached lifecycle using the checker's supported per-site contract; owner-death registration would destroy independent reconciliation.
+
+Proof: scripts/check: 18 checks ok; canonical runner: 1189 passed, 0 failed across six files, including generation fencing, real-process reconciliation and both subprocess source scanners. Six targeted regressions failed before the fix.
+---
+ hermes_cli/kanban_failed_result.py            |  9 ++-
+ hermes_cli/kanban_failed_result_observer.py   |  4 +-
+ hermes_cli/kanban_failed_result_service.py    |  5 +-
+ ...test_kanban_failed_result_launch_safety.py | 56 +++++++++++++++++++
+ .../test_kanban_failed_result_reconcile.py    | 16 +++---
+ 5 files changed, 75 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_launch_safety.py
+
+diff --git a/hermes_cli/kanban_failed_result.py b/hermes_cli/kanban_failed_result.py
+index 696ef1ddab..74775a7e71 100644
+--- a/hermes_cli/kanban_failed_result.py
++++ b/hermes_cli/kanban_failed_result.py
+@@ -7,7 +7,6 @@ proof to close a run. This module does not itself change lifecycle state.
+ from __future__ import annotations
+ 
+ import json
+-import os
+ import re
+ import sys
+ from pathlib import Path
+@@ -27,16 +26,16 @@ def process_gone(pid, birth) -> bool:
+     An exact-identity Linux zombie is exited; permission failures stay unknown.
+     """
+     from hermes_cli import kanban_db_dispatch as dispatch
++    import psutil
+ 
+     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+         return False
+     if not valid_birth(birth):
+         return False
+     try:
+-        os.kill(pid, 0)
+-    except ProcessLookupError:
+-        return True
+-    except (PermissionError, OSError):
++        if not psutil.pid_exists(pid):
++            return True
++    except (psutil.Error, OSError):
+         return False
+     # A matching Linux zombie has exited even if its wedged parent has not
+     # reaped it. Read identity on both sides of the state observation; an
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index 437e97a150..7b37f46197 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -31,6 +31,7 @@ def arm(context):
+     from tools.environments.local import build_subprocess_env
+     from tools.process_registry import restart_safe_gateway_child_argv, systemd_user_bus_env
+     from hermes_cli.kanban_db_dispatch import _process_fingerprint
++    from hermes_cli._startup_fast import project_root_str
+ 
+     context = {key: context[key] for key in ('db', 'task_id', 'run_id', 'claim_lock', 'board') if key in context}
+     context.update(writer_pid=os.getpid(), writer_birth=_process_fingerprint(os.getpid()))
+@@ -45,9 +46,10 @@ def arm(context):
+         raise RuntimeError('independent failed-result observer scope unavailable')
+     proc = subprocess.Popen(
+         launch.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++        # detached-spawn: ok — independent reconciler must outlive the failed writer to close its run
+         start_new_session=True, close_fds=True,
+         env=build_subprocess_env(extra=systemd_user_bus_env()),
+-        cwd=str(Path(__file__).resolve().parents[1]),
++        cwd=project_root_str(),
+     )
+     assert proc.stdout is not None
+     deadline = time.monotonic() + START_SECONDS
+diff --git a/hermes_cli/kanban_failed_result_service.py b/hermes_cli/kanban_failed_result_service.py
+index 718a855512..c0ca55fafe 100644
+--- a/hermes_cli/kanban_failed_result_service.py
++++ b/hermes_cli/kanban_failed_result_service.py
+@@ -19,6 +19,7 @@ def arm_service(context, *, startup_seconds=5.0):
+     """
+     from tools.environments.local import build_subprocess_env
+     from tools.process_registry import systemd_user_bus_env
++    from hermes_cli._startup_fast import project_root_str
+ 
+     binary = shutil.which('systemd-run')
+     if not binary:
+@@ -34,7 +35,7 @@ def arm_service(context, *, startup_seconds=5.0):
+                '--property=Restart=on-failure', '--property=RestartSec=500ms',
+                '--property=RestartForceExitStatus=SIGTERM SIGHUP SIGINT SIGPIPE',
+                '--property=StartLimitIntervalSec=0',
+-               f'--working-directory={Path(__file__).resolve().parents[1]}']
++               f'--working-directory={project_root_str()}']
+     # A manager-created service does not inherit its submitter's environment.
+     # Keep profile/path resolution, without forwarding secrets or worker pins.
+     for key in ('PATH', 'PYTHONPATH', 'HERMES_HOME', 'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BOARD',
+@@ -55,7 +56,7 @@ def arm_service(context, *, startup_seconds=5.0):
+     deadline = time.monotonic() + startup_seconds
+     while time.monotonic() < deadline:
+         try:
+-            if ready.read_text(encoding='utf-8') == unit:
++            if ready.read_text(encoding='utf-8-sig') == unit:
+                 return unit
+         except FileNotFoundError:
+             pass
+diff --git a/tests/hermes_cli/test_kanban_failed_result_launch_safety.py b/tests/hermes_cli/test_kanban_failed_result_launch_safety.py
+new file mode 100644
+index 0000000000..830e7f7f22
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_launch_safety.py
+@@ -0,0 +1,56 @@
++"""Non-signalling process probes and canonical observer launch paths."""
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import psutil
++import pytest
++
++from hermes_cli import _startup_fast
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_failed_result as reconcile
++from hermes_cli import kanban_failed_result_service as service
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++board = fixtures.board
++
++
++@pytest.mark.parametrize('exists', [True, False, PermissionError(), OSError()])
++def test_process_probe_never_signals(monkeypatch, exists):
++    import os
++
++    def signal_forbidden(*args):
++        pytest.fail('death proof must never signal a process')
++
++    def probe(pid):
++        assert pid == 123
++        if isinstance(exists, Exception):
++            raise exists
++        return exists
++
++    monkeypatch.setattr(os, 'kill', signal_forbidden)
++    monkeypatch.setattr(psutil, 'pid_exists', probe)
++    monkeypatch.setattr(dispatch, '_process_fingerprint', lambda pid: None)
++    assert reconcile.process_gone(123, 'epoch|1') is (exists is False)
++
++
++@pytest.mark.parametrize('bom', [False, True])
++def test_service_uses_canonical_install_root_and_reads_readiness(board, tmp_path, monkeypatch, bom):
++    _, context = board
++    root = tmp_path / 'canonical-install'
++    root.mkdir()
++    monkeypatch.setattr(_startup_fast, 'project_root_str', lambda: str(root))
++    monkeypatch.setattr(service.shutil, 'which', lambda name: '/usr/bin/systemd-run')
++    calls = []
++
++    def submit(command, **kwargs):
++        calls.append(command)
++        payload = json.loads(command[-1])
++        Path(payload['ready_path']).write_text(payload['observer_unit'],
++                                              encoding='utf-8-sig' if bom else 'utf-8')
++        return SimpleNamespace(returncode=0, stderr='')
++
++    monkeypatch.setattr(service.subprocess, 'run', submit)
++    unit = service.arm_service(context, startup_seconds=.1)
++    assert unit.endswith('.service')
++    assert f'--working-directory={root}' in calls[0]
+diff --git a/tests/hermes_cli/test_kanban_failed_result_reconcile.py b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+index 49c785cd3c..ad70bfb862 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_reconcile.py
++++ b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+@@ -138,13 +138,13 @@ def test_board_only_proof_accepts_real_dead_child(board):
+ @pytest.mark.parametrize('state', ['live', 'recycled', 'unreadable', 'denied', 'gone'])
+ def test_process_proof_fails_closed(monkeypatch, state):
+     from hermes_cli import kanban_failed_result as reconcile
+-    def probe(pid, signal):
+-        assert (pid, signal) == (123, 0)
+-        if state == 'gone':
+-            raise ProcessLookupError()
++    import psutil
++    def probe(pid):
++        assert pid == 123
+         if state == 'denied':
+             raise PermissionError()
+-    monkeypatch.setattr(reconcile.os, 'kill', probe)
++        return state != 'gone'
++    monkeypatch.setattr(psutil, 'pid_exists', probe)
+     monkeypatch.setattr(reconcile.Path, 'read_text', lambda *args, **kwargs: '123 (fixture) S')
+     monkeypatch.setattr(kbd, '_process_fingerprint',
+                         lambda pid: {'live': 'epoch|1', 'recycled': 'epoch|2'}.get(state))
+@@ -154,9 +154,10 @@ def test_process_proof_fails_closed(monkeypatch, state):
+ @pytest.mark.parametrize('birth', [None, '', 'UNVERIFIED', 12])
+ def test_missing_birth_never_proves_death(monkeypatch, birth):
+     from hermes_cli import kanban_failed_result as reconcile
++    import psutil
+     def unexpected(*args):
+         pytest.fail('invalid binding must not query OS')
+-    monkeypatch.setattr(reconcile.os, 'kill', unexpected)
++    monkeypatch.setattr(psutil, 'pid_exists', unexpected)
+     assert not reconcile.process_gone(123, birth)
+ 
+ 
+@@ -343,9 +344,10 @@ def test_modern_receipt_invalid_binding_still_vetoes_reclaim(board, monkeypatch,
+                                   'epoch| 1', 'epoch|1@-2', 'epoch|1|2'])
+ def test_malformed_birth_never_queries_process(monkeypatch, birth):
+     from hermes_cli import kanban_failed_result as reconcile
++    import psutil
+     def unexpected(*args):
+         pytest.fail('malformed birth must fail before querying process')
+-    monkeypatch.setattr(reconcile.os, 'kill', unexpected)
++    monkeypatch.setattr(psutil, 'pid_exists', unexpected)
+     assert not reconcile.process_gone(123, birth)
+ 
+ 
+-- 
+2.43.0
+

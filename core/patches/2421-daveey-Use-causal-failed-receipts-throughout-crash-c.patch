@@ -1,0 +1,235 @@
+From 338990dd2410c5844ddb93629aa1f0a952d4945d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:32:25 +0000
+Subject: [PATCH] [daveey] Use causal failed receipts throughout crash
+ classification
+
+---
+ hermes_cli/kanban_failed_result_identity.py   | 21 +++++
+ hermes_cli/kanban_host_refusal.py             |  4 +
+ hermes_cli/kanban_owner_recovery.py           |  6 ++
+ hermes_cli/kanban_owner_storage_refusal.py    | 10 +++
+ hermes_cli/kanban_quota_receipt.py            |  8 ++
+ hermes_cli/kanban_worker_log.py               |  5 ++
+ .../test_kanban_failed_result_consumers.py    | 89 +++++++++++++++++++
+ 7 files changed, 143 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_consumers.py
+
+diff --git a/hermes_cli/kanban_failed_result_identity.py b/hermes_cli/kanban_failed_result_identity.py
+index c2cad1c461..28f2c35bdf 100644
+--- a/hermes_cli/kanban_failed_result_identity.py
++++ b/hermes_cli/kanban_failed_result_identity.py
+@@ -5,6 +5,27 @@ import json
+ from typing import cast
+ 
+ 
++def modern_receipt(conn, task_id, run_id, claim_lock):
++    """Return (modern, selected result event/payload), including a strict veto.
++
++    Classifiers also run after closure, so this checks receipt attribution, not
++    task liveness. A modern but ambiguous history must never use legacy logs.
++    """
++    from hermes_cli.kanban_failed_result import modern_result_recorded
++    if not modern_result_recorded(conn, task_id, run_id):
++        return False, None
++    selected = attributable_events(conn, task_id, run_id)
++    if selected is None:
++        return True, None
++    (_, bound), result, _ = selected
++    payload = result[1]
++    if (bound is None or payload is None or bound.get('claim_lock') != claim_lock
++            or payload.get('claim_lock') != claim_lock
++            or bound.get('pid') is None or payload.get('pid') != bound.get('pid')):
++        return True, None
++    return True, (result[0], payload)
++
++
+ def _payload(event):
+     try:
+         value = json.loads(event['payload'])
+diff --git a/hermes_cli/kanban_host_refusal.py b/hermes_cli/kanban_host_refusal.py
+index 57caaf4120..4e5129d0a7 100644
+--- a/hermes_cli/kanban_host_refusal.py
++++ b/hermes_cli/kanban_host_refusal.py
+@@ -108,6 +108,10 @@ def proven(conn: sqlite3.Connection, task_id: str, run_id, claim_lock, *, admitt
+     results = _run_events(conn, task_id, run_id, "worker_result")
+     if len(results) != 1:
+         return None
++    from hermes_cli.kanban_failed_result_identity import modern_receipt
++    modern, selected = modern_receipt(conn, task_id, run_id, claim_lock)
++    if modern and selected is None:
++        return None
+     (result,) = results
+     proof = result.get(PROOF_KEY)
+     if (result.get("claim_lock") != claim_lock or result.get("exit_code") != KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+diff --git a/hermes_cli/kanban_owner_recovery.py b/hermes_cli/kanban_owner_recovery.py
+index 6543dc9940..20f989dcb3 100644
+--- a/hermes_cli/kanban_owner_recovery.py
++++ b/hermes_cli/kanban_owner_recovery.py
+@@ -301,6 +301,12 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
+             return {}
+         return payload if isinstance(payload, dict) else {}
+ 
++    from hermes_cli.kanban_failed_result_identity import modern_receipt
++    task = conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if task is not None:
++        modern, selected = modern_receipt(conn, task_id, task['current_run_id'], claim_lock)
++        if modern:
++            return selected[1].get('exit_code') if selected else None
+     result, bound = latest('worker_result'), latest('worker_bound')
+     pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
+     return result.get('exit_code') if result.get('claim_lock') == claim_lock and result.get('pid') in pids else None
+diff --git a/hermes_cli/kanban_owner_storage_refusal.py b/hermes_cli/kanban_owner_storage_refusal.py
+index 14ab44d2aa..36fece1580 100644
+--- a/hermes_cli/kanban_owner_storage_refusal.py
++++ b/hermes_cli/kanban_owner_storage_refusal.py
+@@ -12,6 +12,16 @@ def proven(conn, task_id, run_id, claim_lock):
+     """
+     if conn is None or run_id is None or not claim_lock:
+         return None
++    from hermes_cli.kanban_failed_result_identity import modern_receipt
++    modern, selected = modern_receipt(conn, task_id, run_id, claim_lock)
++    if modern:
++        if selected is None:
++            return None
++        result = selected[1]
++        if (result.get('exit_code') != 1
++                or result.get('last_output') != 'Worker failed: WorkerPersistenceError: storage_unavailable'):
++            return None
++        return {'kind': OWNER_STORAGE_UNAVAILABLE, 'phase': 'midrun', 'reason': 'storage_unavailable'}
+     bound = _run_events(conn, task_id, run_id, "worker_bound")
+     if not bound or bound[-1].get("claim_lock") != claim_lock or bound[-1].get("pid") is None:
+         return None
+diff --git a/hermes_cli/kanban_quota_receipt.py b/hermes_cli/kanban_quota_receipt.py
+index a5f3f59f31..a248105d22 100644
+--- a/hermes_cli/kanban_quota_receipt.py
++++ b/hermes_cli/kanban_quota_receipt.py
+@@ -68,6 +68,14 @@ def _relative_seconds(text):
+ def _owned_receipt(conn, task_id, run_id):
+     """The exact attempt's quota-exit receipt under its own claim, or None."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_failed_result_identity import modern_receipt
++    run = conn.execute('SELECT claim_lock FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
++    if run is not None:
++        modern, selected = modern_receipt(conn, task_id, run_id, run['claim_lock'])
++        if modern:
++            if selected is None or selected[1].get('exit_code') != kb.KANBAN_RATE_LIMIT_EXIT_CODE:
++                return None
++            return selected[1], kb._to_epoch(selected[0]['created_at'])
+     row = conn.execute(
+         "SELECT e.payload, e.created_at, r.claim_lock FROM task_events e JOIN task_runs r "
+         "ON r.id=e.run_id AND r.task_id=e.task_id WHERE e.task_id=? AND e.run_id=? "
+diff --git a/hermes_cli/kanban_worker_log.py b/hermes_cli/kanban_worker_log.py
+index 62751c918e..da00adb0c3 100644
+--- a/hermes_cli/kanban_worker_log.py
++++ b/hermes_cli/kanban_worker_log.py
+@@ -140,6 +140,11 @@ def _run_receipt_output(conn, task_id, run_id, pid, claim_lock):
+         "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+         "AND kind='worker_bound' ORDER BY id DESC LIMIT 1", (task_id, run_id),
+     ).fetchone()
++    from hermes_cli.kanban_failed_result_identity import modern_receipt
++    modern, selected = modern_receipt(conn, task_id, run_id, claim_lock)
++    if modern:
++        output = selected[1].get('last_output') if selected else None
++        return True, output if isinstance(output, str) else None
+     bound = kb._json_dict(bound_row[0]) if bound_row else {}
+     pids = {pid}
+     if bound.get('claim_lock') == claim_lock and bound.get('pid') is not None:
+diff --git a/tests/hermes_cli/test_kanban_failed_result_consumers.py b/tests/hermes_cli/test_kanban_failed_result_consumers.py
+new file mode 100644
+index 0000000000..e44ce5bf9b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_consumers.py
+@@ -0,0 +1,89 @@
++"""Every classifier must consume the same causal modern receipt."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_owner_recovery as owner
++from hermes_cli import kanban_owner_storage_refusal as storage
++from hermes_cli import kanban_quota_receipt as quota
++from hermes_cli import kanban_worker_log as logs
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++board = fixtures.board
++STORAGE = 'Worker failed: WorkerPersistenceError: storage_unavailable'
++
++
++def _history(board, latest, *, ambiguous=False):
++    conn, context = board
++    first = fixtures._failed_child(conn, context)
++    payload = json.loads(first['payload'])
++    second = {**payload, 'result_sequence': 1 if ambiguous else 2, **latest}
++    with kb.write_txn(conn):
++        kb._append_event(conn, context['task_id'], 'worker_result', second, run_id=context['run_id'])
++        conn.execute('UPDATE task_events SET id=? WHERE id=?', (first['id'] + 1000, first['id']))
++    return conn, context, payload
++
++
++@pytest.mark.parametrize('failed_results_only', [False, True])
++def test_reclaim_classification_follows_causal_receipt(board, failed_results_only):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, ctx, _ = _history(board, {'exit_code': 7, 'last_output': 'causal final output'})
++    dispatch.detect_crashed_workers(conn, failed_results_only=failed_results_only)
++    run = conn.execute('SELECT status,error FROM task_runs WHERE id=?', (ctx['run_id'],)).fetchone()
++    assert run['status'] == 'crashed'
++    assert 'causal final output' in run['error']
++    assert 'fixture worker_receipt_timeout' not in run['error']
++
++
++@pytest.mark.parametrize('damage', ['none', 'missing_identity', 'foreign_claim', 'foreign_pid'])
++def test_host_refusal_requires_attributable_modern_receipt(board, damage):
++    from hermes_cli import kanban_host_refusal as host
++    from hermes_cli.kanban_owner_unavailable import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++    conn, ctx = board
++    row = fixtures._failed_child(conn, ctx)
++    result = json.loads(row['payload'])
++    result.update(exit_code=KANBAN_OWNER_UNAVAILABLE_EXIT_CODE,
++                  host_refusal={'kind': host.REGISTRY_EMPTY, 'phase': 'startup'})
++    if damage == 'missing_identity':
++        result.pop('bound_event_identity')
++    if damage == 'foreign_claim':
++        result['claim_lock'] = 'foreign:claim'
++    if damage == 'foreign_pid':
++        result['pid'] += 1
++    with kb.write_txn(conn):
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(result), row['id']))
++    assert bool(host.proven(conn, ctx['task_id'], ctx['run_id'], ctx['claim_lock'])) is (damage == 'none')
++
++
++def test_output_and_exit_follow_causal_result(board):
++    conn, ctx, first = _history(board, {'exit_code': 7, 'last_output': 'causal final output'})
++    assert logs.managed_worker_output(conn, ctx['task_id'], ctx['run_id'], first['pid'], ctx['claim_lock']) == 'causal final output'
++    assert owner.managed_run_exit_code(conn, ctx['task_id'], first['pid'], ctx['claim_lock']) == 7
++
++
++def test_quota_metadata_follows_causal_result(board):
++    conn, ctx, _ = _history(board, {'exit_code': kb.KANBAN_RATE_LIMIT_EXIT_CODE,
++                                  'failure_reason': 'rate_limit', 'failure_resets_at': 1900000000,
++                                  'route_provider': 'example-provider'})
++    assert quota.receipt_deadline(conn, ctx['task_id'], ctx['run_id']) == 1900000000
++    assert quota.receipt_route(conn, ctx['task_id'], ctx['run_id']) == 'example-provider'
++
++
++@pytest.mark.parametrize('output,expected', [(STORAGE, True), ('ordinary failure', False)])
++def test_storage_classification_follows_causal_result(board, output, expected):
++    conn, ctx, _ = _history(board, {'exit_code': 1, 'last_output': output})
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT id,payload FROM task_events WHERE kind='worker_result' ORDER BY id DESC LIMIT 1").fetchone()
++        old = json.loads(row['payload'])
++        old['last_output'] = 'ordinary failure' if expected else STORAGE
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(old), row['id']))
++    assert bool(storage.proven(conn, ctx['task_id'], ctx['run_id'], ctx['claim_lock'])) is expected
++
++
++def test_ambiguous_modern_history_supplies_no_classifier_evidence(board):
++    conn, ctx, first = _history(board, {'last_output': STORAGE}, ambiguous=True)
++    assert logs.managed_worker_output(conn, ctx['task_id'], ctx['run_id'], first['pid'], ctx['claim_lock']) == ''
++    assert owner.managed_run_exit_code(conn, ctx['task_id'], first['pid'], ctx['claim_lock']) is None
++    assert storage.proven(conn, ctx['task_id'], ctx['run_id'], ctx['claim_lock']) is None
++    assert quota.receipt_deadline(conn, ctx['task_id'], ctx['run_id']) is None
+-- 
+2.43.0
+

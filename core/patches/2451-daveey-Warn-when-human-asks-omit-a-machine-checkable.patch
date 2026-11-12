@@ -1,0 +1,142 @@
+From 131213bd895fe0c70ae8d19c31c2f6c0eda7e64e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:58:54 +0000
+Subject: [PATCH] [daveey] Warn when human asks omit a machine-checkable
+ premise probe
+
+Keep blocking non-fatal; suggest PR state, path and existing version probes. Proof: three new PR/path/build tests failed before implementation; 67 ask-lint and resolved-check tests pass, including automatic unblock after exit 0.
+---
+ hermes_cli/kanban_ask_premise.py         | 43 ++++++++++++++++++++
+ tests/tools/test_kanban_user_ask_lint.py | 51 ++++++++++++++++++++++++
+ tools/kanban_tools.py                    |  3 +-
+ 3 files changed, 96 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_ask_premise.py
+
+diff --git a/hermes_cli/kanban_ask_premise.py b/hermes_cli/kanban_ask_premise.py
+new file mode 100644
+index 0000000000..cda1590adb
+--- /dev/null
++++ b/hermes_cli/kanban_ask_premise.py
+@@ -0,0 +1,43 @@
++"""Non-fatal filing advice for human asks with observable premises. [daveey]
++
++Suggestions are never executed or installed: the worker must confirm the target,
++resolution semantics and probe host before supplying resolved_check.
++"""
++import re
++import shlex
++
++_PR = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/([1-9][0-9]*)(?=$|[\s/#?.,)\]`])")
++_PATH = re.compile(r"`(/[^`\n]+)`|\"(/[^\"\n]+)\"|'(/[^'\n]+)'|(?:^|[\s(])(/[^\s`\"'<>;|]+)")
++_BUILD = re.compile(r"\b(?:build|version)\s+[vV]?[0-9][\w.-]*\b|\bios-app[0-9]+\b", re.IGNORECASE)
++_VERSION_READ = re.compile(r"(?:version read|version command|version probe)\s*:\s*`([^`\n]+)`", re.IGNORECASE)
++
++
++def warning_fields(request: dict | None) -> dict:
++    """Use the lifecycle result's advisory-field convention; never reject an ask."""
++    if not request or request.get("resolved_check"):
++        return {}
++    text = "\n".join(str(request.get(key) or "") for key in ("action", "evidence"))
++    suggestions = []
++    for match in _PR.finditer(text):
++        repo, number = match.groups()
++        suggestions.append(
++            f"state=$(gh pr view {number} -R {shlex.quote(repo)} --json state -q .state) || exit 2; "
++            'case "$state" in MERGED|CLOSED) exit 0;; OPEN) exit 1;; *) exit 2;; esac')
++    for match in _PATH.finditer(text):
++        quoted = next((part for part in match.groups()[:3] if part is not None), None)
++        path = shlex.quote(quoted if quoted is not None else match.group(4).rstrip(".,):]"))
++        suggestions.append(f"test -e {path} (or ! test -e {path} if absence resolves the ask)")
++    if _BUILD.search(text):
++        read = _VERSION_READ.search(text)
++        source = f"`{read.group(1)}`" if read else "the existing version read used to establish this premise"
++        suggestions.append(f"Reuse {source}, comparing its output with the required build/version; "
++                           "do not invent a device endpoint or treat read failures as resolution")
++    if not suggestions:
++        return {}
++    return {"resolved_check_warning": (
++        "Machine-checkable premise without human_request.resolved_check: re-test before asking; "
++        "attach a verified probe so a changed premise resumes the card automatically. "
++        "Suggested probes (review target host and resolution condition; not executed): "
++        + "; ".join(dict.fromkeys(suggestions))
++        + ". Exit 0 only when the human step is no longer needed, 1 while pending, 2 on read failure. "
++          "A closed PR or missing path may require replanning, not completion. This block still succeeded.")}
+diff --git a/tests/tools/test_kanban_user_ask_lint.py b/tests/tools/test_kanban_user_ask_lint.py
+index 1b9864fa6e..bbbc496ca8 100644
+--- a/tests/tools/test_kanban_user_ask_lint.py
++++ b/tests/tools/test_kanban_user_ask_lint.py
+@@ -72,6 +72,57 @@ def test_block_without_human_request_is_not_this_lint(worker_env):
+     assert "archiving" in user_ask_lint_error({**CLEAR, "action": "Unblock to proceed"})
+ 
+ 
++@pytest.mark.parametrize("premise, probe", [
++    ("Merge https://github.com/example/project/pull/42", "gh pr view 42 -R example/project"),
++    ("Remove /var/cache/example-build", "test -e /var/cache/example-build"),
++    ("Install build 649; version read: `device-info --version`", "device-info --version"),
++])
++def test_machine_premise_warns_without_refusing(worker_env, premise, probe):
++    from tools import kanban_tools as kt
++    ask = {**CLEAR, "action": premise + ". Unblock = proceed; archive = drop it."}
++    result = json.loads(kt._handle_block({"reason": "Human step", "kind": "needs_input",
++                                         "human_request": ask}))
++    assert result.get("ok") is True, result
++    assert _task(worker_env).status == "blocked"
++    assert probe in result["resolved_check_warning"]
++    assert "resolved_check" in result["resolved_check_warning"]
++
++
++@pytest.mark.parametrize("extra", [
++    {"action": "Press the door-release button. Unblock = proceed; archive = drop it.", "evidence": "Door is closed"},
++    {"evidence": "https://github.com/example/project/pull/42", "resolved_check": "false"},
++])
++def test_no_premise_warning_for_physical_or_probed_asks(worker_env, extra):
++    from tools import kanban_tools as kt
++    result = json.loads(kt._handle_block({"reason": "Human step", "kind": "needs_input",
++                                         "human_request": {**CLEAR, **extra}}))
++    assert result.get("ok") is True, result
++    assert "resolved_check_warning" not in result
++
++
++@pytest.mark.parametrize("evidence, expected", [
++    ("See https://github.com/example/project/pull/42", "MERGED|CLOSED"),
++    ('Remove `/var/cache/build files`', "test -e '/var/cache/build files'"),
++    ('Remove "/var/cache/build files"', "test -e '/var/cache/build files'"),
++    ("Remove '/var/cache/build files'", "test -e '/var/cache/build files'"),
++    ("Install version v649", "existing version read"),
++    ("Device needs ios-app1655", "existing version read"),
++])
++def test_evidence_premises_preserve_probe_targets(worker_env, evidence, expected):
++    from tools import kanban_tools as kt
++    result = json.loads(kt._handle_block({"reason": "Human step", "kind": "needs_input",
++                                         "human_request": {**CLEAR, "evidence": evidence}}))
++    assert result.get("ok") is True, result
++    assert expected in result["resolved_check_warning"]
++
++
++@pytest.mark.parametrize("ask", [None, {}, {"action": "See https://example.com/docs"},
++    {"action": "https://github.com/example/project/pull/42oops"}])
++def test_no_machine_premise_has_no_advice(ask):
++    from hermes_cli.kanban_ask_premise import warning_fields
++    assert warning_fields(ask) == {}
++
++
+ def test_create_blocked_with_vague_ask_is_refused(worker_env, monkeypatch):
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     from tools import kanban_tools as kt
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 578eeb8203..e331631981 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1124,7 +1124,8 @@ def _handle_block(args: dict, **kw) -> str:
+         if escalated:
+             return escalated
+         landed_kind = kb.get_task(conn, tid).block_kind
+-        extra: dict = {"block_kind": landed_kind}
++        from hermes_cli.kanban_ask_premise import warning_fields
++        extra: dict = {"block_kind": landed_kind, **warning_fields(args.get("human_request"))}
+         if blocker_id:
+             extra["blocker_id"] = blocker_id
+         landed_status = kb.get_task(conn, tid).status
+-- 
+2.43.0
+

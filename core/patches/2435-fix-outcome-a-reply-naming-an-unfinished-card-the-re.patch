@@ -1,0 +1,180 @@
+From 4062c3ee5b08ae82c36372a954a263d912a7ccfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:08:53 +0000
+Subject: [PATCH] fix(outcome): a reply naming an unfinished card the reader
+ does not count is never derived done [daveey]
+
+Problem: a chat showed a green idle stripe (outcome done/derived) while its reply said "Remaining: verify ..."
+and "card t_... ready, not yet running"; the card was linked (CLI) but the task API returned [] so no wait
+was counted.
+
+Why 1: judge prompt + heuristic read "remaining items owned by a card" as a closing report.
+Why 2: that rule is safe only while the card is counted as live work; _derive_current consults the judge
+only when no card wait exists, i.e. exactly when the claim is unverified.
+Why 3: a failed card read was swallowed by _guarded as empty, also inferring done.
+Root (happened): the done verdict trusted prose about a card with no corroborating live-work evidence.
+Root (not caught): tests covered counted cards and judge verdicts, never a reply naming an uncounted card;
+handoff checks stopped at CLI link visibility, not outcome/API parity.
+Recurrence: prior t_088df457 false-green linked tasks.
+Fix: _names_unverified_card (card id + unfinished cue, or any card id when the card read failed) downgrades
+a derived done to unresolved/no_summary; declared outcomes, counted waits and human decisions unchanged.
+Projection omission of qualified remote shepherd links is a separate seam owned by t_01a1c7a649c59bec.
+
+Proof: tests/hermes_state/test_session_outcome.py 3 RED -> 90 GREEN; 9 related files 232 passed; both
+new conditions mutation-killed.
+---
+ hermes_state_outcome.py                    | 28 ++++++++++-
+ tests/hermes_state/test_session_outcome.py | 54 ++++++++++++++++++++++
+ 2 files changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index d366c9a1b2..d843cf7bbe 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -22,6 +22,7 @@ from __future__ import annotations
+ import contextlib
+ import json
+ import logging
++import re
+ import sqlite3
+ import time
+ from pathlib import Path
+@@ -48,6 +49,14 @@ _NOTICE_KIND = "kanban_notice"
+ _TYPED_KINDS = frozenset({None, "steer"})
+ _PROGRESS_OPENERS = ("let me ", "i'll ", "i will ", "now i", "next, i", "next i ", "working on")
+ 
++# A reply that names a Kanban card and, in the same message, says work remains. Judge and heuristic both read
++# "the remaining items are owned by a card" as a closing report, which is only safe while that card is counted as
++# live work. This is consulted only when no card is counted, so the claim is unverified (or the read failed): never done.
++_CARD_REF = re.compile(r"\bt_[0-9a-f]{8,}\b")
++_UNFINISHED_CUE = re.compile(
++    r"\b(remaining|remains|not yet|not (?:yet )?(?:running|started|built|verified|complete[d]?)|unverified|pending"
++    r"|still (?:open|unfinished|pending|running|queued|ready)|awaiting)\b", re.IGNORECASE)
++
+ ProviderFn = Callable[[str], Optional[dict]]
+ # ``fn(sid, text, *, source=None)``; a judge without the ``source`` keyword is called as ``fn(sid, text)``.
+ JudgeFn = Callable[..., Optional[bool]]
+@@ -396,12 +405,14 @@ def _provider_items(sid: str) -> tuple[list[dict], list[dict]]:
+     return decisions, waits
+ 
+ 
+-def _guarded(label: str, sid: str, fn: Callable[[], Any], empty: Any) -> Any:
++def _guarded(label: str, sid: str, fn: Callable[[], Any], empty: Any, on_fail: Optional[Callable[[], None]] = None) -> Any:
+     """One live-work source; a failed read is logged and counts as nothing from that source."""
+     try:
+         return fn()
+     except Exception:
+         logger.warning("session outcome: %s unavailable for %s", label, sid, exc_info=True)
++        if on_fail is not None:
++            on_fail()
+         return empty
+ 
+ 
+@@ -554,7 +565,8 @@ def _outcome(kind: str, now: float, **fields: Any) -> dict[str, Any]:
+ def _live_work(db: Any, sid: str, ids: list[str]) -> tuple[list[dict], list[dict]]:
+     """(open decision items, named waits) across every live-work source. A recurring cron is not one: it never
+     ends, so a chat that owns one would wait forever (see ``_derive``, which names it on the outcome instead)."""
+-    card_decisions, card_waits = _guarded("kanban cards", sid, lambda: _card_items(ids), ([], []))
++    card_decisions, card_waits = _guarded("kanban cards", sid, lambda: _card_items(ids), ([], []),
++                                          on_fail=lambda: _CARD_READ_FAILED.add(sid))
+     prov_decisions, prov_waits = _provider_items(sid)
+     waits = (card_waits + _guarded("processes", sid, lambda: _process_items(sid, ids), [])
+              + _guarded("subagents", sid, lambda: _subagent_items(db, ids), [])
+@@ -581,6 +593,14 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     return {**historical, **current}
+ 
+ 
++_CARD_READ_FAILED: set[str] = set()  # sids whose card read failed in the current derivation (single-threaded per call)
++
++
++def _names_unverified_card(text: str, card_read_failed: bool) -> bool:
++    """The reply names a card id and says work remains (or the card read failed, so any named card is unverified)."""
++    return bool(_CARD_REF.search(text)) and (card_read_failed or bool(_UNFINISHED_CUE.search(text)))
++
++
+ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+                     pending_reply: Optional[str] = None) -> dict[str, Any]:
+     now = time.time()
+@@ -591,6 +611,8 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     if not ignore_live_turn and _live_turn(db, sid):
+         return _outcome("running", now)
+     decisions, waits = _live_work(db, sid, _lineage_ids(db, sid))
++    card_unknown = sid in _CARD_READ_FAILED
++    _CARD_READ_FAILED.discard(sid)
+     tail = _without_finished_notes(_tail(db, sid))
+     if pending_reply is not None:  # the unsaved final reply is the last assistant message
+         tail.insert(0, {"role": "assistant", "content": pending_reply, "timestamp": now})
+@@ -630,6 +652,8 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     judged = {"judged": True, "judged_msg": msg_id} if verdict is not None and msg_id is not None else {}
+     if verdict is None:
+         verdict = looks_like_summary(text)
++    if verdict and _names_unverified_card(text, card_unknown):
++        verdict = False  # an unfinished card the reader does not count is unknown remote state, never done
+     if verdict:
+         return _outcome("done", now, summary=text[:SUMMARY_CHARS], **judged, **named, **carry)
+     return _outcome("unresolved", now, reason="no_summary", **judged, **carry)
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 43b54f8cf3..51c0794997 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -621,3 +621,57 @@ def test_unfinished_agrees_with_the_title_producer(result, unfinished):
+                                                       async_delegation_display_unfinished)
+     for evt in ({"goal": "g", **result}, {"is_batch": True, "goals": ["g"], "results": [{"task_index": 0, **result}]}):
+         assert async_delegation_display_unfinished(async_delegation_display_text(evt)) is unfinished
++
++# ── a reply naming an unfinished card the reader does not count is never done ──
++
++REAL_UNFINISHED = (
++    "Resumed and cleared the placement blocker: refreshed the registry and moved the existing owner back.\n\n"
++    "The saved evidence records the core change merged and independent safety review passed.\n\n"
++    "**Remaining:** verify the loaded serving code and complete final acceptance review.\n\n"
++    "The existing owner **t_01a1c7b8ebe8316f** is verified **ready at priority 9001**, not yet running.")
++
++
++@pytest.mark.parametrize("verdict", [True, None])
++def test_reply_naming_unfinished_uncounted_card_is_not_done(db, verdict):
++    so.register_outcome_judge(lambda sid, text: verdict)
++    turn(db, REAL_UNFINISHED)
++    out = so.refresh_outcome("chat", "turn_end", db=db)
++    assert (out["kind"], out["reason"]) == ("unresolved", "no_summary")
++
++
++def test_same_unfinished_reply_with_the_card_counted_is_waiting(db, board):
++    add_card(board, "t_01a1c7b8ebe8316f", "chat", "ready")
++    so.register_outcome_judge(lambda sid, text: True)
++    turn(db, REAL_UNFINISHED)
++    out = so.refresh_outcome("chat", "turn_end", db=db)
++    assert out["kind"] == "waiting" and out["on"][0]["id"] == "t_01a1c7b8ebe8316f"
++
++
++@pytest.mark.parametrize("reply", [
++    SUMMARY,  # no card named
++    "Shipped the fix in t_01a1c7b8ebe8316f, which merged; all 12 tests pass and nothing else is open.",  # card done
++    "Nothing else to do. The explanation: stale cache, cleared, verified by running the suite twice.",
++])
++def test_truly_done_replies_stay_done(db, reply):
++    so.register_outcome_judge(lambda sid, text: True)
++    turn(db, reply)
++    assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "done"
++
++
++def test_card_read_failure_never_vouches_for_a_named_card(db, monkeypatch):
++    def boom(*a, **k):
++        raise sqlite3.OperationalError("database is locked")
++    monkeypatch.setattr(ksa, "session_tasks", boom)
++    so.register_outcome_judge(lambda sid, text: True)
++    turn(db, "Fixed and merged via t_01a1c7b8ebe8316f; all 12 tests pass.")
++    assert so.refresh_outcome("chat", "turn_end", db=db)["reason"] == "no_summary"
++    say(db, "user", "and the other one?")
++    say(db, "assistant", SUMMARY)  # no card named: a failed read alone does not downgrade a done report
++    assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "done"
++
++
++def test_human_decision_card_still_outranks_the_reply(db, board):
++    add_card(board, "t_01a1c7b8ebe8316f", "chat", "blocked", HUMAN_REQUEST)
++    so.register_outcome_judge(lambda sid, text: True)
++    turn(db, REAL_UNFINISHED)
++    assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "decision"
+-- 
+2.43.0
+

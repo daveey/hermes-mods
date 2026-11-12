@@ -1,0 +1,149 @@
+From bab8c684f3a4bb630de95cd393a488c0d39fd9b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:39:15 -0800
+Subject: [PATCH] fix(state): arm Darwin fd scanner when /dev/null device is
+ nonnegative [daveey]
+
+CI mini's devfs reports a positive /dev/null st_dev, so the negative-sentinel
+conversion proof disarmed the native scanner there (4 native tests failed).
+Learn the CPython dev_t conversion lazily from the first consistent negative
+device (deferring to Python's own fstat until then) instead of requiring a
+negative sentinel at import.
+---
+ hermes_state_lockguard_darwin.py              | 50 +++++++++++++++----
+ .../test_lockguard_darwin_safety.py           | 43 +++++++++++++++-
+ 2 files changed, 83 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_state_lockguard_darwin.py b/hermes_state_lockguard_darwin.py
+index eea4f1da75..3022b0327c 100644
+--- a/hermes_state_lockguard_darwin.py
++++ b/hermes_state_lockguard_darwin.py
+@@ -29,15 +29,41 @@ def build():
+     except (ImportError, OSError, AttributeError):
+         return None
+ 
+-    unsigned_dev = False
++    mask = (1 << 64) - 1
++    # CPython builds differ in how a negative int32 dev_t becomes st_dev
++    # (signed vs uint64). None = not yet proven on this interpreter.
++    unsigned_dev = [None]
+ 
+-    def identity(fd):
++    def learn(fd, dev, ino):
++        # Until a negative device has been observed, ask Python itself (one
++        # GIL-releasing fstat) and learn its conversion only from a consistent
++        # answer. Python's own st_dev is always the authoritative identity.
++        try:
++            st = os.fstat(fd)
++        except OSError:
++            return None
++        if st.st_ino == ino and st.st_dev in (dev, dev & mask):
++            unsigned_dev[0] = st.st_dev != dev
++        return st.st_dev, st.st_ino
++
++    def raw(fd):
+         # Per-call buffers also make independent diagnostic callers thread-safe.
+         buf = ctypes.create_string_buffer(256)
+         if fd < 0 or fd > 2147483647 or fstat(fd, buf) != 0:
+             return None
+         dev, _mode, _links, ino = struct.unpack_from("=iHHQ", buf)
+-        return (dev & ((1 << 64) - 1) if unsigned_dev else dev), ino
++        return dev, ino
++
++    def identity(fd):
++        got = raw(fd)
++        if got is None:
++            return None
++        dev, ino = got
++        if dev >= 0:
++            return dev, ino
++        if unsigned_dev[0] is None:
++            return learn(fd, dev, ino)
++        return (dev & mask if unsigned_dev[0] else dev), ino
+ 
+     def descriptors():
+         buf = ctypes.create_string_buffer(MAX_FDS * 8)
+@@ -52,14 +78,20 @@ def build():
+         return None
+     try:
+         st = os.fstat(probe)
+-        raw = identity(probe)
+-        # CPython builds differ in signed dev_t conversion. Require a negative
+-        # native device sentinel so the build's conversion is actually proven.
+-        if raw is None or raw[0] >= 0:
+-            return None
+-        unsigned_dev = st.st_dev == (raw[0] & ((1 << 64) - 1))
++        # A negative /dev/null device proves the conversion now; a nonnegative
++        # one (devfs numbering varies by host) leaves it to learn() at runtime.
++        # Either way the native identity must match Python's exactly.
+         if identity(probe) != (st.st_dev, st.st_ino) or identity(-1) is not None:
+             return None
++        if identity(probe) != (st.st_dev, st.st_ino):
++            return None
++        # The raw native device must itself agree with Python's st_dev, and a
++        # negative sentinel must have taught the conversion.
++        native_dev = raw(probe)[0]
++        if native_dev < 0 and unsigned_dev[0] is None:
++            return None
++        if native_dev >= 0 and native_dev != st.st_dev:
++            return None
+         listed = descriptors()
+         if listed is None or probe not in listed:
+             return None
+diff --git a/tests/hermes_state/test_lockguard_darwin_safety.py b/tests/hermes_state/test_lockguard_darwin_safety.py
+index e99f8208de..b287c5228e 100644
+--- a/tests/hermes_state/test_lockguard_darwin_safety.py
++++ b/tests/hermes_state/test_lockguard_darwin_safety.py
+@@ -63,7 +63,48 @@ def test_invalid_enumeration_disarms_at_probe_and_runtime(abi, size):
+     assert abi.closes == [42, 42]
+ 
+ 
+-@pytest.mark.parametrize("dev,stat_dev,ino", [(7, 7, 123), (-7, 99, 123), (-7, -7, 999)])
++@pytest.mark.parametrize("unsigned", [False, True])
++def test_nonnegative_sentinel_learns_conversion_at_runtime(abi, monkeypatch, unsigned):
++    # devfs numbering is host-specific: a positive /dev/null device must not disarm.
++    abi.dev = abi.stat_dev = 7
++    native, descriptors = darwin.build()
++    assert native(42) == (7, 123)
++    abi.dev = -7
++    abi.stat_dev = ((1 << 64) - 7) if unsigned else -7
++    assert native(42) == (abi.stat_dev, 123)
++
++    def fail(fd):
++        raise AssertionError("conversion is learned; no Python fstat handoff")
++
++    monkeypatch.setattr(darwin.os, "fstat", fail)
++    assert native(42) == (abi.stat_dev, 123)
++    assert descriptors() == [42]
++
++
++def test_unlearned_negative_device_defers_to_python(abi, monkeypatch):
++    abi.dev = abi.stat_dev = 7
++    native, _descriptors = darwin.build()
++    abi.dev, abi.stat_dev = -7, 99  # inconsistent: report Python's identity, learn nothing
++    assert native(42) == (99, 123)
++    abi.stat_dev = -7  # consistent signed answer: learned
++    assert native(42) == (-7, 123)
++    abi.dev, abi.stat_dev = -8, 12345  # ignored now; native signed conversion is used
++    assert native(42) == (-8, 123)
++
++
++def test_runtime_fstat_failure_before_learning_reports_closed(abi, monkeypatch):
++    abi.dev = abi.stat_dev = 7
++    native, _descriptors = darwin.build()
++    abi.dev = -7
++
++    def closed(fd):
++        raise OSError(9, "closed")
++
++    monkeypatch.setattr(darwin.os, "fstat", closed)
++    assert native(42) is None
++
++
++@pytest.mark.parametrize("dev,stat_dev,ino", [(7, 8, 123), (7, 7, 999), (-7, 99, 123), (-7, -7, 999)])
+ def test_unproven_identity_disarms(abi, dev, stat_dev, ino):
+     abi.dev, abi.stat_dev, abi.ino = dev, stat_dev, ino
+     assert darwin.build() is None
+-- 
+2.43.0
+

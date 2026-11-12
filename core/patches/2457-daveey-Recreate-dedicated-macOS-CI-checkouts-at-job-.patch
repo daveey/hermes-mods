@@ -1,0 +1,346 @@
+From 24451063e7d5db73eda82eb8591da9e18926ee5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:22:07 +0000
+Subject: [PATCH] [daveey] Recreate dedicated macOS CI checkouts at job start
+
+---
+ .github/workflows/hermes-state-macos.yml  |  74 ++++++++
+ tests/ci/test_macos_checkout_retention.py | 219 ++++++++++++++++++++++
+ tests/ci/test_macos_state_routing.py      |   2 +-
+ 3 files changed, 294 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ci/test_macos_checkout_retention.py
+
+diff --git a/.github/workflows/hermes-state-macos.yml b/.github/workflows/hermes-state-macos.yml
+index a3c0947e33..4d0af2c0bb 100644
+--- a/.github/workflows/hermes-state-macos.yml
++++ b/.github/workflows/hermes-state-macos.yml
+@@ -45,10 +45,75 @@ jobs:
+     # Include cold environment provisioning and reduced-priority shared-host work.
+     timeout-minutes: 90
+     steps:
++      # This dedicated runner executes one job at a time. Recreate only at the
++      # first step, before checkout registers post actions or starts test workers.
++      # Start cleanup also recovers leftovers from cancelled/failed previous jobs.
++      - name: Recreate dedicated CI checkout
++        working-directory: ${{ runner.temp }}
++        shell: /usr/bin/python3 {0}
++        run: |
++          import os
++          from pathlib import Path
++          import shutil
++          import subprocess
++
++          ROOT = Path('/Users/me/ci-runner-hermes-state')
++
++          def prepare():
++              work = ROOT / '_work'
++              expected = {
++                  'GITHUB_ACTIONS': 'true',
++                  'RUNNER_OS': 'macOS',
++                  'GITHUB_REPOSITORY': 'example-org/hermes',
++                  'GITHUB_WORKSPACE': str(work / 'daveey-hermes/daveey-hermes'),
++                  'RUNNER_TEMP': str(work / '_temp'),
++              }
++              if any(os.environ.get(key) != value for key, value in expected.items()):
++                  raise RuntimeError('Refusing cleanup outside dedicated CI workspace')
++              if Path.cwd() != work / '_temp' or not shutil.rmtree.avoids_symlink_attacks:
++                  raise RuntimeError('Cleanup needs runner temp cwd and fd-safe rmtree')
++              targets = (work / 'daveey-hermes/daveey-hermes', work / 'hermes')
++              # Validate ALL targets before removing any. Never follow an aliased
++              # ancestor onto a user checkout, another runner or an external disk.
++              for target in targets:
++                  for path in (target, *target.parents):
++                      if path.is_symlink():
++                          raise RuntimeError(f'Refusing symlink: {path}')
++                  if target.exists() and (not target.is_dir() or
++                                          target.stat().st_dev != ROOT.stat().st_dev):
++                      raise RuntimeError(f'Refusing non-directory or foreign device: {target}')
++                  if target.exists():
++                      if target.is_mount():
++                          raise RuntimeError(f'Refusing root mount: {target}')
++                      for directory, dirs, _ in os.walk(target, followlinks=False):
++                          for name in dirs:
++                              child = Path(directory) / name
++                              if not child.is_symlink() and (child.is_mount() or
++                                      child.stat().st_dev != ROOT.stat().st_dev):
++                                  raise RuntimeError(f'Refusing nested mount: {child}')
++                      # Runner serialization is the boundary; lsof additionally
++                      # refuses survivors from a failed/cancelled previous job.
++                      probe = subprocess.run(
++                          ['/usr/sbin/lsof', '-nP', '+D', str(target)],
++                          capture_output=True, text=True, encoding='utf-8', timeout=120,
++                          check=False,
++                      )
++                      if probe.returncode != 1 or probe.stdout or probe.stderr:
++                          raise RuntimeError(f'Checkout busy or lsof uncertain: {target}')
++              for target in targets:
++                  if target.exists():
++                      shutil.rmtree(target)
++              # Keep the workspace available even if checkout itself fails.
++              targets[0].mkdir(parents=True, exist_ok=True)
++              print('Fresh CI checkout; obsolete hermes namespace absent')
++
++          prepare()
++
+       - name: Checkout code
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+         with:
+           ref: ${{ inputs.commit || github.sha }}
++          fetch-depth: 1
+ 
+       - name: Run tests/hermes_state
+         shell: bash
+@@ -64,3 +129,12 @@ jobs:
+           OPENROUTER_API_KEY: ''
+           OPENAI_API_KEY: ''
+           NOUS_API_KEY: ''
++
++      - name: Measure retained checkout (2 GiB ceiling)
++        if: always()
++        shell: bash
++        run: |
++          set -euo pipefail
++          usage_kib=$(du -sk "$GITHUB_WORKSPACE" | cut -f1)
++          printf 'Retained checkout: %s KiB; ceiling: 2097152 KiB (2 GiB)\n' "$usage_kib"
++          test "$usage_kib" -le 2097152
+diff --git a/tests/ci/test_macos_checkout_retention.py b/tests/ci/test_macos_checkout_retention.py
+new file mode 100644
+index 0000000000..05dce11611
+--- /dev/null
++++ b/tests/ci/test_macos_checkout_retention.py
+@@ -0,0 +1,219 @@
++"""Exercise the actual pre-checkout program with disposable CI paths."""
++import ast
++from pathlib import Path
++import shutil
++import subprocess
++
++import pytest
++import hermes_yaml as yaml
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def steps():
++    workflow = yaml.safe_load((ROOT / '.github/workflows/hermes-state-macos.yml').read_text())
++    return workflow['jobs']['hermes-state-macos']['steps']
++
++
++@pytest.fixture
++def boundary(tmp_path, monkeypatch):
++    first = steps()[0]
++    assert first['name'] == 'Recreate dedicated CI checkout'
++    assert first['working-directory'] == '${{ runner.temp }}'
++    tree = ast.parse(first['run'])
++    assert isinstance(tree.body[-1], ast.Expr)
++    assert ast.unparse(tree.body[-1]) == 'prepare()'
++    # Load definitions, then replace only the hard-coded root with a temp tree.
++    tree.body.pop()
++    namespace = {}
++    exec(compile(tree, '<workflow-cleanup>', 'exec'), namespace)
++    root = tmp_path / 'ci-runner-hermes-state'
++    namespace['ROOT'] = root
++    work = root / '_work'
++    current = work / 'daveey-hermes/daveey-hermes'
++    old = work / 'hermes'
++    for path in (current, old, work / '_temp', work / '_actions', work / '_tool'):
++        path.mkdir(parents=True)
++        (path / 'sentinel').write_text('keep until boundary')
++    for key, value in {
++        'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'macOS',
++        'GITHUB_REPOSITORY': 'example-org/hermes',
++        'GITHUB_WORKSPACE': str(current), 'RUNNER_TEMP': str(work / '_temp'),
++    }.items():
++        monkeypatch.setenv(key, value)
++    monkeypatch.chdir(work / '_temp')
++    calls = []
++
++    def unused(argv, **kwargs):
++        assert argv[:3] == ['/usr/sbin/lsof', '-nP', '+D']
++        assert kwargs['timeout'] == 120
++        calls.append(Path(argv[-1]))
++        return subprocess.CompletedProcess(argv, 1, '', '')
++
++    monkeypatch.setattr(subprocess, 'run', unused)
++    return namespace['prepare'], current, old, calls
++
++
++@pytest.mark.parametrize('previous_result', ['success', 'failure', 'cancelled'])
++def test_next_start_recreates_checkout_and_removes_old_namespace(boundary, previous_result):
++    prepare, current, old, calls = boundary
++    for path in (current / '.git/objects/pack', old / 'hermes/.git/objects/pack'):
++        path.mkdir(parents=True)
++        (path / f'{previous_result}.pack').write_bytes(b'old pack')
++    prepare()
++    assert list(current.iterdir()) == []
++    assert not old.exists()
++    assert calls == [current, old]
++    work = old.parent
++    for name in ('_temp', '_actions', '_tool'):
++        assert (work / name / 'sentinel').exists()
++    prepare()  # No obsolete namespace is also valid.
++    assert list(current.iterdir()) == []
++
++
++@pytest.mark.parametrize('target_index', [0, 1])
++@pytest.mark.parametrize('result', [(0, 'open file', ''), (1, '', 'warning'),
++                                   (2, '', ''), (1, 'unexpected', '')])
++def test_busy_or_uncertain_probe_preserves_both_targets(boundary, monkeypatch, target_index, result):
++    prepare, current, old, _ = boundary
++
++    def probe(argv, **kwargs):
++        code, out, err = result if argv[-1] == str((current, old)[target_index]) else (1, '', '')
++        return subprocess.CompletedProcess(argv, code, out, err)
++
++    monkeypatch.setattr(subprocess, 'run', probe)
++    with pytest.raises(RuntimeError, match='busy or lsof uncertain'):
++        prepare()
++    assert (current / 'sentinel').exists()
++    assert (old / 'sentinel').exists()
++
++
++@pytest.mark.parametrize('error', [FileNotFoundError('lsof'), subprocess.TimeoutExpired('lsof', 120)])
++def test_probe_failures_preserve_checkout(boundary, monkeypatch, error):
++    prepare, current, old, _ = boundary
++
++    def probe(*args, **kwargs):
++        raise error
++
++    monkeypatch.setattr(subprocess, 'run', probe)
++    with pytest.raises(type(error)):
++        prepare()
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
++@pytest.mark.parametrize('key', ['GITHUB_ACTIONS', 'RUNNER_OS', 'GITHUB_REPOSITORY',
++                                  'GITHUB_WORKSPACE', 'RUNNER_TEMP'])
++def test_explicit_ci_allowlist(boundary, monkeypatch, key):
++    prepare, current, old, calls = boundary
++    monkeypatch.setenv(key, '/unrelated/user/path')
++    with pytest.raises(RuntimeError, match='outside dedicated CI'):
++        prepare()
++    assert not calls
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
++@pytest.mark.parametrize('ancestor', [False, True])
++def test_symlink_target_or_ancestor_refused(boundary, tmp_path, ancestor):
++    prepare, current, old, _ = boundary
++    alias = current.parent if ancestor else old
++    moved = tmp_path / 'preserved'
++    alias.rename(moved)
++    alias.symlink_to(moved, target_is_directory=True)
++    with pytest.raises(RuntimeError, match='symlink'):
++        prepare()
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
++def test_wrong_cwd_and_unsafe_rmtree_refused(boundary, monkeypatch):
++    prepare, current, old, _ = boundary
++    monkeypatch.setattr(shutil.rmtree, 'avoids_symlink_attacks', False)
++    with pytest.raises(RuntimeError, match='fd-safe'):
++        prepare()
++    monkeypatch.setattr(shutil.rmtree, 'avoids_symlink_attacks', True)
++    monkeypatch.chdir(current)
++    with pytest.raises(RuntimeError, match='runner temp cwd'):
++        prepare()
++    assert (old / 'sentinel').exists()
++
++
++def test_non_directory_refused_before_deletion(boundary):
++    prepare, current, old, _ = boundary
++    shutil.rmtree(old)
++    old.write_text('not a directory')
++    with pytest.raises(RuntimeError, match='non-directory'):
++        prepare()
++    assert (current / 'sentinel').exists()
++
++
++def test_deletion_failure_aborts(boundary, monkeypatch):
++    prepare, current, old, _ = boundary
++
++    def refuse(path):
++        raise PermissionError(str(path))
++
++    monkeypatch.setattr(shutil, 'rmtree', refuse)
++    refuse.avoids_symlink_attacks = True
++    with pytest.raises(PermissionError):
++        prepare()
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
++@pytest.mark.parametrize('target_index', [0, 1])
++def test_root_mount_refused_before_either_target_deleted(boundary, monkeypatch, target_index):
++    prepare, current, old, _ = boundary
++    mount = (current, old)[target_index]
++    monkeypatch.setattr(Path, 'is_mount', lambda self: self == mount)
++    with pytest.raises(RuntimeError, match='root mount'):
++        prepare()
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
++def test_nested_mount_refused(boundary, monkeypatch):
++    prepare, current, old, _ = boundary
++    mount = old / 'mounted'
++    mount.mkdir()
++    monkeypatch.setattr(Path, 'is_mount', lambda self: self == mount)
++    with pytest.raises(RuntimeError, match='nested mount'):
++        prepare()
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
++def test_foreign_device_refused(boundary, monkeypatch):
++    import os
++
++    prepare, current, old, _ = boundary
++    real_stat = Path.stat
++
++    def stat(path, **kwargs):
++        result = real_stat(path, **kwargs)
++        if path == old:
++            values = list(result)
++            values[2] += 1
++            return os.stat_result(values)
++        return result
++
++    monkeypatch.setattr(Path, 'stat', stat)
++    with pytest.raises(RuntimeError, match='foreign device'):
++        prepare()
++    assert (current / 'sentinel').exists() and (old / 'sentinel').exists()
++
++
++def test_inner_symlink_does_not_delete_external_tree(boundary, tmp_path):
++    prepare, _current, old, _ = boundary
++    outside = tmp_path / 'outside'
++    outside.mkdir()
++    (outside / 'valuable').write_text('preserve')
++    (old / 'alias').symlink_to(outside, target_is_directory=True)
++    prepare()
++    assert (outside / 'valuable').read_text() == 'preserve'
++
++
++def test_boundary_and_measurement_wiring():
++    workflow_steps = steps()
++    assert 'actions/checkout@' in workflow_steps[1]['uses']
++    assert workflow_steps[1]['with']['fetch-depth'] == 1
++    assert workflow_steps[0]['shell'] == '/usr/bin/python3 {0}'
++    measure = workflow_steps[-1]
++    assert measure['if'] == 'always()'
++    assert '2097152' in measure['run']
++    assert 'du -sk "$GITHUB_WORKSPACE"' in measure['run']
+diff --git a/tests/ci/test_macos_state_routing.py b/tests/ci/test_macos_state_routing.py
+index 2f3fa1cbd1..39df22fdbb 100644
+--- a/tests/ci/test_macos_state_routing.py
++++ b/tests/ci/test_macos_state_routing.py
+@@ -162,7 +162,7 @@ def test_reusable_job_also_rejects_fork_prs(fork):
+ def test_suite_launch_receipt_and_failure_propagation(tmp_path, code):
+     """Execute shell wiring; receipt taskpolicy's launch boundary, not native macOS execution."""
+     job = workflow('hermes-state-macos.yml')['jobs']['hermes-state-macos']
+-    step = next(step for step in job['steps'] if 'run' in step)
++    step = next(step for step in job['steps'] if step.get('name') == 'Run tests/hermes_state')
+     workflow_steps.required(step, context())
+     receipt = tmp_path / 'receipt.json'
+     shim = '''taskpolicy() {
+-- 
+2.43.0
+

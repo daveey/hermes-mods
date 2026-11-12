@@ -1,0 +1,81 @@
+From fd8e708c4115622bbec2692371e9cf5bc8cc3dc0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:26:16 +0000
+Subject: [PATCH] [daveey] Stop the leaked notification poller in
+ test_review_summary_callback
+
+Main CI (run 43163378617, job 130999635611) passed all 8 tests in 0.98s
+and then the pytest process never exited: the file hit the 600 s
+per-file timeout and made "All required checks pass (v2)" red.
+
+_init_session starts a tui-notif-poller-<sid> daemon thread. The server
+fixture's teardown only cleared _sessions, so that poller was never
+stopped. It stayed alive past pytest_unconfigure and kept running its
+loop (kanban board, delegation store and state.db polls with lazy
+imports) during atexit, the conftest rmtree of the test home, and
+interpreter finalization. Local runs show it alive at unconfigure and
+still logging after the summary ("Could not restore async delegation
+completions: attempt to write a readonly database").
+
+The teardown now sets each live poller's PollerStop, which wakes its
+queue wait, and joins it under the shared DEFAULT_TIMEOUT deadline. It
+asserts that none are still alive, so a future leak fails the test
+instead of hanging the process. No retry or timeout was widened.
+---
+ .../test_review_summary_callback.py           | 26 +++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/tests/tui_gateway/test_review_summary_callback.py b/tests/tui_gateway/test_review_summary_callback.py
+index fe2b1a4aed..2f241a20d6 100644
+--- a/tests/tui_gateway/test_review_summary_callback.py
++++ b/tests/tui_gateway/test_review_summary_callback.py
+@@ -11,6 +11,7 @@ transcript line.
+ 
+ from __future__ import annotations
+ 
++import time
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+@@ -20,6 +21,30 @@ import pytest
+ # "MagicMock/<name>/<id>", so the store landed in the cwd (the repo checkout). The real one
+ # follows the test's isolated HERMES_HOME.
+ from hermes_constants import get_process_hermes_home as _real_get_process_hermes_home
++from tests.waiting import DEFAULT_TIMEOUT
++
++
++def _stop_notification_pollers() -> None:
++    """Stop and join the notification poller ``_init_session`` started.
++
++    Clearing ``_sessions`` does not stop it: the daemon keeps polling the kanban board, the
++    delegation store and state.db, lazily importing as it goes, through interpreter shutdown and
++    the conftest's rmtree of the test home. In CI the file passed in under a second and then the
++    process never exited (600 s file timeout). ``PollerStop.set`` wakes its queue wait, so the
++    join returns as soon as the loop body finishes its current pass.
++    """
++    from tui_gateway import session_notifications
++
++    pollers = [(stop, t) for stop, t in list(session_notifications._notification_pollers) if t.is_alive()]
++    for stop, _thread in pollers:
++        stop.set()
++    deadline = time.monotonic() + DEFAULT_TIMEOUT
++    for _stop, thread in pollers:
++        thread.join(timeout=max(0.0, deadline - time.monotonic()))
++    alive = [t.name for _stop, t in pollers if t.is_alive()]
++    session_notifications._notification_pollers[:] = [
++        (stop, t) for stop, t in session_notifications._notification_pollers if t.is_alive()]
++    assert not alive, f"notification pollers still running at teardown: {alive}"
+ 
+ 
+ @pytest.fixture()
+@@ -43,6 +68,7 @@ def server():
+         mod = importlib.import_module("tui_gateway.server")
+ 
+     yield mod
++    _stop_notification_pollers()
+     # Reset module-level session state without re-importing. importlib.reload
+     # would re-register the module's atexit hooks (ThreadPoolExecutor
+     # shutdown, _shutdown_sessions); the duplicates race the stderr
+-- 
+2.43.0
+

@@ -1,0 +1,628 @@
+From 801743f1d02cb2b7dda9dd430de021b235171989 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:00:05 +0000
+Subject: [PATCH] fix(kanban): canonicalize renamed GitHub repo URLs in
+ respawn-guard PR matching [daveey]
+
+daveey/hermes was transferred to example-org/hermes (same repo id).
+Owners still checkpoint PRs as https://github.com/daveey/hermes/pull/N while
+reviewers record the canonical URL from gh, so _named_prs failed closed and
+active_pr held implementers whose exact-head review handoff was complete
+(t_01a1cca14b7a62d3, PR 1208).
+
+norm_pr is now the single PR comparison key: lowercased, no trailing slash,
+https scheme, and a known renamed repo mapped to its canonical owner/repo
+(built-in daveey/hermes -> example-org/hermes, extensible with
+kanban.github_repo_aliases; invalid entries ignored, unreadable config keeps
+built-ins, map cached 60 s). It is used by the review checkpoint, _named_prs
+(URL and repo#N refs), resumes_review, is_review_result, holding_urls and
+foreign-contract matching, hold release scope/publications/released_after,
+and pr_state/rejection caching. Matching never falls back to number-only
+across repos.
+
+Proof:
+- RED on origin/main: 21 of 33 new alias tests and the hold-release scope
+  test fail; GREEN: 46 importing test files, 2105 passed.
+- 22 mutants on every added condition: all killed.
+- Replay old vs new active_pr_reason (pr_state stubbed OPEN, pinned clock)
+  over the local Board replica boards (default/hermes/bb/askeve: 87 live
+  cards naming PRs) and the hub kanban DB copy (50 cards): 2 changed, both
+  held -> released and both the target shape: t_01a1cca14b7a62d3 (alias
+  checkpoint, canonical reviewed_pr, request_changes at exact head) and
+  t_01a1cde626be2ada (canonical checkpoint, alias reviewed_pr, same). No card
+  moved to held.
+---
+ hermes_cli/kanban_db_dispatch_pr_policy.py    |  69 +++++-
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  16 +-
+ hermes_cli/kanban_dependency_review.py        |  33 ++-
+ hermes_cli/kanban_hold_release.py             |   9 +-
+ .../hermes_cli/test_kanban_pr_repo_aliases.py | 209 ++++++++++++++++++
+ .../test_kanban_hold_release_boundaries.py    |  32 +++
+ 6 files changed, 341 insertions(+), 27 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pr_repo_aliases.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_policy.py b/hermes_cli/kanban_db_dispatch_pr_policy.py
+index dd4c7f3656..c2f8b6e82e 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_policy.py
++++ b/hermes_cli/kanban_db_dispatch_pr_policy.py
+@@ -24,8 +24,64 @@ _NONBLOCKING_RE = re.compile(
+ )
+ 
+ 
++# Renamed/transferred GitHub repositories: old ``owner/repo`` -> canonical ``owner/repo``.
++# Cards keep naming a PR by the URL they were given while ``gh`` reports the canonical
++# one; both name the same pull. Only exact, known repo identities are collapsed: matching
++# never falls back to the bare pull number across repositories. Extend per host with
++# ``kanban.github_repo_aliases`` in config.yaml.
++BUILTIN_GITHUB_REPO_ALIASES = {"daveey/hermes": "example-org/hermes"}
++_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
++_PULL_URL_RE = re.compile(r"https?://github\.com/(?P<repo>[^/\s]+/[^/\s]+)(?P<tail>/pull/\d+)")
++_ALIAS_TTL_SECONDS = 60.0
++_alias_cache: tuple[float, dict[str, str]] | None = None
++
++
++def _configured_aliases() -> dict:
++    """``kanban.github_repo_aliases`` from config.yaml; ``{}`` when unreadable."""
++    from ruamel.yaml.error import YAMLError
++
++    try:
++        from hermes_cli.config import load_config
++        cfg = load_config()
++    except (ImportError, OSError, ValueError, TypeError, AttributeError, YAMLError):
++        return {}  # config errors can carry secrets: log nothing, built-ins only
++    kanban = cfg.get("kanban") if isinstance(cfg, dict) else None
++    aliases = kanban.get("github_repo_aliases") if isinstance(kanban, dict) else None
++    return aliases if isinstance(aliases, dict) else {}
++
++
++def repo_aliases() -> dict[str, str]:
++    """Lowercased alias -> canonical repo map (built-ins plus valid config entries)."""
++    global _alias_cache
++    import time
++
++    now = time.monotonic()
++    if _alias_cache is not None and now < _alias_cache[0]:
++        return _alias_cache[1]
++    merged = dict(BUILTIN_GITHUB_REPO_ALIASES)
++    for old, new in _configured_aliases().items():
++        if (isinstance(old, str) and isinstance(new, str)
++                and _REPO_RE.fullmatch(old.strip()) and _REPO_RE.fullmatch(new.strip())):
++            merged[old.strip().lower()] = new.strip().lower()
++    aliases = {old: new for old, new in merged.items() if old != new}
++    _alias_cache = (now + _ALIAS_TTL_SECONDS, aliases)
++    return aliases
++
++
++def canonical_repo(repo: str) -> str:
++    """Canonical lowercased ``owner/repo`` for a possibly renamed repository."""
++    repo = repo.lower()
++    return repo_aliases().get(repo, repo)
++
++
+ def norm_pr(url: str) -> str:
+-    return url.rstrip("/").lower()
++    """The one comparison key for a pull URL: lowercased, no trailing slash, and a
++    renamed repository's URL mapped to its canonical repository."""
++    key = url.strip().rstrip("/").lower()
++    match = _PULL_URL_RE.fullmatch(key)
++    if match is None:
++        return key
++    return "https://github.com/" + canonical_repo(match["repo"]) + match["tail"]
+ 
+ 
+ def _says_pull_does_not_block(body: str) -> bool:
+@@ -66,14 +122,15 @@ def _foreign_live_contract_keys(conn: sqlite3.Connection, task_id: str, keys: se
+     """
+     if not keys:
+         return set()
+-    placeholders = ",".join("?" * len(keys))
++    # Compare canonical keys in Python: a renamed repo's contract URL and the
++    # canonical mention are the same pull, which SQL lower/rtrim cannot see.
+     rows = conn.execute(
+-        "SELECT lower(rtrim(completion_contract, '/')) FROM tasks "
++        "SELECT completion_contract FROM tasks "
+         "WHERE id != ? AND status NOT IN ('done', 'archived') "
+-        f"AND lower(rtrim(completion_contract, '/')) IN ({placeholders})",
+-        (task_id, *sorted(keys)),
++        "AND lower(completion_contract) LIKE 'http%'",
++        (task_id,),
+     ).fetchall()
+-    return {row[0] for row in rows}
++    return {norm_pr(row[0]) for row in rows} & keys
+ 
+ 
+ def holding_urls(conn: sqlite3.Connection, task_id: str, mentions: list[tuple[str, str]]) -> set[str]:
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 04d17ed2e9..5cc05b960a 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -23,6 +23,8 @@ import subprocess
+ import time
+ from typing import Iterable, Optional
+ 
++from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
++
+ logger = logging.getLogger(__name__)
+ 
+ TERMINAL_STATES = frozenset({"MERGED", "CLOSED"})
+@@ -74,7 +76,7 @@ def _gh_pr_state(url: str) -> Optional[str]:
+     except (ValueError, AttributeError):
+         return None
+     state = state.upper() if isinstance(state, str) and state else None
+-    key = url.rstrip("/").lower()
++    key = norm_pr(url)
+     _rejections.pop(key, None)
+     if state == "OPEN":
+         from hermes_cli.kanban_db_dispatch_pr_rejection import rejection_reason
+@@ -88,7 +90,7 @@ def _gh_pr_state(url: str) -> Optional[str]:
+ 
+ def pr_state(url: str) -> Optional[str]:
+     """Cached :func:`_gh_pr_state`."""
+-    key = url.rstrip("/").lower()
++    key = norm_pr(url)
+     now = time.monotonic()
+     hit = _cache.get(key)
+     if hit is not None and (hit[1] is None or now < hit[1]):
+@@ -107,7 +109,7 @@ def all_prs_finished(urls: Iterable[str]) -> bool:
+     """True only when ``urls`` is non-empty and every PR is MERGED or CLOSED.
+ 
+     An unknown state (gh failure) counts as unfinished: duplicate-PR risk fails closed."""
+-    seen = {u.rstrip("/").lower(): u for u in urls}
++    seen = {norm_pr(u): u for u in urls}
+     if not seen:
+         return False
+     return all(pr_state(u) in TERMINAL_STATES for u in seen.values())
+@@ -177,7 +179,7 @@ def _comment_rejections(conn: sqlite3.Connection, task_id: str, urls: Iterable[s
+ 
+     for url in dict.fromkeys(urls):
+         if pr_state(url) == "REJECTED":
+-            comment_rejection(conn, task_id, url, _rejections[url.rstrip("/").lower()])
++            comment_rejection(conn, task_id, url, _rejections[norm_pr(url)])
+ 
+ 
+ # ``add_comment`` stamps the row before taking the write lock and its ``commented`` event
+@@ -454,7 +456,7 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     """
+     from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_dispatch as _kbd
+-    from hermes_cli.kanban_db_dispatch_pr_policy import holding_urls, norm_pr
++    from hermes_cli.kanban_db_dispatch_pr_policy import holding_urls
+     from hermes_cli.kanban_db_dispatch_rerun import is_handoff_event, reopened_after
+ 
+     foreign_ids = _foreign_pr_comment_ids(conn, task_id)
+@@ -494,7 +496,7 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+         from hermes_cli.kanban_db_dispatch_pr_rejection import comment_rejection
+         for url in dict.fromkeys(pr_urls):
+             if pr_state(url) == "REJECTED":
+-                comment_rejection(conn, task_id, url, _rejections[url.rstrip("/").lower()])
++                comment_rejection(conn, task_id, url, _rejections[norm_pr(url)])
+         return None
+     from hermes_cli.kanban_hold_release import released_after
+     if released_after(conn, task_id, max(pr_times), pr_urls):
+@@ -521,7 +523,7 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+         from hermes_cli.kanban_db_dispatch_pr_rejection import comment_rejection
+         for url, state in states.items():
+             if state == "REJECTED":
+-                comment_rejection(conn, task_id, url, _rejections[url.rstrip("/").lower()])
++                comment_rejection(conn, task_id, url, _rejections[norm_pr(url)])
+         return None
+     return "active_pr"
+ 
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 982f5d6b98..f04bc980c9 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -22,6 +22,7 @@ def checkpoint(conn, task_id, expected_run_id):
+     """Capture scope inside block_task's transaction, before closing the owner run."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE
++    from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
+ 
+     if expected_run_id is None:
+         return None
+@@ -36,7 +37,7 @@ def checkpoint(conn, task_id, expected_run_id):
+     parents = kb.parent_ids(conn, task_id)
+     urls = set()
+     for comment in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (task_id,)):
+-        urls.update(u.lower() for u in _RESPAWN_GUARD_PR_URL_RE.findall(comment["body"] or ""))
++        urls.update(norm_pr(u) for u in _RESPAWN_GUARD_PR_URL_RE.findall(comment["body"] or ""))
+     if not parents or not urls:
+         return None
+     awaited = [p for p, status in kb.parent_states(conn, task_id)
+@@ -109,7 +110,13 @@ def _completed_review_run(conn, parent_id, parked_at, owner_run_id):
+ 
+ 
+ def _named_prs(data, captured: set[str]) -> set[str] | None:
+-    """Absent is checkpoint-bound; present must resolve uniquely, or fail closed."""
++    """Absent is checkpoint-bound; present must resolve uniquely, or fail closed.
++
++    ``captured`` holds :func:`norm_pr` keys, so a renamed repository's URL or
++    ``repo#N`` ref matches its canonical form (and vice versa); never number-only.
++    """
++    from hermes_cli.kanban_db_dispatch_pr_policy import canonical_repo, norm_pr
++
+     key = "pr" if "pr" in data else "reviewed_pr"
+     if key not in data:
+         return None
+@@ -117,7 +124,7 @@ def _named_prs(data, captured: set[str]) -> set[str] | None:
+     if type(pr) is int and pr > 0:
+         ref = f"#{pr}"
+     elif isinstance(pr, str):
+-        ref = pr.strip().rstrip("/").lower()
++        ref = norm_pr(pr)
+     else:
+         return set()
+     if ref in captured:
+@@ -126,8 +133,9 @@ def _named_prs(data, captured: set[str]) -> set[str] | None:
+     if match is None:
+         return set()
+     suffix = "/pull/" + match["num"]
++    repo = canonical_repo(match["repo"]) if match["repo"] else None
+     matches = {u for u in captured if u.endswith(suffix) and (
+-        match["repo"] is None or u == "https://github.com/" + match["repo"] + suffix
++        repo is None or u == "https://github.com/" + repo + suffix
+     )}
+     return matches if len(matches) == 1 else set()
+ 
+@@ -252,18 +260,22 @@ def is_review_result(metadata, summary, captured) -> bool:
+     prose and names the PR is held too, and a review that keeps its outcome under other
+     keys is treated as a prerequisite. [daveey]
+     """
++    from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE
++    from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
++
+     if (any(key in metadata for key in _REVIEW_KEYS)
+             or any(key.startswith("reviewed_sha_prefix") for key in metadata)
+             or _SUMMARY_VERDICT.search(summary or "")):
+         return True
+-    prs = {u.rstrip("/").lower() for u in captured or () if isinstance(u, str)}
++    prs = {norm_pr(u) for u in captured or () if isinstance(u, str)}
+     if not prs or not set(metadata) <= _LOST_REVIEW_KEYS:
+         return False
+     if _named_prs(metadata, prs):
+         return True
+     text = (summary or "").lower()
+     nums = set(_SUMMARY_PR_NUM.findall(text))
+-    return any(u in text or u.rsplit("/", 1)[-1] in nums for u in prs)
++    named = {norm_pr(u) for u in _RESPAWN_GUARD_PR_URL_RE.findall(text)}
++    return any(u in text or u in named or u.rsplit("/", 1)[-1] in nums for u in prs)
+ 
+ 
+ def _historical_parent(conn, parent_id, parked_at):
+@@ -322,6 +334,7 @@ def _checkpoint_matches_run(evidence, run):
+ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     """One continuation only: claiming any new run consumes the park's permission."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
+ 
+     row = conn.execute(
+         "SELECT e.payload, e.created_at, r.*, t.assignee "
+@@ -344,8 +357,9 @@ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     captured = evidence.get("prs")
+     if not isinstance(captured, list) or not all(isinstance(u, str) for u in captured):
+         return False
+-    urls = {u.rstrip("/").lower() for u in pr_urls}
+-    if not urls or not urls.issubset(set(captured)):
++    captured_set = {norm_pr(u) for u in captured}
++    urls = {norm_pr(u) for u in pr_urls}
++    if not urls or not urls.issubset(captured_set):
+         return False
+     parked_at = kb._to_epoch(row["created_at"])
+     if parked_at is None:
+@@ -353,10 +367,9 @@ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     parents = _awaited_parents(conn, parents, evidence, parked_at)
+     if not parents:
+         return False
+-    urls -= {u.rstrip("/").lower() for u in discharged}
++    urls -= {norm_pr(u) for u in discharged}
+     if not urls:
+         return False
+-    captured_set = {u.rstrip("/").lower() for u in captured}
+     reviewed = set().union(*(_reviewed_prs(conn, p, parked_at, row["id"], captured_set) for p in parents))
+     if urls.issubset(reviewed):
+         return True
+diff --git a/hermes_cli/kanban_hold_release.py b/hermes_cli/kanban_hold_release.py
+index 836eca1676..be7bfac565 100644
+--- a/hermes_cli/kanban_hold_release.py
++++ b/hermes_cli/kanban_hold_release.py
+@@ -10,6 +10,7 @@ import time
+ 
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_dependency_review as review
++from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
+ 
+ 
+ def _identity(row):
+@@ -53,7 +54,7 @@ def _scope(conn, task_id):
+     if (not isinstance(captured, list) or not captured
+             or not all(isinstance(u, str) and u.startswith("https://github.com/") for u in captured)):
+         raise ValueError("hold release requires captured PR scope")
+-    captured = {u.rstrip("/").lower() for u in captured}
++    captured = {norm_pr(u) for u in captured}
+     covered = set()
+     proofs = []
+     for parent in parents:
+@@ -79,7 +80,7 @@ def _check_publications(conn, task_id, captured):
+     for comment in conn.execute("SELECT * FROM task_comments WHERE task_id=?", (task_id,)):
+         if comment["id"] in foreign or comment["author"] == "kanban-dispatcher":
+             continue
+-        urls = {u.rstrip("/").lower() for u in _RESPAWN_GUARD_PR_URL_RE.findall(comment["body"] or "")}
++        urls = {norm_pr(u) for u in _RESPAWN_GUARD_PR_URL_RE.findall(comment["body"] or "")}
+         if not urls.issubset(captured):
+             raise ValueError("hold release PR publication scope changed")
+         at = kb._to_epoch(comment["created_at"])
+@@ -135,7 +136,7 @@ def released_after(conn, task_id, since, pr_urls):
+     run = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+     if run is None:
+         return False
+-    urls = {u.rstrip("/").lower() for u in pr_urls}
++    urls = {norm_pr(u) for u in pr_urls}
+     for event in conn.execute("SELECT payload, created_at FROM task_events WHERE task_id=? AND kind='hold_released'",
+                               (task_id,)):
+         data = kb._json_dict(event["payload"])
+@@ -147,6 +148,6 @@ def released_after(conn, task_id, since, pr_urls):
+                 and review._checkpoint_matches_run(data.get("park"), run)
+                 and ("run_uid" in data["park"] or not foreign_copy(conn, task_id))
+                 and isinstance(captured, list) and all(isinstance(u, str) for u in captured)
+-                and urls and urls.issubset(captured)):
++                and urls and urls.issubset({norm_pr(u) for u in captured})):
+             return True
+     return False
+diff --git a/tests/hermes_cli/test_kanban_pr_repo_aliases.py b/tests/hermes_cli/test_kanban_pr_repo_aliases.py
+new file mode 100644
+index 0000000000..94d0889d77
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_repo_aliases.py
+@@ -0,0 +1,209 @@
++"""A renamed GitHub repo's pull URL and its canonical URL are one PR to the respawn guard.
++
++Production shape (t_01a1cca14b7a62d3): the owner's checkpoint captured
++``https://github.com/daveey/hermes/pull/1208`` while its reviewer (``gh`` output)
++recorded ``https://github.com/example-org/hermes/pull/1208``. The guard
++must treat them as the same pull, and never collapse different repos by number. [daveey]
++"""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_pr_policy as policy
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_dependency_review as review
++from tests.hermes_cli import test_kanban_dependency_review as reviews
++from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++ALIAS = "https://github.com/daveey/hermes/pull/1208"
++CANON = "https://github.com/example-org/hermes/pull/1208"
++HEAD = reviews.HEAD
++
++board = reviews.board
++REAL_CONFIGURED_ALIASES = getattr(policy, "_configured_aliases", None)
++
++
++@pytest.fixture(autouse=True)
++def aliases(monkeypatch):
++    """Built-in map only, fresh per test; tests may set extra configured entries."""
++    configured: dict = {}
++    monkeypatch.setattr(policy, "_alias_cache", None, raising=False)
++    monkeypatch.setattr(policy, "_configured_aliases", lambda: configured, raising=False)
++    yield configured
++    policy._alias_cache = None
++
++
++@pytest.mark.parametrize("url,key", [
++    (ALIAS, CANON),
++    (ALIAS.upper().replace("HTTPS://GITHUB.COM", "https://github.com") + "/", CANON),
++    ("http://github.com/daveey/hermes/pull/1208", CANON),
++    (CANON, CANON),
++    (CANON + "/", CANON),
++    # Not the renamed repo: unchanged (no prefix/suffix or number-only matching).
++    ("https://github.com/daveey/hermes-fork/pull/1208", "https://github.com/daveey/hermes-fork/pull/1208"),
++    ("https://github.com/xdaveey/hermes/pull/1208", "https://github.com/xdaveey/hermes/pull/1208"),
++    ("https://github.com/example-org/other/pull/1208", "https://github.com/example-org/other/pull/1208"),
++    ("https://github.com/daveey/hermes/issues/1208", "https://github.com/daveey/hermes/issues/1208"),
++])
++def test_norm_pr_canonicalizes_only_known_renamed_repos(url, key):
++    assert policy.norm_pr(url) == key
++
++
++def test_canonical_repo_is_case_insensitive():
++    assert policy.canonical_repo("Daveey/Hermes") == "example-org/hermes"
++    assert policy.canonical_repo("Other/Repo") == "other/repo"
++
++
++def test_configured_aliases_extend_builtins_and_ignore_invalid(aliases):
++    aliases.update({"Example/Old": " example/repo ", "bad": "example/repo",
++                    "example/x": 3, 4: "a/b", "same/repo": "same/repo"})
++    assert policy.norm_pr("https://github.com/EXAMPLE/old/pull/7") == "https://github.com/example/repo/pull/7"
++    assert policy.norm_pr(ALIAS) == CANON
++    assert policy.repo_aliases() == {"daveey/hermes": "example-org/hermes",
++                                     "example/old": "example/repo"}
++
++
++def test_alias_map_is_cached_until_ttl(monkeypatch, aliases):
++    clock = [100.0]
++    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
++    assert "example/old" not in policy.repo_aliases()
++    aliases["example/old"] = "example/repo"
++    assert "example/old" not in policy.repo_aliases()  # cached
++    clock[0] += policy._ALIAS_TTL_SECONDS - 2
++    assert "example/old" not in policy.repo_aliases()  # still cached
++    clock[0] += 3
++    assert policy.repo_aliases()["example/old"] == "example/repo"
++
++
++def test_real_config_reader(monkeypatch):
++    from hermes_cli import config
++
++    monkeypatch.setattr(policy, "_configured_aliases", REAL_CONFIGURED_ALIASES)
++
++    def broken():
++        raise ValueError("secret-bearing parse error")
++    monkeypatch.setattr(config, "load_config", broken)
++    assert policy._configured_aliases() == {}
++    assert policy.norm_pr(ALIAS) == CANON  # built-ins survive an unreadable config
++    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"github_repo_aliases": {"a/old": "a/new"}}})
++    assert policy._configured_aliases() == {"a/old": "a/new"}
++    for cfg in ({"kanban": {"github_repo_aliases": ["a/old"]}}, {"kanban": []}, {"kanban": ["x"]}, []):
++        monkeypatch.setattr(config, "load_config", lambda cfg=cfg: cfg)
++        assert policy._configured_aliases() == {}
++
++
++@pytest.mark.parametrize("ref,expected", [
++    (CANON, {CANON}),
++    (ALIAS, {CANON}),
++    ("daveey/hermes#1208", {CANON}),
++    ("example-org/hermes#1208", {CANON}),
++    (1208, {CANON}),
++    ("https://github.com/example-org/other/pull/1208", set()),
++    ("example-org/other#1208", set()),
++])
++def test_named_prs_resolves_renamed_repo_refs(ref, expected):
++    captured = {policy.norm_pr(ALIAS)}
++    assert review._named_prs({"pr": ref}, captured) == expected
++
++
++def _parked(conn, monkeypatch, published):
++    monkeypatch.setattr(reviews, "PR", published)
++    return reviews.parked(conn)
++
++
++@pytest.mark.parametrize("published,reviewed", [(ALIAS, CANON), (CANON, ALIAS)])
++@pytest.mark.parametrize("verdict", ["REQUEST_CHANGES", "approve"])
++def test_review_of_renamed_repo_pr_resumes_owner(board, monkeypatch, published, reviewed, verdict):
++    """The 1208 shape both ways: alias checkpoint + canonical review, and vice versa."""
++    task, parents = _parked(board, monkeypatch, published)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    reviews.finish_reviews(board, parents, metadata={"verdict": verdict, "pr": reviewed, "reviewed_sha": HEAD})
++    # A reviewer repeating the PR in the other spelling is not a new publication.
++    kb.add_comment(board, task, "reviewer", "Reviewed " + reviewed)
++    assert kb.get_task(board, task).status == "ready"
++    assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("reviewed", [
++    "https://github.com/example-org/other/pull/1208",
++    "https://github.com/daveey/hermes-fork/pull/1208",
++    "https://github.com/example-org/hermes/pull/1209",
++])
++def test_review_of_other_repo_same_number_stays_held(board, monkeypatch, reviewed):
++    task, parents = _parked(board, monkeypatch, ALIAS)
++    reviews.finish_reviews(board, parents, metadata={"verdict": "REQUEST_CHANGES", "pr": reviewed,
++                                                     "reviewed_sha": HEAD})
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_new_pr_in_other_repo_after_review_stays_held(board, monkeypatch):
++    task, parents = _parked(board, monkeypatch, ALIAS)
++    reviews.finish_reviews(board, parents, metadata={"verdict": "REQUEST_CHANGES", "pr": CANON,
++                                                     "reviewed_sha": HEAD})
++    worker_comment(board, task, "dev", "Opened https://github.com/example-org/other/pull/1208")
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_checkpoint_stores_canonical_keys(board, monkeypatch):
++    task, _ = _parked(board, monkeypatch, ALIAS)
++    payload = json.loads(board.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='dependency_wait'", (task,)).fetchone()[0])
++    assert payload["review_checkpoint"]["prs"] == [CANON]
++
++
++def test_legacy_alias_checkpoint_matches_canonical_review(board, monkeypatch):
++    """Checkpoints written before canonicalization stored the lowercased alias URL."""
++    task, parents = _parked(board, monkeypatch, ALIAS)
++    event = board.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='dependency_wait'",
++                          (task,)).fetchone()
++    payload = json.loads(event["payload"])
++    payload["review_checkpoint"]["prs"] = [ALIAS]
++    board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event["id"]))
++    board.commit()
++    reviews.finish_reviews(board, parents, metadata={"verdict": "REQUEST_CHANGES", "pr": CANON,
++                                                     "reviewed_sha": HEAD})
++    assert dispatch.check_respawn_guard(board, task) is None
++
++
++@pytest.mark.parametrize("summary_pr", [ALIAS, CANON])
++def test_lost_verdict_naming_renamed_pr_is_a_review(summary_pr):
++    assert review.is_review_result({"worker_session_id": "s"}, "Looked at " + summary_pr, [ALIAS])
++    assert review.is_review_result({"worker_session_id": "s"}, "Looked at " + summary_pr, [CANON])
++    assert not review.is_review_result({"worker_session_id": "s"},
++                                       "Looked at https://github.com/example-org/other/pull/1208",
++                                       [ALIAS])
++
++
++def test_foreign_contract_in_renamed_spelling_does_not_hold(board):
++    owner = kb.create_task(board, title="owner", assignee="dev", completion_contract=ALIAS)
++    board.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (ALIAS.upper() + "/", owner))
++    board.commit()
++    task = kb.create_task(board, title="fyi", assignee="dev")
++    assert policy.holding_urls(board, task, [(CANON, "Working on " + CANON)]) == set()
++    other = "https://github.com/example-org/other/pull/1208"
++    assert policy.holding_urls(board, task, [(other, "Working on " + other)]) == {other}
++
++
++def test_pr_state_cache_shares_renamed_and_canonical_spellings(monkeypatch):
++    calls = []
++    monkeypatch.setattr(prs, "_gh_pr_state", lambda url: calls.append(url) or "MERGED")
++    prs.clear_cache()
++    try:
++        assert prs.pr_state(ALIAS) == "MERGED"
++        assert prs.pr_state(CANON) == "MERGED"
++        assert prs.all_prs_finished([ALIAS, CANON])
++        assert calls == [ALIAS]
++    finally:
++        prs.clear_cache()
++
++
++def test_all_prs_finished_reads_each_pull_once(monkeypatch):
++    calls = []
++    monkeypatch.setattr(prs, "pr_state", lambda url: calls.append(url) or "MERGED")
++    assert prs.all_prs_finished([ALIAS, CANON + "/"])
++    assert calls == [CANON + "/"]
+diff --git a/tests/tools/test_kanban_hold_release_boundaries.py b/tests/tools/test_kanban_hold_release_boundaries.py
+index 59fc857309..7dbf083d61 100644
+--- a/tests/tools/test_kanban_hold_release_boundaries.py
++++ b/tests/tools/test_kanban_hold_release_boundaries.py
+@@ -101,3 +101,35 @@ def test_no_run_receipt(board):
+     with kbc.connect() as conn:
+         task = kb.create_task(conn, title="No history", assignee="dev")
+         assert not release.released_after(conn, task, 0, [cases.reviews.PR])
++
++
++def test_renamed_repo_spellings_share_scope_and_receipt(board, monkeypatch):
++    """A renamed repo's URL and its canonical URL are one PR to scope and receipt. [daveey]"""
++    from hermes_cli import kanban_db_dispatch_pr_policy as policy
++    monkeypatch.setattr(policy, "_alias_cache", None, raising=False)
++    monkeypatch.setattr(policy, "_configured_aliases", lambda: {"example/old": "example/repo"}, raising=False)
++    canon = cases.reviews.PR
++    old = canon.replace("example/repo", "Example/Old")
++    with kbc.connect() as conn:
++        task, _, _ = cases.held(conn, monkeypatch)
++        # Legacy checkpoint spelled with the old repo; the review names the canonical one.
++        event = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='dependency_wait'",
++                             (task,)).fetchone()
++        payload = json.loads(event["payload"])
++        payload["review_checkpoint"]["prs"] = [old.lower()]
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event["id"]))
++        conn.commit()
++        assert release._scope(conn, task)[1] == {canon}
++        now = int(time.time()) + 2
++        monkeypatch.setattr(time, "time", lambda: now)
++        assert wake._unblock(task).get("ok")
++        assert release.released_after(conn, task, now - 1, [old])
++        receipt = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='hold_released'",
++                               (task,)).fetchone()
++        data = json.loads(receipt["payload"])
++        data["prs"] = [old]
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(data), receipt["id"]))
++        conn.commit()
++        assert release.released_after(conn, task, now - 1, [canon])
++        assert not release.released_after(conn, task, now - 1, ["https://github.com/example/other/pull/10"])
++    policy._alias_cache = None
+-- 
+2.43.0
+

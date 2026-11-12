@@ -1,0 +1,509 @@
+From ef7a9e6b2de1f1769a1e384c1f467dbd20c37fa2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:51:21 +0000
+Subject: [PATCH] [daveey] Take over: wait out a live-but-slow writer; let the
+ retry resend a refused prompt
+
+Chat 20261112_052539_8d8534: Take over failed twice against a GIL-starved
+Desktop backend that let go 22.8 s after the request (fixed 8 s ACK deadline),
+and the retry after a later Take over showed "may already have run" for a send
+the owner check had refused before admission.
+
+Backend (_take_over_durable_writer): a writer provably alive here
+(pid=<n>:pidns=<this process's pid-ns inode>, kill(n, 0) succeeds) is waited
+out up to HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S (default 60 s) while the
+handoff stays current; liveness is re-checked every poll and anything else
+keeps the 8 s ACK deadline. Never forces a writer out. The refusal names the
+live process ("alive but did not let go within N s; it may be overloaded"),
+drops the "older Hermes CLI" guess unless the holder is a CLI, and is logged.
+
+Desktop: sendIdentityless clears legacyAttempted when the server answers with
+a definite refusal (4009, 4090 other than SESSION_OWNER_UNCONFIRMED, or a
+pre-admission capability refusal), so an explicit retry resends it. Timeouts,
+disconnects, malformed ACKs and SESSION_OWNER_UNCONFIRMED keep the flag.
+takeOverSession gives session.take_over a 75 s request timeout on both routes.
+
+test_cli_durable_takeover's older-CLI test sets the live-writer wait small:
+its CLI child is alive in this pid namespace, so it now gets the live wait.
+---
+ .../hooks/use-session-tile-delegate.test.ts   |  29 +++++
+ .../hooks/use-session-tile-delegate.ts        |  16 ++-
+ .../submit-legacy-identity.test.tsx           |  73 ++++++++++-
+ .../hooks/use-prompt-actions/submit.ts        |  44 ++++++-
+ .../session/hooks/use-prompt-actions/utils.ts |   2 +-
+ .../tui_gateway/test_cli_durable_takeover.py  |   2 +
+ tests/tui_gateway/test_session_takeover.py    | 115 ++++++++++++++++++
+ tui_gateway/methods_session_takeover.py       |  52 ++++++--
+ 8 files changed, 312 insertions(+), 21 deletions(-)
+
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts
+index b4aac9eaf2..fc6182eea5 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts
+@@ -968,6 +968,35 @@ describe('useSessionTileDelegate interruptSession', () => {
+   })
+ })
+ 
++describe('useSessionTileDelegate takeOverSession', () => {
++  beforeEach(() => {
++    setSessions([])
++    vi.mocked(requestGatewayForProfile).mockReset()
++  })
++
++  afterEach(() => {
++    setSessions([])
++  })
++
++  // session.take_over waits up to 60 s for a live writer to let go (HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S);
++  // the 30 s default request timeout would cut that wait off on both routes.
++  it('gives session.take_over a request timeout that outlasts the backend live-writer wait', async () => {
++    const requestGateway = vi.fn(async (..._args: unknown[]) => ({ status: 'taken_over', acknowledged: true }) as never)
++    renderTile(requestGateway)
++    await sessionTileDelegate()!.takeOverSession!('runtime-unrouted')
++    expect(requestGateway).toHaveBeenCalledWith('session.take_over', { session_id: 'runtime-unrouted' }, expect.any(Number))
++    expect(requestGateway.mock.calls[0][2]).toBeGreaterThanOrEqual(75_000)
++
++    setSessions([row({ id: 'stored-takeover', profile: 'ai-engineer' })])
++    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({ status: 'taken_over', acknowledged: true } as never)
++    renderTile(requestGateway, { runtimeIdByStoredSessionIdRef: { current: new Map([['stored-takeover', 'runtime-routed']]) } })
++    await sessionTileDelegate()!.takeOverSession!('runtime-routed')
++    const routed = vi.mocked(requestGatewayForProfile).mock.calls.find(call => call[1] === 'session.take_over')
++    expect(routed?.[0]).toBe('ai-engineer')
++    expect(routed?.[3]).toBeGreaterThanOrEqual(75_000)
++  })
++})
++
+ describe('useSessionTileDelegate send from a tile behind the stored transcript', () => {
+   const storedId = 'stored-tile-peer'
+   const runtimeId = 'rt-tile-peer'
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+index 52a0c3fe4e..70d101acd2 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+@@ -78,6 +78,10 @@ import {
+ 
+ type SessionStateCache = ReturnType<typeof useSessionStateCache>
+ 
++/** session.take_over waits up to 60 s for a live-but-slow writer to let go
++ *  (HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S); the 30 s default request timeout would cut it off. */
++const SESSION_TAKE_OVER_TIMEOUT_MS = 75_000
++
+ /** Runtime a stored session is bound to: the primary reverse lookup, else a retained tile. */
+ function boundTileRuntimeId(
+   runtimeIdByStoredSessionIdRef: SessionStateCache['runtimeIdByStoredSessionIdRef'],
+@@ -410,12 +414,16 @@ export function useSessionTileDelegate({
+       takeOverSession: async runtimeId => {
+         // Same profile routing as interrupt: the lease lives in the owning profile's registry.
+         const storedSessionId = storedSessionIdForRuntime(runtimeId)
++        const params = { session_id: runtimeId }
+ 
+         return storedSessionId
+-          ? await requestForStoredSession<SessionTakeOverResult>(storedSessionId, 'session.take_over', {
+-              session_id: runtimeId
+-            })
+-          : await requestGateway<SessionTakeOverResult>('session.take_over', { session_id: runtimeId })
++          ? await requestForStoredSession<SessionTakeOverResult>(
++              storedSessionId,
++              'session.take_over',
++              params,
++              SESSION_TAKE_OVER_TIMEOUT_MS
++            )
++          : await requestGateway<SessionTakeOverResult>('session.take_over', params, SESSION_TAKE_OVER_TIMEOUT_MS)
+       },
+       resumeTile: async (storedSessionId, options) => {
+         // A retained tile can still own its runtime after the primary view drops
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+index d3e3ed5ab8..93e2baa324 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+@@ -1,9 +1,12 @@
++import { JsonRpcGatewayError } from '@hermes/shared'
+ import { cleanup } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { getLatestSessionMessages } from '@/hermes'
++import { en } from '@/i18n/en'
++import { $notifications, clearNotifications } from '@/store/notifications'
+ 
+-import { actRender, Harness, type HarnessHandle } from './index-test-utils'
++import { actRender, Harness, type HarnessHandle, RUNTIME_SESSION_ID } from './index-test-utils'
+ import { clearStoredJournal } from './prepared-submissions-test-utils'
+ import { clearSingleFlightSessionResumeState } from './single-flight-resume'
+ import { resetSubmissionIdSupportForTests } from './submission-identity-support'
+@@ -127,3 +130,71 @@ describe('a backend that refuses submission_id', () => {
+     expect(submits[before]).toMatchObject({ submission_id: 'uncertain-1', text: 'maybe admitted' })
+   })
+ })
++
++describe('a refused identityless send', () => {
++  const legacySends = (submits: Array<Record<string, unknown>>) => submits.filter(p => !('submission_id' in p)).length
++
++  // A backend whose PromptSubmitParams forbids submission_id refuses it before admission (4094),
++  // so every send goes identityless; `refusal` answers the first identityless one.
++  function refusingGateway(refusal: Error, submits: Array<Record<string, unknown>>) {
++    return vi.fn(async (method: string, params?: Record<string, unknown>) => {
++      if (method === 'session.resume') {return { session_id: RUNTIME_SESSION_ID } as never}
++
++      if (method !== 'prompt.submit') {return {} as never}
++      submits.push(params!)
++
++      if (params?.submission_id) {throw Object.assign(new Error('capability refused'), { code: 4094 })}
++
++      if (legacySends(submits) === 1) {throw refusal}
++
++      return { ok: true } as never
++    })
++  }
++
++  // Chat 20261112_052539_8d8534: Take over's retry of a send the owner check refused before
++  // admission showed legacySendUnconfirmed, though that send never ran. A definite refusal is not
++  // an unconfirmed send; an unconfirmed owner hand-off (SESSION_OWNER_UNCONFIRMED) still is.
++  it.each([
++    ['SESSION_NOT_OWNED', true],
++    ['SESSION_OWNER_UNCONFIRMED', false]
++  ])('an explicit retry after a legacy send refused 4090 %s resends it: %s', async (reason, resent) => {
++    const submits: Array<Record<string, unknown>> = []
++    clearNotifications()
++
++    const refusal = new JsonRpcGatewayError('This chat is active in another Hermes window/terminal.', {
++      code: 4090,
++      data: { reason }
++    })
++
++    const requestGateway = refusingGateway(refusal, submits)
++    let handle: HarnessHandle | null = null
++    await actRender(
++      <Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />
++    )
++    expect(await handle!.submitText('take me over', { submission_id: 'refused-legacy' })).toBe(false)
++    expect(legacySends(submits)).toBe(1)
++    clearNotifications()
++    // Take over's explicit retry names the refused send's identity.
++    expect(await handle!.submitText('take me over', { submission_id: 'refused-legacy' })).toBe(resent)
++    const shown = $notifications.get().map(n => n.message)
++
++    if (resent) {
++      expect(legacySends(submits)).toBe(2)
++      expect(shown).not.toContain(en.promptNotices.legacySendUnconfirmed)
++    } else {
++      expect(legacySends(submits)).toBe(1)
++      expect(shown).toContain(en.promptNotices.legacySendUnconfirmed)
++    }
++  })
++
++  it('a legacy send refused session busy (4009) is retried by the busy loop instead of failing as unconfirmed', async () => {
++    const submits: Array<Record<string, unknown>> = []
++    const requestGateway = refusingGateway(new JsonRpcGatewayError('session busy', { code: 4009 }), submits)
++    let handle: HarnessHandle | null = null
++    await actRender(
++      <Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />
++    )
++    expect(await handle!.submitText('wait for the turn', { submission_id: 'busy-legacy' })).toBe(true)
++    expect(legacySends(submits)).toBe(2)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index 1a31fddd53..b32ad1098c 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -1,4 +1,4 @@
+-import { type PromptSubmitResult, randomUuid } from '@hermes/shared'
++import { JsonRpcGatewayError, type PromptSubmitResult, randomUuid } from '@hermes/shared'
+ import { type MutableRefObject, useCallback } from 'react'
+ 
+ import { getSession, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
+@@ -70,6 +70,7 @@ import {
+ } from './submission-identity-support'
+ import {
+   acquireSubmitInFlight,
++  gatewayReason,
+   type GatewayRequest,
+   inlineErrorMessage,
+   isAdmittedSubmissionConflict,
+@@ -223,6 +224,24 @@ function isPreAdmissionRefusal(error: unknown): boolean {
+   return code === 4094 || (code === 4000 && typeof message === 'string' && /submission_id/.test(message))
+ }
+ 
++/** The server answered that it admitted nothing: session busy (4009), an ownership refusal (4090)
++ *  other than an unconfirmed owner hand-off (SESSION_OWNER_UNCONFIRMED: the owner may already hold
++ *  the send), or a pre-admission capability refusal. Resending it cannot run a second copy.
++ *  Timeouts, disconnects and malformed ACKs are not answers and never match. */
++function isDefiniteSubmitRefusal(error: unknown): boolean {
++  if (error instanceof JsonRpcGatewayError) {
++    if (error.code === 4009) {
++      return true
++    }
++
++    if (error.code === 4090 && gatewayReason(error) !== 'SESSION_OWNER_UNCONFIRMED') {
++      return true
++    }
++  }
++
++  return isPreAdmissionRefusal(error)
++}
++
+ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+   const {
+     activeSessionIdRef,
+@@ -1191,11 +1210,24 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+                   await writePreparedSubmission(retryKey, prepared)
+                   const { submission_id: _id, ...legacyParams } = params
+ 
+-                  const result = await requestGateway<SubmitReceipt>(
+-                    'prompt.submit',
+-                    legacyParams,
+-                    PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+-                  )
++                  let result: SubmitReceipt
++
++                  try {
++                    result = await requestGateway<SubmitReceipt>(
++                      'prompt.submit',
++                      legacyParams,
++                      PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
++                    )
++                  } catch (error) {
++                    // A definite refusal means this send never ran: an explicit retry (Take over's)
++                    // may send it again. Every other failure keeps the send unconfirmed.
++                    if (isDefiniteSubmitRefusal(error)) {
++                      prepared.legacyAttempted = false
++                      await writePreparedSubmission(retryKey, prepared)
++                    }
++
++                    throw error
++                  }
+ 
+                   legacyAccepted = true
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+index c35b309648..4eb6f6e533 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+@@ -339,7 +339,7 @@ export function refusalDroppedImages(error: unknown): boolean {
+   )
+ }
+ 
+-function gatewayReason(error: unknown): unknown {
++export function gatewayReason(error: unknown): unknown {
+   return error instanceof JsonRpcGatewayError ? (error.data as { reason?: unknown } | undefined)?.reason : undefined
+ }
+ 
+diff --git a/tests/tui_gateway/test_cli_durable_takeover.py b/tests/tui_gateway/test_cli_durable_takeover.py
+index e1677afae0..8405900603 100644
+--- a/tests/tui_gateway/test_cli_durable_takeover.py
++++ b/tests/tui_gateway/test_cli_durable_takeover.py
+@@ -140,6 +140,8 @@ def test_older_cli_is_bounded_refusal_and_never_forced_out(setup, monkeypatch):
+     _home, db, sid, _session, spawn = setup
+     proc, ready = spawn('old')
+     monkeypatch.setenv('HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S', '0.5')
++    # The old CLI is alive in this pid namespace, so take_over waits out the live-writer cap first.
++    monkeypatch.setenv('HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S', '0.5')
+     start = time.monotonic()
+     result = server._methods['session.take_over']('take', {'session_id': sid})
+     assert time.monotonic() - start < 5
+diff --git a/tests/tui_gateway/test_session_takeover.py b/tests/tui_gateway/test_session_takeover.py
+index c19f8d54b1..2ce0a796ef 100644
+--- a/tests/tui_gateway/test_session_takeover.py
++++ b/tests/tui_gateway/test_session_takeover.py
+@@ -310,3 +310,118 @@ def test_take_over_with_take_over_active_session_contract(env, sleeper):
+         session_id=KEY, surface="desktop", metadata={"live_session_id": SID}, track_liveness=True)
+     assert refusal is None and [e["lease_id"] for e in removed] == ["foreign-lease"]
+     lease.release()
++
++
++# ── (e) durable writer handoff: a live-but-slow writer ──────────────────────────────────────────
++# Chat 20261112_052539_8d8534: a GIL-starved Desktop backend let go 22.8 s after Take over, but the
++# fixed 8 s ACK deadline had already refused it twice. A writer provably alive here (same pid
++# namespace, pid alive) is waited out up to HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S.
++
++
++@pytest.fixture
++def durable_writer(env):
++    """A Desktop session on a real state.db whose turn lease another writer holds."""
++    from hermes_state import SessionDB
++
++    home = Path(os.environ["HERMES_HOME"])
++    db = SessionDB(home / "state.db")
++    db.create_session(KEY, source="desktop")
++    session = _session(profile_home=str(home))
++    env.sessions.append(session)
++    server._sessions[SID] = session
++    held: list[str] = []
++    timers: list[threading.Timer] = []
++
++    def hold(holder: str) -> None:
++        assert db.try_acquire_session_turn_lease(KEY, holder)
++        held.append(holder)
++
++    def release_after(holder: str, delay_s: float) -> threading.Timer:
++        timer = threading.Timer(delay_s, db.release_session_turn_lease, args=(KEY, holder))
++        timers.append(timer)
++        timer.start()
++        return timer
++
++    yield types.SimpleNamespace(db=db, session=session, hold=hold, release_after=release_after)
++    for timer in timers:
++        timer.cancel()
++        timer.join(5)
++    for holder in held:
++        db.release_session_turn_lease(KEY, holder)
++    db.close()
++
++
++def _same_ns_holder(pid: int, platform: str = "desktop") -> str:
++    from hermes_state_pidns import holder_namespace_token
++    token = holder_namespace_token()
++    if not token:
++        pytest.skip("needs a Linux pid namespace")
++    return f"pid={pid}{token}:turn=slow:platform={platform}"
++
++
++def test_take_over_waits_out_a_live_writer_that_releases_after_the_ack_deadline(
++        durable_writer, sleeper, rpc, monkeypatch):
++    import time
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "0.3")
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S", "10")
++    proc = sleeper()
++    holder = _same_ns_holder(proc.pid)
++    durable_writer.hold(holder)
++    releaser = durable_writer.release_after(holder, 1.2)  # well past the 0.3 s ACK deadline
++    started = time.monotonic()
++    resp = rpc()
++    elapsed = time.monotonic() - started
++    releaser.join(5)
++    assert resp.get("result", {}).get("status") == "taken_over", resp
++    assert resp["result"]["acknowledged"] is True
++    assert resp["result"]["previous_owner"]["pid"] == proc.pid
++    assert 1.0 <= elapsed < 8
++    assert durable_writer.db.session_turn_lease_owner(KEY) is None
++
++
++def test_take_over_refuses_an_unprovable_writer_at_the_ack_deadline(durable_writer, rpc, monkeypatch):
++    import time
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "0.3")
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S", "10")
++    gone = subprocess.Popen(["true"])
++    gone.wait()
++    # A dead pid this process cannot probe (foreign namespace stamp): the lease defers to its TTL and
++    # nothing proves the writer alive, so the ACK deadline applies as before.
++    holder = f"pid={gone.pid}:pidns=1:turn=gone:platform=desktop"
++    durable_writer.hold(holder)
++    started = time.monotonic()
++    resp = rpc()
++    elapsed = time.monotonic() - started
++    assert resp["error"]["code"] == 4090
++    assert resp["error"]["data"] == {"reason": "SESSION_NOT_OWNED"}
++    assert 0.3 <= elapsed < 3
++    message = resp["error"]["message"]
++    assert "alive" not in message
++    assert "older Hermes CLI" not in message  # the holder is a Desktop backend, not a CLI
++    assert message.endswith("No writer was forced out.")
++    assert durable_writer.db.session_turn_lease_owner(KEY)["holder"] == holder
++
++
++def test_take_over_refuses_a_live_writer_that_never_releases_at_the_live_cap(
++        durable_writer, sleeper, rpc, monkeypatch, caplog):
++    import logging
++    import time
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "0.2")
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S", "1")
++    proc = sleeper()
++    holder = _same_ns_holder(proc.pid)
++    durable_writer.hold(holder)
++    started = time.monotonic()
++    with caplog.at_level(logging.WARNING):
++        resp = rpc()
++    elapsed = time.monotonic() - started
++    assert resp["error"]["code"] == 4090
++    assert resp["error"]["data"] == {"reason": "SESSION_NOT_OWNED"}
++    assert 1.0 <= elapsed < 5
++    assert resp["error"]["message"] == (
++        f"The Hermes desktop process (pid {proc.pid}) running this chat is alive but did not let go within 1 s; "
++        "it may be overloaded. Retry Take over here in a minute. No writer was forced out.")
++    assert any("session.take_over: writer" in r.getMessage() and "alive=True" in r.getMessage()
++               for r in caplog.records)
++    assert proc.poll() is None  # never forced out
++    assert durable_writer.db.session_turn_lease_owner(KEY)["holder"] == holder
+diff --git a/tui_gateway/methods_session_takeover.py b/tui_gateway/methods_session_takeover.py
+index 566764b7bc..c3077cbc8b 100644
+--- a/tui_gateway/methods_session_takeover.py
++++ b/tui_gateway/methods_session_takeover.py
+@@ -178,6 +178,34 @@ def _takeover_previous_owner(entry: dict | None) -> dict | None:
+             "started_at": float(started) if isinstance(started, (int, float)) else None}
+ 
+ 
++def _live_local_writer_pid(holder: str) -> int | None:
++    """The pid of a ``pid=<n>:pidns=<ns>:...`` writer provably alive here (same pid namespace and
++    ``kill(n, 0)`` succeeds), else None: unstamped, foreign, dead or unprobeable holders."""
++    parts = dict(p.split("=", 1) for p in (holder or "").split(":") if "=" in p)
++    pid, ns = parts.get("pid", ""), parts.get("pidns", "")
++    if not (holder.startswith("pid=") and pid.isdigit() and ns.isdigit()):
++        return None
++    try:
++        if int(ns) != os.stat("/proc/self/ns/pid").st_ino:
++            return None
++        os.kill(int(pid), 0)  # windows-footgun: ok — the /proc stat above raises off Linux first
++    except (OSError, OverflowError):  # PermissionError included: alive is not proven
++        return None
++    return int(pid)
++
++
++def _unreleased_writer_message(surface: str, live_pid: int | None, waited_s: float) -> str:
++    cli = surface == "cli"
++    if live_pid is not None:
++        return (f"The Hermes {surface} process (pid {live_pid}) running this chat is alive but did not let go "
++                f"within {waited_s:.0f} s; it may be overloaded. Retry Take over here in a minute. "
++                + ("If it is an older Hermes CLI, stop its turn in that terminal. " if cli else "")
++                + "No writer was forced out.")
++    return ("The other writer has not released this chat. "
++            + ("It may be an older Hermes CLI. Stop its turn in that terminal" if cli else "Stop its turn there")
++            + ", then retry Take over here. No writer was forced out.")
++
++
+ def _take_over_durable_writer(rid, sid: str, session: dict, owner: dict):
+     from pathlib import Path
+     from hermes_cli.active_sessions import (
+@@ -200,25 +228,31 @@ def _take_over_durable_writer(rid, sid: str, session: dict, owner: dict):
+     if not request_turn_handoff(lease, owner["holder"]):
+         return _err(rid, 4090, _SESSION_OWNERSHIP_UNAVAILABLE,
+                     {"reason": "SESSION_COORDINATION_UNAVAILABLE"})
+-    deadline = time.monotonic() + max(0.0, env_float("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", 8.0))
++    holder = owner["holder"]
++    surface = holder.rsplit(":platform=", 1)[-1] if ":platform=" in holder else "unknown"
++    # A writer provably alive here may just be slow (a GIL-starved backend acted 22.8 s after the
++    # request): wait it out up to the live cap. Anything else keeps the ACK deadline.
++    ack_s = max(0.0, env_float("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", 8.0))
++    live_s = max(ack_s, env_float("HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S", 60.0))
++    started = time.monotonic()
+     while True:
+         current = _foreign_turn_owner(session)
+         if (session.get("active_session_lease") is not lease
+-                or not turn_handoff_is_current(lease, owner["holder"])
+-                or (current is not None and current["holder"] != owner["holder"])):
++                or not turn_handoff_is_current(lease, holder)
++                or (current is not None and current["holder"] != holder)):
+             return _err(rid, 4090, "Ownership changed during handoff. Retry Take over here.",
+                         {"reason": "SESSION_NOT_OWNED"})
+         if current is None:
+             break
+-        if time.monotonic() >= deadline:
+-            return _err(rid, 4090,
+-                        "The other writer has not released this chat. It may be an older Hermes CLI. "
+-                        "Stop its turn in that terminal, then retry Take over here. No writer was forced out.",
++        live_pid = _live_local_writer_pid(holder)  # re-checked every poll: a writer that dies gets ack_s
++        limit = live_s if live_pid is not None else ack_s
++        if time.monotonic() - started >= limit:
++            logger.warning("session.take_over: writer %s did not release %s within %.0fs (alive=%s)",
++                           holder, session.get("session_key"), limit, live_pid is not None)
++            return _err(rid, 4090, _unreleased_writer_message(surface, live_pid, limit),
+                         {"reason": "SESSION_NOT_OWNED"})
+         time.sleep(_TAKEOVER_ACK_POLL_S)
+     _reload_history_after_takeover(session)
+-    holder = owner["holder"]
+-    surface = holder.rsplit(":platform=", 1)[-1] if ":platform=" in holder else "unknown"
+     return _ok(rid, {"status": "taken_over", "acknowledged": True,
+                      "previous_owner": {"surface": surface,
+                                         "pid": int(holder.split(":", 1)[0][4:])
+-- 
+2.43.0
+

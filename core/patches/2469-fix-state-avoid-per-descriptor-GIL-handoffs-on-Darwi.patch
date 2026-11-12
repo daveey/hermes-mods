@@ -1,0 +1,371 @@
+From df1243dc450c799cfafa8161787c9f7347d9930c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:32:02 -0800
+Subject: [PATCH] fix(state): avoid per-descriptor GIL handoffs on Darwin
+ [daveey]
+
+---
+ hermes_state_lockguard_darwin.py              | 70 +++++++++++++++
+ hermes_state_lockguard_fdscan.py              | 38 +++++---
+ .../test_lockguard_darwin_safety.py           | 88 +++++++++++++++++++
+ .../test_lockguard_fd_scan_darwin.py          | 86 ++++++++++++++++++
+ .../test_lockguard_fd_scan_gil.py             |  4 +-
+ 5 files changed, 273 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_state_lockguard_darwin.py
+ create mode 100644 tests/hermes_state/test_lockguard_darwin_safety.py
+ create mode 100644 tests/hermes_state/test_lockguard_fd_scan_darwin.py
+
+diff --git a/hermes_state_lockguard_darwin.py b/hermes_state_lockguard_darwin.py
+new file mode 100644
+index 0000000000..eea4f1da75
+--- /dev/null
++++ b/hermes_state_lockguard_darwin.py
+@@ -0,0 +1,70 @@
++"""Verified Darwin fd identities without per-syscall GIL handoffs. [daveey]
++
++Darwin sys/stat.h: dev_t at offset 0, ino64_t at offset 8. proc_info.h:
++PROC_PIDLISTFDS=1 returns proc_fdinfo {int32 fd; uint32 type}. A full buffer
++may be truncated: reject it, never hand the WAL guard a partial snapshot.
++"""
++from __future__ import annotations
++
++import os
++import platform
++import struct
++import sys
++
++MAX_FDS = 8192
++
++
++def build():
++    if sys.platform != "darwin" or platform.machine() not in ("arm64", "x86_64"):
++        return None
++    try:
++        import ctypes
++
++        libc = ctypes.PyDLL(None)
++        fstat = getattr(libc, "fstat$INODE64", None) or libc.fstat
++        fstat.argtypes, fstat.restype = [ctypes.c_int, ctypes.c_void_p], ctypes.c_int
++        pidinfo = libc.proc_pidinfo
++        pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
++        pidinfo.restype = ctypes.c_int
++    except (ImportError, OSError, AttributeError):
++        return None
++
++    unsigned_dev = False
++
++    def identity(fd):
++        # Per-call buffers also make independent diagnostic callers thread-safe.
++        buf = ctypes.create_string_buffer(256)
++        if fd < 0 or fd > 2147483647 or fstat(fd, buf) != 0:
++            return None
++        dev, _mode, _links, ino = struct.unpack_from("=iHHQ", buf)
++        return (dev & ((1 << 64) - 1) if unsigned_dev else dev), ino
++
++    def descriptors():
++        buf = ctypes.create_string_buffer(MAX_FDS * 8)
++        size = pidinfo(os.getpid(), 1, 0, buf, len(buf))
++        if size <= 0 or size >= len(buf) or size % 8:
++            return None
++        return [fd for fd, _kind in struct.iter_unpack("=iI", buf.raw[:size])]
++
++    try:
++        probe = os.open(os.devnull, os.O_RDONLY)
++    except OSError:
++        return None
++    try:
++        st = os.fstat(probe)
++        raw = identity(probe)
++        # CPython builds differ in signed dev_t conversion. Require a negative
++        # native device sentinel so the build's conversion is actually proven.
++        if raw is None or raw[0] >= 0:
++            return None
++        unsigned_dev = st.st_dev == (raw[0] & ((1 << 64) - 1))
++        if identity(probe) != (st.st_dev, st.st_ino) or identity(-1) is not None:
++            return None
++        listed = descriptors()
++        if listed is None or probe not in listed:
++            return None
++    except (OSError, ValueError, TypeError, struct.error, ctypes.ArgumentError):
++        return None
++    finally:
++        os.close(probe)
++    return identity, descriptors
+diff --git a/hermes_state_lockguard_fdscan.py b/hermes_state_lockguard_fdscan.py
+index b264da386c..82a32a9045 100644
+--- a/hermes_state_lockguard_fdscan.py
++++ b/hermes_state_lockguard_fdscan.py
+@@ -8,9 +8,10 @@ the board's lifecycle lock across that scan, which made every reader on the hub
+ "board lifecycle is busy" in bursts across all boards.
+ 
+ ``identity(fd)`` calls libc's ``fstat`` through ``ctypes.PyDLL``, which keeps the GIL for the call,
+-and reads ``(st_dev, st_ino)``, the first two 64-bit fields of glibc's ``struct stat`` on x86_64 and
+-aarch64. It is armed only on Linux with those architectures, and only after it agrees with
+-``os.fstat`` at import. Anywhere else, or if anything about the ctypes path fails, it is ``os.fstat``.
++and reads ``(st_dev, st_ino)`` using a platform-specific verified layout: glibc on Linux
++x86_64/aarch64, and Darwin on arm64/x86_64. Darwin's bounded proc_pidinfo listing avoids
++per-entry GIL handoffs and rejects potentially truncated snapshots. Both paths must agree
++with ``os.fstat`` at import; unsupported or unverified runtimes retain ``os.fstat``.
+ """
+ 
+ from __future__ import annotations
+@@ -85,6 +86,13 @@ def _build_native() -> Optional[tuple[Callable[[int], Optional[Identity]], Calla
+ _built = _build_native()
+ _native = _built[0] if _built else None
+ _read_status = _built[1] if _built else None
++_darwin_descriptors = None
++if sys.platform == "darwin":
++    from hermes_state_lockguard_darwin import build as _build_darwin
++
++    _darwin = _build_darwin()
++    if _darwin is not None:
++        _native, _darwin_descriptors = _darwin
+ 
+ 
+ def identity(fd: int) -> Optional[Identity]:
+@@ -118,19 +126,25 @@ def _fd_table_size() -> Optional[int]:
+ 
+ 
+ def open_fd_identities() -> Optional[list[tuple[int, Identity]]]:
+-    """Every open ``(fd, identity)`` of this process from one GIL-held sweep, or ``None`` when that
+-    is unavailable (the caller lists ``/proc/self/fd`` instead). ``os.listdir`` releases the GIL on
+-    every directory entry, which cost 100+ ms for 600 descriptors with one busy thread; this sweep
+-    reads ``/proc/self/status`` once, then fstats each fd number below ``FDSize`` without releasing
+-    the GIL (a closed number fails at once with EBADF)."""
++    """Open ``(fd, identity)`` pairs without a GIL handoff per syscall, or ``None``
++    for the caller's platform directory-listing fallback. Linux sweeps below
++    ``FDSize``; Darwin uses a bounded ``proc_pidinfo`` listing. Each native call
++    holds the GIL, but the Python loop can still be scheduled between calls:
++    this is not an atomic snapshot of descriptor opens/closes."""
+     if _native is None:
+         return None
+-    size = _fd_table_size()
+-    if size is None or size <= 0 or size > MAX_NATIVE_SWEEP:
+-        return None
++    if _darwin_descriptors is not None:
++        descriptors = _darwin_descriptors()
++        if descriptors is None:
++            return None
++    else:
++        size = _fd_table_size()
++        if size is None or size <= 0 or size > MAX_NATIVE_SWEEP:
++            return None
++        descriptors = range(size)
+     native = _native
+     out = []
+-    for fd in range(size):
++    for fd in descriptors:
+         ident = native(fd)
+         if ident is not None:
+             out.append((fd, ident))
+diff --git a/tests/hermes_state/test_lockguard_darwin_safety.py b/tests/hermes_state/test_lockguard_darwin_safety.py
+new file mode 100644
+index 0000000000..e99f8208de
+--- /dev/null
++++ b/tests/hermes_state/test_lockguard_darwin_safety.py
+@@ -0,0 +1,88 @@
++"""Exercise Darwin ABI refusal with injected native-call failures."""
++import ctypes
++import struct
++from types import SimpleNamespace
++
++import pytest
++
++import hermes_state_lockguard_darwin as darwin
++
++pytestmark = pytest.mark.platforms("macos")
++
++
++class Function:
++    def __init__(self, fn):
++        self.fn = fn
++
++    def __call__(self, *args):
++        return self.fn(*args)
++
++
++@pytest.fixture
++def abi(monkeypatch):
++    state = SimpleNamespace(dev=-7, ino=123, listed=8, closes=[], stat_dev=-7)
++
++    def fstat(fd, buf):
++        if fd < 0:
++            return -1
++        struct.pack_into("=iHHQ", buf, 0, state.dev, 0, 0, state.ino)
++        return 0
++
++    def pidinfo(pid, flavor, arg, buf, size):
++        assert flavor == 1 and arg == 0
++        struct.pack_into("=iI", buf, 0, 42, 1)
++        return state.listed
++
++    libc = SimpleNamespace(fstat=Function(fstat), proc_pidinfo=Function(pidinfo))
++    monkeypatch.setattr(darwin.platform, "machine", lambda: "arm64")
++    monkeypatch.setattr(ctypes, "PyDLL", lambda _: libc)
++    monkeypatch.setattr(darwin.os, "open", lambda *args: 42)
++    monkeypatch.setattr(darwin.os, "close", state.closes.append)
++    monkeypatch.setattr(darwin.os, "fstat", lambda fd: SimpleNamespace(st_dev=state.stat_dev, st_ino=123))
++    state.libc = libc
++    return state
++
++
++@pytest.mark.parametrize("unsigned", [False, True])
++def test_runtime_dev_conversion(abi, unsigned):
++    abi.stat_dev = ((1 << 64) - 7) if unsigned else -7
++    native, descriptors = darwin.build()
++    assert native(42) == (abi.stat_dev, 123)
++    assert descriptors() == [42]
++    assert native(-1) is None
++    assert native(1 << 31) is None
++    assert abi.closes == [42]
++
++
++@pytest.mark.parametrize("size", [-1, 0, 1, 7, 9, darwin.MAX_FDS * 8, darwin.MAX_FDS * 8 + 8])
++def test_invalid_enumeration_disarms_at_probe_and_runtime(abi, size):
++    _native, descriptors = darwin.build()
++    abi.listed = size
++    assert descriptors() is None
++    assert darwin.build() is None
++    assert abi.closes == [42, 42]
++
++
++@pytest.mark.parametrize("dev,stat_dev,ino", [(7, 7, 123), (-7, 99, 123), (-7, -7, 999)])
++def test_unproven_identity_disarms(abi, dev, stat_dev, ino):
++    abi.dev, abi.stat_dev, abi.ino = dev, stat_dev, ino
++    assert darwin.build() is None
++    assert abi.closes == [42]
++
++
++def test_missing_symbol_disarms(abi):
++    del abi.libc.proc_pidinfo
++    assert darwin.build() is None
++    assert abi.closes == []
++
++
++def test_unsupported_architecture_disarms(abi, monkeypatch):
++    monkeypatch.setattr(darwin.platform, "machine", lambda: "unknown")
++    assert darwin.build() is None
++    assert abi.closes == []
++
++
++def test_probe_not_listed_disarms(abi, monkeypatch):
++    monkeypatch.setattr(darwin.os, "open", lambda *args: 43)
++    assert darwin.build() is None
++    assert abi.closes == [43]
+diff --git a/tests/hermes_state/test_lockguard_fd_scan_darwin.py b/tests/hermes_state/test_lockguard_fd_scan_darwin.py
+new file mode 100644
+index 0000000000..c47df54590
+--- /dev/null
++++ b/tests/hermes_state/test_lockguard_fd_scan_darwin.py
+@@ -0,0 +1,86 @@
++"""Darwin must not retain the per-descriptor GIL handoff fallback."""
++import os
++import sys
++
++import pytest
++
++import hermes_state_lockguard_fdscan as fdscan
++
++pytestmark = pytest.mark.platforms("macos")
++
++
++def test_darwin_native_identity_and_complete_enumeration(tmp_path):
++    assert fdscan.native_enabled(), "Darwin must use the verified GIL-held scanner"
++    path = tmp_path / "regular"
++    path.write_bytes(b"x")
++    fds = [os.open(path, os.O_RDONLY), os.open(os.devnull, os.O_RDONLY),
++           os.open(tmp_path, os.O_RDONLY), *os.pipe()]
++    try:
++        scanned = dict(fdscan.open_fd_identities())
++        for fd in fds:
++            st = os.fstat(fd)
++            assert fdscan.identity(fd) == (st.st_dev, st.st_ino)
++            assert scanned[fd] == (st.st_dev, st.st_ino)
++    finally:
++        for fd in fds:
++            os.close(fd)
++    assert fdscan.identity(-1) is None
++
++
++def test_darwin_saturated_buffer_uses_complete_fallback(monkeypatch):
++    import hermes_state_lockguard_darwin as darwin
++    import hermes_state_lockguard as guard
++
++    assert fdscan.native_enabled()
++    fd = os.open(os.devnull, os.O_RDONLY)
++    try:
++        st = os.fstat(fd)
++        monkeypatch.setattr(darwin, "MAX_FDS", 1)
++        assert fdscan.open_fd_identities() is None
++        assert (fd, (st.st_dev, st.st_ino)) in list(guard._own_fds_for({(st.st_dev, st.st_ino)}))
++    finally:
++        os.close(fd)
++
++
++def test_darwin_scan_under_cpu_contention(tmp_path):
++    from tests.hermes_state.test_lockguard_fd_scan_gil import (
++        test_own_fds_scan_stays_fast_while_another_thread_is_cpu_bound as check,
++    )
++
++    assert fdscan.native_enabled()
++    check(tmp_path)
++
++
++def test_high_descriptor_survives_lowered_soft_limit(tmp_path):
++    # Isolate the process-wide limit: no other pytest thread sees the change.
++    import subprocess
++    import textwrap
++
++    code = textwrap.dedent('''
++        import fcntl, os, resource
++        import hermes_state_lockguard_fdscan as scan
++        low = os.open(os.devnull, os.O_RDONLY)
++        high = fcntl.fcntl(low, fcntl.F_DUPFD, 1024)
++        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
++        try:
++            resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
++            st = os.fstat(high)
++            assert scan.native_enabled()
++            assert dict(scan.open_fd_identities())[high] == (st.st_dev, st.st_ino)
++        finally:
++            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
++            os.close(high)
++            os.close(low)
++    ''')
++    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=15, check=False)
++    assert result.returncode == 0, result.stderr
++
++
++def test_probe_open_failure_disarms(monkeypatch):
++    import hermes_state_lockguard_darwin as darwin
++
++    def unavailable(*args):
++        raise OSError("descriptor limit")
++
++    monkeypatch.setattr(darwin.os, "open", unavailable)
++    assert darwin.build() is None
+diff --git a/tests/hermes_state/test_lockguard_fd_scan_gil.py b/tests/hermes_state/test_lockguard_fd_scan_gil.py
+index 57a8c0edd5..7cd8170132 100644
+--- a/tests/hermes_state/test_lockguard_fd_scan_gil.py
++++ b/tests/hermes_state/test_lockguard_fd_scan_gil.py
+@@ -17,7 +17,8 @@ import pytest
+ import hermes_state_lockguard as guard
+ import hermes_state_lockguard_fdscan as fdscan
+ 
+-linux_native = pytest.mark.skipif(not fdscan.native_enabled(), reason="native fstat only on Linux x86_64/aarch64")
++linux_native = pytest.mark.skipif(not sys.platform.startswith("linux") or not fdscan.native_enabled(),
++                                  reason="Linux fd-table sweep")
+ 
+ 
+ @linux_native
+@@ -67,6 +68,7 @@ def test_sweep_finds_exactly_the_listed_descriptors(tmp_path):
+ 
+ 
+ def test_oversized_fd_table_falls_back_to_the_listing(monkeypatch):
++    monkeypatch.setattr(fdscan, "_darwin_descriptors", None)
+     monkeypatch.setattr(fdscan, "_fd_table_size", lambda: fdscan.MAX_NATIVE_SWEEP + 1)
+     assert fdscan.open_fd_identities() is None
+     fd = os.open(os.devnull, os.O_RDONLY)
+-- 
+2.43.0
+

@@ -1,0 +1,167 @@
+From fb2712fbe8848c5d13e485ce34f5e58794f1ba05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:26:09 +0000
+Subject: [PATCH] [daveey] Add conservative board-only failed-result death
+ proof
+
+---
+ hermes_cli/kanban_failed_result.py            | 84 +++++++++++++++++++
+ .../test_kanban_failed_result_reconcile.py    | 54 ++++++++++++
+ 2 files changed, 138 insertions(+)
+ create mode 100644 hermes_cli/kanban_failed_result.py
+
+diff --git a/hermes_cli/kanban_failed_result.py b/hermes_cli/kanban_failed_result.py
+new file mode 100644
+index 0000000000..e7aeba6043
+--- /dev/null
++++ b/hermes_cli/kanban_failed_result.py
+@@ -0,0 +1,84 @@
++"""Conservative, board-only proof for failed-result reconciliation. [daveey]
++
++No owner session store access and no signals: an unavailable identity is not
++proof of death. The caller must hold the board write transaction when using a
++proof to close a run. This module does not itself change lifecycle state.
++"""
++from __future__ import annotations
++
++import json
++import os
++
++
++def process_gone(pid, birth) -> bool:
++    """Prove the recorded incarnation gone; fail closed on live/recycled PIDs.
++
++    A birth witness is required even for an absent PID, rejecting legacy and
++    unverified bindings. A currently occupied PID is never acted on, including
++    one recycled since the recorded birth. Permission failures remain unknown.
++    """
++    from hermes_cli import kanban_db_dispatch as dispatch
++
++    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
++        return False
++    if not isinstance(birth, str) or '|' not in birth:
++        return False
++    if birth == dispatch.UNVERIFIED_WORKER_FINGERPRINT:
++        return False
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return True
++    except (PermissionError, OSError):
++        return False
++    # Read birth even though both a matching live process and a recycled PID
++    # veto closure. Never treat an unreadable birth as evidence of death.
++    dispatch._process_fingerprint(pid)
++    return False
++
++
++def failed_result_proof(conn, task_id, run_id, claim_lock):
++    """Return latest attributable failed result only after both processes exit."""
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute(
++        "SELECT status, current_run_id, claim_lock, worker_pid, worker_started_at "
++        "FROM tasks WHERE id=?", (task_id,),
++    ).fetchone()
++    if (row is None or row['status'] != 'running' or row['current_run_id'] != run_id
++            or row['claim_lock'] != claim_lock
++            or not kb._claim_is_local(claim_lock or '', kb._host_prefix())):
++        return None
++    run = conn.execute('SELECT status, ended_at FROM task_runs WHERE id=? AND task_id=?',
++                       (run_id, task_id)).fetchone()
++    if run is None or run['status'] != 'running' or run['ended_at'] is not None:
++        return None
++    events = {}
++    for kind in ('worker_bound', 'worker_result'):
++        event = conn.execute(
++            'SELECT id, created_at, payload FROM task_events '
++            'WHERE task_id=? AND run_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++            (task_id, run_id, kind),
++        ).fetchone()
++        if event is None:
++            return None
++        try:
++            payload = json.loads(event['payload'])
++        except (TypeError, ValueError):
++            return None
++        if not isinstance(payload, dict) or payload.get('claim_lock') != claim_lock:
++            return None
++        events[kind] = (event, payload)
++    bound_event, bound = events['worker_bound']
++    result_event, result = events['worker_result']
++    code = result.get('exit_code')
++    if (not isinstance(code, int) or isinstance(code, bool) or code == 0
++            or result.get('continuable') or result_event['id'] <= bound_event['id']
++            or result.get('pid') != bound.get('pid')):
++        return None
++    if not process_gone(row['worker_pid'], row['worker_started_at']):
++        return None
++    if not process_gone(bound.get('pid'), bound.get('started_at')):
++        return None
++    return {'source_result_event_id': result_event['id'],
++            'result_recorded_at': result_event['created_at'], 'result': result}
+diff --git a/tests/hermes_cli/test_kanban_failed_result_reconcile.py b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+index bcb376dcd6..40bb3f15d4 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_reconcile.py
++++ b/tests/hermes_cli/test_kanban_failed_result_reconcile.py
+@@ -95,3 +95,57 @@ def test_failed_child_reconciles_without_owner_progress(board, entry):
+     crashes = conn.execute("SELECT id FROM task_events WHERE run_id=? AND kind='crashed'",
+                            (context['run_id'],)).fetchall()
+     assert len(crashes) == 1
++
++
++def test_board_only_proof_accepts_real_dead_child(board):
++    from hermes_cli.kanban_failed_result import failed_result_proof
++    conn, context = board
++    result = _failed_child(conn, context)
++    proof = failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock'])
++    assert proof is not None
++    assert proof['source_result_event_id'] == result['id']
++    assert proof['result_recorded_at'] == result['created_at']
++
++
++@pytest.mark.parametrize('state', ['live', 'recycled', 'unreadable', 'denied', 'gone'])
++def test_process_proof_fails_closed(monkeypatch, state):
++    from hermes_cli import kanban_failed_result as reconcile
++    def probe(pid, signal):
++        assert (pid, signal) == (123, 0)
++        if state == 'gone':
++            raise ProcessLookupError()
++        if state == 'denied':
++            raise PermissionError()
++    monkeypatch.setattr(reconcile.os, 'kill', probe)
++    monkeypatch.setattr(kbd, '_process_fingerprint',
++                        lambda pid: {'live': 'epoch|1', 'recycled': 'epoch|2'}.get(state))
++    assert reconcile.process_gone(123, 'epoch|1') is (state == 'gone')
++
++
++@pytest.mark.parametrize('birth', [None, '', 'UNVERIFIED', 12])
++def test_missing_birth_never_proves_death(monkeypatch, birth):
++    from hermes_cli import kanban_failed_result as reconcile
++    def unexpected(*args):
++        pytest.fail('invalid binding must not query OS')
++    monkeypatch.setattr(reconcile.os, 'kill', unexpected)
++    assert not reconcile.process_gone(123, birth)
++
++
++@pytest.mark.parametrize('change', ['run', 'claim', 'outer_live', 'bound_live', 'success', 'wrong_pid'])
++def test_proof_rejects_changed_identity(board, monkeypatch, change):
++    from hermes_cli import kanban_failed_result as reconcile
++    conn, context = board
++    _failed_child(conn, context)
++    if change in ('run', 'claim'):
++        context = {**context, 'run_id': -1} if change == 'run' else {**context, 'claim_lock': 'foreign:1'}
++    elif change in ('outer_live', 'bound_live'):
++        calls = iter([False] if change == 'outer_live' else [True, False])
++        monkeypatch.setattr(reconcile, 'process_gone', lambda *args: next(calls))
++    else:
++        row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND kind='worker_result'",
++                           (context['run_id'],)).fetchone()
++        payload = json.loads(row['payload'])
++        payload['exit_code' if change == 'success' else 'pid'] = 0
++        with kb.write_txn(conn):
++            kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
++    assert reconcile.failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']) is None
+-- 
+2.43.0
+

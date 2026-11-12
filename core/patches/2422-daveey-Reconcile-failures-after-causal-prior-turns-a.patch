@@ -1,0 +1,469 @@
+From c8c76fa7110ce12b2b0763738c0e7aee8f57dcea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:51:34 +0000
+Subject: [PATCH] [daveey] Reconcile failures after causal prior turns and
+ rebindings
+
+---
+ docs/failed-result-reconciliation.md          |  64 ++++++++++
+ hermes_cli/kanban_failed_result.py            |  11 ++
+ hermes_cli/kanban_failed_result_identity.py   |  43 ++++++-
+ .../test_kanban_failed_result_identity.py     |  81 ++++++++++++
+ .../test_kanban_failed_result_observer.py     | 116 ++++++++++++++++++
+ .../test_kanban_failed_result_sync.py         |  65 ++++++++++
+ 6 files changed, 377 insertions(+), 3 deletions(-)
+ create mode 100644 docs/failed-result-reconciliation.md
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_observer.py
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_sync.py
+
+diff --git a/docs/failed-result-reconciliation.md b/docs/failed-result-reconciliation.md
+new file mode 100644
+index 0000000000..6234d76d3b
+--- /dev/null
++++ b/docs/failed-result-reconciliation.md
+@@ -0,0 +1,64 @@
++# Failed worker-result reconciliation
++
++The dispatcher and a pre-armed observer share the same transactional close and
++failure-accounting path. The observer reads only the Kanban board and OS process
++identity, not the owner session database. This addresses a stalled owner loop
++without signalling the worker or the owner.
++
++## Eligibility and safety
++
++A modern failed result records the bound process identity, a writer sequence and
++a snapshot of preceding bound/result event identities. Synced boards use event
++UIDs; unsynced snapshots use content fingerprints, never replica-local row IDs.
++A complete snapshot permits a final failure to supersede an earlier successful
++turn or restart checkpoint. It cannot hide a later unseen receipt or rebind.
++Every historical bound interpreter, as well as the outer worker, must be proved
++dead. A still-occupied recycled PID or unreadable birth is a veto. Linux zombies
++count as exited only with the exact saved birth checked around the state read.
++
++Closure compares the exact current task/run/claim/PID/birth under the board write
++transaction. Closure, counters and final events commit together; competing
++observers and dispatcher ticks cannot charge the same local run twice. The
++source result event is immutable. Its time is recorded separately from the
++reconciliation time. Quota, storage refusal and owner restart remain neutral
++according to the existing policy; their metadata uses the same causal selection.
++
++Legacy launches without valid two-process witnesses retain the existing
++reclaimer policy. Ambiguous modern evidence remains fail-closed, including TTL
++reclaim. Such a hold requires investigation; it is not proof of a live worker.
++
++## Custody and timing boundary
++
++On Linux, the writer starts a transient user-manager service outside the worker
++cgroup and waits for the observer's board-open acknowledgment before committing
++the result. The service uses `Restart=on-failure`, a 500ms restart delay and a
++500ms read-only observation interval. Board connections use a 250ms busy timeout
++without creating or migrating a board. A removed target terminates observation.
++
++The real-child regression and separate-cgroup natural-teardown test require
++closure within **five seconds after both processes exit**, with the owner
++performing no dispatcher ticks. This is an exercised healthy-observer deadline,
++not a hard real-time guarantee across OS starvation, a stopped user manager,
++repeated observer crashes, unavailable storage or indefinite write contention.
++
++A total arm failure preserves the original result and records
++`worker_result_observer_failed`; it does **not** establish independent custody.
++In that case a healthy dispatcher can reconcile it, but this implementation does
++not promise bounded closure while that dispatcher is also stalled. Non-Linux
++launching is detached best effort, not demonstrated restart supervision. Missing
++birth evidence and old legacy launches are outside the bounded observer contract.
++
++## Verification boundaries
++
++The tests cover both entry paths, real-child death, outer/bound live vetoes,
++recycled/unknown identities, historical binding liveness, competing finalizers,
++rollback of accounting, causal selection with reordered local IDs, readiness,
++failed arm, idle read-only polling, explicit board forwarding, and deleted-target
++startup. Sync tests use the actual SQLite capture/client against an **in-memory
++Board contract double**, including grant/echo/release and duplicate sweeps. They
++are not a deployed Board or a network-partition/lease-expiry arbitration proof.
++
++Forced observer restart, Mac/Windows behavior, a production owner-lock fault,
++and production deployment are not established by these fixtures. Merely reading
++`Restart=on-failure` is not a successful restart test. The live hub's loaded
++`code_sha` must be verified separately after landing.
+diff --git a/hermes_cli/kanban_failed_result.py b/hermes_cli/kanban_failed_result.py
+index 8713a74204..03d8937179 100644
+--- a/hermes_cli/kanban_failed_result.py
++++ b/hermes_cli/kanban_failed_result.py
+@@ -154,4 +154,15 @@ def failed_result_proof(conn, task_id, run_id, claim_lock):
+         return None
+     if not process_gone(*receipt.pop('outer')) or not process_gone(*receipt.pop('bound')):
+         return None
++    # Continued attempts can have historical bindings. Superseding their result
++    # does not remove their process-liveness fence.
++    for event in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++                              "AND kind='worker_bound'", (task_id, run_id)):
++        try:
++            bound = json.loads(event['payload'])
++        except (TypeError, ValueError):
++            return None
++        if (not isinstance(bound, dict) or bound.get('claim_lock') != claim_lock
++                or not process_gone(bound.get('pid'), bound.get('started_at'))):
++            return None
+     return receipt
+diff --git a/hermes_cli/kanban_failed_result_identity.py b/hermes_cli/kanban_failed_result_identity.py
+index 28f2c35bdf..c000e40db6 100644
+--- a/hermes_cli/kanban_failed_result_identity.py
++++ b/hermes_cli/kanban_failed_result_identity.py
+@@ -41,6 +41,40 @@ def _identity(event, payload):
+     return value
+ 
+ 
++def _event_identity(event):
++    if 'uid' in event.keys() and event['uid']:
++        return event['uid']
++    import hashlib
++    # Unsynced boards lack UIDs; hash exact content instead of local integers.
++    return hashlib.sha256(json.dumps(
++        [event['kind'], event['created_at'], event['payload']],
++        separators=(',', ':')).encode('utf-8')).hexdigest()
++
++
++def _observed_history(rows, results, bounds):
++    """Complete predecessor snapshots supersede legacy receipts, not live PIDs.
++
++    Dropping unmarked receipts would hide later results; require the writer to
++    have observed every other result/binding, independent of import order.
++    """
++    for event, payload in results:
++        if (payload is None or payload.get('death_proof_version') != 1
++                or type(payload.get('result_sequence')) is not int or payload['result_sequence'] <= 0):
++            continue
++        prior = payload.get('causal_predecessors')
++        expected = [_event_identity(row) for row in rows if row['id'] != event['id']]
++        if not isinstance(prior, list) or not all(isinstance(item, str) for item in prior):
++            continue
++        if sorted(prior) != sorted(expected):
++            continue
++        identity = payload.get('bound_event_identity')
++        matching = [(row, bound) for row, bound in bounds
++                    if bound is not None and _identity(row, bound) == identity]
++        if len(matching) == 1:
++            return matching[0], (event, payload), True
++    return None
++
++
+ def result_identity_fields(conn, context):
+     """Called under the result writer transaction, after its binding check."""
+     params = (context['task_id'], context['run_id'])
+@@ -55,7 +89,10 @@ def result_identity_fields(conn, context):
+         seq = prior.get('result_sequence') if prior else None
+         if type(seq) is int and seq > 0:
+             sequences.append(seq)
+-    return {'bound_event_identity': _identity(bound, payload), 'result_sequence': max(sequences) + 1}
++    history = conn.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=? "
++                           "AND kind IN ('worker_result','worker_bound')", params).fetchall()
++    return {'bound_event_identity': _identity(bound, payload), 'result_sequence': max(sequences) + 1,
++            'causal_predecessors': [_event_identity(event) for event in history]}
+ 
+ 
+ def attributable_events(conn, task_id, run_id):
+@@ -76,7 +113,7 @@ def attributable_events(conn, task_id, run_id):
+         return bounds[-1], results[-1], False
+     sequences = [p.get('result_sequence') if p else None for _, p in results]
+     if any(type(seq) is not int or seq <= 0 for seq in sequences) or len(set(sequences)) != len(sequences):
+-        return None
++        return _observed_history(rows, results, bounds)
+     result = results[sequences.index(max(cast(list[int], sequences)))]
+     assert result[1] is not None  # validated alongside its positive sequence above
+     identity = result[1].get('bound_event_identity')
+@@ -85,5 +122,5 @@ def attributable_events(conn, task_id, run_id):
+     # Require every visible binding to agree; a later live rebind cannot be
+     # hidden by importing its row before the earlier failed result.
+     if any(payload is None or _identity(row, payload) != identity for row, payload in bounds):
+-        return None
++        return _observed_history(rows, results, bounds)
+     return bounds[-1], result, True
+diff --git a/tests/hermes_cli/test_kanban_failed_result_identity.py b/tests/hermes_cli/test_kanban_failed_result_identity.py
+index fe5f3271ea..98c1a526c3 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_identity.py
++++ b/tests/hermes_cli/test_kanban_failed_result_identity.py
+@@ -23,6 +23,87 @@ def test_ttl_reclaim_reserves_modern_failed_run_for_strict_finalizer(board, monk
+                         (context['run_id'],)).fetchone()[0] == 'running'
+ 
+ 
++@pytest.mark.parametrize('prior', ['success', 'continuable'])
++def test_real_writer_failure_after_prior_result_is_reconcilable(board, monkeypatch, prior):
++    conn, context = board
++    extra = ", extra={'continuable': True}" if prior == 'continuable' else ''
++    earlier = f"_record_worker_result(context, 0, 'earlier turn'{extra})\n"
++    monkeypatch.setattr(fixtures, '_CHILD', fixtures._CHILD.replace(
++        "_record_worker_result(context, 1, 'fixture worker_receipt_timeout')",
++        earlier + "_record_worker_result(context, 1, 'fixture worker_receipt_timeout')"))
++    # Helper checks the first receipt, so fetch the production child directly
++    # through its existing harness but assert the multi-receipt outcome here.
++    import subprocess
++    import sys
++    from pathlib import Path
++    from tools.environments.local import build_subprocess_env
++    from hermes_cli import kanban_db_dispatch as dispatch
++    proc = subprocess.Popen([sys.executable, '-c', fixtures._CHILD, json.dumps(context), 'unit'],
++                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                            text=True, encoding='utf-8', env=build_subprocess_env(),
++                            cwd=str(Path(__file__).resolve().parents[2]))
++    try:
++        dispatch._set_worker_pid(conn, context['task_id'], proc.pid)
++        out, err = proc.communicate('x', timeout=30)
++        assert proc.returncode == 1, (out, err)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++    dispatch.detect_crashed_workers(conn, failed_results_only=True)
++    assert conn.execute('SELECT status FROM task_runs WHERE id=?',
++                        (context['run_id'],)).fetchone()[0] == 'crashed'
++
++
++@pytest.mark.parametrize('prior_live', [False, True])
++@pytest.mark.parametrize('observer_path', [False, True])
++def test_rebound_failure_preserves_every_bound_process_fence(board, monkeypatch, prior_live, observer_path):
++    import os
++    from hermes_cli import kanban_db_dispatch as dispatch
++    conn, context = board
++    if prior_live:
++        with kb.write_txn(conn):
++            kb._append_event(conn, context['task_id'], 'worker_bound',
++                             {'pid': os.getpid(), 'started_at': dispatch._process_fingerprint(os.getpid()),
++                              'claim_lock': context['claim_lock']}, run_id=context['run_id'])
++    else:
++        fixtures._failed_child(conn, context)
++    fixtures._failed_child(conn, context)
++    # Reverse binding order as a replica may do, without changing its identity.
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_events SET id=id+2000 WHERE id=(SELECT MIN(id) FROM task_events WHERE kind='worker_bound')")
++    dispatch.detect_crashed_workers(conn, failed_results_only=observer_path)
++    state = conn.execute('SELECT status FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()[0]
++    assert state == ('running' if prior_live else 'crashed')
++
++
++@pytest.mark.parametrize('sequence', [None, True, 0, -1, '1'])
++def test_snapshot_cannot_validate_invalid_selected_sequence(board, sequence):
++    conn, context = board
++    row = fixtures._failed_child(conn, context)
++    payload = json.loads(row['payload'])
++    payload['result_sequence'] = sequence
++    with kb.write_txn(conn):
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
++    assert failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']) is None
++
++
++def test_unseen_legacy_result_cannot_be_hidden_by_history_snapshot(board):
++    from hermes_cli.kanban_failed_result_identity import result_identity_fields
++    conn, context = board
++    row = fixtures._failed_child(conn, context)
++    payload = json.loads(row['payload'])
++    with kb.write_txn(conn):
++        # A later valid marked result observes the first result, not the final
++        # legacy result appended afterwards. No observer may guess its order.
++        kb._append_event(conn, context['task_id'], 'worker_result',
++                         {**payload, **result_identity_fields(conn, context)}, run_id=context['run_id'])
++        kb._append_event(conn, context['task_id'], 'worker_result',
++                         {'exit_code': 0, 'pid': payload['pid'], 'claim_lock': context['claim_lock']},
++                         run_id=context['run_id'])
++    assert failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']) is None
++
++
+ def test_result_sequence_not_import_order_selects_latest(board):
+     conn, context = board
+     result = fixtures._failed_child(conn, context)
+diff --git a/tests/hermes_cli/test_kanban_failed_result_observer.py b/tests/hermes_cli/test_kanban_failed_result_observer.py
+new file mode 100644
+index 0000000000..64bd19f2c4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_observer.py
+@@ -0,0 +1,116 @@
++"""Observer protocol boundaries on disposable boards; no live service mutation."""
++import contextlib
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from gateway import session_kanban
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_failed_result_observer as observer
++from hermes_cli import kanban_failed_result_service as service
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++board = fixtures.board
++
++
++class EndPoll(Exception):
++    pass
++
++
++def _ready_context(context, tmp_path):
++    return {**context, 'ready_path': str(tmp_path / 'ready'), 'observer_unit': 'fixture.service',
++            'writer_pid': os.getpid(), 'writer_birth': dispatch._process_fingerprint(os.getpid())}
++
++
++def test_idle_observer_acknowledges_without_board_writes(board, tmp_path, monkeypatch):
++    _, context = board
++    context = _ready_context(context, tmp_path)
++    statements = []
++    original = observer.connect_existing
++    @contextlib.contextmanager
++    def traced(path):
++        with original(path) as conn:
++            conn.set_trace_callback(statements.append)
++            yield conn
++    monkeypatch.setattr(observer, 'connect_existing', traced)
++    def end_poll(seconds):
++        assert seconds == observer.POLL_SECONDS
++        raise EndPoll
++    monkeypatch.setattr(observer.time, 'sleep', end_poll)
++    with pytest.raises(EndPoll):
++        observer.observe(context)
++    assert Path(context['ready_path']).read_text() == context['observer_unit']
++    assert not any(sql.upper().startswith(('BEGIN', 'INSERT', 'UPDATE', 'DELETE', 'REPLACE')) for sql in statements)
++
++
++def test_observer_carries_explicit_nondefault_board(board, tmp_path, monkeypatch):
++    conn, context = board
++    fixtures._failed_child(conn, context)
++    context = {**_ready_context(context, tmp_path), 'board': 'alternate'}
++    original = dispatch.detect_crashed_workers
++    calls = []
++    def sweep(connection, **kwargs):
++        calls.append(kwargs)
++        return original(connection, **kwargs)
++    monkeypatch.setattr(dispatch, 'detect_crashed_workers', sweep)
++    observer.observe(context)
++    assert calls == [{'board': 'alternate', 'failed_results_only': True}]
++    assert conn.execute('SELECT status FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()[0] == 'crashed'
++
++
++def test_failed_arm_keeps_result_and_records_diagnostic(board, monkeypatch):
++    conn, context = board
++    dispatch._set_worker_pid(conn, context['task_id'], os.getpid())
++    with kb.write_txn(conn):
++        kb._append_event(conn, context['task_id'], 'worker_bound',
++                         {'pid': os.getpid(), 'started_at': dispatch._process_fingerprint(os.getpid()),
++                          'claim_lock': context['claim_lock']}, run_id=context['run_id'])
++    def refuse(ctx):
++        assert ctx == context
++        assert not conn.in_transaction
++        assert conn.execute("SELECT 1 FROM task_events WHERE kind='worker_result'").fetchone() is None
++        raise RuntimeError('fixture manager unavailable')
++    monkeypatch.setattr(observer, 'arm', refuse)
++    session_kanban._record_worker_result(context, 1, 'fixture failure')
++    rows = conn.execute("SELECT kind,payload FROM task_events WHERE kind LIKE 'worker_result%' ORDER BY id").fetchall()
++    assert [row['kind'] for row in rows] == ['worker_result_observer_failed', 'worker_result']
++    assert json.loads(rows[0]['payload'])['error'] == 'fixture manager unavailable'
++    assert json.loads(rows[1]['payload'])['exit_code'] == 1
++    assert json.loads(rows[1]['payload'])['death_proof_version'] == 1
++    assert conn.execute('SELECT status FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()[0] == 'running'
++
++
++@pytest.mark.parametrize('ack', ['correct', 'wrong', 'none', 'refused'])
++def test_service_custody_requires_exact_readiness_ack(board, monkeypatch, ack):
++    _, context = board
++    monkeypatch.setattr(service.shutil, 'which', lambda name: '/usr/bin/systemd-run')
++    times = iter([0, 0, 2])
++    monkeypatch.setattr(service.time, 'monotonic', lambda: next(times))
++    monkeypatch.setattr(service.time, 'sleep', lambda _: None)
++    calls = []
++    def submit(command, **kwargs):
++        from types import SimpleNamespace
++        calls.append(command)
++        payload = json.loads(command[-1])
++        if ack in ('correct', 'wrong'):
++            Path(payload['ready_path']).write_text(payload['observer_unit'] if ack == 'correct' else 'other.service')
++        return SimpleNamespace(returncode=1 if ack == 'refused' else 0, stderr='fixture refusal')
++    monkeypatch.setattr(service.subprocess, 'run', submit)
++    if ack == 'correct':
++        assert service.arm_service(context, startup_seconds=1).endswith('.service')
++    else:
++        with pytest.raises(RuntimeError, match='refused|acknowledge'):
++            service.arm_service(context, startup_seconds=1)
++    assert '--property=Slice=app.slice' in calls[0]
++    assert '--property=Restart=on-failure' in calls[0]
++    assert not any(arg.startswith('--setenv=HERMES_KANBAN_TASK=') for arg in calls[0])
++
++
++def test_missing_manager_is_not_reported_as_custody(board, monkeypatch):
++    _, context = board
++    monkeypatch.setattr(service.shutil, 'which', lambda name: None)
++    with pytest.raises(RuntimeError, match='needs systemd-run'):
++        service.arm_service(context)
+diff --git a/tests/hermes_cli/test_kanban_failed_result_sync.py b/tests/hermes_cli/test_kanban_failed_result_sync.py
+new file mode 100644
+index 0000000000..db431f45e1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_sync.py
+@@ -0,0 +1,65 @@
++"""Real sync client/SQLite capture against the in-memory Board contract double.
++
++This is not a production Board deployment or network-partition proof.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_failed_result_observer as observer
++from tests.hermes_cli import test_kanban_failed_result_reconcile as processes
++from tests.hermes_cli import test_kanban_sync_run_rows as transport
++
++kanban_home = transport.kanban_home
++svc = transport.svc
++live = transport.live
++
++
++@pytest.mark.parametrize('entry', ['observer', 'dispatcher'])
++@pytest.mark.parametrize('rebound', [False, True])
++def test_failed_result_closure_survives_real_sync_echo(live, kanban_home, svc, monkeypatch, tmp_path, entry, rebound):
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    tid, uid = transport._claimed(live, kanban_home, svc, 'failed receipt transport')
++    task = kb.get_task(live, tid)
++    assert task is not None
++    context = {'db': str(kanban_home / 'kanban.db'), 'task_id': tid,
++               'run_id': task.current_run_id, 'claim_lock': task.claim_lock, 'board': transport.BOARD}
++    first = processes._failed_child(live, context)
++    payload = json.loads(first['payload'])
++    assert payload['bound_event_identity']['uid']
++    if rebound:
++        processes._failed_child(live, context)
++        payload = json.loads(live.execute("SELECT payload FROM task_events WHERE kind='worker_result' ORDER BY id DESC LIMIT 1").fetchone()[0])
++    from hermes_cli.kanban_failed_result_identity import result_identity_fields
++    # Import order is not causal order: retain the original UID but put the old
++    # receipt after the later writer sequence in this local mirror.
++    with kb.write_txn(live):
++        kb._append_event(live, tid, 'worker_result',
++                         {**payload, **result_identity_fields(live, context), 'last_output': 'causal transport failure'},
++                         run_id=task.current_run_id)
++        live.execute('UPDATE task_events SET id=? WHERE id=?', (first['id'] + 1000, first['id']))
++    transport._round(kanban_home, svc)
++    if entry == 'observer':
++        observer.observe({**context, 'ready_path': str(tmp_path / 'ready'),
++                          'observer_unit': 'fixture.service'})
++    else:
++        dispatch.detect_crashed_workers(live)
++    assert live.execute('SELECT status FROM task_runs WHERE uid=?', (uid,)).fetchone()[0] == 'crashed'
++    for _ in range(3):
++        transport._round(kanban_home, svc)
++        dispatch.detect_crashed_workers(live)
++    transport._assert_ended(live, svc, uid, 'crashed')
++    local = kb.get_task(live, tid)
++    assert local is not None
++    assert local.consecutive_failures == 1
++    rows = svc.board(transport.BOARD)['rows']
++    assert rows['tasks'][tid]['consecutive_failures'] == 1
++    crashes = [row for row in rows['task_events'].values() if row.get('task_id') == tid and row.get('kind') == 'crashed']
++    assert len(crashes) == 1
++    evidence = json.loads(crashes[0]['payload'])
++    assert evidence['worker_output'] == 'causal transport failure'
++    assert evidence['source_result_event_uid'] in rows['task_events']
++    assert evidence['result_recorded_at'] <= evidence['reconciled_at']
++    assert tid not in svc.board(transport.BOARD)['leases']
+-- 
+2.43.0
+

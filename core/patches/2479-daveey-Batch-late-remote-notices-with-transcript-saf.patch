@@ -1,0 +1,1163 @@
+From ef742990ddc7e97022d57f0019c31cc894c7f56e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:57:53 +0000
+Subject: [PATCH] [daveey] Batch late remote notices with transcript-safe
+ grouped custody
+
+---
+ hermes_state_errors.py                        |   5 +
+ hermes_state_messages.py                      |  26 +-
+ tests/tui_gateway/test_kanban_remote_late.py  | 494 ++++++++++++++++++
+ .../tui_gateway/test_kanban_remote_overlap.py | 211 ++++++++
+ tui_gateway/kanban_remote_late.py             | 167 ++++++
+ tui_gateway/kanban_remote_notices.py          |  61 ++-
+ tui_gateway/session_notifications.py          |  10 +-
+ 7 files changed, 951 insertions(+), 23 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_late.py
+ create mode 100644 tests/tui_gateway/test_kanban_remote_overlap.py
+ create mode 100644 tui_gateway/kanban_remote_late.py
+
+diff --git a/hermes_state_errors.py b/hermes_state_errors.py
+index 7019c6c6e1..77a412569b 100644
+--- a/hermes_state_errors.py
++++ b/hermes_state_errors.py
+@@ -6,6 +6,11 @@ import errno
+ import re
+ import sqlite3
+ 
++
++class KanbanNoticeOverlapError(ValueError):
++    """Only part of a notice batch is durable; re-render its missing members and retry."""
++
++
+ # Malformed schema: ``sqlite_master`` itself is inconsistent (typically a DUPLICATE
+ # ``CREATE VIRTUAL TABLE messages_fts`` row). SQLite parses the whole schema while
+ # preparing the FIRST statement, so EVERY statement raises (even ``PRAGMA
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index 05d6d350ec..0c44ad4b74 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -455,11 +455,11 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+     def record_kanban_notice(self, session_id: str, content: str, metadata: dict[str, Any], *,
+                              message: Optional[dict[str, Any]] = None,
+                              reject_active_turn: bool = True) -> tuple[int, bool]:
+-        """:meth:`append_kanban_notice` returning ``(row id, inserted)``. Besides ``notice_id``, any of
+-        ``metadata['kanban_event_keys']`` already present in the session's lineage counts as delivered (no row is
+-        written and that row's id is returned), checked in the same writer txn. ``message`` supplies the
+-        stamped dict (timestamp, uid) a live turn will adopt; ``reject_active_turn=False`` is for the backend
+-        that just admitted the turn itself. [daveey]"""
++        """:meth:`append_kanban_notice` returning ``(row id, inserted)``. A keyed batch is already delivered
++        only when ALL its keys are present in the session's lineage, checked again in the writer txn.
++        Partial overlap raises ``KanbanNoticeOverlapError``: callers must re-render the missing members,
++        never acknowledge an existing row as custody for absent keys. ``message`` supplies the stamped dict
++        a live turn will adopt; ``reject_active_turn=False`` is for the backend that admitted that turn. [daveey]"""
+         notice_id = metadata.get("notice_id")
+         if not notice_id:
+             raise ValueError("Kanban notice requires a stable notice_id")
+@@ -474,13 +474,19 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+ 
+         def _existing(conn):
+             existing = conn.execute(_LINEAGE_CTE_SQL + _NOTICE_BY_ID_SQL, (session_id, session_id, notice_id)).fetchone()
+-            if existing is None and keys:
+-                existing = conn.execute(
+-                    _LINEAGE_CTE_SQL + " SELECT m.id FROM messages m, "
++            if keys:
++                rows = conn.execute(
++                    _LINEAGE_CTE_SQL + " SELECT m.id, j.value FROM messages m, "
+                     "json_each(json_extract(m.display_metadata, '$.kanban_event_keys')) j "
+                     "WHERE m.session_id IN (SELECT id FROM lineage) AND m.display_kind = 'kanban_notice' "
+-                    "AND json_valid(m.display_metadata) AND j.value IN (" + ",".join("?" * len(keys)) + ") LIMIT 1",
+-                    (session_id, session_id, *keys)).fetchone()
++                    "AND json_valid(m.display_metadata) AND j.value IN (" + ",".join("?" * len(keys)) + ")",
++                    (session_id, session_id, *keys)).fetchall()
++                covered = {str(row[1]) for row in rows}
++                if set(keys) <= covered:
++                    return rows[0]
++                if existing is not None or covered:
++                    from hermes_state_errors import KanbanNoticeOverlapError
++                    raise KanbanNoticeOverlapError("Kanban notice partial key overlap; retry missing members")
+             return existing
+ 
+         # Already delivered (the common case: the unloaded sweep re-offers every done card each tick): answer
+diff --git a/tests/tui_gateway/test_kanban_remote_late.py b/tests/tui_gateway/test_kanban_remote_late.py
+new file mode 100644
+index 0000000000..573d5bc7e2
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_late.py
+@@ -0,0 +1,494 @@
++"""Late arrivals are one explicit catch-up notice, with custody for every member."""
++import contextlib
++import json
++import os
++import sqlite3
++import threading
++from datetime import datetime
++from zoneinfo import ZoneInfo
++
++import pytest
++
++from hermes_state import SessionDB
++from tests.tui_gateway.test_kanban_remote_arrival import _hub
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, _card
++from tui_gateway import kanban_remote_notices as krn
++
++
++@pytest.fixture
++def arrival(tmp_path, monkeypatch):
++    krn._reset_for_tests()
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    monkeypatch.setattr(krn, "ledger_path", lambda: ledger)
++    monkeypatch.setattr(krn, "hub_db_path", lambda: replica)
++    now = 1_800_000_000.0
++    assert krn.collect(CHAT, "default", now=now - 60) == []
++
++    def insert(count, status, age):
++        cards = [_card(f"t_late_{i:02}", CHAT, status=status, at=now - age - i * 60)
++                 for i in range(count)]
++        with sqlite3.connect(replica) as conn:
++            for i, card in enumerate(cards, 1):
++                conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,?)",
++                             (card["key"], json.dumps(card["task"]), i))
++        return cards
++
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield db, sid
++
++        yield replica, ledger, now, insert, db, opener
++
++
++def _rows(ledger):
++    with sqlite3.connect(ledger) as conn:
++        return conn.execute("SELECT notice_key, delivered FROM notices ORDER BY ref").fetchall()
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep", "passive"])
++@pytest.mark.parametrize("status", ["done", "blocked"])
++@pytest.mark.parametrize("count", [1, 5, 23])
++def test_late_arrivals_are_one_durable_group(arrival, door, status, count):
++    replica, ledger, now, insert, db, opener = arrival
++    cards = insert(count, status, 8 * 3600)
++    wakes = []
++
++    class Waker:
++        grace_s = 0
++
++        def deliver(self, tip, text, metadata, task, at, *, persist, started):
++            wakes.append(text)
++            assert all(delivered == 0 for _, delivered in _rows(ledger))
++            assert persist()
++            return "persisted"
++
++    if door == "collect":
++        got = krn.collect(CHAT, "default", now=now)
++        assert len(got) == 1
++        group = got[0]
++        text = group["text"]
++        keys = group.get("event_keys", [group["event_key"]])
++        assert len(keys) == count
++        assert len(_rows(ledger)) == count
++        assert all(delivered == 0 for _, delivered in _rows(ledger))
++        db.append_kanban_notice(CHAT, text, {"notice_id": keys[0], "kanban_event_keys": keys})
++        assert krn.ack(group)
++    else:
++        got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                       ledger=ledger, now=now, waker=Waker() if door == "sweep" else None)
++        assert len(got) == 1
++        assert len(wakes) == (1 if door == "sweep" else 0)
++        text = db.get_messages(CHAT)[0]["content"]
++    assert text.startswith("Late notices")
++    for card in cards[:20]:
++        owner_at = krn._fresh_at(card["task"])
++        assert owner_at is not None
++        stamp = datetime.fromtimestamp(owner_at, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M %Z")
++        assert stamp in text
++        assert card["task"]["id"] in text
++    assert "8h" in text and "not delivered then" in text
++    assert text.count("not delivered then") == min(count, 20)
++    if count > 20:
++        assert "+3 more" in text and cards[20]["task"]["id"] not in text
++    assert len(_rows(ledger)) == count
++    assert all(delivered == 1 for _, delivered in _rows(ledger))
++    keys = [key for key, _ in _rows(ledger)]
++    assert db.kanban_notice_keys_delivered(CHAT, keys) == set(keys)
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", now=now) == []
++    assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                    ledger=ledger, now=now) == []
++    assert len(db.get_messages(CHAT)) == 1
++
++
++def test_poller_persists_all_group_keys_before_ack(arrival, monkeypatch):
++    from tui_gateway import server
++
++    _, ledger, now, insert, db, _ = arrival
++    insert(5, "done", 8 * 3600)
++    collect = krn.collect
++    monkeypatch.setattr(krn, "collect", lambda *a, **k: collect(*a, **{**k, "now": now}))
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    claims = []
++    texts = server._collect_remote_kanban_notifications(CHAT, claims)
++    assert len(texts) == 1 and len(texts[0]._kb_keys) == 5
++    session = {"session_key": CHAT, "history": [], "_kanban_claims": claims}
++    server._kb_ack_durable(session, set())
++    assert {delivered for _, delivered in _rows(ledger)} == {0}
++    verdict, _, _ = server._kb_persist_batch(session, texts, False)
++    assert verdict == "written"
++    server._kb_ack_durable(session, {id(texts[0])})
++    keys = [key for key, _ in _rows(ledger)]
++    assert len(keys) == 5 and db.kanban_notice_keys_delivered(CHAT, keys) == set(keys)
++    assert {delivered for _, delivered in _rows(ledger)} == {1}
++
++
++@pytest.mark.parametrize("written", [False, True])
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++def test_group_crash_recovery(arrival, monkeypatch, written, door):
++    replica, ledger, now, insert, db, opener = arrival
++    insert(5, "done", 8 * 3600)
++    metadata = []
++
++    class Waker:
++        grace_s = 0
++
++        def deliver(self, tip, text, meta, task, at, *, persist, started):
++            metadata.append(meta)
++            assert not started()  # admission is not delivery
++            if written:
++                db.append_kanban_notice(tip, text, meta)
++            return "started"
++
++    if door == "collect":
++        first = krn.collect(CHAT, "default", now=now)[0]
++        if written:
++            db.append_kanban_notice(CHAT, first["text"],
++                                   {"notice_id": first["event_key"], "kanban_event_keys": first["event_keys"]})
++    else:
++        krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                 ledger=ledger, now=now, waker=Waker())
++        assert len(metadata) == 1 and len(metadata[0]["kanban_event_keys"]) == 5
++    assert len(_rows(ledger)) == 5 and {d for _, d in _rows(ledger)} == {0}
++    with sqlite3.connect(ledger) as conn:
++        conn.execute("UPDATE notices SET holder_pid=-1, holder_start=NULL")
++    krn._reset_for_tests()
++    monkeypatch.setattr(krn, "_holder_alive", lambda *a: False)
++    monkeypatch.setattr(krn, "_holder_is_me", lambda pid: pid == os.getpid())
++    if door == "collect":
++        again = krn.collect(CHAT, "default", now=now,
++                            transcript_has=lambda k, t: krn.notice_in_transcript(db, CHAT, k, t))
++        assert len(again) == (0 if written else 1)
++        if not written:
++            assert len(again[0]["children"]) == 5
++    else:
++        got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                       ledger=ledger, now=now)
++        assert len(got) == (0 if written else 1)
++        assert len(db.get_messages(CHAT)) == 1
++    if written or door == "sweep":
++        assert {d for _, d in _rows(ledger)} == {1}
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++def test_refusal_releases_every_group_member(arrival, monkeypatch, door):
++    from tui_gateway import server
++
++    replica, ledger, now, insert, db, opener = arrival
++    insert(5, "done", 8 * 3600)
++    if door == "collect":
++        claim = krn.collect(CHAT, "default", now=now)[0]
++        text = object()
++        session = {"_kanban_claims": [{"remote": claim, "texts": [text]}], "history_lock": threading.RLock()}
++        server._kb_rewind_refused(session, [text], not_owned=True)
++    else:
++        class Waker:
++            grace_s = 0
++
++            def deliver(self, tip, text, metadata, task, at, *, persist, started):
++                def busy(*a, **kw):
++                    raise RuntimeError("refused before transcript")
++                with monkeypatch.context() as m:
++                    m.setattr(db, "append_kanban_notice", busy)
++                    assert not persist()
++                return "deferred"
++
++        krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                 ledger=ledger, now=now, waker=Waker())
++    assert _rows(ledger) == [] and db.get_messages(CHAT) == []
++    again = krn.collect(CHAT, "default", now=now)
++    assert len(again) == 1 and len(again[0]["children"]) == 5
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++@pytest.mark.parametrize("age", [600, 2 * 3600, 6 * 3600])
++def test_fresh_owner_times_keep_original_text(arrival, door, age):
++    replica, ledger, now, insert, db, opener = arrival
++    cards = insert(1, "done", age)
++    card = cards[0]
++    expected = krn._completion_text("hub", card["key"], card["task"], "macbook", "default", CHAT)
++    if door == "collect":
++        got = krn.collect(CHAT, "default", now=now)
++        assert [g["text"] for g in got] == [expected]
++        assert "children" not in got[0]
++    else:
++        krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                 ledger=ledger, now=now)
++        assert [m["content"] for m in db.get_messages(CHAT)] == [expected]
++
++
++def test_late_sweep_retains_live_poller_grace(arrival):
++    replica, ledger, now, insert, db, opener = arrival
++    insert(5, "done", 8 * 3600)
++
++    class Waker:
++        grace_s = 30
++
++        def deliver(self, *a, **kw):
++            pytest.fail("grace must defer the whole late group")
++
++    assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                    ledger=ledger, now=now, waker=Waker()) == []
++    assert _rows(ledger) == [] and db.get_messages(CHAT) == []
++    assert len(krn.collect(CHAT, "default", now=now)) == 1
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++@pytest.mark.parametrize("month,zone", [(7, "PDT"), (12, "PST")])
++def test_late_owner_time_uses_pacific_dst_and_notice_fallback(arrival, door, month, zone):
++    replica, ledger, now, insert, db, opener = arrival
++    owner = datetime.fromisoformat(f"2026-{month:02}-01T12:00:00+00:00").timestamp()
++    card = insert(1, "done", now - owner)[0]
++    del card["task"]["completed_at"]
++    card["task"]["completion_notice"]["created_at"] = owner
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE replica SET data=?, seq=2", (json.dumps(card["task"]),))
++    if door == "collect":
++        text = krn.collect(CHAT, "default", now=now)[0]["text"]
++    else:
++        krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                 ledger=ledger, now=now)
++        text = db.get_messages(CHAT)[0]["content"]
++    stamp = datetime.fromtimestamp(owner, ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M %Z")
++    assert stamp.endswith(zone) and stamp in text
++    assert text.startswith("Late notices")
++
++
++@pytest.mark.parametrize("guard", ["archived", "moved", "worker", "live"])
++def test_late_sweep_keeps_destination_guards(arrival, guard):
++    replica, ledger, now, insert, db, opener = arrival
++    insert(5, "done", 8 * 3600)
++    if guard == "archived":
++        db._write_rowcount("UPDATE sessions SET archived=1 WHERE id=?", (CHAT,))
++    elif guard == "moved":
++        db.end_session(CHAT, "moved_to_gateway:other")
++    elif guard == "worker":
++        db._write_rowcount("UPDATE sessions SET source='kanban' WHERE id=?", (CHAT,))
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=ledger, now=now, live_ids={CHAT} if guard == "live" else set())
++    assert got == [] and db.get_messages(CHAT) == []
++    assert {d for _, d in _rows(ledger)} == ({krn.SETTLED} if guard == "worker" else set())
++
++
++def test_real_waker_groups_each_chat_with_deferred_callbacks(arrival, monkeypatch):
++    from tui_gateway import kanban_unloaded as ku
++    from tests.tui_gateway.test_kanban_remote_notices import OTHER
++
++    replica, ledger, now, insert, db, opener = arrival
++    cards = insert(5, "done", 8 * 3600)
++    db.create_session(OTHER, "desktop")
++    with sqlite3.connect(replica) as conn:
++        for i, card in enumerate(cards):
++            card["task"]["sessions"].append({"gw": "macbook", "profile": "default", "session": OTHER,
++                                                "rel": "shepherd"})
++            conn.execute("UPDATE replica SET data=?, seq=? WHERE key=?",
++                         (json.dumps(card["task"]), 10 + i, card["key"]))
++    ku._reset_wake_budget_for_tests()
++    jobs, turns = [], []
++
++    def wake(tip, text, metadata):
++        turns.append(tip)
++        assert text.startswith("Late notices") and len(metadata["kanban_event_keys"]) == 5
++        db.append_kanban_notice(tip, text, metadata)
++        return "started"
++
++    waker = ku._RemoteWaker(wake, lambda job: (jobs.append(job), "dispatched")[1], 0)
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=ledger, now=now, waker=waker)
++    assert len(got) == 2 and len(jobs) == 2 and turns == []
++    assert len(_rows(ledger)) == 10 and {d for _, d in _rows(ledger)} == {0}
++    for job in jobs:
++        assert job() == "started"
++    assert set(turns) == {CHAT, OTHER} and len(turns) == 2
++    assert {d for _, d in _rows(ledger)} == {1}
++    assert len(db.get_messages(CHAT)) == len(db.get_messages(OTHER)) == 1
++    assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                    ledger=ledger, now=now, waker=waker) == []
++    ku._reset_wake_budget_for_tests()
++
++
++# --- custody under failure, wake representative, six-day acceptance -----------------------------------------
++
++HUMAN = {"action": "Reply A or B. Unblock = A; archive = drop.", "why_human": "owner pick",
++         "interaction": "reply", "scope": "deploy window", "evidence": "no window chosen"}
++
++
++def _put(replica, cards, start=100):
++    with sqlite3.connect(replica) as conn:
++        for i, card in enumerate(cards, start):
++            conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,?)", (card["key"], json.dumps(card["task"]), i))
++
++
++def _mixed(now, order, age=8 * 3600):
++    done = _card("t_mix_done", CHAT, status="done", at=now - age)
++    human = _card("t_mix_human", CHAT, status="blocked", at=now - age - 60)
++    human["task"]["human_request"] = HUMAN
++    return [human, done] if order == "human_first" else [done, human]
++
++
++def _two_chats(arrival):
++    from tests.tui_gateway.test_kanban_remote_notices import OTHER
++
++    replica, _ledger, _now, insert, db, _opener = arrival
++    cards = insert(2, "done", 8 * 3600)
++    db.create_session(OTHER, "desktop")
++    with sqlite3.connect(replica) as conn:
++        for i, card in enumerate(cards):
++            card["task"]["sessions"].append({"gw": "macbook", "profile": "default", "session": OTHER,
++                                            "rel": "shepherd"})
++            conn.execute("UPDATE replica SET data=?, seq=? WHERE key=?", (json.dumps(card["task"]), 10 + i, card["key"]))
++    return OTHER
++
++
++def _delivered_by_session(ledger):
++    with sqlite3.connect(ledger) as conn:
++        return {(s, d) for s, d in conn.execute("SELECT session, delivered FROM notices")}
++
++
++def test_render_failure_releases_claims_and_isolates_chats(arrival, monkeypatch):
++    from tui_gateway import kanban_remote_late as late
++
++    replica, ledger, now, _insert, db, opener = arrival
++    other = _two_chats(arrival)
++    real = late.group
++
++    def flaky(items, at):
++        if items[0]["session"] == other:
++            raise ValueError("render boom")
++        return real(items, at)
++
++    monkeypatch.setattr(late, "group", flaky)
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=ledger, now=now)
++    assert [g["session_id"] for g in got] == [CHAT]
++    assert _delivered_by_session(ledger) == {(CHAT, 1)}  # OTHER's claims were released, not left in flight
++    assert len(db.get_messages(CHAT)) == 1 and db.get_messages(other) == []
++    monkeypatch.setattr(late, "group", real)
++    krn._reset_for_tests()
++    retry = krn.collect(other, "default", now=now)
++    assert len(retry) == 1 and len(retry[0]["children"]) == 2
++
++
++def test_wake_failure_never_unclaims_a_persisted_chat(arrival):
++    replica, ledger, now, _insert, db, opener = arrival
++    other = _two_chats(arrival)
++
++    class Waker:
++        grace_s = 0
++
++        def deliver(self, tip, text, metadata, task, at, *, persist, started):
++            if tip == other:
++                raise RuntimeError("waker boom")
++            assert persist()
++            return "persisted"
++
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=ledger, now=now, waker=Waker())
++    assert [g["session_id"] for g in got] == [CHAT]
++    assert _delivered_by_session(ledger) == {(CHAT, 1)}
++    assert len(db.get_messages(CHAT)) == 1
++
++
++def test_error_midscan_still_flushes_pending_batches(arrival, monkeypatch):
++    replica, ledger, now, insert, db, opener = arrival
++    insert(3, "done", 8 * 3600)
++    calls = []
++    real = krn._deliver_link
++
++    def boom(*a, **kw):
++        calls.append(1)
++        if len(calls) == 3:
++            raise RuntimeError("scan boom")
++        return real(*a, **kw)
++
++    monkeypatch.setattr(krn, "_deliver_link", boom)
++    with contextlib.suppress(RuntimeError):
++        krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger, now=now)
++    rows = _rows(ledger)
++    assert len(rows) in (0, 2) and len({d for _, d in rows}) <= 1  # delivered together, or not claimed at all
++    assert len(db.get_messages(CHAT)) == (1 if rows else 0)
++
++
++def test_collect_grouping_failure_releases_claims(arrival, monkeypatch):
++    from tui_gateway import kanban_remote_late as late
++
++    replica, ledger, now, insert, _db, _opener = arrival
++    insert(5, "done", 8 * 3600)
++    monkeypatch.setattr(late, "group", lambda *a: (_ for _ in ()).throw(KeyError("owner_at")))
++    assert krn.collect(CHAT, "default", now=now) == []
++    assert _rows(ledger) == []
++    monkeypatch.undo()
++    monkeypatch.setattr(krn, "ledger_path", lambda: ledger)
++    monkeypatch.setattr(krn, "hub_db_path", lambda: replica)
++    again = krn.collect(CHAT, "default", now=now)
++    assert len(again) == 1 and len(again[0]["children"]) == 5
++
++
++@pytest.mark.parametrize("order", ["human_first", "done_first"])
++def test_mixed_group_wakes_once_in_either_order(arrival, order):
++    from tui_gateway import kanban_unloaded as ku
++
++    replica, ledger, now, _insert, db, opener = arrival
++    _put(replica, _mixed(now, order))
++    ku._reset_wake_budget_for_tests()
++    jobs, turns = [], []
++
++    def wake(tip, text, metadata):
++        turns.append((tip, text, metadata))
++        db.append_kanban_notice(tip, text, metadata)
++        return "started"
++
++    waker = ku._RemoteWaker(wake, lambda job: (jobs.append(job), "dispatched")[1], 0)
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=ledger, now=now, waker=waker)
++    assert [g["wake"] for g in got] == ["dispatched"] and len(jobs) == 1  # one batch, not skipped:human
++    assert jobs[0]() == "started"
++    (_tip, text, metadata), = turns
++    assert len(metadata["kanban_event_keys"]) == 2 and metadata["blocked_on_human"] is False
++    assert "t_mix_done" in text and "t_mix_human" in text
++    assert {d for _, d in _rows(ledger)} == {1} and len(db.get_messages(CHAT)) == 1
++    ku._reset_wake_budget_for_tests()
++
++
++@pytest.mark.parametrize("door", ["sweep", "collect"])
++def test_human_only_group_stays_passive(arrival, door):
++    from tui_gateway import kanban_unloaded as ku
++
++    replica, ledger, now, _insert, db, opener = arrival
++    cards = [_card(f"t_h{i}", CHAT, status="blocked", at=now - 8 * 3600 - i * 60) for i in range(3)]
++    for card in cards:
++        card["task"]["human_request"] = HUMAN
++    _put(replica, cards)
++    ku._reset_wake_budget_for_tests()
++    jobs = []
++    waker = ku._RemoteWaker(lambda *a: pytest.fail("human-only groups must not wake"),
++                            lambda job: (jobs.append(job), "dispatched")[1], 0)
++    if door == "collect":
++        group = krn.collect(CHAT, "default", now=now)[0]
++        assert group["blocked_on_human"] is True and len(group["children"]) == 3
++        return
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=ledger, now=now, waker=waker)
++    assert [g["wake"] for g in got] == ["skipped:human"] and jobs == []
++    assert {d for _, d in _rows(ledger)} == {1} and len(db.get_messages(CHAT)) == 1
++    ku._reset_wake_budget_for_tests()
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++def test_six_day_old_owner_time_is_explicit(arrival, door):
++    replica, ledger, now, insert, db, opener = arrival
++    cards = insert(2, "done", 6 * 86400)
++    if door == "collect":
++        text = krn.collect(CHAT, "default", now=now)[0]["text"]
++    else:
++        krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger, now=now)
++        text = db.get_messages(CHAT)[0]["content"]
++    zone = ZoneInfo("America/Los_Angeles")
++    assert text.startswith("Late notices")
++    for card, age in zip(cards, ("144h 0m", "144h 1m")):
++        stamp = datetime.fromtimestamp(krn._fresh_at(card["task"]), zone).strftime("%Y-%m-%d %H:%M %Z")
++        assert f"- {stamp} ({age} ago; not delivered then)" in text
+diff --git a/tests/tui_gateway/test_kanban_remote_overlap.py b/tests/tui_gateway/test_kanban_remote_overlap.py
+new file mode 100644
+index 0000000000..d388f1098b
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_overlap.py
+@@ -0,0 +1,211 @@
++"""A competing writer taking one member must not consume the rest of a late batch."""
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_errors import KanbanNoticeOverlapError
++
++from tests.tui_gateway.test_kanban_remote_late import arrival, _rows
++from tests.tui_gateway.test_kanban_remote_notices import CHAT
++from tui_gateway import kanban_remote_notices as krn
++
++
++def _seed_member(db, group):
++    child = group["children"][0]
++    db.append_kanban_notice(CHAT, child["text"], {
++        "notice_id": child["event_key"], "kanban_event_keys": [child["event_key"]]})
++    return child
++
++
++def _assert_once(db, keys):
++    rows = db.get_messages(CHAT)
++    stored = [k for row in rows for k in row["display_metadata"]["kanban_event_keys"]]
++    assert sorted(stored) == sorted(keys)
++    assert len(rows) == 2
++
++
++@pytest.mark.parametrize("same_id", [False, True])
++def test_partial_overlap_is_not_a_successful_record(arrival, same_id):
++    _, _, now, insert, db, _ = arrival
++    insert(3, "done", 8 * 3600)
++    group = krn.collect(CHAT, "default", now=now)[0]
++    child = _seed_member(db, group)
++    with pytest.raises(ValueError, match="partial.*overlap"):
++        db.record_kanban_notice(CHAT, group["text"], {
++            "notice_id": child["event_key"] if same_id else "overlapping-batch",
++            "kanban_event_keys": group["event_keys"]})
++    assert db.kanban_notice_keys_delivered(CHAT, group["event_keys"]) == {child["event_key"]}
++
++
++def test_poller_retries_partial_overlap_without_losing_or_repeating_members(arrival, monkeypatch):
++    from tui_gateway import server
++
++    _, ledger, now, insert, db, _ = arrival
++    insert(3, "done", 8 * 3600)
++    collect = krn.collect
++    monkeypatch.setattr(krn, "collect", lambda *a, **k: collect(*a, **{**k, "now": now}))
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    claims = []
++    texts = server._collect_remote_kanban_notifications(CHAT, claims)
++    group = claims[0]["remote"]
++    # Another consumer commits AFTER the poller has claimed/rendered the group.
++    child = _seed_member(db, group)
++    session = {"session_key": CHAT, "history": [], "_kanban_claims": claims}
++    verdict, fresh, _ = server._kb_persist_batch(session, texts, False)
++    assert verdict == "written"
++    assert child["text"] not in str(fresh[0])
++    server._kb_ack_durable(session, {id(t) for t in texts})
++    assert {d for _, d in _rows(ledger)} == {1}
++    _assert_once(db, group["event_keys"])
++
++
++@pytest.mark.parametrize("wake", [False, True])
++def test_sweep_partial_overlap_keeps_all_members_in_custody(arrival, wake):
++    replica, ledger, now, insert, db, opener = arrival
++    insert(3, "done", 8 * 3600)
++    original = db.append_kanban_notice
++    injected, keys = [], []
++
++    def competing_write(tip, text, metadata):
++        if len(metadata.get("kanban_event_keys", [])) > 1 and not injected:
++            keys.extend(metadata["kanban_event_keys"])
++            key = metadata["kanban_event_keys"][0]
++            injected.append(key)
++            original(tip, "Competing delivery", {"notice_id": key, "kanban_event_keys": [key]})
++        return original(tip, text, metadata)
++
++    db.append_kanban_notice = competing_write
++
++    class Waker:
++        grace_s = 0
++
++        def deliver(self, tip, text, metadata, task, at, *, persist, started):
++            return "persisted" if persist() else "deferred"
++
++    krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                             ledger=ledger, now=now, waker=Waker() if wake else None)
++    # A lost race can defer, but it must not mark absent members delivered.
++    assert len(keys) == 3
++    durable = db.kanban_notice_keys_delivered(CHAT, keys)
++    assert all(not delivered or key in durable for key, delivered in _rows(ledger))
++    krn._reset_for_tests()
++    krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                             ledger=ledger, now=now)
++    assert {d for _, d in _rows(ledger)} == {1}
++    _assert_once(db, keys)
++
++
++def test_record_rechecks_partial_overlap_inside_writer_transaction(arrival, monkeypatch):
++    _, _, now, insert, db, _ = arrival
++    insert(3, "done", 8 * 3600)
++    group = krn.collect(CHAT, "default", now=now)[0]
++    execute = db._execute_write
++    with SessionDB(db.db_path) as competitor:
++        def race(callback, **kwargs):
++            _seed_member(competitor, group)
++            return execute(callback, **kwargs)
++        monkeypatch.setattr(db, "_execute_write", race)
++        with pytest.raises(KanbanNoticeOverlapError, match="partial.*overlap"):
++            db.record_kanban_notice(CHAT, group["text"], {
++                "notice_id": "transaction-race", "kanban_event_keys": group["event_keys"]})
++    assert len(db.get_messages(CHAT)) == 1
++
++
++def test_poller_retries_a_race_after_its_prefilter(arrival, monkeypatch):
++    from tui_gateway import server
++
++    _, ledger, now, insert, db, _ = arrival
++    insert(3, "done", 8 * 3600)
++    collect = krn.collect
++    monkeypatch.setattr(krn, "collect", lambda *a, **k: collect(*a, **{**k, "now": now}))
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    claims = []
++    texts = server._collect_remote_kanban_notifications(CHAT, claims)
++    group = claims[0]["remote"]
++    session = {"session_key": CHAT, "history": [], "_kanban_claims": claims}
++    execute, raced = db._execute_write, []
++    with SessionDB(db.db_path) as competitor:
++        def race(callback, **kwargs):
++            if not raced:
++                raced.append(_seed_member(competitor, group))
++            return execute(callback, **kwargs)
++        monkeypatch.setattr(db, "_execute_write", race)
++        verdict, _, _ = server._kb_persist_batch(session, texts, False)
++        assert verdict == "busy" and "_submit_user_row" not in session
++        assert {d for _, d in _rows(ledger)} == {0}
++        verdict, fresh, _ = server._kb_persist_batch(session, texts, False)
++    assert verdict == "written"
++    assert raced[0]["text"] not in str(fresh[0])
++    server._kb_ack_durable(session, {id(t) for t in texts})
++    assert {d for _, d in _rows(ledger)} == {1}
++    _assert_once(db, group["event_keys"])
++
++
++def test_record_full_coverage_can_span_rows_without_a_write_lock(arrival, monkeypatch):
++    _, _, now, insert, db, _ = arrival
++    insert(2, "done", 8 * 3600)
++    group = krn.collect(CHAT, "default", now=now)[0]
++    for child in group["children"]:
++        db.append_kanban_notice(CHAT, child["text"], {
++            "notice_id": child["event_key"], "kanban_event_keys": [child["event_key"]]})
++    def no_write(*args, **kwargs):
++        pytest.fail("fully covered batch must not take the writer lock")
++    monkeypatch.setattr(db, "_execute_write", no_write)
++    _, inserted = db.record_kanban_notice(CHAT, group["text"], {
++        "notice_id": "different-batch", "kanban_event_keys": group["event_keys"]})
++    assert not inserted
++    _assert_once(db, group["event_keys"])
++
++
++def test_poller_fully_delivered_late_group_needs_no_second_row(arrival, monkeypatch):
++    from tui_gateway import server
++
++    _, ledger, now, insert, db, _ = arrival
++    insert(3, "done", 8 * 3600)
++    collect = krn.collect
++    monkeypatch.setattr(krn, "collect", lambda *a, **k: collect(*a, **{**k, "now": now}))
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    claims = []
++    texts = server._collect_remote_kanban_notifications(CHAT, claims)
++    group = claims[0]["remote"]
++    db.append_kanban_notice(CHAT, group["text"], {
++        "notice_id": "competing-group", "kanban_event_keys": group["event_keys"]})
++    session = {"session_key": CHAT, "history": [], "_kanban_claims": claims}
++    verdict, fresh, _ = server._kb_persist_batch(session, texts, False)
++    assert verdict == "delivered" and fresh == []
++    server._kb_ack_durable(session, {id(t) for t in texts})
++    assert len(db.get_messages(CHAT)) == 1 and {d for _, d in _rows(ledger)} == {1}
++
++
++def test_sweep_full_coverage_during_scan_does_not_wake(arrival, monkeypatch):
++    from tui_gateway import kanban_remote_late as late
++
++    replica, ledger, now, insert, db, opener = arrival
++    insert(3, "done", 8 * 3600)
++    flush = late.SweepBatches._flush_one
++
++    def race(self, profile, tip, entries):
++        for item, _, metadata, _ in entries:
++            db.append_kanban_notice(tip, item["text"], metadata)
++        return flush(self, profile, tip, entries)
++
++    monkeypatch.setattr(late.SweepBatches, "_flush_one", race)
++
++    class Waker:
++        grace_s = 0
++        def deliver(self, *args, **kwargs):
++            pytest.fail("fully delivered group must not wake")
++
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                 ledger=ledger, now=now, waker=Waker())
++    assert [entry["wake"] for entry in got] == ["delivered"]
++    assert len(db.get_messages(CHAT)) == 3 and {d for _, d in _rows(ledger)} == {1}
++
++
++@pytest.mark.parametrize("count", [19, 20, 21])
++def test_group_cap_boundary_keeps_all_keys(arrival, count):
++    _, _, now, insert, _db, _ = arrival
++    insert(count, "done", 8 * 3600)
++    group = krn.collect(CHAT, "default", now=now)[0]
++    assert len(group["event_keys"]) == count
++    assert group["text"].count("not delivered then") == min(20, count)
++    assert (f"+{count - 20} more" in group["text"]) == (count > 20)
+diff --git a/tui_gateway/kanban_remote_late.py b/tui_gateway/kanban_remote_late.py
+new file mode 100644
+index 0000000000..1a15477e0a
+--- /dev/null
++++ b/tui_gateway/kanban_remote_late.py
+@@ -0,0 +1,167 @@
++"""Presentation and grouped custody for eligible remote arrivals with old owner times."""
++from __future__ import annotations
++
++import contextlib
++import logging
++import sqlite3
++from datetime import datetime
++from functools import partial
++from zoneinfo import ZoneInfo
++
++logger = logging.getLogger(__name__)
++
++
++def owner_time(task: dict, now: float):
++    from tui_gateway import kanban_remote_notices as notices
++
++    at = notices._fresh_at(task)
++    return at if at is not None and now - at > notices.FRESH_S else None
++
++
++def representative(items: list[dict]) -> dict:
++    """The member that speaks for the group's wake policy: the first one that is not parked on a human, so a
++    done card is not silenced by a human-blocked sibling. An all-human group keeps its first member (passive)."""
++    return next((item for item in items if not item.get("blocked_on_human")), items[0])
++
++
++def release_undelivered(claims: list[dict], ledger) -> None:
++    """Hand back claims whose row is not in a transcript. Unlike ``release`` it never deletes a delivered row, so
++    it is safe after a partial failure. Never raises."""
++    from tui_gateway import kanban_remote_notices as notices
++
++    try:
++        with contextlib.closing(notices._ledger(ledger)) as conn:
++            with conn:
++                for claim in claims:
++                    conn.execute("DELETE FROM notices WHERE session=? AND ref=? AND state=? AND delivered=0",
++                                 (claim["session"], claim["ref"], claim["state"]))
++    except (sqlite3.Error, OSError, KeyError):
++        logger.warning("late remote notices: could not release %d claim(s)", len(claims), exc_info=True)
++
++
++def group(items: list[dict], now: float) -> dict:
++    """Keep the first member's legacy fields, but carry every real key and claim."""
++    lines = ["Late notices — remote updates:"]
++    zone = ZoneInfo("America/Los_Angeles")
++    for item in items[:20]:
++        at = item["owner_at"]
++        stamp = datetime.fromtimestamp(at, zone).strftime("%Y-%m-%d %H:%M %Z")
++        minutes = int((now - at) // 60)
++        age = f"{minutes // 60}h {minutes % 60}m"
++        lines.append(f"- {stamp} ({age} ago; not delivered then)\n{item['text']}")
++    if len(items) > 20:
++        lines.append(f"+{len(items) - 20} more")
++    return {**representative(items), "text": "\n".join(lines), "children": items, "late_at": now,
++            "event_keys": [item["event_key"] for item in items],
++            "blocked_on_human": all(item.get("blocked_on_human") for item in items)}
++
++
++def collect_groups(items: list[dict], now: float) -> list[dict]:
++    late = [item for item in items if item.get("owner_at") is not None]
++    regular = [item for item in items if item.get("owner_at") is None]
++    return regular + ([group(late, now)] if late else [])
++
++
++def missing_texts(batch: list, done: set) -> list:
++    """Re-render partially delivered late groups without changing original claim/text identities.
++
++    The transcript writer rechecks atomically, so a second race returns busy and repeats this on the next poll.
++    Original claims retain ALL children: the old rows plus the new row jointly secure their custody.
++    """
++    result = []
++    for text in batch:
++        item = getattr(text, "_kb_remote", {})
++        children = item.get("children")
++        if children and done.intersection(item["event_keys"]):
++            missing = [child for child in children if child["event_key"] not in done]
++            if not missing:
++                continue
++            remaining = group(missing, item["late_at"])
++            replacement = type(text)(remaining["text"])
++            replacement._kb_remote = remaining
++            replacement._kb_keys = tuple(remaining["event_keys"])
++            replacement._kb_blocked = remaining["blocked_on_human"]
++            text = replacement
++        if not (getattr(text, "_kb_keys", None) and set(text._kb_keys) <= done):
++            result.append(text)
++    return result
++
++
++class SweepBatches:
++    """Reuse the ordinary link guards/claims, deferring only delivery until the scan ends."""
++
++    def __init__(self, waker, session_db, ledger, now):
++        self.waker = waker
++        self.session_db = session_db
++        self.ledger = ledger
++        self.now = now
++        self.pending: dict[tuple, list] = {}
++        self.grace_s = waker.grace_s if waker is not None else 0
++
++    def target(self, owner, key, task, link, path):
++        from tui_gateway import kanban_remote_notices as notices
++
++        profile, sid = link["profile"], link["session"]
++        at = notices._terminal_at(task)
++        claim = {"session": sid, "ref": f"{owner}/{key}",
++                 "state": f"{task['status']}@{int(at) if at else 0}",
++                 "event_key": notices._shared_key(owner, key, task, profile, sid),
++                 "owner_at": notices._fresh_at(task)}
++        claim["notice_key"] = claim["event_key"]
++        memo = (str(path), profile, sid, notices._notice_id(owner, key, task, profile, sid))
++        batches = self
++
++        class Target:
++            grace_s = batches.grace_s
++
++            def deliver(self, tip, text, metadata, task, now, *, persist, started):
++                batches.pending.setdefault((profile, tip), []).append(
++                    ({**claim, "text": text, "blocked_on_human": metadata.get("blocked_on_human")},
++                     memo, metadata, task))
++                return "batched"
++
++        return Target()
++
++    def flush(self) -> list[dict]:
++        """Deliver one group per chat. A failure in one chat releases that chat's unpersisted claims and leaves
++        the others alone."""
++        delivered = []
++        pending, self.pending = self.pending, {}
++        for (profile, tip), entries in pending.items():
++            try:
++                delivered.append(self._flush_one(profile, tip, entries))
++            except (sqlite3.Error, OSError, ValueError, KeyError, TypeError, RuntimeError):
++                logger.warning("late remote notices for %s not delivered; claims released for the next pass",
++                               tip, exc_info=True)
++                release_undelivered([entry[0] for entry in entries], self.ledger)
++        return delivered
++
++    def _flush_one(self, profile, tip, entries) -> dict:
++        from tui_gateway import kanban_remote_notices as notices
++
++        claim = group([entry[0] for entry in entries], self.now)
++        claim["memo_keys"] = [entry[1] for entry in entries]
++        with self.session_db(profile, tip) as (db, target):
++            if db is None:
++                raise RuntimeError("late notice destination unavailable")
++            done = db.kanban_notice_keys_delivered(target, claim["event_keys"])
++        missing = [entry for entry in entries if entry[0]["event_key"] not in done]
++        if not missing:
++            notices._settle_claim(claim, entries[0][1], self.ledger)
++            return {"task_id": entries[0][3]["id"], "session_id": tip, "wake": "delivered"}
++        remaining = group([entry[0] for entry in missing], self.now)
++        rep = next(e for e in missing if e[0] is representative([x[0] for x in missing]))
++        metadata = {**rep[2], "kanban_event_keys": remaining["event_keys"],
++                    "blocked_on_human": remaining["blocked_on_human"]}
++        memo = entries[0][1]
++        sid = claim["session"]
++        text = remaining["text"]
++        persist = partial(notices._persist_claimed, self.session_db, profile, sid, text, metadata,
++                          claim, memo, self.ledger)
++        started = partial(notices._settle_started, self.session_db, profile, sid, claim["event_key"],
++                          claim, memo, self.ledger)
++        if self.waker is None:
++            result = "persisted" if persist() else "deferred"
++        else:
++            result = self.waker.deliver(tip, text, metadata, rep[3], self.now, persist=persist, started=started)
++        return {"task_id": rep[3]["id"], "session_id": tip, "wake": result}
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 8bffc92a23..3a83600683 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -363,7 +363,7 @@ def remote_blocked_on_human(task: dict) -> bool:
+         return False
+ 
+ 
+-def _notice_item(card: dict, session_key: str, me: str, profile: str) -> dict:
++def _notice_item(card: dict, session_key: str, me: str, profile: str, now: Optional[float] = None) -> dict:
+     task = card["task"]
+     sid = card.get("sid") or session_key
+     text = _completion_text(card["gw"], card["key"], task, me, profile, sid)
+@@ -374,6 +374,10 @@ def _notice_item(card: dict, session_key: str, me: str, profile: str) -> dict:
+         item["event_key"] = _event_key(card["gw"], card["key"], task["completion_notice"])
+     elif task.get("status") == "blocked" or _withdrawal(task) is not None:
+         item["event_key"] = _shared_key(card["gw"], card["key"], task, profile, sid)
++    if now is not None:
++        from tui_gateway.kanban_remote_late import owner_time
++        item["owner_at"] = owner_time(task, now)
++    item.setdefault("event_key", _shared_key(card["gw"], card["key"], task, profile, sid))
+     return item
+ 
+ 
+@@ -412,7 +416,7 @@ def _reconcile_legacy(conn, session_key: str, cards: list, now: float, transcrip
+             "WHERE session=? AND ref=? AND state=? AND delivered=1 AND IFNULL(legacy_seen,0)=0",
+             (pid, start, key, session_key, row["ref"], row["state"]))
+         if cur.rowcount == 1:
+-            out.append(_notice_item(card, session_key, me, profile))
++            out.append(_notice_item(card, session_key, me, profile, now))
+     if stale:
+         logger.info("remote kanban: left %d delivered notice(s) unreoffered "
+                     "(older than %.0fh, or not in the replica)", stale, FRESH_S / 3600)
+@@ -541,8 +545,10 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                 out.extend(_reconcile_legacy(conn, session_key, cards, now, transcript_has, me, profile))
+             offered = {(item["ref"], item["state"]) for item in out}
+             for card in cards:
+-                if len(out) >= MAX_PER_POLL:
+-                    break
++                from tui_gateway.kanban_remote_late import owner_time
++                if owner_time(card["task"], now) is None and sum(
++                        item.get("owner_at") is None for item in out) >= MAX_PER_POLL:
++                    continue
+                 task = card["task"]
+                 ref = f"{card['gw']}/{card['key']}"
+                 state = _notice_state(task)
+@@ -564,10 +570,18 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                                         notice_key=key, task_id=str(task["id"]), transcript_has=transcript_has,
+                                         swept_key=swept_key, settle_reason=reason)
+                 if verdict == "offer":
+-                    out.append(_notice_item(card, session_key, me, profile))
++                    out.append(_notice_item(card, session_key, me, profile, now))
++                    offered.add((ref, state))
+         finally:
+             conn.close()
+-        return out
++        from tui_gateway.kanban_remote_late import collect_groups, release_undelivered
++        try:
++            return collect_groups(out, now)
++        except (KeyError, TypeError, ValueError, OverflowError, OSError):
++            logger.warning("remote kanban: grouping late notices failed; releasing %d claim(s)", len(out),
++                           exc_info=True)
++            release_undelivered(out, ledger)
++            return []
+     except Exception:
+         logger.debug("remote kanban collect failed", exc_info=True)
+         return []
+@@ -575,6 +589,9 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+ 
+ def ack(claim: dict, *, ledger: Optional[Path] = None) -> bool:
+     """The notice is in the transcript: the in-flight row is delivered. Idempotent."""
++    if claim.get("children"):
++        results = [ack(child, ledger=ledger) for child in claim["children"]]
++        return all(results)
+     _forget_woken((claim.get("session"), claim.get("ref"), claim.get("state")))
+     try:
+         conn = _ledger(ledger)
+@@ -605,6 +622,9 @@ def ack(claim: dict, *, ledger: Optional[Path] = None) -> bool:
+ 
+ def release(claim: dict, *, ledger: Optional[Path] = None) -> bool:
+     """Hand a refused notice back so the chat's owning backend claims it on its next poll."""
++    if claim.get("children"):
++        results = [release(child, ledger=ledger) for child in claim["children"]]
++        return all(results)
+     try:
+         conn = _ledger(ledger)
+         try:
+@@ -876,8 +896,10 @@ def _settle_claim(claim: dict, memo_key: tuple, ledger) -> None:
+     """The notice is in the chat's transcript (a written row, or a started turn's row found by its key): ledger
+     delivered, memo and ``swept`` set."""
+     ack(claim, ledger=ledger)
+-    _record_swept([memo_key], ledger, reason="delivered")
+-    _remember_delivered(memo_key)
++    keys = claim.get("memo_keys", [memo_key])
++    _record_swept(keys, ledger, reason="delivered")
++    for key in keys:
++        _remember_delivered(key)
+ 
+ 
+ def _settle_started(session_db, profile: str, sid: str, event_key: str, claim: dict, memo_key: tuple,
+@@ -895,6 +917,10 @@ def _settle_started(session_db, profile: str, sid: str, event_key: str, claim: d
+     [daveey] The claim also follows the woken turn (``_track_woken``): the live session is looked up BEFORE the
+     transcript check, so a turn that ends with no row (context refused, an error before the persist) is
+     re-offered by this process's next pass instead of waiting for the backend to exit."""
++    if claim.get("children"):
++        results = [_settle_started(session_db, profile, child["session"], child["event_key"], child, key, ledger)
++                   for child, key in zip(claim["children"], claim["memo_keys"])]
++        return all(results)
+     tip = None
+     session = _live_woken_session(sid)
+     try:
+@@ -1044,6 +1070,20 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+ 
+ def _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept,
+                    counts, waker=None) -> None:
++    from tui_gateway.kanban_remote_late import SweepBatches
++
++    batches = SweepBatches(waker, session_db, ledger, now)
++    try:
++        _deliver_fresh_cards(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered,
++                             swept, counts, waker, batches)
++    finally:  # claims taken before an error still reach the flush, which delivers or releases them
++        delivered.extend(batches.flush())
++
++
++def _deliver_fresh_cards(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept,
++                         counts, waker, batches) -> None:
++    from tui_gateway.kanban_remote_late import owner_time
++
+     for owner, key, task, links in cards:
+         ref, state = f"{owner}/{key}", _notice_state(task)
+         observed_at = fresh_times.get((owner, key, state), _fresh_at(task))
+@@ -1051,9 +1091,12 @@ def _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger,
+             counts["stale"] = counts.get("stale", 0) + 1
+             continue
+         for link in links:
++            late = owner_time(task, now) is not None
++            target = batches.target(owner, key, task, link, path) if late else waker
++            results = [] if late else delivered
+             _deliver_link(owner, key, task, link, me=me, ref=ref, state=state, path=path, live=live,
+                           session_db=session_db, ledger=ledger, settled=settled,
+-                          delivered=delivered, swept=swept, waker=waker, observed_at=observed_at, now=now)
++                          delivered=results, swept=swept, waker=target, observed_at=observed_at, now=now)
+ 
+ 
+ def _sweep_snapshot(path, me: str) -> tuple:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index c08e81b28b..ae5e33e64e 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -925,8 +925,9 @@ def _collect_remote_kanban_notifications(session_key: str, claims: list | None)
+     texts = []
+     for item in found:
+         text = _KanbanText(item["text"])
++        text._kb_remote = item
+         if item.get("event_key"):
+-            text._kb_keys = (item["event_key"],)  # type: ignore[attr-defined]  # same identity the sweeper records
++            text._kb_keys = tuple(item.get("event_keys") or [item["event_key"]])  # type: ignore[attr-defined]
+         text._kb_blocked = bool(item.get("blocked_on_human"))  # type: ignore[attr-defined]  # notice guarantee
+         texts.append(text)
+         if claims is not None:
+@@ -1127,7 +1128,7 @@ def _kb_persist_batch(session: dict, batch: list, diagnostic: bool) -> tuple:
+     keys = _kb_text_keys(batch)
+     if not keys:
+         return "unkeyed", batch, {}
+-    from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
++    from hermes_state_errors import CompressionSessionClosedError, KanbanNoticeOverlapError, SessionTurnLeaseLostError
+     try:
+         with _session_db(session) as db:
+             if db is None or not hasattr(db, "record_kanban_notice"):
+@@ -1137,7 +1138,8 @@ def _kb_persist_batch(session: dict, batch: list, diagnostic: bool) -> tuple:
+                 return "unkeyed", batch, {}
+             done = db.kanban_notice_keys_delivered(target, keys)
+             from tui_gateway.kanban_claim_custody import fresh_texts
+-            fresh = fresh_texts(batch, done)
++            from tui_gateway.kanban_remote_late import missing_texts
++            fresh = fresh_texts(missing_texts(batch, done), done)
+             if not fresh:
+                 return "delivered", [], {}
+             text = "\n".join(fresh)
+@@ -1159,7 +1161,7 @@ def _kb_persist_batch(session: dict, batch: list, diagnostic: bool) -> tuple:
+                 return "busy", batch, {}  # raced another consumer for some of these keys: re-filter next poll
+             from hermes_state_outcome import refresh_outcomes_quietly
+             refresh_outcomes_quietly([target], "notice", db=db)  # [daveey] until its turn ends, the notice is the tail
+-    except (SessionTurnLeaseLostError, CompressionSessionClosedError):
++    except (SessionTurnLeaseLostError, CompressionSessionClosedError, KanbanNoticeOverlapError):
+         return "busy", batch, {}
+     except Exception as exc:
+         _notif_log_failure("kanban notice row write failed; the turn records it instead", exc)
+-- 
+2.43.0
+

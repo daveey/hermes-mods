@@ -1,0 +1,149 @@
+From 15891c47d708350f3090342391985e19d84bf120 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:05:31 +0000
+Subject: [PATCH] [daveey] Bound observer board opens without migration or
+ creation
+
+---
+ hermes_cli/kanban_dispatch_owner.py           |  7 ++-
+ hermes_cli/kanban_failed_result_observer.py   | 32 +++++++++++++-
+ .../test_kanban_failed_result_connection.py   | 44 +++++++++++++++++++
+ 3 files changed, 79 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_connection.py
+
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 96a0f537ea..2d8429b640 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -9,7 +9,7 @@ import sqlite3
+ import tempfile
+ 
+ 
+-def connect_with_identity(path, **kwargs):
++def connect_with_identity(path, *, existing_only=False, **kwargs):
+     """Capture the opened inode while native archive/delete cannot relocate it.
+ 
+     Ordinary clients may still connect during a tick. Such handles cannot later
+@@ -30,7 +30,10 @@ def connect_with_identity(path, **kwargs):
+     def open_once(remaining):
+         with lifecycle_access(canonical, remaining) as lock, _dispatch_tick_lock(canonical) as held:
+             recover(str(canonical))
+-            conn = connect_tracked(str(canonical), wait_for_tracking=False, **kwargs)
++            # Observer opens must never resurrect an archived/deleted board.
++            database = canonical.as_uri() + '?mode=rw' if existing_only else str(canonical)
++            options = {**kwargs, 'uri': True} if existing_only else kwargs
++            conn = connect_tracked(database, wait_for_tracking=False, **options)
+             conn._hermes_lifecycle_lock = lock
+             try:
+                 prepare_connection(conn, timeout)
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index 74265dffb9..58a3308c5b 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -5,6 +5,7 @@ result in a commit-to-launch gap. Never reads the owner's session store.
+ """
+ from __future__ import annotations
+ 
++import contextlib
+ import json
+ import os
+ import select
+@@ -66,16 +67,43 @@ def arm(context):
+     raise RuntimeError('independent failed-result observer did not acknowledge startup')
+ 
+ 
++@contextlib.contextmanager
++def connect_existing(path):
++    """Bounded native access without schema/init locks or board creation.
++
++    The result writer has already initialized this board. Preserve native inode,
++    generation and raw-file guards, but do not repeat migrations in the observer.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_dispatch_owner import connect_with_identity
++    from hermes_state_guard import ensure_kanban_test_isolation
++
++    path = Path(path)
++    ensure_kanban_test_isolation(path)
++    with contextlib.closing(connect_with_identity(
++            path, existing_only=True, isolation_level=None, timeout=.25)) as conn:
++        conn.row_factory = sqlite3.Row
++        conn.text_factory = kb._lossy_text
++        conn.execute('PRAGMA busy_timeout=250')
++        conn.execute('PRAGMA foreign_keys=ON')
++        conn.execute('PRAGMA synchronous=FULL')
++        conn.execute('PRAGMA secure_delete=ON')
++        conn.execute('PRAGMA cell_size_check=ON')
++        # Missing/old schema fails visibly instead of being migrated here.
++        conn.execute('SELECT current_run_id, claim_lock FROM tasks LIMIT 0')
++        conn.execute('SELECT ended_at FROM task_runs LIMIT 0')
++        yield conn
++
++
+ def observe(context):
+     from hermes_cli import kanban_db_dispatch as dispatch
+-    from hermes_cli.kanban_db_connect import connect_closing
+     from hermes_cli.kanban_failed_result import failed_result_proof, process_gone
+ 
+     path = Path(context['db'])
+     if not path.is_file():
+         # A removed board has no run to reconcile. Never recreate it on restart.
+         return
+-    with connect_closing(path) as conn:
++    with connect_existing(path) as conn:
+         if conn.execute('SELECT 1 FROM tasks WHERE id=? AND current_run_id=?',
+                         (context['task_id'], context['run_id'])).fetchone() is None:
+             return
+diff --git a/tests/hermes_cli/test_kanban_failed_result_connection.py b/tests/hermes_cli/test_kanban_failed_result_connection.py
+new file mode 100644
+index 0000000000..6a21b74807
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_connection.py
+@@ -0,0 +1,44 @@
++"""Observer access must not initialize, recreate, or wait minutes on a board."""
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as connections
++from hermes_cli import kanban_failed_result_observer as observer
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++board = fixtures.board
++
++
++def test_observer_connection_does_not_initialize(board, monkeypatch):
++    _, context = board
++    def forbidden(*args, **kwargs):
++        pytest.fail('observer must not initialize or migrate an existing board')
++    monkeypatch.setattr(connections, '_cross_process_init_lock', forbidden)
++    with observer.connect_existing(context['db']) as conn:
++        assert conn.execute('PRAGMA busy_timeout').fetchone()[0] == 250
++        assert conn.execute('PRAGMA foreign_keys').fetchone()[0] == 1
++        assert conn.execute('SELECT id FROM tasks').fetchone()[0] == context['task_id']
++        assert conn._dispatch_identity is not None
++
++
++def test_observer_connection_never_creates_missing_board(tmp_path):
++    path = tmp_path / 'missing.db'
++    with pytest.raises((FileNotFoundError, sqlite3.OperationalError)):
++        with observer.connect_existing(path):
++            pytest.fail('missing board opened')
++    assert not path.exists()
++
++
++def test_observer_connection_bounds_busy_wait(board):
++    conn, context = board
++    with kb.write_txn(conn):
++        start = time.monotonic()
++        with observer.connect_existing(context['db']) as other:
++            with pytest.raises(sqlite3.OperationalError, match='locked'):
++                other.execute('BEGIN IMMEDIATE')
++        assert time.monotonic() - start < 2
+-- 
+2.43.0
+

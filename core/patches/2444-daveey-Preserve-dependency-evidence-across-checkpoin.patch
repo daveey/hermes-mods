@@ -1,0 +1,607 @@
+From fa24324e485a6c971e86d65f7662c60285896a7a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:33:51 +0000
+Subject: [PATCH] [daveey] Preserve dependency evidence across checkpointed
+ queued moves
+
+---
+ hermes_cli/kanban.py                          |   3 +-
+ hermes_cli/kanban_db_dispatch_pr_state.py     |   3 +
+ hermes_cli/kanban_db_sync.py                  |  40 ++--
+ hermes_cli/kanban_dependency_review.py        |  14 +-
+ hermes_cli/kanban_move.py                     |   6 +-
+ hermes_cli/kanban_move_parent_evidence.py     |  88 +++++++++
+ .../test_kanban_move_parent_evidence.py       | 182 ++++++++++++++++++
+ .../hermes_cli/test_kanban_move_pr_handoff.py | 166 ++++++++++++++++
+ 8 files changed, 484 insertions(+), 18 deletions(-)
+ create mode 100644 hermes_cli/kanban_move_parent_evidence.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_parent_evidence.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_pr_handoff.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 5bdee85986..dcad654cea 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -900,7 +900,8 @@ def _cmd_move(args: argparse.Namespace) -> int:
+             else:
+                 res = km.move_reclaim(conn, args.task_id, runs_on=labels, reason=args.reason, force=args.force)
+         else:
+-            res = km.move_queued(conn, args.task_id, runs_on=labels, reason=args.reason, force=args.force)
++            res = km.move_queued(conn, args.task_id, runs_on=labels, reason=args.reason,
++                                 checkpoint=args.checkpoint or "", force=args.force)
+     if getattr(args, "json", False):
+         print(json.dumps(res))
+     elif res.get("ok"):
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 1e4741cca6..04d17ed2e9 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -399,6 +399,9 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+         result = conn.execute(
+             "SELECT metadata, summary FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (parent,),
+         ).fetchone()
++        if result is None:
++            from hermes_cli.kanban_move_parent_evidence import result as moved_parent_result
++            result = moved_parent_result(conn, task_id, parent)
+         if result is None:
+             # A synced parent another gateway owns has no local run to read. When the
+             # owner's checkpoint names it as already done at park time (in parents,
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 8e7270cd6c..6289464e36 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -351,22 +351,34 @@ def refresh_remote_parents(live: sqlite3.Connection, replica: sqlite3.Connection
+         return []
+     wanted = [r[0] for r in live.execute(
+         "SELECT DISTINCT l.parent_id FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id WHERE p.id IS NULL")]
+-    found: dict[str, str] = {}
+-    for i in range(0, len(wanted), 500):
+-        chunk = wanted[i:i + 500]
+-        found.update({r[0]: r[1] for r in replica.execute(
+-            f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk)})
+-    current = {r[0]: r[1] for r in live.execute(f"SELECT parent_id, status FROM {REMOTE_PARENTS_TABLE}")}
+-    if current == found:
+-        return []
+-    changed = sorted(k for k in set(current) | set(found) if current.get(k) != found.get(k))
+-    now = int(time.time())
++    from hermes_cli import kanban_move_parent_evidence as evidence
+     from hermes_cli.kanban_db_connect import write_txn
++
++    # Status and result must describe the same replica snapshot. A savepoint also
++    # composes with callers already reading a transaction on this connection.
++    replica.execute("SAVEPOINT move_parent_snapshot")
++    try:
++        found: dict[str, str] = {}
++        for i in range(0, len(wanted), 500):
++            chunk = wanted[i:i + 500]
++            found.update({r[0]: r[1] for r in replica.execute(
++                f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk)})
++        values, evidence_changed = evidence.prepare(live, replica, wanted)
++    finally:
++        replica.execute("RELEASE move_parent_snapshot")
++    current = {r[0]: r[1] for r in live.execute(f"SELECT parent_id, status FROM {REMOTE_PARENTS_TABLE}")}
++    changed = {k for k in set(current) | set(found) if current.get(k) != found.get(k)}
++    if not changed and not evidence_changed:
++        return []  # An unchanged sync round must not acquire a primary write lock.
+     with write_txn(live):
+-        live.execute(f"DELETE FROM {REMOTE_PARENTS_TABLE}")
+-        live.executemany(f"INSERT INTO {REMOTE_PARENTS_TABLE} (parent_id, status, refreshed_at) VALUES (?, ?, ?)",
+-                         [(pid, st, now) for pid, st in found.items()])
+-    return changed
++        if evidence_changed:
++            evidence.apply(live, values)
++        if changed:
++            now = int(time.time())
++            live.execute(f"DELETE FROM {REMOTE_PARENTS_TABLE}")
++            live.executemany(f"INSERT INTO {REMOTE_PARENTS_TABLE} (parent_id, status, refreshed_at) VALUES (?, ?, ?)",
++                             [(pid, st, now) for pid, st in found.items()])
++    return sorted(changed | set(evidence_changed))
+ 
+ 
+ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index cf71375df4..982f5d6b98 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -89,7 +89,19 @@ def _completed_review_run(conn, parent_id, parked_at, owner_run_id):
+         "WHERE t.id = ? AND t.status = 'done' ORDER BY r.id DESC LIMIT 1",
+         (parent_id,),
+     ).fetchone()
+-    if (row is None or not row["was_claimed"] or row["outcome"] != "completed"
++    if row is None:
++        # A checkpointed move can leave the parent's run on another gateway.
++        # Use the refreshed Board result, never a move-supplied verdict or a
++        # source database's integer run ID as a local identity.
++        from hermes_cli.kanban_move_parent_evidence import result
++        owner = conn.execute("SELECT task_id FROM task_runs WHERE id = ?", (owner_run_id,)).fetchone()
++        mirrored = result(conn, owner[0], parent_id) if owner else None
++        if (mirrored and mirrored.get("parent_status") == "done" and mirrored.get("was_claimed")
++                and mirrored.get("outcome") == "completed"
++                and (kb._to_epoch(mirrored.get("ended_at")) or 0) >= parked_at):
++            return mirrored
++        return None
++    if (not row["was_claimed"] or row["outcome"] != "completed"
+             or row["id"] == owner_run_id
+             or (kb._to_epoch(row["ended_at"]) or 0) < parked_at):
+         return None
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 565958d752..2ff22b44c3 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -214,7 +214,7 @@ def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: s
+     return out
+ 
+ 
+-def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, force: bool = False,
++def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, checkpoint: str = "", force: bool = False,
+                 machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
+                 cfg: Optional[dict] = None, hub: Any = None) -> dict[str, Any]:
+     """Move a card that is NOT running (ready/todo/scheduled/blocked/triage): same guards, no run to end.
+@@ -247,7 +247,9 @@ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason:
+         kb._append_event(conn, task_id, MOVED_EVENT, {
+             "from_machine": plan["me"], "runs_on": plan["runs_on"], "previous_runs_on": plan["previous"],
+             "reason": reason[:500], "move_no": plan["move_no"], "forced": plan["forced"],
+-            "matches": plan["matches"], "queued": True})
++            "matches": plan["matches"], "queued": True, "checkpoint": checkpoint.strip()})
++        if checkpoint.strip():
++            kb.add_comment(conn, task_id, "kanban-operator", f"Move checkpoint:\n\n{checkpoint.strip()}")
+     return {"ok": True, "runs_on": plan["runs_on"], "matches": plan["matches"], "move_no": plan["move_no"],
+             "status": row["status"]}
+ 
+diff --git a/hermes_cli/kanban_move_parent_evidence.py b/hermes_cli/kanban_move_parent_evidence.py
+new file mode 100644
+index 0000000000..678f84a680
+--- /dev/null
++++ b/hermes_cli/kanban_move_parent_evidence.py
+@@ -0,0 +1,88 @@
++"""Move-scoped mirror of dependency results; never an exemption from PR policy.
++
++The primary file owns only this gateway's cards. Moving a parked owner must not
++lose the parent results the ordinary dependency/review checks need. Refresh these
++from the Board replica together with foreign parent statuses, not from move prose.
++"""
++from __future__ import annotations
++
++import json
++
++_TABLE = "kanban_move_parent_results"
++
++
++def prepare(live, replica, wanted):
++    from hermes_cli import kanban_db as kb
++
++    # Do not copy arbitrary foreign histories: only dependencies of cards whose
++    # operator explicitly supplied a queued-move checkpoint need this evidence.
++    scoped = set()
++    for event in live.execute(
++        "SELECT e.task_id, e.payload FROM tasks t JOIN task_events e ON e.id = "
++        "(SELECT MAX(m.id) FROM task_events m WHERE m.task_id = t.id AND m.kind = 'moved') "
++        "WHERE t.status NOT IN ('done', 'archived')"
++    ):
++        payload = kb._json_dict(event["payload"])
++        checkpoint = payload.get("checkpoint")
++        if payload.get("queued") is True and isinstance(checkpoint, str) and checkpoint.strip():
++            scoped.update(kb.parent_ids(live, event["task_id"]))
++    values = []
++    for parent in sorted(set(wanted) & scoped):
++        row = replica.execute(
++            "SELECT r.*, t.status AS parent_status, EXISTS (SELECT 1 FROM task_events e "
++            "WHERE e.task_id = r.task_id AND e.run_id = r.id AND e.kind = 'claimed') AS was_claimed "
++            "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE t.id = ? "
++            "ORDER BY r.id DESC LIMIT 1", (parent,),
++        ).fetchone()
++        if row is not None:
++            values.append((parent, json.dumps(dict(row))))
++    exists = live.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_TABLE,)).fetchone()
++    current = dict(live.execute(f"SELECT parent_id, payload FROM {_TABLE}")) if exists else {}
++    updated = dict(values)
++    changed = sorted(k for k in set(current) | set(updated) if current.get(k) != updated.get(k))
++    return values, changed
++
++
++def apply(live, values):
++    """Caller owns the transaction shared with the parent-status refresh."""
++    live.execute(f"CREATE TABLE IF NOT EXISTS {_TABLE} (parent_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
++    live.execute(f"DELETE FROM {_TABLE}")
++    live.executemany(f"INSERT INTO {_TABLE} VALUES (?, ?)", values)
++
++
++def result(conn, task_id, parent_id):
++    """Read only for a checkpointed queued move of an orderly parked owner."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_unused_grant import latest_started_run
++
++    if kb.get_task(conn, parent_id) is not None:
++        return None  # A local parent's own rows always decide; no stale mirror fallback.
++    if parent_id not in dict(kb.parent_states(conn, task_id)):
++        return None
++    move = conn.execute(
++        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = 'moved' "
++        "ORDER BY id DESC LIMIT 1", (task_id,),
++    ).fetchone()
++    if move is None:
++        return None
++    payload = kb._json_dict(move["payload"])
++    checkpoint = payload.get("checkpoint")
++    if payload.get("queued") is not True or not isinstance(checkpoint, str) or not checkpoint.strip():
++        return None
++    run = latest_started_run(conn, task_id)
++    if run is None or run["outcome"] != "blocked":
++        return None
++    ended = kb._to_epoch(run["ended_at"])
++    moved = kb._to_epoch(move["created_at"])
++    if ended is None or moved is None or moved < ended:
++        return None
++    faults = conn.execute(
++        "SELECT created_at FROM task_events WHERE task_id = ? "
++        "AND kind IN ('crashed', 'reclaimed', 'timed_out')", (task_id,),
++    )
++    if any((kb._to_epoch(e[0]) or 0) >= ended for e in faults):
++        return None
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_TABLE,)).fetchone():
++        return None
++    row = conn.execute(f"SELECT payload FROM {_TABLE} WHERE parent_id = ?", (parent_id,)).fetchone()
++    return kb._json_dict(row[0]) if row else None
+diff --git a/tests/hermes_cli/test_kanban_move_parent_evidence.py b/tests/hermes_cli/test_kanban_move_parent_evidence.py
+new file mode 100644
+index 0000000000..83b0a0cb8f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_parent_evidence.py
+@@ -0,0 +1,182 @@
++"""Fail-closed boundaries of the move-scoped foreign-result reader."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_move_parent_evidence as evidence
++from hermes_cli import kanban_unused_grant
++from tests.hermes_cli import test_kanban_dependency_pr_handoff as helpers
++from tests.hermes_cli import test_kanban_move as moves
++
++svc = moves.svc
++gws = moves.gws
++
++
++@pytest.fixture
++def moved_parent(gws, monkeypatch):
++    hub, worker = gws
++    hub.enter()
++    task, _run, clock = helpers.park(hub.conn, monkeypatch)
++    parent = kb.parent_ids(hub.conn, task)[0]
++    clock[0] += 1
++    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++                          checkpoint="Resume existing PR")["ok"]
++    # Use the source's real evidence with an independent primary. No dispatch
++    # claim consumes the checkpoint before individual reader boundaries run.
++    from hermes_cli import kanban_db_dispatch_pr_state as prs
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    hub.round()
++    worker.round()
++    # A short review SHA deliberately holds target dispatch while importing it.
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
++                         (json.dumps({"verdict": "approve", "reviewed_sha": "short", "pr": helpers.PR}), parent))
++    hub.round()
++    worker.round()
++    assert (task, "active_pr") in worker.tick().respawn_guarded
++    assert evidence.result(worker.conn, task, parent)
++    return hub, worker, task, parent
++
++
++@pytest.mark.parametrize("case", [
++    "local_parent", "not_parent", "missing_move", "queued_false", "checkpoint_list",
++    "checkpoint_blank", "missing_run", "outcome", "unfinished", "bad_end", "bad_move",
++    "move_before_end", "crashed", "reclaimed", "timed_out", "missing_table", "missing_row",
++])
++def test_reader_rejects_invalid_custody(moved_parent, monkeypatch, case):
++    _, worker, task, parent = moved_parent
++    conn = worker.conn
++    if case == "local_parent":
++        original = kb.get_task
++        monkeypatch.setattr(kb, "get_task", lambda c, t: object() if t == parent else original(c, t))
++    elif case == "not_parent":
++        monkeypatch.setattr(kb, "parent_states", lambda *a: [])
++    elif case == "missing_move":
++        conn.execute("DELETE FROM task_events WHERE task_id = ? AND kind = 'moved'", (task,))
++    elif case in ("queued_false", "checkpoint_list", "checkpoint_blank"):
++        payload = {"queued": True, "checkpoint": "Resume"}
++        if case == "queued_false":
++            payload["queued"] = False
++        else:
++            payload["checkpoint"] = ["Resume"] if case == "checkpoint_list" else "   "
++        conn.execute("UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'moved'",
++                     (json.dumps(payload), task))
++    elif case in ("missing_run", "outcome", "unfinished", "bad_end"):
++        run = dict(kanban_unused_grant.latest_started_run(conn, task))
++        if case == "outcome":
++            run["outcome"] = "crashed"
++        elif case == "unfinished":
++            run["ended_at"] = None
++        elif case == "bad_end":
++            run["ended_at"] = "invalid"
++        monkeypatch.setattr(kanban_unused_grant, "latest_started_run", lambda *a: None if case == "missing_run" else run)
++    elif case in ("bad_move", "move_before_end"):
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'moved'",
++                     ("invalid" if case == "bad_move" else 1, task))
++    elif case in ("crashed", "reclaimed", "timed_out"):
++        kb._append_event(conn, task, case, {})
++    elif case == "missing_table":
++        conn.execute("DROP TABLE kanban_move_parent_results")
++    else:
++        conn.execute("DELETE FROM kanban_move_parent_results")
++    assert evidence.result(conn, task, parent) is None
++
++
++def test_unchanged_sync_does_not_write_and_removed_parent_drops_evidence(moved_parent):
++    hub, worker, task, parent = moved_parent
++    sync.refresh_remote_parents(worker.conn, hub.conn)
++    statements = []
++    worker.conn.set_trace_callback(statements.append)
++    try:
++        assert sync.refresh_remote_parents(worker.conn, hub.conn) == []
++    finally:
++        worker.conn.set_trace_callback(None)
++    assert not any(s.startswith(("BEGIN", "CREATE", "DELETE", "INSERT", "UPDATE")) for s in statements)
++    hub.conn.execute("DELETE FROM task_runs WHERE task_id = ?", (parent,))
++    assert sync.refresh_remote_parents(worker.conn, hub.conn) == [parent]
++    assert evidence.result(worker.conn, task, parent) is None
++
++
++@pytest.mark.parametrize("case", ["queued_false", "checkpoint_list", "checkpoint_blank", "latest", "done", "archived", "unwanted"])
++def test_prepare_scopes_only_latest_active_checkpoint(moved_parent, case):
++    hub, worker, task, parent = moved_parent
++    assert evidence.prepare(worker.conn, hub.conn, [parent])[0]
++    payload = {"queued": True, "checkpoint": "Resume"}
++    wanted = [parent]
++    if case == "queued_false":
++        payload["queued"] = False
++    elif case == "checkpoint_list":
++        payload["checkpoint"] = ["Resume"]
++    elif case == "checkpoint_blank":
++        payload["checkpoint"] = "   "
++    elif case == "latest":
++        payload = {"queued": True}
++    elif case in ("done", "archived"):
++        worker.conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (case, task))
++    else:
++        wanted = []
++    kb._append_event(worker.conn, task, "moved", payload)
++    values, changed = evidence.prepare(worker.conn, hub.conn, wanted)
++    assert values == []
++    assert changed == [parent]
++
++
++@pytest.mark.parametrize("case", ["valid", "not_done", "not_claimed", "not_completed", "before_park", "missing_owner", "missing_evidence"])
++def test_completed_review_requires_foreign_completion(moved_parent, case):
++    from hermes_cli.kanban_dependency_review import _completed_review_run
++
++    _, worker, task, parent = moved_parent
++    owner = kanban_unused_grant.latest_started_run(worker.conn, task)
++    parked_at = kb._to_epoch(owner["ended_at"])
++    mirrored = evidence.result(worker.conn, task, parent)
++    assert mirrored["parent_status"] == "done"
++    assert mirrored["was_claimed"]
++    assert mirrored["outcome"] == "completed"
++    mirrored["ended_at"] = parked_at
++    if case == "not_done":
++        mirrored["parent_status"] = "ready"
++    elif case == "not_claimed":
++        mirrored["was_claimed"] = False
++    elif case == "not_completed":
++        mirrored["outcome"] = "crashed"
++    elif case == "before_park":
++        mirrored["ended_at"] = parked_at - 1
++    worker.conn.execute("UPDATE kanban_move_parent_results SET payload = ? WHERE parent_id = ?",
++                        (json.dumps(mirrored), parent))
++    if case == "missing_evidence":
++        worker.conn.execute("DELETE FROM kanban_move_parent_results")
++    owner_id = -1 if case == "missing_owner" else owner["id"]
++    actual = _completed_review_run(worker.conn, parent, parked_at, owner_id)
++    assert actual == (mirrored if case == "valid" else None)
++
++
++def test_refresh_reads_status_and_result_in_one_snapshot(moved_parent, monkeypatch):
++    import sqlite3
++
++    hub, worker, task, parent = moved_parent
++    path = hub.conn.execute("PRAGMA database_list").fetchone()[2]
++    assert hub.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
++    original = evidence.prepare
++
++    def change_between_reads(live, replica, wanted):
++        other = sqlite3.connect(path, isolation_level=None)
++        try:
++            other.execute("BEGIN IMMEDIATE")
++            other.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
++            other.execute("UPDATE task_runs SET outcome = 'crashed' WHERE task_id = ?", (parent,))
++            other.commit()
++        finally:
++            other.close()
++        return original(live, replica, wanted)
++
++    monkeypatch.setattr(evidence, "prepare", change_between_reads)
++    sync.refresh_remote_parents(worker.conn, hub.conn)
++    assert dict(kb.parent_states(worker.conn, task))[parent] == "done"
++    assert evidence.result(worker.conn, task, parent)["outcome"] == "completed"
++    monkeypatch.setattr(evidence, "prepare", original)
++    sync.refresh_remote_parents(worker.conn, hub.conn)
++    assert dict(kb.parent_states(worker.conn, task))[parent] == "ready"
++    assert evidence.result(worker.conn, task, parent)["outcome"] == "crashed"
+diff --git a/tests/hermes_cli/test_kanban_move_pr_handoff.py b/tests/hermes_cli/test_kanban_move_pr_handoff.py
+new file mode 100644
+index 0000000000..8cb8302afc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_pr_handoff.py
+@@ -0,0 +1,166 @@
++"""Moving an orderly PR owner preserves its dependency checkpoint across gateways."""
++import time
++from argparse import Namespace
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db_connect as kbc
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_move as km
++from tests.hermes_cli import test_kanban_dependency_pr_handoff as helpers
++from tests.hermes_cli import test_kanban_move as moves
++
++svc = moves.svc
++gws = moves.gws
++
++
++@pytest.mark.parametrize("reclaim", [False, True])
++def test_running_pr_owner_move(gws, monkeypatch, reclaim):
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    hub, worker = gws
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    task, run = moves._running_hub_card(hub)
++    worker_comment(hub.conn, task, "default", helpers.PR)
++    stopped = []
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, **kw: stopped.append(pid) or {
++        "prev_pid": pid, "host_local": True, "termination_attempted": True,
++        "terminated": True, "sigkill": False})
++    if reclaim:
++        result = km.move_reclaim(hub.conn, task, runs_on=["machine:worker-1"], reason="operator reclaim")
++        assert stopped
++    else:
++        result = km.move_task(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++                              checkpoint="Resume the existing PR", expected_run_id=run)
++    assert result["ok"], result
++    hub.round()
++    worker.round()
++    tick = worker.tick()
++    assert ((task, "active_pr") in tick.respawn_guarded) is reclaim
++    assert kb.get_task(worker.conn, task).status == ("ready" if reclaim else "running")
++
++
++@pytest.mark.parametrize("publication", [helpers.PR, "https://github.com/example/repo/pull/11"])
++def test_publication_after_park_is_not_authorized_by_move(gws, monkeypatch, publication):
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    hub, worker = gws
++    hub.enter()
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    task, _, clock = helpers.park(hub.conn, monkeypatch)
++    clock[0] += 1
++    worker_comment(hub.conn, task, "dev", publication)
++    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++                          checkpoint="Resume PR")["ok"]
++    hub.round()
++    worker.round()
++    assert (task, "active_pr") in worker.tick().respawn_guarded
++
++
++def test_parent_result_refresh_wakes_without_status_change(gws, monkeypatch):
++    import json
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_move_parent_evidence import result
++
++    hub, worker = gws
++    hub.enter()
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    task, _, clock = helpers.park(hub.conn, monkeypatch)
++    parent = kb.parent_ids(hub.conn, task)[0]
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
++                         (json.dumps({"verdict": "approve", "reviewed_sha": "short", "pr": helpers.PR}), parent))
++    clock[0] += 1
++    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++                          checkpoint="Resume PR")["ok"]
++    hub.round()
++    worker.round()
++    assert (task, "active_pr") in worker.tick().respawn_guarded
++    assert result(worker.conn, task, parent)["parent_status"] == "done"
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
++                         (json.dumps({"verdict": "approve", "reviewed_sha": "a" * 40, "pr": helpers.PR}), parent))
++    assert sync.refresh_remote_parents(worker.conn, hub.conn) == [parent]
++    assert prs.active_pr_reason(worker.conn, task, int(time.time())) is None
++    before = worker.conn.total_changes
++    assert sync.refresh_remote_parents(worker.conn, hub.conn) == []
++    assert worker.conn.total_changes == before
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
++    assert sync.refresh_remote_parents(worker.conn, hub.conn) == [parent]
++    assert result(worker.conn, task, parent)["parent_status"] == "ready"
++    assert prs.active_pr_reason(worker.conn, task, int(time.time())) == "active_pr"
++
++
++def test_operator_cli_preserves_checkpoint(gws, monkeypatch):
++    hub, _ = gws
++    hub.enter()
++    task = kb.create_task(hub.conn, title="move queued card", assignee="dev")
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    args = Namespace(task_id=task, runs_on="machine:worker-1", reason="capacity",
++                     checkpoint="Resume the existing PR, not a new implementation.",
++                     force=False, reclaim=False, json=True)
++    assert cli._cmd_move(args) == 0
++    with kbc.connect_closing() as conn:
++        event = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'moved'",
++                             (task,)).fetchone()
++        assert kb._json_dict(event[0]).get("checkpoint") == args.checkpoint
++
++
++
++@pytest.mark.parametrize("review,checkpoint,allowed", [
++    (False, "Resume existing PR", True),
++    (True, "Resume existing PR", True),
++    (False, "", False),
++    ("invalid", "Resume existing PR", False),
++])
++def test_operator_move_after_dependency_park(gws, monkeypatch, review, checkpoint, allowed):
++    hub, worker = gws
++    hub.enter()
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    task, _, clock = helpers.park(hub.conn, monkeypatch, finish=False)
++    clock[0] += 1
++    parent = kb.parent_ids(hub.conn, task)[0]
++    assert kb.claim_task(hub.conn, parent)
++    metadata = {"verdict": "approve", "reviewed_sha": "a" * 40, "pr": helpers.PR} if review else {}
++    if review == "invalid":
++        metadata["reviewed_sha"] = "short"
++    assert kb.complete_task(hub.conn, parent, summary="prerequisite finished", metadata=metadata)
++    kb.recompute_ready(hub.conn)
++    clock[0] += 1
++    result = km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="continue on worker",
++                            checkpoint=checkpoint)
++    assert result["ok"], result
++    hub.round()
++    worker.round()
++    tick = worker.tick()
++    if not allowed:
++        assert (task, "active_pr") in tick.respawn_guarded
++        return
++    assert (task, "active_pr") not in tick.respawn_guarded
++    moved = kb.get_task(worker.conn, task)
++    assert moved is not None and moved.status == "running", vars(tick)
++    assert prs.active_pr_reason(worker.conn, task, int(time.time())) == "active_pr"
++
++
++@pytest.mark.parametrize("outcome", ["crashed", "timed_out", "reclaimed"])
++def test_move_after_failed_run_stays_guarded(gws, monkeypatch, outcome):
++    hub, worker = gws
++    hub.enter()
++    monkeypatch.setattr(prs, "pr_state", lambda _: "OPEN")
++    task, run, clock = helpers.park(hub.conn, monkeypatch)
++    clock[0] += 1
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE task_runs SET outcome = ? WHERE id = ?", (outcome, run))
++        kb._append_event(hub.conn, task, outcome, {}, run_id=run)
++    result = km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="continue on worker",
++                            checkpoint="Resume existing PR after dependency completion")
++    assert result["ok"], result
++    assert prs.active_pr_reason(hub.conn, task, int(time.time())) == "active_pr"
++    hub.round()
++    worker.round()
++    tick = worker.tick()
++    assert (task, "active_pr") in tick.respawn_guarded
+-- 
+2.43.0
+

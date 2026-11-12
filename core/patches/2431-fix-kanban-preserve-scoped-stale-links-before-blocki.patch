@@ -1,0 +1,709 @@
+From 711eeb253ef4f8e342dfbf6288a567cfd162a18f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:53:41 +0000
+Subject: [PATCH] fix(kanban): preserve scoped stale links before blocking
+ reads [daveey]
+
+---
+ hermes_cli/kanban_chat_links.py               |  11 +-
+ hermes_cli/kanban_links_refresh.py            |  64 +++++++
+ hermes_cli/kanban_session_activity.py         |  72 ++++----
+ tests/hermes_cli/test_kanban_chat_links.py    |  26 +++
+ .../test_kanban_links_stale_controls.py       | 168 ++++++++++++++++++
+ .../test_kanban_links_stale_scopes.py         | 112 ++++++++++++
+ .../test_kanban_remote_inventory_cache.py     |   2 +-
+ tests/hermes_cli/test_web_links_stale.py      | 113 ++++++++++++
+ 8 files changed, 526 insertions(+), 42 deletions(-)
+ create mode 100644 hermes_cli/kanban_links_refresh.py
+ create mode 100644 tests/hermes_cli/test_kanban_links_stale_controls.py
+ create mode 100644 tests/hermes_cli/test_kanban_links_stale_scopes.py
+ create mode 100644 tests/hermes_cli/test_web_links_stale.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 16593588c4..2ee7ba8a15 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -379,14 +379,15 @@ def _owner_of(known: list[tuple[str, str, str, bool]], owner: Optional[str],
+     return (owner if owner is not None else gateways[0] if len(gateways) == 1 else None), "default"
+ 
+ 
+-def _ledger_fallback(board: str, gateway: str, profile: str, statuses: tuple[str, ...]) -> list[dict[str, Any]]:
++def _ledger_fallback(board: str, gateway: str, profile: str, statuses: tuple[str, ...], *,
++                     stale_ok: bool = False) -> list[dict[str, Any]]:
+     """Cold start with an unreadable replica: the ledger's rows for that board, all stale (never "no cards")."""
+     from hermes_cli.kanban_session_activity import _remote_links
+     try:
+-        cards = _remote_links()
+-    except Exception as exc:  # health: allow BLE001 -- both sources unreadable: nothing to show, logged
++        cards = _remote_links(stale_ok=True) if stale_ok else _remote_links()
++    except Exception as exc:  # health: allow BLE001 -- log both-source failure, then preserve the failed-read contract
+         _log.warning("kanban chat links: replica and ledger both unreadable for %s (%s)", board, exc)
+-        return []
++        raise
+     out = []
+     for c in cards:
+         if (c.get("board") != board or c.get("origin_gateway") not in (None, gateway)
+@@ -443,7 +444,7 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             _log.info("kanban chat links: replica %s unreadable (%s); %s", path, exc,
+                       "keeping its last rows as stale" if hit else "falling back to the ledger, stale")
+             if hit is None:
+-                for c in _ledger_fallback(board, gateway, profile, statuses):
++                for c in _ledger_fallback(board, gateway, profile, statuses, stale_ok=stale_ok):
+                     if ids is None or c["session"] in ids:
+                         out.setdefault((c["session"], c["key"]), c)
+                 continue
+diff --git a/hermes_cli/kanban_links_refresh.py b/hermes_cli/kanban_links_refresh.py
+new file mode 100644
+index 0000000000..89c045a818
+--- /dev/null
++++ b/hermes_cli/kanban_links_refresh.py
+@@ -0,0 +1,64 @@
++"""Bounded, context-captured background checks of last-good link projections."""
++from contextvars import Context, copy_context
++import logging
++import threading
++from collections.abc import Callable
++
++_log = logging.getLogger(__name__)
++
++
++class ScopeRefresher:
++    """One lazy process-lifetime daemon; pending and active scopes share one bound.
++
++    No projection IO runs under the condition. Each job owns its captured context,
++    which is released before the worker goes idle. Repeated polls of an active or
++    queued scope coalesce. A full queue leaves last-good data intact; a later poll
++    retries admission. Cold and strict reads do not use this worker.
++    """
++
++    def __init__(self, refresh: Callable[[tuple], None], capacity: int):
++        self._refresh = refresh
++        self._capacity = capacity
++        self._ready = threading.Condition()
++        self._pending: dict[tuple, Context] = {}
++        self._worker: threading.Thread | None = None
++
++    @property
++    def busy(self) -> bool:
++        with self._ready:
++            return bool(self._pending)
++
++    def submit(self, scope: tuple) -> None:
++        with self._ready:
++            if scope in self._pending or len(self._pending) >= self._capacity:
++                return
++            self._pending[scope] = copy_context()
++            self._ready.notify()
++            if self._worker is not None:
++                return
++            try:
++                # Explicit empty outer context: only each queued job carries scope.
++                worker = threading.Thread(target=Context().run, args=(self._run,),
++                                          daemon=True, name='kanban-remote-links')
++                worker.start()
++                self._worker = worker
++            except RuntimeError:
++                self._pending.clear()
++                _log.warning('kanban remote links: could not start background refresh', exc_info=True)
++
++    def _run(self) -> None:
++        while True:
++            with self._ready:
++                while not self._pending:
++                    self._ready.wait()
++                scope = next(iter(self._pending))
++                context = self._pending[scope]
++            try:
++                context.run(self._refresh, scope)
++            except Exception:  # health: allow BLE001 -- refresh failure retains last-good data; later polls retry
++                _log.warning('kanban remote links: background rebuild failed; serving the previous projection',
++                             exc_info=True)
++            finally:
++                with self._ready:
++                    del self._pending[scope]
++                context = None  # release captured request/profile values before going idle
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 17cb454c8e..933fdb3756 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -36,6 +36,7 @@ from hermes_cli.kanban_session_activity_attention import AttentionCache as _Atte
+ from hermes_cli.kanban_session_activity_attention import run_checks as _run_done_checks
+ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ from hermes_cli.kanban_watch import not_watch_sql as _not_watch
++from hermes_cli.kanban_links_refresh import ScopeRefresher
+ import contextlib
+ import json
+ import logging
+@@ -948,7 +949,8 @@ def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
+ _links_lock = threading.Lock()
+ # (expires, scope, fingerprint, cards, origin rows): origin rows are the ledger ``project()`` rows the cards came
+ # from, released ones included (``remote_links_and_origin_rows``).
+-_links_cache: tuple[float, tuple, tuple, list[dict[str, Any]], list[dict[str, Any]]] | None = None
++_LINKS_SCOPE_CAP = 16
++_links_cache: dict[tuple, tuple] = {}
+ _origin_rows_sink = threading.local()  # .rows: set by _project_remote_links for _store_links
+ 
+ 
+@@ -1011,20 +1013,20 @@ def _links_entry(stale_ok: bool, *, with_rows: bool = False):
+ 
+ 
+ def _links_lookup(scope: tuple, stale_ok: bool) -> tuple:
++    hit = _links_cache.get(scope)
++    # Even revision/fingerprint reads can wait on Python locks. A matching warm
++    # stale read must precede ALL of that work; an evicted/cold scope still waits.
++    if stale_ok and hit is not None:
++        _refresh_links_in_background(scope)
++        return hit
+     fingerprint = _links_fingerprint()
+-    hit = _links_cache
+-    if hit is not None and hit[1] == scope:
+-        fresh = hit[2] == fingerprint and time.monotonic() < hit[0]
+-        if fresh:
+-            return hit
+-        if stale_ok:
+-            _refresh_links_in_background(scope)
+-            return hit
++    if hit is not None and hit[2] == fingerprint and time.monotonic() < hit[0]:
++        return hit
+     with _links_lock:
+-        hit = _links_cache
+-        if hit is not None and hit[1] == scope and hit[2] == fingerprint and time.monotonic() < hit[0]:
++        hit = _links_cache.get(scope)
++        if hit is not None and hit[2] == fingerprint and time.monotonic() < hit[0]:
+             return hit
+-        if stale_ok and hit is not None and hit[1] == scope:
++        if stale_ok and hit is not None:
+             return hit
+         return _store_links(scope, fingerprint)
+ 
+@@ -1039,36 +1041,34 @@ def _store_links(scope: tuple, fingerprint: tuple) -> tuple:
+         rows = _origin_rows_sink.rows
+     finally:
+         _origin_rows_sink.rows = None
+-    _links_cache = (time.monotonic() + _LINKS_MAX_AGE_S, scope, fingerprint, cards, rows)
+-    return _links_cache
++    entry = (time.monotonic() + _LINKS_MAX_AGE_S, scope, fingerprint, cards, rows)
++    # Copy-on-publish keeps lock-free readers from seeing an intermediate eviction.
++    updated = dict(_links_cache)
++    updated.pop(scope, None)
++    updated[scope] = entry
++    while len(updated) > _LINKS_SCOPE_CAP:
++        del updated[next(iter(updated))]
++    _links_cache = updated
++    return entry
+ 
+ 
+-_links_refreshing = False
+-_links_refresh_guard = threading.Lock()
++def _refresh_links_in_background(scope: tuple) -> None:
++    _links_refresher.submit(scope)
+ 
+ 
+-def _refresh_links_in_background(scope: tuple) -> None:
+-    """At most one background rebuild at a time; readers keep the previous projection meanwhile."""
+-    global _links_refreshing
+-    with _links_refresh_guard:
+-        if _links_refreshing:
++def _refresh_links_scope(scope: tuple) -> None:
++    with _links_lock:
++        # ContextVars carry profile/home/board overrides. Process environment may have
++        # changed meanwhile: never publish another origin's projection under this key.
++        if _origin_scope() != scope:
+             return
+-        _links_refreshing = True
++        fingerprint = _links_fingerprint()
++        hit = _links_cache.get(scope)
++        if hit is None or hit[2] != fingerprint or time.monotonic() >= hit[0]:
++            _store_links(scope, fingerprint)
+ 
+-    def run() -> None:
+-        global _links_refreshing
+-        try:
+-            with _links_lock:
+-                fingerprint = _links_fingerprint()
+-                if _origin_scope() == scope:
+-                    _store_links(scope, fingerprint)
+-        except Exception:  # health: allow BLE001 -- a failed rebuild keeps the previous projection; readers must not fail
+-            _log.warning("kanban remote links: background rebuild failed; serving the previous projection", exc_info=True)
+-        finally:
+-            with _links_refresh_guard:
+-                _links_refreshing = False
+ 
+-    threading.Thread(target=run, daemon=True, name="kanban-remote-links").start()
++_links_refresher = ScopeRefresher(lambda scope: _refresh_links_scope(scope), _LINKS_SCOPE_CAP)
+ 
+ 
+ def _project_remote_links() -> list[dict[str, Any]]:
+@@ -1940,7 +1940,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+         _board_memo.clear()
+     _busy.reset()
+     with _links_lock:
+-        _links_cache = None
++        _links_cache.clear()
+     with _cache_lock:
+         _cache = None
+         _count_scopes.reset_locked()
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index fad1852e8b..5957510c51 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -37,6 +37,32 @@ def live(kanban_home):
+         ksa._reset_cache_for_tests()
+ 
+ 
++@pytest.mark.parametrize('stale_ok', [True, False])
++def test_unreadable_replica_fallback_preserves_stale_policy(tmp_path, monkeypatch, stale_ok):
++    from hermes_cli import profiles
++
++    calls = []
++
++    def remote_links(stale_ok=False):
++        calls.append(stale_ok)
++        return [_ledger_row('t_prior', 's1')]
++
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(ksa, '_remote_links', remote_links)
++    rows = links.replica_cards(['s1'], ME, replicas=[('default', tmp_path / 'absent.db')], stale_ok=stale_ok)
++    assert calls == [stale_ok]
++    assert [(r['id'], r['stale'], r['source']) for r in rows] == [('t_prior', True, 'ledger-fallback')]
++
++
++def test_unreadable_replica_and_cold_ledger_failure_is_not_empty(tmp_path, monkeypatch):
++    def fail(stale_ok=False):
++        raise sqlite3.OperationalError('ledger unreadable')
++
++    monkeypatch.setattr(ksa, '_remote_links', fail)
++    with pytest.raises(sqlite3.OperationalError, match='ledger unreadable'):
++        links.replica_cards(['s1'], ME, replicas=[('default', tmp_path / 'absent.db')], stale_ok=True)
++
++
+ def _links(conn):
+     return {(r[0], r[1], r[2], r[3]) for r in conn.execute(
+         "SELECT task_id, chat_session, kind, released FROM task_chat_links ORDER BY task_id")}
+diff --git a/tests/hermes_cli/test_kanban_links_stale_controls.py b/tests/hermes_cli/test_kanban_links_stale_controls.py
+new file mode 100644
+index 0000000000..e8e992c82c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_stale_controls.py
+@@ -0,0 +1,168 @@
++"""Bounds and failure controls for last-good linked-card projections."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from tests.waiting import wait_until
++
++
++@pytest.fixture
++def cache(monkeypatch):
++    scope, revision = ['A'], [0]
++    calls = []
++    monkeypatch.setattr(activity, '_origin_scope', lambda: (scope[0],))
++    monkeypatch.setattr(activity, '_links_fingerprint', lambda: (revision[0],))
++
++    def project():
++        calls.append(scope[0])
++        return [{'id': scope[0], 'revision': revision[0]}]
++
++    monkeypatch.setattr(activity, '_project_remote_links', project)
++    activity._reset_cache_for_tests()
++    yield scope, revision, calls
++    wait_until(lambda: not activity._links_refresher.busy, what='refresh cleanup')
++    activity._reset_cache_for_tests()
++
++
++def test_worker_start_failure_can_retry(monkeypatch):
++    import threading
++    from hermes_cli.kanban_links_refresh import ScopeRefresher
++
++    called = []
++    refresher = ScopeRefresher(called.append, 16)
++
++    def fail_start(thread):
++        raise RuntimeError('no thread available')
++
++    with monkeypatch.context() as patch:
++        patch.setattr(threading.Thread, 'start', fail_start)
++        refresher.submit(('A',))
++        assert not refresher.busy
++        assert refresher._worker is None
++    refresher.submit(('A',))
++    wait_until(lambda: not refresher.busy, what='thread creation retry')
++    assert called == [('A',)]
++
++
++def test_sequential_refreshes_reuse_one_worker(cache, monkeypatch):
++    import threading
++
++    _, revision, _ = cache
++    activity._remote_links()
++    starts = []
++    original = threading.Thread.start
++
++    def start(thread):
++        if thread.name == 'kanban-remote-links':
++            starts.append(thread)
++        return original(thread)
++
++    monkeypatch.setattr(threading.Thread, 'start', start)
++    for i in range(1, 4):
++        revision[0] = i
++        activity._remote_links(stale_ok=True)
++        wait_until(lambda: not activity._links_refresher.busy, what='sequential refresh')
++        assert activity._links_cache[('A',)][3][0]['revision'] == i
++    assert len(starts) <= 1, 'one new thread per poll is not a bounded worker lifecycle'
++
++
++def test_queued_scopes_are_bounded_and_coalesced(cache, monkeypatch):
++    import threading
++    from contextvars import ContextVar
++
++    scope = ContextVar('bounded_refresh_scope', default='0')
++    monkeypatch.setattr(activity, '_origin_scope', lambda: (scope.get(),))
++    monkeypatch.setattr(activity, '_project_remote_links', lambda: [{'id': scope.get()}])
++    entered, release = threading.Event(), threading.Event()
++    checked = []
++
++    def fingerprint():
++        checked.append(scope.get())
++        if scope.get() == '0':
++            entered.set()
++            assert release.wait(5)
++        return ('changed',)
++
++    for i in range(16):
++        scope.set(str(i))
++        activity._remote_links()
++    monkeypatch.setattr(activity, '_links_fingerprint', fingerprint)
++    scope.set('0')
++    try:
++        activity._remote_links(stale_ok=True)
++        assert entered.wait(2)
++        for _ in range(3):
++            for i in range(16):
++                scope.set(str(i))
++                assert activity._remote_links(stale_ok=True)[0]['id'] == str(i)
++        scope.set('overflow')
++        activity._refresh_links_in_background(('overflow',))
++        assert len(activity._links_refresher._pending) == 16
++    finally:
++        release.set()
++        wait_until(lambda: not activity._links_refresher.busy, what='bounded queue drained')
++    assert checked == [str(i) for i in range(16)]
++    activity._refresh_links_in_background(('overflow',))
++    wait_until(lambda: not activity._links_refresher.busy, what='overflow retries later')
++    assert checked[-1] == 'overflow'
++
++
++def test_changed_ambient_scope_does_not_publish_wrong_origin(cache, monkeypatch):
++    scope, revision, _ = cache
++    first = activity._remote_links()
++    revision[0] = 1
++    scope[0] = 'different'
++    activity._refresh_links_in_background(('A',))
++    wait_until(lambda: not activity._links_refresher.busy, what='mismatched origin skipped')
++    assert activity._links_cache[('A',)][3] == first
++    assert ('different',) not in activity._links_cache
++
++
++def test_scope_capacity_and_cold_eviction(cache):
++    scope, _, calls = cache
++    for i in range(17):
++        scope[0] = str(i)
++        assert activity._remote_links()[0]['id'] == str(i)
++    assert len(activity._links_cache) == 16
++    scope[0] = '0'
++    assert activity._remote_links(stale_ok=True)[0]['id'] == '0'
++    assert len(calls) == 18  # genuine cold miss remains synchronous, not successful empty
++
++
++def test_background_failure_retains_good_but_strict_failure_raises(cache, monkeypatch):
++    _, revision, _ = cache
++    first = activity._remote_links()
++    revision[0] = 1
++
++    def fail():
++        raise sqlite3.OperationalError('projection unavailable')
++
++    monkeypatch.setattr(activity, '_project_remote_links', fail)
++    assert activity._remote_links(stale_ok=True) == first
++    wait_until(lambda: not activity._links_refresher.busy, what='failed refresh finished')
++    with pytest.raises(sqlite3.OperationalError, match='projection unavailable'):
++        activity._remote_links()
++    assert activity._links_cache[('A',)][3] == first
++    activity._reset_cache_for_tests()
++    with pytest.raises(sqlite3.OperationalError, match='projection unavailable'):
++        activity._remote_links(stale_ok=True)
++    assert not activity._links_cache
++
++
++def test_strict_read_your_writes_after_stale_read(cache):
++    _, revision, _ = cache
++    first = activity._remote_links()
++    assert activity._remote_links(stale_ok=True) == first
++    wait_until(lambda: not activity._links_refresher.busy, what='fresh check finished')
++    revision[0] = 1
++    assert activity._remote_links()[0]['revision'] == 1
++
++
++def test_annotation_pins_cards_and_origin_rows(cache):
++    _, revision, _ = cache
++    with activity.one_annotation_snapshot():
++        first = activity.remote_links_and_origin_rows()
++        revision[0] = 1
++        assert activity.remote_links_and_origin_rows() == first
++    assert activity.remote_links_and_origin_rows()[0][0]['revision'] == 1
+diff --git a/tests/hermes_cli/test_kanban_links_stale_scopes.py b/tests/hermes_cli/test_kanban_links_stale_scopes.py
+new file mode 100644
+index 0000000000..c9fe1de0f3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_stale_scopes.py
+@@ -0,0 +1,112 @@
++"""Warm linked-card reads must not enter blocking fingerprint/projection work."""
++import threading
++
++from hermes_cli import kanban_session_activity as activity
++from tests.waiting import wait_until
++
++
++def test_scope_a_survives_scope_b_projection_lock(monkeypatch):
++    from contextvars import ContextVar
++
++    scope = ContextVar('test_links_scope', default='B')
++    monkeypatch.setattr(activity, '_origin_scope', lambda: (scope.get(),))
++    monkeypatch.setattr(activity, '_links_fingerprint', lambda: ('revision',))
++    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
++    held = [False]
++    results = []
++    projected = []
++
++    def project():
++        projected.append(scope.get())
++        if held[0] and scope.get() == 'B':
++            entered.set()
++            assert release.wait(5)
++        return [{'id': scope.get()}]
++
++    monkeypatch.setattr(activity, '_project_remote_links', project)
++    activity._reset_cache_for_tests()
++    scope.set('A')
++    expected = activity._remote_links()
++    scope.set('B')
++    activity._remote_links()
++    monkeypatch.setattr(activity, '_links_fingerprint', lambda: ('changed',))
++    held[0] = True
++    activity._remote_links(stale_ok=True)
++
++    def read_a():
++        scope.set('A')
++        results.append(activity._remote_links(stale_ok=True))
++        returned.set()
++
++    reader = threading.Thread(target=read_a)
++    try:
++        assert entered.wait(2)
++        reader.start()
++        assert returned.wait(2), 'scope B evicted the warm scope A fast path'
++        assert results == [expected]
++    finally:
++        release.set()
++        if reader.ident is not None:
++            reader.join(5)
++        wait_until(lambda: not activity._links_refresher.busy, what='scope refresh cleanup')
++        activity._reset_cache_for_tests()
++    assert projected == ['A', 'B', 'B', 'A'], 'queued A refresh must not be lost behind B'
++
++
++def test_refresh_captures_nondefault_context(monkeypatch):
++    from contextvars import ContextVar
++
++    scope = ContextVar('refresh_scope', default='wrong')
++    scope.set('named-profile')
++    revision = [0]
++    observed = []
++    monkeypatch.setattr(activity, '_origin_scope', lambda: (scope.get(),))
++    monkeypatch.setattr(activity, '_links_fingerprint', lambda: (revision[0],))
++
++    def project():
++        observed.append(scope.get())
++        return [{'id': scope.get(), 'revision': revision[0]}]
++
++    monkeypatch.setattr(activity, '_project_remote_links', project)
++    activity._reset_cache_for_tests()
++    first = activity._remote_links()
++    revision[0] = 1
++    try:
++        assert activity._remote_links(stale_ok=True) == first
++        wait_until(lambda: not activity._links_refresher.busy, what='captured refresh')
++        assert observed == ['named-profile', 'named-profile']
++        assert activity._remote_links()[0]['revision'] == 1
++    finally:
++        activity._reset_cache_for_tests()
++
++
++def test_warm_stale_returns_while_fingerprint_is_held(monkeypatch):
++    activity._reset_cache_for_tests()
++    monkeypatch.setattr(activity, '_origin_scope', lambda: ('A',))
++    monkeypatch.setattr(activity, '_links_fingerprint', lambda: ('first',))
++    monkeypatch.setattr(activity, '_project_remote_links', lambda: [{'id': 'A'}])
++    expected = activity._remote_links()
++    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
++    results = []
++
++    def fingerprint():
++        entered.set()
++        assert release.wait(5)
++        return ('next',)
++
++    def read():
++        results.append(activity._remote_links(stale_ok=True))
++        returned.set()
++
++    monkeypatch.setattr(activity, '_links_fingerprint', fingerprint)
++    reader = threading.Thread(target=read)
++    reader.start()
++    try:
++        assert entered.wait(2)
++        assert returned.wait(2), 'warm stale reader waited for fingerprint'
++        assert results == [expected]
++    finally:
++        release.set()
++        reader.join(5)
++        wait_until(lambda: not activity._links_refresher.busy, what='refresh cleanup')
++        activity._reset_cache_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_remote_inventory_cache.py b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+index 62d6ca4188..a640e70af7 100644
+--- a/tests/hermes_cli/test_kanban_remote_inventory_cache.py
++++ b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+@@ -90,7 +90,7 @@ def test_stale_ok_readers_never_wait_for_a_rebuild(projection):
+         assert calls['n'] == 2
+     finally:
+         gate.set()
+-    wait_until(lambda: not activity._links_refreshing, what='the rebuild finished')
++    wait_until(lambda: not activity._links_refresher.busy, what='the rebuild finished')
+ 
+ 
+ def test_concurrent_readers_wait_for_one_projection(projection):
+diff --git a/tests/hermes_cli/test_web_links_stale.py b/tests/hermes_cli/test_web_links_stale.py
+new file mode 100644
+index 0000000000..2313016fed
+--- /dev/null
++++ b/tests/hermes_cli/test_web_links_stale.py
+@@ -0,0 +1,113 @@
++"""Real ASGI warm-stale reads; optional independently installed user-steps router."""
++import importlib.util
++import os
++from pathlib import Path
++import sqlite3
++import threading
++from unittest.mock import AsyncMock
++
++import pytest
++from fastapi import APIRouter
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_session_activity as activity
++from tests.waiting import wait_until
++
++
++@pytest.fixture(params=['ledger', 'unreadable-replica'])
++def reader_mode(request):
++    return request.param
++
++
++@pytest.fixture(params=['core', 'user-steps'])
++def linked_client(request, monkeypatch, tmp_path, reader_mode):
++    from hermes_cli import web_server as ws
++    from hermes_cli import web_server_dashboard as dashboard
++    from hermes_cli import kanban_db_sync
++
++    endpoint = '/api/session-kanban-tasks'
++    if request.param == 'user-steps':
++        path = Path(os.environ.get('HERMES_TEST_USER_STEPS_API',
++                                   str(Path.home() / 'code/hermes-mods/plugins/user-steps/dashboard/plugin_api.py')))
++        if not path.is_file():
++            pytest.skip('independently shipped user-steps router not installed')
++        spec = importlib.util.spec_from_file_location('_stale_links_user_steps', path)
++        assert spec is not None and spec.loader is not None
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        router = module.create_router()
++        # Outbox recovery is unrelated to this read. Keep the actual handler and
++        # enabled-plugin middleware, but do not start the plugin's outbox writer.
++        overrides = dict(ws.app.dependency_overrides)
++        for dep in router.dependencies:
++            overrides[dep.dependency] = lambda: None
++        monkeypatch.setattr(ws.app, 'dependency_overrides', overrides)
++        prefixed = APIRouter()
++        prefixed.include_router(router, prefix='/api/plugins/user-steps')
++        monkeypatch.setattr(ws.app.router, 'routes', list(prefixed.routes) + list(ws.app.router.routes))
++        monkeypatch.setattr(ws, '_get_dashboard_plugins', lambda: [{'name': 'user-steps', 'source': 'user'}])
++        monkeypatch.setattr(dashboard, '_plugin_enable_sets_here', lambda: ({'user-steps'}, set()))
++        monkeypatch.setattr(ws, 'forward_secondary_plugin_request', AsyncMock(return_value=None))
++        endpoint = '/api/plugins/user-steps/session-cards'
++    monkeypatch.setattr(activity, '_board_db_paths', list)
++    monkeypatch.setattr(kanban_db_sync, 'sync_config', dict)
++    if reader_mode == 'unreadable-replica':
++        from types import SimpleNamespace
++        from hermes_cli import kanban_sync_client as sync
++        monkeypatch.setattr(kanban_db_sync, 'sync_config', lambda: {'links_reader': 'replica'})
++        monkeypatch.setattr(sync, 'load_identity', lambda: SimpleNamespace(gateway='origin'))
++        monkeypatch.setattr(sync, 'board_paths', lambda: [('work', tmp_path / 'board.db')])
++        monkeypatch.setattr(sync, 'shadow_path', lambda _: tmp_path / 'missing.db')
++    monkeypatch.setattr(activity, '_origin_scope', lambda: ('http',))
++    monkeypatch.setattr(activity, '_links_fingerprint', lambda: ('first',))
++    activity._reset_cache_for_tests()
++    client = TestClient(ws.app, raise_server_exceptions=False)
++    client.headers[ws._SESSION_HEADER_NAME] = ws._SESSION_TOKEN
++    yield client, endpoint
++    wait_until(lambda: not activity._links_refresher.busy, what='HTTP refresh cleanup')
++    activity._reset_cache_for_tests()
++    client.close()
++
++
++def test_http_warm_stale_does_not_wait_for_fingerprint(linked_client, monkeypatch):
++    client, endpoint = linked_client
++    card = dict(id='prior', key='owner/default/work/prior', board='work', session='s-chat',
++                status='running', unfinished=True, gateway='owner', profile='default')
++    monkeypatch.setattr(activity, '_project_remote_links', lambda: [card])
++    first = client.get(endpoint, params={'ids': 's-chat'})
++    assert first.status_code == 200, first.text
++    assert first.json()['tasks'][0]['id'] == 'prior'
++    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
++    responses = []
++
++    def fingerprint():
++        entered.set()
++        assert release.wait(5)
++        return ('changed',)
++
++    def read():
++        responses.append(client.get(endpoint, params={'ids': 's-chat'}))
++        returned.set()
++
++    monkeypatch.setattr(activity, '_links_fingerprint', fingerprint)
++    thread = threading.Thread(target=read)
++    thread.start()
++    try:
++        assert entered.wait(2)
++        assert returned.wait(2), 'HTTP warm-stale read blocked on fingerprint'
++        assert responses[0].status_code == 200
++        assert responses[0].json()['tasks'] == first.json()['tasks']
++    finally:
++        release.set()
++        thread.join(5)
++
++
++def test_http_cold_projection_failure_is_not_empty_success(linked_client, monkeypatch):
++    client, endpoint = linked_client
++
++    def fail():
++        raise sqlite3.OperationalError('no such table: origin_receipts')
++
++    monkeypatch.setattr(activity, '_project_remote_links', fail)
++    assert client.get(endpoint, params={'ids': 's-chat'}).status_code == 500
++    assert not activity._links_cache
+-- 
+2.43.0
+
