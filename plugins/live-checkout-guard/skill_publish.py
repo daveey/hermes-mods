@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import fcntl
+from contextlib import contextmanager
+from contextvars import ContextVar
 import io
 import json
 import os
@@ -14,10 +16,38 @@ import sys
 import tarfile
 import tempfile
 import time
+from typing import Callable
 
 MAX_PATHS = 16
 MAX_BYTES = 1024 * 1024
 LOCK_WAIT = 5.0
+WORK_BUDGET = 45.0
+CLEANUP_BUDGET = 5.0
+REAP_BUDGET = 2.0
+_budget: ContextVar[tuple[float, Callable[[], float]] | None] = ContextVar(
+    'skill_publication_budget', default=None)
+
+
+@contextmanager
+def operation_budget(seconds, clock):
+    token = _budget.set((clock() + seconds, clock))
+    try:
+        yield
+    finally:
+        _budget.reset(token)
+
+
+def remaining(cap):
+    budget = _budget.get()
+    if budget is None:
+        return cap
+    deadline, clock = budget
+    left = deadline - clock()
+    if left <= 0:
+        raise ValueError('publication deadline exceeded')
+    return min(cap, left)
+
+
 GIT_ROUTING_ENV = {
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
     'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
@@ -37,6 +67,7 @@ def clean_env(env=None):
 
 def bounded(command, *, timeout, data=None, env=None, cwd=None):
     """Timeout the whole subprocess group, including Git transports and hooks."""
+    timeout = remaining(timeout)
     # An explicit env (from run) is already sanitized and may carry a snapshot index.
     env = dict(clean_env() if env is None else env,
                GIT_TERMINAL_PROMPT='0', GH_PROMPT_DISABLED='1')
@@ -50,7 +81,7 @@ def bounded(command, *, timeout, data=None, env=None, cwd=None):
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.communicate(timeout=5)
+            process.communicate(timeout=REAP_BUDGET)
             raise
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
@@ -60,7 +91,19 @@ def run(root, *args, data=None, env=None, index=None):
     env = dict(clean_env(env), GIT_OPTIONAL_LOCKS='0')
     if index is not None:
         env['GIT_INDEX_FILE'] = str(index)
-    p = bounded(['git', '-C', str(root), *args], data=data, timeout=30, env=env)
+    credential_args = []
+    # Resolve the effective fetch/push URL (including insteadOf and pushurl).
+    # Only this Git subprocess receives the helper; never persist config or extract
+    # a token into argv, environment, logs, or an archive.
+    if 'fetch' in args or 'push' in args:
+        from urllib.parse import urlsplit
+        options = ('--push',) if 'push' in args else ()
+        url = run(root, 'remote', 'get-url', *options, 'origin', env=env).decode().strip()
+        parsed = urlsplit(url)
+        if parsed.scheme == 'https' and parsed.hostname:
+            scope = 'credential.https://' + parsed.hostname + '.helper'
+            credential_args = ['-c', scope + '=', '-c', scope + '=!gh auth git-credential']
+    p = bounded(['git', '-C', str(root), *credential_args, *args], data=data, timeout=30, env=env)
     if p.returncode:
         raise ValueError(p.stderr.decode(errors='replace').strip() or 'git command failed')
     return p.stdout
@@ -132,7 +175,13 @@ def latest_main_ci(root, sha):
         return 'unknown'
 
 
-def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
+def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci, clock=None):
+    clock = clock or time.monotonic
+    with operation_budget(WORK_BUDGET, clock):
+        return _publish(root, paths, session_id=session_id, task_id=task_id, ci=ci, clock=clock)
+
+
+def _publish(root, paths, *, session_id, task_id, ci, clock):
     root = Path(root).expanduser().resolve(strict=True)
     if run(root, 'rev-parse', '--show-toplevel').decode().strip() != str(root):
         raise ValueError('root must be repository top level')
@@ -144,14 +193,14 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
     lock = gitdir / 'skill-publish.lock'
     # flock is released by the kernel on crash, so no stale lock; the file is never
     # unlinked (that would let holders lock different inodes). Contention is bounded.
+    deadline = clock() + remaining(LOCK_WAIT)
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-    deadline = time.monotonic() + LOCK_WAIT
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             break
         except OSError:
-            if time.monotonic() >= deadline:
+            if clock() >= deadline:
                 os.close(fd)
                 raise ValueError('publication lock busy')
             time.sleep(0.05)
@@ -277,7 +326,8 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
         try:
             if worktree is not None and worktree.exists():
                 # Only the disposable publication worktree; source edits and archive stay intact.
-                run(root, 'worktree', 'remove', '--force', str(worktree))
+                with operation_budget(CLEANUP_BUDGET, clock):
+                    run(root, 'worktree', 'remove', '--force', str(worktree))
         finally:
             os.close(fd)
 

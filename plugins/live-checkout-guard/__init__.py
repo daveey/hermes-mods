@@ -187,6 +187,11 @@ def _post_tool_call(tool_name: str = "", args: Any = None, result: Any = None,
         logger.warning("live-checkout-guard: skill publication preserved edits: %s", exc)
 
 
+# 45s shared publication deadline + 5s disposable-worktree cleanup + two
+# 2s process-group reap allowances, with headroom before core abandons the hook.
+_post_tool_call.hermes_hook_timeout = 60
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)

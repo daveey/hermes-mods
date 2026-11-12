@@ -16,6 +16,72 @@ publisher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(publisher)
 
 
+class BudgetTests(unittest.TestCase):
+    def test_shared_deadline_caps_git_ci_and_reconcile_subprocesses(self):
+        now = [100.0]
+        with publisher.operation_budget(45, lambda: now[0]):
+            now[0] = 140.0
+            with patch.object(publisher.subprocess, 'Popen') as popen:
+                process = popen.return_value.__enter__.return_value
+                process.communicate.return_value = (b'', b'')
+                process.returncode = 0
+                for command, cap in [(['git', 'fetch'], 30), (['gh', 'run'], 20),
+                                     (['python', 'reconcile.py'], 90)]:
+                    publisher.bounded(command, timeout=cap)
+                    self.assertEqual(process.communicate.call_args.kwargs['timeout'], 5)
+                now[0] = 145.0
+                with self.assertRaisesRegex(ValueError, 'publication deadline'):
+                    publisher.bounded(['git', 'push'], timeout=30)
+                self.assertEqual(popen.call_count, 3)
+        self.assertEqual(publisher.remaining(30), 30)
+
+    def test_registered_hook_allows_work_cleanup_and_two_reaps_under_minute(self):
+        spec = importlib.util.spec_from_file_location('budget_guard_test', HERE / '__init__.py')
+        assert spec is not None and spec.loader is not None
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        hooks = {}
+        class Context:
+            def register_hook(self, name, callback):
+                hooks[name] = callback
+        plugin.register(Context())
+        allowance = getattr(hooks['post_tool_call'], 'hermes_hook_timeout', 30)
+        self.assertGreater(allowance, publisher.WORK_BUDGET + publisher.CLEANUP_BUDGET
+                           + 2 * publisher.REAP_BUDGET)
+        self.assertLessEqual(allowance, 60)
+
+
+class CredentialTests(unittest.TestCase):
+    def test_https_fetch_and_push_use_subprocess_gh_helper(self):
+        for args in [('fetch', 'origin', 'main'),
+                     ('-c', 'core.hooksPath=.githooks', 'push', 'origin', 'HEAD:main')]:
+            with self.subTest(args=args):
+                calls = []
+                def capture(command, **kwargs):
+                    calls.append((command, kwargs))
+                    output = b'https://github.com/example/mods.git\n' if 'get-url' in command else b''
+                    return subprocess.CompletedProcess(command, 0, output, b'')
+                with patch.object(publisher, 'bounded', side_effect=capture):
+                    publisher.run('/example', *args, env={'GIT_CONFIG_COUNT': '1'})
+                command, kwargs = calls[-1]
+                self.assertIn('credential.https://github.com.helper=', command)
+                self.assertIn('credential.https://github.com.helper=!gh auth git-credential', command)
+                self.assertNotIn('GIT_CONFIG_COUNT', kwargs['env'])
+                self.assertEqual(command[-len(args):], list(args))
+                self.assertEqual('--push' in calls[0][0], 'push' in args)
+
+    def test_non_https_origins_have_no_credential_override(self):
+        for url in ['git@github.com:example/mods.git', 'ssh://git@example.com/mods',
+                    'file:///example/mods.git', '/example/mods.git']:
+            calls = []
+            def capture(command, **kwargs):
+                calls.append(command)
+                return subprocess.CompletedProcess(command, 0, url.encode() + b'\n', b'')
+            with patch.object(publisher, 'bounded', side_effect=capture):
+                publisher.run('/example', 'fetch', 'origin', 'main')
+            self.assertFalse(any('credential.' in arg for arg in calls[-1]))
+
+
 class PublicationTests(unittest.TestCase):
     def setUp(self):
         if not shutil.which('gitleaks'):
@@ -79,6 +145,25 @@ fi
     def assert_no_worktrees(self):
         self.assertEqual(self.git(self.root, 'worktree', 'list', '--porcelain').count('worktree '), 1)
         self.assertFalse(self.git(self.root, 'worktree', 'list').count('skill-publish-') > 0)
+
+    def test_total_deadline_stops_after_commit_and_still_cleans_worktree(self):
+        now = [100.0]
+        original = publisher.bounded
+        def advance_after_commit(command, **kwargs):
+            result = original(command, **kwargs)
+            if 'commit' in command:
+                now[0] += 45.0
+            return result
+        with patch.object(publisher, 'bounded', side_effect=advance_after_commit):
+            with self.assertRaisesRegex(ValueError, 'publication deadline.*archive:'):
+                self.publish(clock=lambda: now[0])
+        self.assertEqual(self.target.read_text(), 'published\n')
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+        self.assertTrue(list((self.base / 'hermes-home/kanban/evidence/mods-reconcile').glob(
+            'skill-publish-*/publish.patch')))
+        self.assert_no_worktrees()
+        # An expired context must not poison the next publication on this worker.
+        self.assertEqual(self.publish()['status'], 'published')
 
     def test_publish_clean_and_later_ff_inherited_identity(self):
         result = self.publish()
