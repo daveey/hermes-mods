@@ -3,8 +3,10 @@
 Pure functions, no Hermes imports, shared by the Hermes plugin (__init__.py) and the Claude Code hook.
 Each ``check_*`` returns None (allow) or a short reason string (refuse).
 
-Protected root: ``$LIVE_CHECKOUT_ROOT`` (default ``~/code/hermes-mods``), compared after ``realpath`` so symlinks
-into it (e.g. ``~/.hermes/plugins/<name>``) count as inside it. Kill switch: ``LIVE_CHECKOUT_GUARD=0``.
+Protected roots, compared after ``realpath`` so symlinks into them (e.g. ``~/.hermes/plugins/<name>``) count as
+inside: ``$LIVE_CHECKOUT_ROOT`` (default ``~/code/hermes-mods``) and the live Hermes core checkout(s)
+(``core_roots()``: ``$LIVE_CORE_CHECKOUT``, else ``~/.hermes/hermes-agent`` plus the checkout the running
+``hermes_cli`` was imported from). Kill switch: ``LIVE_CHECKOUT_GUARD=0``.
 
 Best-effort lexical analysis, not a sandbox. See README.md for limitations.
 """
@@ -17,6 +19,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -61,6 +64,86 @@ def root_label() -> str:
     return os.environ.get("LIVE_CHECKOUT_ROOT") or DEFAULT_ROOT
 
 
+# ---- the live core checkout ----------------------------------------------------------------------
+# Every running backend imports from it and the core updater only fast-forwards it while it is clean and on
+# main. On 2026-11-12 a worker agent ran `cd ~/.hermes/hermes-agent && git checkout -q --detach ...` on a node
+# without the coach plugin (whose rule covered it) and the updater skipped every pass for 1h25m.
+DEFAULT_CORE = "~/.hermes/hermes-agent"
+CORE_WHERE = "the live core checkout"
+_OFF = {"", "0", "off", "false", "no", "none"}
+
+
+def core_roots() -> list[str]:
+    """Realpaths of the live core checkout(s) to protect. ``$LIVE_CORE_CHECKOUT`` (``os.pathsep`` list; empty /
+    ``0`` / ``off`` disables) replaces the defaults: ``~/.hermes/hermes-agent`` and the checkout the in-process
+    ``hermes_cli`` was imported from (the mini runs core from ``~/code/hermes-agent``). A candidate counts only
+    when it is a git checkout; the in-process one only when it is a main clone (``.git`` directory), never a
+    linked worktree, so a backend started from a scratch worktree does not lock that worktree."""
+    env = os.environ.get("LIVE_CORE_CHECKOUT")
+    cands: list[tuple[str, bool]] = []
+    if env is not None:
+        if env.strip().lower() in _OFF:
+            return []
+        cands = [(c, False) for c in env.split(os.pathsep) if c.strip()]
+    else:
+        cands.append((DEFAULT_CORE, False))
+        f = getattr(sys.modules.get("hermes_cli"), "__file__", None)
+        if isinstance(f, str) and f:
+            cands.append((str(Path(f).resolve().parents[1]), True))
+    mods, out = root(), []
+    for c, main_clone_only in cands:
+        r = os.path.realpath(os.path.expanduser(c.strip()))
+        dot = os.path.join(r, ".git")
+        if (os.path.isdir(dot) if main_clone_only else os.path.exists(dot)) and r not in out and r != mods:
+            out.append(r)
+    return out
+
+
+def _label(r: str) -> str:
+    home = os.path.realpath(os.path.expanduser("~"))
+    return "~" + r[len(home):] if r == home or r.startswith(home + os.sep) else r
+
+
+def _inside(r: str, base: str) -> bool:
+    return r == base or r.startswith(base + os.sep)
+
+
+def _match_root(r: str) -> Optional[str]:
+    """The protected root containing realpath ``r`` (the mods root first), else None."""
+    for base in [root(), *core_roots()]:
+        if _inside(r, base):
+            return base
+    return None
+
+
+def _where(base: str) -> str:
+    return "the live checkout" if base == root() else f"{CORE_WHERE} {_label(base)}"
+
+
+def _core_ignored(r: str, base: str) -> bool:
+    """A gitignored runtime path in a core checkout (logs, venv, build output): writable, like coach's rule.
+    ``node_modules`` is ignored but is the live dependency install, so it is not. Unknown counts as tracked."""
+    rel = os.path.relpath(r, base)
+    parts = Path(rel).parts
+    if rel == "." or not parts or parts[0] == ".git" or "node_modules" in parts[:2]:
+        return False
+    try:
+        out = subprocess.run(["git", "-C", base, "check-ignore", "-q", "--", rel], capture_output=True, timeout=3)
+    except Exception:
+        return False
+    return out.returncode == 0
+
+
+def _write_where(r: Optional[str]) -> Optional[str]:
+    """Where a write to realpath ``r`` would land ("the live checkout" / "the live core checkout ~/..."), or None."""
+    if r is None:
+        return None
+    base = _match_root(r)
+    if base is None or (base != root() and _core_ignored(r, base)):
+        return None
+    return _where(base)
+
+
 # Shell analysis only: variables assigned earlier in the same command (``D=$TMPDIR/x; rm -rf $D``; a None value
 # means "assigned, value unknown"). None outside check_shell, so file-tool and python paths are taken literally.
 _SHELL_VARS: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("lcg_shell_vars", default=None)
@@ -93,25 +176,59 @@ def _expand(path: str) -> Optional[str]:
     return os.path.expanduser(out)
 
 
-def in_root(path: str, cwd: Optional[str] = None) -> bool:
-    """True if ``path`` (relative to ``cwd``) resolves, through symlinks, to the protected root or below."""
+def _resolve(path: str, cwd: Optional[str] = None) -> Optional[str]:
+    """Realpath of ``path`` relative to ``cwd``; None when it cannot be known."""
     if not path or path.startswith(UNKNOWN_CWD):
-        return False
+        return None
     p = _expand(path)
     if p is None:
-        return False
+        return None
     if not os.path.isabs(p):
         if cwd and cwd.startswith(UNKNOWN_CWD):
-            return False
+            return None
         p = os.path.join(cwd or os.getcwd(), p)
-    r = os.path.realpath(p)
-    base = root()
-    return r == base or r.startswith(base + os.sep)
+    return os.path.realpath(p)
+
+
+def root_of(path: str, cwd: Optional[str] = None) -> Optional[str]:
+    """The protected root (mods root or a core checkout) ``path`` resolves into, else None."""
+    r = _resolve(path, cwd)
+    return _match_root(r) if r is not None else None
+
+
+def in_root(path: str, cwd: Optional[str] = None) -> bool:
+    """True if ``path`` (relative to ``cwd``) resolves, through symlinks, to a protected root or below."""
+    return root_of(path, cwd) is not None
+
+
+def write_where(path: str, cwd: Optional[str] = None) -> Optional[str]:
+    """Where writing ``path`` would land, when that is refused (see ``_write_where``); else None."""
+    return _write_where(_resolve(path, cwd))
+
+
+def core_message(why: str) -> str:
+    m = re.search(re.escape(CORE_WHERE) + r" (\S+?)[),.]?(?:\s|$)", why)
+    c = m.group(1) if m else DEFAULT_CORE
+    return (f"[live-checkout-guard] Refused: {why}.\n"
+            f"{c} is the live Hermes core checkout: every running backend imports from it, and the core updater "
+            "only fast-forwards it while it is clean and on main. A HEAD move (checkout/switch --detach, reset, "
+            "merge, ...) or a source edit there makes the updater skip every pass (\"checkout not on main\") and "
+            "leaves running backends on skewed code.\n"
+            "  read another revision without moving HEAD:  "
+            f"git -C {c} show origin/main:<path>\n"
+            "  change core in a worktree:  ~/.hermes/bin/hermes-core-wt new <slug>   "
+            f"(or git -C {c} worktree add --detach <dir outside it> origin/main)\n"
+            "Allowed on the core checkout: reads (log/show/diff/status/grep), git fetch, git worktree add, and "
+            "writes to gitignored runtime paths (logs, venv, build output; not node_modules). Updates go through "
+            "the fenced core updater. Only for a git step the user explicitly asked for in the live tree (e.g. "
+            "putting a detached checkout back on main): prefix that git command with COACH_ALLOW_LIVE=1.")
 
 
 def message(why: str) -> str:
     if why.startswith(HOME_EXPORT_WHY):
         return home_export_message(why)
+    if CORE_WHERE in why:
+        return core_message(why)
     if why == "unfenced hermes update":
         return ("[live-checkout-guard] Refused: unfenced hermes update. Core updates go through each "
                 "host's fenced route: the hub's hermes-core-update.timer (every 10 min, drain-first, "
@@ -144,8 +261,8 @@ def check_file_tool(tool: str, args: dict, cwd: Optional[str] = None) -> Optiona
         for m in _V4A.finditer(args["patch"]):
             paths.append(m.group(1) or m.group(2))
     for p in paths:
-        if in_root(p, cwd):
-            return f"{tool} would write {p}, inside the live checkout"
+        if where := write_where(p, cwd):
+            return f"{tool} would write {p}, inside {where}"
     return None
 
 
@@ -739,12 +856,16 @@ def _check_git(args: list[str], cwd: str, git_env: Optional[dict] = None) -> Opt
         return None
     sub, rest = args[i], args[i + 1:]
     via = ""
-    if git_dir and in_root(git_dir):
+    if git_dir and (base := root_of(git_dir)):
         via = " (via --git-dir/GIT_DIR)"
-    elif work_tree and in_root(work_tree):
+    elif work_tree and (base := root_of(work_tree)):
         via = " (via --work-tree/GIT_WORK_TREE)"
-    elif not in_root(d) or git_dir or work_tree:
+    elif git_dir or work_tree or not (base := root_of(d)):
         return None  # an explicit git dir / work tree elsewhere wins over the cwd
+    if base != root():
+        if git_env.get("COACH_ALLOW_LIVE") == "1":
+            return None  # coach's escape hatch, scoped to this one command (a user-asked core recovery)
+        return _check_core_git(sub, rest, _where(base) + via)
     clean_dir = d if in_root(d) else root()
     if sub == "update-ref":
         # stdin can name arbitrary refs; never infer safety from shell input.
@@ -774,6 +895,19 @@ def _check_git(args: list[str], cwd: str, git_env: Optional[dict] = None) -> Opt
     return None
 
 
+def _check_core_git(sub: str, rest: list[str], where: str) -> Optional[str]:
+    """The core checkout: every HEAD move or tree write is refused, including a clean ff-only merge and pull
+    (only the fenced core updater moves it). Reads, fetch, ``stash list|show`` and ``worktree add`` stay allowed."""
+    if sub == "update-ref" and ("--stdin" in rest or any(a == "HEAD" or a.startswith("refs/heads/")
+                                                         or a == "refs/stash" for a in rest)):
+        return f"git update-ref in {where}"
+    if sub == "stash":
+        return None if rest and rest[0] in GIT_STASH_READ else f"git stash in {where}"
+    if sub in GIT_BLOCKED:
+        return f"git {sub} in {where}"
+    return None
+
+
 def _strip_wrappers(words: list[str], cwd: str) -> tuple[list[str], str, dict]:
     """Drop env assignments and wrapper commands (with their option values). Returns (words, cwd, git_env);
     ``env -C DIR`` / ``sudo -D DIR`` move the cwd for this command only."""
@@ -782,7 +916,7 @@ def _strip_wrappers(words: list[str], cwd: str) -> tuple[list[str], str, dict]:
         w = words[0]
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w, re.S)
         if m:
-            if m.group(1) in {"GIT_DIR", "GIT_WORK_TREE", "HERMES_UPDATE_OK"}:
+            if m.group(1) in {"GIT_DIR", "GIT_WORK_TREE", "HERMES_UPDATE_OK", "COACH_ALLOW_LIVE"}:
                 git_env[m.group(1)] = m.group(2)
             words = words[1:]
             continue
@@ -832,18 +966,16 @@ def _shell_c_script(args: list[str]) -> Optional[str]:
     return args[i] if seen_c and i < len(args) else None
 
 
-def _in_root_nofollow(path: str, cwd: str) -> bool:
-    """Like in_root, but a final symlink component is not followed unless it points at a directory
+def _write_where_nofollow(path: str, cwd: str) -> Optional[str]:
+    """Like write_where, but a final symlink component is not followed unless it points at a directory
     (where tools like ln create the new entry inside it)."""
     p = _join(cwd, path)
     if p.startswith(UNKNOWN_CWD):
-        return False
+        return None
     if os.path.isdir(p):
-        return in_root(p)
+        return write_where(p)
     parent, base = os.path.split(os.path.normpath(p))
-    r = os.path.join(os.path.realpath(parent or "."), base)
-    b = root()
-    return r == b or r.startswith(b + os.sep)
+    return _write_where(os.path.join(os.path.realpath(parent or "."), base))
 
 
 def _ln_dest(args: list[str], cwd: str) -> Optional[str]:
@@ -876,8 +1008,8 @@ def _ln_dest(args: list[str], cwd: str) -> Optional[str]:
 def _check_segment(words: list[str], targets: list[str], cwd: str) -> tuple[Optional[str], str]:
     """Returns (reason, new_cwd)."""
     for t in targets:
-        if in_root(t, cwd):
-            return f"output redirection to {t}, inside the live checkout", cwd
+        if where := write_where(t, cwd):
+            return f"output redirection to {t}, inside {where}", cwd
     seg_cwd = cwd
     lead = words[1:] if words and words[0] in {"export", "declare", "typeset", "readonly", "local"} else words
     assigns = [re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w, re.S) for w in lead]
@@ -915,31 +1047,31 @@ def _check_words(words: list[str], cwd: str, git_env: dict) -> tuple[Optional[st
         return _check_git(args, cwd, git_env), cwd
     if cmd == "ln":  # only the link being created matters; a source inside the root is just read
         dest = _ln_dest(args, cwd)
-        if dest is not None and _in_root_nofollow(dest, cwd):
-            return f"ln creates a link inside the live checkout ({dest})", cwd
+        if dest is not None and (where := _write_where_nofollow(dest, cwd)):
+            return f"ln creates a link inside {where} ({dest})", cwd
         return None, cwd
     files = [a for a in args if not a.startswith("-")]
     if cmd in {"sed", "gsed"} and any(re.match(r"^-[a-zA-Z]*i|^--in-place", a) for a in args):
         for f in files[1:] if files else []:  # files[0] may be the script
-            if in_root(f, cwd):
-                return f"in-place sed on {f}, inside the live checkout", cwd
+            if where := write_where(f, cwd):
+                return f"in-place sed on {f}, inside {where}", cwd
         for f in files[:1]:
-            if in_root(f, cwd) and not any(a == "-e" for a in args) and len(files) == 1:
-                return f"in-place sed on {f}, inside the live checkout", cwd
+            if (where := write_where(f, cwd)) and not any(a == "-e" for a in args) and len(files) == 1:
+                return f"in-place sed on {f}, inside {where}", cwd
     if cmd == "perl" and any(re.match(r"^-[a-zA-Z]*i", a) for a in args):
         for f in files:
-            if in_root(f, cwd):
-                return f"in-place perl edit of {f}, inside the live checkout", cwd
+            if where := write_where(f, cwd):
+                return f"in-place perl edit of {f}, inside {where}", cwd
     if cmd == "tee":
         for f in files:
-            if in_root(f, cwd):
-                return f"tee writes {f}, inside the live checkout", cwd
+            if where := write_where(f, cwd):
+                return f"tee writes {f}, inside {where}", cwd
     if cmd in WRITE_ALL:
         for f in files:
-            if in_root(f, cwd):
-                return f"{cmd} on {f}, inside the live checkout", cwd
-    if cmd in {"cp", "install", "rsync"} and files and in_root(files[-1], cwd):
-        return f"{cmd} into the live checkout ({files[-1]})", cwd
+            if where := write_where(f, cwd):
+                return f"{cmd} on {f}, inside {where}", cwd
+    if cmd in {"cp", "install", "rsync"} and files and (where := write_where(files[-1], cwd)):
+        return f"{cmd} into {where} ({files[-1]})", cwd
     return None, cwd
 
 
@@ -1298,14 +1430,14 @@ def check_python(code: str, cwd: Optional[str] = None) -> Optional[str]:
         elif name == "open" and isinstance(node.func, ast.Name):
             mode = kw.get("mode") or (pos[1] if len(pos) > 1 else "r")
             if isinstance(pos[0] if pos else None, str) and isinstance(mode, str) and set(mode) & set("wax+") \
-                    and in_root(pos[0], cwd):
-                why = f"open({pos[0]!r}, {mode!r}) writes inside the live checkout"
+                    and (where := write_where(pos[0], cwd)):
+                why = f"open({pos[0]!r}, {mode!r}) writes inside {where}"
         elif name in {"write_text", "write_bytes", "touch", "unlink", "mkdir", "rename", "replace"}:
             f = node.func
             if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call) and _callname(f.value.func) == "Path":
                 p = _const(f.value.args[0]) if f.value.args else None
-                if isinstance(p, str) and in_root(p, cwd):
-                    why = f"Path({p!r}).{name}() writes inside the live checkout"
+                if isinstance(p, str) and (where := write_where(p, cwd)):
+                    why = f"Path({p!r}).{name}() writes inside {where}"
         if why:
             return why
     return None

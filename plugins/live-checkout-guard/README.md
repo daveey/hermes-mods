@@ -15,6 +15,30 @@ git -C ~/code/hermes-mods worktree remove <worktree>
 Kill switch: `LIVE_CHECKOUT_GUARD=0`. Paths are compared after `realpath`, so symlinks into the root
 (e.g. `~/.hermes/plugins/<name>`) count as inside it; worktrees outside the root are free.
 
+## The live core checkout
+
+The live Hermes core checkout is protected too: `~/.hermes/hermes-agent` and the main clone the running
+`hermes_cli` was imported from (the mini runs core from `~/code/hermes-agent`); `$LIVE_CORE_CHECKOUT`
+(`:`-separated) replaces both, and `LIVE_CORE_CHECKOUT=0` turns this part off. Only git checkouts count, and the
+in-process one only when `.git` is a directory, so a backend started from a linked worktree never locks it.
+Every running backend imports from that tree and the core updater only fast-forwards it while it is clean and on
+`main`, so the rules there are stricter than for hermes-mods:
+
+- Every HEAD move or tree write is refused: `checkout` (incl. `--detach`), `switch`, `reset`, `merge` (also a
+  clean `--ff-only`), `pull`, `rebase`, `commit`, `stash` (not `list|show`), `cherry-pick`, `restore`, `apply`, `am`,
+  `revert`, `clean`, `update-ref HEAD|refs/heads/*|--stdin`, by cwd, `cd`, `git -C`, `--git-dir`/`GIT_DIR`.
+- Reads stay allowed: `show origin/main:<path>`, `log`, `diff`, `status`, `grep`, `fetch`, `worktree add`
+  (outside the tree), `merge-base`.
+- File writes are refused like in hermes-mods, except gitignored runtime paths (logs, venv, build output), the
+  same exemption as coach's rule; `node_modules` stays refused (it is the live dependency install).
+- One-command escape hatch for a git step the user asked for (e.g. putting a detached checkout back on main):
+  `COACH_ALLOW_LIVE=1 git -C ~/.hermes/hermes-agent checkout main`, the same hatch coach honours.
+
+Why here and not only in coach: coach's `blocks_live_checkout` had this rule, but worker nodes run coach
+executor-only (not in `plugins.enabled`), while this guard is enabled on every host and profile. On 2026-11-12 a
+worker agent ran `cd ~/.hermes/hermes-agent && git checkout -q --detach 2>/dev/null; git show origin/main:… | sed …`
+there and the updater skipped every pass for 1h25m. Tests: `tests_core_root.py`.
+
 ## Behavior
 
 - `patch` / `write_file` (Hermes, also `mcp__` names; replace mode and V4A `*** Update/Add/Delete File` / `Move to`):
