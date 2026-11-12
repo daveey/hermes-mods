@@ -191,6 +191,13 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
         self.assertTrue(self.db.exists())
 
+    def test_active_sidecar_holder_blocks(self):
+        proc = self.holder('-wal')
+        result = self.cli()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(str(proc.pid), result.stderr)
+        self.assertIn('fixture.db-wal', result.stderr)
+
     def test_deleted_sidecar_holder_blocks(self):
         self.holder('-wal', deleted=True)
         result = self.cli()
