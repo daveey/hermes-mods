@@ -1,9 +1,7 @@
 """Real same-capability harness reload followed by quiet/worker expiry."""
 import os
 from pathlib import Path
-import shutil
 import subprocess
-import sys
 import threading
 import time
 import unittest
@@ -13,14 +11,15 @@ from chrome_agent_daemons import exchange
 from chrome_agent_lifecycle import Config, Ledger, Lifecycle
 from chrome_agent_process import fingerprint
 import test_chrome_endpoint_ownership as endpoints
-from chrome_test_fixtures import socket_directory
+from chrome_test_fixtures import require_real_linux_chrome, socket_directory
 
 hca = endpoints.hca
 
 
-@unittest.skipUnless(sys.platform == 'linux' and shutil.which('browser-harness') and shutil.which('google-chrome'),
-                     'real Linux Chrome and harness required')
 class HarnessRetirementTests(unittest.TestCase):
+    def setUp(self):
+        require_real_linux_chrome(self, harness=True)
+
     def test_same_capability_reload_then_quiet_expiry_preserves_active_sibling(self):
         self.exercise_expiry(worker_exit=False)
 

@@ -104,6 +104,15 @@ class PluginSuitesWorkflow(unittest.TestCase):
         skill_publish = (ROOT / "plugins" / "live-checkout-guard" / "tests_skill_publish.py").read_text()
         self.assertIn(f"gitleaks v{version}", skill_publish)
 
+    def test_browser_harness_is_provisioned_at_one_pin_for_both_chrome_workflows(self):
+        # invisible-chrome-agent's real stop/retirement suites skipped in CI for want of it (5 tests).
+        pins = set(re.findall(r"browser-harness==([0-9.]+)", self.text))
+        self.assertEqual(len(pins), 1, pins)
+        for name in ("invisible-chrome-agent.yml", "skill-tests.yml"):  # the other runners of that suite
+            other = (ROOT / ".github" / "workflows" / name).read_text()
+            self.assertEqual(set(re.findall(r"browser-harness==([0-9.]+)", other)), pins, name)
+        self.assertIn('uv tool dir --bin)" >> "$GITHUB_PATH"', self.text)
+
     def test_runs_each_suite_through_test_all_without_core(self):
         self.assertIn("scripts/test-all --exact", self.text)
         self.assertIn("--json results.json", self.text)

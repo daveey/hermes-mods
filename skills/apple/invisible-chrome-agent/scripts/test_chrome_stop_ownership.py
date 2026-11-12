@@ -2,10 +2,8 @@
 
 import os
 from pathlib import Path
-import shutil
 
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -17,7 +15,7 @@ from chrome_agent_lifecycle import Ledger, Lifecycle, Config
 from chrome_agent_daemons import exchange
 from chrome_agent_process import fingerprint
 from test_chrome_endpoint_ownership import free_port
-from chrome_test_fixtures import chrome_environment, socket_directory
+from chrome_test_fixtures import chrome_environment, require_real_linux_chrome, socket_directory
 
 
 class IdleRetirementTests(unittest.TestCase):
@@ -38,9 +36,10 @@ class IdleRetirementTests(unittest.TestCase):
                 wake.assert_not_called()
 
 
-@unittest.skipUnless(sys.platform == 'linux' and shutil.which('browser-harness') and shutil.which('google-chrome'),
-                     'real Linux Chrome and harness required')
 class SupervisorStopTests(unittest.TestCase):
+    def setUp(self):
+        require_real_linux_chrome(self, harness=True)
+
     def test_supervisor_only_stop_drains_then_verifies_daemon_exit(self):
         self.exercise_stop(finish_requests=True)
 
