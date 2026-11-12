@@ -1344,22 +1344,164 @@ def _backed(session_id: str) -> bool:
     return False
 
 
-def pre_final_gate(session_id: str = "", platform: str = "", final_response: str = "",
-                   turn_messages: list | None = None, attempt: int = 0, **_: Any) -> Optional[dict]:
-    """Turn-end lint: a promise to report later must have a tracked thing behind it."""
-    if not _eligible(session_id, platform) or not isinstance(final_response, str):
+# ---- turn-end visibility: cards created this turn must show in the chat's own task list -------------------------
+_CREATE_TOOL = "kanban_create"
+_BRIDGE_CALL = "tool_call"
+_TASK_ID_RE = re.compile(r"^t_[A-Za-z0-9_]+$")
+VISIBILITY_RECHECK_S = 3.0
+_visibility_sleep = time.sleep  # tests replace it
+# Statuses that count as "the chat shows it": a card that already finished within the turn is not missing.
+_VISIBLE_EXTRA = ("done", "archived")
+
+
+def _as_json(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _content_text(content: Any) -> Any:
+    if isinstance(content, list):  # multi-part tool content
+        return "".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+    return content
+
+
+def _created_id(result: Any) -> Optional[str]:
+    """The task id a kanban_create result reports as created; None for refusals, overlaps, queued-only placements
+    (no id yet) and anything unparsable."""
+    r = _as_json(result)
+    if not isinstance(r, dict) or r.get("ok") is False or r.get("created") is False or r.get("error"):
+        return None
+    tid = r.get("task_id")
+    return tid if isinstance(tid, str) and _TASK_ID_RE.match(tid) else None
+
+
+def _bridge_create_ids(args: Any, content: Any) -> list[str]:
+    """kanban_create run through the deferred-tool bridge (``tool_call``): its result entries name the tool, or a
+    single bridged create comes back unwrapped."""
+    parsed_args = _as_json(args)
+    calls = parsed_args.get("calls") if isinstance(parsed_args, dict) else None
+    names = [c.get("name") for c in calls or [] if isinstance(c, dict)]
+    if _CREATE_TOOL not in names:
+        return []
+    parsed = _as_json(content)
+    if names == [_CREATE_TOOL] and (tid := _created_id(parsed)):
+        return [tid]
+    out: list[str] = []
+    entries = parsed.get("results") if isinstance(parsed, dict) else parsed
+    for i, entry in enumerate(entries if isinstance(entries, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or (names[i] if i < len(names) else None)
+        if name != _CREATE_TOOL:
+            continue
+        for key in ("result", "content", "output"):
+            if key in entry and (tid := _created_id(_content_text(entry[key]))):
+                out.append(tid)
+                break
+    return out
+
+
+def created_this_turn(turn_messages: Any) -> list[str]:
+    """Task ids of every successful kanban_create in this turn (local, placed on another gateway, or bridged),
+    read from the tool results themselves, never from the reply's wording."""
+    calls: dict[Any, tuple[Any, Any]] = {}
+    out: list[str] = []
+    for msg in turn_messages if isinstance(turn_messages, list) else []:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    calls[tc.get("id")] = (fn.get("name") or tc.get("name"), fn.get("arguments", tc.get("arguments")))
+        elif msg.get("role") == "tool":
+            name, args = calls.get(msg.get("tool_call_id"), (msg.get("name"), None))
+            content = _content_text(msg.get("content"))
+            if name == _CREATE_TOOL:
+                if tid := _created_id(content):
+                    out.append(tid)
+            elif name == _BRIDGE_CALL:
+                out.extend(_bridge_create_ids(args, content))
+    return list(dict.fromkeys(out))
+
+
+def _shown_ids(session_id: str) -> set[str]:
+    """Card ids in the chat's own task list: core ``session_tasks`` over the lineage (local boards plus cards on
+    other gateways), the projection /api/session-kanban-tasks serves. Raises on a failed read."""
+    from hermes_cli import kanban_session_activity as ksa
+    statuses = tuple(dict.fromkeys(tuple(getattr(ksa, "LISTED_STATUSES", ())) + _VISIBLE_EXTRA))
+    shown: set[str] = set()
+    for row in ksa.session_tasks(_lineage(session_id), statuses):
+        if not isinstance(row, dict):
+            continue
+        for value in (row.get("id"), str(row.get("key") or "").rsplit("/", 1)[-1]):
+            if value:
+                shown.add(str(value))
+    return shown
+
+
+def _visibility_gate(session_id: str, turn_messages: Any, attempt: int) -> Optional[dict]:
+    """Hold once (private nudge), then append a visible warning, when a card created this turn is missing from the
+    chat's task list after one re-read ``VISIBILITY_RECHECK_S`` later (replica lag). Fails open on any error."""
+    created = created_this_turn(turn_messages)
+    if not created:
         return None
     try:
-        promise = core.find_promise(final_response)
-        if not promise or _backed(session_id):
-            return None
-        logger.info("chat-closeout: unbacked promise in %s (%r), attempt %d", session_id, promise, attempt)
-        if attempt < 1:
-            return {"hold": True, "nudge": core.LINT_NUDGE.format(tag=core.TAG, promise=promise)}
-        return {"append": core.LINT_APPEND}
+        missing = [t for t in created if t not in _shown_ids(session_id)]
+        if missing:
+            _visibility_sleep(VISIBILITY_RECHECK_S)
+            shown = _shown_ids(session_id)
+            missing = [t for t in missing if t not in shown]
     except Exception:
-        logger.debug("chat-closeout pre_final_gate failed", exc_info=True)
+        logger.debug("chat-closeout: task-list read failed; letting the reply through", exc_info=True)
         return None
+    for tid in created:
+        logger.info("chat-closeout: turn-end visibility %s card=%s session=%s attempt=%d",
+                    "held" if tid in missing else "ok", tid, session_id, attempt)
+    if not missing:
+        return None
+    cards = ", ".join(missing)
+    if attempt < 1:
+        it = "it" if len(missing) == 1 else "them"
+        return {"hold": True, "nudge": core.VISIBILITY_NUDGE.format(tag=core.TAG, cards=cards, it=it)}
+    return {"append": core.VISIBILITY_APPEND.format(cards=cards)}
+
+
+def _promise_gate(session_id: str, final_response: str, attempt: int) -> Optional[dict]:
+    promise = core.find_promise(final_response)
+    if not promise or _backed(session_id):
+        return None
+    logger.info("chat-closeout: unbacked promise in %s (%r), attempt %d", session_id, promise, attempt)
+    if attempt < 1:
+        return {"hold": True, "nudge": core.LINT_NUDGE.format(tag=core.TAG, promise=promise)}
+    return {"append": core.LINT_APPEND}
+
+
+def pre_final_gate(session_id: str = "", platform: str = "", final_response: str = "",
+                   turn_messages: list | None = None, attempt: int = 0, **_: Any) -> Optional[dict]:
+    """Turn-end lint: a promise to report later must have a tracked thing behind it, and every card created this
+    turn must show in the chat's own task list."""
+    if not _eligible(session_id, platform) or not isinstance(final_response, str):
+        return None
+    results = []
+    for check in (lambda: _promise_gate(session_id, final_response, attempt),
+                  lambda: _visibility_gate(session_id, turn_messages, attempt)):
+        try:
+            if out := check():
+                results.append(out)
+        except Exception:
+            logger.debug("chat-closeout pre_final_gate failed", exc_info=True)
+    holds = [r["nudge"] for r in results if r.get("hold")]
+    if holds:
+        return {"hold": True, "nudge": "\n\n".join(holds)}
+    appends = [r["append"] for r in results if r.get("append")]
+    return {"append": "\n".join(appends)} if appends else None
 
 
 pre_final_gate.needs_buffer = True
