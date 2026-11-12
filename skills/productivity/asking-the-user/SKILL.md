@@ -212,6 +212,11 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
 
 - A bare "go" / "yes" after a reply that recommends several decisions approves all of them. Act on each one. Don't
   take it as approval of only the first and re-ask the rest: that costs the user another round trip.
+- Passing the user's answer on to a card that asked them: post it with `kanban_comment(relays_user_message=true)`
+  (another gateway: `cross_task action=comment relays_user_message=true`), once per answer, from the chat the user
+  answered in. Only that mark tells the card's no-progress budget a person answered; a plain comment or a bare
+  unblock counts as an idle run, and five such runs stop the card. A `no_progress_relay_suspect` event on a card
+  means an answer was relayed without the mark: re-post it marked.
 
 ## Done means
 
