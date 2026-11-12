@@ -40,8 +40,17 @@ class HomePinUnresolved(RuntimeError):
 
 
 def _core_identity():
-    """``(synced, gateway)`` from core's own config/enrollment (``kanban.sync`` + hub identity). Raises on failure."""
-    from hermes_cli import kanban_db_sync, kanban_sync_client
+    """``(synced, gateway)`` from core's own config/enrollment (``kanban.sync`` + hub identity). Raises on failure.
+
+    No Hermes core importable at all (core-free CI, a bare interpreter) means no Board sync client exists in this
+    process, so the card can only land on the local board: ``(False, None)``. A core that IS installed but fails to
+    report its identity still raises (fail closed)."""
+    try:
+        from hermes_cli import kanban_db_sync, kanban_sync_client
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli":
+            raise
+        return False, None
     if not kanban_db_sync.sync_enabled():
         return False, None
     return True, kanban_sync_client.load_identity().gateway

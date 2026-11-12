@@ -397,6 +397,23 @@ def test_unimportable_core_fails_closed(core, board_identity, monkeypatch):
         pe.home_machine()
 
 
+def test_no_core_package_means_local_board_only(monkeypatch):
+    """No `hermes_cli` at all (core-free CI): no Board sync client exists here, so no pin and filing proceeds."""
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+    assert pe.home_machine() is None and pe.home_runs_on_argv() == []
+
+
+def test_installed_core_missing_identity_module_fails_closed(monkeypatch):
+    import types
+    stub = types.ModuleType("hermes_cli")
+    stub.__path__ = []  # a package, but without kanban_db_sync / kanban_sync_client
+    monkeypatch.setitem(sys.modules, "hermes_cli", stub)
+    monkeypatch.delitem(sys.modules, "hermes_cli.kanban_db_sync", raising=False)
+    monkeypatch.delitem(sys.modules, "hermes_cli.kanban_sync_client", raising=False)
+    with pytest.raises(pe.HomePinUnresolved):
+        pe.home_machine()
+
+
 @pytest.mark.parametrize("which", ["backend", "withheld", "probe", "leftover", "stranded"])
 def test_every_producer_call_site_pins_or_refuses(core, board_identity, tmp_path, which):
     """Each call site: pinned to the Board gateway when resolvable; files nothing when a synced board is unreadable."""
