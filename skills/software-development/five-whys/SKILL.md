@@ -172,7 +172,7 @@ too big for now, file it (card or issue with the chain) and say so in the report
 Choose enforcement at the failure point rather than relying only on prose: capability preflight before placement; bounded typed recovery for checkpoints, quota and exhausted budgets; per-job memory feasibility plus aggregate resource admission; and end-to-end origin visibility and deployed-revision checks. Pair each with failure-injection acceptance. State the coverage limits of containment: stopping new idle workers does not constrain already-running producers or restore disk space, and a guard holding the cleanup lock may prevent reclamation until its owner coordinates release. Never present such a brake as capacity recovery.
 
 After the countermeasures ship, verify each one against live data before calling the chain closed: the guard's own
-telemetry (did it fire, how often, what did it fall back to), not the worker's "done" summary. A live check proves
+telemetry (did it fire, how often, what did it fall back to), not the worker's "done" summary. Replay its trigger on recent real inputs from every producer, not only its fixture. A trigger keyed on how an input is worded (for example, a body that names the right field) silently skips producers that word it differently, so key it on what the input is. A live check proves
 the guard only when the failure's precondition was present: the change under test touched the failing path (e.g.
 the update's diff changed the module that broke) and the process was in the vulnerable state (e.g. booted before
 the update). Write that precondition into the live-check acceptance and confirm it before citing the result; when
