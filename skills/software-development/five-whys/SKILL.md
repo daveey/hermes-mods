@@ -84,12 +84,17 @@ For each answer:
 - **It is a fact with evidence**, not a guess: cite the log line, test, `file:line`, commit, config value or
   measurement. Toyota's version of this is *genchi genbutsu*, go and see. If you only have a hypothesis, label it
   `(hypothesis)`, test it, and don't build further whys on it until it holds.
+- **A missing mechanism is a hypothesis until searched.** Before a why says nothing does X ("nothing asks workers
+  to pause", "X is never retried"), search the code, repo README/docs and active configuration for X. Start from
+  distinctive log terms (policy names, flags), then trace the documented contract to the deployed control.
+  Missing, bypassed and misconfigured controls need different fixes. When the control exists, the next why is
+  why it did not act in this case; verify its eligibility checks, invocation and runtime state.
 - **It directly causes the previous answer.** Read the chain backwards with "therefore": "no strainer, therefore
   chips got in, therefore the shaft wore…". If a "therefore" doesn't follow, a step is missing or wrong.
 - **It is one step**, not a leap to the cause you already suspected. Jumping straight to a familiar cause is the
   most common way the method fails.
 
-**For a slow agent, read the execution log before explaining the delay.** Resolve the active worker session from its task/run, read timestamped tool calls and results, then inspect the output paths those calls actually used and query live publication state. Heartbeats prove liveness, not progress; an unchanged data directory says nothing about a separate build directory. Show the user a compact timeline of concrete operations/errors rather than another supervision promise. Separate dependency waits, productive execution, tool timeouts, recovery, rework and deployment; run counts alone do not measure wasted work. Tie resource failures to the operation stopped: a per-worker OOM does not establish global concurrency pressure. Inspect existing controls before calling them absent; missing, bypassed and misconfigured controls need different fixes. Preserve useful work before taking over. On a laptop host, rule out sleep before
+**For a slow agent, read the execution log before explaining the delay.** Resolve the active worker session from its task/run, read timestamped tool calls and results, then inspect the output paths those calls actually used and query live publication state. Heartbeats prove liveness, not progress; an unchanged data directory says nothing about a separate build directory. Show the user a compact timeline of concrete operations/errors rather than another supervision promise. Separate dependency waits, productive execution, tool timeouts, recovery, rework and deployment; run counts alone do not measure wasted work. Tie resource failures to the operation stopped: a per-worker OOM does not establish global concurrency pressure. Preserve useful work before taking over. On a laptop host, rule out sleep before
 blaming software for a wall-clock gap: minutes with no lines at all in the agent log, plus `pmset -g log`
 Sleep/DarkWake entries, mean the machine was asleep, and timers on the monotonic clock (pause, resume and
 replacement watchers) don't advance during sleep. A gap that spans a sleep is not a software delay.
