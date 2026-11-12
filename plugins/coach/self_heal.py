@@ -2005,16 +2005,28 @@ def budget(board: Optional[str] = None, now: Optional[float] = None,
         busy = [c for c in inflight if c.get("status", "running") in ("running", "ready")]
         occupied_fix = sum(1 for c in busy if str(c.get("title") or "").startswith(FIX_TITLE))
         reserved = float(new_card_usd)
+        holders = []
         for c in inflight:
-            cb = eb.card_budget(c, snap) if hasattr(eb, "card_budget") else float(INVESTIGATION_BUDGET)
+            # inv_key is selfheal:<fingerprint>[:rN]; all other kinds default to FIX.
+            key = str(c.get("idempotency_key") or "")
+            default = (INVESTIGATION_BUDGET if re.fullmatch(r"selfheal:[^:]+(?::r[1-9][0-9]*)?", key)
+                       else FIX_BUDGET)
+            # Only admission substitutes this fallback. The watchdog's original snapshot
+            # and card_budget()/decide() semantics remain untouched.
+            admission_snap = {**snap, "caps": {**snap["caps"], "selfheal": default}, "total_cap": default}
+            cb = eb.card_budget(c, admission_snap) if hasattr(eb, "card_budget") else float(default)
             spent = eb.card_cost(home, b, c["id"]) if hasattr(eb, "card_cost") else 0.0
-            reserved += max(0.0, float(cb) - float(spent))
+            if not all(math.isfinite(float(v)) and float(v) >= 0 for v in (cb, spent)):
+                raise ValueError("invalid card budget or spend")
+            remaining = max(0.0, float(cb) - float(spent))
+            holders.append({"card": c["id"], "reserved": remaining})
+            reserved += remaining
         ok, why = eb.check(snap, "selfheal", reserved)
         if not ok and usd < cap:
             why = f"{why} (spend ${usd:.2f} + ${reserved:.2f} reserved for in-flight and the new card)"
         # Commit the observation only after ALL reads succeed. Unknown is not zero spend.
         out.update(usd=usd, cap=cap, running=running, ok_usd=ok, reserved=round(reserved, 2),
-                   occupied=len(busy), occupied_fix=occupied_fix,
+                   occupied=len(busy), occupied_fix=occupied_fix, holders=holders, new_card_usd=new_card_usd,
                    ok_running=len(busy) < MAX_RUNNING, available=True, why=why)
     except Exception as exc:
         out["why"] = f"budget read failed: {exc}"
@@ -2030,9 +2042,66 @@ def _budget_unavailable(b: dict, fp: str, store) -> Optional[dict]:
     return {"action": "error", "why": why}
 
 
-def _admission_denied(b: dict, now: float) -> Optional[dict]:
+def note_reservation_starved(store, b: dict, now: float, runner=None) -> None:
+    """Caller holds the admission lock. One daily event and one open incident owner, never Inbox."""
+    if (not b.get("available", False) or b.get("ok_usd") or b.get("usd") != 0
+            or b.get("reserved", 0) < b.get("cap", float("inf"))):
+        return
+    path = Path(store.root) / "selfheal-reservation-starved.json"
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    owner = state.get("card")
+    # A closed owner ends an incident, including a recurrence on the same UTC day.
+    # An unreadable status is not evidence of closure: retain the owner on read failure.
+    if owner and card_status(owner, None, runner) in ENDED:
+        state = {"incident": int(state.get("incident", 1)) + 1}
+        owner = None
+    state.setdefault("incident", 1)
+    now = store.clock()
+    day = _utc_day(now)
+    def save():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, path)
+    if state.get("day") != day:
+        state["day"] = day
+        save()
+        store.log({"event": "selfheal_reservation_starved", "utc_day": day, "ts": now,
+                   "holders": b.get("holders", []), "reserved": b["reserved"], "cap": b["cap"],
+                   "new_card_usd": b.get("new_card_usd")})
+    if state.get("delivered_day") == day:
+        return
+    body = (f"Self-heal admission starved at $0 spend on {day}: ${b['reserved']:.2f} reserved "
+            f"against ${b['cap']:g} cap. Holding cards (unspent reservations):\n" +
+            "\n".join(f"- {h['card']}: ${h['reserved']:.2f}" for h in b.get("holders", [])) +
+            f"\nNew admission: ${b.get('new_card_usd', 0):g}.\n"
+            "Inspect the holding cards and admission accounting. Fix the root cause without raising the cap "
+            "or cancelling legitimate work. Verify admission resumes. Post nothing to Inbox.")
+    if owner:
+        rc, _, _ = _run(["hermes", "kanban", "comment", owner, body], runner)
+        delivered = rc == 0
+    else:
+        result = _lane_card("self-heal lane: reservations starve admission at zero spend", body,
+                            f"selfheal-reservation-starved:{host_name()}:{day}:{state['incident']}", runner)
+        delivered = bool(result.get("card"))
+        if delivered:
+            state["card"] = result["card"]
+    if delivered:
+        state["delivered_day"] = day
+        save()
+
+
+def _admission_denied(b: dict, now: float, store=None, runner=None) -> Optional[dict]:
     """A known denial must never create a dispatchable card, even briefly."""
     if not b["ok_usd"]:
+        if store is not None:
+            try:
+                note_reservation_starved(store, b, now, runner)
+            except Exception as exc:
+                store.log({"event": "selfheal_reservation_alert_error", "why": str(exc)[:300]})
         return {"action": "deferred", "retry_at": _next_utc_midnight(now),
                 "why": b.get("why") or "self-heal daily cap reached"}
     if not b["ok_running"]:
@@ -3880,7 +3949,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
         return unavailable
-    denied = _admission_denied(b, now) or _fix_first_denied(b, store, now)
+    denied = _admission_denied(b, now, store, runner) or _fix_first_denied(b, store, now)
     if denied:
         return _defer_investigation(d, denied, store)
     known, gen = known_cards(st), dec["gen"]
@@ -4122,7 +4191,7 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
         return unavailable
-    denied = _admission_denied(b, now)
+    denied = _admission_denied(b, now, store, runner)
     if denied:
         # Keep status=proposed: sync rereads the same Do-it outcome and retries admission.
         _log_deferral_once(store, fp, denied, b, now)
@@ -4497,7 +4566,7 @@ def _recover_completion_receipt(fp: str, store, runner, now: float) -> Optional[
         b = budget(r["board"], now)
         if _budget_unavailable(b, fp, store):
             return None
-        denied = _admission_denied(b, now)
+        denied = _admission_denied(b, now, store, runner)
         if denied:
             _log_deferral_once(store, fp, denied, b, now, stage="receipt")
             return None

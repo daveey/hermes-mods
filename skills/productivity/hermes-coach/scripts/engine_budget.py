@@ -181,9 +181,10 @@ def engine_cards(home, board, statuses=("running",)):
         pid = "t.worker_pid" if "worker_pid" in cols else "null"
         body = "coalesce(t.body, '')" if "body" in cols else "''"
         for lane in LIVE_LANES:
-            for r in k.execute(f"select t.id, t.title, t.status, {body}, {pid} from tasks t "
+            for r in k.execute(f"select t.id, t.title, t.status, {body}, {pid}, t.idempotency_key from tasks t "
                                f"where t.status in ({q}) and {fx.LANE_WHERE[lane]}", statuses):
-                out.append({"id": r[0], "title": r[1], "status": r[2], "body": r[3], "worker_pid": r[4], "lane": lane})
+                out.append({"id": r[0], "title": r[1], "status": r[2], "body": r[3], "worker_pid": r[4], "lane": lane,
+                            "idempotency_key": r[5]})
     return out
 
 

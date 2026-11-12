@@ -110,6 +110,20 @@ class Engine(unittest.TestCase):
         snap = eb.snapshot(self.home, "hermes", self.data, self.now, me="me")
         self.assertEqual(snap["lanes"]["fixer"], 7.0)
 
+    def test_selfheal_key_export_and_markerless_stop_fallback(self):
+        key = "selfheal:agent-0123456789:fix"
+        self.card("t_selfheal", key, by="selfheal", cost=15)
+        cards = eb.engine_cards(self.home, "hermes")
+        self.assertEqual(cards[0]["idempotency_key"], key)
+        snap = eb.snapshot(self.home, "hermes", self.data, self.now)
+        self.assertEqual(eb.card_budget(cards[0], snap), 200)
+        self.assertEqual(eb.decide(self.home, "hermes", snap, cards), [])
+        self.s.execute("update sessions set estimated_cost_usd=200")
+        self.s.commit()
+        stops = eb.decide(self.home, "hermes", snap, cards)
+        self.assertEqual(stops[0][1:3], (200, 200))
+        self.assertIn("card cost", stops[0][3])
+
     # ── watchdog ──
     def test_watchdog_stops_over_budget_engine_card_only(self):
         self.card("t_eng", "coach-fix:loop", cost=7.5, pid=4242)               # over its $7 card budget
