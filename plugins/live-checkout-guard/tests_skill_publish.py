@@ -15,6 +15,11 @@ spec = importlib.util.spec_from_file_location('skill_publish_test', HERE / 'skil
 publisher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(publisher)
 
+# PATH of the MacBook Desktop serve backend (launchd child): no /opt/homebrew/bin, so no gitleaks.
+DESKTOP_SERVE_PATH = os.pathsep.join([
+    '/Users/you/.local/bin', '/Users/you/.cargo/bin', '/Users/you/.nix-profile/bin',
+    '/nix/var/nix/profiles/default/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+
 
 class BudgetTests(unittest.TestCase):
     def test_shared_deadline_caps_git_ci_and_reconcile_subprocesses(self):
@@ -80,6 +85,55 @@ class CredentialTests(unittest.TestCase):
             with patch.object(publisher, 'bounded', side_effect=capture):
                 publisher.run('/example', 'fetch', 'origin', 'main')
             self.assertFalse(any('credential.' in arg for arg in calls[-1]))
+
+
+class ToolPathTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name)
+        self.a = self.base / 'a'
+        self.b = self.base / 'b'
+        self.a.mkdir()
+        self.b.mkdir()
+        self.absent = self.base / 'absent'
+
+    def test_appends_existing_missing_dirs_after_inherited_order(self):
+        inherited = os.pathsep.join(['/x', '/y', str(self.a), '/x'])
+        tools = (str(self.a), str(self.absent), str(self.b), str(self.b) + '/')
+        with patch.object(publisher, 'TOOL_DIRS', tools, create=True):
+            self.assertEqual(publisher.tool_path(inherited).split(os.pathsep),
+                             ['/x', '/y', str(self.a), '/x', str(self.b)])
+            # Idempotent: run() re-cleans an env clean_env already built.
+            once = publisher.clean_env({'PATH': inherited})['PATH']
+            self.assertEqual(publisher.clean_env({'PATH': once})['PATH'], once)
+
+    def test_clean_env_and_bounded_subprocesses_get_tool_path(self):
+        with patch.object(publisher, 'TOOL_DIRS', (str(self.a),), create=True):
+            env = publisher.clean_env({'PATH': '/usr/bin', 'GIT_DIR': '/decoy'})
+            self.assertEqual(env, {'PATH': '/usr/bin' + os.pathsep + str(self.a)})
+            self.assertEqual(publisher.clean_env({})['PATH'],
+                             os.defpath + os.pathsep + str(self.a))
+            with patch.dict(os.environ, {'PATH': DESKTOP_SERVE_PATH}), \
+                    patch.object(publisher.subprocess, 'Popen') as popen:
+                process = popen.return_value.__enter__.return_value
+                process.communicate.return_value = (b'', b'')
+                process.returncode = 0
+                publisher.bounded(['gh', 'run', 'list'], timeout=5)
+                publisher.run('/example', 'status')
+        self.assertEqual(popen.call_count, 2)
+        for call in popen.call_args_list:
+            self.assertEqual(call.kwargs['env']['PATH'],
+                             DESKTOP_SERVE_PATH + os.pathsep + str(self.a))
+
+    def test_default_dirs_are_homebrew_usr_local_and_home_local(self):
+        self.assertEqual(publisher.TOOL_DIRS,
+                         ('/opt/homebrew/bin', '/usr/local/bin', '~/.local/bin'))
+        (self.base / '.local/bin').mkdir(parents=True)
+        with patch.dict(os.environ, {'HOME': str(self.base)}):
+            added = publisher.tool_path('/nowhere').split(os.pathsep)[1:]
+        self.assertEqual(added, [d for d in ['/opt/homebrew/bin', '/usr/local/bin',
+                                             str(self.base / '.local/bin')] if os.path.isdir(d)])
 
 
 class PublicationTests(unittest.TestCase):
@@ -226,6 +280,39 @@ fi
         self.assertEqual(outside.read_text(), 'outside')
         self.assertEqual(self.target.read_text(), 'published\n')
         self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+
+    def test_desktop_serve_path_reaches_gitleaks_through_tool_dirs(self):
+        real = shutil.which('gitleaks')
+        assert real is not None
+        if shutil.which('gitleaks', path=DESKTOP_SERVE_PATH):
+            self.skipTest('gitleaks is on the Desktop serve PATH on this host')
+        tools = self.base / 'tools'
+        tools.mkdir()
+        (tools / 'gitleaks').symlink_to(real)
+        with patch.dict(os.environ, {'PATH': DESKTOP_SERVE_PATH}), \
+                patch.object(publisher, 'TOOL_DIRS', (str(tools),), create=True):
+            result = self.publish()
+        self.assertEqual(result['status'], 'published')
+        self.assertEqual(self.git(self.origin, 'show', 'main:' + self.path), 'published')
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), result['commit'])
+        self.assertEqual(self.git(self.root, 'status', '--porcelain'), '')
+        self.assert_no_worktrees()
+
+    def test_truly_missing_gitleaks_still_refused_and_preserved(self):
+        if shutil.which('gitleaks', path=DESKTOP_SERVE_PATH):
+            self.skipTest('gitleaks is on the Desktop serve PATH on this host')
+        empty = self.base / 'empty-tools'
+        empty.mkdir()
+        with patch.dict(os.environ, {'PATH': DESKTOP_SERVE_PATH}), \
+                patch.object(publisher, 'TOOL_DIRS', (str(empty), str(self.base / 'absent')),
+                             create=True):
+            with self.assertRaisesRegex(ValueError, r'privacy check\(s\) cannot run: gitleaks'):
+                self.publish()
+        self.assertEqual(self.target.read_text(), 'published\n')
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+        self.assertEqual(len(list((self.base / 'hermes-home/kanban/evidence/mods-reconcile').glob(
+            'skill-publish-*/publish.patch'))), 1)
+        self.assert_no_worktrees()
 
     def test_red_and_unknown_ci_one_skip_no_mutation(self):
         for state in ['red', 'unknown']:

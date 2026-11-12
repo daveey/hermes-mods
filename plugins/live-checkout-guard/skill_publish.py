@@ -59,10 +59,30 @@ SAFE_SUFFIXES = {'.md', '.txt', '.rst', '.csv', '.json', '.yaml', '.yml',
                  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf'}
 
 
+# Host tool directories (gitleaks, gh) appended to PATH for every publisher subprocess.
+# A launchd-started backend (the MacBook Desktop serve) inherits a PATH without
+# /opt/homebrew/bin, so the pre-commit hook could not find gitleaks and refused.
+TOOL_DIRS = ('/opt/homebrew/bin', '/usr/local/bin', '~/.local/bin')
+
+
+def tool_path(path):
+    """PATH with each existing TOOL_DIRS entry appended once, after the inherited order."""
+    entries = path.split(os.pathsep) if path else []
+    present = {os.path.normpath(e) for e in entries if e}
+    for directory in TOOL_DIRS:
+        directory = os.path.normpath(os.path.expanduser(directory))
+        if directory not in present and os.path.isdir(directory):
+            entries.append(directory)
+            present.add(directory)
+    return os.pathsep.join(entries)
+
+
 def clean_env(env=None):
-    """Inherited environment minus Git repository-routing variables."""
-    return {k: v for k, v in (os.environ if env is None else env).items()
-            if k not in GIT_ROUTING_ENV and not k.startswith('GIT_CONFIG')}
+    """Inherited environment minus Git repository-routing variables, with host tool dirs on PATH."""
+    env = {k: v for k, v in (os.environ if env is None else env).items()
+           if k not in GIT_ROUTING_ENV and not k.startswith('GIT_CONFIG')}
+    env['PATH'] = tool_path(env.get('PATH', os.defpath))
+    return env
 
 
 def bounded(command, *, timeout, data=None, env=None, cwd=None):
