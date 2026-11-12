@@ -302,6 +302,9 @@ def check_complete(task_id: str, summary: str, paths: list[Path], title: Optiona
     if hits and not valid_followups(task_id, handoff, paths):
         named = [t for t in dict.fromkeys(TASK_ID_RE.findall(handoff)) if t != task_id]
         return complete_refusal(task_id, hits, named)
+    why = _delivery_refusal(task_id, handoff, paths)
+    if why:  # I: "posted on t_X" needs the write's result, not the intent
+        return why
     why = _threshold_refusal(task_id, summary, metadata, found)
     if why:  # G: a failed threshold never becomes a waiver or a guessed pass
         return why
@@ -317,6 +320,43 @@ def _threshold_refusal(task_id: str, summary: str, metadata: Any, found) -> Opti
                                                   (found[1].get("body") or "") if found else "")
     except Exception:
         return None
+
+
+def _delivery_refusal(task_id: str, handoff: str, paths: list[Path]) -> Optional[str]:
+    """I, isolated: a delivery-gate bug fails open for I only."""
+    try:
+        why = _sibling("delivery").check_deliveries(task_id, handoff, list(paths), ro_connect)
+    except Exception:
+        return None
+    if why:
+        try:
+            _sibling("consent").telemetry("delivery_claim_refused", task=task_id, detail=why[:300])
+        except Exception:
+            pass
+    return why
+
+
+def _sibling(name: str):
+    try:
+        import importlib
+
+        return importlib.import_module(f"{__package__}.{name}") if __package__ else _load_sibling(name)
+    except ImportError:
+        return _load_sibling(name)
+
+
+def _load_sibling(name: str):
+    import importlib.util
+    import sys
+
+    key = f"kanban_honest_done_{name}"
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name(f"{name}.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod = sys.modules.setdefault(key, mod)
+    return mod
 
 
 def check_review(task_id: str, summary: str, paths: list[Path], metadata: Any = None) -> Optional[str]:

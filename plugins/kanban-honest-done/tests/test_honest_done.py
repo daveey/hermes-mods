@@ -265,7 +265,7 @@ def test_register_wires_pre_tool_call():
             hooks[name] = fn
 
     plugin.register(Ctx())
-    assert set(hooks) == {"pre_tool_call"}
+    assert set(hooks) == {"pre_tool_call", "post_tool_call", "pre_llm_call"}  # H records/clears consent stops
 
 
 # --- C: needs_attention (sidebar amber) ---------------------------------------------------------------------------

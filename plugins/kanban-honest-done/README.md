@@ -39,6 +39,8 @@ Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call`
 | E | (any session, not only workers) `kanban_create` whose title/body names an origin chat on **another** gateway (`origin … @session:<profile>@<gw>/<id>`, `<gw>` a known hermes-hub gateway) without `origin_session` (or `HERMES_ORIGIN_SESSION`) binding that chat. The refusal gives the exact `origin_session='…'` to pass, which subscribes the chat so it sees the card and its completion. Fails open when this gateway has no hermes-hub name | `kanban_create` tool (direct or via `tool_call`) |
 | F | (any session) `hermes kanban edit <id> --body` that **changes acceptance**: adds waiver text (`ACCEPTANCE AMENDED`, "acceptance waived/withdrawn/…", a `WITHDRAWN:`/`WAIVED:` line, "observation/proof withdrawn") or drops a sentence of the current body that states acceptance (a `DONE` sentence, an "acceptance" sentence; removing an earlier waiver section is a restore and passes), unless the new body cites `user message <id>` (or `msg<id>`) that resolves in `state.db` to a user turn typed in **this** chat (this session or its compression ancestors; not a delegated parent, not another chat), in a local human chat only (session source `desktop`/`tui`/`cli`/`local`; `peer-mail`, kanban, subagent, cron, dispatch/review lanes and any unknown source are refused), with `messages.display_kind` empty (including legacy/UI decision rows that pass the text checks; not proof of exclusive keyboard authorship) or `steer` (a mid-turn `[OUT-OF-BAND USER MESSAGE …]` row, accepted only when it is exactly one envelope), not a runtime/Kanban notice (`[...]`, `⏸ [..]`, `⚠ subagent … was stopped by a restart`, `[Message from another Hermes session …]`, `David pressed …`; any other `display_kind`), and newer than the card's current body (its last `edited` body event, else creation). An unknown calling session fails closed for such edits only. It proves who gave the authority and when, not that the words authorize the change. `acceptance.py` | `terminal`/`process` (literal `--body`, `"$(cat FILE)"`, `$(< FILE)`, unquoted `$(cat FILE)`, variables assigned earlier in the same command), `execute_code` (decoded string literals), `tool_call`. A body built any other way at runtime is not recovered (not refused). The `kanban edit` CLI typed by a human and the dashboard are not hooked |
 | G | completing or `kanban_request_review`-ing your **own** card with a handoff that turns a **failed acceptance threshold into a waiver or a guessed pass** (see below). `thresholds.py` | `kanban_complete`, `kanban_request_review` (direct or via `tool_call`), `hermes kanban complete <own>` via shell / `execute_code` |
+| H | (any session) a **write that delegates an action the user did not consent to**: after an approval result in this chat is a non-consent (`BLOCKED: … has NOT consented` / timed out, "Silence is not consent"), any `kanban_create`, `kanban_comment`, `kanban_supervisor_request`, `cross_task`/`cross_session` send, `delegate_task`, or `hermes kanban`/`hermes-hub` write command naming a card the blocked call named, until the user's next real message in that chat. A worker is bound by the stops of the chat its card came from (`tasks.session_id` or the body's `origin @session:`), on the same host. `consent.py` (see below) | `post_tool_call` records, `pre_tool_call` refuses, `pre_llm_call` clears |
+| I | completing your **own** card with a handoff that **claims a delivery to another card** ("posted on t_X", "commented on t_X", "relayed to t_X") with no write result behind it. `delivery.py` (see below) | same paths as B |
 
 Each refusal says what to do: finish the missing part, or `kanban_create` the follow-up (`parents=[<this card>]`)
 and name its id, or `kanban_block` with the exact physical step. Completing another card (a reviewer approving a
@@ -54,6 +56,32 @@ Classifier: titles are request context, not evidence of unfinished work; only th
 Per sentence, quoted text removed, questions skipped; negations ("no follow-ups", "nothing deferred",
 "deferred at X's request", "deployment is deferred") don't count; follow-up commits/PRs are finished work. Patterns
 are `DROP_PATTERNS` in `core.py`.
+
+## Gates H and I: a consent stop survives delegation, and intent is not delivery
+
+Why (defect kanban-6cf8e9e3fd, 2026-11-12): a chat's comment on another gateway's card hit an approval prompt that
+timed out. The chat then ordered a worker card to post the same comment (the delegated request carried
+action/target/text, not the stop). That worker completed saying the tests "were posted on t_…", and filed the
+operator request 13 s later, after completion, where the `stale_run` fence correctly refused it. Nothing was
+posted, and the chat relayed the false claim.
+
+H records a stop only from an approval result's own status field (`error`/`message`, or the whole result)
+starting `BLOCKED:` and saying the user has NOT consented / silence is not consent (or `user_consent: false`), and
+only for card ids the blocked call named. Technical refusals (`stale_run`, `foreign_card`, guard refusals, a
+notifier that could not send) are never a human veto; quoted stop text in ordinary output is not a stop. Stops
+live in `$HERMES_HOME/cache/kanban-honest-done/consent-stops.json` (24 h TTL) and clear on the chat's next real
+user message (`pre_llm_call` with canonical user content; notice turns do not clear). Limit: a worker on another
+host does not see its origin chat's stops; the parent's delegation is refused at the source instead.
+
+I treats a past-tense, non-negated, unquoted delivery sentence naming another card as a claim. It holds when a
+readable board (live files and `kanban/sync-shadow` replicas) has a comment on that card written since this card
+was created, a `supervisor_requests` row from this card naming it with status `done` (filed before completion),
+or the card was created by / links to this card. `pending`/`accepted` means queued, not delivered (the refusal
+gives the honest wording, `requested … (supervisor request #N, pending); not yet delivered`); `rejected`/`failed`
+is a failure to report. Replay on worker-6's 278 recent runs: 3 claims, all verified, 0 refused.
+
+Telemetry (agent-owned, never the Inbox): `$HERMES_HOME/logs/kanban-honest-done.jsonl` lines
+`consent_stop_recorded`, `consent_relay_refused`, `consent_stop_cleared`. `tests/test_delivery_and_consent.py`.
 
 ## Gate G: failed thresholds stay failed
 

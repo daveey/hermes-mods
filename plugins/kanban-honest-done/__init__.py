@@ -47,6 +47,11 @@ except ImportError:  # loaded without a parent package (pytest, hyphenated dir)
         _spec.loader.exec_module(_mod)
         core = sys.modules.setdefault(_key, _mod)
 
+try:
+    from . import consent as consent_mod
+except ImportError:  # same fallback as core
+    consent_mod = core._load_sibling("consent")
+
 logger = logging.getLogger(__name__)
 
 SHELL_TOOLS = {"terminal", "process_manage", "process", "run_in_user_terminal"}
@@ -146,13 +151,45 @@ def classify_acceptance(tool_name: str, args: Any, session_id: str, paths_fn=Non
     return None
 
 
+def _origin_chats(own: str, paths_fn=None) -> list[str]:
+    """Chats a worker card came from: the creating session (``tasks.session_id``) and any ``origin @session:`` its
+    body names. Their consent stops bind the worker too (H)."""
+    out: list[str] = []
+    for p in (paths_fn or core.board_paths)():
+        try:
+            conn = core.ro_connect(p)
+        except Exception:
+            continue
+        try:
+            row = conn.execute("SELECT session_id, body FROM tasks WHERE id=?", (own,)).fetchone()
+        except Exception:
+            row = None
+        finally:
+            conn.close()
+        if row:
+            out += [str(row[0])] if row[0] else []
+            out += core.origin_sessions(row[1] or "")
+            break
+    return list(dict.fromkeys(out))
+
+
+def classify_consent(tool_name: str, args: Any, session_id: str, own: Optional[str] = None) -> Optional[str]:
+    """H: a write naming a card under this chat's (or, for a worker, its origin chat's) consent stop."""
+    if not consent_mod.write_texts(tool_name, args):
+        return None
+    sessions = [session_id] + (_origin_chats(own) if own else [])
+    return consent_mod.check_relay(tool_name, args, sessions)
+
+
 def _pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any) -> Optional[dict]:
     own = None
     try:
-        why = classify_create(tool_name, args) or classify_acceptance(tool_name, args, session_id or "")
-        if not why and _in_worker():
-            own = core.own_task_id()
-            why = classify(tool_name, args, own) if own else None
+        worker = _in_worker()
+        own = core.own_task_id() if worker else None
+        why = (classify_consent(tool_name, args, session_id or "", own)
+               or classify_create(tool_name, args) or classify_acceptance(tool_name, args, session_id or ""))
+        if not why and own:
+            why = classify(tool_name, args, own)
     except Exception:  # never let this plugin break a tool call
         logger.debug("kanban-honest-done classify failed", exc_info=True)
         return None
@@ -160,6 +197,25 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", 
         return None
     logger.info("kanban-honest-done refused %s for %s", tool_name, own)
     return {"action": "block", "message": why}
+
+
+def _post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "",
+                    **_: Any) -> None:
+    """H: remember an approval non-consent for the cards the blocked call named."""
+    try:
+        consent_mod.record(tool_name, args, result, session_id or "")
+    except Exception:
+        logger.debug("kanban-honest-done consent record failed", exc_info=True)
+
+
+def _pre_llm_call(session_id: str = "", canonical_user_content: Any = None, **_: Any) -> None:
+    """H: a real user message (not a notice turn) clears that chat's consent stops."""
+    try:
+        if isinstance(canonical_user_content, dict) and session_id:
+            consent_mod.clear(session_id)
+    except Exception:
+        logger.debug("kanban-honest-done consent clear failed", exc_info=True)
+    return None
 
 
 def _register_done_check() -> bool:
@@ -177,4 +233,6 @@ def _register_done_check() -> bool:
 
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _pre_tool_call)
+    ctx.register_hook("post_tool_call", _post_tool_call)
+    ctx.register_hook("pre_llm_call", _pre_llm_call)
     _register_done_check()
