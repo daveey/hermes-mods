@@ -702,6 +702,13 @@ def _shadow_owner_ok(key: str, row: dict) -> bool:
     return '/' not in key or (row.get('created_on') is not None and str(row['created_on']) == key.split('/')[0])
 
 
+def _legacy_alias(key: str) -> Optional[str]:
+    """``gateway/board/id``: the unqualified legacy owner key of a four-part ``gateway/profile/board/id`` (core
+    projects a replica record without an owner profile under it), else None."""
+    parts = key.split('/')
+    return '/'.join((parts[0], parts[2], parts[3])) if len(parts) == 4 else None
+
+
 def _board_absence_veto(keys: set[str]) -> set[str]:
     """``_board_coverage``'s veto alone (nothing resolved): the inventory-failure path."""
     return _board_coverage(keys, resolve=False)[1]
@@ -860,8 +867,8 @@ def _reused_read(ids: list[str], remote_inventory: Callable[[], list[dict]], lig
     out = core.Cards({k: _fresh_card(c) for k, c in snap["cards"].items()})
     shadow, veto = _board_coverage(want - set(out), exclude=snap["uncertain"])
     out.update(shadow)
-    out.absence_veto = frozenset(veto)
-    out.uncertain = frozenset(snap["uncertain"] | out.absence_veto)
+    out.absence_veto = frozenset(veto | ((snap.get("alias_held") or frozenset()) & want) - set(shadow))
+    out.uncertain = frozenset((snap["uncertain"] & want) | out.absence_veto)
     return out
 
 
@@ -914,6 +921,7 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
     merged: dict[str, dict] = {}
     times: dict[str, float] = {}
     by_id: dict[str, set[str]] = {}
+    alias_held: set[str] = set()
     for card in remote:
         cid = str(card['id'])
         if cid in cards:
@@ -939,6 +947,11 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
         elif len(parts) in (1, 3) and len(owners) == 1:
             canonical = next(iter(owners))
             cards[key] = {**merged[canonical], 'canonical_key': canonical}
+        elif owners and owners == {_legacy_alias(key)}:
+            # Only this card's own unqualified legacy row (gateway/board/id, owner profile unknown) names the id:
+            # not another owner. The board's fresh full shadow may still resolve the qualified key; if it does
+            # not, the alias still vetoes absence (below), so the key is never unlinked as missing.
+            alias_held.add(key)
         elif owners:
             uncertain.add(key)  # several owners, or another owner key than this one: not "matches nothing"
     fill = [c for c in cards.values() if c.get('remote') and c.get('via') == 'shepherd'
@@ -960,11 +973,12 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
     # Time-judged (shadow freshness), so never part of the memo below: recomputed on every reuse too.
     shadow, veto = _board_coverage(want - set(cards), exclude=frozenset(uncertain & want))
     out.update(shadow)
-    out.absence_veto = frozenset(veto)
+    out.absence_veto = frozenset(veto | (alias_held - set(shadow)))
     out.uncertain = frozenset((uncertain & want) | out.absence_veto)
     if content is not None and not failed and _read_key(ids, light) == content:
         # Labelled with the board revisions read BEFORE the read; nothing committed since.
         snap = {"key": content, "rows": list(remote), "hub": hub_key, "uncertain": frozenset(uncertain & want),
+                "alias_held": frozenset(alias_held),
                 "cards": {k: _fresh_card(c) for k, c in cards.items()}}
         with _read_memo_lock:
             _read_memo[light] = snap
@@ -1021,8 +1035,13 @@ def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
             except Exception:
                 union["healthy"] = False
             else:
-                union["healthy"] = (not any(r.get("stale") is not False and r.get("via") != "origin"
-                                            for r in rows) and _hub_fresh())
+                # A failed replica read hands back the last good rows ALL marked stale: an outage. A fresh read
+                # still carries ghost rows (cards the replica stopped publishing, kept stale by core forever, e.g.
+                # an old card archived without completion); they are evidence about those cards only, so one
+                # fresh projected row shows this read succeeded.
+                linked = [r for r in rows if r.get("via") != "origin"]
+                union["healthy"] = ((not linked or any(r.get("stale") is False for r in linked))
+                                    and _hub_fresh())
         return union["healthy"]
 
     read.healthy = healthy  # type: ignore[attr-defined]
@@ -2127,7 +2146,9 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                            "working, so no close-out can run. Check whether these cards moved, were deleted, "
                            "are on a gateway this one no longer syncs, or lack their owner's release; reconcile the "
                            "ledger row or restore the "
-                           "link. Entries missing through 24 h of fresh inventory reads are unlinked automatically."))
+                           "link. Entries missing, or found but stranded (a row the fresh replica no longer publishes, or done "
+                           "without owner evidence), through 24 h of healthy inventory reads are unlinked "
+                           "automatically."))
     for handoff in routing.stalled(led, now, 0):
         key = f"chat-closeout:handoff:{handoff['id']}"
         observed.add(key)

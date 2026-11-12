@@ -475,6 +475,19 @@ def is_unresolved(card: Optional[dict[str, Any]]) -> bool:
     return is_unknown(card) or (not is_settled(card) and (card or {}).get("status") in DONE_STATUSES)
 
 
+def is_stranded(card: Optional[dict[str, Any]]) -> bool:
+    """A found remote row that nothing can ever move on, as seen on a healthy pass (``track_unlinked``): a linked
+    (non-origin) row the fresh replica no longer publishes (core keeps the last pre-withdrawal copy, marked stale,
+    forever; e.g. an old card archived without completion is never republished), or a fresh row finished by status
+    without the owner evidence that settles it (origin without binding, shepherd not attesting the close). Such a row
+    is unresolved, never settled: it ages out like a missing entry and never counts as a delivered close-out."""
+    if not card or not card.get("remote"):
+        return False
+    if card.get("stale") is not False:
+        return card.get("via") != "origin"
+    return card.get("status") in DONE_STATUSES and not is_settled(card)
+
+
 def needs_human(card: Optional[dict[str, Any]]) -> bool:
     return bool(card) and is_settled(card) and card.get("status") not in DONE_STATUSES
 
@@ -728,13 +741,14 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
 
 
 # ---- unlinking: an entry nothing can find any more ---------------------------------------------------------------
-UNLINK_AFTER_S = 24 * 3600.0   # healthy observation before a missing entry leaves the batch
+UNLINK_AFTER_S = 24 * 3600.0   # healthy observation before a missing or stranded entry leaves the batch
 UNLINK_MAX_GAP_S = 300.0       # a longer gap between two observations is not observation (an outage, a sleep)
 
 
 def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, healthy: Callable[[], bool],
                    now: float, mono: float, pid: Optional[int] = None) -> dict[str, Any]:
-    """Age batch entries that match nothing: no local card, no inventory row, and not ``cards.uncertain``.
+    """Age batch entries that match nothing: no local card, no inventory row, and not ``cards.uncertain``; and
+    found remote rows that are ``is_stranded`` (one shared clock: either way nothing can resolve the entry).
 
     Only time observed while the inventory is fresh and readable (``healthy()``) counts. Each observation adds the
     time since the previous one, as far as this process's monotonic clock confirms it (a lid sleep moves the wall
@@ -749,6 +763,8 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
     before = {k: dict(v) for k, v in (row.get("unlinked") or {}).items() if isinstance(v, dict)}
     state = {k: dict(v) for k, v in before.items() if "removed" in v or k in batch}
     missing = {k for k in batch if cards.get(k) is None and k not in uncertain}
+    stranded = {k for k in batch if is_stranded(cards.get(k))}
+    missing |= stranded
     for k in batch - missing:
         if k in getattr(cards, "absence_veto", ()):
             state.pop(k, None)  # prior linked-only reads never established this board's absence
@@ -770,7 +786,14 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
             continue
         if e is None or "removed" in e:
             state[k] = {"since": now, "observed": 0.0, "at": now, "mono": mono, "pid": pid}
+            if k in stranded:
+                state[k]["found"] = True
             continue
+        # Missing and stranded are one clock (nothing can resolve the entry either way); ``found`` names the last.
+        if k in stranded:
+            e["found"] = True
+        else:
+            e.pop("found", None)
         # Several backends share the ledger. Remember each observer's last clock,
         # but count only since the last shared observation (never double-count).
         clocks = dict(e.get("clocks") or {})
@@ -785,7 +808,7 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
         e["clocks"] = dict(sorted(clocks.items(), key=lambda item: item[1]["at"])[-8:])
         e.update(at=now, mono=mono, pid=pid)
         if float(e.get("observed") or 0) >= UNLINK_AFTER_S:
-            state[k] = {"removed": now, "since": e.get("since")}
+            state[k] = {"removed": now, "since": e.get("since"), **({"found": True} if e.get("found") else {})}
             removed.add(k)
     out: dict[str, Any] = {}
     if state != before:
@@ -794,8 +817,8 @@ def track_unlinked(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, hea
         out["batch"] = batch - removed
         out["covered"] = covered - removed
         out["relayed"] = {p for p in row.get("relayed") or [] if _premise_card(p) not in removed}
-        logger.info("chat-closeout: %s no longer waits on %s (missing for %d h of fresh inventory reads)",
-                    row.get("session_id"), ", ".join(sorted(removed)), int(UNLINK_AFTER_S / 3600))
+        logger.info("chat-closeout: %s no longer waits on %s (missing or stranded for %d h of fresh inventory "
+                    "reads)", row.get("session_id"), ", ".join(sorted(removed)), int(UNLINK_AFTER_S / 3600))
     return out
 
 
@@ -1721,8 +1744,14 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
             else:
                 lines.append(omission + " Artifact acceptance: unspecified.")
     for tid in unlinked_removed(row):
-        lines.append(f"- {tid}: no longer linked to this chat (no board or remote inventory has had it for "
-                     f"{int(UNLINK_AFTER_S / 3600)} h of healthy reads; this chat stopped waiting on it)")
+        if (row.get("unlinked") or {}).get(tid, {}).get("found"):
+            lines.append(f"- {tid}: no longer linked to this chat (its remote row stayed unresolvable for "
+                         f"{int(UNLINK_AFTER_S / 3600)} h of healthy reads: no longer published by its owner, or "
+                         "finished without owner evidence; this chat stopped waiting on it. Not a delivered "
+                         "result: say so if the chat still expects one)")
+        else:
+            lines.append(f"- {tid}: no longer linked to this chat (no board or remote inventory has had it for "
+                         f"{int(UNLINK_AFTER_S / 3600)} h of healthy reads; this chat stopped waiting on it)")
     if any("completion_receipt" not in (cards.get(tid) or {}) for tid in row.get("batch") or []):
         # Preserve legacy closeout behavior, without inferring artifact acceptance
         # or treating a handoff as permission to expand the approved scope.
