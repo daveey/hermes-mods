@@ -103,3 +103,25 @@ def test_a_db_without_display_kind_is_skipped_not_a_collector_crash(tmp_path):
     _db(h, [(SID, "user", "q", None, -5)], display_kind=False)
     sigs = sg.collect(h, {}, "hubhost", NOW)
     assert not [s for s in sigs if s["kind"] in ("refusals", "collector")]
+
+
+RETRY = ("[Hermes: automatic retry of 1 automated delivery that failed earlier in this chat because the provider "
+         "refused it]")
+
+
+def test_a_streak_of_automated_delivery_retries_is_not_called_a_user_re_ask(tmp_path):
+    # Hub chats 20261110_220455_fb17fe / 20261112_034756_e957f3: every refused row was core's automatic retry of a
+    # failed automated delivery, so "the user re-asked" sent the fixer looking for a human re-ask that never happened.
+    h = tmp_path / "home"
+    _db(h, [
+        ("auto", "user", RETRY, R, -120), ("auto", "user", RETRY, R, -60),
+        ("mixed", "user", RETRY, R, -50), ("mixed", "user", "still there?", R, -40),
+    ])
+    sigs = {s["session_id"]: s for s in _refusals(sg.collect(h, {}, "hubhost", NOW))}
+    assert set(sigs) == {"auto", "mixed"}  # still one stuck-chat signal per session
+    auto = sigs["auto"]["symptom"]
+    assert "user re-asked" not in auto
+    assert "automated deliveries" in auto and "2 times in a row" in auto
+    assert sigs["auto"]["fp"] == sg.fp("agent", "refusal_streak", "auto")
+    # One human ask in the run keeps the user wording.
+    assert "the user re-asked" in sigs["mixed"]["symptom"]
