@@ -441,14 +441,20 @@ def test_failure_injection_spinner_script(tmp_path, monkeypatch):
         services = [{"name": "spin", "match": marker}]
         time.sleep(1.0)
         a = cb.snapshot(cb.parse_ps(cb.run_ps()), services, os.getpid())
-        time.sleep(4.0)
-        b = cb.snapshot(cb.parse_ps(cb.run_ps()), services, os.getpid())
+        (ident, c1), = a["spin"].items()
+        # A loaded CI runner can starve the spinner (seen: 2 s of cpu in 4 s wall), so poll for
+        # cpu progress with a generous deadline instead of assuming one full core for a fixed sleep.
+        deadline = time.monotonic() + 30.0
+        while True:
+            time.sleep(1.0)
+            b = cb.snapshot(cb.parse_ps(cb.run_ps()), services, os.getpid())
+            c2 = b["spin"][ident]
+            if c2 - c1 >= 2.5 or time.monotonic() > deadline:
+                break
     finally:
         spinner.kill()
         spinner.wait()
-    (ident, c1), = a["spin"].items()
-    c2 = b["spin"][ident]
-    assert c2 - c1 >= 2.5  # ~4 s of cpu, cputime granularity on Linux is 1 s
+    assert c2 - c1 >= 2.5  # cputime granularity on Linux is 1 s
     acc = cb.account_interval(a, b, services, T0, T0 + 30, 90)
     assert acc["reasons"] == [] and acc["cpu"]["spin"] == pytest.approx(c2 - c1)
 
