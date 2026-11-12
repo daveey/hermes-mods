@@ -569,6 +569,117 @@ def _hd_written(prefix: str, rest: str) -> list:
     return paths
 
 
+def _hd_assigned(text: str, openers: tuple) -> str:
+    """The variable a data heredoc is assigned to (`x=$(cat <<EOF ...)`, `export x="$(cat <<EOF ...)"`), else ''.
+    Only the innermost enclosing substitution counts: its text must directly follow `NAME=`."""
+    if not openers or text[openers[-1]] not in "$`":
+        return ""
+    k = len(openers) - 1
+    lo = 0 if k == 0 else openers[k - 1] + (1 if text[openers[k - 1]] == "`" else 2)
+    start = text.rfind("\n", 0, openers[-1]) + 1
+    while start >= 2 and text[start - 2] == "\\":
+        start = text.rfind("\n", 0, start - 2) + 1
+    seg = _HD_SEPARATOR.split(text[max(lo, start):openers[-1]].replace("\\\n", " "))[-1]
+    m = re.search(r"(?:^|\s)(?:(?:export|local|declare|typeset|readonly)\s+(?:-\S+\s+)*)?([A-Za-z_]\w*)\+?=\S*\Z", seg)
+    return m.group(1) if m else ""
+
+
+_HD_DQ_WORD = re.compile(r"(?:then|do|else|elif|while|until|if)\b")
+
+
+def _hd_mask(code: str, keep: tuple = ()) -> str:
+    """`code` (same length) with what bash does not expand made inert for pattern matching: the text of '...'
+    (unless it is one plain path-like word or one of the `keep` paths), backslash pairs, and in "..." (outside a
+    `$(...)`) the command separators `;` `&` `|` `(` `{` newline and keywords (`echo "do $x"` is not a loop), so a
+    quoted argument stays one word. `$x` in "..." stays visible, `$x` in '...' or after `\\` does not."""
+    out, i, n, dq, depth = [], 0, len(code), False, 0
+    while i < n:
+        c = code[i]
+        if c == "\\":
+            out.append("  " if code[i + 1:i + 2] == "\n" else "__")
+            i += 2
+        elif dq:
+            if code.startswith("$(", i) and not code.startswith("$((", i):
+                depth += 1
+                out.append("$(")
+                i += 2
+                continue
+            if depth:
+                depth -= c == ")"
+                out.append(c)
+            elif c == '"':
+                dq = False
+                out.append(c)
+            elif c in ";&|\n({" and not (c == "{" and code[i - 1:i] == "$") and not (c == "(" and code[i - 1:i] == "$"):
+                out.append(" ")
+            elif (m := _HD_DQ_WORD.match(code, i)) and not code[i - 1:i].isalnum():
+                out.append("_" * len(m.group()))
+                i += len(m.group())
+                continue
+            else:
+                out.append(c)
+            i += 1
+        elif c == '"':
+            dq = True
+            out.append(c)
+            i += 1
+        elif c == "'" or code.startswith("$'", i):
+            d = c == "$"
+            j = i + 1 + d
+            while j < n and code[j] != "'":
+                j += 2 if d and code[j] == "\\" else 1
+            seg, inner = code[i:j + 1], code[i + 1 + d:j]
+            keepit = not d and (re.fullmatch(r"[\w./~+-]+", inner) or inner in keep)
+            out.append(seg if keepit or len(seg) < 2 else "'" + "_" * (len(seg) - 2) + seg[-1:])
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+_HD_SHELL = r"(?<![\w./$-])(?:[\w./-]*/)?(?:ba|z|da|k|mk)?sh(?![\w.-])"
+_HD_RUN_WRAP = (r"(?:(?:sudo|doas|env|nohup|command|exec|time)[ \t]+(?:(?:-[ugCDhprtTU]|--user|--group)[ \t]+\S+[ \t]+"
+                r"|-\S*[ \t]+|\w+=\S*[ \t]+)*)*")
+_HD_RUN_START = (r"(?:^|(?<![=(])\(|[;&|`{]|\b(?:then|do|else|elif|while|until|if)\b)\s*(?:\w+=\S*[ \t]+)*"
+                 + _HD_RUN_WRAP)
+
+
+def _hd_exec_re(src: str, extra: tuple = ()):
+    """Regex (on `_hd_mask`ed text) for a command that runs the text `src` matches as code: `src` at command
+    position, an `eval`/`source`/`.` argument, the argument of `SHELL -c`, `echo src | SHELL`, `SHELL <<< src`.
+    Each form is bounded to one command (`[^;&|\\n]`) and starts at a command position, so `echo bash -c $x` and
+    `'$x'` do not match. `extra` are further whole patterns (already starting with `_HD_RUN_START`)."""
+    s, sh = _HD_RUN_START, _HD_SHELL
+    forms = [
+        s + '"?' + src,
+        s + r"(?:eval\b|source\b|\.[ \t])[^;&|\n]*?" + src,
+        s + sh + r"[ \t][^;&|\n]*?" + src,  # any argument of a shell: `bash "$x"`, `bash -x $x`, `bash -c "$x"`
+        s + r"(?:echo|printf|print)\b[^;&|\n]*?" + src + r"[^;&|\n]*\|\s*" + _HD_RUN_WRAP + sh,
+        s + sh + r"[^;&|\n]*?<<<\s*\"?" + src,
+    ]
+    return re.compile("|".join("(?:%s)" % f for f in forms + list(extra)), re.M)
+
+
+def _hd_file_run_re(path: str):
+    """`_hd_exec_re` for a file a heredoc wrote: `bash < P`, `cat P | bash`, `source /dev/stdin < P`,
+    `bash <(cat P)`, and `$(cat P)`, `$(< P)`, backticks or `<(cat P)` where code runs (`_hd_exec_re`)."""
+    p = r"[\"']?(?:\./)?" + re.escape(path[2:] if path.startswith("./") else path) + r"[\"']?(?![\w/.-])"
+    s, sh = _HD_RUN_START, _HD_SHELL
+    subst = r"(?:\$\(|<\(|`)\s*(?:cat\s+(?:-\S+\s+)*|<\s*)" + p + r"\s*[)`]"
+    return _hd_exec_re(subst, (
+        s + sh + r"(?:[ \t]+-\S+)*[ \t]*<[ \t]*" + p,
+        s + r"cat[ \t]+(?:-\S+[ \t]+)*" + p + r"[ \t]*\|[ \t]*" + _HD_RUN_WRAP + sh,
+        s + r"(?:source|\.)[ \t]+/dev/stdin[ \t]*<[ \t]*" + p,
+        s + sh + r"[ \t]+(?:-\S+[ \t]+)*<\(\s*cat[ \t]+(?:-\S+[ \t]+)*" + p,
+    ))
+
+
+def _hd_var_run_re(name: str):
+    """`_hd_exec_re` for the variable `name` a heredoc body was assigned to: `$name` / `${name...}`."""
+    return _hd_exec_re(r"\$(?:" + re.escape(name) + r"(?!\w)|\{" + re.escape(name) + r"[}:\-+=?/%^,\[@])")
+
+
 def _split_heredocs(text: str, _level: int = 0) -> tuple:
     """(code, bodies) of shell `text`, by bash rules: the command text a shell parses, and the heredoc bodies.
 
@@ -587,11 +698,11 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
     Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`)."""
     if "<<" not in text and "#" not in text:
         return text, []
-    out, bodies, pending, stack, subs, written = [], [], [], [], [], []
-    n, i, line_start = len(text), 0, 0
+    out, bodies, pending, stack, subs, written, assigned = [], [], [], [], [], [], []
+    n, i, line_start, emitted = len(text), 0, 0, 0  # `emitted`: length of `code` before the current operator
 
     def take_bodies(i: int) -> int:
-        for delim, strip_tabs, quoted, op_start, nl, openers in pending:
+        for delim, strip_tabs, quoted, op_start, nl, openers, at in pending:
             lines = []
             while i < n:
                 e = text.find("\n", i)
@@ -609,7 +720,10 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
             else:
                 bodies.append((body, quoted))
                 runs = [] if quoted else _hd_substitutions(body)
-                written.extend((path, body) for path in _hd_written(text[line_start:op_start], text[op_start:nl]))
+                written.extend((path, body, at) for path in _hd_written(text[line_start:op_start], text[op_start:nl]))
+                name = _hd_assigned(text, openers)
+                if name:
+                    assigned.append((name, body, at))
             for run in runs:
                 sub_code, sub_bodies = _split_heredocs(run, _level + 1) if _level < 16 else (run, [])
                 out.append(sub_code + "\n")
@@ -721,7 +835,8 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
                 i += 2
                 continue
             nl = text.find("\n", w)
-            pending.append(("".join(word), strip_tabs, quoted, i, n if nl < 0 else nl, tuple(subs)))
+            pending.append(("".join(word), strip_tabs, quoted, i, n if nl < 0 else nl, tuple(subs),
+                            sum(map(len, out))))
             out.append(text[i:w])
             i = w
         elif c == "\n":
@@ -734,13 +849,20 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
             out.append(c)
             i += 1
     code = "".join(out)
-    for path, body in written:  # a script written from a body and run later in `text` (`bash s.sh`, `./s.sh`)
+    masked = _hd_mask(code, tuple(w[0] for w in written)) if written or assigned else ""
+    ran = []
+    for name, body, at in assigned:  # a body assigned to a variable that is run after it (`x=$(cat <<EOF ...)`, then `$x`, `eval "$x"`)
+        if _hd_var_run_re(name).search(masked, at):
+            ran.append(body)
+    for path, body, at in written:  # a script written from a body and run later in `text` (`bash s.sh`, `./s.sh`, `bash < s.sh`)
         p = r"[\"']?(?:\./)?" + re.escape(path[2:] if path.startswith("./") else path) + r"[\"']?(?![\w/.-])"
-        if re.search(r"(?<![\w/.-])(?:(?:ba|z|da|k|mk)?sh|source|\.)\s+(?:-\S+\s+)*" + p, code) \
-                or re.search(r"(?:^|[;&|(`])\s*" + p, code, re.M):
-            sub_code, sub_bodies = _split_heredocs(body, _level + 1) if _level < 16 else (body, [])
-            code += "\n" + sub_code + "\n"
-            bodies.extend(sub_bodies)
+        if re.compile(r"(?<![\w/.-])(?:(?:ba|z|da|k|mk)?sh|source|\.)\s+(?:-\S+\s+)*" + p).search(code, at) \
+                or re.compile(r"(?:^|[;&|(`])\s*" + p, re.M).search(code, at) or _hd_file_run_re(path).search(masked, at):
+            ran.append(body)
+    for body in ran:
+        sub_code, sub_bodies = _split_heredocs(body, _level + 1) if _level < 16 else (body, [])
+        code += "\n" + sub_code + "\n"
+        bodies.extend(sub_bodies)
     return code, bodies
 
 

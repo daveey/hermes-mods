@@ -435,3 +435,45 @@ def test_heredoc_commit_message_body_is_not_a_target(tmp_path, shape):
     g = _guard_module()
     cmd = shape.format(c="rm -rf plugins/x")
     assert [t for t in g.shell_targets(cmd, str(tmp_path)) if t.startswith(str(tmp_path))] == [str(tmp_path)], cmd
+
+
+# Store data first, then run it in the same tool call. Test actual admission, not extraction.
+STORED_ASSIGNMENT = "x=$(cat <<'EOF'\n{c}\nEOF\n)\n"
+STORED_FILE = "cat > /tmp/stored-heredoc-regression.sh <<'EOF'\n{c}\nEOF\n"
+STORED_RUNS = [
+    pytest.param(STORED_ASSIGNMENT + 'eval "$x"', id="assignment-eval"),
+    pytest.param(STORED_ASSIGNMENT + 'bash -c "$x"', id="assignment-bash-c"),
+    pytest.param(STORED_ASSIGNMENT + '$x', id="assignment-command"),
+    pytest.param(STORED_ASSIGNMENT + 'source <(printf "%s\\n" "$x")', id="assignment-source"),
+    pytest.param(STORED_FILE + 'bash < /tmp/stored-heredoc-regression.sh', id="file-shell-stdin"),
+    pytest.param(STORED_FILE + 'cat /tmp/stored-heredoc-regression.sh | bash', id="file-pipe-shell"),
+    pytest.param(STORED_FILE + 'sh -c "$(cat /tmp/stored-heredoc-regression.sh)"', id="file-shell-cat"),
+    pytest.param(STORED_FILE + 'eval "$(< /tmp/stored-heredoc-regression.sh)"', id="file-eval-read"),
+]
+STORED_CONTROLS = [
+    pytest.param(STORED_ASSIGNMENT, id="assignment-no-run"),
+    pytest.param('git commit -m "$(cat <<\'EOF\'\n{c}\nEOF\n)"', id="commit-message"),
+    pytest.param(STORED_FILE + 'cat /tmp/stored-heredoc-regression.sh', id="write-then-cat"),
+    pytest.param(STORED_ASSIGNMENT + "echo 'eval \"$x\"; bash -c \"$x\"; $x'", id="quoted-variable-references"),
+    pytest.param(STORED_FILE + "echo 'bash < /tmp/stored-heredoc-regression.sh; cat /tmp/stored-heredoc-regression.sh | bash'", id="quoted-file-references"),
+]
+
+
+@pytest.mark.parametrize("shape", STORED_RUNS)
+def test_stored_heredoc_execution_refused_at_hook(env, shape):
+    env["reg"].add("python -m pytest", env["fix2"])
+    command = shape.format(c=f"rm -f {env['fix2']}/retention_policy.py")
+    result = env["hook"](tool_name="terminal", args={"command": command, "workdir": str(env["other"])},
+                         task_id=TASK)
+    assert result and result["action"] == "block", (command, result)
+    assert "busy-tree-guard" in result["message"]
+    assert str(env["fix2"]) in result["message"]
+
+
+@pytest.mark.parametrize("shape", STORED_CONTROLS)
+def test_stored_heredoc_data_allowed_at_hook(env, shape):
+    env["reg"].add("python -m pytest", env["fix2"])
+    command = shape.format(c=f"rm -f {env['fix2']}/retention_policy.py")
+    # git commit targets the idle other tree; only the INERT body names the busy tree.
+    assert env["hook"](tool_name="terminal", args={"command": command, "workdir": str(env["other"])},
+                       task_id=TASK) is None, command

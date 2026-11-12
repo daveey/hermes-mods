@@ -825,3 +825,39 @@ def test_heredoc_body_a_data_reader_reads_stays_allowed(shape):
     cmd = shape.format(c="docker build -t x .")
     assert guard.check_shell(cmd, os.path.expanduser("~")) is None, cmd
     assert not blocked("terminal", command=cmd), cmd
+
+
+# Store data first, then run it in the same tool call. Test actual admission, not extraction.
+STORED_ASSIGNMENT = "x=$(cat <<'EOF'\n{c}\nEOF\n)\n"
+STORED_FILE = "cat > /tmp/stored-heredoc-regression.sh <<'EOF'\n{c}\nEOF\n"
+STORED_RUNS = [
+    pytest.param(STORED_ASSIGNMENT + 'eval "$x"', id="assignment-eval"),
+    pytest.param(STORED_ASSIGNMENT + 'bash -c "$x"', id="assignment-bash-c"),
+    pytest.param(STORED_ASSIGNMENT + '$x', id="assignment-command"),
+    pytest.param(STORED_ASSIGNMENT + 'source <(printf "%s\\n" "$x")', id="assignment-source"),
+    pytest.param(STORED_FILE + 'bash < /tmp/stored-heredoc-regression.sh', id="file-shell-stdin"),
+    pytest.param(STORED_FILE + 'cat /tmp/stored-heredoc-regression.sh | bash', id="file-pipe-shell"),
+    pytest.param(STORED_FILE + 'sh -c "$(cat /tmp/stored-heredoc-regression.sh)"', id="file-shell-cat"),
+    pytest.param(STORED_FILE + 'eval "$(< /tmp/stored-heredoc-regression.sh)"', id="file-eval-read"),
+]
+STORED_CONTROLS = [
+    pytest.param(STORED_ASSIGNMENT, id="assignment-no-run"),
+    pytest.param('git commit -m "$(cat <<\'EOF\'\n{c}\nEOF\n)"', id="commit-message"),
+    pytest.param(STORED_FILE + 'cat /tmp/stored-heredoc-regression.sh', id="write-then-cat"),
+    pytest.param(STORED_ASSIGNMENT + "echo 'eval \"$x\"; bash -c \"$x\"; $x'", id="quoted-variable-references"),
+    pytest.param(STORED_FILE + "echo 'bash < /tmp/stored-heredoc-regression.sh; cat /tmp/stored-heredoc-regression.sh | bash'", id="quoted-file-references"),
+]
+
+
+@pytest.mark.parametrize("shape", STORED_RUNS)
+def test_stored_heredoc_execution_refused_at_hook(shape):
+    command = shape.format(c="docker build -t x .")
+    result = plugin._pre_tool_call(tool_name="terminal", args={"command": command})
+    assert result and result["action"] == "block", (command, result)
+    assert "mac-heavy-guard" in result["message"]
+
+
+@pytest.mark.parametrize("shape", STORED_CONTROLS)
+def test_stored_heredoc_data_allowed_at_hook(shape):
+    command = shape.format(c="docker build -t x .")
+    assert plugin._pre_tool_call(tool_name="terminal", args={"command": command}) is None, command
