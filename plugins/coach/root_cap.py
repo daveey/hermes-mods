@@ -1245,6 +1245,55 @@ def _temporary_intent(own_text):
     return False
 
 
+# A later message about the surviving authorization without restating it: it names the key, or points at "that/it/this
+# change" ("Make that temporary, not permanent.", "Restore it to 7 on owner completion.", "That's only for an hour.").
+_DEICTIC = re.compile(
+    r"\b(?:make|keep|treat|mark|consider|call|set|restrict|limit|turn)\s+(?:that|it|this)\b|"
+    r"\b(?:that|this|the)\s+(?:change|raise|increase|bump|override|exception|authori[sz]ation|approval|cap|limit)\b|"
+    r"\b(?:restor\w*|revert\w*)\s+(?:it|that|this)\b|"
+    r"\b(?:roll\w*|put|set|change)\s+(?:it|that|this)\s+back\b|"
+    r"\b(?:that|it)(?:['\u2019]s|\s+(?:is|should\s+be|must\s+be|will\s+be))\s+(?:only|just|temporary|non|not)\b")
+_PERMANENT_NOW = re.compile(r"\bpermanen")
+_CARD = re.compile(r"\bt_[0-9a-z]{4,}\b")
+
+
+def _fold_followup(current, own_text, item, leaf):
+    """A later native message of the human that refers to the surviving authorization (names the key, or points at
+    'that/it/this change') acts only through its OWN sentences (quoted / reported / interrogative text is skipped, as
+    everywhere): a restriction (temporary, non-permanent, restoration, time bound, owner scope) makes the surviving
+    authorization bounded, so the owner/restore terms are demanded; the message's own affirmative owner/restore
+    terms replace the earlier ones field by field (latest wins); a plain affirmative 'permanent' relaxes it back
+    (the latest decision governs, as for a later value). Unrelated messages change nothing. The authorization, its
+    target value and its sha stay those of the authorizing message; the follow-up's sha/ref is linked."""
+    live = [x for x in _sentences(own_text)
+            if not _QUESTION_LEAD.search(x.lower()) and not _REPORTED.search(x.lower())]
+    if not any(leaf in x.lower() or _DEICTIC.search(x.lower()) for x in live):
+        return
+    mine = " ".join(live)
+    link = {"sha": _sha(item["text"]), "ref": item["ref"]}
+    if not _temporary_intent(mine):
+        if any(_PERMANENT_NOW.search(x.lower()) and not _PERM_NEG.search(x.lower()) and not _NEG.search(x.lower())
+               and not _CANCEL.search(x.lower()) for x in live):
+            current["temporary"] = False
+            current["terms_text"] = ""
+            current["followups"].append(link)
+        return
+    current["temporary"] = True
+    later = _own_terms(mine)
+    has_restore = any("restore" in x.lower() for x in _sentences(later))
+    has_card = bool(_CARD.search(later.lower()))
+    keep = []
+    for x in _sentences(current["terms_text"]):
+        low = x.lower()
+        if has_restore and "restore" in low:
+            continue
+        if has_card and (_CARD.search(low) or re.search(r"\b(?:run\s+\d+|this session)\b", low)):
+            continue
+        keep.append(x)
+    current["terms_text"] = (later + " " + " ".join(keep)).strip()
+    current["followups"].append(link)
+
+
 def _decision(items, rec, new_value):
     """Latest surviving direct human decision for this contract revision, whatever its value; it is returned only when
     it authorizes `new_value`. A later explicit decision for another value (or a cancellation) therefore supersedes an
@@ -1258,6 +1307,7 @@ def _decision(items, rec, new_value):
         raw = item["text"]
         text = raw.lower()
         text_own = _own_speech(raw)
+        before, set_here = current, False
         for s in _sentences(_own_speech(text)):
             if _QUESTION_LEAD.search(s):
                 continue
@@ -1286,7 +1336,10 @@ def _decision(items, rec, new_value):
             # affirmative sentences: quoted, reported, interrogative or withdrawing text is never a term.
             own = _own_terms(text_own)
             current = {"text": raw, "terms_text": own, "temporary": _temporary_intent(text_own),
-                       "sha": _sha(raw), "ref": item["ref"], "target": target}
+                       "sha": _sha(raw), "ref": item["ref"], "target": target, "followups": []}
+            set_here = True
+        if current is not None and not set_here and current is before:
+            _fold_followup(current, text_own, item, leaf)
     if current is None or current["target"] != new_value:
         return None
     return current
@@ -1558,13 +1611,15 @@ def _admit(rec, decision, terms, value, session_id, tool_name, args, tool_call_i
              "restore_value": terms["restore_value"], "restore_trigger": terms["restore_trigger"],
              "owner_ref": terms["owner_ref"], "decision_sha256": decision["sha"],
              "decision_ref": {"session": session_id, "message_uid": decision.get("ref")},
+             "decision_followups": decision.get("followups", []),
              "session": session_id, "tool": str(tool_name), "tool_call_id": tool_call_id, "call_sha256": call,
              "admitted_at": time.time(), "state": "admitted"}
 
     def apply(data):
         for old in data:
             if (old.get("decision_sha256"), old.get("session"), old.get("override_value"), old.get("call_sha256"),
-                    old.get("state")) == (entry["decision_sha256"], session_id, value, call, "admitted"):
+                    old.get("state")) == (entry["decision_sha256"], session_id, value, call, "admitted") \
+                    and old.get("decision_followups", []) == entry["decision_followups"]:
                 return None, old
         return [*data, entry], entry
 
