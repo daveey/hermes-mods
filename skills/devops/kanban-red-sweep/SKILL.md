@@ -109,6 +109,10 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
 - A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
 - Cards whose dependents wait on them: unblocking or completing promotes the children. Check them, queue position
   included: a promoted card keeps its old low priority and sits behind the queue you just cleared for its parent.
+  A child that is paused by decision and was only parked behind this card as a makeshift hold would restart: give
+  it its own hold first (`hermes kanban schedule <child> --wake-check 'test -f <approval marker>' --check-every 3600
+  --awaiting external:<decision> --awaiting-why "..." "<reason + how to resume>"`; awaiting kinds are card, ci,
+  deploy, external, clock, human, resource), read back `scheduled`, then `hermes kanban unlink <parent> <child>`.
 - A card you unblock may sit `ready` behind a full worker pool. Read the queue head first
   (`select id,priority from tasks where status='ready' order by priority desc limit 10`) and set
   `hermes kanban edit <id> --priority <above the head of that list>` in the same turn, for every card you
@@ -118,6 +122,8 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   unchecked "only the hub can": pool workers carry Mac reach (`--runs-on capability:tailnet-exec`), hub reads and
   hub writes, so Mac-only work is portable. An assignee profile the pool doesn't run (e.g. `mac-ops`) pins the
   card to the hub and the move fails `capability_mismatch`: `hermes kanban assign <id> default` first, then move.
+  A card created with `placement=local` or `requires host_repo` can't be un-pinned (`No move target satisfies
+  required worker labels`; `kanban edit` can't change requirements): archive it unstarted and recreate it without the pin.
   If you do a queued card's work in the chat instead, comment the evidence and archive the card the same turn,
   or a worker repeats it. `no_machine` for a worker usually means a Board hold; read its owner
   card before filing a fault. Free slots but nothing starting: check `~/.hermes/core-update/drain-hold` (a
@@ -217,6 +223,10 @@ there, which execs the skill script.
   blocked (its ask is already in the user's For-you queue); log it `--action left-blocked` and don't comment on
   it again unless its state changed. Don't re-link it to a chat.
 - Read state first and record last with recurring-job-state (`job_state.py show|record kanban-red-sweep`).
+- The cron overdue with no run: a core-update drain (`~/.hermes/core-update/drain-hold`) holds ALL cron dispatch, not
+  only card starts; deferred jobs fire once on release. Don't cut the drain short; note the overdue count on the
+  card that owns the drain. Parked until a date days away instead: the cron route's quota is out
+  (claude-usage-diagnostics §3c).
 - Final response: only decisions you guessed (card title, pick, how to reverse) and cards still waiting on the
   user, a few lines. Nothing cleared, guessed or newly waiting: reply `[SILENT]`.
 
