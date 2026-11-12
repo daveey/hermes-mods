@@ -13,6 +13,26 @@ import threading
 import time
 
 
+def require_real_linux_chrome(test, harness=False):
+    """Skip a real-Chrome test off Linux or without its tools; fail instead under CI=true on Linux.
+
+    CI provisions google-chrome and browser-harness (plugin-suites.yml, invisible-chrome-agent.yml), so a
+    missing one there is a provisioning regression, not a host quirk: a skip would report green while the
+    real endpoint/stop/retirement suites never ran (browser-harness was missing from CI until it was added).
+    """
+    reason = 'real Linux Chrome and harness required' if harness else 'isolated Linux Chrome required'
+    if sys.platform != 'linux':
+        test.skipTest(reason)
+    missing = [tool for tool in ('google-chrome', 'browser-harness')[:2 if harness else 1]
+               if not shutil.which(tool)]
+    if not missing:
+        return
+    if os.environ.get('CI', '').lower() == 'true':
+        test.fail('%s, under CI=true: %s not on PATH (provision it in the workflow)'
+                  % (reason, ', '.join(missing)))
+    test.skipTest(reason)
+
+
 def fresh_profile_arguments(directory, profile):
     """Select test-only flags once, before launching a disposable profile.
 

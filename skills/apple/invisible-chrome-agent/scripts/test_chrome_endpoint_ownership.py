@@ -1,10 +1,8 @@
 """Actual process/listener ownership; disposable Linux Chrome only."""
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 import urllib.request
@@ -16,7 +14,7 @@ from chrome_agent_lifecycle import Ledger, Lifecycle, LifecycleError
 from chrome_agent_process import fingerprint
 from chrome_test_fixtures import (
     CHROME_READY_S, chrome_environment, cleanup_disposable_tree, reap_profile_processes,
-    wait_until_ready)
+    require_real_linux_chrome, wait_until_ready)
 
 
 def free_port():
@@ -36,9 +34,9 @@ def _log_tail(handle, limit=800):
     return text[-limit:]
 
 
-@unittest.skipUnless(sys.platform == 'linux' and shutil.which('google-chrome'), 'isolated Linux Chrome required')
 class EndpointOwnershipTests(unittest.TestCase):
     def setUp(self):
+        require_real_linux_chrome(self)
         tmp = tempfile.TemporaryDirectory(prefix='astra-endpoint-')
         self.addCleanup(lambda: cleanup_disposable_tree(tmp))
         self.root = Path(tmp.name)
