@@ -621,7 +621,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if not hit:
                 return None
             store.log({"event": "agent_hint", "session_id": session_id, "rule": "relay_repeat", "n": hit["n"],
-                       "turn": turn, "cards": hit["cards"][:5], "evidence": hit["phrase"][:200]})
+                       "kind": hit.get("kind", "relay"), "turn": turn, "cards": hit["cards"][:5],
+                       "evidence": hit["phrase"][:200]})
             return hit["hint"]
         except Exception as exc:
             log.debug("coach relay_repeat: %s", exc)

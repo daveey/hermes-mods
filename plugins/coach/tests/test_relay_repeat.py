@@ -186,3 +186,98 @@ def test_detection_guard_forces_second_opinion_and_audits():
     rc.check(R_745893, "why cant you fix it, what's going on", [], llm, threshold=0.8, only=["report_only"],
              confirm=confirm, confirm_floor=0.5, audit=events.append, thresholds={"report_only": 0.85})
     assert confirmed == []
+
+
+# --- self-heal agent-954fae4dfc: "do this yourself" after a verification report that only reviewed old evidence ----
+# Scrubbed reconstructions of the 2026-11-10 hub messages (the originals are gone; the quoted phrases are verbatim):
+# 928924 was the follow-up subagent's result, 928936 the parent's final reply, then David wrote "do this yourself".
+SUB_928924 = (
+    "Reviewed the earlier test runs for the recovery path: they exercised reconnect and resume on the merged head and "
+    "passed. Did not repeat them or create another fixture.")
+R_928936 = (
+    "Follow-up verified. The subagent reviewed the existing test reports for the merged change: the recovery tests "
+    "already cover the reconnect path and passed. No duplicate test run was needed.\n\nProduction recovery remains "
+    "NO_PROOF: no natural fault has occurred since the deploy.")
+SELF_ASK = "do this yourself"
+# the reply that would have satisfied the ask: a bounded check executed now, nothing left open
+R_RAN_NOW = (
+    "I ran the bounded recovery check myself just now: started a local fixture server, dropped its connection three "
+    "times, and the client resumed each time within 2.1 s (3/3 passed).")
+# honest limits: the reply names exactly why it could not execute the check
+R_SAFETY_LIMIT = (
+    "I ran the local fixture check now and it passed. Reproducing it on the production gateway would require "
+    "production fault injection, which is unsafe, so production recovery stays NO_PROOF until a natural fault occurs.")
+R_PERMISSION_LIMIT = (
+    "I couldn't run the live check: it needs your sudo password on the build host, so recovery there is unverified.")
+# implementation finished, verification not: a done card must not count as done verification
+R_IMPL_DONE = (
+    "The fix card t_01a1cafe1234 is done and merged. I haven't run the recovery check against it yet; the existing "
+    "tests already cover the reconnect path, so production recovery is not yet proven.")
+
+
+def test_unresolved_verification_reads_review_only_reports():
+    for r in (R_928936, SUB_928924, R_IMPL_DONE):
+        assert rr.unresolved_verification(r), r[:80]
+    for r in (R_RAN_NOW, R_SAFETY_LIMIT, R_PERMISSION_LIMIT, R_755338,
+              "Fixed: the sidebar scrolls now; I reloaded it and checked.", ""):
+        assert rr.unresolved_verification(r) is None, r[:80]
+
+
+def test_self_do_ask_paraphrases():
+    for t in (SELF_ASK, "Do it yourself.", "verify it yourself please", "can you just run the check yourself?",
+              "why didn't you run it?", "stop handing it off and test it yourself", "you do it"):
+        assert rr.self_do_ask(t), t
+    for t in ("thanks", "resume", "great, now add a dark mode toggle", "what's next on the latency rollout?",
+              "\u2714 [default] @default Kanban t_01a1cafe1234 done \u2014 do this yourself",
+              "[coach] do this yourself"):
+        assert not rr.self_do_ask(t), t
+
+
+def test_real_messages_fire_once_with_self_verify_hint():
+    for prev in (R_928936, SUB_928924):
+        st = {"last_reply": prev}
+        hit = rr.assess(st, 4, SELF_ASK, card_status=lambda c: "running")
+        assert hit and hit["kind"] == "self_verify", prev[:60]
+        h = hit["hint"]
+        assert "yourself this turn" in h and "executed now" in h and "exact limit" in h
+        assert st["relay_repeat_turn"] == 4  # reply_check forces the report_only second opinion on this turn
+        assert rr.assess(st, 4, SELF_ASK, card_status=lambda c: "running") is None  # once per turn
+
+
+def test_completed_implementation_card_is_not_completed_verification():
+    st = {"last_reply": R_IMPL_DONE}
+    hit = rr.assess(st, 2, "verify it yourself", card_status=lambda c: "done")
+    assert hit and hit["kind"] == "self_verify"
+
+
+def test_self_verify_does_not_fire_without_cause():
+    cases = [
+        (R_RAN_NOW, SELF_ASK),  # proof was executed
+        (R_928936, "thanks"),  # honest NO_PROOF, no correction: NO_PROOF itself is not an error
+        (R_928936, "great, now add a dark mode toggle"),
+        ("", "do this yourself: build a CSV export for the report page"),  # an unrelated first request
+        (R_SAFETY_LIMIT, SELF_ASK),  # the exact safety limit was stated
+        (R_PERMISSION_LIMIT, SELF_ASK),  # needs a permission only the user holds
+        (R_928936, "\u2714 [default] @default Kanban t_01a1cafe1234 done \u2014 do this yourself"),  # notice
+    ]
+    for prev, user in cases:
+        st = {"last_reply": prev}
+        assert rr.assess(st, 3, user, card_status=lambda c: "running") is None, (prev[:40], user)
+
+
+def test_self_verify_hook_end_to_end(tmp_path, monkeypatch):
+    mod = _mod("coach_init_rr_sv", "__init__.py")
+    core = mod._load("core")
+    flm = mod._load("fix_loop")
+    monkeypatch.setattr(flm, "aux_judge", lambda s, p: json.dumps({"p_failed_fix": 0.1, "issue": ""}))
+    monkeypatch.setattr(mod._load("relay_repeat"), "board_card_status", lambda c: "running")
+    store = core.Store(root=tmp_path / "coach")
+    coach, hooks = mod.build(store=store, checkout=None)
+    hooks["pre_llm_call"](session_id="s2", user_message="check that the recovery fix holds")
+    hooks["post_llm_call"](session_id="s2", assistant_response=R_928936)
+    out = hooks["pre_llm_call"](session_id="s2", user_message=SELF_ASK)
+    assert out and "yourself this turn" in out["context"]
+    assert coach.loop_state("s2")["relay_repeat_turn"] == coach.turn_number("s2")
+    logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    hints = [e for e in logged if e.get("event") == "agent_hint" and e.get("rule") == "relay_repeat"]
+    assert [e.get("kind") for e in hints] == ["self_verify"]

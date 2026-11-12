@@ -20,6 +20,17 @@ The hint tells the agent to take the next step itself or delegate with fix autho
 the chat. The hook marks the turn (loop state `relay_repeat_turn`) so the reply check always runs the report_only
 second opinion on that turn's reply (reply_check.check(relay_repeat=True); report_only_scored gets relay_repeat: true).
 
+Second trigger, self-verify (self-heal agent-954fae4dfc, 2026-11-10): a follow-up "verified" a fix by reading old
+test reports ("Did not repeat them or create another fixture", "No duplicate test run was needed") and left production
+recovery NO_PROOF; David wrote "do this yourself". No owner was relayed and it is no repeat status ask, so the rule
+above stayed silent. Fires (once per turn, sharing `relay_repeat_turn` and so the forced report_only second opinion) when
+  (a) a person explicitly asks the agent to do / verify / run it itself (self_do_ask), and
+  (b) the previous final reply left verification unresolved: it reviewed prior evidence instead of executing the
+      check, or says the result is NO_PROOF / unproven / not yet verified (unresolved_verification), and did not
+      state an exact safety or permission limit for not running it.
+A completed implementation card is never completed verification: this path reads no card status. NO_PROOF alone, with
+no correction from the user, never fires.
+
 Off switch: env COACH_RELAY_REPEAT=off, or config plugins.entries.coach.settings.relay_repeat: false.
 """
 from __future__ import annotations
@@ -89,6 +100,84 @@ HINT = ("[coach] The user has asked again ({n} time{s}) while your replies relay
         "session_outcome wait) so the user can see the work.")
 
 
+# --- self-verify (agent-954fae4dfc) ---------------------------------------------------------------------------------
+# a person telling the agent to do / verify / run the thing itself
+SELF_ASK_RE = re.compile(
+    r"\b(?:do|verify|check|test|run|prove|confirm|execute|try)\s+(?:(?:it|this|that|them|the (?:check|test|run|fix))\s+)?"
+    r"(?:your ?self|personally)\b"
+    r"|\byou do (?:it|this|that)\b"
+    r"|\b(?:can|could|would) you (?:just |please )?(?:run|verify|test|execute) (?:it|this|that|the (?:check|test))\b"
+    r"|\bwhy (?:didn'?t|didnt|haven'?t|havent) you (?:just )?(?:run|verify|test|execute|check)\b"
+    r"|\b(?:stop|don'?t|dont) (?:handing (?:it |this )?off|hand (?:it |this )?off|delegating|delegate)\b",
+    re.I)
+# the reply reviewed prior evidence instead of executing the check now ...
+REVIEW_ONLY_RE = re.compile(
+    r"\bdid(?: not|n'?t) (?:repeat|re-?run|run|execute|reproduce|exercise)\b"
+    r"|\bha(?:ve|s)(?:n'?t| not) (?:yet )?(?:run|re-?run|executed|exercised)\b"
+    r"|\bno (?:duplicate |new |additional |further |extra )?(?:test |live )?(?:run|re-?run|execution|check|fixture)s? "
+    r"(?:was |were |is )?(?:needed|required|necessary)\b"
+    r"|\b(?:the )?existing (?:tests?|test reports?|coverage|runs?|evidence) (?:already )?"
+    r"(?:cover|covers|covered|show|shows|prove|proves)\b"
+    r"|\b(?:reviewed|inspected|read|checked) (?:the )?(?:existing|earlier|prior|previous|old) (?:tests?|test (?:reports?|runs?)|"
+    r"logs?|runs?|evidence|coverage|reports?)\b"
+    r"|\bwithout (?:re-?)?running\b",
+    re.I)
+# ... or left the outcome explicitly unproven
+UNPROVEN_RE = re.compile(
+    r"\bNO_PROOF\b|\bunproven\b|\bunverified\b"
+    r"|\bnot (?:yet )?(?:been )?(?:proven|observed|verified|exercised|reproduced)\b"
+    r"|\bremains? unobserved\b",
+    re.I)
+# an exact limit on executing it: honest, not a gap to correct
+LIMIT_RE = re.compile(
+    r"\b(?:unsafe|not safe)\b|\bwould (?:require|need) (?:a |an )?(?:production |live )?fault injection\b"
+    r"|\bneeds? your (?:approval|permission|sudo|password|credentials?|sign-?in|login|ok)\b"
+    r"|\brequires? (?:your )?(?:sudo|approval|permission|credentials?|a password)\b"
+    r"|\b(?:not|isn'?t|aren'?t) (?:permitted|allowed|authori[sz]ed)\b|\bno (?:permission|access) to\b",
+    re.I)
+
+SELF_VERIFY_HINT = (
+    "[coach] The user asked you to do this yourself after your last reply left verification unresolved "
+    "(\"{phrase}\"). Run the promised check yourself this turn: a bounded, safe execution on the user's path, not "
+    "another review of earlier reports or a review-only follow-up. In the reply, separate checks executed now, prior "
+    "evidence reviewed, and production conditions still unobserved. If running it is unsafe or needs a permission you "
+    "lack, state that exact limit instead of implying it ran.")
+
+
+def self_do_ask(user_text: str) -> bool:
+    """A person explicitly asking the agent to do / verify / run it itself (never a notice or worker prompt)."""
+    if not isinstance(user_text, str) or not user_text.strip() or _automated(user_text):
+        return False
+    return bool(SELF_ASK_RE.search(user_text[:1500]))
+
+
+def unresolved_verification(reply: str) -> Optional[dict]:
+    """{"phrase": evidence} when the reply left verification unresolved (reviewed prior evidence instead of executing,
+    or reported the outcome unproven) without stating an exact safety/permission limit, else None."""
+    text = (reply or "")[-4000:]
+    if not text.strip() or LIMIT_RE.search(text):
+        return None
+    rc = _rc()
+    for rx in (REVIEW_ONLY_RE, UNPROVEN_RE):
+        m = next((m for m in rx.finditer(text) if not rc._quoted(text, m.start(), m.end())), None)
+        if m:
+            return {"phrase": m.group(0).strip()[:160]}
+    return None
+
+
+def _assess_self_verify(state: dict, turn: int, user_text: str) -> Optional[dict]:
+    if state.get("relay_repeat_turn") == turn or not self_do_ask(user_text):
+        return None
+    un = unresolved_verification(state.get("last_reply") or "")
+    if not un:
+        return None
+    asks = [t for t in (state.get("self_verify_asks") or []) if isinstance(t, int) and t != turn] + [turn]
+    state["self_verify_asks"] = asks[-20:]
+    state["relay_repeat_turn"] = turn
+    return {"n": len(asks), "kind": "self_verify", "owner": "", "cards": [], "phrase": un["phrase"],
+            "hint": SELF_VERIFY_HINT.format(phrase=un["phrase"][:120])}
+
+
 def enabled() -> bool:
     """Env COACH_RELAY_REPEAT, then config plugins.entries.coach.settings.relay_repeat; default on."""
     raw: Any = os.environ.get("COACH_RELAY_REPEAT")
@@ -145,10 +234,16 @@ def repeat_ask(user_text: str) -> bool:
 
 def assess(state: dict, turn: int, user_text: str,
            card_status: Optional[Callable[[str], Optional[str]]] = None) -> Optional[dict]:
-    """state: the session's coach loop state (last_reply, relay*). Returns {"n", "owner", "cards", "phrase", "hint"}
-    at most once per turn, else None. Fail-open: an unreadable board counts as not completed."""
+    """state: the session's coach loop state (last_reply, relay*). Returns {"n", "kind", "owner", "cards", "phrase",
+    "hint"} at most once per turn, else None: kind "relay" (owner relay + repeat ask) or "self_verify" (a do-it-yourself
+    ask after an unresolved verification report). Fail-open: an unreadable board counts as not completed."""
     if not enabled() or not isinstance(user_text, str):
         return None
+    return _assess_relay(state, turn, user_text, card_status) or _assess_self_verify(state, turn, user_text)
+
+
+def _assess_relay(state: dict, turn: int, user_text: str,
+                  card_status: Optional[Callable[[str], Optional[str]]] = None) -> Optional[dict]:
     prev = state.get("last_reply") or ""
     if _automated(user_text):
         done = DONE_NOTICE_RE.findall(user_text)
@@ -186,5 +281,5 @@ def assess(state: dict, turn: int, user_text: str,
     state["relay_repeat_turn"] = turn
     n = len(asks)
     owner = ", ".join(cards[:3]) if cards else "another owner"
-    return {"n": n, "owner": owner, "cards": cards, "phrase": own["phrase"],
+    return {"n": n, "kind": "relay", "owner": owner, "cards": cards, "phrase": own["phrase"],
             "hint": HINT.format(n=n, s="" if n == 1 else "s", owner=owner, phrase=own["phrase"][:120])}
