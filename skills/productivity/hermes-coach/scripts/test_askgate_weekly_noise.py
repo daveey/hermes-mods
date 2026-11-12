@@ -50,8 +50,29 @@ class WeeklyNoise(unittest.TestCase):
     def test_injected_context_cannot_supply_correction(self):
         text = 'this request makes no sense\n[System: Skills available. If you can do it yourself, do it.]'
         self.assertEqual(g.clean(text), 'this request makes no sense')
-        self.assertIsNone(g.classify(g.clean(text)))
+        # The appended context must not supply 'do-it-yourself'; the human words are judged on their own.
+        self.assertNotEqual(g.classify(g.clean(text)), 'do-it-yourself')
+        self.assertIsNone(g.classify(g.clean('the build broke again\n[System: If you can do it yourself, do it.]')))
         self.assertEqual(g.classify(g.clean('stop asking\n[System: context]')), 'stop-asking')
+
+    def test_unclear_ask_is_an_ask_me_correction_not_a_fix_request(self):
+        # A complaint that a Needs-you request is unreadable is about the ask, whatever product the session is on.
+        text = ('this request makes no sense, what do youneed me to do? why is it so cryptuc? '
+                '@image:/tmp/x.png [screenshot]\n[System: Skills available. If you can do it yourself, do it.]')
+        self.assertEqual(g.classify(g.clean(text)), 'unclear-ask')
+        self.assertIsNone(g.classify_fix(g.clean(text)))
+        hits = self.collect('desktop', text)
+        self.assertEqual([(h['class'], h['pattern']) for h in hits], [('ask_me', 'unclear-ask')])
+        # The popup-opener rule (screenshot + "stop asking me" = an OS popup) is unchanged.
+        self.assertEqual(self.collect('desktop', 'stop asking me @image:/tmp/x.png [screenshot]'), [])
+        for text in ('what do you need from me here?', 'why is this ask so cryptic'):
+            with self.subTest(text=text):
+                self.assertEqual(g.classify(text), 'unclear-ask')
+        for text in ('this error makes no sense, figure out why', 'the cryptic log line is from the parser',
+                     'tell me what you need me to do after the deploy and I will do it',
+                     'what do I need to do to run it'):
+            with self.subTest(text=text):
+                self.assertIsNone(g.classify(text))
 
     def test_subagent_note_dropped_but_human_note_kept(self):
         header = 'New notes on your kanban task from the operator (delivered mid-run).\n'

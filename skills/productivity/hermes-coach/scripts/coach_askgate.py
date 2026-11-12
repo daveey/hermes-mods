@@ -266,6 +266,10 @@ PATTERNS = [
                      r"|\bhas been (?:revoked|canceled|cancelled|done|handled)\s+for\b"),
     ("you-just-said", r"\byou\s+(?:just|already)\s+(?:said|told|know)\b|\byou should (?:already )?know\b"),
     ("waiting-on-me", r"\bare you waiting (?:for|on) me\b|\bi (?:dont|don.?t) see any blocked\b"),
+    # The ask itself was unreadable ("this request makes no sense, what do you need me to do? why is it so cryptic").
+    ("unclear-ask", r"\b(?:request|ask|card|prompt|question)\b.{0,20}\bmakes? no sense\b"
+                    r"|(?:^|[.,;!?]\s*|\bso\s+)what (?:do|did) you\s*need (?:me to do|from me)\b"
+                    r"|\bwhy is (?:it|this|the)\b.{0,25}\bso crypt\w*"),
 ]
 RX = [(n, re.compile(p, re.I)) for n, p in PATTERNS]
 # Not corrections even though a pattern fires (the user is granting access, giving a style rule, or describing a deliverable).
@@ -509,7 +513,9 @@ def collect(data, since_ts, until_ts, doit=None):
             # (nothing preceded it). Text-only openers still count: they often answer an ask carried over from another
             # session (e.g. a CLI chat replying to a bb-tuner question).
             opener_popup = i == 0 and re.search(r"\[(?:screenshot|Image attached)", text, re.I)
-            kind, cls = (None if opener_popup else classify(text)), ASK_CLASS
+            kind, cls = classify(text), ASK_CLASS
+            if opener_popup and kind != "unclear-ask":  # a screenshot of an unreadable Needs-you ask is about the agent
+                kind = None
             if not kind and d.get("source") in INTERACTIVE_SOURCES:
                 # a fix request often opens a session ("fix [screenshot]"), so the opener rule does not apply here
                 kind, cls = classify_fix(text), FIX_CLASS
