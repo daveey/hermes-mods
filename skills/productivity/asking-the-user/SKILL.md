@@ -35,6 +35,14 @@ Never tell the user a choice tile "is in your panel" because a user-steps row or
 When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
 ambiguous acceptance tolerance, test a stricter sufficient bound without redefining the requirement to fit results.
 
+## Physical and sign-in asks
+
+Before filing a physical/on-device/sign-in ask, read `references/physical-asks.md`: search all boards and
+relevant gateways for the same device + evidence, reuse its owner, and require `resolved_check` for readable
+build/file/waiter prerequisites. Expired flows wake their owner to refresh the same ask, never imply consent.
+A report relaying another surface's ask is status, not a new request: name its owning card/surface and do not
+republish it as an imperative, action_request or For-you choice in the reporting chat.
+
 ## Commands that need the user
 
 - Never ask the user to run a shell command themselves: no "run this in your terminal" text and no copy-paste

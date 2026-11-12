@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, replan, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -40,6 +40,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     pr_approval_request = _sib("pr_approval_request")
     chat_delivery = _sib("chat_delivery")
     superseding = _sib("superseding")
+    physical_asks = _sib("physical_asks")
     replan = _sib("replan")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -942,6 +943,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             raise ValueError("human_request cannot accompany dependency/time/transient blocks")
         if tool_name == "kanban_create" and args.get("initial_status") != "blocked":
             raise ValueError("human_request requires initial_status=blocked on creation")
+        physical = physical_asks.preflight(core, args, _block_card(tool_name, args))
+        if physical is not None:
+            return physical
         replanned = _replan_hold(session_id, tool_name, request["action"] + "\n" + request["why_human"])
         if replanned is not None:
             return replanned

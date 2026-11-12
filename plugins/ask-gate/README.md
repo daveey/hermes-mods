@@ -576,6 +576,24 @@ boards: 224 asks): `chat_delivery` matched 3, all real asks to relay text into a
 t_f15d182d, t_01a185154afb4293; default t_a5cc12d9). `tests/test_chat_delivery.py` pins those and the 4 real blocks a
 first draft matched wrongly.
 
+## Physical/sign-in ask admission
+
+`physical_asks.py` runs before the structured-ask judge for `kanban_create` and `kanban_block`. Matching
+`DEVICE:` + `EVIDENCE:` lines in `human_request.scope` identify a single act; an exact legacy action+scope
+pair also matches. An open matching ask on any readable local board/profile returns `physical_ask_duplicate`
+with its card and board, so the caller comments/links to that owner instead of filing another ask. Different
+identifiers remain distinct; an owner may refresh itself. Reads fail closed on errors. No card is changed.
+
+Build/file/waiter prerequisites (including explicit `PREREQUISITE:`/`EXPIRES:` labels) require a nonblank
+`resolved_check`, otherwise `physical_ask_probe_required`. Core—not this plugin—executes it in the target
+context before filing and while blocked. See the asking-the-user skill's `references/physical-asks.md` for
+cross-gateway searches and expiry refresh without consent or physical-success inference. This is a local,
+non-atomic preflight, not remote dedupe, proof of probe correctness, or automatic attachment/approval.
+
+Tests: `tests/test_physical_asks.py` covers both tool entry paths, cross-board/profile duplicates, padded
+interactions, legacy identities, distinct device/evidence, closed owners, self-refresh, mandatory probes and
+real core refusal of an already-met prerequisite. Remote races and live expired-waiter refresh are untested.
+
 ## Dropped resolved_check
 
 When core stops probing an ask's `resolved_check` it stamps `human_request.resolved_check_dropped_at` and `resolved_check_drop_reason` (`resolved_check_broken` / `resolved_check_lost`). The L1 live-state digest and the denied-wait nudge then lead with "Automatic detection stopped ... needs a manual unblock until the ask is re-filed" and show the filed ask under a "historical wording" label (any "I will notice automatically" promise no longer applies). Older cores never write the keys; nothing is imported from core. Tests: `tests/test_dropped_resolved_check.py`.
