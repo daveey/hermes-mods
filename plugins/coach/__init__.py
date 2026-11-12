@@ -249,6 +249,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             coach.check_live(session_id, tool_name, args)
             coach.check_kanban_db_write(session_id, tool_name, args)
             coach.check_hub_ssh_heavy(session_id, tool_name, args)
+            coach.check_worker_ssh_refused(session_id, tool_name, args, result)
             coach.check_widget_send(session_id, tool_name, args)
             coach.check_plan_first(session_id, tool_name, args)
             coach.check_empty_wait(session_id, tool_name, args, result)

@@ -73,6 +73,10 @@ HINTS = {
                       "published branch go on a pool-worker card (kanban_create with runs_on=[\"pool:worker\"]) or "
                       "`hermes-core-wt test` (it moves to a worker when the hub is over its gate). Keep the hub for "
                       "hub-runtime work: its live board, services or state."),
+    "worker_ssh_refused": ("ssh to {host} was refused. That is not \"unreachable\": the hub has no admin SSH to the "
+                           "workers by design. Run the command over SSM with `hub-worker-exec <worker-N|all> -- "
+                           "<command|script-file>` (add --root for system changes). Don't call a worker unreachable "
+                           "or hand the change to a card."),
     "plan_first": ("Plan Before You Build: this is a new build request and the user has not seen a plan yet. Stop "
                    "editing, post the plan (approach, files, how it gets tested) as your reply and end the turn for "
                    "the user's go. Someone else's approval (a reviewer, a cut PR) does not replace it."),
@@ -1296,6 +1300,86 @@ def hub_ssh_heavy(tool: str, args: dict) -> Optional[tuple]:
         what = _heavy_run(" ".join(remote))  # ssh/hub-admin hand the joined words to the remote shell
         if what:
             return host, what
+    return None
+
+
+# worker_ssh_refused (agent-9a9552bdc6): ssh's own refusal lines. Output only: the same text in the command (a grep of
+# auth.log) is not a refused connection.
+WORKER_SSH_REFUSED_RE = re.compile(r"Permission denied \(publickey|Host key verification failed|No ED25519 host key "
+                                   r"is known|REMOTE HOST IDENTIFICATION HAS CHANGED")
+
+
+def _worker_ledger_path() -> Path:
+    """The hub's worker reach-keys ledger (hosts/hermes-workers/reach-keys.py in the private state repo): worker names
+    and tailnet IPs, so this public repo carries none."""
+    return Path.home() / ".ssh" / "hermes-workers.json"
+
+
+def _worker_targets() -> tuple:
+    """(names, ips) of the hub's workers from the ledger; empty when it is missing or unreadable."""
+    try:
+        records = json.loads(_worker_ledger_path().read_text())
+    except (OSError, ValueError):
+        return set(), set()
+    names, ips = set(), set()
+    if isinstance(records, dict):
+        for rid, rec in records.items():
+            name = str(rid).split("#", 1)[0].strip().lower()
+            if name:
+                names.update({name, name if name.startswith("hermes-") else "hermes-" + name})
+            if isinstance(rec, dict):
+                ips.update(str(ip) for ip in rec.get("ips") or [] if ip)
+    return names, ips
+
+
+def _is_worker_host(host: str, names: set, ips: set) -> bool:
+    h = host.rsplit("@", 1)[-1].strip("[]").lower()
+    if h in ips or h in names or h.split(".")[0] in names:
+        return True
+    if "$" in h:  # `ssh hermes-worker-$n` in a loop: any worker the template can name
+        pat = re.compile("^" + ".+".join(re.escape(p) for p in re.split(r"\$\{?\w+\}?", h.split(".")[0])) + "$")
+        return any(pat.match(n) for n in names)
+    return False
+
+
+def _ssh_hosts(cmd: str) -> list:
+    """Destination words of every `ssh` in a shell command (options and their arguments skipped)."""
+    words, hosts = _shell_words(cmd), []
+    for i, w in enumerate(words):
+        if w.rsplit("/", 1)[-1] != "ssh":
+            continue
+        j = i + 1
+        while j < len(words) and words[j].startswith("-") and words[j] not in _SHELL_OPS:
+            opt = words[j]
+            j += 2 if len(opt) == 2 and opt[1] in _SSH_ARG_OPTS else 1
+        if j < len(words) and words[j] not in _SHELL_OPS:
+            hosts.append(words[j])
+    return hosts
+
+
+def worker_ssh_refused(tool: str, args: dict, result: Any) -> Optional[str]:
+    """The worker host a terminal ssh on the hub was refused by (auth or host-key failure), else None."""
+    if tool != "terminal":
+        return None
+    cmd = str(args.get("command") or "")
+    if not re.search(r"\bssh\b", cmd) or _self_host() not in _hub_names():
+        return None
+    d = _as_dict(result)
+    out = str(d.get("output") or "") + "\n" + str(d.get("error") or "") if d else str(result or "")
+    if not WORKER_SSH_REFUSED_RE.search(out):
+        return None
+    names, ips = _worker_targets()
+    if not names and not ips:
+        return None
+    for h in _ssh_hosts(cmd):
+        bare = h.rsplit("@", 1)[-1]
+        if re.fullmatch(r"\$\{?\w+\}?", bare):  # `for h in <list>; do ssh $h`: a worker named in that list
+            listed = next((t for t in sorted(names | ips) if re.search(r"(?<![\w.-])" + re.escape(t) + r"(?![\w-])",
+                                                                       cmd, re.I)), None)
+            if listed:
+                return listed
+        elif _is_worker_host(h, names, ips):
+            return bare
     return None
 
 
@@ -3323,6 +3407,15 @@ class AgentCoach:
         if hit:
             self._fire(self._s(sid), sid, "hub_ssh_heavy", "session", host=hit[0], what=hit[1])
 
+    def check_worker_ssh_refused(self, sid: str, tool: str, args: Any, result: Any) -> None:
+        """worker_ssh_refused rule (once per session): on the hub, an ssh to a worker refused by auth or host key.
+        Also run from transform_tool_result so the hint lands on the refused call itself."""
+        if not sid:
+            return
+        host = worker_ssh_refused(tool, args if isinstance(args, dict) else {}, result)
+        if host:
+            self._fire(self._s(sid), sid, "worker_ssh_refused", "session", host=host)
+
     def check_widget_send(self, sid: str, tool: str, args: Any) -> None:
         """widget_send rule (once per widget file): a chat widget that ignores hermes.send's ack or relies on browser
         storage. Also run from transform_tool_result so the hint lands on the write itself."""
@@ -3411,6 +3504,7 @@ class AgentCoach:
         self.check_live(sid, tool, args)
         self.check_kanban_db_write(sid, tool, args)
         self.check_hub_ssh_heavy(sid, tool, args)
+        self.check_worker_ssh_refused(sid, tool, args, result)
         self.check_widget_send(sid, tool, args)
         self.check_empty_wait(sid, tool, args, result)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
