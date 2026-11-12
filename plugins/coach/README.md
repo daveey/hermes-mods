@@ -1398,7 +1398,14 @@ default-board fix into a portable FIX card (`FIX_REQUIRES`, proposal inside the 
 VERIFY child runs on the pool: `--runs-on capability:hub-read,capability:hub-write,capability:coordination-read`
 (`VERIFY_POOL_LABELS`, attested only by proven workers; the hub carries none) and every gateway step (deploy check,
 host steps, live probe, `event` with result.md staged under `/tmp/selfheal-verify/` and read back) goes through
-`hub-admin '<command>'`. Other gateways keep the home machine pin. Portable FIX titles use
+`hub-admin '<command>'`. Other gateways keep the home machine pin. The hub's other home-bound self-heal cards
+(investigations, deploy checks, lane cards) take the same route (`pool_args` / `remote_lane`: `POOL_LABELS`,
+`REMOTE_NOTE`, every `event` as `hub-admin '...'`, the proposal staged under `.hermes/coach/selfheal/<fp>/`):
+core's hub admission refuses an unadmitted `machine:hub` pin, and refused every investigation from 11:22 UTC
+2026-11-12 until this change. A named board (bb) keeps the pin. A create refused on placement logs
+`selfheal_file_error` with `code: placement_refused`, stops the pending pass (`selfheal_pass_stopped`) and files one
+`self-heal lane: card creates refused by hub admission` card per incident. Tests:
+`tests/test_self_heal_hub_admission.py` (runs each producer's argv through core's real admission apply). Portable FIX titles use
 the defect's hash suffix, not the raw symptom or component (`cron` is itself a host marker): titles are always
 placement-scanned. The full fingerprint and symptom stay in a
 sanitized evidence fence in the body, so incident words cannot re-pin otherwise portable source work. Non-split

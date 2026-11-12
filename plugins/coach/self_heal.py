@@ -47,7 +47,7 @@ else:  # Standalone plugin/cron/CLI loader.
 
 # The placement helper (fence_evidence / home_pin_note) is shared by every coach card producer.
 if __package__:
-    from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, HomePinUnresolved, fence_evidence, home_machine, home_pin_note, home_runs_on_argv, incident_title
+    from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, HOME_PIN_PREFIX, HomePinUnresolved, fence_evidence, home_machine, home_pin_note, home_runs_on_argv, incident_title
 else:
     _spec = importlib.util.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     assert _spec and _spec.loader
@@ -58,6 +58,7 @@ else:
     HomePinUnresolved, home_runs_on_argv = _placement_evidence.HomePinUnresolved, _placement_evidence.home_runs_on_argv
     incident_title = _placement_evidence.incident_title
     home_machine = _placement_evidence.home_machine
+    HOME_PIN_PREFIX = _placement_evidence.HOME_PIN_PREFIX
 
 COMPONENTS = ("agent", "desktop", "plugin", "cron", "kanban", "bot", "gateway", "provider", "browser", "bb", "other")
 
@@ -1427,6 +1428,23 @@ VERIFY_REMOTE_GATEWAYS = ("hub",)
 # writes, and reading the parent fix card's handoff. The hub itself carries none of them, so the card leaves it.
 VERIFY_POOL_LABELS = ("capability:hub-read", "capability:hub-write", "capability:coordination-read")
 VERIFY_REMOTE_DIR = "/tmp/selfheal-verify"  # where a remote VERIFY stages result.md on the gateway for `event`
+# Every other home-bound card this lane files (investigation, deploy check, lane repair) follows the VERIFY route on
+# a remote-reachable gateway: core's hub admission (hermes_cli/kanban_hub_admission_placement.apply) refuses an
+# explicit `machine:hub` pin unless a judge admits an allowlisted hub-only need, and none of these cards has one
+# (their gateway steps are hub-read reads and hub-admin writes). From 11:22 UTC 2026-11-12 every investigation was
+# refused and the lane filed none (t_01a1cfa3b3805315). Pool labels on a default-board card are not hub-only, so the
+# create makes no judge call at all. A named board (bb) is not on the pool and keeps the home pin.
+POOL_LABELS = VERIFY_POOL_LABELS
+REMOTE_NOTE = ("This card runs on a pool worker. The state it works on (logs, state files, Kanban databases and the "
+               "coach store under `~/.hermes`) lives on the gateway that filed it: read it there with "
+               "`ssh hermes-hub <cat|tail|head|grep|ls|sqlite ...>` (`ssh hermes-hub help` lists them) or "
+               "`hub-admin '<command>'`, and run every command that changes it, including the lane's `event`, as "
+               "`hub-admin '<command>'` (single-quoted, so `$HOME` and `~` expand on the gateway). Never run the "
+               "lane's `event` command locally: here it would write this worker's own empty coach store.")
+# A create core refused on placement (hub admission). The same refusal would hit every later create of this pass.
+PLACEMENT_REFUSED_RE = re.compile(r"hub_admission_denied|hub admission denied|\"hub_admission\"\s*:|"
+                                  r"admission unavailable|hub_admission_unavailable", re.I)
+PLACEMENT_ALERT_STATE = "selfheal_placement_refused.json"
 VERIFY_RUNTIME = 3600
 VERIFY_SKILLS = ("five-whys", "hermes-mods-repo")
 # EVIDENCE_OPEN/CLOSE (same strings as core's kanban_placement) come from placement_evidence.py: the placement scan
@@ -1753,7 +1771,26 @@ CHECKLIST["provider"] = ("provider / model calls",
 CHECKLIST["browser"] = CHECKLIST["plugin"]
 
 
-def investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> str:
+def investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[dict] = None,
+                        remote: bool = False) -> str:
+    """The investigation card. ``remote`` (the hub's lane, see :func:`remote_lane`): a pool worker runs it, reads
+    the gateway over hub-read, stages the proposal and records every lane event there through hub-admin."""
+    text = _investigation_brief(d, previous, cfg)
+    if not remote:
+        return text
+    fp = d["fingerprint"]
+    stage = f".hermes/coach/selfheal/{fp}/proposal.md"  # relative to the gateway's $HOME, where hub-admin starts
+    text = text.replace(f"write the proposal to ~/.hermes/coach/selfheal/{fp}/proposal.md",
+                        "write the proposal to `proposal.md` here")
+    text = text.replace(
+        "   Do NOT post it to the Inbox. Record it:",
+        f"   Stage it on the gateway: `hub-admin \"mkdir -p {os.path.dirname(stage)} && echo $(base64 -w0 proposal.md) | "
+        f"base64 -d > {stage}\"`\n   (double quotes: the `$(...)` expands here) and read it back with "
+        f"`hub-admin 'head -n 3 {stage}'`.\n   Do NOT post it to the Inbox. Record it:")
+    return remote_body(text)
+
+
+def _investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> str:
     fp = d["fingerprint"]
     comp = d.get("component") or "other"
     when = _pt(d.get("at") or time.time())
@@ -2670,7 +2707,7 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                 continue
             due.append((_pending_priority(d), fp, d, version))
         due.sort(key=lambda r: r[0])
-        for _, fp, d, version in due:
+        for i, (_, fp, d, version) in enumerate(due):
             try:
                 result = (filer or file_defect)(d, store=store, m="live", now=now)
             except Exception as exc:
@@ -2682,6 +2719,12 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
             elif result.get("action") == "deferred" and result.get("stop_pass", True):
                 break  # a cap denial denies the rest; a missing board (stop_pass false) does not
+            elif result.get("placement_refused"):
+                # Core refused the create's placement (hub admission). Every later row would pay the same judge call
+                # and get the same refusal (106 in 40 min on 2026-11-12): stop here, the rows stay pending.
+                store.log({"event": "selfheal_pass_stopped", "why": "placement_refused", "fingerprint": fp,
+                           "left": len(due) - i - 1})
+                break
     finally:
         db.close()
     return out
@@ -2991,11 +3034,13 @@ def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[
               different_error: str = "") -> dict:
     r = route(d, cfg)
     sym = incident_title(d.get("symptom"))
+    remote = remote_lane(r["board"])  # the hub's lane: a pool worker investigates, never a refused machine:hub pin
     return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
-            "body": investigation_brief(d, previous, cfg) + (f"\n\n{different_error}\n" if different_error else ""),
+            "body": investigation_brief(d, previous, cfg, remote=remote) + (f"\n\n{different_error}\n" if different_error else ""),
             "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True}
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
+            "home_pin": not remote, "runs_on": list(POOL_LABELS) if remote else []}
 
 
 def kanban_argv(args: dict, hermes: str = "hermes") -> list:
@@ -4184,7 +4229,12 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         args = card_args(d, inv_key(fp, gen), dec.get("previous"), cfg, dec.get("different_error", ""))
     if not tid or tid in known:
         why = (err or out).strip()[-300:] if not tid else f"idempotency keys keep returning earlier card {tid}"
-        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
+        refused = not tid and placement_refused(err, out)
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why,
+                   **({"code": "placement_refused"} if refused else {})})
+        if refused:  # every later create of this pass would be refused the same way: the caller stops the pass
+            note_placement_refused(store, fp, err or out, now, runner)
+            return {"action": "error", "why": why, "placement_refused": True}
         return {"action": "error", "why": why}
     prev = dec.get("previous")
     kw: dict = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
@@ -4337,10 +4387,10 @@ def _file_undeployed(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[s
         store.log({**rec, "card": filed[key]})
         return {"action": "skip", "why": why, "not_deployed": True}
     r = route(d, cfg)
-    args = {"title": f"host {dec['label']} hasn't synced fix {dec['sha'][:11]}"[:200],
+    args = pool_args({"title": f"host {dec['label']} hasn't synced fix {dec['sha'][:11]}"[:200],
             "body": undeployed_brief(d, fp, st, dec), "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": ["hermes-mods-repo"], "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True}
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True})
     if m != "live" or not is_hub(cfg):
         store.log({**rec, "would_file": True, "args": args})
         return {"action": "not_deployed", "card": None, "key": key, "why": dec["why"]}
@@ -4429,9 +4479,10 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         # Log every refused create: this bare return hid refusals from log.jsonl (only the cron's 50-run stdout saw
         # them). status stays proposed, so the next pass retries.
         why = (err or out).strip()[-300:] or f"kanban create exited {rc} with no task id"
+        refused = placement_refused(err, out)
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "rc": rc, "key": key,
-                   "board": args.get("board"), "stage": "fix"})
-        return {"action": "error", "why": why}
+                   "board": args.get("board"), "stage": "fix", **({"code": "placement_refused"} if refused else {})})
+        return {"action": "error", "why": why, **({"placement_refused": True} if refused else {})}
     if tid in known_cards(st):
         why = f"fix key {key} returned earlier card {tid}"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why})
@@ -4452,6 +4503,32 @@ def remote_verify() -> bool:
         return home_machine() in VERIFY_REMOTE_GATEWAYS
     except HomePinUnresolved:
         return False
+
+
+def remote_lane(board: Optional[str] = None) -> bool:
+    """True when a home-bound card for ``board`` goes to the pool instead of a machine pin: this gateway's lane is
+    remote-reachable (:func:`remote_verify`) and the board is the pool's (default). A named board stays pinned."""
+    return (not board or board == "default") and remote_verify()
+
+
+_PIN_LINE_RE = re.compile(re.escape(HOME_PIN_PREFIX) + r"[^\n]*")
+_LOCAL_EVENT_RE = re.compile(r"`(" + re.escape(SELF_EVENT) + r"[^`']*)`")
+
+
+def remote_body(body: str) -> str:
+    """A home-pinned brief rewritten for a pool worker: the pin sentence becomes :data:`REMOTE_NOTE` and every
+    backticked lane `event` command runs on the gateway through `hub-admin '<command>'`."""
+    body = _PIN_LINE_RE.sub(lambda _m: REMOTE_NOTE, body)
+    return _LOCAL_EVENT_RE.sub(lambda m: f"`hub-admin '{m.group(1)}'`", body)
+
+
+def pool_args(args: dict) -> dict:
+    """``args`` of a home-pinned card, sent to the pool on a remote-reachable gateway (:func:`remote_lane`):
+    ``runs_on`` the pool attestations and a body whose gateway steps go through hub-read / hub-admin. Anything else
+    (another gateway, a named board, an unresolvable identity) is returned unchanged and keeps the home pin."""
+    if not args.get("home_pin") or not remote_lane(args.get("board")):
+        return args
+    return {**args, "home_pin": False, "runs_on": list(POOL_LABELS), "body": remote_body(args.get("body") or "")}
 
 
 def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: float) -> Optional[str]:
@@ -5565,11 +5642,44 @@ def pull_data(data: Path, runner=None) -> Optional[str]:
         return f"{type(exc).__name__}: {exc}"[:600]
 
 
+def placement_refused(*texts) -> bool:
+    """True when a failed `hermes kanban create` was refused on placement (core hub admission), not by the card."""
+    return any(PLACEMENT_REFUSED_RE.search(t or "") for t in texts)
+
+
+def note_placement_refused(store, fp: str, error: str, now: float, runner=None) -> Optional[dict]:
+    """Detection for a lane whose creates core refuses on placement: ONE pool card per incident (an open card is
+    left alone; a done one gets a fresh card, its key carries the UTC day). Before this, every investigation was
+    refused for 40 min and only a sibling card noticed (t_01a1cfa3b3805315). Never raises."""
+    try:
+        path = Path(store.root) / PLACEMENT_ALERT_STATE
+        if _open_card(path, runner):
+            return None
+        host = host_name()
+        seen = fence_evidence(f"Seen on {host} at {_iso(now)} filing {fp}:\n```\n{(error or '')[-1500:]}\n```")
+        body = ("Core refused the placement of a self-heal card (hub admission), so the lane files no investigations "
+                "and its pending rows wait. Each pass now stops at the first refusal.\n"
+                f"{home_pin_note(PIN_LANE)}\n\n{seen}\n\n"
+                "Find which self-heal producer still asks for a hub slot (plugins/coach/self_heal.py `card_args`, "
+                "`pool_args`, `kanban_argv`) or what core's admission changed, fix it in hermes-mods (hermes-mods-repo) "
+                "with a regression test that runs the producer's argv through core's admission, and confirm the next "
+                "pass logs `selfheal_filed`. Post nothing to the Inbox.")
+        res = _lane_card("self-heal lane: card creates refused by hub admission", body,
+                         f"selfheal-placement:{host}:{_utc_day(now)}", runner)
+        if res.get("card"):
+            path.write_text(json.dumps({"card": res["card"], "at": now}))
+        store.log({"event": "selfheal_placement_card", "fingerprint": fp, **res})
+        return res
+    except Exception as exc:  # health: allow BLE001 -- detection only: never break the filing path
+        store.log({"event": "selfheal_placement_card", "action": "error", "why": str(exc)[:300]})
+        return None
+
+
 def _lane_card(title: str, body: str, key: str, runner=None) -> dict:
     """A plain Kanban card for a lane defect (not an investigation: those need this lane to become fix cards)."""
-    args = {"title": title, "body": body, "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+    args = pool_args({"title": title, "body": body, "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
             "max_runtime": FIX_RUNTIME, "skills": list(FIX_SKILLS), "board": None, "assignee": "default",
-            "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True}
+            "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True})
     try:
         rc, out, err = _run_card(args, runner)
     except Exception as exc:
