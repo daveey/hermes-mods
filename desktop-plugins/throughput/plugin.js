@@ -205,7 +205,10 @@ function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, co
     const r = e.currentTarget.getBoundingClientRect()
     if (!r.width) return
     const i = Math.round(((e.clientX - r.left) / r.width) * (len - 1))
-    setHover(i >= 0 && i < len ? { i, px: e.clientX - r.left, w: r.width } : null)
+    // Open upward when the plot sits in the lower half of the window, so a long list stays on screen.
+    const vh = typeof window === 'undefined' ? 0 : window.innerHeight || 0
+    const up = vh > 0 && r.top + r.height / 2 > vh / 2
+    setHover(i >= 0 && i < len ? { i, px: e.clientX - r.left, w: r.width, up } : null)
   }
   const tipRows = (L, i) => {
     const rows = L.layers.filter((l) => l.v[i] > 0).sort((a, b) => b.v[i] - a.v[i])
@@ -243,7 +246,10 @@ function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, co
       h('div', { className: 'hermes-tp-ticks' }, ticks.map((i) => h('span', { key: i }, timeLabel(t0 + i * bs, view.range)))),
       hover ? h('div', {
         className: 'hermes-tp-tip', role: 'tooltip',
-        style: hover.px > hover.w / 2 ? { right: `${hover.w - hover.px + 10}px` } : { left: `${hover.px + 10}px` }
+        style: {
+          ...(hover.px > hover.w / 2 ? { right: `${hover.w - hover.px + 10}px` } : { left: `${hover.px + 10}px` }),
+          ...(hover.up ? { bottom: '16px' } : { top: '4px' })
+        }
       },
         h('div', { className: 'hermes-tp-tiptime' }, `${timeLabel(t0 + hover.i * bs, view.range)} \u00b7 per ${view.unit}`),
         h('div', { className: 'hermes-tp-tiphead' }, `${upLabel} ${fmt(U.total[hover.i])}`), tipRows(U, hover.i),
@@ -358,12 +364,12 @@ export const CSS = `
 .hermes-tp-plot svg{display:block;width:100%}
 .hermes-tp-axis{fill:var(--ui-text-tertiary);font-size:10px}
 .hermes-tp-ticks{display:flex;justify-content:space-between;font-size:10px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums;margin-top:-12px;pointer-events:none}
-.hermes-tp-tip{position:absolute;top:4px;z-index:4;pointer-events:none;min-width:150px;padding:6px 8px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);font-size:11.5px;line-height:1.45;box-shadow:0 2px 8px rgba(0,0,0,.35)}
+.hermes-tp-tip{position:absolute;z-index:4;pointer-events:none;min-width:150px;max-width:240px;padding:6px 8px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);font-size:11.5px;line-height:1.45;box-shadow:0 2px 8px rgba(0,0,0,.35)}
 .hermes-tp-tiptime{color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums}
 .hermes-tp-tiphead{font-weight:600}
 .hermes-tp-tiphead.is-down{margin-top:4px}
 .hermes-tp-tiprow{display:flex;align-items:center;gap:5px}
-.hermes-tp-tiprow.is-missing{color:var(--ui-text-tertiary)}
+.hermes-tp-tiprow.is-missing{color:var(--ui-text-tertiary);align-items:flex-start}
 .hermes-tp-num{margin-left:auto;padding-left:12px;font-variant-numeric:tabular-nums}
 `
 

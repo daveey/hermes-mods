@@ -201,6 +201,14 @@ test('hover shows per-gateway values and – for gateways without data', async (
     assert.match(tip.textContent, /in\+out 600/)
     assert.match(tip.textContent, /hub600/)
     assert.match(tip.textContent, /worker-1, ephemeral, unattributed\u2013/)
+    // upper half of the window: opens downward; lower half: opens upward (stays on screen)
+    assert.equal(tip.style.top, '4px')
+    window.innerHeight = 1000
+    plot.getBoundingClientRect = () => ({ left: 0, top: 800, width: 590, height: 84, right: 590, bottom: 884 })
+    await ui.event(plot, 'mousemove', { clientX: 590 })
+    const low = document.querySelector('[data-chart="tokens"] [role="tooltip"]')
+    assert.equal(low.style.bottom, '16px')
+    assert.equal(low.style.top, '')
     await ui.event(plot, 'mouseout', { relatedTarget: document.body }) // React's onMouseLeave
     assert.ok(document.querySelector('[data-chart="tokens"] [role="tooltip"]') === null)
   } finally {
