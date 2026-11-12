@@ -107,3 +107,19 @@ test('a stale cached chip lists as unknown with its last-known state, legacy beh
   assert.match(el().querySelector('[data-panel-row]').textContent, /status unknown · last known: running/)
   assert.match(el().querySelector('[data-evidence]').textContent, /unknown \(cached after failed read\)/)
 })
+
+test('a hub-sync replica running card is explicit unknown with the replica reason and its source-activity age', { skip }, async () => {
+  bridges({ chips: [card('task-r', 'running', { replica: true, activityAt: BASE_AT - 120 })] })
+  at(0)
+  await show(React.createElement(m.Panel, { key: 'r' }))
+  assert.equal(el().querySelector('[data-section="in-progress"]'), null)
+  assert.equal(el().querySelector('[data-section="waiting"]').textContent, 'Waiting · 1')
+  assert.match(el().querySelector('[data-panel-row]').textContent, /status unknown \(hub replica not source evidence\) · last known: running \(observed 2 min ago\)/)
+  assert.match(el().querySelector('[data-status-summary]').textContent, /1 evidence unknown/)
+})
+
+test('a hub-sync replica blocked ask keeps its own section', { skip }, async () => {
+  const sorted = m.classify([card('task-s', 'blocked', { look: 'needs-you', replica: true })], { nowMs: (BASE_AT + 10) * 1000, evidence: c => m.chipObservation(c, BASE_AT + 10) })
+  assert.equal(sorted.unasked.length, 1)
+  assert.equal(sorted.waiting.length, 0)
+})
