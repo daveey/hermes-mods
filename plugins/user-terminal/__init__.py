@@ -2934,15 +2934,43 @@ def has_screen() -> bool:
     return shutil.which("osascript") is not None or CMUX_BIN.exists()
 
 
+_OWNER_STEP = None
+
+
+def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, **_: Any) -> str | None:
+    """kanban_unblock of an owner-terminal (user_terminal) ask from a chat: add ``next_step`` saying the step
+    still has to run here (owner_step.py; self-heal kanban-e23aa32ffd). None (unchanged) for anything else."""
+    global _OWNER_STEP
+    if tool_name != "kanban_unblock":
+        return None
+    try:
+        if _OWNER_STEP is None:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(__name__ + "._owner_step",
+                                                          Path(__file__).with_name("owner_step.py"))
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _OWNER_STEP = module
+        return _OWNER_STEP.transform_unblock_result(
+            tool_name, args, result, db_path=lambda board: board_db_path(str(board or _current_board())),
+            jobs_root=lambda: jobs_dir(create=False))
+    except Exception:  # never break the tool result
+        log.warning("user_terminal owner_step hook failed", exc_info=True)
+        return None
+
+
 def register(ctx) -> None:
     if not has_screen():  # Linux/cloud gateway: relay to the owner's Mac (see module docstring)
         ctx.register_tool(name="run_in_user_terminal", toolset=TOOLSET, schema=REMOTE_SCHEMA, handler=handle_remote,
                           emoji="🖥️", description="Open a terminal on the owner's Mac (via its Desktop), confirm there, run, return output")
         ctx.register_hook("transform_terminal_output", transform_terminal_output)
+        ctx.register_hook("transform_tool_result", transform_tool_result)
         return
     ctx.register_tool(name="run_in_user_terminal", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🖥️",
                       description="Open a terminal on the user's screen, confirm there, run, return output")
     ctx.register_hook("transform_terminal_output", transform_terminal_output)
+    ctx.register_hook("transform_tool_result", transform_tool_result)
     start_reconciler(ctx)
 
 
