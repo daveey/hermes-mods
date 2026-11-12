@@ -2135,6 +2135,9 @@ def portable_fix_brief(fp: str, st: dict) -> str:
     text, and the proposal (incident evidence) is fenced, so the hub's worker pool may run it. Its handoff is read
     by the VERIFY child, which runs here."""
     incident = f"Defect: {fp}\nSymptom: {st.get('symptom') or fp}"
+    # Old proposals can still prescribe core shipping. Annotate only this rendered
+    # copy: preserve the source proposal verbatim for VERIFY and investigation.
+    proposal = _proposal_text(fp, st).replace("hermes-core-wt", "[core shipping delegated to VERIFY]")
     return f"""Self-heal FIX for the defect identified in the evidence below.
 The proposal is approved (David's standing self-heal approval;
 the lane auto-approves every proposal). Post nothing to the Inbox. Investigation card: {st.get('card') or '?'}.
@@ -2147,7 +2150,7 @@ the evidence you get (it describes where it happened, not where you work).
 
 ## Approved proposal (evidence)
 {fenced_evidence(incident)}
-{fenced_evidence(_proposal_text(fp, st))}
+{fenced_evidence(proposal)}
 
 ## Acceptance (all of it, in order)
 1. Re-check the defect still reproduces on the current code of the repo(s) it names (fresh clone or worktree on

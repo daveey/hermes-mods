@@ -153,6 +153,21 @@ def test_core_change_is_handed_to_verify_for_shipping(store):
     assert '<hermes-mods and state commit sha>' in fix
 
 
+def test_copied_proposal_core_shipping_is_explicitly_deferred(store):
+    proposal = store.root / "selfheal" / FP / "proposal.md"
+    original = PROPOSAL + "\nCore (hermes-core-wt): change parser.py.\nUndo: hermes-core-wt ship rollback.\n"
+    proposal.write_text(original)
+    b = Board()
+    sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    fix, verify = [fields(a)["body"] for a in b.creates()]
+    assert "hermes-core-wt" not in fix
+    assert "Do not ship core from this card." in fix
+    assert "[core shipping delegated to VERIFY]" in fix
+    assert "change parser.py" in fix
+    assert "hermes-core-wt ship" in verify
+    assert proposal.read_text() == original  # retain the exact source evidence
+
+
 def test_verify_files_and_waits_for_core_change(store):
     b = Board()
     sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
