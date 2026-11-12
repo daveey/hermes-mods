@@ -141,7 +141,9 @@ class SuiteSelection(unittest.TestCase):
                          ["plugins/cpu-load-guard"])
 
     def test_mac_heavy_guard_test_change_selects_its_suite(self):
-        self.assertEqual(self.pick("plugins/mac-heavy-guard/tests_guard.py"), ["plugins/mac-heavy-guard"])
+        # tailnet's runner.py names plugins/mac-heavy-guard (it overrides its lexer), so it is selected too (8c59b46d).
+        self.assertEqual(self.pick("plugins/mac-heavy-guard/tests_guard.py"),
+                         ["plugins/mac-heavy-guard", "plugins/tailnet"])
 
     def test_shared_runner_helpers_and_workflow_select_every_suite(self):
         for path in ("scripts/test-all", "scripts/ci-plugin-suites", "tests/test_test_all.py",
