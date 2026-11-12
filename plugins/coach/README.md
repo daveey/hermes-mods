@@ -71,7 +71,12 @@ hardcoded: the freeze exists only as a registered record.
   later restriction invalidates cached terms, including within the same message. Negating one bound alone is not
   affirmative permanence. Owner/restore assignments use closed affirmative forms (`Owner card t_example, run 1,
   this session.` / `Restore root kanban.max_in_progress to 7 on owner completion.`); unknown or withdrawn fields
-  replace, never reuse, the earlier field. Compound withdrawals invalidate every mentioned field. A later genuine
+  replace, never reuse, the earlier field. Compound withdrawals invalidate every mentioned field. The restore trigger
+  (owner completion and/or an expiry) is recognised by topic, not by withdrawal wording: any own sentence that
+  mentions an expiry, deadline, time limit/box, cutoff, end date, owner completion, rollback time, or a timer/date/trigger
+  together with a negation/change signal, or points straight at one (`Expiry cancelled.`, `Forget the 2099 deadline.`,
+  `Nuke expiry.`), retires the stale trigger unless it names another object (`My passport expires next year.`,
+  `The report deadline is Friday.`); a false positive only asks for a fresh `Restore ... to N <trigger>` sentence. A later genuine
   `Make that permanent.` or a fresh complete assignment remains possible. These deterministic English forms are
   intentionally conservative: unsupported wording may refuse this frozen-cap write and require a clearer decision;
   this is not natural-language equivalence or a general configuration-edit ban.
