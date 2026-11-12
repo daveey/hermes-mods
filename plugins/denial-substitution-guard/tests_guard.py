@@ -3,6 +3,7 @@
 Fixtures keep the RECORDED SHAPES (principal/role/session, action, resource ARN, truncation marker) with synthetic ids.
 """
 import importlib.util
+from functools import partial
 import json
 import time
 from pathlib import Path
@@ -43,14 +44,18 @@ AMBIENT_CMD = (
 
 @pytest.fixture
 def g(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    return _load("denial_guard_logic", "guard.py")
+    mod = _load("denial_guard_logic", "guard.py")
+    mod.record_from_result = partial(mod.record_from_result, root=tmp_path)
+    mod.classify = partial(mod.classify, root=tmp_path)
+    return mod
 
 
 @pytest.fixture
 def plugin(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    return _load("denial_guard_plugin", "__init__.py")
+    mod = _load("denial_guard_plugin", "__init__.py")
+    mod.guard.record_from_result = partial(mod.guard.record_from_result, root=tmp_path)
+    mod.guard.classify = partial(mod.guard.classify, root=tmp_path)
+    return mod
 
 
 def deny(g, now=None, cmd=DENIED_CMD, result=TRUNCATED):
@@ -117,6 +122,7 @@ def test_terminal_ambient_replay_of_denied_operation_is_blocked(g):
     deny(g)
     why = g.classify("terminal", {"command": AMBIENT_CMD})
     assert why and "ssm:SendCommand" in why and RESOURCE in why and PRINCIPAL in why and "broker:aws.write.hermes" in why
+    assert "UNAVAILABLE" in why
 
 
 def test_execute_code_nested_terminal_literal_is_blocked(g):
@@ -162,20 +168,20 @@ def test_unrelated_operations_pass(g, cmd):
     assert g.classify("terminal", {"command": cmd}) is None
 
 
-def test_same_identity_retry_is_not_substitution(g):
+def test_same_identity_retry_still_requires_authority(g):
     deny(g)
     retry = ("token-broker exec --scope aws.write.hermes --reason 'retry' -- aws ssm send-command "
              f"--instance-ids {INSTANCE} --document-name AWS-RunShellScript")
-    assert g.classify("terminal", {"command": retry}) is None
+    assert g.classify("terminal", {"command": retry})
 
 
 def test_no_denial_no_block(g):
     assert g.classify("terminal", {"command": AMBIENT_CMD}) is None
 
 
-def test_denial_older_than_ttl_is_ignored(g):
+def test_elapsed_time_does_not_authorize(g):
     deny(g, now=time.time() - 25 * 3600)
-    assert g.classify("terminal", {"command": AMBIENT_CMD}) is None
+    assert g.classify("terminal", {"command": AMBIENT_CMD})
 
 
 # --- independent grant -------------------------------------------------------------------------------------------
@@ -187,10 +193,10 @@ def grant(tmp_path, **kw):
     (tmp_path / "denial-grants.json").write_text(json.dumps([row]))
 
 
-def test_verified_grant_after_denial_lifts_block(g, tmp_path):
+def test_claimed_verified_grant_after_denial_is_not_authority(g, tmp_path):
     deny(g)
     grant(tmp_path)
-    assert g.classify("terminal", {"command": AMBIENT_CMD}) is None
+    assert g.classify("terminal", {"command": AMBIENT_CMD})
 
 
 @pytest.mark.parametrize("kw", [
@@ -215,9 +221,9 @@ def test_agent_cannot_write_grants_or_ledger_but_can_read(g):
 
 # --- boundary + plugin wiring ------------------------------------------------------------------------------------
 
-def test_human_terminal_boundary_is_never_classified(g):
+def test_user_terminal_reason_is_not_authority(g):
     deny(g)
-    assert g.classify("run_in_user_terminal", {"command": AMBIENT_CMD, "reason": "owner approved"}) is None
+    assert g.classify("run_in_user_terminal", {"command": AMBIENT_CMD, "reason": "owner approved"})
 
 
 def test_plugin_hooks_block_and_record_and_never_raise(plugin, tmp_path):
@@ -228,4 +234,4 @@ def test_plugin_hooks_block_and_record_and_never_raise(plugin, tmp_path):
     assert plugin._pre_tool_call(tool_name="terminal", args=None) is None
     assert plugin._post_tool_call(tool_name="terminal", args=None, result=object()) is None
     (tmp_path / "denial-ledger.jsonl").write_text("not json\n")
-    assert plugin._pre_tool_call(tool_name="terminal", args={"command": AMBIENT_CMD}) is None  # fail open
+    assert plugin._pre_tool_call(tool_name="terminal", args={"command": AMBIENT_CMD})["action"] == "block"
