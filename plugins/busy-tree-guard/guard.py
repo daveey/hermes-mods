@@ -364,6 +364,9 @@ _HD_DATA_READERS = frozenset({
     "column", "fold", "fmt", "nl", "rev", "base64", "md5sum", "sha1sum", "sha256sum", "shasum", "xxd", "od",
     "diff", "cmp", "jq", "yq", "less", "more", "git", "gh", "patch", "pbcopy", "true", ":"})
 _HD_PYTHON = re.compile(r"python(?:\d+(?:\.\d+)*)?\Z")
+# Commands known to use a command substitution's output only as data (`git commit -m "$(cat <<'EOF' ...)"`,
+# `x=$(cat <<EOF ...)`). Any other consumer (a shell, `eval`, `source`, `ssh`, `xargs`, `python -c`, ...) may run it.
+_HD_DATA_CONSUMERS = frozenset({"git", "gh", "export", "local", "declare", "typeset", "readonly"})
 _HD_WRAPPERS = frozenset({"sudo", "doas", "env", "nohup", "command", "exec", "time"})
 _HD_ARG_OPTS = frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U", "--user", "--group"})
 _HD_REDIRECT = re.compile(r"(?:\d+|&)?(?:<<<|<<-?|<>|>>|>\||>&|<&|&>>?|<|>)")
@@ -453,10 +456,11 @@ def _hd_substitutions(body: str) -> list:
     return found
 
 
-def _hd_data_reader(words: list) -> bool:
+def _hd_data_reader(words: list, consumer: bool = False) -> bool:
     """True when the simple command `words` reads its stdin only as data: a `_HD_DATA_READERS` name or Python,
     also behind `sudo`/`env`/`exec`-style wrappers, or no command word at all (`> f <<EOF`). `sudo -s`/`-i` is
-    a shell."""
+    a shell. With `consumer`: whether it uses a command substitution in its words only as data instead (one of
+    `_HD_DATA_CONSUMERS`, or a bare assignment)."""
     i, n = 0, len(words)
     while i < n:
         w = words[i]
@@ -477,6 +481,8 @@ def _hd_data_reader(words: list) -> bool:
                     return False
                 i += 2 if opt in _HD_ARG_OPTS else 1
             continue
+        if consumer:
+            return base in _HD_DATA_CONSUMERS
         return base in _HD_DATA_READERS or bool(_HD_PYTHON.match(base))
     return True
 
@@ -505,7 +511,62 @@ def _hd_feeds_shell(prefix: str, rest: str) -> bool:
     if pos >= 0:
         stages.append(rest[pos:])
     stages[0] = _HD_SEPARATOR.split(prefix)[-1] + stages[0]
+    if re.search(r"[<>]\(", prefix + rest):  # a process substitution on the line (`tee >(bash)`) may run it
+        return True
     return not all(_hd_data_reader(words(seg)) for seg in stages)
+
+
+def _hd_subst_data(text: str, openers: tuple) -> bool:
+    """True when every command substitution enclosing a heredoc (`openers`: the index of each enclosing `$(`,
+    backtick, `<(` or `>(`, outermost first) hands its output to a data consumer (`_hd_data_reader` with
+    `consumer`): `git commit -m "$(cat <<'EOF' ...)"` and `x=$(cat <<EOF ...)` are data, while
+    `bash -c "$(cat <<'EOF' ...)"`, `eval "$(cat ...)"` or a process substitution may run the body."""
+    import shlex
+
+    for k in range(len(openers) - 1, -1, -1):
+        pos = openers[k]
+        if text[pos] in "<>":
+            return False
+        lo = 0 if k == 0 else openers[k - 1] + (1 if text[openers[k - 1]] == "`" else 2)
+        start = text.rfind("\n", 0, pos) + 1
+        while start >= 2 and text[start - 2] == "\\":  # a `\`-continued command line
+            start = text.rfind("\n", 0, start - 2) + 1
+        seg = text[max(lo, start):pos].replace("\\\n", " ")
+        prev = None
+        while prev != seg:  # earlier, closed substitutions on the line are one word each
+            prev, seg = seg, re.sub(r"\$\([^()]*\)|`[^`]*`", "_", seg)
+        seg = _HD_SEPARATOR.split(seg)[-1]
+        try:
+            words = shlex.split(seg)
+        except ValueError:
+            words = seg.split()
+        if not _hd_data_reader(words, consumer=True):
+            return False
+    return True
+
+
+def _hd_written(prefix: str, rest: str) -> list:
+    """The files the command holding a heredoc writes its body to: `> P`, `>> P`, `>| P` or `tee P`."""
+    import shlex
+
+    seg = _HD_SEPARATOR.split(prefix)[-1] + _HD_SEPARATOR.split(rest)[0]
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        words = seg.split()
+    paths, tee = [], False
+    for k, w in enumerate(words):
+        m = re.match(r"(?:\d|&)?(?:>>|>\||>)(.*)", w)
+        if m and not w.startswith((">&", "&>&")):
+            target = m.group(1) or (words[k + 1] if k + 1 < len(words) else "")
+            if target and not target.startswith("&"):
+                paths.append(target)
+        elif os.path.basename(w) == "tee":
+            tee = True
+        elif tee and not w.startswith("-") and not _HD_REDIRECT.match(w) and not (
+                k and _HD_REDIRECT.fullmatch(words[k - 1])):
+            paths.append(w)
+    return paths
 
 
 def _split_heredocs(text: str, _level: int = 0) -> tuple:
@@ -517,18 +578,20 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
     is handled (bare, 'quoted', "quoted", \\escaped), several on one line in order, `<<-` tab stripping, an
     unterminated body to the end. Two kinds of body still reach `code`:
     - a body fed to a shell, or to any reader not known to read it as data (`_hd_feeds_shell`), is code that may
-      run: it is split recursively and kept;
+      run: it is split recursively and kept. So is a body read inside a command substitution whose output is not
+      used only as data (`bash -c "$(cat <<'EOF' ...)"`, `_hd_subst_data`), and a body written to a file that
+      `text` then runs (`cat > s.sh <<EOF ... EOF` then `bash s.sh`, `_hd_written`);
     - each `$(...)`/backtick substitution of an unquoted-delimiter body runs before the command does: its command
       text is appended as its own line (`_hd_substitutions`).
     `bodies` lists every other body as (text, quoted delimiter), for a guard that scans data conservatively.
     Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`)."""
     if "<<" not in text and "#" not in text:
         return text, []
-    out, bodies, pending, stack = [], [], [], []
+    out, bodies, pending, stack, subs, written = [], [], [], [], [], []
     n, i, line_start = len(text), 0, 0
 
     def take_bodies(i: int) -> int:
-        for delim, strip_tabs, quoted, op_start, nl in pending:
+        for delim, strip_tabs, quoted, op_start, nl, openers in pending:
             lines = []
             while i < n:
                 e = text.find("\n", i)
@@ -541,11 +604,12 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
                     break
                 lines.append(line)
             body = "\n".join(lines)
-            if _hd_feeds_shell(text[line_start:op_start], text[op_start:nl]):
+            if _hd_feeds_shell(text[line_start:op_start], text[op_start:nl]) or not _hd_subst_data(text, openers):
                 runs = [body]
             else:
                 bodies.append((body, quoted))
                 runs = [] if quoted else _hd_substitutions(body)
+                written.extend((path, body) for path in _hd_written(text[line_start:op_start], text[op_start:nl]))
             for run in runs:
                 sub_code, sub_bodies = _split_heredocs(run, _level + 1) if _level < 16 else (run, [])
                 out.append(sub_code + "\n")
@@ -570,11 +634,13 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
                 continue
             elif text.startswith("$(", i):
                 stack.append(0)
+                subs.append(i)
                 out.append("$(")
                 i += 2
                 continue
             elif c == "`":
                 stack.append("`")
+                subs.append(i)
             out.append(c)
             i += 1
             continue
@@ -593,11 +659,18 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
             i += 1
         elif c == "`" and top == "`":
             stack.pop()
+            subs.pop()
+            out.append(c)
+            i += 1
+        elif c == "`":
+            stack.append("`")
+            subs.append(i)
             out.append(c)
             i += 1
         elif isinstance(top, int) and c in "()":
             if c == ")" and top == 0:
                 stack.pop()
+                subs.pop()
             else:
                 stack[-1] += 1 if c == "(" else -1
             out.append(c)
@@ -606,6 +679,11 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
             j = _hd_arith_end(text, i + (c == "$"))
             out.append(text[i:j])
             i = j
+        elif text.startswith("$(", i) or (c in "<>" and text.startswith("(", i + 1)):  # `$(`, `<(`, `>(`
+            stack.append(0)
+            subs.append(i)
+            out.append(text[i:i + 2])
+            i += 2
         elif text.startswith("${", i):  # parameter expansion: a `<<` or `#` in it (`${x/<</y}`) is text
             j, depth = i + 2, 1
             while j < n and depth:
@@ -643,7 +721,7 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
                 i += 2
                 continue
             nl = text.find("\n", w)
-            pending.append(("".join(word), strip_tabs, quoted, i, n if nl < 0 else nl))
+            pending.append(("".join(word), strip_tabs, quoted, i, n if nl < 0 else nl, tuple(subs)))
             out.append(text[i:w])
             i = w
         elif c == "\n":
@@ -655,7 +733,15 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
         else:
             out.append(c)
             i += 1
-    return "".join(out), bodies
+    code = "".join(out)
+    for path, body in written:  # a script written from a body and run later in `text` (`bash s.sh`, `./s.sh`)
+        p = r"[\"']?(?:\./)?" + re.escape(path[2:] if path.startswith("./") else path) + r"[\"']?(?![\w/.-])"
+        if re.search(r"(?<![\w/.-])(?:(?:ba|z|da|k|mk)?sh|source|\.)\s+(?:-\S+\s+)*" + p, code) \
+                or re.search(r"(?:^|[;&|(`])\s*" + p, code, re.M):
+            sub_code, sub_bodies = _split_heredocs(body, _level + 1) if _level < 16 else (body, [])
+            code += "\n" + sub_code + "\n"
+            bodies.extend(sub_bodies)
+    return code, bodies
 
 
 def _lexable(text: str, lex, dropped: Optional[list] = None) -> str:

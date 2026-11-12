@@ -362,6 +362,9 @@ def test_heredoc_and_comment_apostrophes_refused_in_busy_tree(env):
 # A body fed to anything else may run as shell code: `su -`, `sudo -s`/`-i`, `source /dev/stdin`, `"$SHELL"`,
 # `eval`, `exec bash`, `xargs sh`, a pipe into `sudo -s`, or an unknown reader. Review of 77ac105f found those
 # read as data (fail open); they are code again (card t_01a1d020a0b79528). `<<` inside `${...}` is no heredoc.
+# Review of df783b71: a body read inside a command substitution is data only when the substitution's output
+# goes to a data consumer (git/gh args, an assignment); `bash -c "$(cat <<'EOF' ...)"`, `eval "$(cat ...)"`
+# and a reader on a line with `>(bash)` run it. So does a script written from a body and then run (`bash s.sh`).
 READER_SHAPES = [
     "su - <<EOF\n{c}\nEOF",
     "sudo -s <<EOF\n{c}\nEOF",
@@ -380,6 +383,19 @@ READER_SHAPES = [
     "cat <<'EOF' | xargs sh -c\n{c}\nEOF",
     "some-tool <<'EOF'\n{c}\nEOF",
     "echo ${{x/<</y}}\n{c}",
+    "bash -c \"$(cat <<'EOF'\n{c}\nEOF\n)\"",
+    "eval \"$(cat <<'EOF'\n{c}\nEOF\n)\"",
+    "sh -c \"$(cat <<EOF\n{c}\nEOF\n)\"",
+    "bash -c \"$(\ncat <<'EOF'\n{c}\nEOF\n)\"",
+    "eval `cat <<'EOF'\n{c}\nEOF\n`",
+    "python3 -c \"$(cat <<'EOF'\n{c}\nEOF\n)\"",
+    "git commit -m \"$(echo \"$(cat <<'EOF'\n{c}\nEOF\n)\")\"",
+    "bash <(cat <<'EOF'\n{c}\nEOF\n)",
+    "tee >(bash) <<'EOF'\n{c}\nEOF",
+    "cat <<'EOF' > >(bash)\n{c}\nEOF",
+    "cat > /tmp/s.sh <<'EOF'\n{c}\nEOF\nbash /tmp/s.sh",
+    "cat > s.sh <<'EOF'\n{c}\nEOF\nchmod +x s.sh && ./s.sh",
+    "tee /tmp/x.sh >/dev/null <<'EOF'\n{c}\nEOF\nsource /tmp/x.sh",
 ]
 READER_ALLOWED = [
     "sudo tee /tmp/n.conf <<'EOF'\nit's {c}\nEOF",
@@ -387,6 +403,15 @@ READER_ALLOWED = [
     "python3 - <<'EOF'\nprint(\"it's {c}\")\nEOF",
     "env FOO=1 cat > /tmp/n.txt 2>&1 <<'EOF'\nit's {c}\nEOF",
     "gh issue create --body-file - <<'EOF'\nit's {c}\nEOF",
+    "gh pr create --title t --body \"$(cat <<'EOF'\nit's {c}\nEOF\n)\"",
+    "x=$(cat <<'EOF'\nit's {c}\nEOF\n)",
+    "export MSG=\"$(cat <<'EOF'\nit's {c}\nEOF\n)\"",
+    "cat > /tmp/s.sh <<'EOF'\nit's {c}\nEOF\nbash /tmp/other.sh",
+]
+
+GIT_COMMIT_MESSAGES = [
+    "git commit -m \"$(cat <<'EOF'\nwe don't {c}\nEOF\n)\"",
+    "git commit -m \"$(date)\" -m \"$(cat <<'EOF'\nwe don't {c}\nEOF\n)\"",
 ]
 
 
@@ -402,3 +427,11 @@ def test_heredoc_body_a_data_reader_reads_targets_nothing_in_the_tree(tmp_path, 
     g = _guard_module()
     cmd = shape.format(c="rm -rf plugins/x")
     assert [t for t in g.shell_targets(cmd, str(tmp_path)) if t.startswith(str(tmp_path))] == [], cmd
+
+
+# `git commit` writes the tree itself, so this guard names the tree root; the message body's CMD is never a target.
+@pytest.mark.parametrize("shape", GIT_COMMIT_MESSAGES)
+def test_heredoc_commit_message_body_is_not_a_target(tmp_path, shape):
+    g = _guard_module()
+    cmd = shape.format(c="rm -rf plugins/x")
+    assert [t for t in g.shell_targets(cmd, str(tmp_path)) if t.startswith(str(tmp_path))] == [str(tmp_path)], cmd
