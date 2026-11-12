@@ -42,6 +42,10 @@ relevant gateways for the same device + evidence, reuse its owner, and require `
 build/file/waiter prerequisites. Expired flows wake their owner to refresh the same ask, never imply consent.
 A report relaying another surface's ask is status, not a new request: name its owning card/surface and do not
 republish it as an imperative, action_request or For-you choice in the reporting chat.
+A future or conditional step ("when the build is ready you'll get one ask: ...") is a plain sentence, never a
+user-step or action_request. user-steps turns it into an open For-you item now: the user answers "Done" and does it
+early, which can break the live path (a closed app that stops a webhook), or asks what there is to test. File the
+ask only once its prerequisite is verifiably in place. If an early one is already open, withdraw it.
 
 ## Commands that need the user
 
