@@ -116,4 +116,28 @@ test('sameCard: exact qualified identity only', () => {
   assert.equal(steps.sameCard({ id: 't_x', gateway: 'G1', profile: 'p', title: 'A' }, { id: 't_y', gateway: 'G1', profile: 'p', title: 'A' }), false, 'title is not identity')
 })
 
+test('composed: bound card question replaces legacy rows and Skip leaves no Needs-you duplicate', async () => {
+  await React.act(async () => root.render(null))
+  const id = 't_question_fixture'
+  const ref = { gatewayId: 'G1', profile: 'default', type: 'kanban', board: 'default', id }
+  const request = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000098', aliases: [],
+    scope: { complete: true, markdown: 'Pick a color. Unblock = continue; archive = abandon.', sourceRefs: [ref] },
+    presentation: { kind: 'kanban-question', question: 'Pick a color.', details: 'Original evidence', other: true, sourceRef: ref } }
+  const dispose = wire({ chips: [chip(id)], items: [item(id)], requests: [request] })
+  await render('bound-question')
+  assert.equal(el().querySelectorAll('[data-action-request]').length, 1)
+  assert.equal(unaskedRows(id).length, 0)
+  assert.equal(stripCards(id).length, 0)
+  assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 1')
+  await React.act(async () => { el().querySelector('[data-clarify-row="skip"]').click(); await flush() })
+  assert.equal(steps.openAskCount(), 0)
+  assert.equal(unaskedRows(id).length, 0)
+  assert.equal(stripCards(id).length, 0)
+  assert.equal(el().querySelector('[data-section="needs-you"]'), null)
+  assert.equal(window.__sessionTasks.snapshot.chips[0].state, 'blocked')
+  assert.equal(steps.requestForSource([{ ...request, presentation: undefined }], ref), null, 'a citation alone is not a bound display alias')
+  assert.equal(steps.requestForSource([request], { ...ref, board: 'other' }), null)
+  await React.act(async () => root.render(null)); dispose()
+})
+
 test('done', () => { root.unmount() })

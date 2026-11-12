@@ -683,7 +683,14 @@ export function projectRequests(requests) {
 export function requestForSource(requests, source) {
   const key = sourceKey(source)
   if (!key) return null
-  const matches = projectRequests(requests).filter(r => (r.aliases || []).some(a => sourceKey(a) === key))
+  const matches = projectRequests(requests).filter(r => {
+    // The mirror's display identity is server-bound; arbitrary scope.sourceRefs
+    // are only citations and must never suppress another card. This is UI dedup,
+    // not decision authority, and deliberately survives local Skip.
+    const ref = cardPresentation(r)?.sourceRef
+    return (r.aliases || []).some(a => sourceKey(a) === key) ||
+      (ref?.type === 'kanban' && ref.gatewayId === r.owner.gatewayId && ref.profile === r.owner.profile && sourceKey(ref) === key)
+  })
   // A withdrawn ask still retires its own references (they never resurface as legacy asks or blocked chips),
   // but never competes with a live request that claims the same source.
   const live = matches.filter(r => r.state !== 'withdrawn')
@@ -699,10 +706,11 @@ const currentRoute = route => routeKey(route) === routeKey(decisionRoute())
 const operations = new Map() // authoritative readbacks shared by mounted tiles
 const INTENT_PREFIX = 'hermes.actionIntent.v2:'
 // Persist only retry intent, NOT authorization or delivery success. Every recovery queries the owner.
+const cardPresentation = r => r?.presentation?.kind === 'kanban-question' && typeof r.presentation.question === 'string' && typeof r.presentation.details === 'string' ? r.presentation : null
 function recoverIntent(key, request) {
   try {
     const d = JSON.parse(window.localStorage.getItem(INTENT_PREFIX + key) || 'null')
-    return d?.session === request.owner.storedSessionId && d.expectedRevision === request.revision && typeof d.idempotencyKey === 'string' && request.choices.some(c => c.id === d.choiceId) ? d : null
+    return d?.session === request.owner.storedSessionId && d.expectedRevision === request.revision && typeof d.idempotencyKey === 'string' && (request.choices.some(c => c.id === d.choiceId) || (cardPresentation(request)?.other === true && d.choiceId === 'answer-text')) ? d : null
   } catch { return null }
 }
 function rememberIntent(key, decision) {
@@ -911,7 +919,7 @@ const failedText = op => sessionBusy(op)
   ? 'Decision recorded. The session is busy with another turn; it is delivered automatically when that turn ends.'
   : 'Decision recorded; delivery unconfirmed. Work may have started. Retrying automatically with the same operation.'
 
-export function DecisionRow({ request, route, call = api, unavailable = false }) {
+export function DecisionRow({ request, route, call = api, unavailable = false, position = 1, total = 1 }) {
   const key = `${routeKey(route)}:${requestKey(request)}`
   const [state, setState] = useState(() => {
     const decision = recoverIntent(key, request)
@@ -1097,6 +1105,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
       if (live.current) setDismissal(outcome)
     }
   }
+  const presentation = cardPresentation(r)
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
   // Pre-v2 migrations stored one placeholder choice; it is agent work, never a user-facing control.
@@ -1116,25 +1125,34 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   const explainOf = c => typeof c.explain === 'string' && c.explain.trim() ? c.explain.trim()
     : c.authorizes === true ? 'Approves running exactly the plan above.'
     : r.kind === 'approval' && ['approve','decline'].includes(c.effect) ? str(r.outcomes?.[c.effect]).trim() : ''
-  const recommended = shown.find(c => c.recommended === true)
+  const recommended = shown.find(c => c.id === presentation?.recommendedChoiceId || c.recommended === true)
   const ordered = recommended ? [recommended, ...shown.filter(c => c !== recommended)] : shown
   const explained = ordered.filter(c => !needsText(c) && explainOf(c))
   const primary = c => recommended ? c === recommended : c.effect === 'approve' || c.authorizes === true
   // Questions: each explained option is its own full-width button. Approvals keep their Approve/Decline row.
-  const optionButtons = question
+  const optionButtons = question && !presentation
   const choiceDisabled = c => unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open'))
   const kindLabel = { approval: 'Approval', choice: 'Question', input: 'Question', external_step: 'Your step' }[r.kind] || 'Ask'
   const scopeView = jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) })
   const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${permissionNote(l.permissionRequired)}` }, i)) })] })
   const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
   const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
-  return jsxs('article', { ref: article, 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
-    jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
+  const letter = i => String.fromCharCode(65 + i)
+  const questionRow = (id, index, label, onClick, disabled, isRecommended = false) => jsxs('button', { type: 'button', 'data-clarify-row': id, 'data-decision-option': id, disabled, onClick, style: { width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', minHeight: 32, border: 0, borderRadius: 4, textAlign: 'left', font: 'inherit', fontSize: 13, color: 'var(--foreground)', cursor: 'pointer', background: isRecommended ? 'color-mix(in srgb, var(--primary) 12%, transparent)' : 'transparent' }, children: [jsx('span', { 'data-choice-letter': '', 'aria-hidden': true, style: { fontSize: 11, minWidth: 18, textAlign: 'center', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--muted-foreground)' }, children: letter(index) }), jsx('span', { 'data-option-label': '', children: label })] }, id)
+  return jsxs('article', { ref: article, 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': presentation?.question || r.title, style: { ...rowStyle, minWidth: 0 }, children: [
+    !presentation && jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
       jsx('span', { 'data-action-kind': r.kind, style: { padding: '0 6px', borderRadius: 4, color: r.kind === 'approval' ? AMBER : 'var(--muted-foreground)', background: `color-mix(in srgb, ${r.kind === 'approval' ? AMBER : 'var(--muted-foreground)'} 14%, transparent)` }, children: kindLabel }),
       age && jsx('time', { 'data-asked-age': '', dateTime: r.createdAt, title: `${new Date(r.createdAt).toLocaleString()} · revision ${r.revision}`, style: { flex: 'none' }, children: age })
     ] }),
-    jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
-    !locked && (explained.length
+    !presentation && jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
+    presentation && jsxs('div', { 'data-clarify-question': '', style: { display: 'flex', alignItems: 'baseline', gap: 8, margin: '8px 0 4px', fontSize: 13, lineHeight: 1.5 }, children: [jsx('p', { style: { margin: 0, flex: 1, overflowWrap: 'anywhere' }, children: `${position}/${total} — ${presentation.question}` }), jsx('span', { style: { flex: 'none', color: 'var(--muted-foreground)', fontSize: 10 }, children: 'Pick one' })] }),
+    !locked && presentation && jsx('div', { role: 'group', 'aria-label': 'Options', children: [
+      ...ordered.map((c, i) => questionRow(c.id, i, `${c.label.replace(/\s*\(recommended\)\s*$/i, '')}${c === recommended ? ' (recommended)' : ''}`, () => void send(c), choiceDisabled(c), c === recommended)),
+      questionRow('skip', ordered.length, 'Skip', () => dismissRequest(r), unavailable || dismissal.busy),
+      presentation.other === true && questionRow('answer-text', ordered.length + 1, 'Other (type your answer)', e => { trigger.current = e.currentTarget; setEditing({ id: 'answer-text', label: 'Other (type your answer)', effect: 'answer' }) }, choiceDisabled({ effect: 'answer' }))
+    ] }),
+    !locked && presentation && fold('Details', [jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'pre-wrap' }, children: presentation.details }), limitsView, exclusionsView]),
+    !locked && !presentation && (explained.length
       ? fold(r.kind === 'approval' ? 'Full plan and limits' : 'Full question', [scopeView, limitsView, exclusionsView])
       : jsxs('div', { style: { display: 'contents' }, children: [scopeView, (limitsView || exclusionsView) && fold('Limits and exclusions', [limitsView, exclusionsView])] })),
     // Explained options ARE the buttons: what it is, what happens, and the agent's pick, in one target.
@@ -1145,7 +1163,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
       ] }),
       jsx('span', { 'data-option-explain': '', style: { display: 'block', color: 'var(--muted-foreground)', fontSize: 12.5, fontWeight: 400, lineHeight: 1.45 }, children: explainOf(c) })
     ] }, c.id)) }),
-    !locked && !optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
+    !locked && !presentation && !optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
       jsx('strong', { style: { fontWeight: 600 }, children: choiceLabel(c, choices, r.kind) }),
       c.recommended === true && jsx('span', { 'data-recommended': '', style: { marginLeft: 6, fontSize: 11, color: 'var(--primary, var(--accent))' }, children: 'recommended' }),
       jsx('div', { style: { color: 'var(--muted-foreground)', fontSize: 12.5 }, children: jsx(MessageTextContent, { media: false, text: explainOf(c) }) })
@@ -1155,7 +1173,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     state.phase === 'confirmed' && jsx('div', { 'data-owner-phase': ownerPhase(state.consumer), children: ownerPhaseText(state.consumer) }),
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : explainOf(selected)}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
-    !locked && jsxs('div', { style: flowStyle, children: [
+    !locked && !presentation && jsxs('div', { style: flowStyle, children: [
       ...ordered.filter(c => !optionButtons || !explained.includes(c)).map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, title: explainOf(c) || c.label, style: needsText(c) ? { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' } : primary(c) ? primaryStyle : choiceStyle(c.effect === 'approve' ? 'neutral' : c.effect), disabled: choiceDisabled(c), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: c.recommended === true && !needsText(c) && !explained.includes(c) ? `${choiceLabel(c, choices, r.kind)} · Recommended` : choiceLabel(c, choices, r.kind) }, c.id)),
       ...(approvalPending ? [
         jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),
@@ -1215,7 +1233,7 @@ export function openAskCount() {
     // Terminal backend state is durable confirmation, not a new ask on reload.
     // Still read it back when the expanded queue mounts, and retain local failures.
     if (['resolved','superseded','cancelled'].includes(r.state) && r.resolution?.revision === r.revision && !op?.decision && !recoverIntent(key, r)) return false
-    return requestNeedsReadback(scope, r) || (!r.resolution && ['open','needs_context'].includes(r.state) && !agentPending(r))
+    return requestNeedsReadback(scope, r) || (!r.resolution && ['open','needs_context'].includes(r.state) && !agentPending(r) && !isRequestDismissed(r))
   }).length
 }
 
@@ -1235,7 +1253,7 @@ export function ActionQueue({ embedded = false } = {}) {
   // Closed requests, including withdrawn (moot) asks, are not shown or counted; they still suppress their
   // own legacy references through requestForSource.
   const needsReadback = r => requestNeedsReadback(scope, r)
-  const requests = snap.requests.filter(r => ((!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r)) && !(agentPending(r) && !needsReadback(r) && isRequestDismissed(r)))
+  const requests = snap.requests.filter(r => ((!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r)) && !(!needsReadback(r) && isRequestDismissed(r)))
   if (!requests.length && !snap.error) return null
   const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
   // Minimized holds only while every shown request was already shown when the user minimized; a new one (or a new
@@ -1251,7 +1269,7 @@ export function ActionQueue({ embedded = false } = {}) {
     ] }),
     !minimized && snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
     !minimized && requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
-    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: embedded ? 'none' : '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error || !!snap.stale }, `${scope}:${requestKey(r)}`)) })
+    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: embedded ? 'none' : '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map((r, i) => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error || !!snap.stale, position: i + 1, total: visible.length }, `${scope}:${requestKey(r)}`)) })
   ] })
 }
 

@@ -229,6 +229,50 @@ class Mirror:
             )
         )
 
+    def present(self, request):
+        """Display-only metadata; never rewrite a frozen request or mint a new tile."""
+        binding = self.binding(request['owner'], request['requestId'])
+        if not binding:
+            return request
+        frozen = self.store.get(request['owner'], request['requestId'])
+        frozen.pop('resolution', None)
+        frozen['state'] = json.loads(binding['request'])['state']
+        if encoded(frozen) != binding['request']:
+            return request
+        snap = json.loads(binding['snapshot'])
+        hr = snap['ask']
+        question = re.split(r'\bUnblock\s*=', hr['action'], maxsplit=1, flags=re.I)[0].strip()
+        question = question or snap['title']
+        question = re.sub(r'\bt_[a-zA-Z0-9_]+\b', 'this card', question)
+        options = hr.get('choices') or []
+        recommended = next((f'card-{i}' for i, opt in enumerate(options)
+                            if opt.get('recommended') is True), None)
+        if recommended is None and options and re.search(r'\(recommended\)\s*$', options[0]['label'], re.I):
+            recommended = 'card-0'
+        details = '\n\n'.join(str(hr[k]) for k in ('action', 'why_human', 'scope', 'evidence') if hr.get(k))
+        return dict(request, presentation=dict(kind='kanban-question', question=question,
+                    details=details, recommendedChoiceId=recommended, other=True,
+                    sourceRef=dict(gatewayId=request['owner']['gatewayId'],
+                                   profile=request['owner']['profile'], type='kanban',
+                                   board=binding['board'], id=binding['task'])))
+
+    def decide_other(self, owner, decision):
+        """An informational answer to an exact card ask, not a new permission.
+
+        The supplemental choice is server-owned, not added to the immutable v2
+        choices or numbered-list snapshot. Existing tiles keep their UUID/revision.
+        """
+        def supplemental(c, request, payload):
+            if payload['choiceId'] != 'answer-text':
+                return None
+            row = c.execute('SELECT request FROM kanban_projections WHERE namespace=? AND request_id=? AND session=?',
+                            (self.store._ns(owner), request['requestId'], owner['storedSessionId'])).fetchone()
+            if not row or encoded(request) != row['request']:
+                raise self.core.ActionError('Exact server projection binding required', 409)
+            return dict(id='answer-text', label='Other (type your answer)', effect='answer')
+        return self.store._decide(owner, decision, supplemental_choice=supplemental,
+                                  provenance=dict(type='kanban_other', version=1))
+
     def binding(self, owner, rid):
         with self.store._read() as c:
             row = c.execute(
@@ -551,14 +595,20 @@ class Mirror:
                 ),
                 None,
             )
-            if selected is None:
+            other = op['decision']['choiceId'] == 'answer-text'
+            if other and (op.get('provenance') != dict(type='kanban_other', version=1)
+                          or op['intent'].get('executionAuthorized') is not False
+                          or op['intent'].get('permissionGrants') != []):
+                raise self.core.ActionError('Bound informational answer required', 409)
+            if selected is None and not other:
                 raise self.core.ActionError("Unknown card choice", 409)
             hr = json.loads(binding["snapshot"])["ask"]
             options = hr.get("choices") or [
                 dict(label="Unblock", value="unblock"),
                 dict(label="Archive", value="archive"),
             ]
-            choice = options[selected]
+            choice = (dict(label='Other', value=op['intent']['revisionText'])
+                      if other else options[selected])
             comment = (
                 "Choice recorded in Desktop: "
                 + encoded(choice)
@@ -589,7 +639,7 @@ class Mirror:
                     else "changed ask"
                 )
 
-            archive = not hr.get("choices") and choice["value"] == "archive"
+            archive = not other and not hr.get("choices") and choice["value"] == "archive"
             # Core owns the transaction (and post-commit archive cleanup). Its event
             # is the durable receipt, committed together with the choice comment.
             (api.archive_task if archive else api.unblock_task)(

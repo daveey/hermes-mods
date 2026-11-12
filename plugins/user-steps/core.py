@@ -2734,7 +2734,7 @@ class ActionStore:
         return self._decide(owner, {'idempotencyKey': idempotency_key}, provenance=provenance,
                             fingerprint=fingerprint, resolve=resolve)
 
-    def _decide(self, owner, decision, *, provenance=None, fingerprint=None, resolve=None):
+    def _decide(self, owner, decision, *, provenance=None, fingerprint=None, resolve=None, supplemental_choice=None):
         if resolve is None:
             text = self._check_decision(decision)
             fingerprint = _json(dict(decision, revisionText=text))
@@ -2754,6 +2754,10 @@ class ActionStore:
             if r['revision'] != decision['expectedRevision'] or r['state'] not in ('open', 'needs_context'):
                 raise ActionError('Stale or closed request', 409)
             choice = next((x for x in r['choices'] if x['id'] == decision['choiceId']), None)
+            if not choice and supplemental_choice is not None:
+                # Producer-owned extension, checked under this transaction. Never
+                # supplied by a decision payload or inferred from sourceRefs.
+                choice = supplemental_choice(c, r, decision)
             if not choice: raise ActionError('Unknown choice')
             effect = choice['effect']
             if effect in ('approve', 'answer') and not r['scope']['complete']: raise ActionError('Scope is incomplete')

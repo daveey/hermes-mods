@@ -227,12 +227,13 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             st = migrate(own)
             _load('chat').reconcile(_load('core'), st, own, db=state_db)
             retire_moot(st, own)
-            return {'requests': st.views(own, include_withdrawn=include == 'withdrawn')}
+            presenter = mirror()
+            return {'requests': [presenter.present(r) for r in st.views(own, include_withdrawn=include == 'withdrawn')]}
         return run(action)
 
     @router.get('/requests/{request_id}')
     def request(request_id: str, session: str):
-        return run(lambda: {'request': store().view(owner(session), request_id)})
+        return run(lambda: {'request': mirror().present(store().view(owner(session), request_id))})
 
     @router.post('/requests/{request_id}/withdraw')
     def withdraw(request_id: str, body: WithdrawBody):
@@ -249,7 +250,11 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             own = owner(body.session); st = store()
             payload = body.model_dump(exclude={'session'})
             payload['requestId'] = request_id
-            recorded = st.decide(own, payload)  # durable commit BEFORE any receiver effects
+            # Only this producer can supply the supplemental informational choice.
+            producer = mirror()
+            recorded = (producer.decide_other(own, payload)
+                        if payload['choiceId'] == 'answer-text' and producer.binding(own, request_id)
+                        else st.decide(own, payload))  # durable commit BEFORE receiver effects
             return st.dispatch(own, recorded['operation']['operationId'], delivery())
         return run(action)
 
@@ -276,13 +281,19 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             return st.dispatch(own, recorded['operation']['operationId'], delivery())
         return run(action)
 
+    def present_operation(result):
+        # Decorate only the readback view, never the operation's frozen intent.
+        if result.get('request'):
+            return dict(result, request=mirror().present(result['request']))
+        return result
+
     @router.get('/operations')
     def operation_by_key(session: str, idempotencyKey: str):
-        return run(lambda: store().operation(owner(session), key=idempotencyKey))
+        return run(lambda: present_operation(store().operation(owner(session), key=idempotencyKey)))
 
     @router.get('/operations/{operation_id}')
     def operation(operation_id: str, session: str):
-        return run(lambda: store().operation(owner(session), oid=operation_id))
+        return run(lambda: present_operation(store().operation(owner(session), oid=operation_id)))
 
     @router.get('/operations/{operation_id}/receipts')
     def receipts(operation_id: str, session: str):

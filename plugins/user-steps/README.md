@@ -16,6 +16,31 @@ edit, `read_exact()` deliberately raises `ValueError`, so lifecycle consumers
 trusting an unversioned snapshot. Test:
 `tests/test_lifecycle_source.py::test_revision_new_migration_and_noop`.
 
+## Blocked-card question layout
+
+Server-bound Kanban asks use a compact clarify-style question with full-width
+lettered choices, recommended first, then **Skip** and **Other (type your answer)**.
+Multiple asks are numbered 1/N. Original action/context/evidence remain in collapsed
+**Details**. The shared ActionQueue supplies this layout in the session panel and
+standalone For-you queue. The blocked-panel yields its composer surface when
+user-steps is loaded; its standalone fallback, unrelated approval layouts and the
+core clarify form are unchanged.
+
+The mirror emits presentation metadata from its immutable source snapshot, without
+changing v2 request bytes, UUID5, revision, choice IDs or numbered-list snapshots.
+A display-only qualified source identity suppresses duplicate legacy card rows,
+including after Skip. Skip hides only this owner/request revision on this device;
+it sends no decision and leaves the source card blocked. Other uses the existing
+versioned decision endpoint, with a server-bound informational `answer-text`
+extension: it records the text and resumes the exact still-blocked card, never
+archives based on typed text or grants execution permission. Old backends without
+presentation metadata retain their existing controls.
+
+Tests: `tests/test_kanban_question_display.py` (identity, recommendations, REST
+round-trip, retry, invalid owner/revision/binding, typed archive),
+`desktop-plugins/user-steps/kanban-question.test.mjs` (rows and exact payloads), and
+`desktop-plugins/session-panel/test/composed.test.mjs` (one ask/count, Skip dedup).
+
 ## What you see (Hermes Desktop)
 
 The decision sheet separates **Read this** (the inline plan rendered through the
