@@ -1180,6 +1180,14 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   candidate must touch the component's paths, not just say its name in the subject. A `fixed`/`not_defect` event
   citing a commit older than the lane's filed card logs `selfheal_late_adopt` (`status` → `late_adopt`): the
   "already fixed?" check missed it. Tests: `tests/test_session_commit_mods.py` (defect desktop-9077b82c2d).
+- **Admission fixes land before the admission:** an admission is the agent reporting a defect it usually already
+  fixed, so for `source=admission` (`POST_FIX_REPORT_SOURCES`) `session_commit_fix` searches from
+  `ADMISSION_FIX_LOOKBACK_S` (2 h) before `complaint_at`, and also adopts a commit within 2 h either side whose
+  message names the origin session id (`via=session_named`). Naming the session is provenance, not subject: the
+  commit's subject+body must still share max(2, a third) of the symptom's distinctive words
+  (`_commit_names_origin`), so an unrelated same-session fix is not adopted. User complaints keep the strict
+  after-`complaint_at` window. Tests: `tests/test_session_commit_admission.py` (plugin-aafb20159a, hermes-mods
+  2c0772cc landed 7 min before the report).
 - **SQLite incidents:** `database disk image is malformed`, `KanbanDbCorruptError`, and `file is not a database`
   share a fingerprint by source host, normalized DB path and UTC event-hour. Explicit `db_path` wins, then a path
   in evidence; pathless Kanban tracebacks default to `~/.hermes/kanban.db`. Other pathless SQLite errors are not

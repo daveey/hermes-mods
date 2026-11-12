@@ -3121,6 +3121,13 @@ def _store(store=None):
 
 ADOPT_STATUSES = ("ready", "running", "blocked", "todo", "review", "done")  # finished fixes count: the work exists
 ADOPT_LOOKBACK_S = 2 * 3600  # no `complaint_at` on the defect: the complaint turn is at most this long before detection
+# An admission's quote is the agent reporting a defect it usually ALREADY fixed, so its fix commit predates
+# complaint_at by construction (plugin-aafb20159a: hermes-mods 2c0772cc landed 7 min before the report that became the
+# admission). session_commit_fix searches this far before complaint_at for those sources; defect binding is still
+# required, so the window only selects candidates. A user complaint raised after a commit says that commit did not fix
+# it, so complaints keep the strict "after complaint_at" window.
+ADMISSION_FIX_LOOKBACK_S = 2 * 3600
+POST_FIX_REPORT_SOURCES = ("admission",)
 
 
 def session_owned_cards(session_id: Optional[str], since: float, home: Optional[Path] = None) -> list:
@@ -3347,12 +3354,28 @@ def _commit_binds_defect(repo: Path, sha: str, subject: str, d: dict) -> bool:
     are in the diff, or the commit's own subject/body names the fingerprint, the symptom or enough of its
     distinctive words (card_names_defect rules). Time and component overlap never count (79477b7501f4, a turn-lease
     fix, was credited to three unrelated needs-you/credential complaints), and neither does a sha the session
-    merely mentions."""
+    merely mentions. One extra rule (_commit_names_origin): a message that names the defect's origin session id
+    is bound when its subject and body together share enough distinctive symptom words; the session id is provenance,
+    the shared words are the subject (an unrelated fix from the same session shares at most one)."""
     tb_files = {os.path.basename(p) for p in re.findall(r'File "([^"]+)"', str(d.get("details") or ""))}
     if tb_files:
         return bool(tb_files & {os.path.basename(f) for f in _git_lines(repo, "show", "--name-only", "--format=", sha)})
     body = "\n".join(_git_lines(repo, "show", "-s", "--format=%b", sha))
-    return card_names_defect({"title": subject, "body": body}, d)
+    return card_names_defect({"title": subject, "body": body}, d) or _commit_names_origin(subject, body, d)
+
+
+def _commit_names_origin(subject: str, body: str, d: dict) -> bool:
+    """The commit message names the origin session id and shares max(2, a third) of the symptom's distinctive words
+    (card_names_defect's threshold and stemming), counted over subject AND body. card_names_defect counts the title
+    only, because a long body shares a couple of words with almost any symptom; the session id is what makes the body
+    count here. plugin-aafb20159a: 2c0772cc's body named session 20261026_235722_bef6c6, its subject shared
+    "subscription" and its body "completion". One shared word is not enough even then: an unrelated same-session
+    fix shares a word like "task"."""
+    sid = str(d.get("session_id") or "")
+    if len(sid) < 12 or sid not in f"{subject}\n{body}":
+        return False
+    want = _subject_words(d.get("error") if d.get("kind") == "repeat_failure" else d.get("symptom"))
+    return bool(want) and len(want & _subject_words(f"{subject}\n{body}")) >= max(2, -(-len(want) // 3))
 
 
 def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo: Optional[Path] = None,
@@ -3365,7 +3388,11 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
     (b) named in the session's digest (other hosts' sessions; a clipped, whole-session summary) and bound by
         _commit_binds_defect; or
     (c) landed inside the session's active window (since .. last_activity_at + slack) as a `fix` whose diff touches
-        the component (_commit_in_component) and is bound by _commit_binds_defect.
+        the component (_commit_in_component) and is bound by _commit_binds_defect; or
+    (d) for a post-fix report (POST_FIX_REPORT_SOURCES: an admission), a commit within ADMISSION_FIX_LOOKBACK_S of
+        `since` (either side) whose message names the origin session id, bound by _commit_binds_defect.
+    For a post-fix report every path searches from ADMISSION_FIX_LOOKBACK_S before `since`: the agent reports a
+    defect it already fixed, so the fix predates the report (plugin-aafb20159a). Other sources search after `since`.
     Window and component only select candidates; without defect-bound proof the defect stays unresolved (a session
     can report several defects, and a nearby fix for another one proves nothing). -> {sha, at, subject, via}|None."""
     sid, host, comp = d.get("session_id"), d.get("host"), (d.get("component") or "").lower()
@@ -3373,16 +3400,18 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
     paths = (sorted(root.glob(f"{host}/*/{sid}.json")) if host else sorted(root.glob(f"*/*/{sid}.json"))) if sid else []
     repos = _fix_repos(repo)
     reply = _complaint_reply_text(sid, since) if sid else None
+    post_fix = d.get("source") in POST_FIX_REPORT_SOURCES
+    lo = since - ADMISSION_FIX_LOOKBACK_S if post_fix else since
 
     cache: dict = {}
 
-    def history(r: Path) -> list:  # (sha, committer ts, subject) on origin/main since the complaint; lazy, cached
+    def history(r: Path) -> list:  # (sha, committer ts, subject) on origin/main since `lo`; lazy, cached
         if r not in cache:
             out = []
-            for ln in _git_lines(r, "log", "origin/main", f"--since={int(since)}", "--format=%H\t%ct\t%s"):
+            for ln in _git_lines(r, "log", "origin/main", f"--since={int(lo)}", "--format=%H\t%ct\t%s"):
                 sha, _, rest = ln.partition("\t")
                 ts, _, subj = rest.partition("\t")
-                if ts.isdigit() and int(ts) > since:
+                if ts.isdigit() and int(ts) > lo:
                     out.append((sha, int(ts), subj))
             cache[r] = out
         return cache[r]
@@ -3419,6 +3448,15 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
                     if not _commit_binds_defect(r, sha, subj, d):
                         continue
                     return {"sha": sha, "at": ts, "subject": subj, "via": "window", "repo": str(r)}
+    if post_fix and sid and len(str(sid)) >= 12:
+        hi = since + ADMISSION_FIX_LOOKBACK_S  # a session-named commit long after the report is later, other work
+        for r in repos:
+            for ln in _git_lines(r, "log", "origin/main", f"--since={int(lo)}", "--fixed-strings", f"--grep={sid}",
+                                 "--format=%H\t%ct\t%s"):
+                sha, _, rest = ln.partition("\t")
+                ts, _, subj = rest.partition("\t")
+                if ts.isdigit() and lo < int(ts) <= hi and _commit_binds_defect(r, sha, subj, d):
+                    return {"sha": sha, "at": int(ts), "subject": subj, "via": "session_named", "repo": str(r)}
     if not has_digest:
         tnow = time.time() if now is None else now
         for r in repos:
