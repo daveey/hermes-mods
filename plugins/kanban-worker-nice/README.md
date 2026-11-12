@@ -55,3 +55,8 @@ worker floors. `tests_terminal.py` covers host configuration, opt-out, idempoten
 worker exclusion, and real core dispatch/local-shell execution for both direct
 terminal and the generated execute_code terminal stub plus RPC dispatcher. Core
 integration checks skip when Hermes core is unavailable (standalone CI).
+Both dispatch paths also execute core's real survivable-process tee wrapper,
+which forks a subshell. The prefix targets `BASHPID`, not `$$` (the outer shell).
+A dedicated zero-priority regression verifies command=10 and outer shell=0;
+it explicitly skips under an already-niced launcher. Run once at nice 0 for
+that proof and again under `nice -n 15` for inherited-floor compatibility.

@@ -33,6 +33,21 @@ def run(command='nice', **args):
     return int(subprocess.check_output(['bash', '-c', effective['command']], text=True))
 
 
+@pytest.mark.parametrize('command,expected', [('nice', 10), ('HUB_NICE_OK=1 nice', 0)])
+def test_zero_priority_subshell(command, expected):
+    """Match the local terminal launcher: eval runs in a forked bash subshell."""
+    if os.getpriority(os.PRIO_PROCESS, 0) != 0:
+        pytest.skip('zero-priority regression requires an ordinary launcher')
+    args = {'command': command}
+    result = plugin.terminal_request(tool_name='terminal', args=args)
+    effective = result['args'] if result else args
+    import shlex
+    script = '( eval ' + shlex.quote(effective['command']) + ' ); nice'
+    output = subprocess.check_output(['bash', '-c', script], text=True)
+    assert [int(n) for n in output.split()] == [expected, 0]
+    assert os.getpriority(os.PRIO_PROCESS, 0) == 0
+
+
 def test_listed_chat():
     assert run() == max(os.getpriority(os.PRIO_PROCESS, 0), 10)
 
@@ -87,9 +102,10 @@ def test_idempotent_and_preserve_args():
     assert plugin.terminal_request(tool_name='terminal', args=first) is None
 
 
+@pytest.mark.parametrize('survivable_shell', [False, True])
 @pytest.mark.parametrize('entry', ['terminal', 'execute_code'])
 @pytest.mark.parametrize('command,optout', [('nice', False), ('HUB_NICE_OK=1 nice', True)])
-def test_registered_dispatch_paths(monkeypatch, tmp_path, entry, command, optout):
+def test_registered_dispatch_paths(monkeypatch, tmp_path, entry, command, optout, survivable_shell):
     """Real core dispatch and local shell; execute_code uses its generated RPC stub."""
     import json
     import time
@@ -98,6 +114,15 @@ def test_registered_dispatch_paths(monkeypatch, tmp_path, entry, command, optout
     from hermes_cli import plugins
     from tools.code_execution_tool import generate_hermes_tools_module
     from tools.code_execution_rpc import _default_dispatch, _handle_rpc_request
+
+    if survivable_shell:
+        # The isolated HOME disables production's survivable-process setting.
+        # Exercise its REAL tee/subshell builder without needing a systemd scope.
+        from tools.environments import base
+        from tools.process_registry_survivable import tee_wrapped
+        wrap = base._wrap_command_script
+        monkeypatch.setattr(base, '_wrap_command_script',
+                            lambda *a, **kw: tee_wrapped(wrap(*a, **kw), tmp_path / 'command.log'))
 
     middleware = {}
     plugin.register(SimpleNamespace(register_middleware=lambda kind, fn: middleware.setdefault(kind, []).append(fn)))

@@ -90,8 +90,10 @@ def terminal_request(tool_name='', args=None, **_):
     want = min(19, target_nice())
     if want <= 0:
         return None
+    # $$ still names the outer shell inside survivable terminal's subshell.
+    # BASHPID names the shell actually executing this prefix (Linux bash).
     prefix = (_MARKER + f'if [ "$(nice)" -lt {want} ]; then '
-              f'renice -n {want} -p $$ >/dev/null || exit $?; fi\n')
+              f'renice -n {want} -p "${{BASHPID:-$$}}" >/dev/null || exit $?; fi\n')
     return {'args': dict(args, command=prefix + command),
             'source': 'kanban-worker-nice', 'reason': 'host terminal niceness floor'}
 
