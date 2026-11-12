@@ -278,6 +278,25 @@ class ContentFreeHandoff(unittest.TestCase):
                                                           "host": "macbook", "session": "s0", "pattern": "is-broken"})
             self.assertIsNone(g.project_bb_handoff(Path(d) / "nope" / "x.jsonl"))
 
+    def test_long_session_ids_hostile_t_values_and_torn_utf8(self):
+        import json, tempfile
+        sid = "local-" + "ab12" * 16                                   # hub session ids are 70 characters
+        good = {"id": f"askgate-bb:{sid}:1793652485", "t": 1793652485, "week": "2026-11-02", "host": "mini",
+                "session": sid, "pattern": "is-broken"}
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "askgate-bb-misses.jsonl"
+            weird = [dict(good, id=["x"], t=1), dict(good, t=float("nan")), dict(good, t=float("inf")),
+                     dict(good, t=10 ** 400), dict(good, t="1793652485")]
+            with open(out, "wb") as fh:
+                for r in weird:
+                    fh.write(json.dumps(r).encode() + b"\n")
+                fh.write(b'{"quote": "\xe2\x82')                           # torn multi-byte sequence, no newline
+                fh.write(b"\n" + json.dumps(good).encode() + b"\n")
+            self.assertEqual(g.project_bb_handoff(out), 1)
+            got = [json.loads(x) for x in (Path(d) / "askgate-bb-requests.jsonl").read_text().splitlines()]
+            self.assertEqual([r["id"] for r in got], [good["id"]])
+            self.assertEqual(g.project_bb_handoff(out), 0)              # idempotent
+
     def test_values_are_shape_checked_and_a_torn_twin_line_is_closed(self):
         import json, tempfile
         ok = {"id": "askgate-bb:s1:5", "t": 5, "week": "2026-10-12", "host": "macbook", "session": "s1",

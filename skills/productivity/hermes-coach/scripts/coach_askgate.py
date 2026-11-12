@@ -980,7 +980,7 @@ def requests_path_for(path):
 def _jsonl_ids(p):
     have = set()
     if p.exists():
-        for line in p.read_text().splitlines():
+        for line in p.read_bytes().decode("utf-8", "replace").splitlines():
             try:
                 have.add(json.loads(line)["id"])
             except Exception:
@@ -988,7 +988,7 @@ def _jsonl_ids(p):
     return have
 
 
-_ID_RX = re.compile(r"askgate-bb:([A-Za-z0-9_.-]{1,64}):([0-9]{1,12})")
+_ID_RX = re.compile(r"askgate-bb:([A-Za-z0-9_.-]{1,128}):([0-9]{1,12})")
 _HOST_RX = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 _PATTERN_RX = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
 _WEEK_RX = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -1034,7 +1034,7 @@ def project_bb_handoff(path, requests_path=None):
         return None
     have = _jsonl_ids(q)
     new = []
-    for line in (p.read_text().splitlines() if p.exists() else []):
+    for line in (p.read_bytes().decode("utf-8", "replace").splitlines() if p.exists() else []):
         try:
             r = content_free_row(json.loads(line))
         except Exception:
