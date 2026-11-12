@@ -121,7 +121,7 @@ The symptom is many cards crashing within a minute or two on several hosts with 
 1. Force the pull on every worker now: over instance-role SSM, run `sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user start hermes-oauth-relay.service`. Don't wait for the timer.
 2. **Fresh tokens alone don't finish the fix.** Retries during that window fail at start with `SubscriptionQuotaUnavailable … resets at <days away>`, and that failure persists in three places:
    - an `anthropic` entry in each affected host's `~/.hermes/provider_walls.json`. If another provider is genuinely walled, that host then runs no LLM work at all.
-   - a `quota_episode` event on each card, which holds it with the `subscription_quota_reset` guard even after it's unblocked to ready.
+   - a `quota_episode` event on each card, which holds it with the `subscription_quota_reset` guard even after it's unblocked to ready. Stall notices print that hold as a bare `until HH:MM:SSZ` with no date, and it can be days out. Before telling the user when it lifts, read the full date from the episode's `until` (`kanban_quota_episode.hold_until`).
    - a Kanban notice to a chat that failed then with `HTTP 429 … Retrying once at <that reset>`: its only retry is days away. Act now on each card such a notice names.
    Read every gateway's walls file (Macs included), and query each board's DB (the hub's, and each Mac's local `kanban.db`) for `quota_episode` events with provider `anthropic` from the window.
 3. Disprove the wall before removing it:
