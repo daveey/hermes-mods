@@ -1,4 +1,5 @@
 """self_heal: complaint (pre_llm_call) and self-admission (post_llm_call) detectors, fingerprint dedupe, modes."""
+import hashlib
 import importlib.util
 import json
 import sys
@@ -463,6 +464,30 @@ def test_admission_detect_logs_the_model_each_audit_stage_resolved_to(tmp_path):
     quiet = lambda s, p: json.dumps({"p_defect": 0.7, "kind": "admission", "component": "agent", "symptom": "a"})
     v = sh.audit_verdict(reply, quiet, confirm=quiet)
     assert "judge_model" not in v and "confirm_model" not in v
+
+
+def test_admission_detect_keeps_the_exact_judged_input_for_replay(tmp_path):
+    """t_01a1d01a9a9bb5db: rows rebuilt from state.db scored 0.82-0.90 on the model that scored them 0.97-0.99 live, so
+    the rebuild is not the live input. A filed admission now logs prompt_sha and writes the exact (system, prompt) to
+    admission_inputs.jsonl (never into log.jsonl or the card), and audit_verdict replays it via judged_input."""
+    reply = "I was wrong earlier: I stopped the worker before you answered."
+    seen = []
+
+    def j(system, prompt):
+        seen.append((system, prompt))
+        return json.dumps({"p_defect": 0.95, "kind": "admission", "component": "agent", "symptom": "a"})
+    hit = sh.detect_admission(reply, j, confirm=j)
+    filed = []
+    store = core.Store(tmp_path / "coach")
+    sh.handle(hit, "s1", store, evidence=reply, m="shadow", filer=lambda d, store=None, m=None: filed.append(d))
+    (det,) = [e for e in events(tmp_path) if e["event"] == "selfheal_detect"]
+    (inp,) = [json.loads(x) for x in (tmp_path / "coach" / "admission_inputs.jsonl").read_text().splitlines()]
+    assert (inp["system"], inp["prompt"]) == seen[0] == seen[1]
+    assert det["prompt_sha"] == inp["prompt_sha"] == hashlib.sha1(f"{seen[0][0]}\n{seen[0][1]}".encode()).hexdigest()[:16]
+    assert "_audit_input" not in json.dumps(det) and filed and "_audit_input" not in filed[0]
+    seen.clear()
+    v = sh.audit_verdict("unrelated text", j, confirm=j, judged_input=(inp["system"], inp["prompt"]))
+    assert seen == [(inp["system"], inp["prompt"])] * 2 and v["prompt_sha"] == det["prompt_sha"]
 
 
 def test_replay_reports_resolved_models_and_pins_the_confirm_stage(tmp_path, monkeypatch):

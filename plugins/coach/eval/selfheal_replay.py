@@ -140,11 +140,15 @@ def main(argv=None, llm=None, confirm_llm=None):
     def sample(r, i):
         tag = f"#s{i}" if i else ""
         if a.mode == "admission":
+            # A row with "system"/"prompt" (a live detection's admission_inputs.jsonl line) replays that exact input.
+            ji = (r["system"], r["prompt"]) if r.get("prompt") else None
             if confirm:
                 return sh.audit_verdict(r["text"], lambda s, p: judge(s, p, tag), r.get("tool_log"),
-                                        r.get("ask") or "", lambda s, p: judge(s, p, tag + "#confirm", confirm))
-            return sh.parse(judge(sh._with_profile(sh.AUDIT_SYS),
-                                  sh.admission_prompt(r["text"], r.get("tool_log"), r.get("ask") or ""), tag))
+                                        r.get("ask") or "", lambda s, p: judge(s, p, tag + "#confirm", confirm),
+                                        **({"judged_input": ji} if ji else {}))
+            return sh.parse(judge(*(ji or (sh._with_profile(sh.AUDIT_SYS),
+                                          sh.admission_prompt(r["text"], r.get("tool_log"), r.get("ask") or ""))),
+                                  tag))
         prev = "" if a.no_prev else r.get("prev_reply") or ""
         return sh.parse(judge(sh._with_profile(sh.COMPLAINT_SYS), sh.complaint_prompt(prev, r["text"],
                                                                                       r.get("tool_log")), tag))

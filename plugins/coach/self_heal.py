@@ -1178,13 +1178,15 @@ def _resolved(key: str) -> dict:
 
 
 def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=None, ask="",
-                  confirm: Optional[Callable[[str, str], str]] = None) -> Optional[dict]:
+                  confirm: Optional[Callable[[str, str], str]] = None,
+                  judged_input: Optional[tuple] = None) -> Optional[dict]:
     """The turn-end audit, before the threshold: judge; an admission at >= GATE goes to the confirm model (when
     configured), whose verdict replaces it. Only AUDIT_KINDS count; other kinds score 0. The verdict carries `stages`
     (judge, or judge+confirm) and, when confirmed, the judge's own `stage1_p`/`stage1_kind`, so a filed detection
     shows which stage filed it; `judge_model`/`confirm_model` name the model each stage resolved to (class routing
-    picks one per session)."""
-    system, prompt = _with_profile(AUDIT_SYS), admission_prompt(final_reply, tool_log, ask)
+    picks one per session). `judged_input` = (system, prompt) a live detection logged to admission_inputs.jsonl:
+    replay that exact input instead of rebuilding it."""
+    system, prompt = judged_input or (_with_profile(AUDIT_SYS), admission_prompt(final_reply, tool_log, ask))
     v = parse(_tracked(llm)(system, prompt))
     stages = {"stages": "judge", **_resolved("judge_model")}
     if v and confirm and v.get("kind") in AUDIT_KINDS and v["p_defect"] >= GATE:
@@ -1193,7 +1195,11 @@ def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=Non
         stages.update(_resolved("confirm_model"))
     if not v:
         return None
-    v = {**v, **stages}
+    # The exact judged input, so a replay of a filed detection needs no rebuild from state.db: the Sonnet replay of
+    # real catches scored 0.82-0.90 where the same model scored them 0.97-0.99 live (t_01a1d01a9a9bb5db). `prompt_sha`
+    # is logged; `_audit_input` stays off the log and the card (handle() writes it to admission_inputs.jsonl).
+    stages["prompt_sha"] = hashlib.sha1(f"{system}\n{prompt}".encode()).hexdigest()[:16]
+    v = {**v, **stages, "_audit_input": {"system": system, "prompt": prompt}}
     return v if v.get("kind") in AUDIT_KINDS else {**v, "p_defect": 0.0}
 
 
@@ -1342,6 +1348,8 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
             pass
     if not hit:
         return None
+    audit_in = hit.get("_audit_input")
+    hit = {k: v for k, v in hit.items() if k != "_audit_input"}
     m = m or mode()
     if is_crash_hit(hit) and "stop_cause" not in hit:
         # Read the stop's cause HERE, on the host that ran the cut turn (its logs exist nowhere else), and in
@@ -1359,8 +1367,8 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     if hit_ev and not str(evidence or "").startswith(hit_ev[:60]):
         evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
     stop = {k: hit[k] for k in ("stop_cause", "stop_evidence", "stop_host") if k in hit}
-    stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind", "judge_model", "confirm_model")
-                 if k in hit})  # which audit stage filed it, on which model
+    stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind", "judge_model", "confirm_model",
+                                     "prompt_sha") if k in hit})  # which audit stage filed it, on which model
     if probe_session(session_id, ask):
         rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
                "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
@@ -1375,6 +1383,15 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
            "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
            "fingerprint": hit["fingerprint"], "new": new, "evidence": (evidence or "")[:300], **stop}
     store.log(rec)
+    if isinstance(audit_in, dict):
+        try:  # replay input for selfheal_replay.py; fail-open
+            with open(Path(store.root) / "admission_inputs.jsonl", "a") as fh:
+                fh.write(json.dumps({"ts": time.time(), "session_id": session_id, "fingerprint": hit["fingerprint"],
+                                     "p": hit["p_defect"], "prompt_sha": hit.get("prompt_sha"),
+                                     "system": str(audit_in.get("system", ""))[:40000],
+                                     "prompt": str(audit_in.get("prompt", ""))[:60000]}) + "\n")
+        except Exception:
+            pass
     if m == "live" and new:
         q = Path(store.root) / "selfheal_queue.jsonl"
         with open(q, "a") as fh:
