@@ -67,7 +67,9 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   Return verified results to the existing card rather than asking the user to relay them. When a card blocks on
   "from your own Hermes chat open the owner-terminal flow" and this chat IS the user's Desktop chat, the launch is
   yours: run the reviewed recipe through `run_in_user_terminal`, comment the job id and log path, and unblock the
-  card; don't relay the ask. Before extending a bounded service hold, exercise the current updater's read-only
+  card; don't relay the ask. "Approved, unblock" on such a card means run it, then unblock: unblocking alone runs
+  nothing (no worker can), and the user-terminal plugin adds `next_step` to that `kanban_unblock` result until a
+  ran job or a job-id comment exists after the block. Before extending a bounded service hold, exercise the current updater's read-only
   readiness predicate against the proposed stopped state: a longer hold cannot fix a guard that rejects deliberately
   stopped services. Re-review changed timing and guard compatibility rather than treating duration as the only defect.
   Report the script deadline separately from the service timeout and cleanup allowance; none alone proves restoration.
