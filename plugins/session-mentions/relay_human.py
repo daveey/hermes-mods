@@ -41,8 +41,15 @@ def _delegated_child() -> bool:
 def latest_user_message(state_db: Path, session_id: str) -> Optional[tuple[int, float]]:
     if not state_db.is_file():
         return None
+    uri = f"file:{state_db.resolve().as_posix()}"
     try:
-        con = sqlite3.connect(f"file:{state_db.resolve().as_posix()}?mode=ro", uri=True, timeout=2.0)
+        try:
+            con = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=2.0)
+            con.execute("select 1 from sqlite_master limit 1")
+        except sqlite3.OperationalError:
+            # mode=ro fails on a WAL db whose -wal/-shm were deleted: rw + query_only never writes.
+            con = sqlite3.connect(f"{uri}?mode=rw", uri=True, timeout=2.0)
+            con.execute("PRAGMA query_only=ON")
     except sqlite3.Error:
         return None
     try:

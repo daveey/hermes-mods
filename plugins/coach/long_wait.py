@@ -70,8 +70,15 @@ def persisted_reply(session_id: str, home: str | None = None) -> bool | None:
     if not path.exists():
         return None
     import sqlite3
+    uri = path.resolve().as_uri()
     try:
-        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        try:
+            conn = sqlite3.connect(uri + "?mode=ro", uri=True, timeout=0.5)
+            conn.execute("select 1 from sqlite_master limit 1")
+        except sqlite3.OperationalError:
+            # mode=ro fails on a WAL db whose -wal/-shm were deleted: rw + query_only never writes.
+            conn = sqlite3.connect(uri + "?mode=rw", uri=True, timeout=0.5)
+            conn.execute("PRAGMA query_only=ON")
     except Exception:
         return None
     try:
