@@ -191,6 +191,8 @@ republish it as an imperative, action_request or For-you choice in the reporting
   `{"<poster>": {"owner": "cron", "allowed_types": ["<that type>"]}}`), or it is refused `poster_unregistered`.
   Keep status/defect words out of its title ("sent to", "failed", "stuck"): agent-owned titles are matched
   against them and refused `content_status`. Dry-run with `ask_contract.reason(...)` from `~/.hermes/plugins/inbox`.
+  Write "the user asked for this; exception to the no-status rule" in the posting code, the skill and the cron
+  prompt: unattended runs otherwise apply the general rule and strip the post out.
 - The noise breaker: the inbox refuses a poster whose last 3 cards the user archived untouched, and files a card to
   fix that poster.
 
