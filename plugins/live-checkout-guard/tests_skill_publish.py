@@ -78,7 +78,7 @@ fi
 
     def assert_no_worktrees(self):
         self.assertEqual(self.git(self.root, 'worktree', 'list', '--porcelain').count('worktree '), 1)
-        self.assertFalse((self.root / '.git/skill-publish.lock').exists())
+        self.assertFalse(self.git(self.root, 'worktree', 'list').count('skill-publish-') > 0)
 
     def test_publish_clean_and_later_ff_inherited_identity(self):
         result = self.publish()
@@ -293,6 +293,82 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
         result = {'success': True, 'path': str(external / 'references/alias.md')}
         with self.assertRaisesRegex(ValueError, 'symlink'):
             publisher.written_paths({'action': 'write_file'}, result, self.root)
+
+    def test_stale_lock_file_does_not_block(self):
+        (self.root / '.git/skill-publish.lock').write_text('stale from crashed process')
+        self.assertEqual(self.publish()['status'], 'published')
+        self.assertEqual(self.publish()['status'], 'unchanged')
+
+    def test_held_flock_is_bounded_and_preserves_source(self):
+        import fcntl
+        holder = os.open(self.root / '.git/skill-publish.lock', os.O_CREAT | os.O_RDWR)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with patch.object(publisher, 'LOCK_WAIT', 0.2):
+            with self.assertRaisesRegex(ValueError, 'lock busy'):
+                self.publish()
+        self.assertEqual(self.target.read_text(), 'published\n')
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        self.assertEqual(self.publish()['status'], 'published')
+
+    def test_rebase_uses_checked_sha_not_moving_ref(self):
+        racer = self.base / 'racer'
+        self.git(self.base, 'clone', '-q', '-b', 'main', str(self.origin), str(racer))
+        self.git(racer, 'config', 'user.name', 'Fixture Racer')
+        self.git(racer, 'config', 'user.email', 'racer@example.com')
+        calls = []
+        def ci(root, sha):
+            calls.append(sha)
+            if len(calls) == 2:  # main moves again after the retry tip was fetched
+                self.git(racer, 'pull', '-q', 'origin', 'main')
+                self.git(racer, 'commit', '--allow-empty', '-qm', 'unchecked-late')
+                self.git(racer, 'push', '-q', 'origin', 'HEAD:main')
+                self.git(self.root, 'fetch', '-q', 'origin', 'main')  # unrelated fetch moves origin/main
+            return 'green'
+        with patch.dict(os.environ, {'PUBLISH_RACE_REPO': str(racer),
+                                    'PUBLISH_RACE_SENTINEL': str(self.base / 'raced')}):
+            self.assertEqual(self.publish(ci=ci)['status'], 'published')
+        history = self.git(self.origin, 'rev-list', self.head + '..main').split()
+        unchecked = [c for c in history if c not in calls and
+                     self.git(self.origin, 'show', '-s', '--format=%s', c).startswith('skills: publish ') is False]
+        self.assertEqual(unchecked, [])
+
+    def test_inherited_git_routing_env_is_ignored(self):
+        decoy = self.base / 'decoy'
+        decoy.mkdir()
+        with patch.dict(os.environ, {'GIT_DIR': str(decoy), 'GIT_WORK_TREE': str(decoy),
+                                    'GIT_INDEX_FILE': str(decoy / 'index'),
+                                    'GIT_COMMON_DIR': str(decoy),
+                                    'GIT_OBJECT_DIRECTORY': str(decoy / 'objects'),
+                                    'GIT_NAMESPACE': 'decoy'}):
+            self.assertEqual(self.publish()['status'], 'published')
+        self.assertEqual((self.root / '.git/index').read_bytes(), self.index)
+        self.assertEqual(list(decoy.iterdir()), [])
+        self.assertEqual(self.git(self.origin, 'show', 'main:' + self.path), 'published')
+
+    def test_diff_ignores_external_diff_textconv_and_color(self):
+        self.git(self.root, 'config', 'diff.external', 'false')
+        self.git(self.root, 'config', 'color.ui', 'always')
+        self.git(self.root, 'config', 'color.diff', 'always')
+        self.git(self.root, 'config', 'diff.bad.textconv', 'false')
+        (self.root / '.git/info').mkdir(exist_ok=True)
+        (self.root / '.git/info/attributes').write_text('*.md diff=bad\n')
+        with patch.dict(os.environ, {'GIT_EXTERNAL_DIFF': 'false'}):
+            self.assertEqual(self.publish()['status'], 'published')
+        self.assertEqual(self.git(self.origin, 'show', 'main:' + self.path), 'published')
+        patch_file = next((self.base / 'hermes-home/kanban/evidence/mods-reconcile').glob('skill-publish-*/publish.patch'))
+        self.assertNotIn(b'\x1b[', patch_file.read_bytes())
+
+    def test_written_paths_resolves_symlinked_and_relative_root(self):
+        link = self.base / 'live-link'
+        link.symlink_to(self.root, target_is_directory=True)
+        result = {'success': True, 'path': str(self.target)}
+        self.assertEqual(publisher.written_paths({'action': 'write_file'}, result, link), [self.path])
+        cwd = os.getcwd()
+        os.chdir(self.base)
+        self.addCleanup(os.chdir, cwd)
+        self.assertEqual(publisher.written_paths({'action': 'write_file'}, result, 'live'), [self.path])
 
     def test_failed_or_staged_output_does_not_publish(self):
         for result in [{'success': False}, {'status': 'pending_approval'},

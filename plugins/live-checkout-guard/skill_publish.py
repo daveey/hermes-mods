@@ -1,6 +1,7 @@
 """Bounded, documentation-only publication; never commit or stage in the live tree."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -12,16 +13,32 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 MAX_PATHS = 16
 MAX_BYTES = 1024 * 1024
+LOCK_WAIT = 5.0
+GIT_ROUTING_ENV = {
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+    'GIT_QUARANTINE_PATH', 'GIT_IMPLICIT_WORK_TREE', 'GIT_CEILING_DIRECTORIES',
+    'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_GRAFT_FILE', 'GIT_SHALLOW_FILE',
+    'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_EXTERNAL_DIFF'}
+DIFF_FLAGS = ('--no-ext-diff', '--no-textconv', '--no-color')
 SAFE_SUFFIXES = {'.md', '.txt', '.rst', '.csv', '.json', '.yaml', '.yml',
                  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf'}
 
 
+def clean_env(env=None):
+    """Inherited environment minus Git repository-routing variables."""
+    return {k: v for k, v in (os.environ if env is None else env).items()
+            if k not in GIT_ROUTING_ENV}
+
+
 def bounded(command, *, timeout, data=None, env=None, cwd=None):
     """Timeout the whole subprocess group, including Git transports and hooks."""
-    env = dict(os.environ if env is None else env,
+    # An explicit env (from run) is already sanitized and may carry a snapshot index.
+    env = dict(clean_env() if env is None else env,
                GIT_TERMINAL_PROMPT='0', GH_PROMPT_DISABLED='1')
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, env=env, cwd=cwd,
@@ -38,10 +55,11 @@ def bounded(command, *, timeout, data=None, env=None, cwd=None):
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def run(root, *args, data=None, env=None):
-    if env is None:
-        env = dict(os.environ)
-    env = dict(env, GIT_OPTIONAL_LOCKS='0')
+def run(root, *args, data=None, env=None, index=None):
+    """Run Git; inherited routing is stripped, only an explicit snapshot index is honoured."""
+    env = dict(clean_env(env), GIT_OPTIONAL_LOCKS='0')
+    if index is not None:
+        env['GIT_INDEX_FILE'] = str(index)
     p = bounded(['git', '-C', str(root), *args], data=data, timeout=30, env=env)
     if p.returncode:
         raise ValueError(p.stderr.decode(errors='replace').strip() or 'git command failed')
@@ -124,12 +142,24 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
     targets = {n: selected_path(root, n) for n in paths}
     gitdir = Path(run(root, 'rev-parse', '--absolute-git-dir').decode().strip())
     lock = gitdir / 'skill-publish.lock'
-    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    # flock is released by the kernel on crash, so no stale lock; the file is never
+    # unlinked (that would let holders lock different inodes). Contention is bounded.
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    deadline = time.monotonic() + LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise ValueError('publication lock busy')
+            time.sleep(0.05)
     archive = None
     worktree = None
     try:
         head = run(root, 'rev-parse', 'HEAD').decode().strip()
-        if run(root, 'diff', '--cached', '--name-only', '--', *paths):
+        if run(root, 'diff', *DIFF_FLAGS, '--cached', '--name-only', '--', *paths):
             raise ValueError('selected paths have staged changes')
         captured = {n: snapshot(p) for n, p in targets.items()}
         run(root, 'fetch', 'origin', 'main')
@@ -143,32 +173,31 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
         evidence.mkdir(parents=True, exist_ok=True)
         archive = Path(tempfile.mkdtemp(prefix='skill-publish-', dir=evidence))
         index = archive / 'snapshot-index'
-        env = dict(os.environ, GIT_INDEX_FILE=str(index))
-        run(root, 'read-tree', head, env=env)
+        run(root, 'read-tree', head, index=index)
         untracked = []
         for name, snap in captured.items():
             entry = run(root, 'ls-tree', head, '--', name)
             if entry and not entry.startswith(b'100644 blob '):
                 raise ValueError('non-document tracked mode refused')
             if snap is None:
-                run(root, 'update-index', '--force-remove', '--', name, env=env)
+                run(root, 'update-index', '--force-remove', '--', name, index=index)
             else:
                 oid = run(root, 'hash-object', '-w', '--stdin', data=snap[0]).decode().strip()
-                run(root, 'update-index', '--add', '--cacheinfo', '100644', oid, name, env=env)
+                run(root, 'update-index', '--add', '--cacheinfo', '100644', oid, name, index=index)
                 if not entry:
                     untracked.append(name)
-        changed = set(run(root, 'diff', '--cached', '--name-only', '-z', '--no-renames',
-                          head, '--', *paths, env=env).decode().rstrip('\0').split('\0'))
+        changed = set(run(root, 'diff', *DIFF_FLAGS, '--cached', '--name-only', '-z', '--no-renames',
+                          head, '--', *paths, index=index).decode().rstrip('\0').split('\0'))
         paths = [name for name in paths if name in changed]
         if not paths:
             return {'status': 'unchanged'}
         untracked = [name for name in untracked if name in changed]
-        patch = run(root, 'diff', '--cached', '--binary', '--full-index', '--no-renames',
-                    head, '--', *paths, env=env)
+        patch = run(root, 'diff', *DIFF_FLAGS, '--cached', '--binary', '--full-index', '--no-renames',
+                    head, '--', *paths, index=index)
         # reconcile's archive patch excludes untracked additions, stored in its tar instead.
         tracked = [n for n in paths if n not in untracked]
         (archive / 'changes.patch').write_bytes(run(
-            root, 'diff', '--cached', '--binary', '--full-index', head, '--', *tracked, env=env)
+            root, 'diff', *DIFF_FLAGS, '--cached', '--binary', '--full-index', head, '--', *tracked, index=index)
             if tracked else b'')
         with tarfile.open(archive / 'untracked.tar.gz', 'w:gz') as tar:
             for name in untracked:
@@ -189,7 +218,7 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
         # No identity overrides, and no hook bypass even if the caller has opted out globally.
         if not (worktree / '.githooks/pre-commit').is_file():
             raise ValueError('required .githooks/pre-commit missing')
-        commit_env = {k: v for k, v in os.environ.items() if k not in {
+        commit_env = {k: v for k, v in clean_env().items() if k not in {
             'HERMES_MODS_ALLOW_UNSCANNED', 'HERMES_MODS_ALLOW_MULTI_MOD'}}
         # apply --3way stages the full batch. Commit one skill at a time so the real
         # repository scope hook remains enabled for cross-skill tool batches.
@@ -203,7 +232,7 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
         clean = lambda s: re.sub(r'[^a-zA-Z0-9_.:/,-]', '_', str(s))[:160]
         for label, names in groups.items():
             run(worktree, 'add', '--', *names)
-            if not run(worktree, 'diff', '--cached', '--name-only'):
+            if not run(worktree, 'diff', *DIFF_FLAGS, '--cached', '--name-only'):
                 continue
             message = 'skills: publish %s [session:%s card:%s]' % (
                 clean(label), clean(session_id or 'unknown'), clean(task_id or 'none'))
@@ -221,7 +250,7 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
                     raise ValueError('push refused without a main race')
                 if ci(root, tip) != 'green':
                     raise ValueError('latest main CI not green during retry')
-                run(worktree, '-c', 'core.hooksPath=.githooks', 'rebase', 'origin/main')
+                run(worktree, '-c', 'core.hooksPath=.githooks', 'rebase', tip)
                 base = tip
         published = run(worktree, 'rev-parse', 'HEAD').decode().strip()
         run(root, 'fetch', 'origin', 'main')
@@ -232,7 +261,7 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
         for name in paths:
             if snapshot(selected_path(root, name)) != captured[name]:
                 raise ValueError('new writer detected; publication archived')
-        if run(root, 'diff', '--cached', '--name-only', '--', *paths):
+        if run(root, 'diff', *DIFF_FLAGS, '--cached', '--name-only', '--', *paths):
             raise ValueError('selected paths were staged during publication')
         cmd = [sys.executable, str(Path(__file__).with_name('reconcile.py')),
                '--root', str(root), '--archive', str(archive), '--published', published]
@@ -251,11 +280,11 @@ def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci):
                 run(root, 'worktree', 'remove', '--force', str(worktree))
         finally:
             os.close(fd)
-            lock.unlink()
 
 
 def written_paths(args, result, root):
     """Core flat patch returns no path; batch rows carry name/action/file_path only."""
+    root = Path(root).expanduser().resolve()
     if isinstance(result, str):
         result = json.loads(result)
     if (not isinstance(result, dict) or result.get('success') is not True
