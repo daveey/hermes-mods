@@ -32,6 +32,12 @@ Telling the user when a PR merges: green CI is one step of several; list them al
 
 Status of a finite LIST of runs: read `references/bulk-run-status.md` (bounded App-token inspector, never a `gh api` loop).
 
+Searching LOGS across runs (which run a trigger fired, which run printed a line): `gh run view ID --log` costs 4 core
+requests per run (run, workflow, jobs, log redirect), and the user token's fleet-wide burst brake is 250 per 300 s.
+Narrow first with one `gh run list --json databaseId,event,headSha,createdAt,status` call (match createdAt to the
+trigger time, the head sha, the event), then fetch logs for at most 3 runs. A log loop over ~30 runs (120 requests
+in 4 min) tripped the brake for every worker's pushes and land waits.
+
 ## Fixing the CI you wait on: use a worktree
 
 A CI fix (or any branch work) goes in its own worktree: `git worktree add <dir> -b <fix-branch> origin/main`, then
