@@ -233,6 +233,52 @@ class BabyBearSplit(unittest.TestCase):
             self.assertIn("camera stream", row["quote"])
 
 
+class ContentFreeHandoff(unittest.TestCase):
+    """bb-tuner may not carry quotes in its context: the handoff has a twin file with fixed keys only."""
+    QUOTE = "the camera stream is broken, fix it"
+
+    def bb_hits(self, d):
+        import json
+        os.makedirs(f"{d}/macbook/default")
+        json.dump({"id": "s1", "host": "macbook", "source": "desktop", "title": "x", "user_turns": [
+            {"t": 2000, "text": self.QUOTE}, {"t": 2100, "text": "root cause the sidebar bug"}]},
+            open(f"{d}/macbook/default/s1.json", "w"))
+        hits, _ = g.collect(d, 0, 10**10)
+        return [h for h in hits if h["class"] == g.BB_CLASS]
+
+    def test_twin_file_has_fixed_keys_and_the_legacy_ids(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bb = self.bb_hits(d)
+            out = Path(d) / "bbt" / "askgate-bb-misses.jsonl"
+            out.parent.mkdir()
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (1, 0))
+            twin = out.parent / "askgate-bb-requests.jsonl"
+            rows = [json.loads(x) for x in twin.read_text().splitlines()]
+            legacy = [json.loads(x) for x in out.read_text().splitlines()]
+            self.assertEqual([r["id"] for r in rows], [r["id"] for r in legacy])
+            self.assertEqual(set(rows[0]), set(g.BB_REQUEST_KEYS))
+            self.assertNotIn("quote", rows[0])
+            self.assertNotIn("camera", twin.read_text())
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (0, 1))  # idempotent
+            self.assertEqual(len(twin.read_text().splitlines()), 1)
+
+    def test_projection_backfills_old_legacy_rows_without_content(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "askgate-bb-misses.jsonl"
+            out.write_text(json.dumps({"id": "askgate-bb:s0:1", "t": 1, "when": "x", "week": "2026-10-12",
+                                       "host": "macbook", "session": "s0", "pattern": "is-broken",
+                                       "quote": self.QUOTE, "extra": "title text"}) + "\nnot json\n"
+                           + json.dumps({"t": 5, "quote": "no id"}) + "\n")
+            self.assertEqual(g.project_bb_handoff(out), 1)
+            self.assertEqual(g.project_bb_handoff(out), 0)
+            twin = Path(d) / "askgate-bb-requests.jsonl"
+            self.assertEqual(json.loads(twin.read_text()), {"id": "askgate-bb:s0:1", "t": 1, "week": "2026-10-12",
+                                                          "host": "macbook", "session": "s0", "pattern": "is-broken"})
+            self.assertIsNone(g.project_bb_handoff(Path(d) / "nope" / "x.jsonl"))
+
+
 class RouteToLane(unittest.TestCase):
     """The weekly review's Do-it work goes to the self-heal lane: each hit is filed as a monitor finding unless the
     lane already has that session; the card keeps its review prompt only for hits the lane did not take."""

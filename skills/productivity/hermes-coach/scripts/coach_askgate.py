@@ -967,13 +967,17 @@ def route_hits(hits, home, filer=None, signals=None, detected=None, data=None):
 BB_HANDOFF = "~/.hermes/profiles/bb-tuner/work/askgate-bb-misses.jsonl"
 
 
-def hand_to_bb_tuner(hits, path):
-    """Append each Baby Bear fix request bb-tuner has not been handed yet to its handoff file (bb-tuner's daily pre-run
-    prints the rows it has not closed; SOUL.md 'Ask-gate misses'). -> (rows written, rows already there). The file's
-    parent must exist (= bb-tuner runs on this host); otherwise nothing is written and (None, 0) comes back."""
-    p = Path(path).expanduser()
-    if not p.parent.is_dir():
-        return None, 0
+# Content-free twin of the handoff, written next to it. bb-tuner's retention rule bars quotes and titles from its
+# context, so its daily pre-run lists only these rows (fixed keys, never `quote`); the legacy file stays for the report.
+BB_REQUESTS_NAME = "askgate-bb-requests.jsonl"
+BB_REQUEST_KEYS = ("id", "t", "week", "host", "session", "pattern")
+
+
+def requests_path_for(path):
+    return Path(path).expanduser().with_name(BB_REQUESTS_NAME)
+
+
+def _jsonl_ids(p):
     have = set()
     if p.exists():
         for line in p.read_text().splitlines():
@@ -981,6 +985,52 @@ def hand_to_bb_tuner(hits, path):
                 have.add(json.loads(line)["id"])
             except Exception:
                 pass
+    return have
+
+
+def content_free_row(row):
+    """The allowlisted projection of a handoff row (None without a usable id and time): never the quote."""
+    if not isinstance(row, dict) or not isinstance(row.get("id"), str) or isinstance(row.get("t"), bool) \
+            or not isinstance(row.get("t"), (int, float)):
+        return None
+    out = {k: row.get(k) for k in BB_REQUEST_KEYS}
+    out["t"] = int(row["t"])
+    return out
+
+
+def project_bb_handoff(path, requests_path=None):
+    """Append the content-free projection of every legacy handoff row the twin file does not have yet. Reads the legacy
+    file in code only (nothing is printed). -> rows written, or None when the handoff dir is not on this host."""
+    p = Path(path).expanduser()
+    q = Path(requests_path).expanduser() if requests_path else requests_path_for(p)
+    if not p.parent.is_dir():
+        return None
+    have = _jsonl_ids(q)
+    new = []
+    for line in (p.read_text().splitlines() if p.exists() else []):
+        try:
+            r = content_free_row(json.loads(line))
+        except Exception:
+            continue
+        if r and r["id"] not in have:
+            have.add(r["id"])
+            new.append(r)
+    if new:
+        with open(q, "a") as fh:
+            for r in new:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return len(new)
+
+
+def hand_to_bb_tuner(hits, path, requests_path=None):
+    """Append each Baby Bear fix request bb-tuner has not been handed yet to its handoff file, and the content-free
+    projection of every legacy row to the twin file next to it (bb-tuner's daily pre-run lists the twin's rows it has
+    not closed; SOUL.md 'Ask-gate misses'). -> (rows written, rows already there). The file's parent must exist
+    (= bb-tuner runs on this host); otherwise nothing is written and (None, 0) comes back."""
+    p = Path(path).expanduser()
+    if not p.parent.is_dir():
+        return None, 0
+    have = _jsonl_ids(p)
     new = []
     for h in hits:
         rid = f"askgate-bb:{h['session']}:{int(h['t'])}"
@@ -993,6 +1043,7 @@ def hand_to_bb_tuner(hits, path):
         with open(p, "a") as fh:
             for r in new:
                 fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    project_bb_handoff(p, requests_path)
     return len(new), len(hits) - len(new)
 
 
@@ -1035,7 +1086,13 @@ def main():
     ap.add_argument("--pull", action="store_true", help="git pull the data repo first")
     ap.add_argument("--bb-handoff", default=BB_HANDOFF,
                     help="bb-tuner's handoff file for Baby Bear fix requests (written with --post when its dir exists)")
+    ap.add_argument("--project-bb-handoff", action="store_true",
+                    help="only append the content-free twin rows for the handoff file (backfill), then exit")
     a = ap.parse_args()
+    if a.project_bb_handoff:
+        n = project_bb_handoff(a.bb_handoff)
+        print(f"{n} content-free row(s) written" if n is not None else "bb-tuner handoff dir not on this host")
+        return
     data = Path(a.data).expanduser()
     if a.pull:
         subprocess.run(["git", "-C", str(data), "pull", "-q"], check=False)
