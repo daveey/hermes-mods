@@ -29,6 +29,24 @@ over ssh: the hub-side `probe_token_watch.py` in the coach plugin covers those a
 Opt-out when the user asked for a turn in that very chat: prefix `HERMES_PROBE_REAL_CHAT_OK=1` (or set it in the
 process env). `HERMES_USER_CHAT_PROBE_GUARD=off` disables the hook.
 
+## Restart-proof backends on a production home
+
+A restart proof started `HERMES_DESKTOP=1 hermes serve --isolated` on the hub with the real `~/.hermes` home
+(self-heal gateway-9aaf151a15). `--isolated` isolates the server endpoint, not the stored chats: the backend's
+startup-resume sweep adopted David's real interrupted chat, and the proof's planned `kill -TERM` of that PID
+interrupted his turn.
+
+The same hook refuses an agent launch of `hermes serve`/`hermes dashboard` (also `python -m hermes_cli.main`,
+`.../hermes_cli/main.py`) in the restart-proof shape (`--isolated` or `HERMES_DESKTOP=1`) whose `HERMES_HOME` is a
+production home: not set inline (it inherits the live home), `~/.hermes`, `$HOME/.hermes`, `$HERMES_HOME`,
+`.../.hermes/profiles/<name>`, or the caller's own home. It looks through `bash -c`, `ssh <host> '...'` and
+`hub-admin '...'` (a remote launch counts only an inline `HERMES_HOME`), execute_code (shell strings and
+`subprocess` argv lists with their `env`), and a local `python3 <script>.py` (the script is read). Allowed: a
+disposable home (`HERMES_HOME=$(mktemp -d)`, a `tempfile.mkdtemp()` home, any other non-production path), a plain
+`hermes serve`/`dashboard`. Refusal names the recipe; never copy credentials into the proof home (use
+`token-broker`). Opt-out for a real (non-test) backend on the production home: `HERMES_SHARED_HOME_SERVE_OK=1`.
+This is detection at the tool boundary; core's launch-time check is the enforcement boundary.
+
 ## Claude Code
 
 `claude_hook.py` is a Bash `PreToolUse` adapter over the same classifier (exit 2 blocks):
@@ -50,3 +68,12 @@ terminal, execute_code (string and argv-list forms) and nested `tool_call`; prob
 agent-opened test sessions, empty sessions, the caller's own session, interactive resume, unknown ids, quoted or
 echoed commands and the `sessions branch`/`delete` route are allowed; opt-out and off switch; a missing store never
 breaks a call. The Claude adapter is run as a subprocess with hook JSON (block and allow); its `--install` path is the same code as backend-restart-guard's and is not separately tested here.
+
+`tests/test_shared_home_serve.py` (gateway-9aaf151a15): the incident's `hub-admin '... HERMES_DESKTOP=1 hermes serve
+--isolated ...'` and its variants (local, `ssh`, `bash -lc`, `python -m hermes_cli.main`, explicit production homes,
+the caller's own home, `--profile`, `dashboard --isolated`) are refused from terminal and execute_code (argv list with
+an inherited or `Path.home()/".hermes"` home, nested `terminal("hub-admin ...")`) and from a local liveproof-style
+script; a local disposable `HERMES_HOME` does not excuse a remote launch. Disposable homes (`$(mktemp -d)`, a shell
+var set from it, `export`, a scratch path, `tempfile.mkdtemp()`), plain `hermes serve`/`dashboard`, greps/echo/commit
+messages, a missing script, the opt-out and the off switch are allowed. The Claude adapter path for this check is the
+same `_pre_tool_call` and is not separately tested.
