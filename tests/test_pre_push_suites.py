@@ -24,6 +24,12 @@ class PushGate(unittest.TestCase):
                         GIT_COMMITTER_NAME='fixture', GIT_COMMITTER_EMAIL='fixture@example.com')
         self.env.pop('HERMES_MODS_SKIP_PUSH_SUITES', None)
         self.env['HERMES_MODS_PYTHON'] = sys.executable
+        # The hook execs `python3`; receipts bind the gate interpreter, so the
+        # fixture's python3 must be the one running --prepare (CI's PATH differs).
+        shim = self.root / 'bin'
+        shim.mkdir()
+        (shim / 'python3').symlink_to(sys.executable)
+        self.env['PATH'] = f'{shim}{os.pathsep}{self.env.get("PATH", "")}'
         self.git('init', '--bare', str(self.remote), cwd=self.root)
         self.git('init', '-b', 'main', str(self.repo), cwd=self.root)
         for file in ('.githooks/pre-push', 'scripts/pre-push-suites',
