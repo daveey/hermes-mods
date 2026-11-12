@@ -53,6 +53,8 @@ ASK = """# Asking
 
 - tick
 """
+WORKER = ("# Launch\n\n## Pitfalls\n\n- **Run commands on existing workers from the hub with SSM, never SSH.** "
+          "Use us-west-2 and the instance role.\n- **Other bullet** unrelated.\n")
 MODS = "# mods\n\n## Git worktrees\n\n- add owns remove.\n\n## Other\n\nnoise\n"
 REPO = P.parents[1]
 
@@ -61,7 +63,7 @@ REPO = P.parents[1]
 def env(tmp_path, monkeypatch):
     home = tmp_path / "h"
     for n, body in (("token-broker", SKILL), ("kanban-orchestrator", ORCH), ("asking-the-user", ASK),
-                    ("hermes-mods-repo", MODS)):
+                    ("hermes-mods-repo", MODS), ("launch-hub-worker", WORKER)):
         d = home / "skills" / "devops" / n
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text(body)
@@ -212,3 +214,44 @@ def test_kanban_cli_create_row():
 
 def test_kanban_cli_other_verbs_no_match():
     assert run("terminal", {"command": "hermes kanban list"}) is None
+
+
+# Defect agent-cde19bf930: a hub session's ssh to the workers failed (publickey) and it gave up instead of using SSM.
+@pytest.mark.parametrize("cmd,result", [
+    ("ssh -o BatchMode=yes -o ConnectTimeout=10 hermes-worker-2 'systemctl --user is-active hermes-gateway'",
+     "ubuntu@hermes-worker-2: Permission denied (publickey).\n"),
+    ("for n in 1 2 3; do ssh hermes-worker-$n true; done; ssh ubuntu@hermes-worker-4 hostname",
+     "Host key verification failed.\n"),
+    ("ssh hermes-worker-5.example.ts.net uptime", "ssh: connect to host x port 22: Connection timed out\n"),
+])
+def test_worker_ssh_fail_row(cmd, result):
+    out = run("terminal", {"command": cmd}, result)
+    assert out and st.MARK in out and "launch-hub-worker" in out
+    assert "from the hub with SSM" in out and "Other bullet" not in out
+
+
+@pytest.mark.parametrize("cmd,result", [
+    ("ssh -o BatchMode=yes hermes-worker-2 true", "active\n"),                        # ssh worked
+    ("ssh hermes-hub true", "Permission denied (publickey).\n"),                      # not a worker
+    ("echo hermes-worker-2 | ssh-keygen -F x", "Permission denied (publickey).\n"),   # ssh not aimed at a worker
+])
+def test_worker_ssh_fail_row_negatives(cmd, result):
+    assert run("terminal", {"command": cmd}, result) is None
+
+
+def test_worker_ssh_fail_in_execute_code():
+    out = run("execute_code", {"code": "terminal('ssh hermes-worker-3 true')"}, "Permission denied (publickey).")
+    assert out and "from the hub with SSM" in out
+
+
+def test_bold_lead_in_list_item_extracts_one_item():
+    text = ("## Pitfalls\n\n- **First rule.** wrapped\n  continuation line.\n  - nested detail\n"
+            "- **Second rule.** other\n1. **Numbered lead.** n\n2. next\n")
+    assert st.extract_section(text, "First rule") == "- **First rule.** wrapped\n  continuation line.\n  - nested detail"
+    assert st.extract_section(text, "Numbered lead") == "1. **Numbered lead.** n"
+
+
+def test_worker_ssh_fail_row_shipped():
+    rows = {r["id"]: r for r in st.load_rows(user_path=P / "nonexistent.yaml")}
+    r = rows["worker-ssh-fail"]
+    assert r["skill"] == "launch-hub-worker" and r["sections"] == ["Run commands on existing workers from the hub with SSM"]
