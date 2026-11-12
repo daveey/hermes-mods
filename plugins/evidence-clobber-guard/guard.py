@@ -6,12 +6,21 @@ file silently destroys it. Refused: truncating redirects (``>``, ``>|``, ``N>``,
 and ``tee`` without ``-a``/``--append`` whose target already exists as a file inside an evidence
 directory. Allowed: appends (``>>``, ``&>>``, ``tee -a``), new paths, files outside evidence dirs.
 
+Shared scratch (self-heal agent-c97f5ffde4): a subagent inherits its parent's cwd, and a folder under
+``$HERMES_HOME/cache/scratch/<dir>/`` can be shared by hundreds of sessions. There the same truncating
+writes, and ``rm`` (incl. ``-r`` and globs), are refused for files older than the calling task's first
+tool call (``task_started``, persisted per task_id): they were someone else's before this task began.
+The task's own new files, appends, reads and paths outside scratch pass.
+
 This is a bounded lexer, not a shell evaluator: it follows ``cd DIR`` within one command line,
-expands ``~``, ``$HOME`` and ``$HERMES_HOME``, and recurses into ``bash -c``/``sh -c`` payloads.
+expands ``~``, ``$HOME``, ``$HERMES_HOME`` and ``$TMPDIR``, strips here-doc bodies, and recurses into
+``bash -c``/``sh -c`` payloads.
 """
 
 from __future__ import annotations
 
+import glob
+import hashlib
 import json
 import os
 import re
@@ -24,7 +33,9 @@ TRUNCATE = {">", ">|", "&>", ">&"}
 SEPARATORS = {"|", "||", "&&", ";", "&", "(", ")", ";;", "|&", "\n"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 WRAPPERS = {"sudo", "env", "nice", "nohup", "time", "timeout", "command", "exec", "stdbuf"}
-VAR = re.compile(r"\$(?:\{(HOME|HERMES_HOME)\}|(HOME|HERMES_HOME)\b)")
+VAR = re.compile(r"\$(?:\{(HOME|HERMES_HOME|TMPDIR)\}|(HOME|HERMES_HOME|TMPDIR)\b)")
+HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\1")
+RM_WALK_LIMIT = 5000
 
 
 def enabled() -> bool:
@@ -35,9 +46,16 @@ def _hermes_home() -> str:
     return os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
 
 
+def _var(name: str) -> str:
+    if name == "HERMES_HOME":
+        return _hermes_home()
+    if name == "TMPDIR":
+        return os.environ.get("TMPDIR") or "$TMPDIR"
+    return str(Path.home())
+
+
 def _expand(word: str) -> str:
-    word = VAR.sub(lambda m: _hermes_home() if (m.group(1) or m.group(2)) == "HERMES_HOME"
-                   else str(Path.home()), word)
+    word = VAR.sub(lambda m: _var(m.group(1) or m.group(2)), word)
     if word == "~" or word.startswith("~/"):
         word = str(Path.home()) + word[1:]
     return word
@@ -79,7 +97,26 @@ def _drop_fd_prefixes(text: str) -> str:
     return "".join(out)
 
 
+def _strip_heredocs(text: str) -> str:
+    """Drop here-doc bodies (`cat > f <<'EOF' ... EOF`) and their `<<EOF` operators: the body is data,
+    and an apostrophe in it would otherwise make the whole command unlexable (and so unchecked)."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(HEREDOC.sub(" ", line))
+        i += 1
+        for m in HEREDOC.finditer(line):
+            delim, dash = m.group(2), m.group(0).startswith("<<-")
+            while i < len(lines):
+                body = lines[i].lstrip("\t") if dash else lines[i]
+                i += 1
+                if body == delim:
+                    break
+    return "\n".join(out)
+
+
 def _tokens(text: str) -> List[str]:
+    text = _strip_heredocs(text)
     lex = shlex.shlex(_drop_fd_prefixes(text.replace("\n", " ; ")), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
@@ -157,9 +194,84 @@ def _evidence_file(path: str, cwd: str) -> Optional[str]:
         return None
 
 
-def check_shell(text: str, cwd: str, depth: int = 0) -> Optional[str]:
-    """Return the existing evidence path the command would truncate, else None."""
-    if depth > 3 or not text or ">" not in text and "tee" not in text:
+def _scratch_root() -> str:
+    return os.path.join(_hermes_home(), "cache", "scratch")
+
+
+def _in_shared_scratch(p: Path) -> bool:
+    """True when `p` lies inside a folder under `$HERMES_HOME/cache/scratch/` (not directly in the root)."""
+    root = _scratch_root()
+    for base in {os.path.normpath(root), os.path.realpath(root)}:
+        for cand in {str(p), os.path.join(os.path.realpath(str(p.parent)), p.name)}:
+            rel = os.path.relpath(cand, base)
+            if rel != ".." and not rel.startswith("../") and len(Path(rel).parts) >= 2:
+                return True
+    return False
+
+
+def _abs(path: str, cwd: str) -> Path:
+    p = Path(_expand(path))
+    if not p.is_absolute():
+        p = Path(cwd) / p
+    return Path(os.path.normpath(str(p)))
+
+
+def _older(p: Path, started: float) -> bool:
+    """An existing non-directory whose inode changed last before `started`. ctime, not mtime: `tar x`,
+    `cp -p` and `rsync -a` give a task's own new files old mtimes, but ctime can't be set back."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    return not os.path.isdir(p) and st.st_ctime < started
+
+
+def _scratch_file(path: str, cwd: str, started: Optional[float]) -> Optional[str]:
+    """The existing shared-scratch file `path` names, when it predates this task's start."""
+    if started is None:
+        return None
+    p = _abs(path, cwd)
+    return str(p) if _in_shared_scratch(p) and _older(p, started) else None
+
+
+def _rm_hit(argv: List[str], cwd: str, started: Optional[float]) -> Optional[str]:
+    """The first shared-scratch file `rm ARGS` would delete that predates this task's start."""
+    if started is None:
+        return None
+    recursive, opts, operands = False, True, []
+    for word in argv[1:]:
+        if opts and word == "--":
+            opts = False
+        elif opts and word.startswith("--"):
+            recursive = recursive or word == "--recursive"
+        elif opts and word.startswith("-") and len(word) > 1:
+            recursive = recursive or "r" in word[1:] or "R" in word[1:]
+        else:
+            operands.append(word)
+    seen = 0
+    for word in operands:
+        p = str(_abs(word, cwd))
+        for item in map(Path, sorted(glob.glob(p)) if glob.has_magic(p) else [p]):
+            if not _in_shared_scratch(item):
+                continue
+            if _older(item, started):
+                return str(item)
+            if recursive and item.is_dir() and not item.is_symlink():
+                for dirpath, _dirs, files in os.walk(item):
+                    for f in files:
+                        seen += 1
+                        if seen > RM_WALK_LIMIT:  # bounded: a huge tree is not worth a stalled tool call
+                            return None
+                        if _older(Path(dirpath) / f, started):
+                            return str(Path(dirpath) / f)
+    return None
+
+
+def check_shell(text: str, cwd: str, depth: int = 0, started: Optional[float] = None) -> Optional[str]:
+    """Return the existing evidence path, or older shared-scratch file, the command would clobber; else None.
+
+    `started` is the calling task's first tool call (``task_started``); without it only evidence is checked."""
+    if depth > 3 or not text or ">" not in text and "tee" not in text and "rm" not in text:
         return None
     for argv, redirs in _segments(_tokens(text)):
         cmd = _strip_wrappers(argv)
@@ -168,7 +280,11 @@ def check_shell(text: str, cwd: str, depth: int = 0) -> Optional[str]:
         if name == "tee":
             targets += _tee_targets(cmd)
         for target in targets:
-            hit = _evidence_file(target, cwd)
+            hit = _evidence_file(target, cwd) or _scratch_file(target, cwd, started)
+            if hit:
+                return hit
+        if name == "rm":
+            hit = _rm_hit(cmd, cwd, started)
             if hit:
                 return hit
         if name == "cd" and len(cmd) > 1:
@@ -177,14 +293,65 @@ def check_shell(text: str, cwd: str, depth: int = 0) -> Optional[str]:
         if name in SHELLS:
             for k, word in enumerate(cmd[1:-1], start=1):
                 if word.startswith("-") and "c" in word[1:]:
-                    hit = check_shell(cmd[k + 1], cwd, depth + 1)
+                    hit = check_shell(cmd[k + 1], cwd, depth + 1, started)
                     if hit:
                         return hit
                     break
     return None
 
 
+def task_started(key: str) -> Optional[float]:
+    """When this guard first saw a tool call from `key` (task_id, else session_id). Persisted under
+    ``$HERMES_HOME/cache/evidence-clobber-guard/task-starts/`` so a gateway restart or guard reload keeps it:
+    the first call creates the stamp (O_EXCL, so concurrent calls agree), later calls read it."""
+    if not key:
+        return None
+    d = Path(_hermes_home()) / "cache" / "evidence-clobber-guard" / "task-starts"
+    f = d / hashlib.sha256(key.encode()).hexdigest()[:32]
+
+    def read() -> Optional[float]:
+        try:
+            return float(f.read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    got = read()
+    if got is not None:
+        return got
+    now = time.time()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(f"{now} {key[:200]}\n")
+        _prune_starts(d, now)
+    except FileExistsError:
+        return read() or now
+    except OSError:
+        pass
+    return now
+
+
+def _prune_starts(d: Path, now: float, keep_days: int = 30) -> None:
+    """At most once a day, drop start stamps untouched for `keep_days` (a task that old is long gone)."""
+    marker = d / ".pruned"
+    try:
+        if marker.exists() and now - marker.stat().st_mtime < 86400:
+            return
+        marker.touch()
+        for entry in os.scandir(d):
+            if entry.name != ".pruned" and now - entry.stat().st_mtime > keep_days * 86400:
+                os.unlink(entry.path)
+    except OSError:
+        pass
+
+
 def message(target: str) -> str:
+    if _in_shared_scratch(Path(target)) and "/kanban/evidence/" not in target:
+        return (f"evidence-clobber-guard: {target} is in a shared scratch folder and existed before this task "
+                "started (a parent's or sibling session's file). Overwriting or deleting it can destroy their "
+                "work. Put your own files in a private folder: `d=$(mktemp -d -p $TMPDIR)` and work in \"$d\" "
+                "(or use a name that does not exist yet). Operator override: HERMES_EVIDENCE_CLOBBER_GUARD=off.")
     return (f"evidence-clobber-guard: evidence file exists: {target}. "
             "A truncating write would destroy the previous run's record. "
             "Write a new file `<name>-run<N>.log` (e.g. `<name>-run<N>-<src sha8>.log`) "

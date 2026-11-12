@@ -1,9 +1,12 @@
-"""evidence-clobber-guard: refuse shell writes that overwrite an existing evidence file.
+"""evidence-clobber-guard: refuse shell writes that overwrite an existing evidence file, and shell
+writes/deletes of another session's file in a shared scratch folder.
 
 A ``pre_tool_call`` hook on terminal (and nested ``tool_call``) blocks ``cmd > FILE``,
 ``cmd &> FILE``, ``cmd | tee FILE`` (no ``-a``) when FILE already exists under a
 ``*/kanban/evidence/*`` directory, so a second test/mutation run can never wipe the first
-run's log. Decisions live in ``guard.py`` (hot-reloaded per call like the other guards).
+run's log. Under ``$HERMES_HOME/cache/scratch/<dir>/`` (often a parent's cwd that subagents
+inherit) it also blocks those writes and ``rm`` of files older than the task's first tool call.
+Decisions live in ``guard.py`` (hot-reloaded per call like the other guards).
 """
 
 from __future__ import annotations
@@ -90,29 +93,42 @@ def _with_decisions(fn):
 SHELL_TOOLS = {"terminal"}
 
 
-def _cwd(args: dict) -> str:
-    return str(args.get("workdir") or os.environ.get("TERMINAL_CWD") or os.getcwd())
+def _cwd(args: dict, task_id: str = "") -> str:
+    if args.get("workdir"):
+        return str(args["workdir"])
+    if task_id:  # a subagent's cwd record is seeded from its parent's (the shared-scratch case)
+        try:
+            from tools.terminal_tool import get_session_cwd
+            cwd = get_session_cwd(task_id)
+            if cwd:
+                return str(cwd)
+        except Exception:
+            pass
+    return str(os.environ.get("TERMINAL_CWD") or os.getcwd())
 
 
-def classify(tool_name: str, args: Any) -> Optional[str]:
+def classify(tool_name: str, args: Any, task_id: str = "", started: Optional[float] = None) -> Optional[str]:
     args = args if isinstance(args, dict) else {}
     if tool_name in SHELL_TOOLS:
-        return guard.check_shell(str(args.get("command") or ""), _cwd(args))
+        return guard.check_shell(str(args.get("command") or ""), _cwd(args, task_id), started=started)
     if tool_name in {"tool_call", "mcp__tool_call"}:
         for call in args.get("calls") or []:
             if isinstance(call, dict):
-                hit = classify(str(call.get("name") or ""), call.get("arguments"))
+                hit = classify(str(call.get("name") or ""), call.get("arguments"), task_id, started)
                 if hit:
                     return hit
     return None
 
 
 @_with_decisions
-def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[dict]:
+def _pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", session_id: str = "",
+                   **_: Any) -> Optional[dict]:
     try:
         if not guard.enabled():
             return None
-        target = classify(tool_name, args)
+        # Every tool call (not just shell) stamps the task's start: files older than it are someone else's.
+        started = guard.task_started(str(task_id or session_id or ""))
+        target = classify(tool_name, args, str(task_id or ""), started)
     except Exception:  # never let this plugin break a tool call
         logger.debug("evidence-clobber-guard classify failed", exc_info=True)
         return None
