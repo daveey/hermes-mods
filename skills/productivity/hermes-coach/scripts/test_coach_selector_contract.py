@@ -17,6 +17,8 @@ ce = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ce)
 import coach_llm_worker as worker
 
+build_or = worker.build_openrouter_backend
+
 
 class SelectorContract(unittest.TestCase):
     def test_startup_without_model_does_not_resolve_config_model_with_provider_pin(self):
@@ -66,6 +68,37 @@ class SelectorContract(unittest.TestCase):
                 runtime.resolve_runtime_provider.assert_called_with(requested=provider, target_model=model)
             with self.assertRaisesRegex(ValueError, 'Class selectors require provider auto'):
                 worker.build_backend('anthropic', 'class:fast')
+
+    def test_openrouter_backend_is_explicit_env_keyed_and_priced_from_the_model_list(self):
+        from types import ModuleType
+        import sys
+        listing = {'data': [{'id': 'recursive/flint-v1.0:free', 'pricing': {'prompt': '0', 'completion': '0'}},
+                            {'id': 'vendor/paid', 'pricing': {'prompt': '0.000003', 'completion': '0.000015',
+                                                              'input_cache_read': '0.0000003'}}]}
+        sdk = ModuleType('anthropic')
+        sdk.Anthropic = Mock()
+        runtime = ModuleType('hermes_cli.runtime_provider')
+        runtime.resolve_runtime_provider = Mock(side_effect=AssertionError('openrouter must not use the resolver'))
+        mods = {'anthropic': sdk, 'hermes_cli.runtime_provider': runtime}
+        with patch.dict(sys.modules, mods), patch.dict(os.environ, {'OPENROUTER_API_KEY': 'k-offline'}, clear=True), \
+                patch.object(worker, 'build_openrouter_backend',
+                             side_effect=lambda m: build_or(m, fetch=lambda: listing)) as routed:
+            be, info = worker.build_backend('openrouter', 'recursive/flint-v1.0:free')
+        routed.assert_called_once_with('recursive/flint-v1.0:free')
+        sdk.Anthropic.assert_called_once_with(auth_token='k-offline', base_url='https://openrouter.ai/api',
+                                              timeout=300, max_retries=0)
+        self.assertEqual((be.resolved_model, be.provider, be.prefix, info),
+                         ('recursive/flint-v1.0:free', 'openrouter', '', {'provider': 'openrouter', 'oauth': False}))
+        free = be.price('recursive/flint-v1.0:free')
+        self.assertEqual((free['input'], free['output'], free['request']), (0.0, 0.0, 0.0))  # $0 is a real price
+        paid = be.price('vendor/paid')
+        self.assertEqual([round(paid[k], 6) for k in ('input', 'output', 'cache_read')], [3.0, 15.0, 0.3])
+        self.assertEqual(be.price('vendor/unlisted'), {'error': 'no price for vendor/unlisted'})
+
+    def test_openrouter_backend_refuses_without_a_key(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'OPENROUTER_API_KEY'):
+                worker.build_backend('openrouter', 'recursive/flint-v1.0:free')
 
     def test_runner_selector_auto_and_explicit_pins(self):
         runner = ce.DirectRunner.__new__(ce.DirectRunner)

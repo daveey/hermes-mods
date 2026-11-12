@@ -15,7 +15,8 @@ itself and never pass through coach_eval. Protocol: one JSON object per stdin li
 Each "call" is exactly one billable provider request (a model that rejects {"thinking": {"type": "disabled"}}
 answers with an unbilled 400 naming its no-thinking type, which is then sent instead): the SDK client is built with max_retries=0, no tools, no thinking,
 and an explicit max_tokens (thinking tokens count against it), so a request's cost is bounded by (input tokens + max_tokens) x the price table.
-Provider: COACH_EVAL_PROVIDER (default anthropic). Two wires: Anthropic Messages (anthropic_messages) and the Codex
+Provider: COACH_EVAL_PROVIDER (default anthropic; `openrouter` = OpenRouter's Anthropic-compatible Messages endpoint
+with OPENROUTER_API_KEY from the environment and prices from its model list). Two wires: Anthropic Messages (anthropic_messages) and the Codex
 Responses wire (codex_responses, e.g. openai-codex / gpt-6-astra). A request may carry "provider" to use another
 provider than the default (the judge runs on anthropic while a codex model is replayed); backends are built lazily.
 
@@ -313,11 +314,65 @@ class CodexBackend:
         return out
 
 
+OPENROUTER_BASE = "https://openrouter.ai/api"
+
+
+class _OpenRouterPrice:
+    """One model's row of OpenRouter's public model list, shaped like a Hermes pricing entry ($ per million)."""
+    request_cost = 0.0
+    source, pricing_version = "openrouter models api", ""
+
+    def __init__(self, pricing):
+        def per_million(name):
+            v = pricing.get(name)
+            return None if v in (None, "") else float(v) * 1e6
+        self.input_cost_per_million = per_million("prompt")
+        self.output_cost_per_million = per_million("completion")
+        self.cache_write_cost_per_million = per_million("input_cache_write")
+        self.cache_read_cost_per_million = per_million("input_cache_read")
+        self.request_cost = float(pricing.get("request") or 0)
+
+
+def openrouter_prices(fetch=None):
+    """get_price(model, provider, base_url) over OpenRouter's model list (fetched once). A model the list does not
+    carry has no price (None), so the budget refuses it; "0" is a real price (a :free model)."""
+    cache = {}
+
+    def _fetch():
+        import urllib.request
+        with urllib.request.urlopen(OPENROUTER_BASE + "/v1/models", timeout=60) as r:
+            return json.load(r)
+
+    def get_price(model, prov=None, url=None):
+        if not cache:
+            cache.update({m.get("id"): m.get("pricing") or {} for m in (fetch or _fetch)().get("data") or []})
+        return _OpenRouterPrice(cache[model]) if model in cache else None
+    return get_price
+
+
+def build_openrouter_backend(model=None, fetch=None):
+    """OpenRouter through its Anthropic-compatible Messages endpoint, so replays use the same transcript/tool wire as
+    the anthropic provider. Explicit only (COACH_EVAL_PROVIDER=openrouter or a request's "provider"): a paid or
+    third-party route, outside the managed subscription policy, so it is never resolved through Hermes. The key is
+    OPENROUTER_API_KEY from the environment (token-broker exec --scope openrouter.inference), sent as a Bearer."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise ValueError("provider openrouter needs OPENROUTER_API_KEY in the environment "
+                         "(token-broker exec --scope openrouter.inference -- ...)")
+    import anthropic
+    client = anthropic.Anthropic(auth_token=key, base_url=OPENROUTER_BASE, timeout=300, max_retries=0)
+    be = AnthropicBackend(client, "", "openrouter", OPENROUTER_BASE, openrouter_prices(fetch))
+    be.resolved_model = model
+    return be, {"provider": "openrouter", "oauth": False}
+
+
 def build_backend(provider, model=None):
     """The backend for `provider` from Hermes credentials: (backend, hello-info) or raises SystemExit-able ValueError.
     `model` is the model the backend will serve: under a managed subscription policy (model_routing
     enforce_subscription_only) the credential is resolved for that exact (model, provider) pin, and without it Hermes
     pairs the provider with model.default, which a policy rejects for any other provider."""
+    if provider == "openrouter":
+        return build_openrouter_backend(model)
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from agent.usage_pricing import get_pricing_entry
     rt = resolve_runtime_provider(requested=provider, target_model=model or None)

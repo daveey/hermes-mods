@@ -130,6 +130,29 @@ class Run(unittest.TestCase):
         self.assertFalse([p for p in again.calls if isinstance(p, dict) and "messages" in p])  # no new replays
         self.assertEqual(r2["by_pattern"]["report_only"]["fail"], 0)
 
+    def test_a_reply_cut_by_the_output_cap_is_not_an_empty_turn(self):
+        class Cut(FakeRunner):
+            max_tokens = transcript_max_tokens = None
+
+            def __call__(self, prompt, **kw):
+                text, usage = super().__call__(prompt, **kw)
+                judge = isinstance(prompt, dict) and "messages" not in prompt or \
+                    isinstance(prompt, str) and prompt.startswith(ce.JUDGE_SYS)
+                return (text, usage) if judge else ("", {"stop_reason": "max_tokens"})
+        r = Cut("unused")
+        res = mb.run(self.bench, "m", repeats=1, runner=r, root=self.tmp / "root", live=self.live,
+                     log=lambda *_: None, max_tokens=16000)
+        self.assertEqual((r.max_tokens, r.transcript_max_tokens, res["max_tokens"]), (16000, 16000, 16000))
+        ro, ctl = res["by_pattern"]["report_only"], res["by_pattern"]["control"]
+        self.assertEqual((ro["truncated"], ctl["truncated"]), (ro["n"], ctl["n"]))
+        self.assertTrue(ro["n"] and ctl["n"])
+        self.assertTrue(all(mb.TRUNCATED_TEXT in row["reply"] for row in res["rows"]))
+        md = mb.markdown(res)
+        self.assertIn("output cap: 16000", md)
+        self.assertIn(f"report_only {ro['n']}, control {ctl['n']}", md)
+        self.assertEqual(mb.no_text({"stop_reason": "end_turn"}), ce.EMPTY_TEXT)
+        self.assertEqual(mb.no_text({"stop_reason": "refusal"}), ce.REFUSAL_TEXT)
+
     def test_wilson(self):
         lo, hi = mb.wilson(36, 57)
         self.assertTrue(lo < 36 / 57 < hi)

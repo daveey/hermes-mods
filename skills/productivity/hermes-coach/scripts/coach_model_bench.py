@@ -77,6 +77,14 @@ status check or FYI).
 """
 
 MAX_STEPS = 1
+# A reply cut by the output-token cap before any message text (a model whose reasoning alone exceeds the cap). It is
+# the cap's doing, not an empty turn: labeled apart, counted per slice in the report, and fixed with --max-tokens.
+TRUNCATED_TEXT = "[TRUNCATED: the reply hit the output-token cap before any message text]"
+
+
+def no_text(usage):
+    stop = (usage or {}).get("stop_reason")
+    return ce.REFUSAL_TEXT if stop == "refusal" else TRUNCATED_TEXT if stop == "max_tokens" else ce.EMPTY_TEXT
 # cut "start" (bench-v3 turn mode): the replay starts at David's message and the model runs the whole turn itself, up
 # to START_STEPS requests; each tool call gets an output simulated from the original turn's REAL tool outputs.
 # Why: at the "final" cut (right before the original final reply) Opus and Astra stop at the same rate (13/48 vs
@@ -462,7 +470,7 @@ def render_reply(text, calls):
 
 def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root=None, live=None, runner=None,
         limit=None, log=print, replies_path=None, max_steps=None, agents_md=None, cut="final", sim_model=None,
-        sim_provider=None, guidance=None):
+        sim_provider=None, guidance=None, max_tokens=None):
     """replies_path: a JSON-lines cache of finished replays; a rerun after a crash reuses them (no new spend).
     cut "final": replay up to the original final reply, score the next request (a tool call = continued).
     cut "start": replay from David's message; the model runs the turn (tool outputs simulated by sim_model from the
@@ -476,6 +484,8 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
     live = Path(live or ce.env_path("HERMES_HOME", ce.HOME / ".hermes"))
     own = runner is None
     runner = runner or TranscriptRunner(jobs=jobs, live=live)
+    if max_tokens:  # one cap for control and transcript replies (defaults 4000 / 8000); the judge keeps its own
+        runner.max_tokens = runner.transcript_max_tokens = int(max_tokens)
     judge_model = judge_model or os.environ.get("COACH_JUDGE_MODEL") or "claude-sonnet-5-5"
     budget = ce.Budget(budget_usd, engine=ce.live_engine() if getattr(runner, "bounded", False) is True else None)
     t0 = time.time()
@@ -533,7 +543,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
                 new = [dict(c, id=f"r{k}s{step}c{i}") for i, c in enumerate((usage or {}).get("tool_calls") or [])]
                 if not new:
                     if not text.strip():
-                        text = ce.REFUSAL_TEXT if (usage or {}).get("stop_reason") == "refusal" else ce.EMPTY_TEXT
+                        text = no_text(usage)
                     return {"text": text.strip(), "calls": calls, "steps": step + 1, "capped": False,
                             "cost": round(cost, 4), "cut": "start"}
                 calls += new
@@ -560,9 +570,8 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
             if got is None:
                 return ep, k, None
             text, usage = got
-            stop = (usage or {}).get("stop_reason")
             if not text.strip():
-                text = ce.REFUSAL_TEXT if stop == "refusal" else ce.EMPTY_TEXT
+                text = no_text(usage)
             return ep, k, {"text": text.strip(), "calls": [], "steps": 1, "capped": False}
 
         def rollout(ep, k):
@@ -586,7 +595,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
                 new = [dict(c, id=f"r{k}s{step}c{i}") for i, c in enumerate((usage or {}).get("tool_calls") or [])]
                 if not new:
                     if not text.strip():
-                        text = ce.REFUSAL_TEXT if (usage or {}).get("stop_reason") == "refusal" else ce.EMPTY_TEXT
+                        text = no_text(usage)
                     return {"text": text.strip(), "calls": calls, "steps": step + 1, "capped": False, "cost": round(cost, 4)}
                 calls += new
                 msgs += [{"role": "assistant", "content": text, "tool_calls": new}] + \
@@ -640,7 +649,8 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
         random.Random(11).shuffle(ro_items)
         labels = rubric_judge(ro_items, runner, budget, judge_model, jobs, log)
         grades = ce.judge_all(ctl_items, runner, budget, judge_model, jobs=jobs, log=log)
-        rows, ro, ctl = [], {"n": 0, "fail": 0, "capped": 0, "acted": 0, "outcomes": {}}, {"n": 0, "pass": 0}
+        rows, ro, ctl = [], {"n": 0, "fail": 0, "capped": 0, "acted": 0, "truncated": 0, "outcomes": {}}, \
+            {"n": 0, "pass": 0, "truncated": 0}
         by_ctx = {}
         for iid, (ep, k) in key.items():
             rep = replies[(ep["id"], k)]
@@ -658,6 +668,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
                 ro["fail"] += outcome == "report_only"
                 ro["capped"] += rep["capped"]
                 ro["acted"] += bool(rep["calls"])
+                ro["truncated"] += rep["text"] == TRUNCATED_TEXT
                 c = by_ctx.setdefault(ep["context_model"], {"n": 0, "fail": 0})
                 c["n"] += 1
                 c["fail"] += outcome == "report_only"
@@ -667,6 +678,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
                     continue
                 ctl["n"] += 1
                 ctl["pass"] += grades[iid]["pass"]
+                ctl["truncated"] += rep["text"] == TRUNCATED_TEXT
                 row.update(grade=grades[iid])
             rows.append(row)
         n_ro = sum(e["pattern"] == "report_only" for e in eps) * repeats
@@ -678,6 +690,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
         complete = not limit and not budget.stopped and ro["n"] == n_ro and ctl["n"] == n_ctl
         return {"mode": "model-bench", "bench": "bench-v3" + ("-turn" if cut == "start" else ""), "cut": cut,
                 "sim_model": sim_model if cut == "start" else None, "max_steps": steps_cap, "model": model,
+                "max_tokens": max_tokens or None,
                 "provider": os.environ.get("COACH_EVAL_PROVIDER") or "anthropic", "judge_model": judge_model,
                 "repeats": repeats, "episodes": {"report_only": n_ro // repeats, "control": n_ctl // repeats},
                 "by_pattern": {"report_only": ro, "control": ctl}, "by_context_model": by_ctx,
@@ -702,6 +715,12 @@ def markdown(r):
              f"report_only outcomes: {json.dumps(ro['outcomes'])}", "",
              "by context model: " + ", ".join(f"{k} {v['fail']}/{v['n']} ({pct(v['rate'])})"
                                             for k, v in sorted(r["by_context_model"].items()))]
+    cut_n = {k: v.get("truncated") or 0 for k, v in r["by_pattern"].items()}
+    if r.get("max_tokens"):
+        lines.append(f"\noutput cap: {r['max_tokens']} tokens per reply (--max-tokens)")
+    if any(cut_n.values()):
+        lines.append(f"\ncut by the output cap before any text: report_only {cut_n['report_only']}, control "
+                     f"{cut_n['control']} (graded as shown; rerun with a higher --max-tokens)")
     if r.get("stopped"):
         lines.append(f"\nSTOPPED: {r['stopped']}")
     return "\n".join(lines) + "\n"
@@ -732,6 +751,8 @@ def main(argv=None):
     r.add_argument("--cut", choices=("final", "start"), default="final",
                    help="final: next request after the original investigation; start: the whole turn from David's message")
     r.add_argument("--sim-model", help="cut start: the tool-output simulator (default gpt-6-astra on openai-codex)")
+    r.add_argument("--max-tokens", type=int, help="output cap per replay reply, thinking included (default 4000 "
+                   "control / 8000 transcript); raise it for a model whose reasoning alone hits the cap")
     r.add_argument("--no-publish", action="store_true", help="leave reports and accounting local")
     a = ap.parse_args(argv)
     from coach_publish import publish_run
@@ -753,7 +774,7 @@ def _execute(a):
               log=lambda s: print(s, file=sys.stderr, flush=True),
               replies_path=Path(a.out).with_suffix(".replies.jsonl") if a.out else None, max_steps=a.max_steps,
               agents_md=Path(a.agents_md).read_text() if a.agents_md else None, root=a.root, cut=a.cut,
-              sim_model=a.sim_model)
+              sim_model=a.sim_model, max_tokens=a.max_tokens)
     md = markdown(res)
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
