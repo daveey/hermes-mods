@@ -48,6 +48,16 @@ and stat calls remain; steady cache hits do not read text, create directories or
 open SQLite connections. Concurrent sweeps coalesce while one sweep is running.
 There is no persistent cache and no change to the delivery/reconciliation protocol.
 
+Enumeration cost: a host keeps every settled job directory (hundreds after a few weeks), and each
+pass used to build a `Path` per state file and run `Path.is_dir` plus eight `Path.stat` calls per job.
+`_sweep_enumerate` lists the jobs root once with `os.scandir` (directories only, symlinks followed, an
+unreadable entry is not a job) and keeps each job's `Path` and its eight state-file path strings in
+`_SWEEP_PATHS`, keyed by job name, dropped when the name leaves the root and rebuilt when the root differs. Every
+state file is still stat'ed on every pass and the signature tuples are unchanged; only path building and
+pathlib overhead went away. `tests/test_idle_sweep_paths.py` pins the steady pass (no pathlib calls under
+the root, one stat per state file), equality with the pathlib enumeration (files, symlinks, dangling
+links), every kind of change being seen on the next pass, and two roots sharing a job name.
+
 ## Why this change
 
 Repeated historical work came from `sweep_jobs` unconditionally reading every job's

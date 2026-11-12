@@ -2008,6 +2008,9 @@ import threading as _sweep_threading
 _SWEEP_LOCK = _sweep_threading.Lock()
 _SWEEP_DB_LOCK = _sweep_threading.Lock()
 _SWEEP_FINAL: dict = {}
+# job dir name -> (jobs root, job Path, state-file path strings). Path building and pathlib stat
+# calls dominated a steady pass over hundreds of settled jobs; the signatures themselves are unchanged.
+_SWEEP_PATHS: dict = {}
 _SWEEP_DBS: dict = {}  # path -> (file identity, connection, generation, -shm identity)
 _SWEEP_DB_GENERATION = 0
 _SWEEP_DB_MAX = 32
@@ -2017,9 +2020,9 @@ _SWEEP_FILES = ('status.json', 'meta.json', 'owner.json', 'final.lock/result.jso
                 'completion-pending.json')
 
 
-def _sweep_stat(path: Path):
+def _sweep_stat(path):
     try:
-        st = path.stat()
+        st = os.stat(path)  # str or Path; the steady sweep passes prebuilt strings
         return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     except FileNotFoundError:
         return None
@@ -2151,6 +2154,39 @@ def _sweep_remember(job: Path, stamp, db: str) -> None:
     _SWEEP_FINAL[job] = (stamp, db)
 
 
+def _sweep_entry_is_dir(entry) -> bool:
+    try:
+        return entry.is_dir()  # follows symlinks, like Path.is_dir
+    except OSError:
+        return False
+
+
+def _sweep_enumerate(root: Path):
+    """(job dirs under ``root``, {job: its state-file path strings}), in directory order.
+
+    Same jobs and the same files as ``[p for p in root.iterdir() if p.is_dir()]`` with
+    ``job / name`` per file, but one directory scan (a stat only for symlinks or where the
+    filesystem reports no entry type) and paths built once
+    per job name instead of every pass. Nothing about a job's content is remembered here.
+    """
+    root_s = str(root)
+    with os.scandir(root_s) as it:
+        names = [entry.name for entry in it if _sweep_entry_is_dir(entry)]
+    jobs, job_files = [], {}
+    for name in names:
+        entry = _SWEEP_PATHS.get(name)
+        if entry is None or entry[0] != root_s:
+            entry = (root_s, root / name, tuple(os.path.join(root_s, name, f) for f in _SWEEP_FILES))
+            _SWEEP_PATHS[name] = entry
+        jobs.append(entry[1])
+        job_files[entry[1]] = entry[2]
+    if len(_SWEEP_PATHS) > len(names):
+        keep = set(names)
+        for name in [n for n in _SWEEP_PATHS if n not in keep]:
+            _SWEEP_PATHS.pop(name, None)
+    return jobs, job_files
+
+
 def sweep_jobs(skip: Path | None = None) -> None:
     """Inspect active jobs every pass; memoize only successfully proven final no-work jobs."""
     if not _SWEEP_LOCK.acquire(blocking=False):
@@ -2158,7 +2194,7 @@ def sweep_jobs(skip: Path | None = None) -> None:
     try:
         try:
             root = jobs_dir(create=False).absolute()
-            jobs = [p for p in root.iterdir() if p.is_dir()]
+            jobs, job_files = _sweep_enumerate(root)
         except OSError:
             return
         present = set(jobs)
@@ -2182,7 +2218,7 @@ def sweep_jobs(skip: Path | None = None) -> None:
                 continue
             try:
                 # Capture BEFORE inspection, never label an old decision with new inputs.
-                files = tuple(_sweep_stat(job / name) for name in _SWEEP_FILES)
+                files = tuple(_sweep_stat(path) for path in job_files[job])
                 cached = _SWEEP_FINAL.get(job)
                 if cached is not None:
                     previous, db = cached
