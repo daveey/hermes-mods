@@ -22,6 +22,9 @@ OWNER = "t_0000rollout"
 TEMP_OWNER = "t_0000hardening"
 QUEUE = "⏳ [default] Kanban t_0123456789: 0 ahead, 7/7 busy. Bump priority, re-place, or do the work here."
 FAR = "2099-01-01T00:00:00Z"
+# Three acknowledgements push a later sentence past the adjacency window (root_cap._FOLLOWUP_WINDOW): v15 treats every
+# own non-neutral sentence inside the window as scope, so "unrelated text changes nothing" is asserted beyond it.
+PAD = ["ok", "thanks", "sure"]
 
 
 def _coach_mod():

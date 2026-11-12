@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP_OWNER, PERM, TEMP, FAR
+from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP_OWNER, PERM, TEMP, FAR, PAD
 
 OWNER = f"Owner card {TEMP_OWNER}, run 1, this session."
 RESTORE = f"Restore root {KEY} to 7 on owner completion."
@@ -91,7 +91,7 @@ def test_unrelated_withdrawal_and_negated_other_things_change_nothing(w, surface
     w.register()
     for text in ("Do not restore the database backup.", "Don't forget to restore it afterwards.",
                  "Never roll back the migration.", "Do not revert my notes."):
-        assert not w.blocked(surface, SET8, texts=[TEMP_ONE, text]), text
+        assert not w.blocked(surface, SET8, texts=[TEMP_ONE, *PAD, text]), text
         assert rows(w)[-1]["kind"] == "temporary"
 
 
@@ -108,7 +108,7 @@ UNRELATED_PERMANENT = [
 @pytest.mark.parametrize("followup", UNRELATED_PERMANENT[:2] + UNRELATED_PERMANENT[3:])
 def test_unrelated_permanent_sentence_does_not_relax_a_temporary(w, surface, followup):
     w.register()
-    assert not w.blocked(surface, SET8, texts=[TEMP, followup])
+    assert not w.blocked(surface, SET8, texts=[TEMP, *PAD, followup])
     row = rows(w)[-1]
     assert row["kind"] == "temporary" and row["owner_ref"]["card"] == TEMP_OWNER
 

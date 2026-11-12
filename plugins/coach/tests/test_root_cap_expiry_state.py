@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP_OWNER, PERM, TEMP, FAR
+from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP_OWNER, PERM, TEMP, FAR, PAD
 
 OWNER = f"Owner card {TEMP_OWNER}, run 1, this session."
 TEMP_EXPIRY = f"I authorize a temporary root {KEY} increase from 7 to 8. {OWNER} Restore root {KEY} to 7 at {FAR}."
@@ -85,7 +85,7 @@ def test_owner_completion_only_trigger_unaffected_by_unrelated_expiry_talk(w, su
     w.register()
     for text in ("My passport expires next year.", "I'm away until Monday.", "The report deadline is Friday.",
                  "Standup ends at 2099-03-01T10:00:00Z."):
-        assert not w.blocked(surface, SET8, texts=[TEMP_ONE, text]), text
+        assert not w.blocked(surface, SET8, texts=[TEMP_ONE, *PAD, text]), text
         assert rows(w)[-1]["restore_trigger"]["owner_terminal"] is True
 
 

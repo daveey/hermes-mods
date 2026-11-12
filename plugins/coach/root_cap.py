@@ -1266,6 +1266,21 @@ def _live_scope(own_text):
             if not _QUESTION_LEAD.search(s.lower()) and not _REPORTED.search(s.lower())]
 
 
+# Inside the adjacency window a sentence is a no-op only when it is POSITIVELY recognised as a question (a question
+# mark, or an auxiliary followed by a personal subject: "Did I ...", "Can we ...") or as someone else's words (a
+# third-party attribution or quote marker). Imperatives that merely start with the same word ("Do it without
+# conditions.") and the user's own "what I said earlier ..." stay in scope.
+_QUESTION_STRICT = re.compile(r"\?|^\s*(?:(?:did|do|does|have|has|had|is|are|was|were|should|can|could|may|would|shall|"
+                              r"will)\s+(?:i|we|you|they|he|she|there)|"
+                              r"(?:is|are|was|were|has|had|should|can|could|may|would|shall|will)\s+(?:it|that|this))"
+                              r"\b(?!['\u2019])")
+
+
+def _window_scope(own_text):
+    return [s for s in _sentences(own_text)
+            if not _QUESTION_STRICT.search(s.lower()) and not _REPORTED_CANCEL.search(s.lower())]
+
+
 def _permanent_scope(s):
     # Permanence is a positive, closed form, not a substring test. Unknown
     # modifiers in the SAME sentence ("semi-permanent", "permanent through
@@ -1297,8 +1312,31 @@ def _neutral_scope(s):
     return bool(re.fullmatch(r"(?:thanks|thank you)(?:,?\s+it['’]s\s*)?[.!]?", s.lower().strip()))
 
 
+# v15 adjacency rule. The authorizing message and the next _FOLLOWUP_WINDOW human messages after it are one
+# conversation about the decision (user rows carry no assistant boundary, so a fixed count is the deterministic
+# stand-in for "before the next assistant turn"). Inside that window an own sentence is judged by a CLOSED neutral
+# grammar, not by a vocabulary of things that talk about the terms: anything that is not valid terms, affirmative
+# permanence, a restriction, the authorization itself or a pure courtesy/acknowledgement clears the stored terms and
+# marks the decision temporary, so the write refuses until a fresh valid `Owner card ...` / `Restore ... to N
+# <trigger>` pair (or an explicit permanent supersession) exists. A false positive costs one terms sentence; a
+# false negative would admit an untracked raise. Outside the window the older topic gate (`_scope_relevant`) still
+# applies: a restriction phrased in words that gate does not know, sent more than _FOLLOWUP_WINDOW messages later,
+# is the documented residual.
+_FOLLOWUP_WINDOW = 3
+_COURTESY = (r"(?:thanks|thank you|thx|ty|ok|okay|k|yes|yep|yeah|yup|sure|great|perfect|good|nice|cool|got it|"
+             r"understood|sounds good|that works|lgtm|go ahead|go for it|proceed|please proceed|continue|"
+             r"carry on|keep going|go on|do it|please do|please|will do)")
+_NEUTRAL_FOLLOWUP = re.compile(r"(?:" + _COURTESY + r")(?:\s*[,;:!.\-–—]*\s*(?:" + _COURTESY + r"))*[\s,;:!.]*")
+
+
+def _neutral_followup(s):
+    low = s.lower().strip()
+    return bool(_NEUTRAL_FOLLOWUP.fullmatch(low)
+                or re.fullmatch(r"keep (?:that|it|this) unchanged[.!]?", low))
+
+
 def _initial_temporary(own_text, leaf):
-    live = [s for s in _live_scope(own_text) if not _neutral_scope(s)]
+    live = [s for s in _window_scope(own_text) if not _neutral_scope(s)]
     if _temporary_intent(own_text):
         return True
     if len(live) == 1 and _bare_authorization(live[0], leaf):
@@ -1424,6 +1462,14 @@ def _positive_field(s, field):
                              r"(?:,\s*(?:run \d+|this session|profile [\w-]+|gateway [\w-]+))*[.!]?", low))
 
 
+def _initial_exempt(s, leaf):
+    """Own sentences of the authorizing message that do not by themselves put the terms in doubt: the authorization
+    (names the key and an authorizing verb), a restriction, affirmative permanence, a bare approval, a courtesy."""
+    low = s.lower()
+    return bool((_AUTH.search(low) and leaf in low) or _temporary_intent(s) or _permanent_scope(s)
+                or _bare_authorization(s, leaf) or _neutral_followup(s))
+
+
 def _initial_terms(own_text):
     # Use the same ordered field semantics within a message as across messages.
     # A late withdrawal must not disappear in _own_terms and reveal stale terms.
@@ -1431,7 +1477,7 @@ def _initial_terms(own_text):
     # Canonical compound assignment has two independent fields. Split only its
     # explicit clause boundaries so updating restore cannot erase the owner.
     parts = []
-    for original in _live_scope(own_text):
+    for original in _window_scope(own_text):
         if _own_terms(original):
             split = re.sub(r"\s+for owner card\s+", ". Owner card ", original, flags=re.I)
             split = re.sub(r",\s+restoring\s+", ". Restore ", split, flags=re.I)
@@ -1448,12 +1494,15 @@ def _initial_terms(own_text):
         elif (_scope_relevant(s, "max_in_progress") and not _temporary_intent(s)
               and not _bare_authorization(s, "max_in_progress") and not _permanent_scope(s)):
             keep = []  # same unknown-scope invalidation as a later own turn
-        elif _own_terms(s):
-            keep.append(s)
+        elif _initial_exempt(s, "max_in_progress"):
+            if _own_terms(s):
+                keep.append(s)
+        else:
+            keep = []  # v15: any other own sentence of the authorizing message is unknown scope, not chatter
     return " ".join(keep)
 
 
-def _fold_followup(current, own_text, item, leaf):
+def _fold_followup(current, own_text, item, leaf, window=False):
     """A later native message of the human that refers to the surviving authorization (names the key, or points at
     'that/it/this change') acts only through its OWN sentences (quoted / reported / interrogative text is skipped, as
     everywhere): a restriction (temporary, non-permanent, restoration, time bound, owner scope) makes the surviving
@@ -1461,14 +1510,22 @@ def _fold_followup(current, own_text, item, leaf):
     terms replace the earlier ones field by field (latest wins); a plain affirmative 'permanent' relaxes it back
     (the latest decision governs, as for a later value). Unrelated messages change nothing. The authorization, its
     target value and its sha stay those of the authorizing message; the follow-up's sha/ref is linked."""
-    live = _live_scope(own_text)
-    relevant = [s for s in live if _scope_relevant(s, leaf)]
-    if not relevant:
+    live = _window_scope(own_text) if window else _live_scope(own_text)
+    relevant = {s for s in live if _scope_relevant(s, leaf)}
+    # window: inside the adjacency window every own sentence that is not a closed neutral form is in scope too
+    todo = [s for s in live if s in relevant or (window and not _neutral_followup(s))]
+    if not todo:
         return
     link = {"sha": _sha(item["text"]), "ref": item["ref"]}
     changed = False
-    for s in relevant:
+    for s in todo:
         low = s.lower()
+        if s not in relevant:
+            # v15: unknown own scope inside the adjacency window is never chatter.
+            current["temporary"] = True
+            current["terms_text"] = ""
+            changed = True
+            continue
         # Relaxation must be about the cap itself, not an unrelated adjacent
         # sentence, and must be affirmative. It is the sole way to discard a
         # pending temporary/uncertain scope without supplying fresh terms.
@@ -1517,6 +1574,7 @@ def _decision(items, rec, new_value):
     leaf = _leaf(rec["key"])
     digest = rec["contract_revision_digest"]
     current = None
+    seen = 0  # human messages since the surviving authorization (adjacency window, see _FOLLOWUP_WINDOW)
     for item in items:
         raw = item["text"]
         text = raw.lower()
@@ -1552,8 +1610,10 @@ def _decision(items, rec, new_value):
             current = {"text": raw, "terms_text": own, "temporary": _initial_temporary(text_own, leaf),
                        "sha": _sha(raw), "ref": item["ref"], "target": target, "followups": []}
             set_here = True
+            seen = 0
         if current is not None and not set_here and current is before:
-            _fold_followup(current, text_own, item, leaf)
+            seen += 1
+            _fold_followup(current, text_own, item, leaf, window=seen <= _FOLLOWUP_WINDOW)
     if current is None or current["target"] != new_value:
         return None
     return current
