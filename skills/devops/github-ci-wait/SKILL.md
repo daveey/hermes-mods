@@ -33,8 +33,7 @@ Status of a finite LIST of runs: read `references/bulk-run-status.md` (bounded A
 
 A CI fix (or any branch work) goes in its own worktree: `git worktree add <dir> -b <fix-branch> origin/main`, then
 push from there. Never `git checkout`/`switch` a branch in a shared checkout that something runs from (a sync
-mirror, a deploy checkout, the live app checkout): the scripts and services in it vanish with the old branch. That
-happened when CI-fix workers switched a sync mirror to fork branches and its launchd job failed for 4 hours.
+mirror, a deploy checkout, the live app checkout): the scripts and services in it vanish with the old branch.
 [branch-pin-guard](../../../plugins/branch-pin-guard/) blocks this for checkouts listed in
 `$HERMES_HOME/branch-pins.json`. A checkout you find off its branch: commit or stash the stray work onto its own
 branch, check the pinned branch back out, and carry on in a worktree.
@@ -124,7 +123,7 @@ How to run it from an agent:
   arguments. It has often shipped already, and a mistyped sha fails there at once (`Needed a single revision`); a
   background run reports that only in its exit notice, after you have announced the wait. Copy shas from `git`/`gh`
   output; never retype one.
-- On exit 1, investigate the printed run (`gh run view <id> -R OWNER/REPO --log-failed`). Empty failed-step logs do not prove that a job never started or lost its runner. Check the command's exit status/stderr, run attempts, paginated jobs, full logs and annotations via each job's `check_run_url`; missing evidence is not a diagnosis. See `references/workflow-history-audit.md`. Attribute an earlier breaking commit only after verifying its diff and ancestry.
+- On exit 1, investigate the printed run (`gh run view <id> -R OWNER/REPO --log-failed`). Empty failed-step logs do not prove that a job never started or lost its runner. Check the command's exit status/stderr, run attempts, paginated jobs, full logs and annotations via each job's `check_run_url`; missing evidence is not a diagnosis. See `references/workflow-history-audit.md`. Attribute an earlier breaking commit only after verifying its diff and ancestry. On a branch already red, "inherited" means the same failing test ids, not the same workflow: list them per run (`gh run view <id> -R O/R --log-failed | grep -oE '(FAIL|ERROR): [A-Za-z0-9_]+ \([^)]*\)|(FAILED|ERROR) [^ ]+::[^ ]+' | sort -u`) and `comm -13` the previous run's list against this one's. A new id is a new break hiding under the old red (the last run without it and the first with it bracket the commits) and needs its own owner; a landing gate that skips a known-red workflow must diff ids the same way.
 - If `gh run view --log` omits completed reusable-workflow jobs or `--job ID --log` returns empty with exit 0, fetch `gh api repos/OWNER/REPO/actions/jobs/ID/logs` directly before concluding logs are unavailable. A file-level all-pass summary plus the shard's `flaky_kanban: 0 flaky test id(s)` can prove first-attempt success when the runner does not print individual passing node IDs; verify the target exists in that run's source revision.
 - Don't cancel another session's queued run to get yours through: the queued run will contain your
   commit too.
