@@ -19,7 +19,9 @@ import unittest
 
 SCRIPT = Path(os.environ.get('SWAP_TEST_SCRIPT', Path(__file__).with_name('swap_db.py'))).resolve()
 CORE = importlib.util.find_spec('gateway') is not None
-PRIVILEGED = os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1'
+# Hosted Linux CI permits passwordless sudo; test the real scanner instead of
+# weakening production's permission-denied refusal or skipping holder coverage.
+PRIVILEGED = os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1' or os.environ.get('GITHUB_ACTIONS') == 'true'
 
 
 def database(path, sql='CREATE TABLE sessions(id TEXT PRIMARY KEY); INSERT INTO sessions VALUES("saved");'):

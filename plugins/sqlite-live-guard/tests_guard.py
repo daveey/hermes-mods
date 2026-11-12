@@ -256,7 +256,7 @@ def _db(path, rows):
 
 @pytest.fixture(autouse=True)
 def privileged_fixture_scan(monkeypatch):
-    if os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1':
+    if os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1' or os.environ.get('GITHUB_ACTIONS') == 'true':
         real = swap_db._scan
         monkeypatch.setattr(swap_db, '_scan', lambda db, privileged=False, extra_paths=(): real(db, True, extra_paths))
 
