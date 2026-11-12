@@ -123,6 +123,20 @@ def test_latest_eligible_not_latest_own(db, gate):
     assert out.count("newer comment") == 1
 
 
+def test_sibling_card_on_same_board_stays_out(db, gate):
+    """Another card on the same board never feeds this card's line: neither its later comment nor its later block."""
+    sibling = "t_cccccccccccccccc"
+    with closing(sqlite3.connect(db)) as c, c:
+        c.execute("insert into tasks values (?,?,?,?,?,?,?,?,?)", (
+            sibling, "Sibling", "blocked", "default", BLOCK - 50, None,
+            "elsewhere", "needs_input", json.dumps({"action": "Sibling ask"})))
+        c.execute("insert into task_events(task_id,kind,payload,created_at) values (?,'blocked','{}',?)",
+                  (sibling, BLOCK + 120))
+    comment(db)
+    comment(db, card=sibling, body="Sibling card news", ts=BLOCK + 200)
+    assert line(gate, db) == PLAIN + SUFFIX
+
+
 def test_latest_block_is_boundary(db, control, gate):
     comment(db)
     with closing(sqlite3.connect(db)) as c, c:
