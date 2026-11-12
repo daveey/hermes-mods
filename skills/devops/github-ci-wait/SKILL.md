@@ -168,10 +168,11 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
 - Own runs are found in the listing: the newest 100 runs on the branch, or the newest 40 per `--workflow`. On a
   busy branch, an older commit's own run can fall outside that window; it then reads as having none, and a later
   commit's run stands in. For an old commit, read its own runs with `gh run list --commit <sha>` before trusting a pass.
-- `workflow_run`-triggered workflows (for example, "runner-loss recovery" and CI review comments) carry the
-  default branch's head, not the triggering run's commit. The script ignores these events when discovering
-  workflows and evaluating success, failure and activity; otherwise another PR's meta-run can delay or fail a
-  green commit's wait. They still count when explicitly named with `--workflow` (for example, a post-CI deploy).
+- Runs triggered by `workflow_run`, `schedule` or `workflow_dispatch` (meta workflows such as "runner-loss
+  recovery" and "CI review comment", which run on the branch head) say nothing about your commit. The script
+  ignores these three events when discovering workflows and evaluating success, failure and activity; otherwise
+  a meta-run (one PR comment's HTTP 502 in an hourly review-comment run) can delay or fail a green commit's wait.
+  They still count when explicitly named with `--workflow` (a post-CI deploy; `--dispatch` always names it).
   For other discovered workflows, runs whose every job is gated off by `if:` and ends `skipped` count as done
   once their runs on your sha have finished, and appear as `<name> skipped <url>`. With `--workflow X`, a
   skipped X is still not a pass.
