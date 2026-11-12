@@ -87,6 +87,23 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertIn("github.event.before", self.text)
         self.assertIn("select --all", self.text)  # schedule + workflow_dispatch
 
+    def test_gitleaks_is_provisioned_pinned_and_sha256_checked_off_the_desktop_serve_path(self):
+        # live-checkout-guard's real pre-commit tests need gitleaks; without it they skipped silently here
+        # (28 of them, PR #61/#62's end-to-end proofs included). Same pin and digest as gitleaks.yml.
+        step = self.text.split("      - name: Suite provisions", 1)[1].split("\n      - name:", 1)[0]
+        version_m = re.search(r"(?m)^\s+gl_version=(\S+)$", step)
+        digest_m = re.search(r"(?m)^\s+gl_sha256=([0-9a-f]{64})$", step)
+        assert version_m and digest_m, step
+        version, digest = version_m.group(1), digest_m.group(1)
+        self.assertIn('sha256sum -c -', step)
+        self.assertIn('>> "$GITHUB_PATH"', step)
+        self.assertIn('"${RUNNER_TEMP}/tools"', step)  # not /usr/bin: tests simulate a PATH without it
+        scan = (ROOT / ".github" / "workflows" / "gitleaks.yml").read_text()
+        self.assertIn(f"/download/v{version}/gitleaks_{version}_linux_x64.tar.gz", scan)
+        self.assertIn(f"{digest}  gitleaks.tar.gz\" | sha256sum -c -", scan)
+        skill_publish = (ROOT / "plugins" / "live-checkout-guard" / "tests_skill_publish.py").read_text()
+        self.assertIn(f"gitleaks v{version}", skill_publish)
+
     def test_runs_each_suite_through_test_all_without_core(self):
         self.assertIn("scripts/test-all --exact", self.text)
         self.assertIn("--json results.json", self.text)
