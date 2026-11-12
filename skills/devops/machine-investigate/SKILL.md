@@ -60,6 +60,13 @@ including SIGUSR2, SIGQUIT, SIGABRT and SIGKILL. Only signal 0 is a safe existen
 For a stack sample use `sample <pid> 5` on macOS or
 `py-spy dump --nonblocking --pid <pid>` on Linux, under `sudo -n` for a process that isn't your descendant (Yama
 ptrace_scope refuses it otherwise). Do not substitute a signal if sampling is unavailable.
+A `py-spy dump` is one instant: enough to see what a hung process waits on, but a single dump can name a function
+that isn't the hot path. To attribute CPU to code, record instead:
+`sudo -n py-spy record --nonblocking --pid <pid> --duration 15 --rate 40 --format raw -o <f>` (each line is
+`frame;frame;… count`), then rank functions by their inclusive share of samples (count each function once per stack).
+Use the profile to locate code, not to convert sample counts directly into CPU utilization: thread filtering,
+missed samples and nonblocking reads affect that estimate. Cross-check against the step 3 CPU-time delta.
+`<f>` may be owned by root after `sudo`; inspect ownership and use `sudo -n` to read/delete it if needed.
 For a gateway restart use
 `python3 ~/.hermes/sync-runner/hermes-sync pause-turns --timeout 180 -- hermes gateway restart`.
 The backend-restart-guard enforces recognized literal signal commands on both Hermes and Claude Bash;
