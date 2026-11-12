@@ -3,7 +3,35 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_self_heal_lane import sh, NOW, core, Runner, ev
+from test_self_heal_lane import sh, NOW, core, Runner, ev, defect, HUB
+
+
+def test_budget_deferred_redetection_rechecks_before_midnight(tmp_path, monkeypatch):
+    store = core.Store(tmp_path, clock=lambda: NOW)
+    runner = Runner()
+    eb = sh._budget_mod()
+    snap = {'lanes': {'selfheal': 0}, 'caps': {'selfheal': 200}, 'total_cap': 20, 'total': 0}
+    card = {'id': 't_fixture', 'lane': 'selfheal', 'status': 'ready',
+            'body': 'Budget for this card <= $200.',
+            'idempotency_key': sh.fix_key('agent-abc', 1)}
+    monkeypatch.setattr(eb, 'snapshot', lambda **kw: snap)
+    monkeypatch.setattr(eb, 'engine_cards', lambda *a: [card])
+    monkeypatch.setattr(eb, 'card_cost', lambda *a: 0)
+    d = defect()
+    denied = sh.file_defect(d, store=store, m='live', runner=runner, now=NOW, cfg=HUB)
+    assert denied['action'] == 'deferred'
+    db = sh._pending_db(store)
+    try:
+        assert db.execute('SELECT retry FROM pending WHERE fp=?', (d['fingerprint'],)).fetchone()[0] > NOW + 60
+    finally:
+        db.close()
+    # The pending timestamp is a drain backstop, not a re-detection admission veto.
+    # Removing the marker now leaves only the fix-kind default reservation.
+    card['body'] = ''
+    accepted = sh.file_defect(d, store=store, m='live', runner=runner, now=NOW + 60, cfg=HUB)
+    assert accepted['action'] == 'filed', accepted
+    assert accepted['scheduled'] is None
+    assert sh.budget(now=NOW + 60)['reserved'] == sh.FIX_BUDGET + sh.INVESTIGATION_BUDGET
 
 
 @pytest.mark.parametrize('key,expected', [
