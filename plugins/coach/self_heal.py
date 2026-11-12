@@ -1218,9 +1218,36 @@ def detect_admission(final_reply: str, llm: Optional[Callable[[str, str], str]] 
             return sig
         if not admission_prefilter(final_reply, tool_log):
             return None
-        return _verdict(audit_verdict(final_reply, llm or aux_judge, tool_log, ask, confirm), "admission", threshold)
+        hit = _verdict(audit_verdict(final_reply, llm or aux_judge, tool_log, ask, confirm), "admission", threshold)
+        return {**hit, "audit_input": audit_input(final_reply, tool_log, ask)} if hit else None
     except Exception:
         return None
+
+
+def audit_input(final_reply: str, tool_log=None, ask="") -> dict:
+    """What the turn-end audit judged, as a `selfheal_replay.py --mode admission` row body ({text, ask, tool_log}).
+    A filed admission carries it to the hub (AUDIT_INPUT_FILE), so a not_defect verdict on it becomes a replayable
+    negative row. Before, the negatives held only a 300-char reply tail, and every detector card rebuilt each turn by
+    hand from the state.db of the host that ran it (plugin-aafb20159a: the MacBook's)."""
+    return {"text": (final_reply or "")[-4000:], "ask": _ask_text(ask),
+            "tool_log": [str(x)[:400] for x in list(tool_log or [])[-30:]]}
+
+
+AUDIT_INPUT_FILE = "audit_input.json"  # <coach>/selfheal/<fp>/: the audited turn of an admission finding
+
+
+def _save_audit_input(store, d: dict) -> None:
+    """Keep a filed admission's audited turn next to its proposal (<coach>/selfheal/<fp>/). Never raises."""
+    inp = d.get("audit_input")
+    if d.get("source") != "admission" or not isinstance(inp, dict) or not inp.get("text"):
+        return
+    try:
+        p = Path(store.root) / "selfheal" / d["fingerprint"] / AUDIT_INPUT_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({**inp, "session_id": d.get("session_id"), "host": d.get("host"),
+                                 "p": d.get("p_defect"), "stages": d.get("stages"), "stage1_p": d.get("stage1_p")}))
+    except Exception:
+        pass
 
 
 AUDIT_KINDS = ("admission",)
@@ -4246,6 +4273,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
             pass
         store.log({"event": "selfheal_forward", "fingerprint": fp, "ok": rc == 0, "detail": res["out"]})
         return res
+    _save_audit_input(store, d)
     if m == "live" and hub:
         closed = kanban_trigger_closed(d, now=now)
         if closed:
@@ -4861,14 +4889,15 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     if kind in ("not_defect", "declined"):
         kw["closed_at"] = now
     e = lane.update(fp, **kw)
+    late = None
     if kind in ("fixed", "not_defect"):
-        _log_late_adopt(store, fp, st, note, now)
+        late = _log_late_adopt(store, fp, st, note, now)
     store.log({"event": f"selfheal_{kind}", "fingerprint": fp, "card": card or e.get("card"),
                "component": e.get("component"), "note": note[:300], "recurrence": bool(e.get("recurrences")),
                **({"cron_check": cron_check} if cron_check else {}),
                **({"result_file": result_path} if result_path else {})})
     if kind == "not_defect":
-        admission_negative(fp, e, note, store=store, now=now, runner=runner)
+        admission_negative(fp, e, note, store=store, now=now, runner=runner, late_adopt=late)
     return e
 
 
@@ -4927,12 +4956,16 @@ def _close_synthetic_lane(store, fp: str, now: float) -> Optional[str]:
 
 
 def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optional[float] = None,
-                       runner=None) -> Optional[dict]:
+                       runner=None, late_adopt: Optional[dict] = None) -> Optional[dict]:
     """Detection for turn-end audit false alarms (agent-feed37636b): a `not_defect` verdict on an audit (`admission`)
     finding is appended to <coach data>/eval/admission-negatives.jsonl as a label-0 replay row, and the
     ADMISSION_NEG_CARD_AT-th inside ADMISSION_NEG_DAYS opens ONE detector card (later cases comment on it while it is
     open; a done/archived/unreadable card means the next repeat files a fresh one). Three honest, allowed scope notes
-    closed not_defect in one day before anything counted them. Never raises."""
+    closed not_defect in one day before anything counted them. Never raises.
+    `late_adopt` (record_event's selfheal_late_adopt row): the not_defect cites a fix that landed before the card was
+    filed, so the audit found a REAL defect and the lane's "already fixed?" check missed its fix. That is an adoption
+    miss (late_adopt_counts), not an audit false alarm: no row, no count (plugin-aafb20159a was counted and opened a
+    detector card whose audit had been right)."""
     store = _store(store)
     now = now or time.time()
     try:
@@ -4940,11 +4973,21 @@ def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optio
         source = st.get("source") or rec.get("source")
         if source != "admission":
             return None
+        if late_adopt:
+            out = {"event": "selfheal_admission_negative", "fingerprint": fp, "action": "skip",
+                   "why": "already_fixed", "commit": late_adopt.get("commit")}
+            store.log(out)
+            return out
         row = {"id": fp, "label": 0, "source": "admission", "component": st.get("component") or rec.get("component"),
                "symptom": st.get("symptom") or rec.get("symptom"),
                "session_id": st.get("session_id") or rec.get("session_id"), "p": rec.get("p"),
                "evidence": str(rec.get("evidence") or "")[-1500:], "note": note[:500], "card": st.get("card"),
                "at": now, "host": host_name()}
+        try:  # the audited turn, saved at filing: makes the row replayable (selfheal_replay.py --mode admission)
+            inp = json.loads((Path(store.root) / "selfheal" / fp / AUDIT_INPUT_FILE).read_text())
+            row.update({k: inp[k] for k in ("text", "ask", "tool_log", "stages", "stage1_p") if inp.get(k)})
+        except (OSError, ValueError, TypeError):
+            pass
         path = _coach_data() / ADMISSION_NEG_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = []

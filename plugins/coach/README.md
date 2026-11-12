@@ -1084,7 +1084,14 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   reason, a "not reviewed" list) low unless hidden or the verdict depends on it (agent-feed37636b). A `not_defect`
   event on an audit finding appends a label-0 row to `<COACH_DATA>/eval/admission-negatives.jsonl`
   (`selfheal_admission_negative`); the 3rd in 7 days opens one detector card, later ones comment on it while open
-  (`tests/test_self_heal_admission_negatives.py`).
+  (`tests/test_self_heal_admission_negatives.py`). A filed admission carries the audited turn (`audit_input`:
+  reply, request, tool log) to the hub's `<coach>/selfheal/<fp>/audit_input.json`, so its negative row replays as
+  written with `eval/selfheal_replay.py --mode admission --confirm --samples N` (rows without it are listed and
+  skipped). A not_defect citing a fix that predates the filing (`selfheal_late_adopt`) is an adoption miss, not an
+  audit false alarm: no row, no count. Gate set (real catches + negatives, incl. a Done-means-line false alarm):
+  `<COACH_DATA>/eval/selfheal/admission-gate-v1.jsonl`. Prompt carve-outs for self-corrected scratch-helper slips
+  and the Done-means line were replayed three times and each lowered real catches (889e55fe90, d3effcb2e4,
+  829ab754ac) while the negatives already scored < 0.9 at baseline, so none shipped.
 
 Both judges append the private overlay `COACH_REPLY_PROFILE` / `<HERMES_HOME>/coach/reply_profile.md` (shared with
 the reply check), so they know your standing rules. The overlay is rules and environment only: output-format lines

@@ -91,6 +91,13 @@ def main(argv=None, llm=None, confirm_llm=None):
     sh = load_self_heal()
     th = a.threshold if a.threshold is not None else (sh.AUDIT_THRESHOLD if a.mode == "admission" else sh.THRESHOLD)
     rows = [json.loads(x) for x in open(a.data) if x.strip()]
+    # A row with no audited turn (an admission negative written before the lane saved audit_input) can't be judged:
+    # list it instead of crashing the whole replay on r["text"].
+    unreplayable = [r.get("id") for r in rows if not r.get("text")]
+    rows = [r for r in rows if r.get("text")]
+    if unreplayable:
+        print(f"skipped {len(unreplayable)} row(s) with no text (no audited turn saved): "
+              f"{', '.join(map(str, unreplayable))}", file=sys.stderr)
     if a.limit:
         rows = rows[: a.limit]
     out = Path(a.out)
