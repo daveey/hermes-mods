@@ -92,6 +92,17 @@ options" ok no longer covers this shape. Why: self-heal agent-866a12f54f (babybe
 David to "end the project with its >=50% target unproven, or expand scope", relayed three times). Tests:
 `tests/test_replan_hold.py` (incl. the $6 GPU over-cap and EBS resize asks passing).
 
+**Agent-condition holds (L3, no model call).** `agent_condition.py` holds a `kanban_block` / blocked `kanban_create`
+`human_request` whose action/why_human attributes the requirement to an agent (operator, orchestrator, creator,
+parent card, card comment, steer, "my own condition", "self-imposed") with ask/approve/permission/prohibit/require
+language, when no field quotes David's own words ("David said/asked/wrote/instructed ...", a user-step id `us_...`,
+or a quoted line attributed to him). The hold tells the worker to apply its in-scope recommendation (an exact-head
+label or approval is re-checked by its own gate) or ask the agent that set the condition on the card. Runs before
+the PR-wording hold and the judge; an unchanged ask is held twice, then passes (`agent_condition_released`);
+internal errors fail open (`agent_condition_error`). `STRUCTURED_SYSTEM` carries the same rule for prose the regex
+misses. Logs `agent_condition_hold`. Why: self-heal agent-ad97832ad7 (an orchestrator's own "ask before any new
+head" steer parked a test-only CI repair on David). Tests: `tests/test_agent_condition_hold.py`.
+
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
 delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>

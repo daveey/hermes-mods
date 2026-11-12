@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -42,6 +42,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     superseding = _sib("superseding")
     physical_asks = _sib("physical_asks")
     replan = _sib("replan")
+    agent_condition = _sib("agent_condition")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 # Surfaces where the typed turn is the single local user's own words. Only an answer typed there may be bound to a
@@ -907,6 +908,33 @@ def _replan_hold(session_id: str, tool_name: str, text: str, chat: bool = False)
         return None
 
 
+# Process-local hold counts per (session, tool, ask hash), like _REPLAN_HELD.
+_AGENT_CONDITION_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _agent_condition_hold(session_id: str, tool_name: str, request: dict) -> dict | None:
+    """Hold a human_request whose human-only reason is a condition another agent set (operator/orchestrator/creator
+    steer, card comment, own rule) and that quotes nothing David said (self-heal agent-ad97832ad7). Deterministic,
+    bounded to agent_condition.MAX_HOLDS per unchanged ask; fails open."""
+    try:
+        hit = agent_condition.hit(request)
+        if hit is None:
+            return None
+        ask = json.dumps({k: request.get(k) for k in ("action", "why_human")}, sort_keys=True)
+        key = (session_id, tool_name, core.text_hash(ask))
+        n = _AGENT_CONDITION_HELD.get(key, 0)
+        if n >= agent_condition.MAX_HOLDS:
+            core.log_event("agent_condition_released", tool=tool_name, session=session_id, holds=n, quote=hit["quote"])
+            return None
+        _AGENT_CONDITION_HELD[key] = n + 1
+        core.log_event("agent_condition_hold", tool=tool_name, session=session_id, attempt=n,
+                       task=os.environ.get("HERMES_KANBAN_TASK") or "", quote=hit["quote"])
+        return {"action": "block", "message": agent_condition.HOLD_MESSAGE}
+    except Exception as e:
+        core.log_event("agent_condition_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+
+
 def _replan_reply_hold(session_id: str, asks: list[str], attempt: int, budget: int, reply: str = "") -> dict | None:
     """Chat-reply side of _replan_hold: bounded by the reply hold budget. An ask is read with its paragraph, since
     "Your call: which way?" carries the choice in the sentence before it."""
@@ -949,6 +977,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         replanned = _replan_hold(session_id, tool_name, request["action"] + "\n" + request["why_human"])
         if replanned is not None:
             return replanned
+        conditioned = _agent_condition_hold(session_id, tool_name, request)
+        if conditioned is not None:
+            return conditioned
         filing = _pr_filing_hold(session_id, tool_name, args, request)
         if filing is not None:
             return filing
