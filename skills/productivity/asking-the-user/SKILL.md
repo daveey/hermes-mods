@@ -56,6 +56,10 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   step (a migration's `prepare`, a dry run) first and copy its exact list into the limits: a guessed list that
   discovery later widens forces a stop and a second approval round. If it widens anyway, stop before any write, record
   the `applied` receipt as partial (what ran, what didn't), and file one new request naming the extra targets.
+  Never bind that new request to reusing the earlier snapshot of live state ("no re-run of prepare"): a snapshot-CAS
+  apply refuses once any row changed, and on a live queue it goes stale within minutes. Scope it as a fresh capture
+  immediately followed by apply, and first check (code or runbook) whether apply tolerates ordinary churn; if it
+  doesn't, fix the tool before asking.
 - Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
