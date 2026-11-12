@@ -43,6 +43,16 @@ Before filing a physical, on-device or sign-in `human_request`:
    job is reattached by job_id, never duplicated. Do not keep an obsolete login URL or stopped waiter in a
    blocked ask. A constant-success probe or manufactured success receipt is never a substitute.
 
+7. Keep the **human phase and the observation phase apart**. A test needing hands-on acts *and* time or normal
+   use to pass (a day of wear, overnight capture, a soak) is two phases: the act is a human ask, the window is a
+   scheduled wait. Put one `HUMAN_STEP: <outstanding act>` and one `OBSERVATION: <window and the card waiting on
+   it>` line in scope, and make `resolved_check` read only the act's completion evidence, never elapsed time
+   (otherwise doing the act early can never clear the ask and the person sees it "still blocked"). Once the act is
+   done (or `HUMAN_STEP: done`), no human ask is left: park the open test with `kanban_schedule`
+   (SCHEDULED_UNTIL = window end, wake_check = the test probe). Unknown completion stays unknown: read it, don't
+   assume it. A report that the act was done retires the human step only, never the test's acceptance. The
+   ask-gate guard refuses a mixed ask with `physical_ask_phases`.
+
 No rule here authorizes a protected Allow click, sign-in, consent, simulated evidence, auto-approval, or relaxed
 acceptance. A genuinely physical step with no machine-readable prerequisite still needs the person. Keep the
 remaining physical evidence explicit after prerequisite wake-up; do not close it based on install/file/waiter

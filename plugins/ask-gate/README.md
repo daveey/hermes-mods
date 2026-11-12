@@ -607,6 +607,13 @@ context before filing and while blocked. See the asking-the-user skill's `refere
 cross-gateway searches and expiry refresh without consent or physical-success inference. This is a local,
 non-atomic preflight, not remote dedupe, proof of probe correctness, or automatic attachment/approval.
 
+A hands-on ask that also names a passive observation window (normal use, overnight, "at least 20 hours", a soak)
+or whose `resolved_check` waits on elapsed time returns `physical_ask_phases` unless scope separates the phases
+with one `HUMAN_STEP:` and one `OBSERVATION:` line and the probe reads only the act's evidence. `HUMAN_STEP: done`
+means no human ask remains: the hint is to `kanban_schedule` the still-open test. The guard never infers that the
+act happened and never relaxes or completes the test (`tests/test_physical_phases.py`, full hook path with an `ok`
+judge verdict).
+
 Tests: `tests/test_physical_asks.py` covers both tool entry paths, cross-board/profile duplicates, padded
 interactions, legacy identities, distinct device/evidence, closed owners, self-refresh, mandatory probes and
 real core refusal of an already-met prerequisite. Remote races and live expired-waiter refresh are untested.

@@ -119,6 +119,10 @@ Missing CREDENTIAL versus missing ENTITLEMENT. A credential the agent holds or c
  retry of that mint, a permission the evidence shows failing, or a credential the request's scope
  explicitly excludes (e.g. "no classic token fallback") is not a valid how. Name in how only a
  scope that literally appears on the capability sheet; never invent one.
+A physical/test ask is judged per remaining action, separately from passive collection: an act the person
+ still has to do is ok; time or normal use that must elapse after the act is a scheduled wait, not a human
+ ask. If the request's evidence shows the act already done and only the observation window remains, return
+ unverified with how = kanban_schedule the still-open test (never complete it or relax its acceptance).
 A why_human that rests on a condition an agent set (an operator, orchestrator, creator or parent-card steer, a
  card comment, the agent's own rule such as "ask before any new head") and quotes nothing David said is not a
  human-only step: return unverified with how = apply the in-scope recommendation (an exact-head approval or
