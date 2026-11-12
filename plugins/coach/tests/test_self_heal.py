@@ -74,6 +74,10 @@ def test_complaint_prefilter_skips(text):
     '[Message from another Hermes session "Review" (@session:default/other)]\nThe card is blocked; fix it.',
     '⏸ [default] @default Kanban t_12345678 blocked: Approve the maintenance operation.',
     '⏸️ [default] @worker Kanban t_12345678 blocked: needs authorization',
+    # gateway/kanban_watchers_notifier.py stuck/wait notice (kanban-3ba089808c: filed as David's complaint, then the
+    # waiting card itself was adopted as the defect's fix owner)
+    '⏳ [default] @default Kanban t_01a1cc08f1eab72f: t_01a1cc08f1eab72f (Kanban: a failed worker_result), which this '
+    'chat waits on, has been ready 30 min with no worker (waiting for a pool worker (admission_limits))',
     '[chat-closeout] Every kanban card this chat handed work to has settled.\nblocked: needs approval',
 ])
 def test_synthetic_coordination_never_calls_complaint_judge(text):
