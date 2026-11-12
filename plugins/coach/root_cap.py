@@ -1310,10 +1310,22 @@ def _initial_temporary(own_text, leaf):
                 and any(_permanent_scope(s) for s in live))
 
 
+# The restore trigger is one provenance field with two parts: owner completion and/or an expiry. A sentence that
+# mentions either part mutates that field exactly like a sentence about restoring, so withdrawing, replacing or
+# re-dating the expiry retires the old trigger and the write refuses until a valid own restore sentence (a closed
+# `Restore ... to N <trigger>` form) supplies a new one. "the/its/no expiry" always points at the trigger; a bare
+# expires/until/till, deadline/time limit or UTC timestamp does only when the sentence is about the cap (names the key or
+# points at it with it/that/this), so "I'm away until Monday." or "The report deadline is Friday." stays unrelated.
+_EXPIRY_WORDS = re.compile(r"\b(?:the|its|an?|no|this|that|new|old)\s+expir\w*\b|\bexpir\w*\s+(?:date|time|trigger)\b")
+_EXPIRY_WEAK = re.compile(r"\b(?:expir\w*|until|till|deadline|time[- ]?(?:limit|box)\w*)\b")
+
+
 def _provenance_fields(s):
     low = s.lower()
     fields = set()
-    if re.search(r"\b(?:restore|restoration|revert)\w*\b", low):
+    weak = bool(_EXPIRY_WEAK.search(low) or _ISO.search(s)) and (
+        _about_cap(low, "max_in_progress") or bool(re.search(r"\b(?:it|its|that|this)\b", low)))
+    if re.search(r"\b(?:restore|restoration|revert)\w*\b", low) or _EXPIRY_WORDS.search(low) or weak:
         fields.add("restore")
     # The restore trigger's 'owner completion' is not an owner assignment.
     if re.search(r"\bowner\b(?!\s+(?:completion|completes|is done|finishes|terminal)\b)", low) or _CARD.search(low):
