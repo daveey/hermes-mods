@@ -109,7 +109,12 @@ hardcoded: the freeze exists only as a registered record.
   `sed/yq/perl` or redirects onto the root `config.yaml` that name the key, and literal `terminal()`, `subprocess`,
   `os.system` calls in `execute_code` (constants and simple assignments folded). Single-quoted text, `echo`/`grep`
   arguments and `cat <<'EOF'` bodies are data. Dynamic commands or config-API writes that name the key are refused as
-  ambiguous. This is not a sandbox: scripts run from files and fully dynamic Python are not covered.
+  ambiguous. Direct-edit paths are resolved the way the shell resolves them: `$HERMES_HOME`/`${HERMES_HOME}`/`$HOME`,
+  variables the command assigned, `cd`/`pushd` inside the command and the terminal `workdir`; a config writer whose
+  target cannot be resolved (unknown `$VAR`, `$(...)`, relative `config.yaml` with no established directory) and that
+  names the key is refused as unverifiable (`tests/test_root_cap_direct_edit.py`, terminal and execute_code).
+  Unrelated keys, reads and other files stay allowed. This is not a sandbox: scripts run from files and fully
+  dynamic Python are not covered.
 
 Tests: `tests/test_root_cap_guard.py` (matrix on both tool entry paths, native-session fixture) and
 `tests/test_root_cap_hardening.py` (independent-review findings R1-R6, distinct profile stores, concurrency race,

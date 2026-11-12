@@ -79,12 +79,32 @@ def _root_of(home):
     return p.parent.parent if p.parent.name == "profiles" else p
 
 
-def _expand(word):
-    """Literal path of a shell word, or None when it depends on an unknown variable/substitution."""
+_CWDS = "\0cwds"  # key in the scan env: directories the command may be running in (None = unknown/ambient)
+_VAR = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def _expand(word, env=None, _depth=0):
+    """Literal path of a shell word, or None when it depends on an unknown variable/substitution. `$HOME`,
+    `$HERMES_HOME` (the running home unless the command assigned it) and variables the command itself assigned
+    (`env`) are expanded: the repo-documented spellings `$HERMES_HOME/config.yaml` must not hide the path."""
     if not isinstance(word, str):
         return None
     home = os.environ.get("HOME") or os.path.expanduser("~")
-    word = word.replace("${HOME}", home).replace("$HOME", home)
+    env = env or {}
+
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        value = env.get(name)
+        if isinstance(value, str):
+            inner = _expand(value, env, _depth + 1) if _depth < 4 else None
+            return inner if inner is not None else m.group(0)
+        if name == "HOME":
+            return home
+        if name == "HERMES_HOME":
+            return _env_home()
+        return m.group(0)
+
+    word = _VAR.sub(sub, word)
     if "$" in word or "`" in word:
         return None
     return os.path.expanduser(word)
@@ -911,6 +931,9 @@ def _scan_command(command, parsed, env=None, depth=0):
                     k, v = w.split("=", 1)
                     env[k] = v
             continue
+        if exe in ("cd", "pushd"):
+            _track_cd(words, env)
+            continue
         if exe in _SHELLS:
             payload = _payload(words, "c")
             if payload is not None:
@@ -926,7 +949,7 @@ def _scan_command(command, parsed, env=None, depth=0):
             continue
         if _is_hermes(words):
             _scan_hermes(words, env, parsed)
-        _scan_raw(exe, words, redirects, lowered, parsed)
+        _scan_raw(exe, words, redirects, lowered, parsed, env)
     # a redirect-only write such as `echo 'max_in_progress: 8' >> config.yaml` still reaches _scan_raw above
 
 
@@ -993,17 +1016,83 @@ def _scan_hermes(words, env, parsed):
     parsed.sets.append({"key": key, "value": value, "home": home})
 
 
-def _scan_raw(exe, words, redirects, lowered, parsed):
-    paths = [_real(p) for p in (_expand(w) for w in [*words[1:], *redirects]) if p]
-    if not any(p.endswith("config.yaml") for p in paths):
+def _track_cd(words, env):
+    """`cd X` / `pushd X`: the directories later relative paths may resolve against. The set only grows (a subshell
+    `(cd X)` or `popd` can return to an earlier one), so a relative path is checked against every candidate; an
+    unresolvable target (`cd "$(...)"`, `cd $DIR`) adds None = unknown."""
+    if words[1:] == ["-"]:
         return
-    writer = bool(redirects) and any(_real(_expand(r) or "") .endswith("config.yaml") for r in redirects if _expand(r))
+    args = [w for w in words[1:] if not w.startswith("-")]
+    cwds = list(env.get(_CWDS) or [None])
+    target = _expand(args[0], env) if args else os.environ.get("HOME") or os.path.expanduser("~")
+    new = []
+    for c in cwds:
+        if target is None:
+            new.append(None)
+        elif os.path.isabs(target):
+            new.append(os.path.normpath(target))
+        elif c is None:
+            new.append(None)
+        else:
+            new.append(os.path.normpath(os.path.join(c, target)))
+    merged = []
+    for c in [*cwds, *new]:
+        if c not in merged:
+            merged.append(c)
+    env[_CWDS] = merged if len(merged) <= 16 else [*merged[:15], None]
+
+
+_OPAQUE = re.compile(r"^\$\{?\w+\}?(?:/|$)")
+
+
+def _paths_of(word, env, flags):
+    """Resolved absolute path(s) of one operand: `$HERMES_HOME`/`$HOME`/assigned variables expanded, relative paths
+    resolved against every directory the command may be in. Records in `flags` an operand that names config.yaml
+    (or is a bare `$VAR/...` path) but cannot be resolved (`unresolved`), and a relative config.yaml whose directory
+    is not established inside the command (`ambient`: the hook's cwd is not the shell's persistent cwd)."""
+    p = _expand(word, env)
+    if p is None:
+        if isinstance(word, str) and ("config.yaml" in word or _OPAQUE.match(word)):
+            flags["unresolved"] = True
+        return []
+    if not p:
+        return []
+    if os.path.isabs(p):
+        return [_real(p)]
+    out = []
+    for c in env.get(_CWDS) or [None]:
+        if c is None:
+            out.append(_real(p))
+            if p.endswith("config.yaml"):
+                flags["ambient"] = True
+        else:
+            out.append(_real(os.path.join(c, p)))
+    return out
+
+
+def _scan_raw(exe, words, redirects, lowered, parsed, env=None):
+    env = env if env is not None else {}
+    flags = {"unresolved": False, "ambient": False}
+    flags_redirect = {"unresolved": False, "ambient": False}
+    # `VAR=x cmd $VAR/config.yaml` expands $VAR BEFORE the prefix assignment takes effect, so every operand is
+    # resolved twice: with the assignments the command made and with only the built-in $HOME/$HERMES_HOME.
+    views = [env, {_CWDS: env.get(_CWDS)}]
+    paths = [p for v in views for w in words[1:] for p in _paths_of(w, v, flags)]
+    red_paths = [p for v in views for r in redirects for p in _paths_of(r, v, flags_redirect)]
+    paths += red_paths
+    for k in flags:
+        flags[k] = flags[k] or flags_redirect[k]
+    if not any(p.endswith("config.yaml") for p in paths) and not flags["unresolved"]:
+        return
+    writer = any(p.endswith("config.yaml") for p in red_paths) or flags_redirect["unresolved"]
     if exe in _WRITERS:
         writer = True
     if exe in _INPLACE and any(w.startswith("-") and not w.startswith("--") and "i" in w[1:] or w in (
             "--in-place", "--inplace") for w in words[1:]):
         writer = True
     if writer and any(_leaf(k) in lowered for k in GUARDED_KEYS):
+        if flags["unresolved"] or flags["ambient"]:
+            parsed.dynamic = True  # the written file cannot be proven not to be a frozen config: refuse
         parsed.raw.append({"paths": paths})
 
 
@@ -1078,7 +1167,13 @@ def parse(tool_name, args):
     if not isinstance(args, dict):
         return parsed
     if name == "terminal" and isinstance(args.get("command"), str):
-        _scan_command(args["command"], parsed)
+        workdir = args.get("workdir")
+        start = None
+        if isinstance(workdir, str) and workdir.strip():
+            expanded = _expand(workdir)
+            if expanded:
+                start = os.path.normpath(expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded))
+        _scan_command(args["command"], parsed, {_CWDS: [start]})
     elif name == "execute_code" and isinstance(args.get("code"), str):
         _scan_code(args["code"], parsed)
     return parsed
