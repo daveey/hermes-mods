@@ -1237,6 +1237,22 @@ export function openAskCount() {
   }).length
 }
 
+/** Queue membership before search/minimize; shared with card-status dedup. */
+function representedInQueue(scope, r) {
+  const pending = requestNeedsReadback(scope, r)
+  return ((!r.resolution && ['open','needs_context'].includes(r.state)) || pending) && (pending || !isRequestDismissed(r))
+}
+export function presentationForSource(source) {
+  const scope = routeKey(decisionRoute())
+  if (!decisionRoute().session || canonical.scope !== scope) return null
+  const r = requestForSource(canonical.requests, source)
+  return r ? { state: r.state, dismissed: isRequestDismissed(r), representedInQueue: representedInQueue(scope, r) } : null
+}
+export function hasQueuePresentation() {
+  const scope = routeKey(decisionRoute())
+  return !!decisionRoute().session && canonical.scope === scope && canonical.requests.some(r => representedInQueue(scope, r))
+}
+
 // `embedded`: drawn inside the session panel, which supplies the frame, heading and minimize control.
 export function ActionQueue({ embedded = false } = {}) {
   const [snap, setSnap] = useState(canonical), [filter, setFilter] = useState('')
@@ -1253,7 +1269,7 @@ export function ActionQueue({ embedded = false } = {}) {
   // Closed requests, including withdrawn (moot) asks, are not shown or counted; they still suppress their
   // own legacy references through requestForSource.
   const needsReadback = r => requestNeedsReadback(scope, r)
-  const requests = snap.requests.filter(r => ((!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r)) && !(!needsReadback(r) && isRequestDismissed(r)))
+  const requests = snap.requests.filter(r => representedInQueue(scope, r))
   if (!requests.length && !snap.error) return null
   const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
   // Minimized holds only while every shown request was already shown when the user minimized; a new one (or a new
@@ -1357,7 +1373,7 @@ export default {
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, ActionQueue, Strip, openAskCount }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, presentationForSource, hasQueuePresentation, ActionQueue, Strip, openAskCount }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)

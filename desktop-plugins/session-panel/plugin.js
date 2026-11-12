@@ -80,7 +80,7 @@ export function trackSubagents(chips, nowMs, memory) {
 
 /** Sort the chat's work into the panel's sections. `isAsked(chip)` = a user-steps ask already covers this card. */
 const TERMINAL = new Set(['done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'])
-export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false } = {}) {
+export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null } = {}) {
   const now = nowMs / 1000
   const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
@@ -110,7 +110,18 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     if (c.stale) { out.waiting.push({ ...item(c), detail: `status unknown · last known: ${c.look === 'needs-you' ? 'needs you' : c.state || 'unknown'}${last ? ` (${ago(last, nowMs)})` : ''}; the card could not be re-read` }); continue }
     if (c.look === 'needs-you') {
       // A finished, archived or cancelled card asks nothing, whatever wait it last reported.
-      if (!TERMINAL.has(str(c.state)) && !isAsked(c)) out.unasked.push({ ...item(c), detail: on || 'needs you' })
+      if (!TERMINAL.has(str(c.state))) {
+        if (!isAsked(c)) out.unasked.push({ ...item(c), detail: on || 'needs you' })
+        else {
+          const presentation = presentationFor(c)
+          // Retiring an ask does not settle its still-blocked owner. Keep status discoverable without
+          // reviving a decision or inferring authorization; older bridges retain their existing dedup.
+          if (c.state === 'blocked' && presentation?.representedInQueue === false) {
+            out.waiting.push({ ...item(c), cardStatus: true,
+              detail: `${c.gatewayId || c.gateway || '?'} / ${c.profile || '?'} / ${c.board || 'default'} / ${c.id} · blocked · request ${presentation.dismissed ? 'dismissed' : presentation.state}` })
+          }
+        }
+      }
       continue
     }
     // Finished cards come from the Done list (/session-cards); a terminal chip here is not waiting on anything.
@@ -416,6 +427,7 @@ export function Pips({ n, hub = {} }) {
 // Each row leads with the same box as its header pip (shape + colour + hub "H"), not a bullet dot, so the
 // header and the list read as one legend. Centred on the 19px first line.
 function Row({ i, k }) {
+  if (i.cardStatus) return jsx(CardStatusRow, { i })
   const hub = onHub(i)
   return jsxs('div', { 'data-panel-row': i.key, style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr)', columnGap: 6, padding: '3px 0', fontSize: 13 }, children: [
     jsx('span', { 'aria-hidden': true, 'data-row-pip': k, ...(hub ? { 'data-row-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), justifySelf: 'center', marginTop: hub ? 3.5 : 5 }, children: hub ? 'H' : undefined }),
@@ -423,6 +435,19 @@ function Row({ i, k }) {
       jsx('div', { title: str(i.chip?.title) || i.label, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: i.label }),
       i.detail && jsx('div', { style: { ...muted, overflowWrap: 'anywhere' }, children: i.detail })
     ] })
+  ] })
+}
+
+function CardStatusRow({ i }) {
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const canOpen = !!i.chip.connectionId && !!i.chip.profile && typeof st?.openTaskChip === 'function'
+  const request = i.chip.humanRequest
+  return jsxs('div', { 'data-card-status': i.key, style: { padding: '6px 0', overflowWrap: 'anywhere', fontSize: 13 }, children: [
+    jsx('div', { children: i.detail }),
+    jsx('div', { style: muted, children: `Previous request (reference only): ${str(request?.action) || 'Not available.'}` }),
+    request?.why && jsx('div', { style: muted, children: str(request.why) }),
+    jsx('div', { style: muted, children: 'The owner card still reports blocked; this does not reopen its decision.' }),
+    canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: btn, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
   ] })
 }
 
@@ -501,7 +526,8 @@ export function Panel() {
   const chips = tasks && tasks.stored === stored ? tasks.chips || [] : []
   const silence = trackSubagents(chips, now, subMemory)
   const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
-  const sorted = classify(chips, { nowMs: now, silence, isAsked })
+  const presentationFor = c => US?.presentationForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
+  const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor })
   const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
   const finished = doneState.scope === scope ? doneState.rows : cachedDone(scope)
   const n = counts(sorted, { asks, done: finished ? finished.length : null })
@@ -509,7 +535,7 @@ export function Panel() {
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
   // Finished cards alone are no reason to take space above the composer: an all-green chat shows nothing.
-  if (!hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) return null
+  if (!US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) return null
   const attention = attentionKeys(asks, sorted)
   const collapsed = !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
   const toggle = () => { const next = collapsed ? null : attention; writeCollapsed(next); setCollapsedState(next) }
