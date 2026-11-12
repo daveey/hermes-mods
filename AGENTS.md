@@ -73,7 +73,7 @@ A new guard also belongs in private `home/plugins-every-host.txt`; export must n
 5. `git add` + `git commit` (the pre-commit hook runs gitleaks and the private denylist; enable it
    with `git config core.hooksPath .githooks` if `hermes-sync` hasn't yet). Then `git push`, or let
    the next `hermes-sync` run push it.
-   For a large selection, run `scripts/pre-push-suites --prepare origin/main HEAD` first on the hub. It permits up to one hour and saves a one-hour local success receipt for that exact base/head and gate code; the push reuses it, while a changed range, expired receipt, failure or changed gate reruns/refuses. Fetch before preparing. `--no-core` uses an isolated home and clean interpreter environment; do not run core-backed whole suites on the MacBook.
+   For a large selection, run `scripts/pre-push-suites --prepare origin/main HEAD` first on the hub. It permits up to one hour and saves a one-hour local success receipt for that exact base/head and gate code; the push reuses it, while a changed range, expired receipt, failure or changed gate reruns/refuses. Fetch before preparing; on a busy main set `HERMES_MODS_PREPARE_JOBS=<n>` (default 4, `--prepare` only) so it finishes before main moves. `--no-core` uses an isolated home and clean interpreter environment; do not run core-backed whole suites on the MacBook.
 6. New backend plugin → enable it with `hermes plugins enable <name>` (recorded in the private repo).
    Update the tables in `README.md`.
 7. Other machines pick it up on their next `hermes-sync` pass (≤10 min).

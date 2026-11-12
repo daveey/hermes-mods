@@ -111,6 +111,20 @@ def test_contract():
         self.assertNotIn('test-all:', result.stdout)
         self.assertEqual(self.tip(), self.git('rev-parse', 'HEAD').stdout.strip())
 
+    def test_prepare_jobs_must_be_a_positive_integer(self):
+        command = [sys.executable, str(self.repo / 'scripts/pre-push-suites'), '--prepare', self.base, 'HEAD']
+        for bad in ('0', 'many', '-3'):
+            result = subprocess.run(command, cwd=self.repo, env=dict(self.env, HERMES_MODS_PREPARE_JOBS=bad),
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 2, bad)
+            self.assertIn('HERMES_MODS_PREPARE_JOBS', result.stderr)
+        self.test.write_text('def test_contract():\n    assert 3 == 3\n')
+        self.commit()
+        wide = subprocess.run(command, cwd=self.repo, env=dict(self.env, HERMES_MODS_PREPARE_JOBS='12'),
+                              capture_output=True, text=True, timeout=280)
+        self.assertEqual(wide.returncode, 0, wide.stdout + wide.stderr)
+        self.assertIn('verified local receipt', self.git('push', 'origin', 'HEAD:main').stdout)
+
     def test_failed_revalidation_removes_earlier_success(self):
         self.test.write_text('import os\ndef test_contract():\n    assert not os.environ.get("FAIL_FIXTURE")\n')
         self.commit()
