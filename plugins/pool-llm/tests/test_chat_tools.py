@@ -50,6 +50,23 @@ def test_request_translation(upstream, choice, expected):
     assert body == before
 
 
+@pytest.mark.parametrize("thinking", [{"type": "disabled"}, {"type": "enabled", "budget_tokens": 1024}, None])
+def test_thinking_passthrough(upstream, thinking):
+    seen, _ = upstream
+    body = request(thinking=thinking)
+    before = copy.deepcopy(body)
+    pl._chat_completions(body, {})
+    assert "thinking" in seen
+    assert seen["thinking"] == thinking
+    assert body == before
+
+
+def test_absent_thinking_is_not_added(upstream):
+    seen, _ = upstream
+    pl._chat_completions(request(), {})
+    assert "thinking" not in seen
+
+
 def test_reply_calls_and_usage(upstream):
     route = {}
     out = pl._chat_completions(request(), route)
@@ -58,6 +75,27 @@ def test_reply_calls_and_usage(upstream):
         "function": {"name": "weather", "arguments": '{"city": "Paris"}'}}]}}
     assert out["usage"] == {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
     assert route == {"provider": "anthropic", "account": "fixture"}
+
+
+@pytest.mark.parametrize("thinking_tokens", [1191, 0])
+def test_reply_thinking_tokens_reported_as_reasoning(upstream, thinking_tokens):
+    _, reply = upstream
+    reply["usage"]["output_tokens"] = 1500
+    reply["usage"]["output_tokens_details"] = {"thinking_tokens": thinking_tokens}
+    before = copy.deepcopy(reply)
+    out = pl._chat_completions(request(), {})
+    assert out["usage"] == {"prompt_tokens": 12, "completion_tokens": 1500,
+                            "total_tokens": 1512,
+                            "completion_tokens_details": {"reasoning_tokens": thinking_tokens}}
+    assert out["choices"][0]["finish_reason"] == "tool_calls"
+    assert reply == before
+
+
+def test_reply_without_thinking_tokens_omits_reasoning(upstream):
+    _, reply = upstream
+    reply["usage"]["output_tokens_details"] = {}
+    out = pl._chat_completions(request(), {})
+    assert "completion_tokens_details" not in out["usage"]
 
 
 @pytest.mark.parametrize("reason,finish", [("max_tokens", "length"), ("end_turn", "stop")])

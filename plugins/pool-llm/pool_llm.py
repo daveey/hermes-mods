@@ -326,6 +326,8 @@ def _chat_tools_to_anthropic(body: dict, model: str) -> dict:
     """Translate the non-streaming OpenAI function-tool protocol without losing history."""
     messages = body.get("messages") or []
     out = _chat_to_anthropic([], body.get("max_tokens") or body.get("max_completion_tokens") or 4096, model)
+    if "thinking" in body:
+        out["thinking"] = body["thinking"]
     system = []
     for msg in messages:
         role, content = msg.get("role"), msg.get("content")
@@ -402,10 +404,14 @@ def _anthropic_tool_chat_reply(resp: dict, model: str) -> dict:
     usage = resp.get("usage") or {}
     prompt = sum(usage.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
     completion = usage.get("output_tokens", 0)
+    chat_usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    output_details = usage.get("output_tokens_details") or {}
+    if "thinking_tokens" in output_details:
+        chat_usage["completion_tokens_details"] = {"reasoning_tokens": output_details["thinking_tokens"]}
     finish = {"tool_use": "tool_calls", "max_tokens": "length"}.get(resp.get("stop_reason"), "stop")
     return {"id": resp.get("id", "pool-chat"), "object": "chat.completion", "model": resp.get("model", model),
             "choices": [{"index": 0, "finish_reason": finish, "message": message}],
-            "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}}
+            "usage": chat_usage}
 
 
 def _chat_completions(body: dict, route: dict) -> dict:
