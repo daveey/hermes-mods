@@ -253,3 +253,22 @@ test('rows are non-clickable with the backend reason only when selection.unavail
   on.button.onClick(); assert.deepEqual(on.calls, [['anthropic', a]])
   assert.ok(!on.button.title.includes('managed'))
 })
+
+// Core's stale-code refusal of model.options after a core update (hermes-hub 2026-11-12, SSH backend on f4caf04 vs
+// ef7a9e6): the bar must say the backend needs a restart, not a bare "usage ?" (t_01a1cea849893f99).
+const STALE_503 = 'Error invoking remote method \'hermes:api\': Error: 503: {"detail":"Restart required: This process is running code from f4caf04160 but the checkout on disk is now ef7a9e6b2d. The model picker would risk a stale-module crash — restart the Desktop-owned backend to load the new code (use Restart backend in Hermes Desktop, or quit and reopen the app)"}'
+test('stale-code model.options refusal reads "backend on old code: restart"; other errors stay "usage ?"', async () => {
+  const { plugin, ctx } = await setup()
+  globalThis.__auTestHost.request = async () => { throw new Error(STALE_503) }
+  const store = plugin.createStore(ctx)
+  await store.refresh()
+  const { error, groups } = store.$state.get()
+  assert.deepEqual(groups, [])
+  const stale = plugin.unavailableLabel(error)
+  assert.equal(stale.label, 'backend on old code: restart')
+  assert.match(stale.title, /^Account usage unavailable: backend on old code: restart/)
+  assert.match(stale.title, /f4caf04160/)
+  const other = plugin.unavailableLabel('Error: 502: gateway timeout')
+  assert.deepEqual(other, { label: 'usage ?', title: 'Account usage unavailable: Error: 502: gateway timeout' })
+  delete globalThis.__auTestHost.request
+})

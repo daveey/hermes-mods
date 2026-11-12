@@ -203,6 +203,19 @@ export function needsReconnect(account) {
   return !!account && (account.state === 'unavailable' || account.reason === 'auth')
 }
 
+// Status-bar text for a failed model.options read. After a core update the Desktop-owned backend refuses it
+// with core's stale-code 503 ("Restart required: This process is running code from <old> but the checkout on
+// disk is now <new> ...", hermes_cli/web_routers/models.py) until it restarts; a bare "usage ?" hid that.
+const STALE_BACKEND_RE = /Restart required:|running code from \S+ but the checkout on disk is now/i
+export const STALE_BACKEND_LABEL = 'backend on old code: restart'
+export function unavailableLabel(error) {
+  const text = String(error || '')
+  if (STALE_BACKEND_RE.test(text)) {
+    return { label: STALE_BACKEND_LABEL, title: `Account usage unavailable: ${STALE_BACKEND_LABEL} (use Restart backend in Hermes Desktop, or quit and reopen the app). ${text}` }
+  }
+  return { label: 'usage ?', title: `Account usage unavailable: ${text}` }
+}
+
 // ── state ─────────────────────────────────────────────────────────────────
 
 // Provider-global observation, scoped to the ambient gateway/profile. Never fall
@@ -537,7 +550,8 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
   useEffect(() => { if (open) selectionStore.refresh() }, [open, focused, owner, connection, profile, model, selectionStore])
   if (!groups.length) {
     if (!error) return null
-    return jsx('span', { className: BAR_CLASS, title: `Account usage unavailable: ${error}`, children: 'usage ?' })
+    const { label, title } = unavailableLabel(error)
+    return jsx('span', { className: BAR_CLASS, title, children: label })
   }
   return jsxs(Popover, { open, onOpenChange: v => { setOpen(v); if (v) store.refresh() }, children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage', children:
