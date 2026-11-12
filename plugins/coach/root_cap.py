@@ -1320,12 +1320,65 @@ _EXPIRY_WORDS = re.compile(r"\b(?:the|its|an?|no|this|that|new|old)\s+expir\w*\b
 _EXPIRY_WEAK = re.compile(r"\b(?:expir\w*|until|till|deadline|time[- ]?(?:limit|box)\w*)\b")
 
 
+# Topic lexicon (v14). Recognising a withdrawal by its WORDING is an open set (v10-v13 each lost to a new phrasing),
+# so the field is recognised by its TOPIC instead: a sentence that mentions the trigger's subject matter (expiry,
+# deadline, time limit/box, cutoff, end date, owner completion, rollback, a timer/date/trigger) mutates the restore
+# trigger unless it is clearly about something else. Fail-closed by design: a false positive only demands a fresh valid
+# `Restore ... to N <trigger>` sentence, a false negative would admit an untracked raise.
+#   strong topic word  -> relevant when the sentence carries ANY mutation/negation signal, or the word is pointed at
+#                         (sentence start, the/its/that/this/any/a/no/old/new/it/which/your/digits before it) or the
+#                         sentence is a short (<=3 words) imperative; "The report deadline is Friday." and
+#                         "My passport expires next year." (a different object, no signal) stay unrelated.
+#   weak topic word    -> (date, timer, completion, trigger ...) relevant only together with a mutation signal.
+_TRIG_STRONG = re.compile(
+    r"\b(?:expir\w*|deadline\w*|time[- ]?limit\w*|time[- ]?box\w*|time[- ]?out\w*|cut[- ]?off\w*|end[- ]?date\w*|"
+    r"due[- ]?date\w*|ttl|owner[- ]completion|completion[- ]trigger|"
+    r"owner (?:completes?|is done|done|finish\w*|terminal\w*|ends?|exits?)|"
+    r"roll[- ]?back (?:time|trigger|date|deadline)\w*)\b")
+_TRIG_WEAK = re.compile(
+    r"\b(?:dates?|timers?|completion|triggers?|triggering|triggered|lifetime|duration|countdown)\b")
+_TRIG_MUTATION = re.compile(
+    r"\b(?:cancel\w*|withdr\w*|drop\w*|scrap\w*|forget\w*|forgot\w*|disregard\w*|ignor\w*|remov\w*|delet\w*|clear\w*|"
+    r"never|nevermind|none|no|not|without|gone|void\w*|revok\w*|abandon\w*|skip\w*|cease\w*|stop\w*|"
+    r"discard\w*|ditch\w*|kill\w*|lift\w*|waiv\w*|erase\w*|unset|reset|disabl\w*|off|instead|replac\w*|chang\w*|"
+    r"mov\w*|extend\w*|shift\w*|updat\w*|set|make|now|neither|nor|nothing|nope|unlimited|indefinite\w*|forever|"
+    r"open[- ]ended|null|nil|zero|tie|tied|bind|bound|link\w*|detach\w*|"
+    r"decouple\w*|supersed\w*|overrid\w*|amend\w*|revis\w*|adjust\w*|edit\w*|alter\w*|postpon\w*|"
+    r"delay\w*|advance\w*|bring\w*|push\w*|pull\w*)\b|[a-z]n['’]t\b")
+_TRIG_POINTED = re.compile(r"(?:^|[\s:;,(])(?:the|its|that|this|these|those|any|an?|old|new|no|it|which|your|"
+                           r"each|every|one|\d[\w:.+-]*)$")
+
+
+def _trigger_topic(low):
+    strong = list(_TRIG_STRONG.finditer(low))
+    if not strong and not _TRIG_WEAK.search(low):
+        return False
+    if _TRIG_MUTATION.search(low):
+        return True
+    short = len(re.findall(r"[\w'’-]+", low)) <= 3
+    if not strong:
+        # a weak topic word counts without a mutation signal only as a short, pointed-at fragment ("Lose any timer.")
+        m = _TRIG_WEAK.search(low)
+        if not m:
+            return False
+        pre = low[:m.start()].rstrip()
+        return (short or len(re.findall(r"[\w'’-]+", low)) <= 6 and bool(_TRIG_POINTED.search(pre)))
+    if short:
+        return True
+    for m in strong:
+        pre = low[:m.start()].rstrip()
+        if not pre or pre.endswith((":", ";", ",", "(")) or _TRIG_POINTED.search(pre):
+            return True
+    return False
+
+
 def _provenance_fields(s):
     low = s.lower()
     fields = set()
     weak = bool(_EXPIRY_WEAK.search(low) or _ISO.search(s)) and (
         _about_cap(low, "max_in_progress") or bool(re.search(r"\b(?:it|its|that|this)\b", low)))
-    if re.search(r"\b(?:restore|restoration|revert)\w*\b", low) or _EXPIRY_WORDS.search(low) or weak:
+    if (re.search(r"\b(?:restore|restoration|revert)\w*\b", low) or _EXPIRY_WORDS.search(low) or weak
+            or _trigger_topic(low)):
         fields.add("restore")
     # The restore trigger's 'owner completion' is not an owner assignment.
     if re.search(r"\bowner\b(?!\s+(?:completion|completes|is done|finishes|terminal)\b)", low) or _CARD.search(low):
