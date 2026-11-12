@@ -247,6 +247,9 @@ export function trackSubagents(chips, nowMs, memory) {
 
 /** Sort the chat's work into the panel's sections. `isAsked(chip)` = a user-steps ask already covers this card. */
 const TERMINAL = new Set(['done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'])
+const LEGACY_LIVE = new Set(['running', 'review', 'ready', 'todo'])
+const NO_OBSERVATIONS = 'producer_sent_no_observations'
+const legacyLive = (c, ev) => ev?.reason === NO_OBSERVATIONS && c?.kind === 'kanban' && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
 export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
   const now = nowMs / 1000
   const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], lastActivity: 0 }
@@ -293,10 +296,11 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // Finished cards come from the Done list (/session-cards); a terminal chip here is not waiting on anything.
     if (TERMINAL.has(str(c.state))) continue
     // Source evidence that exists but is expired/incomplete/mismatched makes the card's status unknown, whatever the
-    // legacy fields still say (a cached running card must not read as running). A card with NO evidence (older
-    // producer) keeps its legacy section; the explicit unknown line is shown on its row instead.
+    // legacy fields still say (a cached running card must not read as running). An older producer (no
+    // observations array at all) cannot prove live or queued work either: its running/review/ready/todo card is
+    // explicit unknown with its last known state; its waits and asks keep their sections.
     const ev = evidence(c)
-    if (ev?.sourced && ev.state === 'unknown') {
+    if (ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
       out.waiting.push({ ...item(c), detail: `status unknown${ev.reason ? ` (${ev.reason.replace(/_/g, ' ')})` : ''} · last known: ${ev.lastKnown || c.state || 'unknown'}${ev.ageSec != null ? ` (observed ${span(ev.ageSec)} ago)` : ''}` })
       continue
     }
@@ -331,7 +335,7 @@ export function annotateEvidence(sorted, nowMs, opts) {
       const v = chipObservation(i.chip, nowMs / 1000, opts)
       i.evidenceText = chipEvidenceLine(i.chip, nowMs / 1000, opts)
       i.evidenceState = v.state
-      if (v.state === 'unknown' && (v.sourced || i.kind === 'bg' || i.kind === 'sub')) unknown++
+      if (v.state === 'unknown' && (v.sourced || i.kind === 'bg' || i.kind === 'sub' || legacyLive(i.chip, v))) unknown++
     }
   }
   return unknown
