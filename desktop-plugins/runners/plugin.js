@@ -451,7 +451,9 @@ function GatewayRow({ m, now }) {
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const v = loadParts(m.load, now)
   const drainNote = m.state === 'draining'
-    ? `draining: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); finishes running cards, takes no new ones`
+    ? m.hold_reason === undefined
+      ? 'draining: reason unavailable (dashboard older than hold metadata); finishes running cards, takes no new ones'
+      : `draining: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); finishes running cards, takes no new ones`
     : null
   const meta = [
     m.pinned_only ? 'pinned only' : null,

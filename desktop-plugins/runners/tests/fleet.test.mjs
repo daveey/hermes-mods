@@ -264,7 +264,8 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   const held = { state: 'draining', reason: 'on hold: finishes running cards, takes no new ones', labels: [], pinned_only: false, slots: 3, slots_source: 'registry', running: [] }
   body.gateways.machines = [
     { name: 'spare', ...held, hold_reason: 'disk cleanup', hold_by: 'operator-a', hold_at: NOW - 5 * 60000 },
-    { name: 'legacy', ...held, hold_reason: null, hold_by: 'operator-b', hold_at: NOW - 2 * 3600000 }
+    { name: 'legacy', ...held, hold_reason: null, hold_by: 'operator-b', hold_at: NOW - 2 * 3600000 },
+    { name: 'stale', ...held }
   ]
   const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
   const spare = ui.container.querySelector('[data-machine="spare"]')
@@ -281,6 +282,11 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   const slots = [...spare.querySelectorAll('.hermes-fleet-slot.is-draining')]
   assert.equal(slots.length, 3)
   for (const s of slots) assert.equal(s.title, want)
+  const stale = ui.container.querySelector('[data-machine="stale"]')
+  const unavailable = 'draining: reason unavailable (dashboard older than hold metadata)'
+  assert.ok(stale.querySelector('.hermes-fleet-info').dataset.tip.startsWith(unavailable))
+  for (const slot of stale.querySelectorAll('.hermes-fleet-slot.is-draining')) assert.ok(slot.title.startsWith(unavailable))
+  assert.doesNotMatch(stale.querySelector('.hermes-fleet-info').dataset.tip, /no reason recorded|held by unknown/)
   const legacy = ui.container.querySelector('[data-machine="legacy"]')
   assert.ok(legacy.querySelector('.hermes-fleet-info').dataset.tip.startsWith('draining: no reason recorded (held by operator-b, 2h ago); finishes running cards, takes no new ones'))
   await ui.close()
