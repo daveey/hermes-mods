@@ -25,7 +25,7 @@ from plugins.runners.collector import Collector, OwnerLock
 from plugins.runners.store import Store
 from plugins.runners.scripts.run_collector import load_runtime
 from plugins.runners.providers.github_actions import GitHubActions, _Failure
-from plugins.runners.providers.runtime import GitHubHTTPTransport, BrokerCredential, BrokerCredentialResolver
+from plugins.runners.providers.runtime import BrokerCredential, BrokerVendGitHub
 
 INTERVAL = 3600
 MAX_PAGES = 100
@@ -274,9 +274,21 @@ def main(argv=None):
     source = ConfigFile(args.config)
     config = source.load()
     runtime = load_runtime(args.runtime)
-    resolver = BrokerCredentialResolver({k: BrokerCredential(**v) for k, v in runtime['credentials'].items()},
+    # Every GET runs inside an open broker vend: the GitHub quota ledger records it
+    # and the shared reserve/brake can refuse it (providers/runtime.py).
+    github = BrokerVendGitHub({k: BrokerCredential(**v) for k, v in runtime['credentials'].items()},
         broker_command=(runtime.get('broker_executable', 'token-broker'),))
-    adapter = GitHubActions(transport=GitHubHTTPTransport(), credential_resolver=resolver, max_cycle_requests=2048)
+    try:
+        report = _run(args, source, config, runtime, github, discovery)
+    finally:
+        github.close()
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def _run(args, source, config, runtime, github, discovery):
+    resolver = github
+    adapter = GitHubActions(transport=github.transport, credential_resolver=resolver, max_cycle_requests=2048)
     identity = tuple(config[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch'))
     state = Path(args.state_dir)
     with OwnerLock(state / 'collector.lock', config, identity), Store(state / 'state.sqlite') as store:
@@ -298,8 +310,7 @@ def main(argv=None):
             candidate = source.update(candidate, expected_revision=config['config_revision'],
                                       expected_owner_epoch=config['owner_epoch'], backup=True)
     report.update(applied=bool(args.apply and changed), revision=candidate['config_revision'])
-    print(json.dumps(report, indent=2))
-    return 0
+    return report
 
 
 if __name__ == '__main__':

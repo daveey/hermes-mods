@@ -1,4 +1,5 @@
 from copy import deepcopy
+from types import SimpleNamespace
 import pytest
 from plugins.runners.providers.base import HTTPResponse, Credential
 from plugins.runners.canonical import canonical_repository, CanonicalError
@@ -106,7 +107,7 @@ def test_generator_cli_dry_run_then_cas_apply(tmp_path, monkeypatch, capsys):
     config = normalize(deepcopy(BASE)); config['scopes'] = [scope()]
     original = source.update(config, expected_revision=0, expected_owner_epoch=config['owner_epoch'])
     monkeypatch.setattr(cli, 'load_runtime', lambda _: {'credentials': {}})
-    monkeypatch.setattr(cli, 'BrokerCredentialResolver', lambda *a, **k: None)
+    monkeypatch.setattr(cli, 'BrokerVendGitHub', lambda *a, **k: SimpleNamespace(transport=None, close=lambda: None))
     def fake(config, runtime, transport, resolver, **kwargs):
         from plugins.runners.canonical import repoint_scopes
         return repoint_scopes(config, {scope()['id']: 'example/new'}), {'changes': [scope()['id']], 'errors': []}

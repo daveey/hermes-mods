@@ -3,6 +3,7 @@ from copy import deepcopy
 import hashlib
 import json
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -269,12 +270,20 @@ def test_cli_persists_evidence_dry_run_then_applies_only_after_snapshot(tmp_path
             super().__init__(clock=lambda: clock[0], **kw)
     monkeypatch.setattr(cli, 'GitHubActions', ClockedAdapter)
     monkeypatch.setattr(cli, 'load_runtime', lambda _: {'credentials': {}})
-    monkeypatch.setattr(cli, 'BrokerCredentialResolver', lambda *a, **k: lambda ref: Credential(ref, 'fictional-token'))
+    closed = []
     def transport(*a, **k):
         return HTTPResponse(200, {}, []) if '/orgs/' in a[1] else HTTPResponse(404, {}, {})
-    monkeypatch.setattr(cli, 'GitHubHTTPTransport', lambda: transport)
+    class Vend:
+        def __init__(self, *a, **k):
+            self.transport = transport
+        def __call__(self, ref):
+            return Credential(ref, 'fictional-token')
+        def close(self):
+            closed.append(1)
+    monkeypatch.setattr(cli, 'BrokerVendGitHub', Vend)
     args = ['--config', str(source.path), '--runtime', 'unused', '--state-dir', str(tmp_path), '--confirmation-interval', '100']
     assert cli.main(args) == 0
+    assert closed == [1]  # The run's open vends are always closed.
     assert source.path.read_bytes() == original and not list(tmp_path.glob('*.bak'))
     path = tmp_path / 'scope-confirmations.json'
     assert json.loads(path.read_text())[scope()['id']]['at'] == 100
@@ -297,7 +306,7 @@ def test_cli_repeatable_opt_in_organizations(tmp_path, monkeypatch):
     c = config(); c['scopes'] = []
     source.update(c, expected_revision=0, expected_owner_epoch=c['owner_epoch'])
     monkeypatch.setattr(cli, 'load_runtime', lambda _: {'credentials': {}})
-    monkeypatch.setattr(cli, 'BrokerCredentialResolver', lambda *a, **k: None)
+    monkeypatch.setattr(cli, 'BrokerVendGitHub', lambda *a, **k: SimpleNamespace(transport=None, close=lambda: None))
     seen = []
     def fake(config, *a, **kw):
         seen.extend(kw['discover_org'])

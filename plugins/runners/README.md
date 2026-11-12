@@ -101,7 +101,11 @@ alone do not establish production readiness.
 Create a private mode-0600 runtime JSON with `credentials` mapping opaque refs to
 `{scope, env_var, key}` broker references (never token values), and `probes` mapping
 opaque SSH refs to `{target, spec}`. Credential aliases sharing a provider quota
-must use the same `key`. Targets contain hostname, username, identity_file,
+must use the same `key`. The collector and `reconcile_scopes.py` never hold these
+tokens: each broker identity gets a short `token-broker exec` vend that performs the
+GETs itself (`BrokerVendGitHub`, ≤200 requests / 240 s / 60 s idle per vend), so for
+supervised GitHub user scopes every request is a `github_quota` ledger row (with
+`rate_limit_used`) and the shared quota reserve/brake applies. Targets contain hostname, username, identity_file,
 known_hosts_file and port; specs contain platform, opaque-ref-to-exact-service
 `services`, build_volume and explicit `tools`. Optional `job_repositories` maps
 scope IDs to bounded repository allowlists; omitted means no job enrichment.

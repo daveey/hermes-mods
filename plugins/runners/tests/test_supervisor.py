@@ -134,8 +134,10 @@ def test_real_dependencies_pacing_and_single_store(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, 'Store', stores)
     runtime.run(config, private, (GATEWAY, 'example', 1), tmp_path / 'state', once=True, startup_delay=0)
     assert factory.call_args.kwargs['pace_requests'] is True
-    assert isinstance(factory.call_args.kwargs['credential_resolver'], runtime.BrokerCredentialResolver)
-    assert isinstance(factory.call_args.kwargs['transport'], runtime.GitHubHTTPTransport)
+    # Metered: the token stays in the broker vend, which performs each GET.
+    github = factory.call_args.kwargs['credential_resolver']
+    assert isinstance(github, runtime.BrokerVendGitHub)
+    assert factory.call_args.kwargs['transport'] == github.transport
     assert stores.call_count == 1
 
 

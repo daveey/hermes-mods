@@ -36,7 +36,7 @@ from plugins.runners.config import ConfigFile
 from plugins.runners.store import Store
 from plugins.runners.probes.ssh import SSHProbe, SSHTarget, ProbeSpec
 from plugins.runners.providers.github_actions import GitHubActions
-from plugins.runners.providers.runtime import BrokerCredential, BrokerCredentialResolver, GitHubHTTPTransport
+from plugins.runners.providers.runtime import BrokerCredential, BrokerCredentialResolver, BrokerVendGitHub
 
 # The collector reads with GitHub *user* tokens (PAT/OAuth) whose 5000/h core bucket is
 # shared by every token of that user (gh on every host, CI helpers, agents).
@@ -164,10 +164,12 @@ def run(config_path, runtime_path, identity, state_dir, *, stop=None, once=False
             facts['tools_observed_at'] = time.time() - facts['tools_age_seconds']
             return facts
         host_probe.refresh = lambda host: host_probe(host, refresh_tools=True)
-        resolver = BrokerCredentialResolver(credentials,
+        # Every GET runs inside an open broker vend, so the GitHub quota ledger
+        # records it and the shared reserve/brake can refuse it (runtime.py).
+        github = BrokerVendGitHub(credentials,
             broker_command=(private.get('broker_executable', 'token-broker'),))
-        adapter = GitHubActions(transport=GitHubHTTPTransport(),
-                                credential_resolver=resolver, pace_requests=True, pacing_window=30,
+        adapter = GitHubActions(transport=github.transport,
+                                credential_resolver=github, pace_requests=True, pacing_window=30,
                                 quota_reserve=QUOTA_RESERVE, max_hourly_requests=MAX_HOURLY_REQUESTS)
         scopes = {s['id']: s for s in config['scopes']}
         jobs = private.get('job_repositories', {})
@@ -180,6 +182,7 @@ def run(config_path, runtime_path, identity, state_dir, *, stop=None, once=False
                    for repo in repositories):
                 raise RuntimeError('invalid_runtime_configuration')
         with ExitStack() as stack:
+            stack.callback(github.close)
             store = stack.enter_context(Store(state_dir / 'state.sqlite'))
             repairs = None
             if config['features']['repair_sessions']:

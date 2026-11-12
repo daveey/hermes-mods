@@ -1,4 +1,5 @@
 """Maintenance uses the same lifetime lock and keeps execution-bound scopes intact."""
+from types import SimpleNamespace
 import pytest
 from plugins.runners.collector import OwnerLock
 from plugins.runners.config import ConfigFile, normalize
@@ -13,7 +14,7 @@ def test_cli_refuses_live_collector_before_any_http(tmp_path, monkeypatch):
     source = ConfigFile(tmp_path / 'runners.yaml')
     config = source.update(config, expected_revision=0, expected_owner_epoch=config['owner_epoch'])
     monkeypatch.setattr(cli, 'load_runtime', lambda _: {'credentials': {}})
-    monkeypatch.setattr(cli, 'BrokerCredentialResolver', lambda *a, **k: None)
+    monkeypatch.setattr(cli, 'BrokerVendGitHub', lambda *a, **k: SimpleNamespace(transport=None, close=lambda: None))
     monkeypatch.setattr(cli, 'reconcile', lambda *a, **k: pytest.fail('network entered while collector owns lock'))
     identity = tuple(config[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch'))
     with OwnerLock(tmp_path / 'collector.lock', config, identity):
