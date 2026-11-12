@@ -279,6 +279,44 @@ def _reap_test_home_gateways(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _close_core_reader_caches(_join_coach_threads, tmp_path_factory):
+    # Teardown runs after _join_coach_threads: a joined poller can no longer reopen a reader.
+    """Close core's per-path SQLite reader caches after each test.
+
+    Core keeps one cached read-only connection per board path (kanban_session_activity._RO_CACHE, unbounded), up
+    to 16 replica observers (tui_gateway.kanban_replica_observer), and one never-closed lock-safe pread fd per
+    database file (sqlite_safe_read._PREAD_FDS; hermes_state_dbfile._HEADER_PROBE_FDS, opened by every SessionDB()).
+    Production has a
+    handful of boards; this suite makes a fresh kanban.db/state.db per test and pytest keeps every test dir until
+    the session ends, so the caches pinned ~10 fds (db, -wal, -shm) per test and the serial run hit EMFILE ('Too
+    many open files') near the 6,000th test under a 1024-fd limit (hub gate, 25515f06c15b and 91aa39d4f314).
+    Only modules a test already imported are reset (importing them here would cost every test), and only pread
+    fds on files under this session's basetemp are closed: the test is over, so dropping its POSIX locks is moot.
+    """
+    yield
+    activity = sys.modules.get('hermes_cli.kanban_session_activity')
+    if activity is not None and hasattr(activity, '_reset_cache_for_tests'):
+        activity._reset_cache_for_tests()
+    observer = sys.modules.get('tui_gateway.kanban_replica_observer')
+    if observer is not None and hasattr(observer, 'reset'):
+        observer.reset()
+    safe_read = sys.modules.get('hermes_cli.sqlite_safe_read')
+    probes = sys.modules.get('hermes_state_dbfile')
+    base = str(tmp_path_factory.getbasetemp().resolve()) + os.sep
+    for module, cache, guard in ((safe_read, '_PREAD_FDS', '_PREAD_LOCK'),
+                                 (probes, '_HEADER_PROBE_FDS', '_HEADER_PROBE_LOCK')):
+        fds, lock = getattr(module, cache, None), getattr(module, guard, None)
+        if not isinstance(fds, dict) or lock is None:
+            continue
+        with lock:
+            for key in [k for k in fds if os.path.realpath(k).startswith(base)]:
+                try:
+                    os.close(fds.pop(key)[0])
+                except OSError:
+                    pass
+
+
+@pytest.fixture(autouse=True)
 def _no_dependency_sync_in_tmp_home(tmp_path):
     """Regression guard: a test basetemp must never hold a uv cache or a built environment."""
     yield
