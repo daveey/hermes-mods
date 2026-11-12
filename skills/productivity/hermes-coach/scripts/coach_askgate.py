@@ -988,14 +988,41 @@ def _jsonl_ids(p):
     return have
 
 
+_ID_RX = re.compile(r"askgate-bb:([A-Za-z0-9_.-]{1,64}):([0-9]{1,12})")
+_HOST_RX = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+_PATTERN_RX = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
+_WEEK_RX = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
 def content_free_row(row):
-    """The allowlisted projection of a handoff row (None without a usable id and time): never the quote."""
-    if not isinstance(row, dict) or not isinstance(row.get("id"), str) or isinstance(row.get("t"), bool) \
-            or not isinstance(row.get("t"), (int, float)):
+    """The allowlisted, shape-checked projection of a handoff row, or None: never the quote. The id must be
+    `askgate-bb:<session>:<t>` and agree with the row's session and time; host, pattern and week that do not fit
+    their fixed shapes are written as null."""
+    if not isinstance(row, dict) or isinstance(row.get("t"), bool) or not isinstance(row.get("t"), (int, float)) \
+            or not isinstance(row.get("id"), str):
         return None
-    out = {k: row.get(k) for k in BB_REQUEST_KEYS}
-    out["t"] = int(row["t"])
-    return out
+    m = _ID_RX.fullmatch(row["id"])
+    if not m or row.get("session") != m.group(1) or int(row["t"]) != int(m.group(2)):
+        return None
+
+    def shaped(k, rx):
+        v = row.get(k)
+        return v if isinstance(v, str) and rx.fullmatch(v) else None
+
+    return {"id": row["id"], "t": int(row["t"]), "week": shaped("week", _WEEK_RX), "host": shaped("host", _HOST_RX),
+            "session": m.group(1), "pattern": shaped("pattern", _PATTERN_RX)}
+
+
+def _append_rows(p, rows):
+    """Append JSON lines (ASCII-escaped, so no value can fail to encode mid-write), first closing a torn last line."""
+    lines = "".join(json.dumps(r) + "\n" for r in rows)
+    with open(p, "a+b") as fh:
+        fh.seek(0, 2)
+        if fh.tell():
+            fh.seek(-1, 2)
+            if fh.read(1) != b"\n":
+                fh.write(b"\n")
+        fh.write(lines.encode("ascii"))
 
 
 def project_bb_handoff(path, requests_path=None):
@@ -1016,9 +1043,7 @@ def project_bb_handoff(path, requests_path=None):
             have.add(r["id"])
             new.append(r)
     if new:
-        with open(q, "a") as fh:
-            for r in new:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        _append_rows(q, new)
     return len(new)
 
 

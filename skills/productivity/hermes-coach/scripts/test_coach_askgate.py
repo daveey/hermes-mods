@@ -240,9 +240,9 @@ class ContentFreeHandoff(unittest.TestCase):
     def bb_hits(self, d):
         import json
         os.makedirs(f"{d}/macbook/default")
-        json.dump({"id": "s1", "host": "macbook", "source": "desktop", "title": "x", "user_turns": [
-            {"t": 2000, "text": self.QUOTE}, {"t": 2100, "text": "root cause the sidebar bug"}]},
-            open(f"{d}/macbook/default/s1.json", "w"))
+        with open(f"{d}/macbook/default/s1.json", "w") as fh:
+            json.dump({"id": "s1", "host": "macbook", "source": "desktop", "title": "x", "user_turns": [
+                {"t": 2000, "text": self.QUOTE}, {"t": 2100, "text": "root cause the sidebar bug"}]}, fh)
         hits, _ = g.collect(d, 0, 10**10)
         return [h for h in hits if h["class"] == g.BB_CLASS]
 
@@ -277,6 +277,31 @@ class ContentFreeHandoff(unittest.TestCase):
             self.assertEqual(json.loads(twin.read_text()), {"id": "askgate-bb:s0:1", "t": 1, "week": "2026-10-12",
                                                           "host": "macbook", "session": "s0", "pattern": "is-broken"})
             self.assertIsNone(g.project_bb_handoff(Path(d) / "nope" / "x.jsonl"))
+
+    def test_values_are_shape_checked_and_a_torn_twin_line_is_closed(self):
+        import json, tempfile
+        ok = {"id": "askgate-bb:s1:5", "t": 5, "week": "2026-10-12", "host": "macbook", "session": "s1",
+              "pattern": "is-broken"}
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "askgate-bb-misses.jsonl"
+            rows = [dict(ok, host=self.QUOTE, pattern=self.QUOTE, week=self.QUOTE),     # free text in value fields
+                    dict(ok, id="askgate-bb:s2:5", session="other"),                   # id disagrees with session
+                    dict(ok, id="askgate-bb:s3:6"),                                    # id disagrees with t
+                    dict(ok, id="askgate-bb:" + self.QUOTE + ":5", session=self.QUOTE),  # free text as the id
+                    dict(ok, id="askgate-bb:s4:5", session="s4", host="\\ud800bad".encode().decode("unicode_escape")),
+                    dict(ok, id="askgate-bb:s5:5", session="s5", t=True)]
+            out.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            twin = Path(d) / "askgate-bb-requests.jsonl"
+            twin.write_text('{"id": "torn')  # a previous write died mid-line, no newline
+            self.assertEqual(g.project_bb_handoff(out), 2)
+            lines = twin.read_text().splitlines()
+            self.assertEqual(lines[0], '{"id": "torn')
+            got = [json.loads(x) for x in lines[1:]]
+            self.assertEqual([r["id"] for r in got], ["askgate-bb:s1:5", "askgate-bb:s4:5"])
+            self.assertEqual((got[0]["host"], got[0]["pattern"], got[0]["week"]), (None, None, None))
+            self.assertIsNone(got[1]["host"])
+            self.assertNotIn("camera", twin.read_text())
+            twin.read_text().encode("ascii")  # surrogates etc. were never written raw
 
 
 class RouteToLane(unittest.TestCase):
