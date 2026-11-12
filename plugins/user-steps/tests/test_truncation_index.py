@@ -92,3 +92,60 @@ def test_index_entry_shape():
         {"55ae0189-aaaa": 1000.0}, now=1000.0 + 101 * 60, budget=500)
     assert line == '[Open asks from this chat (1): 55ae0189 "' + "x" * 60 + '…" rev 3, open 1 h 41 min]'
     assert plugin._open_asks_index([], {}, now=0.0, budget=500) == ""
+
+
+# The hook fixture above builds a 5-entry line under preview_head, so the trim loop never ran there. Days-old,
+# often-revised asks with long titles make each entry ~97 chars, so five of them overflow a real head budget.
+_NOW = 2_000_000.0
+_DAYS_OLD = 13 * 86400 + 23 * 3600
+
+
+def _long_pending(n=7):
+    pending = [{"requestId": f"{i:08x}-trim-fixture", "title": f"Ask {i}: " + "long scope title words " * 5,
+                "revision": 12} for i in range(n)]
+    return pending, {r["requestId"]: _NOW - _DAYS_OLD for r in pending}
+
+
+def _shown_ids(line, pending):
+    return [r["requestId"][:8] for r in pending if r["requestId"][:8] in line]
+
+
+def test_index_trims_from_end_to_fit_budget():
+    plugin = load_module("truncation_index_trim", ROOT / "__init__.py")
+    pending, created = _long_pending(7)
+    untrimmed = plugin._open_asks_index(pending, created, now=_NOW, budget=None)
+    assert len(untrimmed) > 250 and len(_shown_ids(untrimmed, pending)) == 5  # the fixture must force trimming
+    assert "open 13 d 23 h" in untrimmed
+    line = plugin._open_asks_index(pending, created, now=_NOW, budget=250)
+    assert len(line) <= 250, line
+    shown = _shown_ids(line, pending)
+    assert shown == [r["requestId"][:8] for r in pending[:len(shown)]] and 1 <= len(shown) < 5, line
+    # +N more counts the capped entries (6th, 7th) and the trimmed ones alike.
+    assert line.endswith(f"; +{7 - len(shown)} more]"), line
+    assert line.startswith("[Open asks from this chat (7): " + pending[0]["requestId"][:8])
+
+
+def test_index_budget_boundary_is_inclusive():
+    plugin = load_module("truncation_index_boundary", ROOT / "__init__.py")
+    pending, created = _long_pending(7)
+    two = plugin._open_asks_index(pending, created, now=_NOW, budget=250)
+    assert len(_shown_ids(two, pending)) == 2, two
+    assert plugin._open_asks_index(pending, created, now=_NOW, budget=len(two)) == two
+    one = plugin._open_asks_index(pending, created, now=_NOW, budget=len(two) - 1)
+    assert _shown_ids(one, pending) == [pending[0]["requestId"][:8]] and one.endswith("; +6 more]"), one
+    assert len(one) <= len(two) - 1
+
+
+@pytest.mark.parametrize("budget", [40, 10])  # 40 fits the bare line (39 chars); 10 is below even that
+def test_index_bare_more_when_no_entry_fits(budget):
+    import threading
+    plugin = load_module(f"truncation_index_bare_{budget}", ROOT / "__init__.py")
+    pending, created = _long_pending(7)
+    out = []
+    worker = threading.Thread(target=lambda: out.append(
+        plugin._open_asks_index(pending, created, now=_NOW, budget=budget)), daemon=True)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive(), "_open_asks_index looped when no entry fits the budget"
+    # The bare form is returned even when it is itself over budget: there is nothing left to drop.
+    assert out == ["[Open asks from this chat (7): +7 more]"]
