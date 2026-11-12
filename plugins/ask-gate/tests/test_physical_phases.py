@@ -53,6 +53,44 @@ def test_window_phrasings_are_recognised(gate, window):
     assert result and "physical_ask_phases" in result["message"]
 
 
+@pytest.mark.parametrize("tool", ["kanban_create", "kanban_block"])
+def test_historical_abbreviated_window_with_script_probe(gate, tool):
+    # Preserve producer syntax; scrub only identifiers, never paraphrase the failure.
+    request = ask(
+        action=("For the next 24 h, keep the device app closed and use your ring normally. "
+                "Record at least one note while your phone is away or locked for over an hour. "
+                "Also do one tap, one double tap, one tap-then-hold and one hold, each with no speech. "
+                "Then reply with roughly how many notes you made and whether you saw any pairing prompt. "
+                "Unblock = I compare app pulls against your notes; archive = skip the test "
+                "(Phase A stays unproven)."),
+        scope="24 h of normal ring use; read-only on the ring; device app stays installed.",
+        resolved_check="~/.hermes/evidence/device-direct-sync/day_test_done.sh")
+    result = invoke(gate, request, tool, task_id="t_ring0001")
+    assert result and "physical_ask_phases" in result["message"]
+    assert "kanban_schedule" in result["message"]
+    assert "never complete" in result["message"]
+
+
+@pytest.mark.parametrize("window", [
+    "For the next 24 h, record a note", "for 24h, record a note",
+    "normal ring use", "regular wrist device usage", "ordinary smart-watch wear",
+])
+def test_abbreviated_and_device_qualified_windows(gate, window):
+    result = invoke(gate, ask(
+        action=f"{window}. Unblock = analyse; archive = drop.",
+        resolved_check="~/.hermes/evidence/device-direct-sync/day_test_done.sh"))
+    assert result and "physical_ask_phases" in result["message"]
+
+
+@pytest.mark.parametrize("action", [
+    "Open normal settings on the phone once", "Unlock the phone for the next 24 help prompts",
+    "Open the normal ring settings and use the pairing button once",
+])
+def test_device_words_do_not_bridge_unrelated_clauses(gate, action):
+    assert invoke(gate, ask(action=f"{action}. Unblock = inspect; archive = drop.",
+                            resolved_check="test -s /captures/open.json")) is None
+
+
 def test_completed_step_plus_time_only_wait_is_not_a_human_ask(gate):
     result = invoke(gate, ask(
         scope=DAY_TEST["scope"] + "\nHUMAN_STEP: done (gestures recorded at 09:05)\nOBSERVATION: 24 h normal use",

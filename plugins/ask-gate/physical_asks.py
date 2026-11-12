@@ -16,10 +16,13 @@ _PREREQUISITE = re.compile(
 
 
 # A passive observation window: time or normal use that has to pass, which no human act can hurry.
+# Allow short device noun phrases, not punctuation/newlines or conjunctions joining separate acts.
+_DEVICE_WORD = r"(?!(?:and|or|then|to|on|in|with|for|of|the|a|an)\b)[\w-]+"
 _WINDOW = re.compile(
-    r"\b(?:normal|regular|everyday|ordinary|daily|real[- ]world)\s+(?:use|usage|wear)\b|"
+    r"\b(?:normal|regular|everyday|ordinary|daily|real[- ]world)[ \t]+"
+    + rf"(?:{_DEVICE_WORD}[ \t]+){{0,2}}(?:use|usage|wear)\b|"
     r"\b(?:over|for|during|across)\s+(?:the\s+next\s+)?(?:a\s+(?:full\s+|whole\s+)?|one\s+(?:full\s+)?|\d+\s*)"
-    r"(?:days?|hours?|hrs?|nights?|weeks?)\b|"
+    r"(?:days?|h|hours?|hrs?|nights?|weeks?)\b|"
     r"\bovernight\b|\ball[- ]day\b|\bat\s+least\s+\d+\s*(?:h|hours?|hrs?|days?)\b|"
     r"\b\d+\s*(?:h|hours?|hrs?|days?)\s+(?:of\s+)?(?:soak|wear|use|usage|observation|recording)\b|"
     r"\bsoak\b|\bobservation\s+window\b", re.I)
