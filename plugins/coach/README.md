@@ -77,7 +77,22 @@ hardcoded: the freeze exists only as a registered record.
   together with a negation/change signal, or points straight at one (`Expiry cancelled.`, `Forget the 2099 deadline.`,
   `Nuke expiry.`), retires the stale trigger unless it names another object (`My passport expires next year.`,
   `The report deadline is Friday.`); a false positive only asks for a fresh `Restore ... to N <trigger>` sentence. A later genuine
-  `Make that permanent.` or a fresh complete assignment remains possible. These deterministic English forms are
+  `Make that permanent.` or a fresh complete assignment remains possible.
+  **Adjacency window (the structural rule).** The authorizing message and the next three human messages after it
+  (`_FOLLOWUP_WINDOW`; user rows carry no assistant boundary, so a fixed count is the deterministic stand-in for
+  "before the next assistant turn") are one conversation about the decision. Inside it every own, affirmative,
+  non-question, non-quoted, non-reported sentence is judged by a CLOSED grammar, not by a vocabulary: it is a no-op
+  only when it is a courtesy/acknowledgement (`thanks`, `ok`, `yes, go ahead`, `keep going`, ...), valid owner/restore
+  terms, an affirmative permanence sentence, a restriction (bounded intent) or the authorization itself. Anything else
+  (`Scratch the conditions.`, `No strings attached.`, `Friday only.`, `Good for this sprint.`) clears the stored terms
+  and marks the decision temporary, so the write refuses until a fresh valid `Owner card ...` / `Restore ... to N
+  <trigger>` pair or an explicit permanent supersession exists. A question is recognised by a question mark or an
+  auxiliary plus a subject (`Did I ...`, `Is it ...`), someone else's words by a third-party attribution or quote, so
+  `Do it without conditions.` and `Disregard what I said earlier ...` stay the user's own. **Residual (documented, not
+  closed):** a restriction sent more than three human messages after the authorization is judged only by the older
+  topic gate (restore/owner/trigger/bound vocabulary), so unfamiliar wording that far away is not recognised, and an
+  unrelated own sentence inside the window costs one fresh terms sentence (a deliberate false positive). These
+  deterministic English forms are
   intentionally conservative: unsupported wording may refuse this frozen-cap write and require a clearer decision;
   this is not natural-language equivalence or a general configuration-edit ban.
 - **Storage**: every read-modify-write holds an exclusive `flock` on `<store>/.root_cap.lock` (threads and processes),

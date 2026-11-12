@@ -1,6 +1,6 @@
 import json
 import pytest
-from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP, PERM
+from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP, PERM, PAD
 
 @pytest.mark.parametrize('surface', SURFACES)
 @pytest.mark.parametrize('followup', [
@@ -17,7 +17,7 @@ def test_withdrawn_restoration_not_reused(w, surface, followup):
 def test_unrelated_permanence_does_not_relax(w, surface):
     w.register()
     followup = 'Keep that unchanged. The database migration is permanent.'
-    assert not w.blocked(surface, SET8, texts=[TEMP, followup])
+    assert not w.blocked(surface, SET8, texts=[TEMP, *PAD, followup])
     row = json.loads((w.shared / 'root_cap_exceptions.json').read_text())[-1]
     assert row['kind'] == 'temporary', 'unrelated permanent sentence erased owner/restore linkage'
 

@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP_OWNER, PERM, TEMP
+from test_root_cap_guard import w, KEY, SET8, SURFACES, TEMP_OWNER, PERM, TEMP, PAD
 
 BASE = f"I authorize changing root {KEY} from 7 to 8."
 OWNER = f"Owner card {TEMP_OWNER}, run 1, this session."
@@ -138,8 +138,8 @@ def test_controls_permanent_temp_unrelated(w, surface):
     assert not w.blocked(surface, SET8, texts=[PERM])
     assert not w.blocked(surface, SET8, texts=[TEMP])
     assert not w.blocked(surface, SET8, texts=[BASE])
-    assert not w.blocked(surface, SET8, texts=[BASE, "Thanks, go ahead.", "Restore my database backup until tomorrow."])
-    assert not w.blocked(surface, SET8, texts=[BASE, "Please keep the notes short.", "I will check it later."])
+    assert not w.blocked(surface, SET8, texts=[BASE, "Thanks, go ahead.", *PAD, "Restore my database backup until tomorrow."])
+    assert not w.blocked(surface, SET8, texts=[BASE, *PAD, "Please keep the notes short.", "I will check it later."])
     assert rows(w)[-1]["kind"] == "permanent"
     assert not w.blocked(surface, "hermes config set display.skin default", texts=[BASE, "Make that temporary."])
     assert not w.blocked(surface, "hermes config set display.skin default", texts=["Thanks."])
