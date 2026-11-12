@@ -107,6 +107,38 @@ def test_read_only_and_out_of_tree_commands_pass(live, tmp_path):
     assert not blk("read_file", {"path": str(live / "run_agent.py")}, live)
 
 
+# A subshell's parens are shell syntax, not file arguments: the closing `)` of `( cd <live>; ...; rm -rf "$X" )`
+# resolved inside the cd'd live tree and was refused as "`rm` of `)`" (2026-11-12 false refusal).
+def test_subshell_parens_are_not_write_targets(live, tmp_path):
+    scratch = tmp_path / "scratch"
+    for cmd in (f'( cd {live}; X=1; rm -rf "$X" )',
+                f"(cd {live} && rm -f /tmp/a.log )",
+                f"(cd {live} && rm -f /tmp/a.log)",
+                f"( cd {live}; cp run_agent.py {scratch}/copy.py )",
+                f"(cd {live} && echo x | tee {scratch}/out.txt )",
+                # (scripts with a space: a one-word quoted sed/perl script is still read as a path today)
+                f"(cd {live} && sed -i 's/x = 1/x = 2/' {scratch}/notes.txt )",
+                f"(cd {live} && perl -pi -e 's/x = 1/x = 2/' {scratch}/notes.txt)",
+                f"(cd {live} && npm install --prefix {scratch} flru )"):
+        assert not blk("terminal", {"command": cmd}, live), cmd
+    for cmd, name in ((f"( cd {live}; rm -f hermes_cli/kanban_wake_check.py )", "hermes_cli/kanban_wake_check.py"),
+                      (f"(cd {live} && rm -f hermes_cli/kanban_wake_check.py)", "hermes_cli/kanban_wake_check.py"),
+                      (f"(cd {live} && echo x | tee run_agent.py)", "run_agent.py"),
+                      (f"(cd {live} && sed -i 's/x = 1/x = 2/' run_agent.py)", "run_agent.py"),
+                      (f"(cd {live} && perl -pi -e 's/x = 1/x = 2/' run_agent.py )", "run_agent.py"),
+                      (f"(cd {scratch} && cp a.py {live}/run_agent.py)", "run_agent.py")):
+        what = blk("terminal", {"command": cmd}, live)
+        assert what and f"`{name}`" in what, (cmd, what)
+    what = blk("terminal", {"command": f"(npm install --prefix {live} flru)"}, live)
+    assert what and "node_modules" in what
+
+
+def test_seg_words_drops_unquoted_parens_only():
+    assert rules._seg_words("rm -f tools/foo.py)") == ["rm", "-f", "tools/foo.py"]
+    assert rules._seg_words("( rm -rf x ))") == ["rm", "-rf", "x"]
+    assert rules._seg_words("rm -f 'q(1).txt' \"a b).txt\"") == ["rm", "-f", "q(1).txt", "a b).txt"]
+
+
 def test_coach_allow_live_passes(live, monkeypatch):
     assert not blk("terminal", {"command": "COACH_ALLOW_LIVE=1 " + INCIDENT}, live)
     assert not blk("terminal", {"command": f"COACH_ALLOW_LIVE=1 sed -i s/x/y/ {live}/run_agent.py"}, live)

@@ -1077,11 +1077,17 @@ def _heredoc_python_bodies(raw: str):
 
 
 def _seg_words(seg: str) -> list:
+    """Shell words of one simple command. Subshell parens are shell syntax, not arguments: `( cd X; rm -f a )`
+    and `(cd X && rm -f a)` must yield `a`, never `)` or `a)` (the closing paren resolved inside a cd'd live
+    tree read as an rm/tee/sed -i target). Every word-scanning loop in `_terminal_live_write` reads through here."""
     import shlex
     try:
-        return shlex.split(seg)
+        lex = shlex.shlex(seg, posix=True, punctuation_chars="()")
+        lex.whitespace_split = True
+        words = list(lex)
     except Exception:
-        return seg.split()
+        words = re.sub(r"[()]", " ", seg).split()
+    return [w for w in words if w.strip("()")]
 
 
 def _terminal_live_write(raw: str, cmd: str, wd: str, root: str) -> Optional[str]:
