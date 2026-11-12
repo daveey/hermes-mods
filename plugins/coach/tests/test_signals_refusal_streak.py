@@ -125,3 +125,30 @@ def test_a_streak_of_automated_delivery_retries_is_not_called_a_user_re_ask(tmp_
     assert sigs["auto"]["fp"] == sg.fp("agent", "refusal_streak", "auto")
     # One human ask in the run keeps the user wording.
     assert "the user re-asked" in sigs["mixed"]["symptom"]
+
+
+CLOSEOUT = "[chat-closeout] Every kanban card this chat handed work to has settled. Close out this chat now."
+NOTICE = "⏳ [default] @default Kanban t_01a1cdea4b8f2339: waiting on a parent no worker has claimed"
+
+
+def test_the_refused_original_delivery_then_its_retry_is_automated(tmp_path):
+    # The same two hub chats, as stored: the run opens with the ORIGINAL automated delivery the provider refused (a
+    # chat-closeout prompt / a kanban notice), which never carries the retry prefix; core's retry of it follows.
+    # b286f606 required the prefix on every row, so both chats still read "the user re-asked".
+    h = tmp_path / "home"
+    _db(h, [
+        ("closeout", "user", CLOSEOUT, R, -300), ("closeout", "user", RETRY + "\n\n" + CLOSEOUT, R, -200),
+        ("notice", "user", NOTICE, R, -150), ("notice", "user", RETRY + "\n\n" + NOTICE, R, -100),
+        ("resumed", "user", "[System note: Your previous turn was interrupted mid-run.] go on", R, -95),
+        ("resumed", "user", "✔ [default] @default Kanban t_01a1cd000000000 done — fix x", R, -94),
+        ("human", "user", NOTICE, R, -90), ("human", "user", "why does this keep failing?", R, -80),
+        ("quoted", "user", "what does ⏳ [default] @default Kanban t_1 mean?", R, -70), ("quoted", "user", RETRY, R, -60),
+    ])
+    sigs = {s["session_id"]: s for s in _refusals(sg.collect(h, {}, "hubhost", NOW))}
+    assert set(sigs) == {"closeout", "notice", "resumed", "human", "quoted"}
+    for sid in ("closeout", "notice", "resumed"):
+        assert "automated deliveries were refused" in sigs[sid]["symptom"], sid
+        assert "user re-asked" not in sigs[sid]["symptom"], sid
+    # A human ask anywhere in the run, even one quoting a notice, keeps the user wording.
+    for sid in ("human", "quoted"):
+        assert "the user re-asked" in sigs[sid]["symptom"], sid
