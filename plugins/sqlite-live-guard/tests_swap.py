@@ -1,0 +1,308 @@
+"""Real CLI fixture tests. Never point at the user's home/database/services.
+
+Run: python3 -m unittest discover -s plugins/sqlite-live-guard -p tests_swap.py -v
+For a Linux host with restricted /proc, SWAP_TEST_PRIVILEGED_SCAN=1 enables the
+helper's explicit sudo read-only scanner. Core-backed cases skip without core.
+"""
+import contextlib
+import fcntl
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+
+SCRIPT = Path(os.environ.get('SWAP_TEST_SCRIPT', Path(__file__).with_name('swap_db.py'))).resolve()
+CORE = importlib.util.find_spec('gateway') is not None
+PRIVILEGED = os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1'
+
+
+def database(path, sql='CREATE TABLE sessions(id TEXT PRIMARY KEY); INSERT INTO sessions VALUES("saved");'):
+    with contextlib.closing(sqlite3.connect(path)) as con:
+        con.executescript(sql)
+
+
+class SwapCLI(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='swap-fixture-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.db, self.replacement = self.root / 'fixture.db', self.root / 'recovered.db'
+        database(self.db)
+        database(self.replacement)
+        self.env = dict(os.environ, HERMES_HOME=str(self.root / 'home'))
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        fake = self.bin / 'systemctl'
+        fake.write_text('#!' + sys.executable + '\nimport os,sys\nwith open(os.environ["UNIT_LOG"],"a") as f: f.write(" ".join(sys.argv[1:])+"\\n")\n')
+        fake.chmod(0o700)
+        self.env.update(PATH=str(self.bin) + os.pathsep + os.environ['PATH'], UNIT_LOG=str(self.root / 'units.log'))
+
+    def cli(self, *args, script=SCRIPT):
+        cmd = [sys.executable, str(script), '--db', str(self.db), '--replacement', str(self.replacement), '--wait', '0']
+        if PRIVILEGED:
+            cmd += ['--holder-scan-sudo']
+        return subprocess.run(cmd + list(args), env=self.env, capture_output=True, text=True, timeout=90)
+
+    def successful(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = self.receipt()
+        self.assertEqual(receipt['phase'], 'complete')
+        self.assertTrue(Path(receipt['archive']).exists())
+        self.assertFalse(Path(str(self.db) + '.swap-pending.json').exists())
+        self.assertEqual(self.db.stat().st_mode & 0o777, 0o600)
+        return receipt
+
+    def receipt(self):
+        return json.loads(next(self.root.glob('.*.recovery-*/receipt.json')).read_text())
+
+    def state(self):
+        if not CORE:
+            self.skipTest('Hermes core unavailable; recovered-state E2E gate remains open')
+        self.db = self.db.rename(self.root / 'state.db')
+
+    def add(self, path, sql):
+        with contextlib.closing(sqlite3.connect(path)) as con:
+            con.executescript(sql)
+
+    def test_normal_install(self):
+        self.successful(self.cli('--stop-unit', 'fixture.service'))
+        self.assertEqual((self.root / 'units.log').read_text().splitlines(),
+                         ['--user stop -- fixture.service', '--user start -- fixture.service'])
+
+    def test_single_owner_lock(self):
+        with open(str(self.db) + '.recovery.lock', 'a+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.cli()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('another recovery', result.stderr)
+
+    def test_core_maintenance_lock(self):
+        self.state()
+        with open(self.db.parent / 'gateway.lock', 'a+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.cli('--recovered-state')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('Exclusive maintenance refused', result.stderr)
+
+    def test_allowed_empty_runtime_omission_requires_ack(self):
+        self.state()
+        self.add(self.db, 'CREATE TABLE worker_receipts(id TEXT);')
+        result = self.cli('--recovered-state')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('--ack-runtime-loss', result.stderr)
+        result = self.cli('--recovered-state', '--ack-runtime-loss')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('worker_receipts', result.stdout)
+
+    def test_allowed_omission_install(self):
+        self.state()
+        self.add(self.db, 'CREATE TABLE worker_receipts(id TEXT);')
+        self.assertEqual((r := self.cli('--recovered-state', '--ack-runtime-loss')).returncode, 0,
+                         r.stdout + r.stderr)
+
+    def test_unknown_and_durable_omissions_fail(self):
+        for table in ('hosted_room_unknown', 'security_revocations', 'delivery_obligations'):
+            with self.subTest(table=table):
+                self.add(self.db, f'CREATE TABLE {table}(id TEXT);')
+                result = self.cli()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(table, result.stderr)
+                self.add(self.db, f'DROP TABLE {table};')
+
+    def test_recreated_empty_security_table_is_not_preservation(self):
+        self.state()
+        self.add(self.db, 'CREATE TABLE security_revocations(id TEXT); INSERT INTO security_revocations VALUES("revoked");')
+        self.add(self.replacement, 'CREATE TABLE security_revocations(id TEXT);')
+        result = self.cli('--recovered-state', '--ack-runtime-loss')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('row loss in security_revocations', result.stderr)
+
+    def test_populated_runtime_idempotency_omission_refused(self):
+        self.state()
+        self.add(self.db, 'CREATE TABLE session_admissions(id TEXT); INSERT INTO session_admissions VALUES("already-started");')
+        result = self.cli('--recovered-state', '--ack-runtime-loss')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('row loss in session_admissions', result.stderr)
+
+    def test_epoch_floor_retained(self):
+        self.state()
+        self.add(self.db, 'CREATE TABLE runtime_epoch(singleton INTEGER PRIMARY KEY, epoch INTEGER, instance_id TEXT); INSERT INTO runtime_epoch VALUES(1,42,"old");')
+        self.successful(self.cli('--recovered-state', '--ack-runtime-loss'))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT epoch FROM runtime_epoch').fetchone(), (42,))
+
+    def test_fk_failure(self):
+        self.add(self.replacement, 'CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(pid INTEGER REFERENCES parent(id)); INSERT INTO child VALUES(99);')
+        result = self.cli('--stop-unit', 'fixture.service')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('foreign_key_check', result.stderr)
+        self.assertFalse((self.root / 'units.log').exists())
+
+    def test_replacement_committed_wal_included(self):
+        con = sqlite3.connect(self.replacement)
+        self.addCleanup(con.close)
+        con.execute('PRAGMA journal_mode=WAL')
+        con.execute('PRAGMA wal_autocheckpoint=0')
+        con.execute('INSERT INTO sessions VALUES("wal-only")')
+        con.commit()
+        self.assertTrue(Path(str(self.replacement) + '-wal').exists())
+        result = self.cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with contextlib.closing(sqlite3.connect(self.db)) as installed:
+            self.assertEqual(installed.execute('SELECT count(*) FROM sessions').fetchone(), (2,))
+        self.successful(result)
+
+    def holder(self, suffix='', deleted=False, mapped=False):
+        target = Path(str(self.db) + suffix)
+        if suffix:
+            target.write_bytes(b'x' * 4096)
+        child = self.root / 'hold.py'
+        child.write_text('import os,sys,time,mmap\nf=open(sys.argv[1],"rb")\n'
+                         + ('m=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ); f.close()\n' if mapped else '')
+                         + ('os.unlink(sys.argv[1])\n' if deleted else '')
+                         + 'print("ready",flush=True)\ntime.sleep(90)\n')
+        proc = subprocess.Popen([sys.executable, str(child), str(target), 'serve', '--isolated', '--ssh-session-token-file', 'fixture-token'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def cleanup():
+            proc.terminate()
+            proc.communicate(timeout=10)
+        self.addCleanup(cleanup)
+        assert proc.stdout is not None
+        self.assertEqual(proc.stdout.readline().strip(), 'ready')
+        return proc
+
+    def test_live_ssh_serve_holder_blocks_and_no_abort_restart(self):
+        proc = self.holder()
+        result = self.cli('--stop-unit', 'fixture.service')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        log = (self.root / 'units.log').read_text()
+        self.assertNotIn('start', log)
+        self.assertIn(str(proc.pid), result.stderr)
+        self.assertIn('birth=', result.stderr)
+        self.assertIn('serve', result.stderr)
+        self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
+        self.assertTrue(self.db.exists())
+
+    def test_deleted_sidecar_holder_blocks(self):
+        self.holder('-wal', deleted=True)
+        result = self.cli()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('(deleted)', result.stderr)
+
+    def test_mmap_only_deleted_sidecar_blocks(self):
+        self.holder('-shm', deleted=True, mapped=True)
+        result = self.cli()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('(deleted)', result.stderr)
+
+    def test_unreadable_original_refused(self):
+        self.db.write_bytes(b'not a sqlite database')
+        result = self.cli()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.db.read_bytes(), b'not a sqlite database')
+
+    def test_partial_rename_never_restarts_and_retry_refuses(self):
+        # Only OS fault injection; execute the actual argparse CLI and all real SQLite paths.
+        wrapper = self.root / 'fault.py'
+        wrapper.write_text('import importlib.util,sys\n'
+            + f's=importlib.util.spec_from_file_location("swap",{str(SCRIPT)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n'
+            + 'original=m.os.rename\ndef rename(src,dst):\n'
+            + ' if str(src).endswith("staged.db"): raise OSError("fixture install rename failure")\n'
+            + ' return original(src,dst)\nm.os.rename=rename\nsys.exit(m.main())\n')
+        result = self.cli('--stop-unit', 'fixture.service', script=wrapper)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('fixture install rename failure', result.stderr)
+        self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
+        receipt = self.receipt()
+        self.assertEqual(receipt['failed_phase'], 'installing')
+        self.assertTrue(Path(receipt['archive']).exists())
+        self.assertTrue(Path(receipt['stage']).exists())
+        self.assertTrue(Path(str(self.db) + '.swap-pending.json').exists())
+        self.assertTrue(self.db.exists())  # canonical main never disappears during atomic publication
+        retry = self.cli()
+        self.assertNotEqual(retry.returncode, 0)
+
+    def test_state_install_cannot_bypass_policy(self):
+        self.state()
+        result = self.cli()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('requires --recovered-state', result.stderr)
+
+    def test_autoincrement_floor_preserved(self):
+        self.state()
+        for path in (self.db, self.replacement):
+            self.add(path, 'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO messages VALUES(1);')
+        self.add(self.db, 'UPDATE sqlite_sequence SET seq=1000 WHERE name="messages";')
+        self.successful(self.cli('--recovered-state'))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            con.execute('INSERT INTO messages DEFAULT VALUES')
+            self.assertEqual(con.execute('SELECT max(id) FROM messages').fetchone(), (1001,))
+
+    def test_empty_runtime_omission_preserves_historical_sequence(self):
+        self.state()
+        for path in (self.db, self.replacement):
+            self.add(path, 'CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO messages VALUES(1);')
+        self.add(self.db, 'CREATE TABLE session_admissions(seq INTEGER PRIMARY KEY AUTOINCREMENT); '
+                         'INSERT INTO session_admissions VALUES(100); DELETE FROM session_admissions;')
+        self.successful(self.cli('--recovered-state', '--ack-runtime-loss'))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT seq FROM sqlite_sequence WHERE name="session_admissions"').fetchone(), (100,))
+
+    def test_post_rename_original_holder_blocks(self):
+        # Simulate an uncoordinated reader opening just after the last pre-rename scan.
+        child = self.root / 'late_holder.py'
+        child.write_text('import sys,time\nf=open(sys.argv[1],"rb")\nprint("ready",flush=True)\ntime.sleep(90)\n')
+        wrapper = self.root / 'late.py'
+        wrapper.write_text('import importlib.util,subprocess,sys\n'
+            + f's=importlib.util.spec_from_file_location("swap",{str(SCRIPT)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n'
+            + 'original=m.os.rename\nchildren=[]\ndef rename(src,dst):\n'
+            + ' if str(src).endswith("staged.db"):\n'
+            + f'  p=subprocess.Popen([sys.executable,{str(child)!r},str(dst)],stdout=subprocess.PIPE,text=True); children.append(p); assert p.stdout.readline().strip()=="ready"\n'
+            + ' return original(src,dst)\nm.os.rename=rename\ntry: result=m.main()\nfinally:\n'
+            + ' for p in children: p.terminate(); p.wait(timeout=5)\nsys.exit(result)\n')
+        result = self.cli('--stop-unit', 'fixture.service', script=wrapper)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('late_holder.py', result.stderr)
+        self.assertTrue(Path(str(self.db) + '.swap-pending.json').exists())
+        self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
+
+    def test_actual_sessions_recover_then_install(self):
+        self.state()
+        self.db.unlink()
+        self.replacement.unlink()
+        setup = self.root / 'seed_core.py'
+        setup.write_text('from hermes_state import SessionDB\nfrom pathlib import Path\n'
+                         + f'db=SessionDB(Path({str(self.db)!r}))\n'
+                         + 'db.create_session("fixture-session", "cli")\ndb.close()\n')
+        seed = subprocess.run([sys.executable, str(setup)], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(seed.returncode, 0, seed.stdout + seed.stderr)
+        report = self.root / 'recover.json'
+        recovery = subprocess.run([sys.executable, '-m', 'hermes_cli.main', 'sessions', 'recover',
+                                   '--source', str(self.db), '--output', str(self.replacement),
+                                   '--report', str(report)], env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(recovery.returncode, 0, recovery.stdout + recovery.stderr)
+        self.assertTrue(report.exists())
+        self.successful(self.cli('--recovered-state', '--ack-runtime-loss'))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT id FROM sessions').fetchall(), [('fixture-session',)])
+
+    def test_recheck_before_rename(self):
+        wrapper = self.root / 'racer.py'
+        wrapper.write_text('import importlib.util,sys\n'
+            + f's=importlib.util.spec_from_file_location("swap",{str(SCRIPT)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n'
+            + 'original=m._policy\ndef policy(*args):\n r=original(*args); m._no_holders=lambda *a: (_ for _ in ()).throw(m.Refusal("fixture late holder")); return r\n'
+            + 'm._policy=policy\nsys.exit(m.main())\n')
+        result = self.cli(script=wrapper)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('fixture late holder', result.stderr)
+        self.assertTrue(self.db.exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

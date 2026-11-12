@@ -254,6 +254,13 @@ def _db(path, rows):
     con.close()
 
 
+@pytest.fixture(autouse=True)
+def privileged_fixture_scan(monkeypatch):
+    if os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1':
+        real = swap_db._scan
+        monkeypatch.setattr(swap_db, '_scan', lambda db, privileged=False, extra_paths=(): real(db, True, extra_paths))
+
+
 def test_swap_puts_replacement_in_and_keeps_originals(tmp_path):
     live, rep = tmp_path / "kanban.db", tmp_path / "recovered.db"
     _db(live, ["a"])
@@ -262,9 +269,9 @@ def test_swap_puts_replacement_in_and_keeps_originals(tmp_path):
     con = sqlite3.connect(live)
     assert [r[0] for r in con.execute("select id from tasks order by id")] == ["a", "b"]
     con.close()
-    kept = sorted(p.name for p in tmp_path.glob("kanban.db.pre-swap-*"))
-    assert len(kept) >= 1 and any(n.endswith("Z") for n in kept), kept  # main file kept (+ its -wal/-shm)
-    old = sqlite3.connect(f"file:{tmp_path / [n for n in kept if n.endswith('Z')][0]}?mode=ro", uri=True)
+    kept = list(tmp_path.glob('.kanban.db.recovery-*/original.db'))
+    assert len(kept) == 1
+    old = sqlite3.connect(f"file:{kept[0]}?mode=ro", uri=True)
     assert [r[0] for r in old.execute("select id from tasks")] == ["a"]
     old.close()
 
@@ -423,21 +430,21 @@ def test_swap_helper_refuses_a_kanban_board_without_the_operator_flag(tmp_path, 
 
 def test_swap_helper_records_itself_as_lock_holder(tmp_path, monkeypatch):
     import json
-    live, rep = tmp_path / "state.db", tmp_path / "recovered.db"
+    live, rep = tmp_path / "fixture.db", tmp_path / "recovered.db"
     _db(live, ["a"])
     _db(rep, ["a", "b"])
     seen = {}
-    real = swap_db.check_replacement
+    real = swap_db._snapshot
 
     def spy(db, replacement):
-        seen["record"] = json.loads((tmp_path / "state.db.recover.pid").read_text())
+        seen["record"] = json.loads((tmp_path / "fixture.db.recover.pid").read_text())
         return real(db, replacement)
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_swapcard")
-    monkeypatch.setattr(swap_db, "check_replacement", spy)
+    monkeypatch.setattr(swap_db, "_snapshot", spy)
     assert swap_db.main(["--db", str(live), "--replacement", str(rep), "--wait", "0"]) == 0
     assert seen["record"]["pid"] == os.getpid() and seen["record"]["task_id"] == "t_swapcard"
-    assert not (tmp_path / "state.db.recover.pid").exists(), "released lock leaves no holder record"
+    assert not (tmp_path / "fixture.db.recover.pid").exists(), "released lock leaves no holder record"
 
 
 # --- review follow-ups ---------------------------------------------------------------------------------
@@ -521,28 +528,28 @@ def test_review_claude_hook_logs_its_refusals(tmp_path):
 
 
 def test_review_swap_helper_clears_its_record_when_the_replacement_is_refused(tmp_path):
-    live, bad = tmp_path / "state.db", tmp_path / "bad.db"
+    live, bad = tmp_path / "fixture.db", tmp_path / "bad.db"
     _db(live, ["a"])
     bad.write_bytes(b"SQLite format 3\x00" + b"\x00" * 4000)
     assert swap_db.main(["--db", str(live), "--replacement", str(bad), "--wait", "0"]) == 2
-    assert not (tmp_path / "state.db.recover.pid").exists()
+    assert not (tmp_path / "fixture.db.recover.pid").exists()
 
 
 def test_review_swap_helper_records_the_recovery_holder_card_env(tmp_path, monkeypatch):
     import json
-    live, rep = tmp_path / "state.db", tmp_path / "recovered.db"
+    live, rep = tmp_path / "fixture.db", tmp_path / "recovered.db"
     _db(live, ["a"])
     _db(rep, ["a", "b"])
     seen = {}
-    real = swap_db.check_replacement
+    real = swap_db._snapshot
 
     def spy(db, replacement):
-        seen["record"] = json.loads((tmp_path / "state.db.recover.pid").read_text())
+        seen["record"] = json.loads((tmp_path / "fixture.db.recover.pid").read_text())
         return real(db, replacement)
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_RECOVERY_HOLDER_TASK", "t_viaholderenv")
-    monkeypatch.setattr(swap_db, "check_replacement", spy)
+    monkeypatch.setattr(swap_db, "_snapshot", spy)
     assert swap_db.main(["--db", str(live), "--replacement", str(rep), "--wait", "0"]) == 0
     assert seen["record"]["task_id"] == "t_viaholderenv" and seen["record"].get("proc_start")
 
@@ -566,7 +573,10 @@ def test_check_replacement_falls_back_to_query_only_when_ro_open_fails(tmp_path,
             raise sqlite3.OperationalError("unable to open database file")
         return real(target, *a, **kw)
     monkeypatch.setattr(sqlite3, "connect", connect)
-    assert swap_db.check_replacement(live, rep) is None
+    # Input snapshots refuse rather than open the operator's file rw.
+    # Only the private offline source copy gets query_only fallback.
+    with pytest.raises(sqlite3.OperationalError):
+        swap_db._snapshot(rep, tmp_path / 'staged.db')
     con = swap_db._ro_connect(rep)
     try:
         with pytest.raises(sqlite3.OperationalError):
