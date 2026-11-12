@@ -278,6 +278,35 @@ class ContentFreeHandoff(unittest.TestCase):
                                                           "host": "macbook", "session": "s0", "pattern": "is-broken"})
             self.assertIsNone(g.project_bb_handoff(Path(d) / "nope" / "x.jsonl"))
 
+    def test_jsonl_ids_survive_unicode_separators_inside_a_row(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "legacy.jsonl"
+            r = {"id": "askgate-bb:s1:5", "t": 5, "quote": "a\u2028b\u0085c\x0cd\x1ce\x1df"}
+            p.write_text(json.dumps(r, ensure_ascii=False) + "\n" + json.dumps(dict(r, id="askgate-bb:s2:6")) + "\n",
+                         encoding="utf-8")
+            self.assertEqual(g._jsonl_ids(p), {"askgate-bb:s1:5", "askgate-bb:s2:6"})
+            # so a hand-off of a hit whose id is already in the file does not append it again
+            self.assertEqual(g.hand_to_bb_tuner([{"session": "s1", "t": 5, "pattern": "is-broken", "host": "h",
+                                                  "text": "x", "turn": 0}], p)[0], 0)
+
+    def test_unicode_separators_in_a_quote_do_not_make_the_handoff_rewrite_the_row(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            old = self.QUOTE
+            type(self).QUOTE = old + " \u2028 \u0085 \x0c \x1c \x1d"   # splitlines() would cut the legacy row apart
+            try:
+                bb = self.bb_hits(d)
+            finally:
+                type(self).QUOTE = old
+            out = Path(d) / "bbt" / "askgate-bb-misses.jsonl"
+            out.parent.mkdir()
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (1, 0))
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (0, 1))      # not re-appended on the next run
+            self.assertEqual(len(out.read_bytes().split(b"\n")), 2)     # one row + trailing newline
+            twin = out.parent / "askgate-bb-requests.jsonl"
+            self.assertEqual(len(twin.read_text().splitlines()), 1)
+
     def test_long_session_ids_hostile_t_values_and_torn_utf8(self):
         import json, tempfile
         sid = "local-" + "ab12" * 16                                   # hub session ids are 70 characters
