@@ -13,16 +13,16 @@ metadata:
 
 ## Rule
 
-**Look first:** the exact sha from `git`/`gh` output, the repo's AGENTS.md (it may name its own wait wrapper), and `--once`.
+**Look first:** the exact sha from `git`/`gh` output, the repo's AGENTS.md (it may name its own wait wrapper; prefer it), and `--once`.
 
 For ordinary commit/release waits, use containment rather than "the newest run" (`gh run list -L 1`) or a single-run watch: branch concurrency can replace pending runs with a later run containing your commit. For input-specific experiments (native enabled versus skipped, RED/GREEN controls), containment alone is insufficient: bind evidence to the exact head, dispatch inputs, job and executed tests. A successful same-head run with the target job skipped cannot satisfy that experiment. See the acceptance recipe in `references/ci-authoring-and-failure-fixes.md`. For dispatched or experiment runs, record each run id from the dispatch output and wait with `wait_for_ci.py --run-id ID --expect ID:JOB=CONCLUSION` (below), never a hand-written waiter: one that filtered `gh run list` by a guessed `createdAt` matched none of five queued runs and exited 0 printing `{}`. Tag-mode success establishes containment only, not that CI passed
 or release assets were published; verify the workflow and required release artifacts separately.
 
 When a branch uses ONE serialized concurrency group (in-flight always finishes, only the newest pending waits), a
 pending run that keeps getting `cancelled` with zero jobs may have been superseded before execution; corroborate
-with concurrency configuration, cancellation evidence and replacement timing before classifying it. Find a possible holder: `gh api
-"repos/R/actions/runs?branch=main&status=in_progress"` and look for an old run whose last job sat in a runner
-backlog. To time a full run (capacity acceptance), designate the first run that STARTS after the holder completes,
+with concurrency configuration, cancellation evidence and replacement timing before classifying it. Find the holder: an old run whose job waits for a runner. Until a job starts it reads `queued`, not `in_progress`,
+so query both (`gh api "repos/R/actions/runs?branch=main&status=queued"`, then `in_progress`). If a pending
+run's sha contains the holder's (`git merge-base --is-ancestor`), cancel the holder: no coverage is lost. To time a full run (capacity acceptance), designate the first run that STARTS after the holder completes,
 and record both `created_at`→completed (wall, queue included) and `run_started_at`→completed (exec). A "CI finishes in
 N min" target is judged on wall time unless the card says otherwise; exec time alone never closes it. A
 `workflow_dispatch` on that branch joins the same group, so dispatching doesn't help.
@@ -135,7 +135,7 @@ How to run it from an agent:
 - On exit 1, investigate the printed run (`gh run view <id> -R OWNER/REPO --log-failed`). Empty failed-step logs do not prove that a job never started or lost its runner. Check the command's exit status/stderr, run attempts, paginated jobs, full logs and annotations via each job's `check_run_url`; missing evidence is not a diagnosis. See `references/workflow-history-audit.md`. Attribute an earlier breaking commit only after verifying its diff and ancestry. On a branch already red, "inherited" means the same failing test ids, not the same workflow: list them per run (`gh run view <id> -R O/R --log-failed | grep -oE '(FAIL|ERROR): [A-Za-z0-9_]+ \([^)]*\)|(FAILED|ERROR) [^ ]+::[^ ]+' | sort -u`) and `comm -13` the previous run's list against this one's. A new id is a new break hiding under the old red (the last run without it and the first with it bracket the commits) and needs its own owner; a landing gate that skips a known-red workflow must diff ids the same way.
 - If `gh run view --log` omits completed reusable-workflow jobs or `--job ID --log` returns empty with exit 0, fetch `gh api repos/OWNER/REPO/actions/jobs/ID/logs` directly before concluding logs are unavailable. A file-level all-pass summary plus the shard's `flaky_kanban: 0 flaky test id(s)` can prove first-attempt success when the runner does not print individual passing node IDs; verify the target exists in that run's source revision.
 - Don't cancel another session's queued run to get yours through: the queued run will contain your
-  commit too.
+  commit too. A superseded holder (above) is the exception.
 - Last: check Done means (below), fix at most 2 rounds, then report what still fails.
 
 If failed-only rerun is refused, read `references/refused-failed-only-rerun.md` before diagnosing a broken workflow.
@@ -204,8 +204,6 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
 - A gate on the CURRENT head that sits `queued` is not a latch: it waits for a free runner with its labels. Read
   them first (`gh api repos/O/R/actions/jobs/<id> --jq .labels`; the id ends the check's `detailsUrl`), then
   diagnose that label's pool per `references/self-hosted-runner-migration.md` (Pitfalls, saturation by label).
-- A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
-  maps to) takes precedence; check the repo's AGENTS.md first.
 - Tests: `python3 -B -m unittest discover -s tests` from this skill's dir.
 
 ## CI refused for billing (account-wide outage)
