@@ -129,6 +129,8 @@ Grep transcripts for 429 `task-notification` storms — each names a dead subage
 
 ## Pitfalls
 
+- **Kanban rate_limited storm with tier_reason `default` on a walled default provider: read `~/.hermes/provider_walls.json` first.** When *every* fallback provider is also listed there, dispatch stops rerouting (`default+wall:<p>`) and spawns on the walled default, so each card burns one rate_limited run before `default+quota_reroute`. A burst of `HTTP 401: OAuth access token has been revoked` on one Anthropic account can briefly make the pool raise `SubscriptionQuotaUnavailable` and record a provider-wide anthropic wall even though other accounts still serve. Confirm with per-account `model_cooldowns` in auth.json (some accounts empty = provider not walled); removing the false entry (back up the file) restores routing at the next tick.
+
 - **A red Codex row can be a stale duplicate login, not a dead account.** Re-adding an account leaves the old pool
   entry holding its last `usage_limit_reached` until `last_error_reset_at`, while the new entry serves fine. Decode
   each `credential_pool.openai-codex[].access_token` JWT (`https://api.openai.com/auth.chatgpt_account_id`, `exp`) to
