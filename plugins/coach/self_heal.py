@@ -3368,9 +3368,64 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
     return None
 
 
+def _replica_card_text(cards: list, hub_db: Optional[Path]) -> list:
+    """Fill title/body/key/status of cards another host's digest named (digest_owner_cards knows only their ids)
+    from that gateway's records in the hermes-hub replica, so the subject check can judge them. A card the replica
+    cannot describe stays textless and is not adopted: a mention in the session is not evidence it owns the defect."""
+    import sqlite3
+    if not cards or hub_db is None or not Path(hub_db).exists():
+        return cards
+    try:
+        con = _ro_state(Path(hub_db))
+    except sqlite3.Error:
+        return cards
+    try:
+        for c in cards:
+            gw = str(c.get("board") or "").partition(":")[0]
+            try:
+                rows = con.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key LIKE ?",
+                                   (gw, "%/" + c["id"])).fetchall()
+            except sqlite3.Error:
+                break
+            for (raw,) in rows:
+                try:
+                    t = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(t, dict) and t.get("id") == c["id"] and t.get("gateway") == gw:
+                    c.update(title=t.get("title"), body=str(t.get("body") or "")[:4000],
+                             idempotency_key=t.get("idempotency_key"), status=t.get("status"), described=True)
+                    break
+    finally:
+        con.close()
+    # session_owned_cards only offers ADOPT_STATUSES; a card the replica shows archived is no owner either
+    return [c for c in cards if not c.pop("described", False) or c.get("status") in ADOPT_STATUSES]
+
+
+def _defect_subject_cards(d: dict) -> set:
+    """Card ids the defect's own evidence names (quote, evidence, symptom, details): the complaint is ABOUT them."""
+    return set(_CARD_ID.findall(" ".join(str(d.get(k) or "") for k in ("quote", "evidence", "symptom", "details"))))
+
+
+def _lane_process_cards(store, fp: str) -> set:
+    """Investigation and VERIFY cards of every OTHER fingerprint's lane: self-heal process cards, not repairs."""
+    out: set = set()
+    for other, st in LaneState(store.root).read().items():
+        if other != fp and isinstance(st, dict):
+            out |= {c for c in (st.get("card"), st.get("verify_card")) if c}
+    return out
+
+
+def _card_names_fingerprint(card: dict, fp: str) -> bool:
+    text = _norm_text(" ".join(str(card.get(k) or "") for k in ("title", "body", "idempotency_key")))
+    return bool(fp) and fp.lower() in text
+
+
 def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[Callable] = None) -> Optional[dict]:
-    """If the defect's origin session created/subscribed an active card after the complaint, record the newest as the
-    lane's fix_card (approved) and log `selfheal_adopted_owner`. -> result dict, or None to go on and file."""
+    """If the defect's origin session created/subscribed an active card after the complaint that names the defect
+    (card_names_defect; never the card the complaint is about, never another lane's investigation/VERIFY card),
+    record the newest such card as the lane's fix_card (approved) and log `selfheal_adopted_owner`.
+    -> result dict, or None to go on and file."""
     sid = d.get("session_id")
     if owner_fn is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":
         return None
@@ -3378,7 +3433,8 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     try:
         cards = (owner_fn or session_owned_cards)(sid, since) if sid else []
         if not cards and owner_fn is None and sid:  # not on this hub's boards: the origin host's cards, named in its digest
-            cards = digest_owner_cards(d, d.get("complaint_at") or d.get("at") or since)
+            cards = _replica_card_text(digest_owner_cards(d, d.get("complaint_at") or d.get("at") or since),
+                                       _lookup_sources()[1])
     except Exception as exc:
         store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
         return None
@@ -3399,20 +3455,29 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
                     "commit": fix["sha"], "adopted": True}
     if not cards:
         return None
-    named = [x for x in cards if card_names_defect(x, d, fp)]
-    if d.get("source") not in SESSION_RESPONSE_SOURCES:
-        # No user complaint in that session: its next cards are just its next work (an Ask Eve test once owned a
-        # repeated kanban error; agent-e5b6dcf428's report_only signal was closed against a Kanban owner-death fix).
-        # Adopt only a card with subject evidence; sharing the session is not enough.
-        if not named:
-            store.log({"event": "selfheal_adopt_skipped", "why": "no session card names the defect",
-                       "fingerprint": fp, "session_id": sid, "source": d.get("source"),
-                       "terms": sorted(_subject_words(d.get("symptom")))[:12],
-                       "candidates": [x["id"] for x in cards]})
-            return None
-        cards = named
-    elif named:
-        cards = named  # a complaint's session card that names it beats a newer unrelated one
+    # Sharing the session is not owning the defect, whatever the source: its next cards are just its next work (an
+    # Ask Eve test once owned a repeated kanban error; agent-e5b6dcf428's report_only signal was closed against a
+    # Kanban owner-death fix). A user complaint used to be the exception and adopted the session's newest card with
+    # no subject evidence at all (desktop-d39268b86c: "the response dissapeard" -> a delivery-disposition card;
+    # agent-2e9530b2b5: a landing timeout -> a SQLite read-helper fix); the lane then waited on, and was closed
+    # against, work that never touched the symptom. Two kinds of card are never the owner even when their words
+    # match: one the complaint itself names (it existed before the complaint, so it is the subject, e.g. the stalled
+    # card of a wait notice: kanban-04bdba70ac), and another fingerprint's investigation/VERIFY card (it judges
+    # that lane's fix and implements nothing: desktop-727bbca8b8).
+    subject = _defect_subject_cards(d)
+    process = _lane_process_cards(store, fp)
+    named = [x for x in cards
+             if x["id"] not in subject and card_names_defect(x, d, fp)
+             and (x["id"] not in process or _card_names_fingerprint(x, fp))]
+    if not named:
+        store.log({"event": "selfheal_adopt_skipped", "why": "no session card names the defect",
+                   "fingerprint": fp, "session_id": sid, "source": d.get("source"),
+                   "terms": sorted(_subject_words(d.get("symptom")))[:12],
+                   "candidates": [x["id"] for x in cards],
+                   "subject_cards": [x["id"] for x in cards if x["id"] in subject],
+                   "process_cards": [x["id"] for x in cards if x["id"] in process]})
+        return None
+    cards = named
     c = cards[0]
     lane = LaneState(store.root)
     st = lane.get(fp)
@@ -4401,6 +4466,20 @@ def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: 
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
             "home_pin": not remote, "runs_on": list(VERIFY_POOL_LABELS) if remote else [],
             "parents": [fix_card]}
+    located = _owner_location(st, fix_card)
+    if located and located[0]:
+        # The owner lives on another gateway's board: this board cannot gate on it, and its verifier must read it
+        # there (cross_task), not conclude "no such task" from this board.
+        args["parents"] = []
+        args["body"] += (f"\n\nOwner location: `{fix_card}` is on gateway `{located[0]}`, board `{located[1]}`, "
+                         "not on this board. Read it with `cross_task` "
+                         f"(or `hermes kanban wait-check task {fix_card} --gateway {located[0]}`); "
+                         "\"no such task\" from this board says nothing about it.")
+    elif located and located[1] != (r.get("board") or "default"):
+        # Same host, another board: a parent edge cannot cross boards, and the default-board `show` misses it.
+        args["parents"] = []
+        args["body"] += (f"\n\nOwner location: `{fix_card}` is on this host's board `{located[1]}` "
+                         f"(`hermes kanban --board {located[1]} show {fix_card}`), not on this card's board.")
     rc, out, err = _run_card(args, runner)
     vid = _task_id(out) if rc == 0 else None
     if not vid or vid == fix_card:
@@ -4729,19 +4808,253 @@ def inbox_outcome(fp: str, runner=None) -> Optional[dict]:
         return None
 
 
-def card_status(card: str, board: Optional[str] = None, runner=None) -> Optional[str]:
-    """Kanban status of a card, "missing" when the board has no such card, None when unknown (read failed)."""
-    argv = ["hermes", "kanban"] + (["--board", board] if board else []) + ["show", card, "--json"]
+# ── card lookup authority ──
+# `hermes kanban show` answers for ONE board of THIS host. "no such task" there closed lanes whose owner lived on
+# another board (agent-04039a9129, runners) or another gateway (kanban-f3b72e7010 and bb-448ec69637: MacBook cards
+# the hub board never held), and twice for local cards that existed (agent-69f58b8c13, agent-4027d5f47f; cause never
+# established). "missing" is a closure, so it now needs every source this host can read to agree: the named board's
+# CLI, a read-only scan of every local board DB, and the hermes-hub replica of the other gateways' boards. A source
+# that cannot be read, a board mid-recovery, a stale replica scope or a gateway that has not synced since the lane
+# learned of the card is "unknown" (None): the lane stays open and nothing is inferred from it.
+LOOKUP_SCOPE_FLOOR_S = 600.0    # core kanban_wait_replica.MAX_AGE_SECONDS
+LOOKUP_SCOPE_MAX_S = 1800.0     # core kanban_scope_heartbeat.SCOPE_HEARTBEAT_MAX_S
+LOOKUP_SCOPE_FACTOR = 2.5       # core kanban_scope_heartbeat.SCOPE_HEARTBEAT_PERIOD_FACTOR
+LOOKUP_RETIRED_S = 7 * 86400    # a gateway silent this long is retired: it no longer vouches or vetoes
+
+
+def _hub_replica_path() -> Path:
+    """This host's hermes-hub replica of every gateway's boards (core kanban_capability_registry.hub_db_path)."""
+    return Path(os.environ.get("HERMES_HUB_STATE") or Path.home() / ".local/state/hermes-hub") / "hub.db"
+
+
+def _lookup_sources(runner=None) -> tuple:
+    """(home, hub_db) that card_lookup reads beside the CLI. A caller that injects its runner (tests, dry runs)
+    owns the board it shows, so the live replica is left out; so it is under COACH_SELFHEAL_NO_EXEC."""
+    live = runner is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") != "1"
+    return _kanban_home(), (_hub_replica_path() if live else None)
+
+
+def _board_in_recovery(path: Path) -> bool:
+    """A live `hermes kanban recover` holds this DB (its `<db>.recover.pid` record): its rows prove nothing yet."""
     try:
-        rc, out, err = _run(argv, runner)
-    except Exception:
-        return None
-    if rc != 0:
-        return "missing" if "no such task" in (err + out).lower() else None
+        pid = int(json.loads(path.with_name(path.name + ".recover.pid").read_text())["pid"])
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return False
+    return True
+
+
+def _local_board_lookup(card: str, home: Path) -> tuple:
+    """Read-only scan of every board DB under `home`. -> ({status, board} | None, why-unreadable | None)."""
+    import sqlite3
+    why = None
+    for board, path in _board_dbs(Path(home)):
+        if not path.exists():
+            continue
+        if _board_in_recovery(path):
+            why = f"board {board or 'default'} is in recovery"
+            continue
+        try:
+            con = _ro_state(path)
+            try:
+                r = con.execute("SELECT status FROM tasks WHERE id = ?", (card,)).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error as exc:
+            why = f"board {board or 'default'} unreadable: {str(exc)[:80]}"
+            continue
+        if r:
+            return {"status": r[0], "board": board}, None
+    return None, why
+
+
+def _scope_window(info: dict) -> float:
+    period = info.get("scope_heartbeat_period_s") if isinstance(info, dict) else None
+    if isinstance(period, bool) or not isinstance(period, (int, float)) or period <= 0:
+        return LOOKUP_SCOPE_FLOOR_S
+    return max(LOOKUP_SCOPE_FLOOR_S, min(LOOKUP_SCOPE_MAX_S, LOOKUP_SCOPE_FACTOR * float(period)))
+
+
+def _replica_lookup(card: str, hub_db: Optional[Path], now: float, gateway: Optional[str] = None,
+                    board: Optional[str] = None, since: Optional[float] = None) -> tuple:
+    """The card in the hermes-hub replica (read-only). -> (found | None, why-unknown | None, configured).
+    found = {status, gateway, board} only from an owner-qualified record whose gateway read that board cleanly
+    inside its heartbeat window; a stale or unknown scope gives (None, why) with `last_seen` carried in why's dict
+    form by card_lookup. Absence counts only when every gateway still in service synced after `since`."""
+    import sqlite3
+    if hub_db is None or not Path(hub_db).exists():
+        return None, None, False
     try:
-        return json.loads(out)["task"]["status"]
-    except Exception:
+        con = _ro_state(Path(hub_db))
+        try:
+            rows = con.execute("SELECT gw, key, data FROM replica WHERE coll = 'tasks' AND key LIKE ?",
+                               ("%/" + card,)).fetchall()
+            infos = con.execute("SELECT gw, data FROM replica WHERE coll = 'gateway'").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return None, {"why": f"replica unreadable: {str(exc)[:80]}"}, True
+    scopes: dict = {}   # (gw, profile, board) -> (state, observed_at, window)
+    last_sync: dict = {}  # gw -> newest clean observation
+    last_seen: dict = {}  # gw -> newest observation of any state (is the gateway still in service?)
+    for gw, raw in infos:
+        try:
+            info = json.loads(raw)
+        except ValueError:
+            continue
+        window = _scope_window(info)
+        for sc in (info.get("task_scopes") or []) if isinstance(info, dict) else []:
+            at = sc.get("observed_at")
+            at = float(at) if type(at) in (int, float) else None
+            scopes[(gw, sc.get("profile"), sc.get("board"))] = (sc.get("state"), at, window)
+            if at is not None:
+                last_seen[gw] = max(last_seen.get(gw, 0.0), at)
+            if sc.get("state") == "ok" and at is not None:
+                last_sync[gw] = max(last_sync.get(gw, 0.0), at)
+    owned = []
+    for gw, key, raw in rows:
+        try:
+            t = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(t, dict) or t.get("id") != card or t.get("gateway") != gw or not t.get("profile"):
+            continue  # legacy two-part keys carry no owner and can lag their owner-qualified twin
+        if gateway and gw != gateway:
+            continue
+        if gateway and board and t.get("board") != board:
+            continue
+        owned.append((gw, t))
+    if owned:
+        fresh = []
+        for gw, t in owned:
+            state, at, window = scopes.get((gw, t.get("profile"), t.get("board")), (None, None, LOOKUP_SCOPE_FLOOR_S))
+            if state == "ok" and at is not None and 0 <= now - at <= window:
+                fresh.append((gw, t))
+        if fresh and len({t.get("status") for _, t in fresh}) == 1:
+            gw, t = fresh[0]
+            return {"status": t.get("status"), "gateway": gw, "board": t.get("board")}, None, True
+        gw, t = (fresh or owned)[0]
+        why = ("replica records disagree" if fresh else
+               f"stale replica scope for {gw}/{t.get('board')}: its gateway has not vouched for it recently")
+        return None, {"why": why, "gateway": gw, "board": t.get("board"), "last_seen": t.get("status")}, True
+    if gateway and gateway not in last_sync:
+        return None, {"why": f"no replica of gateway {gateway} to read", "gateway": gateway}, True
+    # Absent from the replica. That is evidence only from scopes read cleanly inside their window: a board its
+    # gateway could not read (state != ok) or has not vouched for lately may hold the card. A gateway silent past
+    # LOOKUP_RETIRED_S is out of service and neither vouches nor vetoes, unless it is the one asked for.
+    dirty = sorted({f"{gw}/{b}" for (gw, _p, b), (state, at, window) in scopes.items()
+                    if (gw == gateway if gateway else now - last_seen.get(gw, 0.0) <= LOOKUP_RETIRED_S)
+                    and (not (gateway and board) or b == board)
+                    and (state != "ok" or at is None or not 0 <= now - at <= window)})
+    if dirty:
+        return None, {"why": f"stale replica scope: {', '.join(dirty[:4])} cannot vouch that the card is absent",
+                      "gateway": gateway}, True
+    if since is not None:
+        behind = sorted(gw for gw, at in last_sync.items()
+                        if at < since and now - at <= LOOKUP_RETIRED_S and (not gateway or gw == gateway))
+        if behind:
+            return None, {"why": f"gateway {', '.join(behind)} has not synced since the card was recorded"}, True
+    return None, None, True
+
+
+def card_lookup(card: str, board: Optional[str] = None, runner=None, home: Optional[Path] = None,
+                hub_db: Optional[Path] = None, now: Optional[float] = None, since: Optional[float] = None,
+                gateway: Optional[str] = None) -> dict:
+    """Where a card is and what state it is in, with the authority behind the answer.
+    -> {status, authority, board?, gateway?, why?, last_seen?}. status is the Kanban status, "missing" (every
+    readable source agrees it is not there) or None (unknown: `why` says which source could not vouch).
+    `board` = the lane's board ('<gateway>:<board>' when a digest named another host's card); `gateway` = a known
+    remote owner; `since` = when the lane learned of the card (absence must be vouched for after it).
+    Reads only: one `hermes kanban show`, mode=ro SQLite opens."""
+    now = time.time() if now is None else now
+    if board and ":" in str(board):  # digest_owner_cards' '<host>:<board>': not a slug this host's CLI accepts
+        gw, _, rboard = str(board).partition(":")
+        gateway, board = gateway or gw, rboard or None
+        remote_board = board
+    else:
+        remote_board = None
+    if not gateway:
+        argv = ["hermes", "kanban"] + (["--board", board] if board else []) + ["show", card, "--json"]
+        try:
+            rc, out, err = _run(argv, runner)
+        except Exception as exc:
+            return {"status": None, "authority": None, "why": f"board read failed: {str(exc)[:80]}"}
+        if rc == 0:
+            try:
+                return {"status": json.loads(out)["task"]["status"], "authority": "board", "board": board}
+            except Exception:
+                return {"status": None, "authority": None, "why": "board read returned no task status"}
+        if "no such task" not in (err + out).lower():
+            return {"status": None, "authority": None, "why": "board read failed"}
+        found, local_why = _local_board_lookup(card, hermes_home(home) if home else _kanban_home())
+        if found:
+            return {**found, "authority": "local_board"}
+    else:
+        local_why = None
+    found, unknown, configured = _replica_lookup(card, hub_db, now, gateway, remote_board, since)
+    if found:
+        return {**found, "authority": "replica"}
+    if unknown:
+        return {"status": None, "authority": None, **unknown}
+    if gateway and not configured:
+        return {"status": None, "authority": None, "gateway": gateway,
+                "why": f"no replica on this host to read gateway {gateway}"}
+    if local_why:
+        return {"status": None, "authority": None, "why": local_why}
+    return {"status": "missing", "authority": "all_sources"}
+
+
+def card_status(card: str, board: Optional[str] = None, runner=None, home: Optional[Path] = None,
+                hub_db: Optional[Path] = None) -> Optional[str]:
+    """Kanban status of a card, "missing" when every readable source agrees there is no such card, None when
+    unknown (a read failed or a source could not vouch): see card_lookup."""
+    d_home, d_hub = _lookup_sources(runner)
+    return card_lookup(card, board, runner, home=home or d_home, hub_db=hub_db or d_hub).get("status")
+
+
+def _owner_location(st: dict, card: str) -> Optional[tuple]:
+    """(gateway | None, board) where reconcile found `card` off the lane's board, or None. The record names the
+    card it was read for (`owner_card`): a lane re-approved onto another fix card must not look that one up on the
+    old owner's gateway (it would read a live local card as missing)."""
+    if not card or st.get("owner_card") != card or not (st.get("owner_gateway") or st.get("owner_board")):
         return None
+    return st.get("owner_gateway"), st.get("owner_board") or "default"
+
+
+def _lane_owner_lookup(lane, store, fp: str, st: dict, card: str, runner, now: float) -> Optional[str]:
+    """reconcile's status read for a lane card. Records where an owner was found off the lane's board
+    (`owner_gateway`/`owner_board`, logged once as selfheal_owner_located) and an unknown read
+    (selfheal_lookup_unknown, once per card and reason): unknown never ends a lane."""
+    home, hub_db = _lookup_sources(runner)
+    owner = card == st.get("fix_card")
+    located = _owner_location(st, card) if owner else None
+    look = card_lookup(card, st.get("board"), runner, home=home, hub_db=hub_db, now=now,
+                       since=st.get("approved_at") or st.get("filed_at"),
+                       gateway=located[0] if located else None)
+    status = look.get("status")
+    if status is None:
+        mark = {"card": card, "why": look.get("why")}
+        if st.get("lookup_unknown") != mark:
+            lane.update(fp, lookup_unknown=mark)
+            store.log({"event": "selfheal_lookup_unknown", "fingerprint": fp, "card": card, "was": st.get("status"),
+                       "why": look.get("why"), "gateway": look.get("gateway"), "board": look.get("board"),
+                       "last_seen": look.get("last_seen")})
+        return None
+    kw: dict = {}
+    if st.get("lookup_unknown"):
+        kw["lookup_unknown"] = None
+    where = (look.get("gateway"), look.get("board") or "default")
+    if owner and look.get("authority") in ("replica", "local_board") and status != "missing" and \
+            where != located and (look.get("gateway") or where[1] != (st.get("board") or "default")):
+        kw.update(owner_card=card, owner_gateway=look.get("gateway"), owner_board=where[1])
+        store.log({"event": "selfheal_owner_located", "fingerprint": fp, "card": card, "status": status,
+                   "gateway": look.get("gateway"), "board": look.get("board"), "lane_board": st.get("board"),
+                   "authority": look.get("authority")})
+    if kw:
+        lane.update(fp, **kw)
+    return status
 
 
 ENDED = ("done", "archived", "missing")
@@ -4786,7 +5099,7 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
         card = st.get("card") if status == "filed" else st.get("fix_card") if status == "approved" else None
         if not card:
             continue
-        ks = card_status(card, st.get("board"), runner)
+        ks = _lane_owner_lookup(lane, store, fp, st, card, runner, now)
         if ks == "done" and status == "approved" and not st.get("verify_card"):
             # Legacy/non-split and adopted owners can finish without ever knowing this fingerprint.
             # Preserve the generation while a budgeted verifier obtains the receipt (including create failure).

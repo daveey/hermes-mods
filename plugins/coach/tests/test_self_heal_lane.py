@@ -1403,11 +1403,14 @@ def _owner(cards):
     return lambda sid, since: sorted((c for c in cards if c["created_at"] >= since), key=lambda c: -c["created_at"])
 
 
+FIX_TITLE = "Sidebar sessions reshuffle on every refresh"  # names defect()'s symptom: adoption needs subject evidence
+
+
 def test_session_linked_active_card_is_adopted_not_filed(store):
     r = Runner()
     d = defect()
-    cards = [{"id": "t_aaaa1111", "status": "ready", "created_at": NOW - 120, "board": None},
-             {"id": "t_bbbb2222", "status": "running", "created_at": NOW - 30, "board": None}]
+    cards = [{"id": "t_aaaa1111", "status": "ready", "created_at": NOW - 120, "board": None, "title": FIX_TITLE},
+             {"id": "t_bbbb2222", "status": "running", "created_at": NOW - 30, "board": None, "title": FIX_TITLE}]
     out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN, owner_fn=_owner(cards))
     assert out["action"] == "skip" and out["adopted"] and out["card"] == "t_bbbb2222"
     assert not r.creates()
@@ -1451,7 +1454,22 @@ def _real_adoption_env(monkeypatch, tmp_path):
     monkeypatch.delenv("COACH_SELFHEAL_NO_EXEC", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("COACH_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))  # never the live hermes-hub replica
     (tmp_path / "home").mkdir(exist_ok=True)
+
+
+def _replica_task(tmp_path, gw, tid, title, status="running"):
+    """One owner-qualified task record in a throwaway hermes-hub replica (what the hub knows of another host's card)."""
+    import sqlite3
+    (tmp_path / "hub-state").mkdir(exist_ok=True)
+    db = sqlite3.connect(tmp_path / "hub-state" / "hub.db")
+    db.execute("create table if not exists replica (gw text, coll text, key text, version integer, seq integer, "
+               "data text, updated_at integer, primary key (gw, coll, key))")
+    db.execute("insert into replica values(?,?,?,?,?,?,?)", (gw, "tasks", f"default/default/{tid}", 1, 1, json.dumps(
+        {"id": tid, "title": title, "body": "", "status": status, "board": "default", "gateway": gw,
+         "profile": "default"}), 1))
+    db.commit()
+    db.close()
 
 
 def _turns_digest(tmp_path, sid, turns, last_reply=None):
@@ -1468,12 +1486,32 @@ def test_remote_host_card_named_in_the_origin_digest_after_the_complaint_is_adop
         {"t": NOW - 500, "text": "earlier work", "prev": "see t_0000aaaa1111 for the old thing"},
         {"t": NOW - 60, "text": "this panel makes no sense", "prev": "ok"},
         {"t": NOW - 30, "text": "next", "prev": "I filed t_01a17f83116946fd for the panel fix"}])
+    _replica_task(tmp_path, "macbook", "t_01a17f83116946fd", FIX_TITLE)
     r = Runner()
     out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
     assert out["action"] == "skip" and out["adopted"] and out["card"] == "t_01a17f83116946fd"
     assert not r.creates()
     (e,) = ev(store, "selfheal_adopted_owner")
     assert e["board"] == "macbook:default" and e["card"] == "t_01a17f83116946fd"
+
+
+@pytest.mark.parametrize("title", [None, "Unrelated follow-up the session also filed"])
+def test_remote_card_the_session_merely_mentions_is_not_adopted(store, tmp_path, monkeypatch, title):
+    """A card id in the origin session's reply is a mention, not ownership: without replica text that names the
+    defect (no record at all, or an unrelated title) the complaint is filed."""
+    _real_adoption_env(monkeypatch, tmp_path)
+    d = defect(at=NOW - 60, host="macbook")
+    _turns_digest(tmp_path, d["session_id"], [
+        {"t": NOW - 60, "text": "this panel makes no sense", "prev": "ok"},
+        {"t": NOW - 30, "text": "next", "prev": "I filed t_01a17f83116946fd for something"}])
+    if title:
+        _replica_task(tmp_path, "macbook", "t_01a17f83116946fd", title)
+    r = Runner()
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and len(r.creates()) == 1
+    assert not ev(store, "selfheal_adopted_owner")
+    (skip,) = ev(store, "selfheal_adopt_skipped")
+    assert skip["candidates"] == ["t_01a17f83116946fd"]
 
 
 @pytest.mark.parametrize("status", ["done", "review"])
@@ -1484,7 +1522,8 @@ def test_local_card_in_review_or_done_is_adopted(store, tmp_path, monkeypatch, s
     db = sqlite3.connect(tmp_path / "home" / "kanban.db")
     db.executescript("create table tasks(id text, title text, status text, created_at int, session_id text);"
                      "create table kanban_notify_subs(task_id text, chat_id text);")
-    db.execute("insert into tasks values('t_ffff0001','fix','%s',?,?)" % status, (int(NOW - 30), d["session_id"]))
+    db.execute("insert into tasks values('t_ffff0001',?,'%s',?,?)" % status,
+               (FIX_TITLE, int(NOW - 30), d["session_id"]))
     db.commit()
     db.close()
     r = Runner()

@@ -130,7 +130,7 @@ def test_card_sharing_several_distinctive_words_is_adopted(store):
     assert out["action"] == "skip" and out["card"] == "t_sidebar001"
 
 
-def test_user_complaint_still_adopts_the_sessions_card_and_prefers_one_naming_it(store):
+def test_user_complaint_adopts_the_session_card_naming_it_and_never_an_unrelated_one(store):
     d = signal_defect(source="complaint", symptom="sidebar sessions reshuffle")
     fix = {"id": "t_fixsort001", "status": "running", "board": None, "created_at": NOW - 50,
            "title": "Sidebar sessions reshuffle on every refresh", "body": ""}
@@ -138,9 +138,13 @@ def test_user_complaint_still_adopts_the_sessions_card_and_prefers_one_naming_it
              "title": "Unrelated follow-up", "body": ""}
     out, r = file(store, d, [fix, newer])
     assert out["action"] == "skip" and out["card"] == "t_fixsort001"
+    # This used to assert the opposite ("the session's own card after the user's complaint" was adopted with no
+    # subject evidence). That fallback closed a dozen complaints against unrelated work (desktop-d39268b86c,
+    # agent-2e9530b2b5, ...; tests/test_self_heal_adopt_authority.py): a complaint now files unless a card names it.
     store2 = core.Store(Path(store.root).parent / "coach2")
-    out, r = file(store2, d, [newer])  # the session's own card after the user's complaint, unchanged behavior
-    assert out["action"] == "skip" and out["card"] == "t_newer00001"
+    out, r = file(store2, d, [newer])
+    assert out["action"] == "filed" and len(r.creates()) == 1
+    assert not ev(store2, "selfheal_adopted_owner")
 
 
 def test_card_names_defect_needs_more_than_one_generic_word():

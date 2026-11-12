@@ -918,13 +918,28 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   stripped; a JSON tool result is unwrapped to its error/output string), so each distinct failure is its own
   fingerprint, and its evidence (the tool, error line, count and last call) leads the defect quote. `handle()` adds it
   itself, so a gateway that hot-reloaded `self_heal.py` under an older `__init__.py` still records it. Session-owner
-  adoption for any defect that is not a user complaint in that session (machine signals, the digest backstop; only
-  `complaint`/`admission` are exempt) takes a session card only with subject evidence (`card_names_defect`): its
-  title, body or idempotency key names the fingerprint, the symptom's first 80 characters or the repeated error, or
-  the non-generic tool; or its title shares max(2, a third) of the symptom's distinctive words. Otherwise it files
-  (`selfheal_adopt_skipped`). A complaint still adopts the session's card, preferring one that names the defect.
+  adoption, for every source (complaints included), takes a session card only with subject evidence
+  (`card_names_defect`): its title, body or idempotency key names the fingerprint, the symptom's first 80 characters
+  or the repeated error, or the non-generic tool; or its title shares max(2, a third) of the symptom's distinctive
+  words. Two cards are never the owner even when their words match: a card the complaint itself names (the stalled
+  card of a wait notice is the subject, not the scheduler's repair), and another fingerprint's investigation or
+  VERIFY card unless it names this fingerprint. A card another host's digest names is judged on its text from the
+  hermes-hub replica; with no readable text it is not adopted. Otherwise it files (`selfheal_adopt_skipped`, with
+  `candidates`, `subject_cards`, `process_cards`).
   Origin: agent-6eb3a51e94 (an Ask Eve test owned a repeated tool error); agent-e5b6dcf428 (any one shared word,
-  "agent" or "check", let a report_only signal close against a Kanban owner-death fix).
+  "agent" or "check", let a report_only signal close against a Kanban owner-death fix); desktop-d39268b86c,
+  agent-2e9530b2b5 and others (a complaint adopted the session's newest unrelated card); kanban-04bdba70ac (the
+  stalled card adopted as its own scheduler fix). Tests: `tests/test_self_heal_adopt_authority.py`.
+  Card lookup authority: `hermes kanban show` answers for one board of this host, so "no such task" alone used
+  to end lanes whose owner sat on another board or another gateway (kanban-f3b72e7010, bb-448ec69637). `card_lookup`
+  returns `missing` only when every readable source agrees: the lane board's CLI, a read-only scan of every local
+  board DB, and the hermes-hub replica (`$HERMES_HUB_STATE/hub.db`) of the other gateways' boards. A replica record
+  counts only while its gateway's scope heartbeat is fresh and `ok`; a stale scope, an unreadable source, a board in
+  recovery, or a gateway that has not synced since the lane learned of the card is unknown (`None`): the lane stays
+  open and logs `selfheal_lookup_unknown` once per card and reason. An owner found off the lane's board is recorded
+  as `owner_gateway`/`owner_board` (`selfheal_owner_located`), and its VERIFY card is told where to read it and is
+  not parented on a card this board lacks. A `<host>:<board>` lane board routes to that gateway's replica records
+  instead of an invalid `--board` slug. Lookups never write.
   A backend that stops mid-turn never reaches this hook: the next user turn, core's `[System note: Your previous turn
   was interrupted mid-run` resume note, files `turn interrupted (backend stopped)` with the gap since the last activity.
   The cause is read on that host when the note is detected (`stop_cause`, window = cut turn's last row/start to the
