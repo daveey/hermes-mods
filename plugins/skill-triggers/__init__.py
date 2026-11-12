@@ -131,14 +131,25 @@ def extract_section(text: str, want: str) -> str | None:
                 out.append(nxt)
             return "\n".join(out).strip()
     for i, ln in enumerate(lines):
-        if ln.lstrip().lower().startswith("**" + w):
-            out = []
-            for nxt in lines[i:]:
-                if not nxt.strip():
+        # A bold lead-in opens a paragraph or a list item ("- **Lead-in.** ..."); an item ends at the next item
+        # at the same or a shallower indent, so one bullet of a Pitfalls list comes out alone.
+        m = _ITEM.match(ln)
+        body = ln[m.end():] if m else ln.lstrip()
+        if body.lower().startswith("**" + w):
+            indent = len(ln) - len(ln.lstrip()) if m else None
+            out = [ln]
+            for nxt in lines[i + 1:]:
+                if not nxt.strip() or re.match(r"^#+\s", nxt):
+                    break
+                n = _ITEM.match(nxt)
+                if indent is not None and n and len(nxt) - len(nxt.lstrip()) <= indent:
                     break
                 out.append(nxt)
             return "\n".join(out).strip()
     return None
+
+
+_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 
 # ---------------------------------------------------------------- session state

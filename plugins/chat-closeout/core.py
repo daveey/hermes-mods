@@ -1947,3 +1947,11 @@ LINT_NUDGE = (
     "rewrite the reply without the promise and give the result now.")
 LINT_APPEND = ("⚠ Nothing tracked will report back on this (no open card, background process or cron job is linked "
                "to this chat); ask again to check on it.")
+
+# Turn-end visibility (``pre_final_gate``): a card created this turn that the chat's own task list does not show.
+VISIBILITY_NUDGE = (
+    "{tag} You created {cards} this turn, but this chat's task list does not show {it} (core session_tasks, the "
+    "list behind the chat's card panel), so the user sees no card here and no completion notice is routed back. "
+    "Link {it} to this chat and re-check, or tell the user plainly that {it} isn't linked to this chat. Don't say "
+    "a pending link or acknowledgement will appear later.")
+VISIBILITY_APPEND = "⚠ {cards} isn't shown in this chat's task list yet."

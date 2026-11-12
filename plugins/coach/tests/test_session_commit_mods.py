@@ -142,3 +142,80 @@ def test_fixed_event_citing_a_commit_older_than_the_card_logs_late_adopt(store, 
     lane.update(d["fingerprint"], filed_at=NOW - 5000)
     sh.record_event("fixed", d["fingerprint"], note=f"fixed in {sha[:8]}", store=store, now=NOW + 10)
     assert len(ev(store, "selfheal_late_adopt")) == 1
+
+
+# desktop-0e7cc2f6c8: Desktop stopped the complaint turn (stock "not processed" reply plus a synthetic "[Turn stopped
+# by Desktop…]" user row), the user sent "resume" hours later, and that turn shipped and named the fix. The lane's
+# complaint_at is a few seconds after the complaint, so every row before "resume" falls before the window.
+STOCK = "Your request was not processed. Send it again if you still want me to carry it out."
+FLASH_FIX = "fix: new-chat panels no longer flash an error before the first turn"
+
+
+def _stopped_then_resumed(sid, then):
+    return [("user", COMPLAINT - 7, "when i create a new session, this panel shows up then disappears"),
+            ("assistant", COMPLAINT - 5.1, STOCK),
+            ("user", COMPLAINT - 5.0, "[Turn stopped by Desktop before it finished.]"),
+            ("user", COMPLAINT + 15000, then),
+            ("assistant", COMPLAINT + 15010, ""),
+            ("assistant", COMPLAINT + 15100, "Red without the fix, green with it. Committing and deploying.")]
+
+
+def test_fix_named_after_a_stopped_turn_and_resume_is_adopted(store, tmp_path, monkeypatch):
+    mods, sha = _repo(tmp_path, "mods", FLASH_FIX, "desktop-plugins/session-panel/plugin.js", at=COMPLAINT + 15120)
+    _env(monkeypatch, tmp_path, mods=mods)
+    d = _defect()
+    _digest(tmp_path, d, "…[clipped")
+    rows = _stopped_then_resumed(d["session_id"], "resume") + [
+        ("assistant", COMPLAINT + 15150, f"Fixed. That panel was two desktop plugins; hermes-mods `{sha[:8]}`.")]
+    _transcript(tmp_path, d["session_id"], rows)
+    assert sha[:8] in sh._complaint_reply_text(d["session_id"], COMPLAINT)
+    fix = sh.session_commit_fix(d, COMPLAINT, data=tmp_path / "data", now=COMPLAINT + 16000)
+    assert fix and fix["sha"] == sha and fix["via"] == "named"
+
+
+def test_stock_only_reply_text_is_empty_and_leaves_no_notice():
+    """The not-processed notice is not an answer: the reply text drops it, so '' means nothing answered."""
+    assert sh._stock_reply(STOCK) and not sh._stock_reply(f"Fixed the bug behind \"{STOCK}\" in abc1234.")
+    assert sh._machine_user_row("[Turn stopped by Desktop before it finished.]")
+    assert not sh._machine_user_row("resume")
+
+
+def test_unrelated_user_turn_after_a_stopped_turn_still_ends_the_window(store, tmp_path, monkeypatch):
+    mods, sha = _repo(tmp_path, "mods", FLASH_FIX, "desktop-plugins/session-panel/plugin.js", at=COMPLAINT + 15120)
+    _env(monkeypatch, tmp_path, mods=mods)
+    d = _defect()
+    _digest(tmp_path, d, "…[clipped")
+    rows = _stopped_then_resumed(d["session_id"], "now rename the sidebar section") + [
+        ("assistant", COMPLAINT + 15150, f"Renamed in `{sha[:8]}`.")]
+    _transcript(tmp_path, d["session_id"], rows)
+    assert sh._complaint_reply_text(d["session_id"], COMPLAINT) == ""
+    assert sh.session_commit_fix(d, COMPLAINT, data=tmp_path / "data", now=COMPLAINT + 16000) is None
+
+
+def test_resume_after_a_real_reply_ends_the_window(store, tmp_path, monkeypatch):
+    """A nudge only carries the window across a turn that never answered; after a real answer it is a new turn."""
+    mods, sha = _repo(tmp_path, "mods", FLASH_FIX, "desktop-plugins/session-panel/plugin.js", at=COMPLAINT + 15120)
+    _env(monkeypatch, tmp_path, mods=mods)
+    d = _defect()
+    _digest(tmp_path, d, "…[clipped")
+    _transcript(tmp_path, d["session_id"], [
+        ("user", COMPLAINT - 1, "when i create a new session, this panel shows up then disappears"),
+        ("assistant", COMPLAINT + 60, "That is the session panel racing the first turn; not fixing it now."),
+        ("user", COMPLAINT + 15000, "continue"),
+        ("assistant", COMPLAINT + 15150, f"Landed `{sha[:8]}`.")])
+    assert sha[:8] not in sh._complaint_reply_text(d["session_id"], COMPLAINT)
+    assert sh.session_commit_fix(d, COMPLAINT, data=tmp_path / "data", now=COMPLAINT + 16000) is None
+
+
+def test_stock_only_reply_falls_through_to_the_digest(store, tmp_path, monkeypatch):
+    """A transcript whose complaint got only the stock notice is no answer: the digest's named sha is read as when
+    the transcript is missing (it was skipped because '' is not None)."""
+    mods, sha = _repo(tmp_path, "mods", "fix: blocked card prompt not visible in the session panel",
+                      "desktop-plugins/session-panel/plugin.js", at=NOW - 600)
+    _env(monkeypatch, tmp_path, mods=mods)
+    d = _defect()
+    _digest(tmp_path, d, f"Fixed in hermes-mods {sha[:8]}.")  # last_activity NOW-3000: the commit is past the window
+    _transcript(tmp_path, d["session_id"], _stopped_then_resumed(d["session_id"], "something else entirely")[:4])
+    assert sh._complaint_reply_text(d["session_id"], COMPLAINT) == ""
+    fix = sh.session_commit_fix(d, COMPLAINT, data=tmp_path / "data", now=NOW)
+    assert fix and fix["sha"] == sha and fix["via"] == "named"

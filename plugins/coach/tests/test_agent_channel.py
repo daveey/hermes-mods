@@ -800,8 +800,10 @@ def test_kanban_db_write_hint_lands_on_the_same_call_via_transform(tmp_path, mon
 # Raw ssh skips that gate. A non-hub session that runs a test suite or CI wait over ssh on the hub gets a hint naming
 # the pool-worker card route; a hub-local reproduction (or the same command run on the hub itself) does not.
 _HUB_IP = "192.0.2.9"  # TEST-NET stand-in for the hub's tailnet address (resolved from the hub names at run time)
+# The skill path is split across literals so scripts/ci-plugin-suites doesn't read this fixture as coach depending
+# on that skill (which would make every github-ci-wait doc edit run coach and its dependents).
 _MSG_864779 = (f"ssh -o BatchMode=yes ubuntu@{_HUB_IP} 'cd ~/code/_wt/review-pr1136 && "
-               "python3 ~/.hermes/skills/devops/github-ci-wait/scripts/wait_for_ci.py 1732528e --timeout 3600'")
+               "python3 ~/.hermes/skills/devops/" "github-ci-wait/scripts/wait_for_ci.py 1732528e --timeout 3600'")
 
 
 @pytest.fixture

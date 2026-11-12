@@ -477,7 +477,7 @@ test('unresolved primary owner stays unknown without querying the active connect
     focusedSessionOwner: { get: () => ({ connectionId, profile: 'work' }) },
     connectionId: { get: () => 'unrelated-active' }
   }
-  host.request = async (...args) => { calls.push(args); return {} }
+  host.request = async (...args) => { calls.push(args); return { processes: [], subagents: [] } }
   globalThis.document = { hidden: false, getElementById: () => ({ remove() {} }), addEventListener() {}, removeEventListener() {} }
   globalThis.window = { hermesDesktop: { api: async args => {
     calls.push(args)
@@ -557,7 +557,7 @@ test('failed lineage stays unknown and retries rather than caching an empty task
     focusedStoredSessionId: { get: () => 'lineage-failure' },
     focusedSessionOwner: { get: () => ({ connectionId: 'owner', profile: 'default' }) }
   }
-  host.request = async () => ({})
+  host.request = async () => ({ processes: [], subagents: [] })
   let failed = true
   let lineageReads = 0
   globalThis.document = { hidden: false, getElementById: () => ({ remove() {} }), addEventListener() {}, removeEventListener() {} }
@@ -587,7 +587,7 @@ test('a new chat with no stored row yet shows no lineage-unavailable chip and re
     focusedStoredSessionId: { get: () => 'new-unstored' },
     focusedSessionOwner: { get: () => ({ connectionId: 'owner', profile: 'default' }) }
   }
-  host.request = async () => ({})
+  host.request = async () => ({ processes: [], subagents: [] })
   let stored = false
   let lineageReads = 0
   let taskReads = 0
