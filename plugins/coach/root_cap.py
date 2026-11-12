@@ -1171,6 +1171,19 @@ def _own_speech(text):
     return _QUOTED_SQ.sub(" ", _QUOTED_DQ.sub(" ", text)).replace("`", "")
 
 
+def _own_terms(own_text):
+    """The human's own affirmative sentences of one message, original case kept: quoted spans are already removed;
+    questions, someone else's words, cancellations and negations are dropped, so none of them can supply an owner,
+    run, session, restore value, expiry or trigger."""
+    keep = []
+    for s in _sentences(own_text):
+        low = s.lower()
+        if _QUESTION_LEAD.search(low) or _CANCEL.search(low) or _NEG.search(low) or _REPORTED.search(low):
+            continue
+        keep.append(s)
+    return " ".join(keep)
+
+
 def _decision(items, rec, new_value):
     """Latest surviving direct human decision for this contract revision, whatever its value; it is returned only when
     it authorizes `new_value`. A later explicit decision for another value (or a cancellation) therefore supersedes an
@@ -1183,6 +1196,7 @@ def _decision(items, rec, new_value):
     for item in items:
         raw = item["text"]
         text = raw.lower()
+        text_own = _own_speech(raw)
         for s in _sentences(_own_speech(text)):
             if _QUESTION_LEAD.search(s):
                 continue
@@ -1207,8 +1221,11 @@ def _decision(items, rec, new_value):
                 target = None
             if target is None:
                 continue
-            current = {"text": raw, "temporary": "temporar" in text, "sha": _sha(raw), "ref": item["ref"],
-                       "target": target}
+            # Temporary provenance (owner/run/session/restore/expiry/trigger) comes only from this message's own
+            # affirmative sentences: quoted, reported, interrogative or withdrawing text is never a term.
+            own = _own_terms(text_own)
+            current = {"text": raw, "terms_text": own, "temporary": "temporar" in own.lower(),
+                       "sha": _sha(raw), "ref": item["ref"], "target": target}
     if current is None or current["target"] != new_value:
         return None
     return current
@@ -1248,7 +1265,8 @@ def owner_task(card, target_home):
 def _temporary_terms(decision, rec, session_id, now):
     """(terms, missing[]): owner/restore provenance parsed from the user's own decision text and validated against
     the actual owner card and run. A supplied field that cannot be verified is rejected, never stored as verified."""
-    text = decision["text"].lower()
+    own_text = decision.get("terms_text", "")
+    text = own_text.lower()
     missing = []
     card = re.search(r"\bt_[0-9a-z]{4,}\b", text)
     owner = {"card": card.group(0) if card else None, "session": session_id if "this session" in text else None}
@@ -1283,7 +1301,7 @@ def _temporary_terms(decision, rec, session_id, now):
     restore = next((s for s in _sentences(text) if "restore" in s), "")
     restore_to = re.findall(r"\bto\s+(\d+)\b", restore)
     restore_value = int(restore_to[-1]) if restore_to else None
-    expiry = expiry_raw = _ISO.search(decision["text"][max(decision["text"].lower().find("restore"), 0):]) \
+    expiry = expiry_raw = _ISO.search(own_text[max(text.find("restore"), 0):]) \
         if restore else None
     owner_terminal = bool(_OWNER_TERMINAL.search(restore))
     if restore_value is None:
