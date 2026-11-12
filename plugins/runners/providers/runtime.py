@@ -5,7 +5,10 @@ reference maps to a broker scope/env name and an explicit stable budget key;
 aliases MUST use the same key. Tokens exist only in process memory and the
 anonymous child pipe. No broker stdout/stderr is retained. Call invalidate(ref)
 or invalidate(key=credential.key) after rejected authorization; TTL is a cache
-ceiling, not a claim about the issuer's actual credential lifetime.
+ceiling, not a claim about the issuer's actual credential lifetime. A failed vend
+(a broker denial such as the GitHub quota brake, a timeout, a bad pipe value) is
+remembered per budget key for failure_ttl seconds: every alias sharing that key
+fails fast without spawning the broker until the cool-down ends.
 """
 from dataclasses import dataclass
 import http.client
@@ -238,8 +241,9 @@ class BrokerCredentialResolver:
     to credentials in the parent environment is implemented.
     """
     def __init__(self, references, *, runner=subprocess.run, clock=time.monotonic,
-                 ttl=300, timeout=30, broker_command=('token-broker',)):
-        if not _bounded_number(ttl, 3600) or not _bounded_number(timeout, 300):
+                 ttl=300, timeout=30, broker_command=('token-broker',), failure_ttl=60):
+        if (not _bounded_number(ttl, 3600) or not _bounded_number(timeout, 300)
+                or not _bounded_number(failure_ttl, 3600)):
             raise ValueError('invalid_broker_options')
         self._references = dict(references)
         for ref, spec in self._references.items():
@@ -258,7 +262,12 @@ class BrokerCredentialResolver:
             raise ValueError('invalid_broker_options')
         self._command = tuple(broker_command)
         self.runner, self.clock, self.ttl, self.timeout = runner, clock, ttl, timeout
+        self.failure_ttl = failure_ttl
         self._cache = {}
+        # Budget key -> monotonic time before which a failed vend is not retried.
+        # Keyed by key, not ref, so hundreds of scopes sharing one credential
+        # cost one broker exec per cool-down instead of one each.
+        self._failures = {}
         self._lock = RLock()
 
     def invalidate(self, ref=None, *, key=None):
@@ -266,15 +275,18 @@ class BrokerCredentialResolver:
         with self._lock:
             if ref is None and key is None:
                 self._cache.clear()
+                self._failures.clear()
                 return
             if ref in self._references:
                 key = self._references[ref].key
+            self._failures.pop(key, None)
             self._cache = {r: item for r, item in self._cache.items()
                            if self._references[r].key != key}
 
     def __call__(self, ref):
         with self._lock:
             read_fd = write_fd = None
+            spec = None
             try:
                 spec = self._references[ref]
                 now = self.clock()
@@ -282,6 +294,12 @@ class BrokerCredentialResolver:
                 if cached is not None and now < cached[0]:
                     return cached[1]
                 self._cache.pop(ref, None)
+                retry_at = self._failures.get(spec.key)
+                if retry_at is not None:
+                    if now < retry_at:
+                        spec = None  # Already recorded; do not extend the cool-down.
+                        raise ValueError()
+                    del self._failures[spec.key]
                 read_fd, write_fd = os.pipe()
                 os.set_blocking(read_fd, False)
                 argv = [*self._command, 'exec', '--scope', spec.scope,
@@ -307,6 +325,8 @@ class BrokerCredentialResolver:
                 self._cache[ref] = (self.clock() + self.ttl, credential)
                 return credential
             except Exception:
+                if spec is not None:
+                    self._failures[spec.key] = self.clock() + self.failure_ttl
                 raise RuntimeBoundaryError('credential_unavailable') from None
             finally:
                 for fd in (read_fd, write_fd):

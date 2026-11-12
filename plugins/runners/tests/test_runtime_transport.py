@@ -151,12 +151,63 @@ def test_broker_exec_pipe_cache_ttl_alias_budget_identity_and_invalidation():
 
 @pytest.mark.parametrize('value', [b'', b'bad\nvalue', b'x' * 4097, b'\xff'])
 def test_broker_bad_pipe_values_never_cached(value):
-    calls = []
-    resolver = BrokerCredentialResolver(specs(), runner=fake_runner(calls, value))
+    calls, now = [], [0.0]
+    resolver = BrokerCredentialResolver(specs(), runner=fake_runner(calls, value),
+                                        clock=lambda: now[0])
     for _ in range(2):
         with pytest.raises(RuntimeBoundaryError, match='credential_unavailable'):
             resolver('first')
-    assert len(calls) == 2
+    assert len(calls) == 1 and not resolver._cache
+    now[0] += 60
+    with pytest.raises(RuntimeBoundaryError, match='credential_unavailable'):
+        resolver('first')
+    assert len(calls) == 2 and not resolver._cache
+
+
+def test_broker_denial_is_negative_cached_per_key_until_cool_down():
+    # The quota brake denies the vend (nonzero broker exit). Every alias that
+    # shares the budget key must fail fast without another broker exec.
+    calls, now, deny = [], [100.0], [True]
+    ok = fake_runner(calls)
+    def run(argv, **kwargs):
+        if deny[0]:
+            calls.append((argv, kwargs))
+            return SimpleNamespace(returncode=1)
+        return ok(argv, **kwargs)
+    resolver = BrokerCredentialResolver(specs(), runner=run, clock=lambda: now[0], failure_ttl=90)
+    for _ in range(50):
+        for ref in ('first', 'alias'):
+            with pytest.raises(RuntimeBoundaryError, match='credential_unavailable'):
+                resolver(ref)
+    assert len(calls) == 1
+    now[0] += 89  # Fast failures inside the window do not extend it.
+    with pytest.raises(RuntimeBoundaryError):
+        resolver('alias')
+    assert len(calls) == 1
+    now[0] += 1
+    with pytest.raises(RuntimeBoundaryError):
+        resolver('alias')
+    assert len(calls) == 2  # One retry per cool-down, and it re-arms on failure.
+    now[0] += 90
+    deny[0] = False
+    assert resolver('first').token == 'fictional-token'
+    assert resolver('alias').token == 'fictional-token' and len(calls) == 4
+
+
+def test_invalidate_clears_negative_cache():
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1)
+    resolver = BrokerCredentialResolver(specs(), runner=run)
+    for invalidate in (lambda: resolver.invalidate('alias'), lambda: resolver.invalidate()):
+        with pytest.raises(RuntimeBoundaryError):
+            resolver('first')
+        before = len(calls)
+        invalidate()
+        with pytest.raises(RuntimeBoundaryError):
+            resolver('first')
+        assert len(calls) == before + 1
 
 
 def test_broker_unknown_reference_and_errors_never_leak():
@@ -251,7 +302,8 @@ def test_real_adapter_contract_with_production_boundaries():
 
 
 @pytest.mark.parametrize('options', [dict(ttl=0), dict(ttl=3601), dict(ttl=float('nan')),
-                                     dict(timeout=0), dict(timeout=301)])
+                                     dict(timeout=0), dict(timeout=301),
+                                     dict(failure_ttl=0), dict(failure_ttl=3601)])
 def test_broker_options_are_bounded(options):
     with pytest.raises(ValueError):
         BrokerCredentialResolver(specs(), runner=fake_runner([]), **options)
