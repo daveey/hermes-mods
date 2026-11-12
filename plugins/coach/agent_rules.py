@@ -1270,6 +1270,17 @@ def _guided_refusal(tool: str, d: dict) -> bool:
                             {"terminal", "file", "git", "host_repo", "kanban"} for c in missing)
                     and d.get("error") ==
                     f"Assignee {assignee!r} lacks required capabilities: {', '.join(missing)}")
+        if d.get("rejection") == "machine_held":
+            machine = d.get("machine")
+            # Operator holds are deliberate. Preserve the refusal and retry
+            # guidance without filing a bug; do not hide registry outages or
+            # mismatched provenance. Exceptions are classified before this.
+            return (d.get("code") == "placement_unavailable" and d.get("created") is False
+                    and isinstance(machine, str) and bool(machine)
+                    and str(d.get("error") or "").startswith(
+                        f"The pin names machine:{machine}, but that machine is on hold in the Board registry "
+                        "(hold=true: it copies and leases no new cards), so no worker would claim the card "
+                        "until an operator releases the hold. Nothing was written. "))
         pin = d.get("placement")
         # A stale/unknown explicit pin must be refused, not silently rerouted.
         # Do not exempt other placement_unavailable causes (transport, storage,
