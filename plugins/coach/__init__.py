@@ -238,6 +238,11 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             coach.observe(session_id, tool_name, args, result, status, duration_ms or 0, error_type, error_message)
         except Exception as exc:
             log.debug("coach post_tool_call: %s", exc)
+        try:  # a lifecycle-guard fail-closed refusal of a command with no lifecycle text: self-heal, every occurrence
+            if result is not None and "the lifecycle guard could not scan this" in str(result):
+                _selfheal_run(_selfheal_guard, session_id, tool_name, args, result)
+        except Exception as exc:
+            log.debug("coach post_tool_call guard refusal: %s", exc)
 
     def transform_tool_result(tool_name="", result=None, session_id="", args=None, **_):
         try:
@@ -801,6 +806,26 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             sh.handle(hit, session_id, store, evidence=evidence, platform=platform, ask=ask)
         except Exception as exc:
             log.debug("coach self_heal admission: %s", exc)
+
+    def _selfheal_guard(session_id, tool_name, args, result):
+        """Lifecycle-guard false refusal (self_heal.guard_refusal_signal). Not gated on user_facing: a guard that
+        refuses safe work is a defect whoever hit it (cron and Kanban sessions too). A `[selfheal-probe]` session
+        is logged by handle() and files nothing."""
+        try:
+            sh = _load("self_heal")
+            hit = sh.guard_refusal_signal(tool_name, args, result)
+            if not hit:
+                return
+            a = args if isinstance(args, dict) else {}
+            cmd = str(a.get("command") or a.get("script") or a.get("prompt") or "")
+            if not sh.guard_occurrence_new(store, session_id or "", cmd, hit["shape"]):
+                store.log({"event": "selfheal_skip", "why": "guard_repeat", "fingerprint": hit["fingerprint"],
+                           "session_id": session_id})
+                return  # the same refused command retried within GUARD_DEDUPE_S is one occurrence
+            ask = coach.turn_context(session_id)[0] if session_id else ""
+            sh.handle(hit, session_id, store, evidence=hit.get("evidence") or "", ask=ask)
+        except Exception as exc:
+            log.debug("coach self_heal guard refusal: %s", exc)
 
     def post_llm_call(session_id="", assistant_response=None, platform="", parent_session_id="", **_):
         try:

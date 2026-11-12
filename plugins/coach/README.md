@@ -1049,6 +1049,27 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   (on the hook path and the digest backstop alike); `p_defect` is the mean of the stage scores. The strict prompt
   counts a fix/root-cause request for a Hermes defect the agent's own message described, and a product problem the
   agent's own work caused; Hermes itself is never a `product_bug`. Outside-world problems (`kind: external`) never count.
+- **Lifecycle-guard false refusal** (`post_tool_call`, `self_heal.guard_refusal_signal`, no judge): core's terminal
+  guard and cron-create guard fail CLOSED when a script the command executes cannot be scanned, and say so:
+  `Blocked: the lifecycle guard could not scan this command|cron job or referenced script: <reason>. Nothing in the …
+  is known to contain a gateway lifecycle command`. Each such result is one hit (`kind: guard_refusal`,
+  `component: gateway`). Only the producing envelope counts: tool `terminal` (with `exit_code` 1 and empty `output`)
+  or `cronjob_manage`/`cronjob`, a JSON `error` that STARTS with that text. A tool that merely quotes it (read_file,
+  kanban_show, pytest output) never counts; a true lifecycle refusal ("cannot restart, stop, or uninstall the
+  gateway") has other text. Not gated on `user_facing()`: cron and Kanban sessions count too.
+  - Shape = reason class + subkind: `sqlite`, `oversized/file|walk|local|remote` (the named file stat'ed on the refused
+    host: over the 1 MiB cap = `file`, under = `walk`, unreadable = `local`), `budget/<text|paths|remote reads>`,
+    `depth` (once core names its depth cap), `other/<cloud|nonregular|unreadable|unknown>`. The path is evidence, not
+    shape. Fingerprint `lifecycleguard-<sha1(shape)[:12]>`, host-independent.
+  - Threshold 1, and every occurrence reaches the lane (`every_occurrence`): the first files the investigation card,
+    later ones comment on the open card (`selfheal_occurrence_comment`), the same (session, command, shape) within 10
+    minutes is one occurrence (`selfheal_skip why=guard_repeat`, `<coach>/guard_refusals.json`). Before deciding,
+    a `filed` lane reconciles its card inline (`selfheal_stale via=occurrence`), so an occurrence after the card is
+    done or archived files a fresh generation the same UTC day (also after `declined`/`reverted`). A `fixed` shape
+    keeps the rollout hold (2 held, `selfheal_recurrence_held`, the 3rd files). A comment in the `proposed` window
+    lands on the finished investigation card. Nothing goes to the Inbox. `[selfheal-probe]` sessions (also on the
+    first turn, from the turn's ask) log `selfheal_detect probe:true` + `selfheal_skip why=probe` and file nothing.
+  - Tests: `tests/test_self_heal_guard_refusal.py` (core-backed cases skip without core).
 - **Turn end** (`post_llm_call`): machine signals first, no judge (a provider-error reply, an interrupted turn, one
   tool error repeated 3×). "Interrupted" is read from the start of the reply only (core's placeholders: `Operation interrupted`,
   `turn lease lost`, `Turn stopped by`, `the turn stopped while a tool result was still pending`); the tool log counts
