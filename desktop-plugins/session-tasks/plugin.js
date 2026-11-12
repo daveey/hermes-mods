@@ -904,6 +904,13 @@ export async function refresh() {
     // Kanban and machine answers depend on the stored chat only, so a runtime id that lands mid-round (resume)
     // must not throw them away; only process/sub-agent chips belong to one runtime session.
     const stillFocused = () => focusScope().scope === scope
+    // Publish actual source failures to core's completion veto, qualified to this owner/chat.
+    // Older renderers lack the optional API; never fabricate task/outcome state as a fallback.
+    const report = (source, available) => {
+      if (!stillFocused() || !stored || !route.connectionId) return
+      host.sessions?.reportWorkSourceRead?.({ connectionId: route.connectionId, profile: route.profile,
+        storedSessionId: stored, source, available })
+    }
     if (!runtime && !stored) {
       snapshot = { runtime, stored, chips: [] }
       return emit()
@@ -942,8 +949,11 @@ export async function refresh() {
           safe(() => host.request('process.list', { session_id: runtime }), null),
           safe(() => host.request('subagent.list', { session_id: runtime }), null)
         ]).then(([p, sa]) => {
-          procs = p
-          subagents = sa
+          // A malformed/failed answer is unknown, never an authoritative empty list.
+          procs = Array.isArray(p?.processes) ? p : null
+          subagents = Array.isArray(sa?.subagents) ? sa : null
+          report('process', procs !== null)
+          report('subagent', subagents !== null)
           publish()
         })
       : Promise.resolve()
@@ -963,6 +973,7 @@ export async function refresh() {
         return publish()
       }
       if (ids.incomplete) {
+        report('lineage', false)
         await rpc
         if (!stillFocused()) return
         // Never turn a partial ancestry read into an authoritative empty answer.
@@ -979,9 +990,11 @@ export async function refresh() {
         emit()
         return
       }
+      report('lineage', true)
       const kanban = kanbanDue
         ? ((lastKanbanAt = Date.now()), loadKanban(ids, route)).then(kChips => {
             if (!stillFocused()) return
+            report('tasks', Array.isArray(kChips) && !kChips.some(c => c.kind === 'kanban-status' && c.state === 'unknown'))
             // null = fetch failed: keep this chat's last good list (cached or live), never the previous chat's.
             if (kChips) {
               kanbanCache = kChips

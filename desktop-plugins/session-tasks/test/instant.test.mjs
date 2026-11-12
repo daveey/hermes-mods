@@ -101,7 +101,7 @@ test('switching chats during an in-flight round paints the new chat at once', as
 test('a switch reads the new chat at once instead of queueing behind the old chat\'s slow round', async () => {
   focus.stored = 'chat-old'
   const slow = deferred(), paths = []
-  host.request = async () => ({})
+  host.request = async () => ({ processes: [], subagents: [] })
   globalThis.window = { hermesDesktop: { api: ({ path }) => {
     paths.push(path)
     if (path.includes('chat-old')) return slow.promise // the old chat's reads hang
@@ -336,4 +336,57 @@ test('a hub-sync replica card is explicit unknown with a replica reason, aged fr
   const [legacy] = m.sessionTaskChips([{ ...row, local: true, gateway: '' }])
   assert.equal(legacy.replica, undefined)
   assert.equal(m.unobservedView(legacy, now).reason, 'producer_sent_no_observations')
+})
+
+// Exercise the actual refresh/RPC/REST seam, not a fabricated outcome or task count.
+test('idle source failures publish qualified completion vetoes and authoritative recovery clears each one', async () => {
+  focus.stored = 'chat-failclosed'
+  const reports = []
+  host.sessions = { reportWorkSourceRead: r => reports.push(r) }
+  let failed = true
+  host.request = async () => {
+    if (failed) throw new Error('request timed out')
+    return { processes: [], subagents: [] }
+  }
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => {
+    if (path.startsWith('/api/sessions/')) return { id: focus.stored, parent_session_id: null }
+    if (path.startsWith('/api/session-kanban-tasks')) {
+      if (failed) throw new Error('authoritative tasks unavailable')
+      return { tasks: [] }
+    }
+    return null
+  } } }
+  const dispose = m.default.register({ register() {} })
+  const clock = Date.now
+  try {
+    await m.refresh()
+    for (const source of ['tasks', 'process', 'subagent']) {
+      assert.ok(reports.some(r => r.source === source && r.available === false), `${source} failure reaches core`)
+    }
+    assert.ok(reports.every(r => r.connectionId === 'conn' && r.profile === 'default' && r.storedSessionId === 'chat-failclosed'))
+    assert.ok(window.__sessionTasks.snapshot.chips.some(c => c.label === 'Task status unavailable'))
+    failed = false
+    Date.now = () => clock() + 11000
+    await m.refresh()
+    for (const source of ['tasks', 'process', 'subagent', 'lineage']) {
+      assert.equal(reports.filter(r => r.source === source).at(-1)?.available, true, `${source} recovers only after a successful read`)
+    }
+    assert.deepEqual(window.__sessionTasks.snapshot.chips, [])
+  } finally { Date.now = clock; dispose(); delete host.sessions; delete host.request; delete globalThis.window }
+})
+
+test('a malformed RPC response is unknown, never an authoritative empty source', async () => {
+  focus.stored = 'chat-malformed-rpc'
+  const reports = []
+  host.sessions = { reportWorkSourceRead: r => reports.push(r) }
+  host.request = async () => ({})
+  globalThis.window = { hermesDesktop: { api: async ({ path }) => path.startsWith('/api/sessions/')
+    ? { id: focus.stored, parent_session_id: null } : { tasks: [], machines: [] } } }
+  const dispose = m.default.register({ register() {} })
+  try {
+    await m.refresh()
+    assert.equal(reports.find(r => r.source === 'process')?.available, false)
+    assert.equal(reports.find(r => r.source === 'subagent')?.available, false)
+    assert.ok(window.__sessionTasks.snapshot.chips.some(c => c.label === 'Process status unknown'))
+  } finally { dispose(); delete host.sessions; delete host.request; delete globalThis.window }
 })
