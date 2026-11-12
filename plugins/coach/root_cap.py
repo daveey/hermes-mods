@@ -1254,6 +1254,10 @@ _DEICTIC = re.compile(
     r"\b(?:roll\w*|put|set|change)\s+(?:it|that|this)\s+back\b|"
     r"\b(?:that|it)(?:['\u2019]s|\s+(?:is|should\s+be|must\s+be|will\s+be))\s+(?:only|just|temporary|non|not)\b")
 _PERMANENT_NOW = re.compile(r"\bpermanen")
+# A sentence that itself concerns the cap decision: it names the key, or points at it ("make/keep that ...", "that
+# change", "restore it"). Other topics ("The database migration is permanent.") and a bare pronoun do not qualify.
+def _about_cap(low, leaf):
+    return leaf in low or bool(_DEICTIC.search(low))
 _CARD = re.compile(r"\bt_[0-9a-z]{4,}\b")
 
 
@@ -1271,14 +1275,29 @@ def _fold_followup(current, own_text, item, leaf):
         return
     mine = " ".join(live)
     link = {"sha": _sha(item["text"]), "ref": item["ref"]}
+    # Withdrawal: the human's own negated restoration about THIS change ("Do not restore it to 7 on owner
+    # completion.") removes the earlier restore terms, so they can no longer satisfy the provenance demand; the write
+    # then refuses until a valid replacement (or a genuine permanent supersession) exists.
+    withdrawn = any(_about_cap(x.lower(), leaf) and any(_negated_before(x.lower(), m.start())
+                                                       for m in _BOUND_RESTORE.finditer(x.lower()))
+                    for x in live)
+    if withdrawn:
+        current["terms_text"] = " ".join(x for x in _sentences(current["terms_text"])
+                                         if not _BOUND_RESTORE.search(x.lower()) and "restore" not in x.lower())
+        current["followups"].append(link)
     if not _temporary_intent(mine):
+        # Relaxation to permanent is read from a sentence that itself concerns this change: an unrelated
+        # "The database migration is permanent." next to "Keep that unchanged." relaxes nothing.
         if any(_PERMANENT_NOW.search(x.lower()) and not _PERM_NEG.search(x.lower()) and not _NEG.search(x.lower())
-               and not _CANCEL.search(x.lower()) for x in live):
+               and not _CANCEL.search(x.lower()) and _about_cap(x.lower(), leaf) for x in live):
             current["temporary"] = False
             current["terms_text"] = ""
-            current["followups"].append(link)
+            if not withdrawn:
+                current["followups"].append(link)
         return
     current["temporary"] = True
+    if not withdrawn:
+        current["followups"].append(link)
     later = _own_terms(mine)
     has_restore = any("restore" in x.lower() for x in _sentences(later))
     has_card = bool(_CARD.search(later.lower()))
@@ -1291,7 +1310,6 @@ def _fold_followup(current, own_text, item, leaf):
             continue
         keep.append(x)
     current["terms_text"] = (later + " " + " ".join(keep)).strip()
-    current["followups"].append(link)
 
 
 def _decision(items, rec, new_value):
