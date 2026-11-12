@@ -84,6 +84,14 @@ unblock it. He will usually just take your recommendation, so take it for him; a
 A guess must still follow the card's own limits (scope, exclusions, normal review and landing gates). Physical and
 sign-in steps and protected-file Allows are never guessed. A rejected guard is never bypassed with another writer.
 
+## Prevent the decision block in the worker
+
+Carry this rule into worker skills and card templates, not only the sweep: when evidence supports a recommended option inside the card's limits and normal review and landing gates, apply it rather than asking. Comment the pick and how to reverse it, then continue. Never bypass review or required CI.
+
+Reserve a human block for real money above standing envelopes; permissions or credentials; other people; safety or privacy consent; hard-to-reverse effects; or genuinely toss-up options with no evidence of the user's preference. A recommended choice is not permission to cross those boundaries. A block-time warning is advisory: a successful block still ends the run, and must not be followed by another lifecycle call.
+
+For recurrence evidence, inspect the private red-sweep log for slug `owner-recommendation-not-applied`; keep personal incident details in the private worker skill rather than copying them into this public repository.
+
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
