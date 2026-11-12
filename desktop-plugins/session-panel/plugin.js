@@ -108,7 +108,7 @@ export function observationView(obs, nowSec, sdk = observationSdk(), sourceClass
     ageSec: obsNum(obsOwn(obs, 'age_seconds')),
     source: obsText(obsOwn(obs, 'source')) || null,
     id: identityText(obsOwn(obs, 'identity')),
-    owner: qual(obsOwn(obs, 'owner')) || null,
+    owner: [qual(obsOwn(obs, 'owner')), obsText(obsOwn(obsOwn(obs, 'owner'), 'session')) || obsText(obsOwn(obsOwn(obs, 'owner'), 'assignee'))].filter(Boolean).join('/') || null,
     progress: progressAt == null ? null : { ageSec: Math.max(0, nowSec - progressAt), kind: obsOwn(obs, 'last_progress_kind') || null, ref: obsOwn(obs, 'last_progress_ref') || null },
     activity: activityAt == null ? null : { ageSec: Math.max(0, nowSec - activityAt), kind: obsText(obsOwn(obs, 'last_activity_kind')) || null },
     wait: waitView(obsOwn(obs, 'wait'), nowSec),
@@ -152,7 +152,9 @@ export function chipObservation(chip, nowSec, { sdk = observationSdk(), sourceCl
   if (!split.present) return missingView('producer_sent_no_observations')
   const candidates = split.work.filter(r => {
     const id = obsOwn(r, 'identity')
-    if (obsOwn(id, 'kind') !== 'card' || obsOwn(id, 'work_id') !== chip.id) return false
+    const kind = chip.kind === 'bg' ? 'process' : chip.kind === 'sub' ? 'subagent' : 'card'
+    if (obsOwn(id, 'kind') !== kind || obsOwn(id, 'work_id') !== chip.id) return false
+
     for (const [k, mine] of [['board', chip.board], ['profile', chip.profile], ['gateway', chip.gateway]]) {
       const theirs = obsOwn(id, k)
       if (obsText(mine) && theirs !== undefined && theirs !== mine) return false
@@ -196,6 +198,8 @@ export function observationLine(v, nowSec) {
   parts.push(v.progress ? `progress ${[v.progress.kind, `${span(v.progress.ageSec)} ago`, v.progress.ref && `(${v.progress.ref})`].filter(Boolean).join(' ')}` : 'progress unknown')
   if (v.receipts) parts.push(v.state === 'done' ? 'verified completion receipt' : `${v.receipts} historical completion receipt${v.receipts === 1 ? '' : 's'}`)
   if (v.id) parts.push(v.id)
+  if (v.source) parts.push(`source ${v.source}`)
+  if (v.owner) parts.push(`owner ${v.owner}`)
   return parts.join(' · ')
 }
 
@@ -248,16 +252,15 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
   for (const c of chips || []) {
     if (!c || !c.key) continue
-    if (c.kind === 'bg') { out.active.push({ ...item(c), detail: `background process · started ${ago(c.since, nowMs)}` }); seen(c.since); continue }
-    if (c.kind === 'machine') { out.active.push({ ...item(c), detail: 'rented machine' }); continue }
-    if (c.kind === 'sub') {
-      const quiet = silence.get(c.key) || 0
-      seen(nowMs / 1000 - quiet / 1000)
-      const tools = `${c.toolCount || 0} tool call${c.toolCount === 1 ? '' : 's'}${c.lastTool ? `, last ${c.lastTool}` : ''}`
-      if (quiet >= STUCK_SUB_MS) out.stuck.push({ ...item(c), reason: 'sub-silent', quietMin: Math.floor(quiet / 60_000), detail: `sub-agent · no new tool call for ${Math.floor(quiet / 60_000)} min (${tools})` })
-      else out.active.push({ ...item(c), detail: `sub-agent · ${tools}` })
+    if (c.kind === 'bg' || c.kind === 'sub') {
+      const ev = evidence(c) || chipObservation(c, now)
+      const row = { ...item(c), detail: observationLine(ev, now) }
+      if (ev.state === 'running') out.active.push(row)
+      else out.waiting.push(row)
+      if (ev.activity) seen(now - ev.activity.ageSec)
       continue
     }
+    if (c.kind === 'machine') { out.active.push({ ...item(c), detail: 'rented machine' }); continue }
     if (c.kind === 'kanban-status') { out.waiting.push({ ...item(c), detail: str(c.title) || 'status unknown' }); continue }
     if (c.kind !== 'kanban') continue
     seen(c.activityAt)
@@ -327,7 +330,7 @@ export function annotateEvidence(sorted, nowMs, opts) {
       const v = chipObservation(i.chip, nowMs / 1000, opts)
       i.evidenceText = chipEvidenceLine(i.chip, nowMs / 1000, opts)
       i.evidenceState = v.state
-      if (v.sourced && v.state === 'unknown') unknown++
+      if (v.state === 'unknown' && (v.sourced || i.kind === 'bg' || i.kind === 'sub')) unknown++
     }
   }
   return unknown
