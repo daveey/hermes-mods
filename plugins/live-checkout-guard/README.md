@@ -185,9 +185,11 @@ allowlist or a guard-disable switch.
 Use Python 3.9 or newer on Linux or macOS (an unqualified `python3` is 3.9 on stock
 macOS; older interpreters are refused by `reconcile.py` with exit 2 and by
 `stash_retirement.py` at import, before the lock or any archive/ref write) and a Git
-version supporting prepared `update-ref` transactions and `rev-parse
---show-ref-format` (tested on Git 2.55 on Linux, and the full helper test suite on
-macOS with Apple Git 2.54 and `/usr/bin/python3` 3.9.6). Only the files ref backend
+version supporting prepared `update-ref` transactions (tested on Git 2.55 and 2.43
+on Linux, and the full helper test suite on macOS with Apple Git 2.54 and
+`/usr/bin/python3` 3.9.6). Git older than 2.45 lacks `rev-parse --show-ref-format`
+and has no reftable backend, so there the backend is read from
+`extensions.refStorage` (unset means files). Only the files ref backend
 is supported; shallow repositories
 are refused. The `live-checkout-guard` GitHub workflow runs the helper suites on
 Python 3.9 and 3.14.

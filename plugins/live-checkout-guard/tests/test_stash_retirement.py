@@ -884,6 +884,49 @@ class KillTests(Base):
         self.assert_retired([self.oids[0]])
 
 
+class RefFormatDetectionTests(Base):
+    """Git < 2.45 has no `rev-parse --show-ref-format` and echoes the flag back."""
+
+    def fake_git(self, show_ref_format=None, ref_storage=None):
+        real = self.mod._git
+        calls = []
+
+        def fake(root, *args, **kw):
+            if args == ('rev-parse', '--show-ref-format') and show_ref_format is not None:
+                calls.append(args)
+                return show_ref_format
+            if args == ('config', '--get', 'extensions.refStorage') and ref_storage is not None:
+                calls.append(args)
+                return subprocess.CompletedProcess(args, 0, ref_storage, b'')
+            return real(root, *args, **kw)
+        p = patch.object(self.mod, '_git', fake)
+        p.start()
+        self.addCleanup(p.stop)
+        return calls
+
+    def test_old_git_echoed_flag_is_files_backend(self):
+        calls = self.fake_git(show_ref_format=b'--show-ref-format\n')
+        self.prepare()
+        self.retire([self.oids[1]])
+        self.assert_retired([self.oids[1]])
+        self.assertIn(('rev-parse', '--show-ref-format'), calls)
+
+    def test_old_git_with_other_ref_storage_config_refused(self):
+        self.fake_git(show_ref_format=b'--show-ref-format\n', ref_storage=b'reftable\n')
+        with self.assertRaisesRegex(self.mod.RetirementError, 'files ref backend.*reftable'):
+            self.prepare()
+        self.assert_unchanged()
+
+    def test_reported_reftable_refused(self):
+        self.fake_git(show_ref_format=b'reftable\n')
+        with self.assertRaisesRegex(self.mod.RetirementError, 'files ref backend.*reftable'):
+            self.prepare()
+        self.assert_unchanged()
+
+    def test_real_git_resolves_files(self):
+        self.assertEqual(self.mod._ref_format(self.root), 'files')
+
+
 class HardeningPrepareTests(Base):
     """Grafts, shallow history, broken refs and worktree/untracked export completeness."""
 

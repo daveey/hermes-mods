@@ -231,12 +231,33 @@ def _line(data):
     return data.decode().rstrip('\n')
 
 
+def _ref_format(root):
+    """The repository's ref backend name ('files' or 'reftable').
+
+    `rev-parse --show-ref-format` exists from Git 2.45; older Git echoes an
+    unknown `--flag` back verbatim with exit 0. Reftable also arrived in 2.45,
+    and older Git refuses to open a repository whose `extensions.refStorage`
+    it does not know, so on that Git the backend is 'files' unless the config
+    names another one (read it anyway, failing closed on any other value).
+    """
+    out = _line(_git(root, 'rev-parse', '--show-ref-format'))
+    if out != '--show-ref-format':
+        return out
+    p = _git(root, 'config', '--get', 'extensions.refStorage', check=False)
+    if p.returncode == 1 and not p.stdout.strip():
+        return 'files'
+    if p.returncode:
+        raise RetirementError('git config extensions.refStorage failed: '
+                              + p.stderr.decode(errors='replace').strip())
+    return _line(p.stdout).strip().lower() or '(empty extensions.refStorage)'
+
+
 def _identity(root):
     top = Path(_line(_git(root, 'rev-parse', '--show-toplevel'))).resolve()
     if top != root:
         raise RetirementError('root must be the repository top level')
     common = Path(_line(_git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir'))).resolve(strict=True)
-    ref_format = _line(_git(root, 'rev-parse', '--show-ref-format'))
+    ref_format = _ref_format(root)
     if ref_format != 'files':
         raise RetirementError('only the files ref backend is supported, not ' + ref_format)
     if _line(_git(root, 'rev-parse', '--is-shallow-repository')) != 'false':
