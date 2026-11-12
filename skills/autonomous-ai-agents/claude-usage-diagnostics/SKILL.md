@@ -127,7 +127,12 @@ The symptom is many cards crashing within a minute or two on several hosts with 
    - `/api/oauth/usage` should show accounts under 100 on `seven_day`;
    - a one-shot `hermes chat --oneshot -m <model> --provider anthropic` on the worker should answer.
    Then drop only that provider's key from `provider_walls.json`: back the file up and write it atomically (tmp file + `os.replace`).
-4. A card's quota episode has no operator clear: unblock and priority don't lift it. For a card you own with no dependents, re-file it with the same spec (and an idempotency key) and archive the original. For other chats' cards, put the release on the card that owns the credential-churn fix.
+4. A card's quota episode ends only at a run that ends without hitting a wall; unblock, priority and `move` don't lift it. Release a disproven hold with an operator claim + reclaim, run on a host whose labels match the card's `runs_on`:
+   - which host: the owning Mac for `machine:macbook`; for `machine:worker-N` or `capability:*`, a matching worker over ssh (`hermes kanban move --json` lists `matches`). A non-matching host answers `cannot claim` or `no such task` and changes nothing.
+   - commands: `HERMES_KANBAN_BOARD=default hermes kanban claim <id> --ttl 120`, then `hermes kanban reclaim <id> --reason "<why the hold is false>"`. The reclaimed run is the episode boundary and resets the failure counter, and the dispatcher spawns the card within seconds. Card spec, links and workspace stay intact, unlike re-filing it.
+   - Keep quota/auth words out of the reason: it becomes the run's error text.
+   - If the guard then says `active_pr` (a PR URL in a recent comment) and the card owns that PR, `hermes kanban resume <id> --reason "<what it must do on the PR>"` lets it continue.
+   - Do this only after step 3 shows no gateway's walls file still lists the provider; otherwise the next run hits the wall again.
 
 ### 4. Find what burned the quota
 
