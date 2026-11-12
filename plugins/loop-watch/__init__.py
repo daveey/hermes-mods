@@ -77,3 +77,13 @@ def register(ctx) -> None:
     except Exception:  # noqa: BLE001
         home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     watch.start(home, stall_s=_stall_s(), slow_s=_slow_s())
+    # Default-off bounded cache census, independent of loop discovery/CPU sampling.
+    if os.environ.get("HERMES_LOOP_WATCH_CACHE_CENSUS") == "1":
+        try:
+            from . import census
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("loop_watch_census", Path(__file__).with_name("census.py"))
+            census = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(census)
+        census.start(home)

@@ -96,6 +96,68 @@ hour eviction increments `dropped_requests`,
 invalidating complete-window acceptance. A death during a storage outage cannot
 report that loss retrospectively. Do not infer full coverage from counters alone.
 
+## Opt-in one-shot cache census
+
+This is **off by default**. To opt in, give the ordinary gateway/serve launcher
+`HERMES_LOOP_WATCH_CACHE_CENSUS=1` before its next natural start, with loop-watch
+enabled. Do not restart a busy gateway, signal it, or force a plugin reload for
+this diagnostic. `HERMES_LOOP_WATCH=off` disables it along with the plugin.
+An already running process without the opt-in has no request listener.
+
+On startup it creates `<HERMES_HOME>/loop-watch-census/<pid>-<random-generation>/`
+(mode 0700). `ready.json` (0600) identifies the PID and schema. Select the directory
+for the intended live process and its current generation, not a leftover directory.
+Create a **new regular mode-0600** file named `request` in that directory containing
+exactly `cache-census-v1\n` (16 bytes including newline). For example, after setting
+`directory` to that verified directory:
+
+```sh
+(umask 077; printf 'cache-census-v1\n' > "$directory/request.new" &&
+ mv "$directory/request.new" "$directory/request")
+```
+
+The listener polls once per second, atomically consumes the request as `consumed`,
+and exits after **one attempt per process**, including rejected attempts. Symlinks,
+nonregular files, hardlinks, wrong owners/modes/commands and pre-start timestamps
+are rejected. No overlapping probes or repeated requests are accepted. A fresh
+process has a different generation and will not read old requests. Directories
+remain for owner inspection; there is no automatic cleanup or retention-policy change.
+
+The fixed output is `result.json` (0600, atomic replacement, at most 4096 bytes).
+It contains only numeric aggregate counts, booleans and fixed schema labels:
+
+- `schema: 1`, `kind: cache_census`, `status: ok|partial|unknown`.
+- `cached_entries` (when the cache is readable), `agents` (sampled entries),
+  `active`, `idle`, `activity_unknown` (sampled cache entries only, not all work).
+  Activity uses the matching raw gateway SessionState/TurnState; unavailable
+  representations are unknown. Non-cache API/worker agents are not included.
+- `buffer_lengths`: summed lengths of exact builtin `_session_messages` and
+  `conversation_history` lists/tuples. Aliased fields count in both lengths.
+- `containers`, `shallow_container_bytes`: identity-deduplicated exact builtin
+  list/dict/tuple containers reached from those fields, at most three edges deep.
+  These **exclude text payload bytes and are not retained heap size**, RSS or a
+  leak attribution. `retained_bytes` is always null.
+- `visited_values`, `truncated`, `deadline_exceeded`. At most 128 cache entries
+  and 10000 visited values/containers are scanned, with a cooperative 100ms
+  deadline. Depth/value/entry limits and concurrent mutation can yield partial
+  coverage; do not extrapolate it into an exact total. This is not a hard
+  real-time bound on scheduling, individual native operations or output I/O.
+  A size-cap fallback sets `output_truncated: true` and `status: unknown`.
+
+The only runner source is the already-loaded core `gateway.run` module's existing
+`_gateway_runner_ref` weak reference, verified against its exact `GatewayRunner`
+class. Unsupported core/serve layouts and a busy cache lock report `unknown`, not
+zero retained memory. The scanner never imports the gateway, enumerates the heap,
+serializes message content/keys, calls arbitrary properties/size/repr methods,
+starts tracemalloc, or changes eviction, GC, trim, TTL or budget policy. The existing
+stall/CPU/request tracing behavior is unchanged.
+
+`tests_census.py` covers counts/sizing/privacy, unsafe files, stale/duplicate
+requests, process-generation targeting, bounds, lock contention and a standalone
+normal PluginManager discovery subprocess with opt-in both off and on (core-backed;
+skipped in public core-free CI). Live deployment and memory-budget acceptance are
+separate operator checks, not established by these fixtures.
+
 ## Tests
 
 Run `scripts/test-all -k loop-watch`. `tests_stats_persistence.py` covers repeated
