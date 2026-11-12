@@ -255,3 +255,23 @@ def test_worker_ssh_fail_row_shipped():
     rows = {r["id"]: r for r in st.load_rows(user_path=P / "nonexistent.yaml")}
     r = rows["worker-ssh-fail"]
     assert r["skill"] == "launch-hub-worker" and r["sections"] == ["Run commands on existing workers from the hub with SSM"]
+
+
+# A JSON-object result stays one valid JSON document: machine readers (the kanban-drift cron's native_tool,
+# defect cron-0d63c0cf26) json.loads the whole result, so prose after the object broke them with "Extra data".
+@pytest.mark.parametrize("payload", [{"task_id": "t_abc", "status": "ready"},
+                                     {"error": "placement_unavailable: target not live", "success": False}])
+def test_json_object_result_stays_valid_json(payload):
+    out = run("kanban_create", {"title": "x"}, json.dumps(payload))
+    data = json.loads(out)  # the whole result parses: no trailing prose
+    assert {k: data[k] for k in payload} == payload  # success id / refusal kept verbatim
+    guidance = data[st.FIELD]
+    assert guidance.startswith(st.MARK) and "spec path" in guidance and "notify-subscribe" in guidance
+    assert run("kanban_create", {"title": "x"}, out) is None  # marked result is never decorated twice
+
+
+def test_non_object_results_keep_prose_append():
+    for raw in ("plain text output", "[1, 2]", "not { json"):
+        st._fired.clear()
+        out = run("kanban_create", {"title": "x"}, raw)
+        assert out.startswith(raw) and st.MARK in out[len(raw):]

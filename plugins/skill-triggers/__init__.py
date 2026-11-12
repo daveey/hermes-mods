@@ -11,6 +11,7 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 MARK = "[skill-triggers]"
+FIELD = "skill_triggers"  # JSON-object results carry the injected rules here, so they stay valid JSON
 
 
 def _home() -> Path:
@@ -233,9 +234,24 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
                 with _lock:
                     _fired.setdefault(sid, set()).add(row["id"])
                 extra.append(inj)
-        return result + "".join(extra) if extra else None
+        return decorate(result, extra) if extra else None
     except Exception:
         return None
+
+
+def decorate(result: str, extra: list[str]) -> str:
+    """Add the injections without breaking a JSON-object result: machine readers (cron consumers calling
+    handle_function_call, e.g. kanban-drift) json.loads the whole result, so prose after the object raised
+    "Extra data". An object result gets the guidance in its FIELD (the model still reads it); any other result
+    (plain text, arrays, non-JSON) keeps the prose append."""
+    try:
+        data = json.loads(result)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict) and FIELD not in data:
+        data[FIELD] = "".join(extra).strip()
+        return json.dumps(data, ensure_ascii=False)
+    return result + "".join(extra)
 
 
 def register(ctx) -> None:
