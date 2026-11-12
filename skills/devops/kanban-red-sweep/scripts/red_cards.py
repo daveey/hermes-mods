@@ -59,29 +59,25 @@ def _ro_connect(path, timeout=10):
         raise
 
 
-def cmd_list(_):
-    n = 0
-    for board, path in boards():
-        c = _ro_connect(path)
-        try:
-            for tid, status, kind, title, ev in c.execute(RED):
-                n += 1
-                print(f"{board}\t{tid}\t{status}\t{kind}\tblocked_event={ev}\t{title[:100]}")
-        finally:
-            c.close()
-    print(f"red_total={n}")
+def cmd_list(a):
+    from fleet_inventory import inventory, snapshot, render
+    if a.local_json:
+        print(json.dumps(snapshot(HOME, _ro_connect, replicas=False), sort_keys=True))
+    else:
+        print(render(inventory(HOME, _ro_connect)))
 
 
 def cmd_log(a):
     rec = dict(
-        ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), board=a.board, card=a.card, title=a.title,
+        ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), gateway=a.gateway,
+        board=a.board, card=a.card, title=a.title,
         cls=a.cls, action=a.action, avoidable=a.avoidable, slug=a.slug, prevention=a.prevention,
         blocked_event=a.blocked_event, run=a.run,
     )
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     if a.blocked_event:
         for old in read():
-            if old.get("card") == a.card and old.get("blocked_event") == a.blocked_event:
+            if (old.get("gateway", "local"), old.get("board", "default"), old.get("card"), old.get("blocked_event")) == (a.gateway, a.board, a.card, a.blocked_event):
                 print(f"already logged {a.card} blocked_event={a.blocked_event}")
                 return
     with open(LOG, "a") as f:
@@ -122,9 +118,12 @@ def cmd_stats(a):
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list").set_defaults(fn=cmd_list)
+    listing = sub.add_parser("list")
+    listing.add_argument("--local-json", action="store_true", help="local snapshot for authorized fleet readers")
+    listing.set_defaults(fn=cmd_list)
     lg = sub.add_parser("log")
     lg.add_argument("--card", required=True)
+    lg.add_argument("--gateway", default="local", help="owner gateway from inventory")
     lg.add_argument("--board", default="default")
     lg.add_argument("--title", default="")
     lg.add_argument("--cls", required=True, choices=CLASSES)
