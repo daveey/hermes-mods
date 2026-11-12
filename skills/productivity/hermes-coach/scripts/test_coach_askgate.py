@@ -283,6 +283,8 @@ class ContentFreeHandoff(unittest.TestCase):
         sid = "local-" + "ab12" * 16                                   # hub session ids are 70 characters
         good = {"id": f"askgate-bb:{sid}:1793652485", "t": 1793652485, "week": "2026-11-02", "host": "mini",
                 "session": sid, "pattern": "is-broken"}
+        ugly = dict(good, id="askgate-bb:s2:1793652486", t=1793652486, session="s2",
+                    quote="a\u2028b\u0085c\x0cd\x1ce\x1df")                # splitlines() would cut this row apart
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "askgate-bb-misses.jsonl"
             weird = [dict(good, id=["x"], t=1), dict(good, t=float("nan")), dict(good, t=float("inf")),
@@ -291,10 +293,12 @@ class ContentFreeHandoff(unittest.TestCase):
                 for r in weird:
                     fh.write(json.dumps(r).encode() + b"\n")
                 fh.write(b'{"quote": "\xe2\x82')                           # torn multi-byte sequence, no newline
-                fh.write(b"\n" + json.dumps(good).encode() + b"\n")
-            self.assertEqual(g.project_bb_handoff(out), 1)
+                fh.write(b"\n" + json.dumps(ugly, ensure_ascii=False).encode() + b"\n")
+                fh.write(json.dumps(good).encode() + b"\n")
+            self.assertEqual(g.project_bb_handoff(out), 2)
             got = [json.loads(x) for x in (Path(d) / "askgate-bb-requests.jsonl").read_text().splitlines()]
-            self.assertEqual([r["id"] for r in got], [good["id"]])
+            self.assertEqual(sorted(r["id"] for r in got), sorted([good["id"], ugly["id"]]))
+            self.assertNotIn("quote", json.dumps(got))
             self.assertEqual(g.project_bb_handoff(out), 0)              # idempotent
 
     def test_values_are_shape_checked_and_a_torn_twin_line_is_closed(self):

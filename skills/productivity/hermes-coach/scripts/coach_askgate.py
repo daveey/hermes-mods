@@ -980,7 +980,7 @@ def requests_path_for(path):
 def _jsonl_ids(p):
     have = set()
     if p.exists():
-        for line in p.read_bytes().decode("utf-8", "replace").splitlines():
+        for line in p.read_bytes().decode("utf-8", "replace").split("\n"):
             try:
                 have.add(json.loads(line)["id"])
             except Exception:
@@ -1034,7 +1034,7 @@ def project_bb_handoff(path, requests_path=None):
         return None
     have = _jsonl_ids(q)
     new = []
-    for line in (p.read_bytes().decode("utf-8", "replace").splitlines() if p.exists() else []):
+    for line in (p.read_bytes().decode("utf-8", "replace").split("\n") if p.exists() else []):
         try:
             r = content_free_row(json.loads(line))
         except Exception:
