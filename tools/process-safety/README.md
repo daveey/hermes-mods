@@ -52,8 +52,11 @@ miss brief stops between timer ticks.
 /usr/bin/python3 -m unittest discover -s tools/process-safety -p 'test_*.py' -v
 ```
 
-Ten tests cover: a real foreign same-name Python sentinel excluded from signal
-handles; deadline and remaining-session-child cleanup; CLI SIGTERM cleanup; EPERM continuation; actual stopped
+Thirteen tests cover: a real foreign same-name Python sentinel excluded from signal
+handles; deadline and remaining-session-child cleanup; CLI SIGTERM cleanup; a
+failing CLI test leaving no stopped grandchild (test cleanup matches the tmpdir
+in argv, so it never depends on having read the pid); atomic pid-marker
+publication, checked directly and end to end; EPERM continuation; actual stopped
 private GPG agent recovery; rejection of a different executable; systemctl
 inactive/failed/malformed responses and JSONL; recovery records; bounded rotation.
 No test sends STOP to a live shared agent. Host-wide old-harness reproduction is

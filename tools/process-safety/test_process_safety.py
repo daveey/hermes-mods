@@ -29,6 +29,38 @@ def publish_pid(marker, delay=0.0):
     return (f'f=open({tmp!r},"w"); time.sleep({delay}); f.write(str(os.getpid())); f.close(); '
             f'os.replace({tmp!r}, {str(marker)!r})')
 
+def tagged(tag):
+    """(pid, state) of every other live process whose argv mentions `tag`."""
+    found = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if tag.encode() in (entry / 'cmdline').read_bytes():
+                state = (entry / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+                if state != 'Z':
+                    found.append((int(entry.name), state))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return found
+
+def kill_tagged(tag):
+    """SIGKILL (effective on stopped processes) every other process whose argv mentions `tag`.
+
+    Pidfds pin identity between the argv check and the signal."""
+    for pid, _ in tagged(tag):
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            continue
+        try:
+            if tag.encode() in Path(f'/proc/{pid}/cmdline').read_bytes():
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+        finally:
+            os.close(fd)
+
 class SafetyTests(unittest.TestCase):
     def test_foreign_same_name_process_never_receives_signal(self):
         # Same executable as the target, but a foreign session, like a shared agent.
@@ -53,10 +85,15 @@ class SafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             marker = Path(d) / 'pid'
             cmd = [sys.executable, '-c', f'import os,time; {publish_pid(marker)}; time.sleep(60)']
-            with self.assertRaises(subprocess.TimeoutExpired):
-                starve.run(cmd, .04, .04, .5)
-            pid = int(marker.read_text())
-            self.assertFalse(Path(f'/proc/{pid}').exists())
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    starve.run(cmd, .04, .04, .5)
+                pid = int(marker.read_text())
+                self.assertFalse(Path(f'/proc/{pid}').exists())
+            finally:
+                # starve.run's own sweep normally kills it; never rely on the
+                # code under test to clean up after a failing assertion.
+                kill_tagged(d)
 
     def test_health_resumes_only_verified_gpg_agent(self):
         import shutil
@@ -99,6 +136,34 @@ class SafetyTests(unittest.TestCase):
             starve.send([10, 11], signal.SIGCONT)
         self.assertEqual(sender.call_count, 2)
 
+    def test_publish_pid_writes_elsewhere_then_renames_onto_marker(self):
+        # Pins atomicity directly, independent of the race-window delay that
+        # test_pid_marker_never_visible_empty depends on (delay 0 included).
+        for delay in (0, .3):
+            with self.subTest(delay=delay), tempfile.TemporaryDirectory() as d:
+                marker = Path(d) / 'pid'
+                events = []
+                def recording_open(path, *args, **kwargs):
+                    events.append(('open', str(path)))
+                    self.assertFalse(marker.exists(), 'marker visible before its contents')
+                    return open(path, *args, **kwargs)
+                def recording_replace(src, dst):
+                    events.append(('replace', str(src), str(dst)))
+                    self.assertTrue(Path(src).read_text(), 'renamed an empty pid file')
+                    os.replace(src, dst)
+                fake_os = type('fake_os', (), {'getpid': staticmethod(lambda: 4242),
+                                               'replace': staticmethod(recording_replace)})
+                fake_time = type('fake_time', (), {'sleep': staticmethod(lambda s: events.append(('sleep', s)))})
+                exec(publish_pid(marker, delay), {'open': recording_open, 'os': fake_os, 'time': fake_time})
+                opened = [e[1] for e in events if e[0] == 'open']
+                self.assertTrue(opened)
+                self.assertNotIn(str(marker), opened)
+                self.assertEqual(events[-1][0], 'replace')
+                self.assertEqual(events[-1][2], str(marker))
+                self.assertIn(events[-1][1], opened)
+                self.assertNotEqual(events[-1][1], str(marker))
+                self.assertEqual(marker.read_text(), '4242')
+
     def test_pid_marker_never_visible_empty(self):
         # A marker created before its pid is written made polling readers parse ''.
         with tempfile.TemporaryDirectory() as d:
@@ -112,25 +177,42 @@ class SafetyTests(unittest.TestCase):
             finally:
                 child.kill(); child.wait()
 
+    def run_cli_sigterm(self, d, wait_for, marker_deadline=5.0):
+        marker = Path(d) / 'pid'
+        cmd = [sys.executable, '-c', f'import os,time; {publish_pid(marker)}; time.sleep(60)']
+        wrapper = subprocess.Popen([sys.executable, str(HERE / 'starve_owned.py'), '--stopped', '.05', '--', *cmd])
+        try:
+            deadline = time.monotonic() + marker_deadline
+            while not wait_for.exists():
+                self.assertLess(time.monotonic(), deadline); time.sleep(.01)
+            pid = int(marker.read_text())
+            wrapper.terminate()
+            self.assertEqual(wrapper.wait(timeout=5), 130)
+            self.assertFalse(Path(f'/proc/{pid}').exists())
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill(); wrapper.wait()
+            # starve_owned runs the child in its own session, so killpg(wrapper)
+            # would miss it; match the tmpdir in its argv instead, which works
+            # even when the pid was never read (e.g. the marker deadline fired).
+            kill_tagged(d)
+
     def test_cli_sigterm_reaps_its_stopped_child(self):
         with tempfile.TemporaryDirectory() as d:
-            marker = Path(d) / 'pid'
-            cmd = [sys.executable, '-c', f'import os,time; {publish_pid(marker)}; time.sleep(60)']
-            wrapper = subprocess.Popen([sys.executable, str(HERE / 'starve_owned.py'), '--stopped', '.05', '--', *cmd])
-            pid = None
+            self.run_cli_sigterm(d, Path(d) / 'pid')
+
+    def test_failed_cli_sigterm_test_leaks_no_stopped_child(self):
+        # The marker deadline fires before the pid is read: cleanup must still
+        # kill the starved (SIGSTOPped, own-session) grandchild, which otherwise
+        # holds the test's stdout open and hangs output-capturing harnesses.
+        with tempfile.TemporaryDirectory() as d:
             try:
-                deadline = time.monotonic() + 5
-                while not marker.exists():
-                    self.assertLess(time.monotonic(), deadline); time.sleep(.01)
-                pid = int(marker.read_text())
-                wrapper.terminate()
-                self.assertEqual(wrapper.wait(timeout=5), 130)
-                self.assertFalse(Path(f'/proc/{pid}').exists())
+                with self.assertRaises(AssertionError):
+                    self.run_cli_sigterm(d, Path(d) / 'never', marker_deadline=.5)
             finally:
-                if wrapper.poll() is None:
-                    wrapper.kill(); wrapper.wait()
-                if pid is not None and Path(f'/proc/{pid}').exists():
-                    os.kill(pid, signal.SIGKILL)
+                leaked = tagged(d)
+                kill_tagged(d)
+            self.assertEqual(leaked, [])
 
     def test_health_main_inactive_and_failure_and_json_log(self):
         import json
