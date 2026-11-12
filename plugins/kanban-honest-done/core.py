@@ -302,9 +302,44 @@ def check_complete(task_id: str, summary: str, paths: list[Path], title: Optiona
     if hits and not valid_followups(task_id, handoff, paths):
         named = [t for t in dict.fromkeys(TASK_ID_RE.findall(handoff)) if t != task_id]
         return complete_refusal(task_id, hits, named)
+    why = _threshold_refusal(task_id, summary, metadata, found)
+    if why:  # G: a failed threshold never becomes a waiver or a guessed pass
+        return why
     if found:
         return check_origin_reached(task_id, found[0], found[1].get("body") or "")
     return None
+
+
+def _threshold_refusal(task_id: str, summary: str, metadata: Any, found) -> Optional[str]:
+    """G, isolated: a G bug fails open for G only, so D and the other gates still run."""
+    try:
+        return _thresholds_mod().check_thresholds(task_id, summary, metadata,
+                                                  (found[1].get("body") or "") if found else "")
+    except Exception:
+        return None
+
+
+def check_review(task_id: str, summary: str, paths: list[Path], metadata: Any = None) -> Optional[str]:
+    """G for ``kanban_request_review``: a review handoff can't waive a failed threshold or guess a pass either."""
+    return _threshold_refusal(task_id, summary, metadata, find_task(task_id, paths))
+
+
+def _thresholds_mod():
+    try:
+        from . import thresholds  # type: ignore
+        return thresholds
+    except ImportError:
+        import importlib.util
+        import sys
+
+        key = "kanban_honest_done_thresholds"
+        mod = sys.modules.get(key)
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name("thresholds.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod = sys.modules.setdefault(key, mod)
+        return mod
 
 
 # --- D: an origin chat named only in prose ------------------------------------------------------------------------
@@ -544,6 +579,10 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
             why = check_complete(own, summary, paths_fn(), metadata=_opt(args, "--metadata"))
             if why:
                 return why
+        if verb == "request-review":
+            why = check_review(own, _opt(args, "--summary") or "", paths_fn(), metadata=_opt(args, "--metadata"))
+            if why:
+                return why
     return None
 
 
@@ -614,7 +653,7 @@ def check_python(code: str, own: str, paths_fn) -> Optional[str]:
         if _is_own(m.group(1), own):
             return EDIT_REFUSAL
     for cmd in _python_string_values(code or ""):
-        if "kanban" not in cmd or ("complete" not in cmd and "edit" not in cmd):
+        if "kanban" not in cmd or ("complete" not in cmd and "edit" not in cmd and "request-review" not in cmd):
             continue
         why = check_shell(cmd, own, paths_fn)
         if why:

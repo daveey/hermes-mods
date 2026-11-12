@@ -76,19 +76,25 @@ can revert a worker's local edit after the card reported it.
 | Ask covered by a standing approval (e.g. spend under the user's no-ask cap, fixing something broken) | Comment the standing rule, then unblock |
 | Agent-doable from an interactive session but refused to a headless worker (guarded `rm -rf` of a verified scratch dir, a tailnet/ssh probe, a `gh` read the worker's profile lacked) | Do it here, verify it, comment, then complete or unblock |
 | Missing credential on the worker profile | Find it with token-broker (`user/github` etc.) before calling it human, then do the step or unblock with the route |
-| Decision card (policy, acceptance, scope, review-tier approval) where you can make a reasonable guess at what the user would pick | Apply your recommendation: comment the choice, why you expect the user to pick it, and "applied under the red-sweep standing rule, not an explicit answer", then unblock. Report it so the user can reverse it |
+| Decision card (policy, scope, review-tier approval, acceptance that does not change a test or target) where you can make a reasonable guess at what the user would pick | Apply your recommendation: comment the choice, why you expect the user to pick it, and "applied under the red-sweep standing rule, not an explicit answer", then unblock. Report it so the user can reverse it |
+| Decision that changes a fixed test, threshold or target after its result (waive a failed check, lower a target, swap or drop a check) | Never guessed, not even under a blanket "resolve them the way you know best": keep it and ask (step 4), recommendation first. Read the card's preregistered `IF FAIL <check>:` branch first; if it names an agent step (re-measure, report FAIL, file the decision), unblock so the owner follows it. A cron run logs it `left-blocked` |
 | Decision where you are really unsure (options near a toss-up, hard to reverse, real money, touches other people, or no evidence of the user's preference); physical or sign-in step; protected-file Allow | Keep it and ask (step 4). If a live chat opened it in the last day, leave the ask to that chat |
 
 The user's rule: for each card blocked on him, first ask yourself whether you can reasonably guess how he would
 unblock it. He will usually just take your recommendation, so take it for him; ask only when really unsure.
 A guess must still follow the card's own limits (scope, exclusions, normal review and landing gates). Physical and
-sign-in steps and protected-file Allows are never guessed. A rejected guard is never bypassed with another writer.
+sign-in steps, protected-file Allows and test/threshold/target changes are never guessed: a guessed waiver of a
+failed check reaches the owner as if it were acceptance (an energy-filter card, 2026-11-12), and the
+kanban-honest-done plugin refuses a worker handoff that waives a failed threshold without a body waiver David
+gave (Gate G). A rejected guard is never bypassed with another writer.
 
 ## Prevent the decision block in the worker
 
 Carry this rule into worker skills and card templates, not only the sweep: when evidence supports a recommended option inside the card's limits and normal review and landing gates, apply it rather than asking. Comment the pick and how to reverse it, then continue. Never bypass review or required CI.
 
-Reserve a human block for real money above standing envelopes; permissions or credentials; other people; safety or privacy consent; hard-to-reverse effects; or genuinely toss-up options with no evidence of the user's preference. A recommended choice is not permission to cross those boundaries. A block-time warning is advisory: a successful block still ends the run, and must not be followed by another lifecycle call.
+Reserve a human block for real money above standing envelopes; permissions or credentials; other people; safety or privacy consent; hard-to-reverse effects; changing a fixed test, threshold or target after its result; or genuinely toss-up options with no evidence of the user's preference. A recommended choice is not permission to cross those boundaries. A block-time warning is advisory: a successful block still ends the run, and must not be followed by another lifecycle call.
+
+Prevent acceptance-change surprises at card creation instead (slug `acceptance-waiver-owner-decision`): a card with a numeric gate states each threshold and preregisters, before execution and with independent review of the plan, one `IF FAIL <check>: <next step>` line per gate (re-measure once on fresh seeds, report FAIL and stop, file the decision card with options). A branch decides the next step; it never waives or passes the check. The worker then reports `metadata.acceptance_results` honestly (`fail` + the `branch` it followed) and the kanban-honest-done plugin's Gate G refuses a waived or guessed pass. When no branch fits, the honest outcome is a needs_input block naming the changed limit ("waives check 4", "lowers the 25% target"); that ask is legitimate, not avoidable.
 
 For recurrence evidence, inspect the private red-sweep log for slug `owner-recommendation-not-applied`; keep personal incident details in the private worker skill rather than copying them into this public repository.
 
