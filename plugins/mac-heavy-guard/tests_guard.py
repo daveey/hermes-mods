@@ -235,6 +235,18 @@ def test_message_names_routes_and_opt_out():
         assert needle in res["message"]
 
 
+def test_message_routes_to_a_worker_card_first_not_raw_ssh_on_the_hub():
+    """agent-24dac018a6: a Mac session followed "Anywhere: run it on the hub" and ran review tests and a CI wait
+    over raw ssh on hermes-hub while the hub refused Kanban claims at ~85% CPU against its 50% gate. Raw ssh skips
+    that admission gate; a pool-worker card obeys it. The first route is the worker card; no raw hub-ssh recipe."""
+    res = plugin._pre_tool_call(tool_name="terminal", args={"command": "cargo build --release"})
+    options = [ln for ln in res["message"].splitlines() if ln.startswith("- ")]
+    assert "pool-worker card" in options[0] and "runs_on" in options[0], options
+    assert "ssh ubuntu@hermes-hub" not in res["message"]
+    assert "Anywhere: run it on the hub" not in res["message"]
+    assert "hub-runtime" in res["message"]
+
+
 def test_tool_call_batch_and_other_tools():
     assert blocked("tool_call", calls=[{"name": "terminal", "arguments": {"command": "uv sync"}}])
     assert not blocked("read_file", path="Cargo.toml")

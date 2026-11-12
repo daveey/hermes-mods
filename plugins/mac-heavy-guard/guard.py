@@ -1280,16 +1280,17 @@ def evaluate(text: str, cwd: Optional[str] = None) -> tuple[Optional[str], Optio
 
 
 def message(why: str, core_cmd: Optional[str] = None) -> str:
-    core = (f"- This is a Hermes core worktree: {core_cmd} runs it on hermes-hub (under nice) and streams the "
-            "output back.\n") if core_cmd else ""
+    core = (f"- This is a Hermes core worktree: {core_cmd} runs it on hermes-hub (under nice), or on a pool worker "
+            "while the hub is over its CPU admission gate, and streams the output back.\n") if core_cmd else ""
     return (
         f"mac-heavy-guard: blocked {why} on this Mac. Heavy builds, whole test suites and whole-repo installs "
-        "pile up across agents here (load 150-270) and make Hermes Desktop slow, so they run on the hub or "
-        "worker-1 by default.\n"
+        "pile up across agents here (load 150-270) and make Hermes Desktop slow, so they run on a pool worker by "
+        "default.\n"
         f"{core}"
-        "- Hermes: put the work on a card; cards that name tests/builds go to worker-1 automatically "
-        "(kanban.placement.heavy_route), or set runs_on=[machine:worker-1].\n"
-        "- Anywhere: run it on the hub, e.g. ssh ubuntu@hermes-hub 'cd <repo> && nice -n 10 <cmd>'.\n"
+        "- Hermes: a pool-worker card: cards that name tests/builds go to worker-1 automatically "
+        "(kanban.placement.heavy_route), or set runs_on=[pool:worker] / [machine:worker-1]. Suites, reviews and CI "
+        "waits of a published branch belong there, not in raw ssh on hermes-hub: that skips the hub's CPU admission "
+        "gate. Use the hub only for hub-runtime work (its live board, services or state).\n"
         "- Narrow it: a single test file/dir or a debug build is allowed here.\n"
         f"- Needs this Mac (Xcode/macOS-only, a Mac-only checkout)? Re-run with {OPT_OUT}=1 <cmd>; "
         "CARGO_BUILD_JOBS / PYTEST_XDIST_AUTO_NUM_WORKERS / VITEST_MAX_WORKERS cap it at 4 workers."
