@@ -259,6 +259,29 @@ test('status bar: one meter for the hub, one for worker gateways; track = capaci
   } finally { await ui.close() }
 })
 
+test('draining: hover text carries the hold reason, holder and age; the row shows no reason text', async () => {
+  const body = fleet()
+  const held = { state: 'draining', reason: 'on hold: finishes running cards, takes no new ones', labels: [], pinned_only: false, slots: 3, slots_source: 'registry', running: [] }
+  body.gateways.machines = [
+    { name: 'spare', ...held, hold_reason: 'disk cleanup', hold_by: 'operator-a', hold_at: NOW - 5 * 60000 },
+    { name: 'legacy', ...held, hold_reason: null, hold_by: 'operator-b', hold_at: NOW - 2 * 3600000 }
+  ]
+  const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
+  const spare = ui.container.querySelector('[data-machine="spare"]')
+  const want = 'draining: disk cleanup (held by operator-a, 5m ago); finishes running cards, takes no new ones'
+  const info = spare.querySelector(':scope > .hermes-fleet-info')
+  assert.equal(info.textContent, 'i')
+  assert.ok(info.title.startsWith(want), info.title)
+  assert.doesNotMatch(spare.textContent, /disk cleanup|operator-a|on hold/)
+  assert.equal(spare.querySelector('.hermes-fleet-drain-label')?.textContent, 'draining')
+  const slots = [...spare.querySelectorAll('.hermes-fleet-slot.is-draining')]
+  assert.equal(slots.length, 3)
+  for (const s of slots) assert.equal(s.title, want)
+  const legacy = ui.container.querySelector('[data-machine="legacy"]')
+  assert.ok(legacy.querySelector('.hermes-fleet-info').title.startsWith('draining: no reason recorded (held by operator-b, 2h ago); finishes running cards, takes no new ones'))
+  await ui.close()
+})
+
 test('gateway rows: one grid line each in a shared column grid, no Investigate control', async () => {
   const body = fleet()
   body.gateways.machines = body.gateways.machines.map((m) => ({ ...m, waiting: 1, ineligible: 2, load: { cpu_load1: 1, cpus: 8, mem_used_pct: 10, disk_free_gb: 5, disk_total_gb: 50, at: NOW, stale: false } }))

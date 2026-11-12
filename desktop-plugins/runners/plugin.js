@@ -450,23 +450,27 @@ function GatewayRow({ m, now }) {
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const v = loadParts(m.load, now)
+  const drainNote = m.state === 'draining'
+    ? `draining: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); finishes running cards, takes no new ones`
+    : null
   const meta = [
     m.pinned_only ? 'pinned only' : null,
     m.slots == null ? 'slots not set' : m.slots_source === 'local' ? 'slots from local cap' : null,
-    m.reason,
+    drainNote || m.reason,
     v ? (v.stale ? `load ${v.stale}` : null) : 'load not reported'
   ].filter(Boolean).join(' · ')
   // Flags and reasons are a small (i) at the end of the row; its tooltip is drawn by CSS from data-tip
   // (native title tooltips do not show inside the Desktop popover).
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
-    h('span', { className: 'hermes-fleet-name' }, text(m.name)),
+    h('span', { className: 'hermes-fleet-name' }, text(m.name),
+      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote, style: { marginLeft: '6px', fontSize: '10px', opacity: 0.75 } }, 'draining') : null),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
         title: `${r.task} · ${text(r.title)}\nboard ${r.board}${r.started_at ? ` · running ${ago(now - r.started_at * 1000)}` : ''}`,
         onClick: () => openCard(r)
       })),
-      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] }))),
+      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: drainNote || SLOT_TITLE[freeState] }))),
     h('span', { className: 'hermes-fleet-cell hermes-fleet-waiting', title: m.waiting != null ? `${m.waiting} unleased ready card(s) for gateway-dispatched profiles match placement labels (including skill labels) on ${m.name}. Need a slot here; portable cards can also fit other machines. Does not include transient admission limits or machine availability.` : undefined }, m.waiting != null ? `${m.waiting}` : ''),
     h('span', { className: 'hermes-fleet-cell hermes-fleet-ineligible', title: m.ineligible != null ? `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` : undefined }, m.ineligible != null ? `${m.ineligible}` : ''),
     h(MeterCell, { k: 'cpu', v }), h(MeterCell, { k: 'ram', v }), h(MeterCell, { k: 'disk', v }),

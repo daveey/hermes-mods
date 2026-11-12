@@ -34,6 +34,22 @@ def test_registry_sets_slots_flags_and_drain():
     assert all(r['state'] == 'active' for k, r in m.items() if k != 'spare')
 
 
+def test_held_machine_keeps_hold_metadata_from_registry():
+    reg = _registry(hub={}, spare=dict(hold=True, hold_reason='disk cleanup', hold_by='operator-a', hold_at=NOW - 5 * MIN),
+                    old=dict(hold=True), live=dict(hold=False, hold_reason='stale', hold_by='x', hold_at=1))
+    out = fleet.gateway_workers(reg, [], NOW)
+    m = {r['name']: r for r in out['machines']}
+    assert m['spare']['state'] == 'draining'
+    assert (m['spare']['hold_reason'], m['spare']['hold_by'], m['spare']['hold_at']) == ('disk cleanup', 'operator-a', NOW - 5 * MIN)
+    # A hold recorded before the metadata columns existed has none of it.
+    assert m['old']['state'] == 'draining'
+    assert (m['old']['hold_reason'], m['old']['hold_by'], m['old']['hold_at']) == (None, None, None)
+    # Metadata of a released machine is never reported as a current hold.
+    assert m['live']['state'] == 'active'
+    assert (m['live']['hold_reason'], m['live']['hold_by'], m['live']['hold_at']) == (None, None, None)
+    assert reg['machines']['spare']['hold_reason'] == 'disk cleanup'  # never mutate registry
+
+
 def test_live_leases_fill_slots_across_boards(tmp_path):
     _shadow(tmp_path, 'default', [
         ('t_a', 'Card A', 'running', 100, 'hub', NOW + MIN),

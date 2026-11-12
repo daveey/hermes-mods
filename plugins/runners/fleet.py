@@ -155,7 +155,7 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
         elif entry is None:
             state, reason = 'unknown', 'not in the machine registry'
         elif entry.get('hold'):
-            state, reason = 'draining', 'on hold: finishes running cards, takes no new ones'
+            state, reason = 'draining', 'draining'
         elif not isinstance(seen, (int, float)):
             state, reason = 'unknown', 'never seen by the Board'
         elif now_ms - seen > UNSEEN_MS:
@@ -170,6 +170,10 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
             fit = sum(eligible(w, name, placement) is None and _offered(w, name, entry) for w in waiting)
         rows.append(dict(
             name=name, me=name == me, state=state, reason=reason, last_seen=seen,
+            # Registry hold metadata (ms epoch like last_seen); only a current hold reports it.
+            hold_reason=(entry.get('hold_reason') or None) if state == 'draining' else None,
+            hold_by=(entry.get('hold_by') or None) if state == 'draining' else None,
+            hold_at=entry.get('hold_at') if state == 'draining' and isinstance(entry.get('hold_at'), (int, float)) else None,
             labels=list(entry.get('labels') or []) if entry else [],
             pinned_only=bool(entry and entry.get('pinned_only')),
             slots=slots, slots_source=slots_source,
