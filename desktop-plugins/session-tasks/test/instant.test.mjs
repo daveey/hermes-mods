@@ -195,12 +195,15 @@ test('a card row reads as status, title, who, what happened last, note and PR', 
   const now = Date.UTC(2026, 9, 27, 9, 0, 0)
   const [chip] = m.sessionTaskChips([card('t_row', 'review', {
     title: 'Fix the flaky wake test', assignee: 'worker', activity_kind: 'review_requested', activity_at: now / 1000 - 300,
-    note: 'Opened the PR; CI green', pr_url: 'https://github.com/o/r/pull/42'
+    note: 'Opened the PR; CI green', pr_url: 'https://github.com/o/r/pull/42', execution_observations: []
   })], { connectionId: 'conn', profile: 'default' })
   assert.deepEqual(m.cardRowModel(chip, now), {
     status: 'review', onHub: false, look: null, wait: '', title: 'Fix the flaky wake test', meta: 'worker · review requested 5m ago',
     note: 'Opened the PR; CI green', evidence: 'unknown (sdk projector unavailable) · progress unknown', prLabel: 'PR #42', prUrl: 'https://github.com/o/r/pull/42'
   })
+  // An older producer (no execution_observations at all) cannot prove the review is current.
+  const [legacy] = m.sessionTaskChips([card('t_row', 'review')], { connectionId: 'conn', profile: 'default' })
+  assert.equal(m.cardRowModel(legacy, now).status, 'unknown')
   const [unsafe] = m.sessionTaskChips([card('t_x', 'running', { pr_url: 'javascript:alert(1)' })], { connectionId: 'conn', profile: 'default' })
   assert.equal(m.cardRowModel(unsafe, now).prUrl, null, 'only GitHub links render as links')
 })

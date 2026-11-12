@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 export const PUBLIC_FIXTURE = resolve(here, 'fixtures/execution-observations-v1.json')
-export const PUBLIC_FIXTURE_SHA256 = 'a0f25162f8579d25c298d3313f5d6903a1a4da841c3cec47ac7cf74d572bc4de'
+export const PUBLIC_FIXTURE_SHA256 = '306928d12ac8828aba9fc1089ac9cd73e0ab3bd99f66505bef5df85ebc0d48cf'
 const CORE_FIXTURE = 'schemas/fixtures/execution-observations-v1.json'
 const CORE_PROJECTOR = 'apps/desktop/src/lib/execution-observations.ts'
 

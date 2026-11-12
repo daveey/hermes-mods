@@ -1034,9 +1034,18 @@ export function openTaskChip(chip) {
   return openQualifiedTask(chip)
 }
 
+// An older producer (no observations array at all) cannot prove live or queued card work: such a card renders
+// explicit unknown with its last known state, never the running pulse. Its waits and asks keep their look.
+const LEGACY_LIVE = new Set(['running', 'review', 'ready', 'todo'])
+const legacyLiveCard = c => c.kind === 'kanban' && !Array.isArray(c.observations) && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
+
 export function Chip({ chip: rawChip, now }) {
   const ev = ['bg', 'sub'].includes(rawChip.kind) ? chipObservation(rawChip, now / 1000) : null
-  const chip = ev ? { ...rawChip, state: ev.state, title: `${rawChip.title}\n${observationLine(ev, now / 1000)}` } : rawChip
+  const chip = ev
+    ? { ...rawChip, state: ev.state, title: `${rawChip.title}\n${observationLine(ev, now / 1000)}` }
+    : legacyLiveCard(rawChip)
+      ? { ...rawChip, state: 'unknown', title: `${rawChip.title}\nstatus unknown (producer sent no observations) · last known: ${rawChip.state}` }
+      : rawChip
   const color = chipColor(chip.look || chip.state)
   const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
   const taskClickable = chip.kind === 'kanban' && !!chip.connectionId && !!chip.profile
@@ -1104,7 +1113,7 @@ export function cardRowModel(chip, now = Date.now()) {
   const age = elapsed(chip.activityAt || chip.since, now)
   const pr = chip.prUrl ? chip.prUrl.match(/\/pull\/(\d+)$/) : null
   return {
-    status: chip.look === 'stalled' ? 'stalled' : chip.state,
+    status: chip.look === 'stalled' ? 'stalled' : legacyLiveCard(chip) ? 'unknown' : chip.state,
     onHub: onHub(chip),
     look: chip.look || null,
     wait: waitLine(chip, now),
@@ -1120,7 +1129,7 @@ export function cardRowModel(chip, now = Date.now()) {
 
 function CardRow({ chip, now }) {
   const m = cardRowModel(chip, now)
-  const color = chipColor(chip.look || chip.state)
+  const color = chipColor(chip.look || (m.status === 'unknown' ? 'unknown' : chip.state))
   const clickable = !!chip.connectionId && !!chip.profile
   return jsxs(clickable ? 'button' : 'div', {
     type: clickable ? 'button' : undefined,
@@ -1136,7 +1145,7 @@ function CardRow({ chip, now }) {
     },
     children: [
       jsx('span', {
-        className: chip.state === 'running' ? 'session-tasks-pulse' : undefined,
+        className: chip.state === 'running' && m.status !== 'unknown' ? 'session-tasks-pulse' : undefined,
         style: {
           fontSize: 10.5, lineHeight: '16px', padding: '0 6px', borderRadius: 999, whiteSpace: 'nowrap', marginTop: 1,
           color, border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, background: `color-mix(in srgb, ${color} 12%, transparent)`
