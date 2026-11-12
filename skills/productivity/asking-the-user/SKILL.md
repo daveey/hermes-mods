@@ -52,6 +52,10 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   readiness predicate against the proposed stopped state: a longer hold cannot fix a guard that rejects deliberately
   stopped services. Re-review changed timing and guard compatibility rather than treating duration as the only defect.
   Report the script deadline separately from the service timeout and cleanup allowance; none alone proves restoration.
+- Before filing an approval whose limits enumerate targets (machines, origins, repos), run the read-only discovery
+  step (a migration's `prepare`, a dry run) first and copy its exact list into the limits: a guessed list that
+  discovery later widens forces a stop and a second approval round. If it widens anyway, stop before any write, record
+  the `applied` receipt as partial (what ran, what didn't), and file one new request naming the extra targets.
 - Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
