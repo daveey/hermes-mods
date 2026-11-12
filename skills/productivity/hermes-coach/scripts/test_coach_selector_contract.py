@@ -82,9 +82,9 @@ class SelectorContract(unittest.TestCase):
         mods = {'anthropic': sdk, 'hermes_cli.runtime_provider': runtime}
         with patch.dict(sys.modules, mods), patch.dict(os.environ, {'OPENROUTER_API_KEY': 'k-offline'}, clear=True), \
                 patch.object(worker, 'build_openrouter_backend',
-                             side_effect=lambda m: build_or(m, fetch=lambda: listing)) as routed:
+                             side_effect=lambda m, provider: build_or(m, fetch=lambda: listing, provider=provider)) as routed:
             be, info = worker.build_backend('openrouter', 'recursive/flint-v1.0:free')
-        routed.assert_called_once_with('recursive/flint-v1.0:free')
+        routed.assert_called_once_with('recursive/flint-v1.0:free', provider='openrouter')
         sdk.Anthropic.assert_called_once_with(auth_token='k-offline', base_url='https://openrouter.ai/api',
                                               timeout=300, max_retries=0)
         self.assertEqual((be.resolved_model, be.provider, be.prefix, info),
@@ -94,6 +94,25 @@ class SelectorContract(unittest.TestCase):
         paid = be.price('vendor/paid')
         self.assertEqual([round(paid[k], 6) for k in ('input', 'output', 'cache_read')], [3.0, 15.0, 0.3])
         self.assertEqual(be.price('vendor/unlisted'), {'error': 'no price for vendor/unlisted'})
+
+    def test_nous_gateway_uses_its_own_key_and_base(self):
+        from types import ModuleType
+        import sys
+        sdk = ModuleType('anthropic')
+        sdk.Anthropic = Mock()
+        listing = {'data': [{'id': 'qwen/q', 'pricing': {'prompt': '0.0000001', 'completion': '0.0000009'}}]}
+        with patch.dict(sys.modules, {'anthropic': sdk}), \
+                patch.dict(os.environ, {'NOUS_API_KEY': 'n-offline', 'OPENROUTER_API_KEY': 'wrong'}, clear=True):
+            be, info = build_or('qwen/q', fetch=lambda: listing, provider='nous')
+        sdk.Anthropic.assert_called_once_with(auth_token='n-offline', base_url='https://inference-api.nousresearch.com',
+                                              timeout=300, max_retries=0)
+        self.assertEqual((be.provider, info['provider']), ('nous', 'nous'))
+        price = be.price('qwen/q')
+        self.assertEqual(([round(price[k], 6) for k in ('input', 'output')], price['source']),
+                         ([0.1, 0.9], 'nous models api'))
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'x'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'NOUS_API_KEY.*user/nous'):
+                worker.build_backend('nous', 'qwen/q')
 
     def test_openrouter_backend_refuses_without_a_key(self):
         with patch.dict(os.environ, {}, clear=True):
