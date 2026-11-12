@@ -356,9 +356,18 @@ def _unmask_quoted(tokens: list) -> list:
 # Byte-identical in live-checkout-guard, mac-heavy-guard, busy-tree-guard, sqlite-live-guard, service-owner-guard,
 # evidence-clobber-guard and coach/agent_rules.py (each plugin loads standalone). Change every copy together.
 
-_HD_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ssh"})
-_HD_PIPED_SHELL = re.compile(r"\|&?\s*(?:(?:sudo|env|exec|command|nohup)\s+(?:-\S+\s+)*)*(?:\S*/)?"
-                             r"(?:ba|z|da|k|mk)?sh(?![\w.-])")
+# Readers known to read a heredoc body only as data. A body is data only when every command that reads it is one
+# of these; any other reader, or one this can't name (`su -`, `sudo -s`, `source /dev/stdin`, `"$SHELL"`, `eval`,
+# `xargs sh`, `{ ...; }`), may run it as shell code, so the body stays code (fail closed).
+_HD_DATA_READERS = frozenset({
+    "cat", "tee", "grep", "egrep", "fgrep", "rg", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "paste",
+    "column", "fold", "fmt", "nl", "rev", "base64", "md5sum", "sha1sum", "sha256sum", "shasum", "xxd", "od",
+    "diff", "cmp", "jq", "yq", "less", "more", "git", "gh", "patch", "pbcopy", "true", ":"})
+_HD_PYTHON = re.compile(r"python(?:\d+(?:\.\d+)*)?\Z")
+_HD_WRAPPERS = frozenset({"sudo", "doas", "env", "nohup", "command", "exec", "time"})
+_HD_ARG_OPTS = frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U", "--user", "--group"})
+_HD_REDIRECT = re.compile(r"(?:\d+|&)?(?:<<<|<<-?|<>|>>|>\||>&|<&|&>>?|<|>)")
+_HD_SEPARATOR = re.compile(r"\|\||&&|\|&?|;|\(|\)|(?<![<>])&(?!>)")
 _HD_WORD_BREAK = " \t\r\n;&|()<>"
 
 
@@ -444,18 +453,59 @@ def _hd_substitutions(body: str) -> list:
     return found
 
 
+def _hd_data_reader(words: list) -> bool:
+    """True when the simple command `words` reads its stdin only as data: a `_HD_DATA_READERS` name or Python,
+    also behind `sudo`/`env`/`exec`-style wrappers, or no command word at all (`> f <<EOF`). `sudo -s`/`-i` is
+    a shell."""
+    i, n = 0, len(words)
+    while i < n:
+        w = words[i]
+        m = _HD_REDIRECT.match(w)
+        if m:
+            i += 2 if m.end() == len(w) else 1
+            continue
+        if re.match(r"[A-Za-z_]\w*\+?=", w):
+            i += 1
+            continue
+        base = os.path.basename(w)
+        if base in _HD_WRAPPERS:
+            i += 1
+            while i < n and words[i].startswith("-") and words[i] != "-":
+                opt = words[i]
+                if base in ("sudo", "doas") and (opt in ("--shell", "--login") or (
+                        not opt.startswith("--") and set(opt[1:]) & {"s", "i"})):
+                    return False
+                i += 2 if opt in _HD_ARG_OPTS else 1
+            continue
+        return base in _HD_DATA_READERS or bool(_HD_PYTHON.match(base))
+    return True
+
+
 def _hd_feeds_shell(prefix: str, rest: str) -> bool:
-    """True when a heredoc is read by a shell, so its body runs as code: a shell word (`bash`, `sudo -u x sh -s`,
-    `ssh host`) in the command before the operator (`prefix`), or a pipe into one after it (`rest`)."""
+    """False only when a heredoc body is known to be read as data; True (its body may run as code) otherwise.
+    `prefix` is the line before the `<<` operator, `rest` the line from it on. The body goes to the command that
+    holds the operator and, through `|`/`|&`, to each later stage of that pipeline: every one must be a data
+    reader (`_hd_data_reader`). So `su - <<EOF`, `sudo -s <<EOF`, `source /dev/stdin <<EOF`, `"$SHELL" <<EOF`
+    and `cat <<EOF | sudo -s` are all code, and so is any reader this does not know (fail closed)."""
     import shlex
-    if _HD_PIPED_SHELL.search(rest):
-        return True
-    seg = re.split(r"[;&|(]", prefix)[-1]
-    try:
-        words = shlex.split(seg)
-    except ValueError:
-        words = seg.split()
-    return any(os.path.basename(w) in _HD_SHELLS for w in words)
+
+    def words(seg: str) -> list:
+        try:
+            return shlex.split(seg)
+        except ValueError:
+            return seg.split()
+
+    stages, pos = [], 0
+    for m in _HD_SEPARATOR.finditer(rest):
+        stages.append(rest[pos:m.start()])
+        pos = m.end()
+        if m.group() not in ("|", "|&"):
+            pos = -1
+            break
+    if pos >= 0:
+        stages.append(rest[pos:])
+    stages[0] = _HD_SEPARATOR.split(prefix)[-1] + stages[0]
+    return not all(_hd_data_reader(words(seg)) for seg in stages)
 
 
 def _split_heredocs(text: str, _level: int = 0) -> tuple:
@@ -466,7 +516,8 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
     in it (`it's done`) can no longer unbalance the quotes of the commands after it. Every `<<WORD`/`<<-WORD` form
     is handled (bare, 'quoted', "quoted", \\escaped), several on one line in order, `<<-` tab stripping, an
     unterminated body to the end. Two kinds of body still reach `code`:
-    - a body fed to a shell (`_hd_feeds_shell`) is code that runs: it is split recursively and kept;
+    - a body fed to a shell, or to any reader not known to read it as data (`_hd_feeds_shell`), is code that may
+      run: it is split recursively and kept;
     - each `$(...)`/backtick substitution of an unquoted-delimiter body runs before the command does: its command
       text is appended as its own line (`_hd_substitutions`).
     `bodies` lists every other body as (text, quoted delimiter), for a guard that scans data conservatively.
@@ -553,6 +604,16 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
             i += 1
         elif text.startswith("$((", i) or (text.startswith("((", i) and _hd_word_start(text, i)):
             j = _hd_arith_end(text, i + (c == "$"))
+            out.append(text[i:j])
+            i = j
+        elif text.startswith("${", i):  # parameter expansion: a `<<` or `#` in it (`${x/<</y}`) is text
+            j, depth = i + 2, 1
+            while j < n and depth:
+                if text[j] == "\\":
+                    j += 1
+                elif text[j] in "{}":
+                    depth += 1 if text[j] == "{" else -1
+                j += 1
             out.append(text[i:j])
             i = j
         elif c == "#" and _hd_word_start(text, i):

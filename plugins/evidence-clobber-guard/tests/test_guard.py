@@ -211,3 +211,44 @@ def test_heredoc_and_comment_apostrophes_hide_no_write(env):
     for shape in HEREDOC_ALLOWED:
         cmd = shape.format(c="python3 mutate.py > mutation-v2.log", safe="ls plugins")
         assert run(env, cmd, env["ev"]) is None, cmd
+
+
+# A heredoc body is data only when every reader is known to read it as data (cat, tee, grep, git, python, ...).
+# A body fed to anything else may run as shell code: `su -`, `sudo -s`/`-i`, `source /dev/stdin`, `"$SHELL"`,
+# `eval`, `exec bash`, `xargs sh`, a pipe into `sudo -s`, or an unknown reader. Review of 77ac105f found those
+# read as data (fail open); they are code again (card t_01a1d020a0b79528). `<<` inside `${...}` is no heredoc.
+READER_SHAPES = [
+    "su - <<EOF\n{c}\nEOF",
+    "sudo -s <<EOF\n{c}\nEOF",
+    "sudo -i <<'EOF'\necho here\n{c}\nEOF",
+    "sudo --login <<EOF\n{c}\nEOF",
+    "sudo -u root bash <<'EOF'\n{c}\nEOF",
+    "source /dev/stdin <<EOF\n{c}\nEOF",
+    ". /dev/stdin <<'EOF'\n{c}\nEOF",
+    "\"$SHELL\" <<'EOF'\n{c}\nEOF",
+    "${{SHELL}} <<EOF\n{c}\nEOF",
+    "eval \"$(cat)\" <<'EOF'\n{c}\nEOF",
+    "exec bash <<'EOF'\n{c}\nEOF",
+    "xargs -0 sh -c <<'EOF'\n{c}\nEOF",
+    "cat <<'EOF' | sudo -s\n{c}\nEOF",
+    "cat <<'EOF' | su\n{c}\nEOF",
+    "cat <<'EOF' | xargs sh -c\n{c}\nEOF",
+    "some-tool <<'EOF'\n{c}\nEOF",
+    "echo ${{x/<</y}}\n{c}",
+]
+READER_ALLOWED = [
+    "sudo tee /tmp/n.conf <<'EOF'\nit's {c}\nEOF",
+    "cat <<'EOF' | grep it\nit's {c}\nEOF",
+    "python3 - <<'EOF'\nprint(\"it's {c}\")\nEOF",
+    "env FOO=1 cat > /tmp/n.txt 2>&1 <<'EOF'\nit's {c}\nEOF",
+    "gh issue create --body-file - <<'EOF'\nit's {c}\nEOF",
+]
+
+
+def test_heredoc_body_a_shell_may_read_is_checked(env):
+    for shape in READER_SHAPES:
+        cmd = shape.format(c="python3 mutate.py > mutation-v2.log")
+        assert_blocked(run(env, cmd, env["ev"]), cmd)
+    for shape in READER_ALLOWED:
+        cmd = shape.format(c="python3 mutate.py > mutation-v2.log")
+        assert run(env, cmd, env["ev"]) is None, cmd
