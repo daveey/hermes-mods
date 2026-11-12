@@ -13,6 +13,116 @@ Coverage: `tests/test_stranded_sqlite_retired.py` checks missing/tombstoned/live
 `tests/test_stranded_sqlite_watch.py` retains real child-process deleted-sidecar detection and mock-only filing.
 
 
+## Frozen root-cap guard
+
+While an approved rollout contract freezes root `kanban.max_in_progress`, `pre_tool_call` refuses a
+terminal/`execute_code` mutation of that key (in that exact root home, not a profile home) that contradicts the
+frozen value. A queue notice, headroom or a generic go-ahead is not permission; the refusal names the contract and the
+queue alternatives (priority, re-placement, local work). Nothing else in config is restricted and no value is
+hardcoded: the freeze exists only as a registered record.
+
+- **One root projection.** The record lives in `<root home>/coach/root_cap_contracts.json` (`root_cap.shared_dir`),
+  not in each profile's store: a profile agent running `HERMES_HOME=<root> hermes config set ...` meets the same
+  registration as a root session. A projection that exists but cannot be read or validated (corrupt JSON, a record
+  missing `frozen_value`, wrong types) is a *known-but-unreadable* contract: only a targeted write is refused. No
+  projection anywhere means no contract (nothing is frozen). A guard fault (`check` or the module failing to load)
+  likewise refuses only a call that names the key; unrelated config and tools keep working.
+- **Register** (`python3 root_cap.py register --store <coach dir> --target-home <root> --value N --contract-ref
+  <approved artifact> --approval-session <chat> --approval-message <id> --owner-card <card>`; `list` shows state).
+  Needs the digest-pinned artifact to state the value, an open owner card and a native typed human approval row
+  (same reader as kanban-honest-done: human-opened session, user role, same chat lineage, **newer than the artifact
+  revision**) that is positive (no negation/withdrawal), names the key and the frozen value, and names the artifact
+  revision (digest prefix or file name) or the owner card. The freeze lapses when the owner card is done/archived; an
+  unreadable owner, changed artifact digest or two conflicting active revisions refuse only the targeted key.
+  Registration (`register`) stays supported for a freeze whose approval is a native typed message; the approving text must be the user's own first-person approval (a quoted or reported approval, `The assistant wrote: "I approve ..."`, `> I approve ...`, is refused, as are a question (`Did I approve ...?`), single-quoted text and one from a machine-opened chat).
+- **Declare** (`python3 root_cap.py declare --target-home <root> --value N --contract-ref <approved artifact>
+  --owner-card <card>` plus EITHER `--approval-session/--approval-message` OR an explicit ActionStore operation
+  `--action-db --operation --request --revision --gateway --profile --stored-session --native-message --mapping-phrase
+  --mapping-rationale --mapping-reviewed-by`) writes a private task-local descriptor of explicit references to
+  `<root>/coach/root_cap_sources.json`. It is verified when declared and **re-verified by the guard at every targeted
+  call**, in every profile (the descriptor lives in the root store), so there is no separate registration step to
+  forget and a missing projection never erases a known protection; the verified record is projected lazily so a later
+  permanent supersession has a record to flip. The guard never scans prose: an approval with no referenced descriptor
+  freezes nothing. For an `action_operation` source it reads ONE operation read-only and requires: positive
+  execution-authorizing `approve` effect, current unwithdrawn revision whose recorded resolution is that operation,
+  frozen intent equal to the stored revision, the reviewed capacity wording (the explicit, reviewed mapping from the
+  approved wording to `kanban.max_in_progress`, not a hardcoded value), a matching owner namespace/session, the
+  owner card's `session_id`, a `scope.sourceRefs` entry naming the owner card, the **canonical native user row**
+  (`--native-message`: a user-role row of the owner session lineage in a human-opened chat whose embedded frozen
+  decision equals the operation intent; an ActionStore record with no such row is not authority) and (bound rows) the
+  scope digest; legacy unbound rows pass on those equalities. A
+  withdrawn/superseded approval, unreadable store, edited artifact or unreadable descriptor is a *known but unprovable*
+  freeze: only the targeted write is refused, with the exact conflict. A finished owner lapses the freeze.
+  The descriptor is an operator/owner step (it holds ids private to a rollout); this plugin never writes one itself.
+- **Authorized change**: the user's own native turn (coach goal_scope capture, with its `message_uid`) says
+  `authorize ... max_in_progress from <frozen> to <new>` (or cites the revision digest). The deciding chat must be a
+  human-opened session (desktop/tui/cli/local); a Kanban/cron/subagent session's opening prompt is machine content.
+  Reported speech (`X said ...`, quotes, `> ...`) is not a decision, and any cancellation ("Cancel that", "Never mind",
+  "Revoke ...") withdraws the earlier decision, key or not. The LATEST relevant decision wins: a later explicit value
+  (`from 7 to 9`) refuses an earlier authorization of 8 and admits only 9. Authority is re-read at every admission. Permanent:
+  provenance (decision hash, native `message_uid`, tool and `tool_call_id`) is kept in `root_cap_exceptions.json` and
+  the contract is superseded only after `post_tool_call` reads the new value back, in the same locked transaction.
+  Temporary: the same decision must also name an existing open owner card whose run/profile (if named) match the
+  card's current run and assignee (an unverifiable gateway is rejected, never stored as verified), restore the original
+  value and give a restore trigger (owner completion and/or a future UTC expiry).
+  Scope is positive, not a list of forbidden temporary synonyms: only an affirmative closed-form permanent
+  sentence (for example `I authorize changing root kanban.max_in_progress from 7 to 8 permanently for this rollout.`)
+  or a bare single authorization is unbounded. Unknown own scope demands temporary provenance; an unknown relevant
+  later restriction invalidates cached terms, including within the same message. Negating one bound alone is not
+  affirmative permanence. Owner/restore assignments use closed affirmative forms (`Owner card t_example, run 1,
+  this session.` / `Restore root kanban.max_in_progress to 7 on owner completion.`); unknown or withdrawn fields
+  replace, never reuse, the earlier field. Compound withdrawals invalidate every mentioned field. The restore trigger
+  (owner completion and/or an expiry) is recognised by topic, not by withdrawal wording: any own sentence that
+  mentions an expiry, deadline, time limit/box, cutoff, end date, owner completion, rollback time, or a timer/date/trigger
+  together with a negation/change signal, or points straight at one (`Expiry cancelled.`, `Forget the 2099 deadline.`,
+  `Nuke expiry.`), retires the stale trigger unless it names another object (`My passport expires next year.`,
+  `The report deadline is Friday.`); a false positive only asks for a fresh `Restore ... to N <trigger>` sentence. A later genuine
+  `Make that permanent.` or a fresh complete assignment remains possible.
+  **Adjacency window (the structural rule).** The authorizing message and the next three human messages after it
+  (`_FOLLOWUP_WINDOW`; user rows carry no assistant boundary, so a fixed count is the deterministic stand-in for
+  "before the next assistant turn") are one conversation about the decision. Inside it every own, affirmative,
+  non-question, non-quoted, non-reported sentence is judged by a CLOSED grammar, not by a vocabulary: it is a no-op
+  only when it is a courtesy/acknowledgement (`thanks`, `ok`, `yes, go ahead`, `keep going`, ...), valid owner/restore
+  terms, an affirmative permanence sentence, a restriction (bounded intent) or the authorization itself. Anything else
+  (`Scratch the conditions.`, `No strings attached.`, `Friday only.`, `Good for this sprint.`) clears the stored terms
+  and marks the decision temporary, so the write refuses until a fresh valid `Owner card ...` / `Restore ... to N
+  <trigger>` pair or an explicit permanent supersession exists. A question is recognised by a question mark or an
+  auxiliary plus a subject (`Did I ...`, `Is it ...`), someone else's words by a third-party attribution or quote, so
+  `Do it without conditions.` and `Disregard what I said earlier ...` stay the user's own. **Residual (documented, not
+  closed):** a restriction sent more than three human messages after the authorization is judged only by the older
+  topic gate (restore/owner/trigger/bound vocabulary), so unfamiliar wording that far away is not recognised, and an
+  unrelated own sentence inside the window costs one fresh terms sentence (a deliberate false positive). These
+  deterministic English forms are
+  intentionally conservative: unsupported wording may refuse this frozen-cap write and require a clearer decision;
+  this is not natural-language equivalence or a general configuration-edit ban.
+- **Storage**: every read-modify-write holds an exclusive `flock` on `<store>/.root_cap.lock` (threads and processes),
+  writes a unique temp file, fsyncs, replaces atomically and reads back; completion is matched on tool + args + call id.
+- **Recovery**: `root_cap.due_restores()` lists temporary exceptions whose trigger fired. `restore` only when the
+  config still holds the override AND the contract revision it was granted against is still active; anything else is a
+  `conflict`. `pre_llm_call` delivers the due/conflict notice as coach context to the owner's chat (`owner_ref.session`)
+  and once to the next live chat when the owner's chat is gone (`root_cap.due_notices`), persisted in
+  `root_cap_notices.json` per exception + action + chat (so a restart or another chat never repeats it), and logs one
+  `root_cap_restore_due` coach event. A restore notice names the `hermes config set` the guard admits; a conflict
+  says do not overwrite. No timer or auto-restorer is installed; the owner performs the restore.
+- **Parsing**: executable `hermes config set` (wrappers, `bash -c`, `eval`, `$(...)`/backticks in unquoted *and*
+  double-quoted words, heredocs that feed a shell or `python -`, `-p/--profile`, `HERMES_HOME=`), in-place
+  `sed/yq/perl` or redirects onto the root `config.yaml` that name the key, and literal `terminal()`, `subprocess`,
+  `os.system` calls in `execute_code` (constants and simple assignments folded). Single-quoted text, `echo`/`grep`
+  arguments and `cat <<'EOF'` bodies are data. Dynamic commands or config-API writes that name the key are refused as
+  ambiguous. Direct-edit paths are resolved the way the shell resolves them: `$HERMES_HOME`/`${HERMES_HOME}`/`$HOME`,
+  variables the command assigned, `cd`/`pushd` inside the command and the terminal `workdir`; a config writer whose
+  target cannot be resolved (unknown `$VAR`, `$(...)`, relative `config.yaml` with no established directory) and that
+  names the key is refused as unverifiable (`tests/test_root_cap_direct_edit.py`, terminal and execute_code).
+  Unrelated keys, reads and other files stay allowed. This is not a sandbox: scripts run from files and fully
+  dynamic Python are not covered.
+
+Tests: `tests/test_root_cap_guard.py` (matrix on both tool entry paths, native-session fixture) and
+`tests/test_root_cap_hardening.py` (independent-review findings R1-R6, distinct profile stores, concurrency race,
+real-bash grammar ground truth with a fixture-owned fake `hermes`) and `tests/test_root_cap_activation.py` (declared
+sources with no registration, a real user-steps ActionStore operation, quoted-approval refusal, notice delivery and
+dedupe) drive the real registered callbacks. They are
+callback-level evidence, not live gateway activation proof.
+
 ## Nonblocking profiler attachment
 
 `pre_tool_call` refuses attached `py-spy record`/`top` commands without `--nonblocking`.

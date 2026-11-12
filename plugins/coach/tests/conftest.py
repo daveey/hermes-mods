@@ -94,6 +94,8 @@ _CORE_ONLY_TESTS = frozenset({
     'test_goal_transport_controls.py::test_ws_reconnect_guarded_completion',
     'test_platform_marks.py::test_windows_only_mark_runs_only_on_windows',
     'test_reply_check.py::test_notice_turn_recognizes_every_prompt_producer_text',
+    # calls the real register() inside a swallow-all try/except: without core it fails before wiring hooks.
+    'test_root_cap_guard.py::test_register_wires_pre_and_post_callbacks',
 })
 
 

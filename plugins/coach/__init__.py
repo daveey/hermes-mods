@@ -6,6 +6,7 @@ import contextvars
 import datetime
 import hashlib
 import importlib.util
+import json
 import logging
 import threading
 import os
@@ -141,6 +142,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         coach.sessions = shared.setdefault("sessions", coach.sessions)
 
     authority_users: dict = shared.setdefault("authority_users", {})
+    authority_rows: dict = shared.setdefault("authority_rows", {})
+    cap_due_seen: set = shared.setdefault("root_cap_due_seen", set())
     # session -> dollar totals the user approved by answering a priced ask with a bare yes ("approved").
     authority_asked: dict = shared.setdefault("authority_asked", {})
 
@@ -154,8 +157,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 canonical_user_content=_.get("canonical_user_content"))
             authority_users[session_id] = [r.get("content") for r in rows
                                           if isinstance(r.get("content"), str)]
+            # typed rows keep the native message identity for root_cap provenance (strings alone lose it)
+            authority_rows[session_id] = [{"content": r.get("content"), "message_uid": r.get("message_uid")}
+                                          for r in rows if isinstance(r.get("content"), str)]
         except Exception as exc:
             authority_users[session_id] = []
+            authority_rows[session_id] = []
             log.debug("coach compute authority scope unavailable: %s", exc)
         try:
             # The figure comes from the assistant's ask; the authority from the user's own typed yes to it.
@@ -164,9 +171,17 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             authority_asked[session_id] = []
             log.debug("coach compute authority answered asks unavailable: %s", exc)
+        cap_notes = ""
+        try:  # existing owner recovery path: due/conflicting temporary cap exceptions ride this turn's coach context
+            rc = _load("root_cap")
+            home_dirs = [os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")]
+            rc.report_due(store.root, store.log, cap_due_seen, homes=home_dirs)  # log once per process
+            cap_notes = " ".join(rc.due_notices(store.root, session_id, log=None, homes=home_dirs))
+        except Exception as exc:
+            log.debug("coach root_cap due report: %s", exc)
         try:
             if not session_id:
-                return None
+                return {"context": cap_notes} if cap_notes else None
             goal_gate.capture(session_id=session_id, user_message=user_message,
                               conversation_history=conversation_history,
                               canonical_user_content=_.get("canonical_user_content"))
@@ -205,17 +220,18 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             plain_hint = _status_plain(session_id, user_message, platform, parent_session_id)
             stall_hint = _stalled_goal(session_id, platform)
             hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", relay_hint or "",
-                                        plain_hint or "", stall_hint or "") if h)
+                                        plain_hint or "", stall_hint or "", cap_notes) if h)
             return {"context": hint} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
-            return None
+            return {"context": cap_notes} if cap_notes else None
 
     def post_tool_call(tool_name="", args=None, result=None, session_id="", status=None, duration_ms=0,
                        error_type=None, error_message=None, **_):
         try:
             goal_gate.observe(session_id=session_id, tool_name=tool_name, args=args, result=result,
                               status=status, tool_call_id=_.get("tool_call_id"))
+            _load("root_cap").after(tool_name, args, session_id, store.root, tool_call_id=_.get("tool_call_id"))
             coach.hint_tool_end(session_id, _.get("tool_call_id"), tool_name,
                                 args if isinstance(args, dict) else {}, result, status)
             coach.observe(session_id, tool_name, args, result, status, duration_ms or 0, error_type, error_message)
@@ -405,6 +421,28 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         msg = _future_clock(session_id, tool_name, args)
         if msg:
             return {"action": "block", "message": msg}
+        try:  # frozen-rollout cap: a queue notice is not permission (root_cap.py)
+            rc = _load("root_cap")
+            cap = rc.check(tool_name, args, session_id, store.root, authority_rows.get(session_id, ()),
+                           tool_call_id=_.get("tool_call_id"))
+        except Exception as exc:
+            # root_cap.check never raises; this is a load/import fault. Refuse ONLY a call that names the guarded
+            # key (targeted uncertainty); every other tool keeps working under the same fault.
+            log.debug("coach root_cap: %s", exc)
+            cap = None
+            try:
+                blob = json.dumps(args, default=str)
+            except Exception:
+                blob = str(args)
+            if tool_name in ("terminal", "execute_code") and "max_in_progress" in blob:
+                cap = {"message": "Root kanban.max_in_progress is guarded and the guard could not load "
+                                  f"({type(exc).__name__}); this targeted change is refused until it can be verified. "
+                                  "Unrelated config and tools are unaffected.",
+                       "event": {"event": "agent_block", "rule": "root_cap", "key": "kanban.max_in_progress",
+                                 "session": session_id, "fault": type(exc).__name__}}
+        if cap:
+            store.log(cap["event"])
+            return {"action": "block", "message": cap["message"]}
         if tool_name in ("kanban_block", "kanban_create", "tool_call"):
             try:
                 ce = _load("compute_envelope")
