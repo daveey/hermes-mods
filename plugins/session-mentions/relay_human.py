@@ -40,13 +40,14 @@ LEDGER_KEEP_SECONDS = 30 * 86400
 _TYPED_KINDS = ("steer",)
 # Core's openings of untyped synthetic user rows (``kanban_relayed_human._synthetic_prefixes()``), mirrored for a
 # core without that module: compaction/runtime scaffolding, the pre-final gate's held-draft notice, the ``/loop``
-# wakeup frame, gateway ``[System:``/``[System note:`` notices and the session-mentions courier. With core present
-# core's own list is used, so a nudge registered there is excluded here too.
+# wakeup and ``/heartbeat`` frames, gateway ``[System:``/``[System note:`` notices and the session-mentions
+# courier. With core present core's own list is used, so a nudge registered there is excluded here too.
 _CORE_SYNTHETIC_PREFIXES = (
     "[System: Your previous response was truncated", "[System: The previous response was cut off",
     "[System: Your previous tool call", "[Your active task list was preserved across context compression]",
     "[IMPORTANT: Background process ", "[runtime] Your draft above was NOT shown to the user.", "[/loop wakeup #",
-    "[System:", "[System note:", "[Message from another Hermes session",
+    "[Heartbeat — recurring instruction, fires every ", "[System:", "[System note:",
+    "[Message from another Hermes session",
 )
 # Untyped user rows hermes-mods writes that core does not know: the coach's `[coach] ...` nudges (stored as user
 # rows by older cores) and its restart brief, the first prompt of a "restart clean" session, which ends with a
@@ -123,9 +124,11 @@ def _connect(state_db: Path) -> Optional[sqlite3.Connection]:
     return con
 
 
-def _loop_tick_since(con: sqlite3.Connection, session_id: str) -> Optional[float]:
-    """Core ``_loop_tick_since``: when this session's running ``/loop`` tick fired (its prompt row is the loop's)."""
-    fn = getattr(_core(), "_loop_tick_since", None)
+def _slash_loop_tick_since(con: sqlite3.Connection, session_id: str) -> Optional[float]:
+    """Core ``_slash_loop_tick_since``: when this session's slash-command ``/loop`` tick (``/loop 10m /recap``)
+    fired, while it is in flight (``awaiting_response``); its prompt is stored as an untyped row, the loop's, not a
+    reply. A wakeup-framed loop's row is caught by its frame instead. ``None`` otherwise."""
+    fn = getattr(_core(), "_slash_loop_tick_since", None)
     if callable(fn):
         try:
             return fn(con, session_id)
@@ -136,9 +139,27 @@ def _loop_tick_since(con: sqlite3.Connection, session_id: str) -> Optional[float
         state = json.loads(row[0]) if row and row[0] else None
         if not isinstance(state, dict) or not state.get("awaiting_response"):
             return None
+        if not str(state.get("prompt") or "").lstrip().startswith("/"):
+            return None
         return float(state.get("last_fired_at") or 0) or None
     except (sqlite3.Error, TypeError, ValueError):
         return None
+
+
+def _slash_loop_tick_row(con: sqlite3.Connection, session_id: str, prefixes: tuple[str, ...]) -> Optional[int]:
+    """Id of an in-flight slash ``/loop`` tick's own prompt row, picked as core picks it: the OLDEST untyped,
+    uncompressed, non-synthetic row at/after the fire. ``awaiting_response`` outlives an interrupted tick, so every
+    later untyped row is the person's."""
+    since = _slash_loop_tick_since(con, session_id)
+    if since is None:
+        return None
+    for row_id, content in con.execute(
+            "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
+            "AND COALESCE(display_kind, '') = '' AND COALESCE(_compressed_summary, 0) = 0 "
+            "AND timestamp >= ? ORDER BY id ASC", (session_id, since - 1)):
+        if not str(content or "").lstrip().startswith(prefixes):
+            return int(row_id)
+    return None
 
 
 def _user_rows(con: sqlite3.Connection, session_id: str):
@@ -151,21 +172,21 @@ def _user_rows(con: sqlite3.Connection, session_id: str):
 
 def latest_user_row(state_db: Path, session_id: str, *, mods: bool = True) -> Optional[tuple[int, float, str]]:
     """``(id, timestamp, content)`` of the session's newest row a person typed, by core's filter
-    (``kanban_relayed_human._latest_user_message``: its synthetic openings and running ``/loop`` tick, taken from
-    core when importable) plus, with ``mods``, the hermes-mods rows core does not know (``is_mods_synthetic``).
-    ``mods=False`` is exactly core's pick (the row core ``verify()`` would name)."""
+    (``kanban_relayed_human._latest_user_message``: its synthetic openings and in-flight slash ``/loop`` tick
+    row, from core when importable) plus, with ``mods``, the hermes-mods rows core does not know
+    (``is_mods_synthetic``). ``mods=False`` is exactly core's pick (the row core ``verify()`` would name)."""
     con = _connect(state_db)
     if con is None:
         return None
     prefixes = core_synthetic_prefixes()
     try:
-        loop_since = _loop_tick_since(con, session_id)
-        for message_id, at, content, kind in _user_rows(con, session_id):
+        tick_id = _slash_loop_tick_row(con, session_id, prefixes)
+        for message_id, at, content, _kind in _user_rows(con, session_id):
             text = str(content or "")
             if text.lstrip().startswith(prefixes):
                 continue
-            if loop_since is not None and not kind and float(at) >= loop_since - 1:
-                continue  # the running /loop tick's own prompt row
+            if tick_id is not None and int(message_id) == tick_id:
+                continue  # an in-flight slash /loop tick's own prompt row
             if mods and is_mods_synthetic(text):
                 continue
             return int(message_id), float(at), text

@@ -189,20 +189,66 @@ def test_card_gateway_refusal_is_a_refusal_not_a_transport_error(relay):
 
 # ── core's widened filter, mods-written rows and probe sessions (t_01a1d0cae1b03635) ─────────────────────────
 
-def _loop_meta(home: Path, session: str, fired_at: float, awaiting: bool = True) -> None:
+def _loop_meta(home: Path, session: str, fired_at: float, awaiting: bool = True, prompt: str = "/recap") -> None:
     db = sqlite3.connect(home / "state.db")
     db.execute("CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT)")
     db.execute("INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
-               (f"loop:{session}", json.dumps({"awaiting_response": awaiting, "last_fired_at": fired_at})))
+               (f"loop:{session}", json.dumps({"awaiting_response": awaiting, "last_fired_at": fired_at,
+                                               "prompt": prompt})))
     db.commit()
     db.close()
 
 
-def test_running_loop_tick_prompt_is_not_the_reply(relay):
+@pytest.fixture(params=["core", "mirror"])
+def which_core(request, monkeypatch):
+    """Run a filter test against core's own module (core PR #1583, when this core has it) and the mirror."""
+    if request.param == "core":
+        krh = pytest.importorskip("hermes_cli.kanban_relayed_human")
+        if not hasattr(krh, "_slash_loop_tick_since"):
+            pytest.skip("this core predates the slash-only /loop tick rule")
+        monkeypatch.setattr(sm.rh, "_core", lambda: krh)
+    else:
+        monkeypatch.setattr(sm.rh, "_core", lambda: None)
+    return request.param
+
+
+def test_running_loop_tick_prompt_is_not_the_reply(relay, which_core):
     sent, home = relay
     reply = _user_message(home, "chat-1", 1700.0)
     _user_message(home, "chat-1", 1800.0, "/recap")  # a slash /loop tick's prompt, stored untyped
     _loop_meta(home, "chat-1", 1800.5)  # fired_at - 1 covers the row written just before the stamp
+    assert json.loads(_comment()) == {"ok": True}
+    assert sent[0]["args"]["relayed_human"]["message_id"] == reply
+
+
+def test_reply_after_an_interrupted_slash_tick_counts(relay, which_core):
+    """Review 5879692894: ``awaiting_response`` outlives an interrupted tick; only the tick's first row is the
+    loop's, the person's later reply is a reply."""
+    sent, home = relay
+    _user_message(home, "chat-1", 1700.0)
+    _user_message(home, "chat-1", 1800.0, "/recap")
+    _loop_meta(home, "chat-1", 1800.5)
+    later = _user_message(home, "chat-1", 1900.0, "use the left one")
+    assert sm.rh.latest_user_message(home / "state.db", "chat-1")[0] == later
+    assert json.loads(_comment()) == {"ok": True}
+    assert sent[0]["args"]["relayed_human"]["message_id"] == later
+
+
+def test_wakeup_framed_loop_leaves_the_reply_alone(relay, which_core):
+    """A non-slash loop's tick row carries the wakeup frame; the awaiting state skips nothing else."""
+    sent, home = relay
+    _user_message(home, "chat-1", 1700.0)
+    _loop_meta(home, "chat-1", 1800.5, prompt="check CI")
+    _user_message(home, "chat-1", 1800.0, "[/loop wakeup #3 · every 10m]\nRecurring task: check CI")
+    later = _user_message(home, "chat-1", 1900.0, "use the left one")
+    assert json.loads(_comment()) == {"ok": True}
+    assert sent[0]["args"]["relayed_human"]["message_id"] == later
+
+
+def test_heartbeat_frame_is_synthetic(relay, which_core):
+    sent, home = relay
+    reply = _user_message(home, "chat-1", 1700.0)
+    _user_message(home, "chat-1", 1800.0, "[Heartbeat — recurring instruction, fires every 10m]\ncheck CI")
     assert json.loads(_comment()) == {"ok": True}
     assert sent[0]["args"]["relayed_human"]["message_id"] == reply
 
