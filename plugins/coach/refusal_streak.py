@@ -3,8 +3,9 @@
 A refusal caused by a chat's earlier history (not the new message) refuses every later message too. Core keeps each
 refused ask as a display-only user row with display_kind `content_refused`; 2+ of those in a row among a session's
 user asks means the user re-asked and still got no answer, so core's history-triggered recovery (compact + retry
-once, then point at /new) did not resolve it. A run made only of core's automatic retries of a failed automated
-delivery is still a stuck chat, but its symptom says automated deliveries were refused, not that the user re-asked.
+once, then point at /new) did not resolve it. A run made only of automated deliveries (the refused kanban notice or
+close-out prompt, then core's automatic retry of it) is still a stuck chat, but its symptom says automated
+deliveries were refused, not that the user re-asked.
 One signal per session: the fingerprint is the session id, and the
 cursor remembers filed sessions so later refusals in the same chat do not refile it.
 
@@ -12,21 +13,36 @@ Stdlib only, Python 3.9+; signals.py loads it by path and passes its own helpers
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Callable, Dict, List, Optional, Tuple
 
 REFUSED_KIND = "content_refused"
 # Core's retry of an automated delivery (cron/card notice) the provider refused: not a human re-ask.
 AUTO_RETRY_PREFIX = "[Hermes: automatic retry of"
+# The automated delivery the provider refused in the first place: a run opens with it (stored without the retry
+# prefix) and core's retry follows. Anchored openings only, so a human question quoting a notice stays human: core's
+# kanban notice line ("<glyph> [board] @who Kanban t_...", tui_gateway/session_notifications.py), Hermes plugin
+# envelopes, core's resume/job notes and a cross-session relay.
+AUTOMATED_RE = re.compile(
+    r"^\s*(?:[ℹ✔✓⏸✖⏱🔄⏳⚠]\ufe0f?\s*(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_\w+"
+    r"|(?i:\[(?:chat-closeout|kanban close-out|owner-wake|false-stop recovery|goal continuation|babysitter)\b)"
+    r"|\[System note:|\[Message from another Hermes session|\[ASYNC DELEGATION |\[IMPORTANT: Background process )")
 STREAK_MIN = 2
 MAX_FILED = 500  # remembered sessions per db; older ones age out (their fingerprint still dedups on the lane)
+
+
+def automated(content: str) -> bool:
+    """A row Hermes delivered on its own: core's retry of a failed automated delivery, or such a delivery itself."""
+    return content.startswith(AUTO_RETRY_PREFIX) or bool(AUTOMATED_RE.match(content))
 
 
 def refused_streaks(conn: sqlite3.Connection, since_id: int, since_ts: float
                     ) -> List[Tuple[str, int, int, float, str, bool]]:
     """``(session_id, streak, last_row_id, last_ts, last_ask, all_auto)`` for every session whose user asks end a
     run of >= STREAK_MIN consecutive `content_refused` rows at a row newer than ``since_id`` / ``since_ts``.
-    ``all_auto`` is true when every row of that run is an automated-delivery retry (AUTO_RETRY_PREFIX). Steers,
+    ``all_auto`` is true when every row of that run is ``automated``: core's retry (AUTO_RETRY_PREFIX) or the
+    original delivery it retries, which opens the run without the prefix. Steers,
     observed rows and compaction summaries (other display kinds / flags) are not asks and neither break nor
     extend a run."""
     sessions = [r[0] for r in conn.execute(
@@ -40,10 +56,10 @@ def refused_streaks(conn: sqlite3.Connection, since_id: int, since_ts: float
             "and (display_kind is null or display_kind=?) order by id", (sid, REFUSED_KIND)).fetchall()
         best: Optional[Tuple[int, int, float, str, bool]] = None
         run = 0
-        all_auto = True  # every row of the current run is core's retry of an automated delivery
+        all_auto = True  # every row of the current run is an automated delivery or core's retry of one
         for rid, ts, kind, content in rows:
             if kind == REFUSED_KIND:
-                all_auto = (all_auto if run else True) and content.startswith(AUTO_RETRY_PREFIX)
+                all_auto = (all_auto if run else True) and automated(content)
                 run += 1
             else:
                 run = 0
