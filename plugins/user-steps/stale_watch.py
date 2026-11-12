@@ -877,39 +877,68 @@ def _ledger(core, owner):
         return None
 
 
+ERROR_PREFIX = 'error:'
+
+
+def _error(kind, key, exc):
+    """``error:<kind>:<key>: <first 300 chars>``: one failed card or duty, recorded so the pass goes on."""
+    text = f'{type(exc).__name__}: {exc}' if not isinstance(exc, RuntimeError) else str(exc)
+    return f'{ERROR_PREFIX}{kind}:{key}: {text[:300]}'
+
+
 def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_card, review_create=None, cards=None,
         local_gateway=None, dead_chats=False):
+    """File every duty's cards. One refused card (any refusal shape) or one failing detector source never stops the
+    others (cron-d1d80dc84a): each failure is recorded as ``error:<kind>:<key>: ...`` and main() exits 1 after the
+    whole pass, so the cron streak alert still fires but every other duty has already run."""
     now = time.time() if now is None else now
     opened = []
     if cards is not None:
         # Retired decisions must not keep asking David on the board (t_01a19a11276edc29).
-        for r in close_retired_cards(store, cards, local_gateway=local_gateway):
-            opened.append(('retired-card-error:' if r.get('error') else 'retired-card:') + r['operationId'])
-    for item in chat.answered_open(core, store, db):
-        if item['replyAt'] is None or now - item['replyAt'] < min_age:
-            continue
-        create(card(item))  # idempotent on the key: a rerun returns the existing card
-        opened.append(item['requestId'])
-    for d in chat.duplicate_open(core, store):
-        create(dup_card(d))  # one card per session; idempotent on its key
-        opened.append('dup:' + d['session'])
-    for p in chat.cross_session_duplicates(core, store):
-        create(cross_dup_card(p))  # one card per pair; idempotent on its key
-        opened.append('xdup:' + ':'.join(p['ids']))
-    for f in failed_decisions(core, store, db, now=now):
-        create(failed_decision_card(f))  # one card per operation; idempotent on its key
-        opened.append('failed-decision:' + f['operationId'])
-    for u in undelivered_decisions(core, store, now=now):
-        create(undelivered_card(u))  # one card per operation; idempotent on its key
-        opened.append('undelivered:' + u['operationId'])
+        try:
+            for r in close_retired_cards(store, cards, local_gateway=local_gateway):
+                opened.append(('retired-card-error:' if r.get('error') else 'retired-card:') + r['operationId'])
+        except Exception as exc:
+            opened.append(_error('retired-card', 'source', exc))
+
+    def duty(kind, source, build, key, when=lambda it: True):
+        try:
+            items = list(source())
+        except Exception as exc:
+            opened.append(_error(kind, 'source', exc))
+            return
+        for it in items:
+            if not when(it):
+                continue
+            label = None
+            try:
+                label = key(it)
+                create(build(it))  # idempotent on the card's key: a rerun returns the existing card
+            except Exception as exc:
+                opened.append(_error(kind, label or '?', exc))
+                continue
+            opened.append(label)
+
+    duty('stale', lambda: chat.answered_open(core, store, db), card, lambda i: i['requestId'],
+         when=lambda i: i['replyAt'] is not None and now - i['replyAt'] >= min_age)
+    duty('dup', lambda: chat.duplicate_open(core, store), dup_card, lambda d: 'dup:' + d['session'])
+    duty('xdup', lambda: chat.cross_session_duplicates(core, store), cross_dup_card,
+         lambda p: 'xdup:' + ':'.join(p['ids']))
+    duty('failed-decision', lambda: failed_decisions(core, store, db, now=now), failed_decision_card,
+         lambda f: 'failed-decision:' + f['operationId'])
+    duty('undelivered', lambda: undelivered_decisions(core, store, now=now), undelivered_card,
+         lambda u: 'undelivered:' + u['operationId'])
     if dead_chats:
-        for d in dead_chat_asks(core, now=now):
-            create(dead_chat_ask_card(d))  # one card per (card, chat); idempotent on its key
-            opened.append(f"dead-chat-ask:{d['task']}:{d['session']}")
+        duty('dead-chat-ask', lambda: dead_chat_asks(core, now=now), dead_chat_ask_card,
+             lambda d: f"dead-chat-ask:{d['task']}:{d['session']}")
     if review_create is not None:
-        listed = review_old_asks(core, store, now=now, create=review_create, local_gateway=_local_gateway(core))
-        if listed:
-            opened.append('old-asks:' + _pt(now, '%Y-%m-%d'))
+        try:
+            listed = review_old_asks(core, store, now=now, create=review_create, local_gateway=_local_gateway(core))
+        except Exception as exc:
+            opened.append(_error('old-asks', 'review', exc))
+        else:
+            if listed:
+                opened.append('old-asks:' + _pt(now, '%Y-%m-%d'))
     return opened
 
 
@@ -1016,8 +1045,11 @@ def main(argv=None):
     cards = None if a.dry_run else _load('cards').QualifiedCardDelivery()
     ids = run(core, chat, store, min_age=a.min_age, create=create, review_create=review_create, cards=cards,
               local_gateway=local_gateway, dead_chats=True)
-    print(json.dumps({'cards': ids}))
-    return 0
+    errors = [i for i in ids if i.startswith(ERROR_PREFIX)]
+    for e in errors:
+        print(e, file=sys.stderr)
+    print(json.dumps({'cards': ids, 'errors': errors} if errors else {'cards': ids}))
+    return 1 if errors else 0
 
 
 if __name__ == '__main__':

@@ -13,10 +13,13 @@ workers attest capability:hub-write (and a control pool that attests nothing), p
 ``apply()`` with a judge that fails the test if it is consulted.
 """
 import argparse
+import ast
 import importlib.util
+import inspect
 import os
 import re
 import sys
+import textwrap
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,20 +116,44 @@ def gateway(monkeypatch):
     return state
 
 
+_BUILDERS = {
+    'card': lambda: sw.card({'requestId': 'req-1', 'session': HOSTILE, 'question': f'Q: {HOSTILE}',
+                             'reply': f'R: {HOSTILE}'}),
+    'dup_card': lambda: sw.dup_card({'namespace': 'ns', 'session': HOSTILE, 'groups': [['r1', 'r2']]}),
+    'cross_dup_card': lambda: sw.cross_dup_card({'namespace': 'ns', 'ids': ['r1', 'r2'],
+                                                 'sessions': [HOSTILE, 's2']}),
+    'failed_decision_card': lambda: sw.failed_decision_card({'operationId': 'op-12345678', 'failedAt': NOW,
+                                                             'requestId': 'r1', 'session': HOSTILE, 'userRowId': 7}),
+    'undelivered_card': lambda: sw.undelivered_card({
+        'operationId': 'op-87654321', 'requestId': 'r1', 'title': f'Approve {HOSTILE}', 'effect': 'approve',
+        'choiceId': 'approve', 'recordedAt': '2026-01-01T00:00:00+00:00', 'owner': {'storedSessionId': 's'},
+        'attempts': 25, 'ownerWaits': 0, 'busyRefusals': 0, 'dispatchState': 'recorded',
+        'lastError': {'class': 'RuntimeError', 'message': HOSTILE, 'at': 'x'}}),
+    'dead_chat_ask_card': lambda: sw.dead_chat_ask_card({
+        'board': 'default', 'task': 't_1', 'title': HOSTILE, 'session': '20261111_032644_40d5be',
+        'blockedAt': NOW - 7200, 'lastTurnAt': None, 'found': False, 'action': f'From owner chat: {HOSTILE}'}),
+}
+
+
+def _run_builders():
+    """Every top-level card builder run() files through ``create``, read from run()'s source (not a hand list):
+    a module function named ``card`` or ``*_card`` that run() references, other than the creators themselves."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(sw.run)))
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    return {n for n in names if (n == 'card' or n.endswith('_card'))
+            and n not in ('create_card', 'create_review_card') and inspect.isfunction(getattr(sw, n, None))}
+
+
+def test_every_builder_run_files_has_a_hub_route_fixture():
+    # A builder added to run() without a fixture here would skip the hub-route guard (dead_chat_ask_card did).
+    found = _run_builders()
+    assert {'card', 'dead_chat_ask_card', 'undelivered_card'} <= found, found
+    assert found == set(_BUILDERS), (f'builders without a fixture: {found - set(_BUILDERS)}; '
+                                     f'stale fixtures: {set(_BUILDERS) - found}')
+
+
 def _detector_cards():
-    item = {'requestId': 'req-1', 'session': HOSTILE, 'question': f'Q: {HOSTILE}', 'reply': f'R: {HOSTILE}'}
-    return {
-        'stale': sw.card(item),
-        'dup': sw.dup_card({'namespace': 'ns', 'session': HOSTILE, 'groups': [['r1', 'r2']]}),
-        'xdup': sw.cross_dup_card({'namespace': 'ns', 'ids': ['r1', 'r2'], 'sessions': [HOSTILE, 's2']}),
-        'failed': sw.failed_decision_card({'operationId': 'op-12345678', 'failedAt': NOW, 'requestId': 'r1',
-                                           'session': HOSTILE, 'userRowId': 7}),
-        'undelivered': sw.undelivered_card({
-            'operationId': 'op-87654321', 'requestId': 'r1', 'title': f'Approve {HOSTILE}', 'effect': 'approve',
-            'choiceId': 'approve', 'recordedAt': '2026-01-01T00:00:00+00:00', 'owner': {'storedSessionId': 's'},
-            'attempts': 25, 'ownerWaits': 0, 'busyRefusals': 0, 'dispatchState': 'recorded',
-            'lastError': {'class': 'RuntimeError', 'message': HOSTILE, 'at': 'x'}}),
-    }
+    return {name: build() for name, build in _BUILDERS.items()}
 
 
 def _review_item():
@@ -197,7 +224,7 @@ def test_review_old_asks_routes_by_gateway(monkeypatch, gateway):
 
 def test_other_gateways_keep_the_machine_pin(monkeypatch, gateway):
     gateway['gateway'] = 'gw-board-a'
-    argv, body = _filed(monkeypatch, _detector_cards()['dup'])
+    argv, body = _filed(monkeypatch, _detector_cards()['dup_card'])
     assert argv[argv.index('--runs-on') + 1] == 'machine:gw-board-a' and 'hub:write' not in _requires(argv)
     assert pe.HOME_PIN_PREFIX in body
 
@@ -207,5 +234,5 @@ def test_unreadable_identity_still_files_nothing(monkeypatch, gateway):
     seen = []
     monkeypatch.setattr(sw.subprocess, 'run', lambda cmd, **k: seen.append(cmd))
     with pytest.raises(RuntimeError, match='refusing to file'):
-        sw.create_card(_detector_cards()['stale'])
+        sw.create_card(_detector_cards()['card'])
     assert seen == []
