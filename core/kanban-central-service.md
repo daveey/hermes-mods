@@ -231,7 +231,7 @@ is what is built and what tests prove:
 - **Registry** (Board service, hermes-hub#40, #42): each enrolled gateway's entry carries `labels`, `pinned_only`,
   `max_card_runs` and `hold`, plus `machine:<name>`, which is always its own and never another's. Only the operator
   path writes them: `PATCH /v2/op/gateways/{name}` (Cloudflare Access operator) or `POST /v1/admin/gateways/{name}/machine`
-  (the admin key, `hermes-mail admin machine <name> --labels ... --max-card-runs N --hold`); every write is audited
+  (the admin key, `hermes-mail admin machine <name> --labels ... --max-card-runs N --hold REASON`; the reason is required: nonempty, at most 200 characters trimmed, stored as `hold_reason` with `hold_by`/`hold_at` in epoch milliseconds); every write is audited
   (`admin machine-audit`). A gateway key can only read (`GET /v2/machines`). Tests: `worker/test/machines.test.ts`.
 - **Lease grant** checks, in order: `hold` (`held`), `pinned_only` (a pinned machine takes another gateway's card
   only when its `runs_on` names `machine:<it>`; its own cards stay its own), `runs_on` labels (`labels_mismatch`; `[]`
