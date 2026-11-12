@@ -220,11 +220,9 @@ there, which execs the skill script.
 - Don't publish the "may I sweep?" question as an approval tile first: this skill is the approval.
 - "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
   `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
-  alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. Until `red_cards.py` covers
-  them on the installed revision, also list the red chats (`select id,title,outcome_json from sessions where coalesce(archived,0)=0 and
-  json_extract(outcome_json,'$.kind')='decision'`), read their cards with `cross_task`, and run the inventory query
-  on each other host with `tailnet_exec` (`mbp`, `mini`). Remote cards are commented and unblocked on their own
-  host (`tailnet_exec ... hermes kanban comment/unblock`); `cross_task` only reads and comments.
+  alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list`
+  covers both; remote cards are commented and unblocked on their own host (`tailnet_exec ... hermes kanban
+  comment/unblock`), `cross_task` only reads and comments.
 - A chat still painted red after its cards finished: run `hermes sessions outcome <id> --refresh` on its gateway. It
   re-derives the outcome from live cards, so a decision about a done card becomes `done`. Never edit `state.db`.
 - Chat-level asks (`us_*` extracted user-steps, For-you requests) can only be withdrawn by the chat that owns them;

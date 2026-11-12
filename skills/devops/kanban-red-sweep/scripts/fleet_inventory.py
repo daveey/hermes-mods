@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 
 
 def snapshot(home, connect, replicas=True):
@@ -75,8 +76,10 @@ def snapshot(home, connect, replicas=True):
                 sessions=sessions, errors=errors)
 
 
-def inventory(home, connect, run=subprocess.run):
+def inventory(home, connect, run=subprocess.run, deadline_s=90, clock=time.monotonic):
+    # One overall deadline: hung gateways must not outlast the cron wrapper's timeout and lose every row.
     result = snapshot(home, connect)
+    stop = clock() + deadline_s
     config = os.path.join(home, 'state', 'red-sweep-sources.json')
     if not os.path.isfile(config):
         result['errors'].append('unreachable fleet coverage-config-missing')
@@ -90,11 +93,15 @@ def inventory(home, connect, run=subprocess.run):
         result['errors'].append('unreachable fleet coverage-config-invalid')
         return result
     for gateway, spec in sorted(sources.items()):
+        left = stop - clock()
+        if left <= 0:
+            result['errors'].append(f'unreachable {gateway}')
+            continue
         try:
             argv = spec['argv']
             if not isinstance(argv, list) or not argv or not all(isinstance(v, str) for v in argv):
                 raise ValueError('invalid argv')
-            proc = run(argv, capture_output=True, text=True, timeout=30, check=True)
+            proc = run(argv, capture_output=True, text=True, timeout=min(30, left), check=True)
             remote = json.loads(proc.stdout)
             if not all(isinstance(remote[k], list) for k in ('cards', 'sessions', 'errors')):
                 raise ValueError('invalid snapshot')

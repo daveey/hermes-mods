@@ -54,6 +54,26 @@ class FleetTests(unittest.TestCase):
         self.assertNotIn('us_closed', outputs[0])
         self.assertNotIn('s_old', outputs[0])
 
+    def test_overall_deadline_bounds_hung_readers(self):
+        board(self.home / 'kanban/boards/extra/kanban.db')
+        names = ['g1', 'g2', 'g3', 'g4', 'g5']
+        self.config({n: {'argv': ['reader', n]} for n in names})
+        now = [1000.0]
+        seen = []
+        def run(argv, **kwargs):
+            seen.append(kwargs['timeout'])
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 30)
+            now[0] += kwargs['timeout']
+            raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+        out = fleet.render(fleet.inventory(str(self.home), sqlite3.connect, run, deadline_s=90,
+                                           clock=lambda: now[0]))
+        for n in names:
+            self.assertEqual(out.count(f'unreachable {n}'), 1)
+        self.assertIn('t_one', out)
+        self.assertEqual(seen, [30, 30, 30])
+        self.assertLessEqual(now[0] - 1000.0, 90)
+
     def test_local_done_suppresses_stale_replica(self):
         board(self.home / 'kanban/sync-shadow/default.db')
         self.assertEqual(fleet.snapshot(str(self.home), sqlite3.connect)['cards'], [])
