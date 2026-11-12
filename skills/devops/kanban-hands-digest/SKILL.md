@@ -52,16 +52,21 @@ machine:<host> --reason "..."` needs `--reason`, and only portable work (code sh
 latest comments: a subagent or chat may already have delivered the work there, and nobody closed the card.
 Verify the artifact (hash, served model in `state.db`) and `kanban_complete` it yourself. "0 ahead" counts
 only its own board, but `max_in_progress` is global: list `running`/`ready` across every board and check
-`~/.hermes/core-update/drain-hold`. The hold stops every new claim for as long as its writer pid
-(`hermes-sync core-drain`) is alive. Readers ignore its `max_s`, and the drain waits for long cards with no deadline.
-If the pid has outlived `max_s` by a lot, kill that pid (it is not a gateway; sync retries the update later).
+`~/.hermes/core-update/drain-hold`. The hold stops every new claim while its writer pid
+(`hermes-sync core-drain`) is alive (older cores ignore its `max_s`). Compare `date +%s` with `started_at+max_s` and
+read `core-drain` lines in `~/.hermes/logs/hermes-sync.log`. A long-expired hold whose pid stays the same: kill that pid
+(it is not a gateway; sync retries later). A hold that keeps coming back with a new pid/`started_at` means sync re-arms
+it every pass, so killing it only delays the update. The drain counts live Desktop turns, your own chat included, as
+busy: reprioritize, then end the turn quickly so the update can apply.
 Free slots with cards still waiting ("1/16 busy, 14 waiting"): on THAT machine run `hermes kanban dispatch --dry-run --json`
 and read `core_update_drain_hold`, `at_capacity` and `skipped_ineligible` reasons (`labels_mismatch`,
 `waiting_for_worker_capacity`). Reach an EC2 worker that has no ssh/tailnet name via hub instance-role SSM:
 `aws --region us-west-2 ec2 describe-instances` filtered on tag `Name=hermes-worker-N`, then `ssm send-command`
 (`AWS-RunShellScript`) with a base64'd script run as `sudo -iu ubuntu bash`, so `hermes` and `~/.hermes` resolve.
-The fleet panel's "waiting" counts every unleased `ready` card on every board replica, including assignees no gateway
-runs and cards the machine can't take, so it overstates how many cards need a slot. Raising
+The fleet panel's header "waiting" counts unleased `ready` cards whose assignee is a dispatchable profile. Each machine
+row splits them into the cards it can take and those it can't (labels, pins), so read the row, not the header, to see
+whether that machine has real demand. Verify it live by fetching `/api/plugins/runners/v1/fleet` on the dashboard port
+(the session token is in the served `/` HTML), then hand-count the replicas. Raising
 `max_in_progress` hands the new slot to the highest-priority ready card on any board, not to yours. If direct execution starts while the card
 is queued, recheck its claim before editing or publishing and hand off to a newly admitted worker; queue
 recovery must not create competing implementations. Also report two states that wait silently:
