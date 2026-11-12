@@ -1375,7 +1375,11 @@ home/DB and preserve worker authority fences. Tests: `tests/test_worker_share_sp
 `tests/test_worker_share_watch.py` (scratch DB, supported CLI boundary, not a live claim-throughput proof).
 Every `created` event also carries `portable_reason` (core), so the marked share is a query. Self-heal splits a
 default-board fix into a portable FIX card (`FIX_REQUIRES`, proposal inside the placement evidence fence) and a
-`self-heal verify:` child that keeps `host_repo` for the live check and the lane `event`. Portable FIX titles use
+`self-heal verify:` child for the live check and the lane `event`. Neither declares `host_repo`. On the hub the
+VERIFY child runs on the pool: `--runs-on capability:hub-read,capability:hub-write,capability:coordination-read`
+(`VERIFY_POOL_LABELS`, attested only by proven workers; the hub carries none) and every gateway step (deploy check,
+host steps, live probe, `event` with result.md staged under `/tmp/selfheal-verify/` and read back) goes through
+`hub-admin '<command>'`. Other gateways keep the home machine pin. Portable FIX titles use
 the defect's hash suffix, not the raw symptom or component (`cron` is itself a host marker): titles are always
 placement-scanned. The full fingerprint and symptom stay in a
 sanitized evidence fence in the body, so incident words cannot re-pin otherwise portable source work. Non-split

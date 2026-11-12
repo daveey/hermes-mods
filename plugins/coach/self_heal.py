@@ -47,7 +47,7 @@ else:  # Standalone plugin/cron/CLI loader.
 
 # The placement helper (fence_evidence / home_pin_note) is shared by every coach card producer.
 if __package__:
-    from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, HomePinUnresolved, fence_evidence, home_pin_note, home_runs_on_argv, incident_title
+    from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, HomePinUnresolved, fence_evidence, home_machine, home_pin_note, home_runs_on_argv, incident_title
 else:
     _spec = importlib.util.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     assert _spec and _spec.loader
@@ -57,6 +57,7 @@ else:
     fence_evidence, home_pin_note = _placement_evidence.fence_evidence, _placement_evidence.home_pin_note
     HomePinUnresolved, home_runs_on_argv = _placement_evidence.HomePinUnresolved, _placement_evidence.home_runs_on_argv
     incident_title = _placement_evidence.incident_title
+    home_machine = _placement_evidence.home_machine
 
 COMPONENTS = ("agent", "desktop", "plugin", "cron", "kanban", "bot", "gateway", "provider", "browser", "bb", "other")
 
@@ -1408,11 +1409,20 @@ FIX_SKILLS = ("five-whys", "hermes-mods-repo", "systematic-debugging")
 # (requires_declaration_missing under kanban.require_capability_declaration), which silently dropped investigations.
 SELFHEAL_REQUIRES = ("terminal", "file", "git")  # genuine capabilities; the home pin is `--runs-on machine:<gateway>`
 # A default-board fix is split in two (kanban-12ee0e4b65): the FIX card is repo work landed by push, so it declares
-# no home pin and fences the proposal as evidence, and the hub's worker pool can run it; its VERIFY child stays on
-# this host (`--runs-on machine:<gateway>`) for the live check and the lane `event` (both read this host's coach store and logs).
+# no home pin and fences the proposal as evidence, and the hub's worker pool can run it. Its VERIFY child needs the
+# filing gateway's coach store, logs and lane `event`. On the hub that is remote work: the child declares the pool
+# attestations (VERIFY_POOL_LABELS) as its `--runs-on` and does every hub step through `hub-admin '<command>'`, so
+# a pool worker runs it. Any other gateway (a Mac filing locally) has no such remote path: its VERIFY keeps the
+# home machine pin (`--runs-on machine:<gateway>`). Neither declares host_repo (a capability, never a pin).
 # Before, every fix card stamped a home pin and quoted the hub-words proposal, so none left the hub's 7 slots.
 FIX_REQUIRES = ("terminal", "file", "git")
 VERIFY_TITLE = "self-heal verify:"
+# Gateways whose lane a pool worker reaches with `hub-admin` (hub-write) and `hub-read`.
+VERIFY_REMOTE_GATEWAYS = ("hub",)
+# Board labels a worker publishes only after a real proof of each tool (kanban-hub-pin-audit): hub reads, hub-admin
+# writes, and reading the parent fix card's handoff. The hub itself carries none of them, so the card leaves it.
+VERIFY_POOL_LABELS = ("capability:hub-read", "capability:hub-write", "capability:coordination-read")
+VERIFY_REMOTE_DIR = "/tmp/selfheal-verify"  # where a remote VERIFY stages result.md on the gateway for `event`
 VERIFY_RUNTIME = 3600
 VERIFY_SKILLS = ("five-whys", "hermes-mods-repo")
 # EVIDENCE_OPEN/CLOSE (same strings as core's kanban_placement) come from placement_evidence.py: the placement scan
@@ -1871,8 +1881,11 @@ the evidence you get (it describes where it happened, not where you work).
 """
 
 
-def verify_brief(fp: str, st: dict, fix_card: str) -> str:
-    """The VERIFY child (machine-pinned, stays here): host steps, live check, and the lane event, from the fix's handoff."""
+def verify_brief(fp: str, st: dict, fix_card: str, remote: bool = False) -> str:
+    """The VERIFY child: host steps, live check, and the lane event, from the fix's handoff. ``remote`` (the hub's
+    lane): a pool worker does every gateway step through `hub-admin '<command>'`; else it is machine-pinned here."""
+    if remote:
+        return remote_verify_brief(fp, st, fix_card)
     return f"""Self-heal VERIFY for defect `{fp}`: owner/fix card {fix_card} (its parent here).
 {home_pin_note(PIN_VERIFY)}
 {fence_evidence('Symptom to verify: ' + str(st.get('symptom') or fp))}
@@ -1909,6 +1922,59 @@ Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
    run `{SELF_EVENT} fixed {fp} --card {fix_card} --note "<every fix sha, space-separated>" --result result.md`.
    That stores it under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed.
 7. Complete the card with the live proof in the summary.
+"""
+
+
+def remote_verify_brief(fp: str, st: dict, fix_card: str) -> str:
+    """The pool VERIFY child for the hub's lane (see :data:`VERIFY_POOL_LABELS`). Every step that reads or writes
+    the gateway (deploy check, host steps, live check, the lane `event`) runs through `hub-admin '<command>'`, so the
+    work text names no local state path or host word: the runs_on attestations are the declared need."""
+    stage = f"{VERIFY_REMOTE_DIR}/{fp}.md"
+    coach = '"$HOME/.hermes/coach"'  # expanded by the gateway's shell inside hub-admin's single quotes
+    return f"""Self-heal VERIFY for defect `{fp}`: owner/fix card {fix_card} (its parent here).
+This card runs on a pool worker. The lane it records into lives on the gateway that filed it, so EVERY step that
+reads or changes that gateway runs there through `hub-admin '<command>'` (single-quoted, so `$HOME` and `~` expand
+on the gateway, not here). Never run the lane's `event` command, a live check or a host step locally: here it would
+write this worker's own empty coach store. Repo reads (git log, a fresh clone) are fine locally.
+{fence_evidence('Symptom to verify: ' + str(st.get('symptom') or fp))}
+A completed card or a commit in its metadata is not proof that this symptom was fixed. The owner may be an
+adopted investigation or unrelated session card, not a self-heal fix card. First confirm the handoff addresses
+this exact defect. If investigation led to another fix card, follow that handoff and wait for its delivery.
+If no fix exists, repair the actual symptom, or create/link a scoped repair owner and wait on it before
+recording fixed (do not call a real unresolved defect not_defect). Clear any mistaken adoption in your report.
+A false detection requires evidence before `event not_defect`.
+Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
+
+1. Read the fix card's handoff: `kanban_show(task_id="{fix_card}")` (summary, metadata `fix_shas`, `core_change`,
+   `red`, `green`, `live_check`, `host_steps`, `undo`, or `not_defect`).
+2. `core_change` set? File one core card with `kanban_create`, assignee="default",
+   idempotency_key="selfheal-core:{fp}", body = that decided spec plus "land with `hermes-core-wt ship` after a
+   green 'All required checks pass (v2)' and an independent exact-head review". Use `kanban_link` to make that
+   core card this VERIFY card's parent, then `kanban_schedule` until it lands. On resume, read its handoff and
+   include its merge sha in the deploy check below and the recorded fix shas. Reuse the idempotent card, never
+   file another core owner for this defect.
+3. `not_defect` set? Confirm the cited sha is deployed (step 4's command), run
+   `hub-admin '{SELF_EVENT} not_defect {fp} --card {fix_card} --note "<its not_defect text>"'` and complete. Stop.
+4. Confirm each fix sha is deployed on the gateway: `hub-admin 'git -C <checkout> merge-base --is-ancestor <sha>
+   HEAD'` (exit 0) for the live checkout that runs it (`~/code/hermes-mods` for a hermes-mods change, which deploys
+   within 10 min; the core checkout for core). Not yet deployed after 30 min? kanban_schedule a re-check; don't
+   record fixed on undeployed code.
+5. Run every `host_steps` entry through `hub-admin '<command>'`. Verify live on the real path (the
+   surface/command/session type where it happened) as `live_check` says, through `hub-admin`, and capture the
+   proof. A live probe that makes a detector fire on purpose starts its first prompt with `[selfheal-probe]`
+   (e.g. `hub-admin 'hermes chat -q "[selfheal-probe] ..."'`): the lane then logs `selfheal_skip why=probe` and
+   files nothing. Check that line with `hub-admin 'grep selfheal_skip {coach}/log.jsonl | tail -n 3'`; never
+   delete selfheal_pending rows by hand. The live check fails? Comment the evidence, then kanban_block naming what
+   still fails; do not record fixed.
+6. Record the result QUIETLY. The Inbox is for decisions only: do NOT run `hermes inbox post`. Write `result.md`
+   here (what changed with commits, the red/green test output from the handoff, your live proof, the undo
+   command), stage it on the gateway and record it there:
+   `hub-admin "mkdir -p {VERIFY_REMOTE_DIR} && echo $(base64 -w0 result.md) | base64 -d > {stage}"` (double quotes:
+   the `$(...)` expands here), then
+   `hub-admin '{SELF_EVENT} fixed {fp} --card {fix_card} --note "<every fix sha, space-separated>" --result {stage}'`.
+   That stores it under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed. Read both back:
+   `hub-admin 'cmp {stage} {coach}/selfheal-results/{fp}.md && grep selfheal_fixed {coach}/log.jsonl | tail -n 1'`.
+7. Complete the card with the live proof and that readback in the summary.
 """
 
 
@@ -2941,6 +3007,8 @@ def kanban_argv(args: dict, hermes: str = "hermes") -> list:
     argv += [x for c in req for x in ("--requires", c)] if req else ["--no-requires"]
     if args.get("home_pin"):  # the explicit machine pin; raises HomePinUnresolved on a synced board it cannot read
         argv += home_runs_on_argv()
+    elif args.get("runs_on"):  # declared pool attestations (labels every eligible worker carries)
+        argv += ["--runs-on", ",".join(args["runs_on"])]
     for parent in args.get("parents") or []:
         argv += ["--parent", parent]
     return argv
@@ -4304,13 +4372,26 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     return {"action": "filed", "card": tid, "key": key, "scheduled": sched, "verify_card": verify}
 
 
+def remote_verify() -> bool:
+    """True when this gateway's VERIFY children run on the pool (its lane is reachable with hub-read/hub-admin).
+    An unresolvable identity is False: the home-pin path then fails the create closed (HomePinUnresolved)."""
+    try:
+        return home_machine() in VERIFY_REMOTE_GATEWAYS
+    except HomePinUnresolved:
+        return False
+
+
 def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: float) -> Optional[str]:
-    """File the VERIFY child of ``fix_card`` (stays on this host: machine pin). -> its id, or None (logged)."""
+    """File the VERIFY child of ``fix_card``: on the pool through hub-admin/hub-read when this gateway is remote-
+    reachable (:func:`remote_verify`), else machine-pinned here. -> its id, or None (logged)."""
     lane = LaneState(store.root)
-    args = {"title": f"{VERIFY_TITLE} {incident_title(st.get('symptom') or fp)}", "body": verify_brief(fp, st, fix_card),
+    remote = remote_verify()
+    args = {"title": f"{VERIFY_TITLE} {incident_title(st.get('symptom') or fp)}",
+            "body": verify_brief(fp, st, fix_card, remote=remote),
             "idempotency_key": verify_key(fp, generation(st) or 1), "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": VERIFY_RUNTIME, "skills": list(VERIFY_SKILLS), "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True,
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
+            "home_pin": not remote, "runs_on": list(VERIFY_POOL_LABELS) if remote else [],
             "parents": [fix_card]}
     rc, out, err = _run_card(args, runner)
     vid = _task_id(out) if rc == 0 else None

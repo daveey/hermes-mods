@@ -2,8 +2,9 @@
 
 Every fix card used to declare host_repo and quote a proposal full of hub words (the hub, its kanban.db, ssh, cron),
 so core's portable_reason kept all of them on the hub's 7 slots. A default-board fix is now a portable FIX card
-(terminal/file/git, the proposal fenced as evidence) plus a VERIFY child that stays on the hub for the live check
-and the lane event. These tests build both from the real templates and judge them with core's real placement check.
+(terminal/file/git, the proposal fenced as evidence) plus a VERIFY child. On the hub that child runs on the pool too
+(runs_on the hub-read/hub-write/coordination-read attestations, every gateway step through hub-admin); elsewhere it
+keeps the home machine pin. These tests build both from the real templates and judge them with core's real placement check.
 """
 import importlib.util
 import json
@@ -270,3 +271,100 @@ def test_reconcile_judges_a_split_fix_by_its_verify_child(store, fix, verify, st
     b = Board(status={"t_f": fix, "t_v": verify})
     out = sh.reconcile(store=store, runner=b, now=NOW)
     assert (sh.LaneState(store.root).get(FP)["status"] == "stale") is stale, out
+
+
+# --- the hub's VERIFY child runs on the pool (hub-read / hub-admin), never host_repo ---------------------------------
+# The pool as the Board registry publishes it (non-skill labels): workers attest hub-read, hub-admin (hub-write) and
+# coordination reads after a real proof; the hub itself carries only its profile tools.
+_WORKER = ["capability:coordination-read", "capability:core-ship", "capability:file", "capability:git",
+           "capability:hub-read", "capability:hub-write", "capability:kanban", "capability:terminal",
+           "capability:token-broker", "linux", "profile:default"]
+POOL = {"hub": {"state": "active", "labels": ["capability:file", "capability:git", "capability:kanban",
+                                              "capability:terminal", "linux", "profile:default"]},
+        "worker-1": {"state": "active", "labels": _WORKER},
+        "worker-3": {"state": "active", "labels": _WORKER},
+        "macbook": {"state": "active", "pinned_only": True, "labels": ["macos"]}}
+
+
+def _hub_split(store, board_identity):
+    board_identity.set(gateway="hub")
+    b = Board()
+    r = sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    assert r["action"] == "filed" and len(b.creates()) == 2
+    return [fields(a) for a in b.creates()], b.creates()
+
+
+def test_hub_fix_and_verify_declare_no_host_repo(store, board_identity):
+    (fix, verify), _ = _hub_split(store, board_identity)
+    for card in (fix, verify):
+        assert "host_repo" not in card["requires"], card["requires"]
+        assert card["requires"] == list(sh.SELFHEAL_REQUIRES)
+    assert fix["runs_on"] is None
+    assert verify["runs_on"] == ",".join(sh.VERIFY_POOL_LABELS)  # the declared need, not a machine pin
+    assert "machine:" not in verify["runs_on"] and verify["parents"] == ["t_00000001"]
+
+
+def test_hub_verify_replays_onto_the_pool_with_its_labels(store, board_identity):
+    from hermes_cli import kanban_worker_node as wn
+    (_, verify), _ = _hub_split(store, board_identity)
+    card = {"runs_on": json.dumps(verify["runs_on"].split(",")), "created_on": "hub"}
+    takers = sorted(m for m in POOL if wn.eligible(card, m, POOL) is None)
+    assert takers == ["worker-1", "worker-3"]  # every attested worker, never the hub or a pinned-only Mac
+
+
+def test_hub_verify_work_text_is_portable_and_needs_only_declared_labels(store, board_identity, monkeypatch):
+    kp = placement()
+    import time
+    from hermes_cli import kanban_capability_registry, kanban_worker_node
+    # The real attestation gate, judged against a fixture pool worker (not the production registry).
+    monkeypatch.setattr(kanban_capability_registry, "self_gateway", lambda: "hub")
+    monkeypatch.setattr(kanban_worker_node, "registry", lambda: {"machines": {
+        "worker-1": {"state": "active", "pickup": True, "last_seen": time.time() * 1000, "labels": _WORKER}}})
+    (_, verify), _ = _hub_split(store, board_identity)
+    assert kp.portable_reason({**verify, "runs_on": None}, POOL_CFG) is None  # no host word left in the work text
+    try:
+        from hermes_cli.kanban_placement_coordination import requirements
+    except ModuleNotFoundError:
+        return
+    work = verify["title"] + "\n" + kp.without_evidence(verify["body"])
+    labels, refusal = requirements(work)
+    assert refusal is None and labels <= set(_WORKER), labels
+
+
+def test_hub_verify_does_every_lane_write_through_hub_admin(store, board_identity):
+    (_, verify), _ = _hub_split(store, board_identity)
+    body = verify["body"]
+    for kind in ("fixed", "not_defect"):
+        assert f"hub-admin '{sh.SELF_EVENT} {kind} {FP} --card t_00000001" in body
+    # result.md is staged on the gateway and read back after the event stores it
+    stage = f"{sh.VERIFY_REMOTE_DIR}/{FP}.md"
+    assert f"--result {stage}'" in body and f"base64 -d > {stage}" in body
+    assert f"cmp {stage}" in body and "selfheal_fixed" in body
+    # never a bare local event or a home-pin sentence
+    stripped = body.replace(f"hub-admin '{sh.SELF_EVENT}", "")
+    assert sh.SELF_EVENT not in stripped
+    assert "Pinned to the gateway that filed it" not in body
+
+
+def test_hub_verify_argv_carries_runs_on_once(store, board_identity):
+    _, creates = _hub_split(store, board_identity)
+    argv = creates[1]
+    assert argv.count("--runs-on") == 1
+    assert argv[argv.index("--runs-on") + 1] == ",".join(sh.VERIFY_POOL_LABELS)
+
+
+def test_other_gateways_keep_the_home_pinned_verify(store, board_identity):
+    b = Board()
+    sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    verify = fields(b.creates()[1])
+    assert verify["runs_on"] == f"machine:{board_identity.gateway}" and "host_repo" not in verify["requires"]
+    assert "hub-admin" not in verify["body"]
+
+
+def test_unresolved_identity_never_files_a_portable_verify(store, board_identity):
+    board_identity.set(error="enrollment unreadable")
+    b = Board()
+    r = sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    # the FIX is portable repo work and files; the VERIFY fails closed (home pin unresolved), never pool-labelled
+    assert r["action"] == "filed" and r["verify_card"] is None
+    assert all("--runs-on" not in a or "capability:hub-write" not in a for a in b.creates())
