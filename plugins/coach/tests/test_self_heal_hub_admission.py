@@ -210,7 +210,9 @@ def test_other_gateways_and_named_boards_keep_the_home_pin(store, board_identity
     assert f["runs_on"] == "machine:gw-board-a" and "hub-admin" not in f["body"]
     board_identity.set(gateway="hub")
     bb = sh.card_args(defect(component="bb"), "k", cfg={"bb_board": "bb"})
-    assert bb["board"] == "bb" and bb["home_pin"] is True  # the bb board is not on the pool
+    # the hub's bb defects go to the default board on the pool (a named board is always judged on the hub and
+    # denied: t_01a1cfb30dc5d3da); other gateways keep the bb board and the home pin (tests/test_producer_hub_admission)
+    assert bb["board"] is None and bb["home_pin"] is False and bb["skills"] == list(sh.BB_SKILLS)
 
 
 def test_unresolved_identity_never_files_a_portable_investigation(store, board_identity):

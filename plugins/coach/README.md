@@ -1402,7 +1402,11 @@ host steps, live probe, `event` with result.md staged under `/tmp/selfheal-verif
 (investigations, deploy checks, lane cards) take the same route (`pool_args` / `remote_lane`: `POOL_LABELS`,
 `REMOTE_NOTE`, every `event` as `hub-admin '...'`, the proposal staged under `.hermes/coach/selfheal/<fp>/`):
 core's hub admission refuses an unadmitted `machine:hub` pin, and refused every investigation from 11:22 UTC
-2026-11-12 until this change. A named board (bb) keeps the pin. A create refused on placement logs
+2026-11-12 until this change. A bb defect on the hub goes to the default board (bb skills) on the pool, since core
+judges every named-board create on the hub and denies it; other gateways keep the bb board and the pin. The other
+coach watchers (backend_timeouts, probe_token_watch, restart_notice_config_watch, stranded_sqlite_watch,
+withheld_notice_watch) share the route through `placement_evidence.home_route()` (`REMOTE_GATEWAYS`, `POOL_LABELS`,
+`REMOTE_NOTE`); tests: `tests/test_producer_hub_admission.py`. A create refused on placement logs
 `selfheal_file_error` with `code: placement_refused`, stops the pending pass (`selfheal_pass_stopped`) and files one
 `self-heal lane: card creates refused by hub admission` card per incident. Tests:
 `tests/test_self_heal_hub_admission.py` (runs each producer's argv through core's real admission apply). Portable FIX titles use

@@ -48,6 +48,7 @@ else:  # Standalone plugin/cron/CLI loader.
 # The placement helper (fence_evidence / home_pin_note) is shared by every coach card producer.
 if __package__:
     from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, HOME_PIN_PREFIX, HomePinUnresolved, fence_evidence, home_machine, home_pin_note, home_runs_on_argv, incident_title
+    from . import placement_evidence as _placement_evidence
 else:
     _spec = importlib.util.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     assert _spec and _spec.loader
@@ -1423,17 +1424,19 @@ SELFHEAL_REQUIRES = ("terminal", "file", "git")  # genuine capabilities; the hom
 FIX_REQUIRES = ("terminal", "file", "git")
 VERIFY_TITLE = "self-heal verify:"
 # Gateways whose lane a pool worker reaches with `hub-admin` (hub-write) and `hub-read`.
-VERIFY_REMOTE_GATEWAYS = ("hub",)
+# Shared with every coach producer (placement_evidence.REMOTE_GATEWAYS / POOL_LABELS: one route, one label set).
+VERIFY_REMOTE_GATEWAYS = _placement_evidence.REMOTE_GATEWAYS
 # Board labels a worker publishes only after a real proof of each tool (kanban-hub-pin-audit): hub reads, hub-admin
 # writes, and reading the parent fix card's handoff. The hub itself carries none of them, so the card leaves it.
-VERIFY_POOL_LABELS = ("capability:hub-read", "capability:hub-write", "capability:coordination-read")
+VERIFY_POOL_LABELS = _placement_evidence.POOL_LABELS
 VERIFY_REMOTE_DIR = "/tmp/selfheal-verify"  # where a remote VERIFY stages result.md on the gateway for `event`
 # Every other home-bound card this lane files (investigation, deploy check, lane repair) follows the VERIFY route on
 # a remote-reachable gateway: core's hub admission (hermes_cli/kanban_hub_admission_placement.apply) refuses an
 # explicit `machine:hub` pin unless a judge admits an allowlisted hub-only need, and none of these cards has one
 # (their gateway steps are hub-read reads and hub-admin writes). From 11:22 UTC 2026-11-12 every investigation was
 # refused and the lane filed none (t_01a1cfa3b3805315). Pool labels on a default-board card are not hub-only, so the
-# create makes no judge call at all. A named board (bb) is not on the pool and keeps the home pin.
+# create makes no judge call at all. A named board is not on the pool and keeps the home pin; on the hub route() files
+# bb defects on the default board instead (core judges every named-board create there: t_01a1cfb30dc5d3da).
 POOL_LABELS = VERIFY_POOL_LABELS
 REMOTE_NOTE = ("This card runs on a pool worker. The state it works on (logs, state files, Kanban databases and the "
                "coach store under `~/.hermes`) lives on the gateway that filed it: read it there with "
@@ -1655,7 +1658,13 @@ def route(d: dict, cfg: Optional[dict] = None) -> dict:
     named board is not created here: live filing defers the payload instead of dropping it."""
     cfg = lane_config() if cfg is None else cfg
     if d.get("component") == "bb":
-        return {"board": cfg.get("bb_board") or "bb", "skills": list(BB_SKILLS), "bb": True}
+        board = cfg.get("bb_board") or "bb"
+        if board != "default" and remote_verify():
+            # On the hub a named board is structural for core's hub admission (structural_reason -> explicit), so
+            # every bb-board create is judged and denied: a bb defect needs no hub-only context (hub-read/hub-admin
+            # and the babybear checkout are on the pool). The hub files it on the default board, bb skills, pool.
+            board = None
+        return {"board": board, "skills": list(BB_SKILLS), "bb": True}
     return {"board": cfg.get("board") or None, "skills": list(SKILLS), "bb": False}
 
 
@@ -4456,6 +4465,8 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY,
             "requires": list(FIX_REQUIRES if split else SELFHEAL_REQUIRES), "home_pin": not split}
+    if not split:  # a one-card (bb) fix on the hub goes to the pool like the investigation: no machine:hub pin
+        args = pool_args(args)
     if args.get("board") and not board_present(args["board"]):
         why = f"kanban board {args['board']!r} does not exist"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args["board"]})
@@ -4499,10 +4510,7 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
 def remote_verify() -> bool:
     """True when this gateway's VERIFY children run on the pool (its lane is reachable with hub-read/hub-admin).
     An unresolvable identity is False: the home-pin path then fails the create closed (HomePinUnresolved)."""
-    try:
-        return home_machine() in VERIFY_REMOTE_GATEWAYS
-    except HomePinUnresolved:
-        return False
+    return _placement_evidence.remote_home()
 
 
 def remote_lane(board: Optional[str] = None) -> bool:
@@ -4511,14 +4519,13 @@ def remote_lane(board: Optional[str] = None) -> bool:
     return (not board or board == "default") and remote_verify()
 
 
-_PIN_LINE_RE = re.compile(re.escape(HOME_PIN_PREFIX) + r"[^\n]*")
 _LOCAL_EVENT_RE = re.compile(r"`(" + re.escape(SELF_EVENT) + r"[^`']*)`")
 
 
 def remote_body(body: str) -> str:
     """A home-pinned brief rewritten for a pool worker: the pin sentence becomes :data:`REMOTE_NOTE` and every
     backticked lane `event` command runs on the gateway through `hub-admin '<command>'`."""
-    body = _PIN_LINE_RE.sub(lambda _m: REMOTE_NOTE, body)
+    body = _placement_evidence.remote_body(body, REMOTE_NOTE)  # the shared pin-sentence rewrite, the lane's note
     return _LOCAL_EVENT_RE.sub(lambda m: f"`hub-admin '{m.group(1)}'`", body)
 
 

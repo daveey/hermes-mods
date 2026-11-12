@@ -27,13 +27,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
-    from .placement_evidence import home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note
+    from .placement_evidence import home_pin_argv, home_route, HomePinUnresolved, fence_evidence, home_pin_note
 except ImportError:  # run as a script, or loaded by path: take the sibling file
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     _pe = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_pe)
     home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note = _pe.home_pin_argv, _pe.HomePinUnresolved, _pe.fence_evidence, _pe.home_pin_note
+    home_route = _pe.home_route
 
 PREFIXES = ("I withheld a", "The workflow remains stopped", "I suppressed a repeated")
 AUTHOR = "withheld-notice-watch"
@@ -149,11 +150,11 @@ def file_card(home: Path, host: str, now: datetime, hits: list, runner: Callable
     if not tid:
         title = f"ask-gate delivered {len(hits)} bare withheld notice(s)"
         try:
-            pin = home_pin_argv()
+            pin, body = home_route(card_body(host, hits))  # the hub's card goes to the pool
         except HomePinUnresolved as exc:  # a synced board with no readable identity: never file it portable
             return {"key": key, "action": "create_failed", "out": str(exc)[-300:]}
         r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
-                          "--created-by", AUTHOR, "--body-file", "-", "--json", *pin, title], card_body(host, hits))
+                          "--created-by", AUTHOR, "--body-file", "-", "--json", *pin, title], body)
         if r.returncode != 0:
             return {"key": key, "action": "create_failed", "out": ((r.stdout or "") + (r.stderr or ""))[-300:]}
         try:

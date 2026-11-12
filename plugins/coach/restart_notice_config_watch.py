@@ -29,13 +29,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
-    from .placement_evidence import home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note
+    from .placement_evidence import home_pin_argv, home_route, HomePinUnresolved, fence_evidence, home_pin_note
 except ImportError:  # run as a script, or loaded by path: take the sibling file
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     _pe = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_pe)
     home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note = _pe.home_pin_argv, _pe.HomePinUnresolved, _pe.fence_evidence, _pe.home_pin_note
+    home_route = _pe.home_route
 
 ALLOW_FILE = "restart-notice-allow.txt"
 ENV_SUFFIX = "_HOME_CHANNEL"
@@ -183,11 +184,18 @@ channel. On a channel other people read that is noise (alpha-askeve: 26 notices 
 """
 
 
+def create_route(host: str, f: dict) -> tuple:
+    """``(argv, body)``: on the hub the card goes to the pool (hub admission refuses a machine:hub pin) with the
+    remote brief; elsewhere the home pin and the body unchanged."""
+    pin, body = home_route(card_body(host, f))
+    return (["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", card_key(host, f),
+             "--created-by", "restart-notice-config-watch", "--body-file", "-", "--json", *pin,
+             f"Profile {f['profile']}: {f['platform']} home channel gets gateway restart notices "
+             f"(gateway_restart_notification not false)"], body)
+
+
 def create_argv(host: str, f: dict) -> list:
-    return ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", card_key(host, f),
-            "--created-by", "restart-notice-config-watch", "--body-file", "-", "--json", *home_pin_argv(),
-            f"Profile {f['profile']}: {f['platform']} home channel gets gateway restart notices "
-            f"(gateway_restart_notification not false)"]
+    return create_route(host, f)[0]
 
 
 def file_cards(findings: list, host: str, runner: Optional[Callable] = None) -> list:
@@ -196,11 +204,11 @@ def file_cards(findings: list, host: str, runner: Optional[Callable] = None) -> 
     out = []
     for f in findings:
         try:
-            argv = create_argv(host, f)
+            argv, body = create_route(host, f)
         except HomePinUnresolved as exc:  # a synced board with no readable identity: never file it portable
             out.append({"key": card_key(host, f), "rc": None, "out": str(exc)[-300:]})
             continue
-        r = run(argv, input=card_body(host, f), capture_output=True, text=True, timeout=120)
+        r = run(argv, input=body, capture_output=True, text=True, timeout=120)
         out.append({"key": card_key(host, f), "rc": r.returncode, "out": ((r.stdout or "") + (r.stderr or ""))[-300:]})
     return out
 

@@ -82,6 +82,54 @@ def home_pin_argv() -> list:
     return [*HOME_REQUIRES_ARGV, *home_runs_on_argv()]
 
 
+# ── the pool route for a home-bound card on a remote-reachable gateway ──────────────────────────────────────────────
+# Core's hub admission (hermes_cli/kanban_hub_admission_placement.apply) refuses an explicit `machine:hub` pin unless
+# a judge admits an allowlisted hub-only need (skill hub-admission-test). A home-bound coach card's gateway steps are
+# reads (`ssh hermes-hub`, hub-read) and routine writes (`hub-admin '<command>'`), which pool workers carry, so on the
+# hub such a card is filed for the pool: ``--runs-on`` the worker attestations below (not hub-only, so core makes no
+# judge call) and a body whose pin sentence becomes :data:`REMOTE_NOTE`. Every other gateway keeps the machine pin
+# (a Mac's state has no remote route). t_01a1cfa3b3805315 (self-heal), t_01a1cfb30dc5d3da (the other producers).
+REMOTE_GATEWAYS = ("hub",)  # Board gateways whose state a pool worker reaches with hub-read and hub-admin
+# Board labels a worker publishes only after a real proof of each tool (kanban-hub-pin-audit): hub reads, hub-admin
+# writes, and reading other cards' handoffs. The hub itself carries none of them, so the card leaves it.
+POOL_LABELS = ("capability:hub-read", "capability:hub-write", "capability:coordination-read")
+REMOTE_NOTE = ("This card runs on a pool worker. The state it works on (logs, state files, configs, processes and "
+               "databases under `~/.hermes`) lives on the gateway that filed it: read it there with "
+               "`ssh hermes-hub <cat|tail|head|grep|ls|sqlite ...>` (`ssh hermes-hub help` lists them) or "
+               "`hub-admin '<command>'`, and run every command that inspects processes or changes that state "
+               "(including `hermes ...` and the `python3 ~/code/hermes-mods/...` rechecks below) as "
+               "`hub-admin '<command>'` (single-quoted, so `$HOME` and `~` expand on the gateway). Run locally they "
+               "would read or change this worker's own `~/.hermes`.")
+_PIN_LINE_RE = re.compile(re.escape(HOME_PIN_PREFIX) + r"[^\n]*")
+
+
+def remote_home() -> bool:
+    """True when this gateway's home-bound cards go to the pool (:data:`REMOTE_GATEWAYS`). An unresolvable identity
+    is False: the home-pin path then fails the create closed (:class:`HomePinUnresolved`)."""
+    try:
+        return home_machine() in REMOTE_GATEWAYS
+    except HomePinUnresolved:
+        return False
+
+
+def remote_body(body: str, note: str = REMOTE_NOTE) -> str:
+    """``body`` for a pool worker: the home-pin sentence (:func:`home_pin_note`) becomes ``note``."""
+    return _PIN_LINE_RE.sub(lambda _m: note, body or "")
+
+
+def pool_runs_on_argv() -> list:
+    return ["--runs-on", ",".join(POOL_LABELS)]
+
+
+def home_route(body: str, note: str = REMOTE_NOTE) -> tuple:
+    """``(argv, body)`` for a home-bound `hermes kanban create`: on a remote-reachable gateway the pool labels and
+    the remote brief, else the capabilities plus the machine pin (:func:`home_pin_argv`) and ``body`` unchanged.
+    Raises :class:`HomePinUnresolved` like :func:`home_pin_argv`."""
+    if remote_home():
+        return [*HOME_REQUIRES_ARGV, *pool_runs_on_argv()], remote_body(body, note)
+    return home_pin_argv(), body
+
+
 def strip_markers(text: str) -> str:
     """``text`` with every fence marker removed, including ones a removal would re-form from nested halves
     (``<!-- placement:<!-- placement:evidence -->evidence -->``): an unsanitized marker in pasted evidence would end
