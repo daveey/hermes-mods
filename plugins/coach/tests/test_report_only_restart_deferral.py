@@ -2,8 +2,8 @@
 scored it, unless the turn restarted the backend or filed a card (self-heal agent-a3c36a6f70).
 
 The 2026-10-29 incident reply below scored 0.72 on the screen, under the 0.75 floor, so the second opinion never
-ran and the dashboard served the old plugin_api.py for ~11 h. Desktop human turns now use a 0.60 floor; Kanban
-worker, CLI, TUI, subagent and notice turns still use 0.75, so the same ending there was still skipped.
+ran and the dashboard served the old plugin_api.py for ~11 h. Desktop human turns now use a lower floor than Kanban
+worker, CLI, TUI, subagent and notice turns (CONFIRM_FLOOR), where the same ending was still skipped.
 """
 import importlib.util
 import json
@@ -22,7 +22,7 @@ REPLY = ("**The 500 error after the banner text.** That's the \"File it once\" b
          "test file passes (15 tests). The fix is pushed to hermes-mods as `0803ca0`.\n\n"
          "The running dashboard reloads Coach's `core.py` live but not the endpoint file I changed, so the button "
          "keeps returning the 500 until the dashboard's next restart.")
-SCREEN_P = 0.72  # the incident's logged screen score (report_only_scored, floor 0.75)
+SCREEN_P = 0.55  # under CONFIRM_FLOOR (0.60). The incident logged 0.72 under the 0.75 floor of the thinking screen judge.
 
 
 def _llm(p):
@@ -106,7 +106,7 @@ def _hooks(tmp_path, monkeypatch, name, screen_p):
 
 
 def test_pre_verify_runs_the_second_opinion_for_kanban_cli_and_notice_turns(tmp_path, monkeypatch):
-    """The real hook path: screen 0.72 on platforms that keep the 0.75 floor still reaches the second opinion and
+    """The real hook path: a screen p under CONFIRM_FLOOR on platforms that keep it still reaches the second opinion and
     logs report_only_confirm."""
     cases = [('kanban', HUMAN_ASK), ('cli', HUMAN_ASK), ('desktop', NOTICE_ASK), ('desktop', HUMAN_ASK)]
     for i, (plat, ask) in enumerate(cases):

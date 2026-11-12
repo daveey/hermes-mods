@@ -363,7 +363,7 @@ def test_confirm_replaces_the_screen_p_and_can_veto_it():
     assert rc.check(REPORT_REPLY, REPORT_ASK, [], llm, only=["report_only"], thresholds=ths,
                     confirm=lambda: (0.1, "fix was sent to the owner"), confirm_floor=rc.CONFIRM_FLOOR) is None
     # a screen p below the floor never reaches the second opinion
-    llm2, _ = _judge(_ro_verdict(0.6))
+    llm2, _ = _judge(_ro_verdict(0.5))
     assert rc.check(REPORT_REPLY, REPORT_ASK, [], llm2, only=["report_only"], thresholds=ths,
                     confirm=lambda: asked.append("below floor") or (0.9, "x"), confirm_floor=rc.CONFIRM_FLOOR) is None
     assert "below floor" not in asked

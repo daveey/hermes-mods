@@ -2645,7 +2645,7 @@ Return ONLY one JSON object:
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
   "na": no unresolved problem in the reply (a pure answer, finished work, chit-chat).
 - user_wanted_action: true if the message asked the agent to do, fix, build or change something (not just a question, status check or FYI)."""
-CONFIRM_FLOOR = 0.75  # screen report_only p at or above this gets the second opinion (tuned on train)
+CONFIRM_FLOOR = 0.60  # screen report_only p at or above this gets the second opinion (re-tuned for the thinking-off judge)
 # 250 covers the busiest day seen (2026-10-30: 189 screen scores at or above the floor, 88 capped turns;
 # agent-f668487724, agent-2d5f5e554b). The coach's daily check opens a Kanban card when report_only_confirm_capped
 # fires anyway (signals.confirm_cap_check).
@@ -2658,7 +2658,11 @@ REPORT_ONLY_FALLBACK = "skip"
 # David's typed question turns still stopping at the diagnosis, and the 0.75 floor recalled only 0.31 of them held-out
 # (0.49 at 0.60, P 0.91). The second opinion and the one-nudge-per-turn cap bound the false-positive cost. Notice turns
 # and every other platform (Kanban workers, CLI, TUI, subagents) keep CONFIRM_FLOOR: the re-measure covers Desktop only.
-HUMAN_CONFIRM_FLOOR = 0.60
+# Both floors moved down 0.15 when the screen judge stopped thinking (JUDGE_REASONING; t_01a1d000efb592cc): it scores
+# lower. Replay of the 762-row labeled set, thinking default at the old floors vs off at the new ones: human turns
+# 60 -> 64 of 69 positives reach the second opinion (screen P 0.291 both), notice turns 46 -> 54 of 78 (P 0.430 ->
+# 0.435), at 10% more second-opinion calls. Off at the old floors would have lost 2 and 8 of them.
+HUMAN_CONFIRM_FLOOR = 0.45
 HUMAN_FLOOR_PLATFORMS = ("desktop",)
 
 
@@ -3249,12 +3253,19 @@ def settings() -> dict:
             "report_only_fallback": fb if fb in ("skip", "nudge") else REPORT_ONLY_FALLBACK}
 
 
+# The reply judge runs inside pre_verify, before the turn ends. Adaptive-thinking models (Claude 4.6+) think unless
+# told not to, and that thinking doubled the call (hub 2026-11-12: p50 5.05 s vs 2.79 s with it off) without being
+# the configuration the rules were tuned on: eval/report_only_eval.py judges with thinking disabled.
+JUDGE_REASONING = {"enabled": False}
+
+
 def aux_judge(system: str, prompt: str) -> str:
-    """Aux task `coach_reply` (auxiliary.coach_reply.{provider,model}; default: the auto aux model)."""
+    """Aux task `coach_reply` (auxiliary.coach_reply.{provider,model}; default: the auto aux model), thinking off."""
     from agent.auxiliary_client import call_llm  # type: ignore
     resp = call_llm(task="coach_reply", messages=[{"role": "system", "content": system},
                                                  {"role": "user", "content": prompt}],
-                    max_tokens=2000, temperature=0, timeout=call_timeout(60))
+                    max_tokens=2000, temperature=0, timeout=call_timeout(60),
+                    reasoning_config=dict(JUDGE_REASONING))
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 

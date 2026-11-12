@@ -29,27 +29,27 @@ def _run(ask, p):
 
 
 def test_floor_values():
-    assert rc.HUMAN_CONFIRM_FLOOR == 0.60 and rc.CONFIRM_FLOOR == 0.75
+    assert rc.HUMAN_CONFIRM_FLOOR == 0.45 and rc.CONFIRM_FLOOR == 0.60
 
 
-def test_human_turn_gets_second_opinion_at_0_65():
-    hit, asked = _run(HUMAN_ASK, 0.65)
+def test_human_turn_gets_second_opinion_at_0_50():
+    hit, asked = _run(HUMAN_ASK, 0.50)
     assert asked and hit and hit['p'] == 0.9
 
 
 def test_notice_turn_keeps_the_higher_floor():
-    hit, asked = _run(NOTICE_ASK, 0.65)
+    hit, asked = _run(NOTICE_ASK, 0.50)
     assert not asked and hit is None
 
 
 def test_human_below_new_floor_still_skipped():
-    hit, asked = _run(HUMAN_ASK, 0.55)
+    hit, asked = _run(HUMAN_ASK, 0.40)
     assert not asked and hit is None
 
 
 def test_without_human_floor_param_behaviour_unchanged():
     asked = []
-    hit = rc.check(REPLY, HUMAN_ASK, [], _llm(0.65), only=['report_only'],
+    hit = rc.check(REPLY, HUMAN_ASK, [], _llm(0.50), only=['report_only'],
                    thresholds={'report_only': 0.75, 'report_only_screen': 0.85},
                    confirm=lambda: asked.append(1) or (0.9, 'x'), confirm_floor=rc.CONFIRM_FLOOR)
     assert hit is None and not asked
@@ -94,12 +94,12 @@ def _hooks(tmp_path, monkeypatch, name, screen_p):
 
 
 def test_pre_verify_applies_the_lower_floor_to_desktop_human_turns_only(tmp_path, monkeypatch):
-    """Screen p 0.65: a Desktop human turn gets the second opinion (and its nudge); the same turn from a Kanban worker,
+    """Screen p 0.50: a Desktop human turn gets the second opinion (and its nudge); the same turn from a Kanban worker,
     CLI, TUI or subagent does not, and neither does a Desktop notice turn."""
     cases = [('desktop', HUMAN_ASK, True), ('kanban', HUMAN_ASK, False), ('cli', HUMAN_ASK, False),
              ('tui', HUMAN_ASK, False), ('subagent', HUMAN_ASK, False), ('desktop', NOTICE_ASK, False)]
     for i, (plat, ask, expect) in enumerate(cases):
-        hooks, confirms, store = _hooks(tmp_path / str(i), monkeypatch, f'coach_init_hf{i}', 0.65)
+        hooks, confirms, store = _hooks(tmp_path / str(i), monkeypatch, f'coach_init_hf{i}', 0.50)
         sid = f'hf{i}'
         hooks['pre_llm_call'](session_id=sid, user_message=ask, platform=plat)
         out = hooks['pre_verify'](session_id=sid, platform=plat, attempt=0, final_response=REPLY)
