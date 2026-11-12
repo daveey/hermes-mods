@@ -21,8 +21,9 @@ Done when:
                     workflow whose runs there all ended `skipped` (no job ran) counts
                     as done, printed "skipped", once none of its runs on the sha
                     itself is queued or running; a --workflow one must succeed.
-                    workflow_run events are ignored unless --workflow is given:
-                    their headSha belongs to the default branch, not the triggering run
+                    workflow_run, schedule and workflow_dispatch runs are ignored unless
+                    --workflow is given: they run meta jobs (review comments, runner-loss
+                    recovery) on the branch head, and their verdict is not the commit's CI
 
 Exit codes: 0 done; 1 stalled (nothing queued/running will finish it: the commit's own
 run, or the newest finished run containing it, failed, or no run will ever pick it up), or
@@ -71,6 +72,10 @@ ACTIVE = {"queued", "in_progress", "waiting", "requested", "pending"}
 STARTUP_GRACE_S = 180  # runs can take a minute or two to appear after a push
 CALL_TIMEOUT_S = 120  # one gh/git call; an unbounded call that hangs holds the wait past its own deadline
 MAX_CALL_ERRORS = 5  # consecutive failed listings before giving up (exit 1), so auth/repo errors still surface
+# Events whose runs build the branch head for meta jobs, not the commit: ignored unless --workflow names the workflow.
+# workflow_run carries the default branch's head; "CI review comment" also runs as workflow_dispatch and schedule,
+# and its run, red from one PR comment's HTTP 502, stalled a commit whose push CI was green (run 43220839508).
+META_EVENTS = frozenset({"workflow_run", "schedule", "workflow_dispatch"})
 
 
 def git(repo: Path, *args: str) -> str:
@@ -130,9 +135,9 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
 
     `runs` are newest first. A run counts for the commit when its headSha
     contains every sha. Cancelled runs are ignored (they were replaced).
-    workflow_run events carry the default branch's head, not the triggering run's
-    commit. Exclude them from discovery AND evidence/activity unless --workflow
-    explicitly opts in (for example, a post-CI deploy).
+    Meta-event runs (META_EVENTS: workflow_run, schedule, workflow_dispatch) build the branch head, not the
+    commit, and run reporting jobs whose red says nothing about it. Exclude them from discovery AND
+    evidence/activity unless --workflow explicitly opts in (for example, a post-CI deploy, or --dispatch).
 
     A discovered workflow whose runs containing the commit all ended `skipped` is done, with
     'skipped' set: every job's `if:` was false, so it checked nothing and can never succeed.
@@ -149,7 +154,7 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
     verdict, so a finished own red is final at once.
     """
     if not workflows:
-        runs = [r for r in runs if r.get("event") != "workflow_run"]
+        runs = [r for r in runs if r.get("event") not in META_EVENTS]
     relevant = [r for r in runs if all(contains(r["headSha"], s) for s in shas)]
     names = workflows if workflows else sorted({workflow_key(r) for r in relevant})
     state = {}
@@ -248,7 +253,7 @@ def mark_failed_jobs(runs: list[dict], shas: list[str], contains, workflows: lis
     for i, r in enumerate(runs):
         if r.get("status") not in ACTIVE or r.get("databaseId") is None:
             continue
-        if not workflows and r.get("event") == "workflow_run":
+        if not workflows and r.get("event") in META_EVENTS:
             continue
         if not all(contains(r["headSha"], s) for s in shas):
             continue
