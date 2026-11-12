@@ -3258,14 +3258,55 @@ def settings() -> dict:
 # the configuration the rules were tuned on: eval/report_only_eval.py judges with thinking disabled.
 JUDGE_REASONING = {"enabled": False}
 
+# The screen runs on the model its thresholds were tuned on (eval/report_only_eval.py --model claude-sonnet-5-5,
+# thinking disabled) whenever the configured route is a class or auto. `class:standard` is a weighted allocation: on
+# hermes-hub (2026-11-12) it sent about half the judge calls to gpt-6.1-sol, which cannot turn reasoning off and took
+# 5.0-7.5 s against 2.1-2.8 s for Sonnet on the same prompt; that half was the chat pre_verify p90 (7.15 s after the
+# thinking-off change; t_01a1d000efb592cc). Pinned Sonnet, 15 calls: p50 2.29 s, p90 3.75 s, max 4.20 s.
+# When the pin is unavailable (no eligible Sonnet route on this host, a quota wall, an error) the call falls back to the
+# task's own route with what is left of the budget, so the check still runs. COACH_REPLY_JUDGE_MODEL overrides the
+# model; set it to "" to always use the route. A concrete auxiliary.coach_reply.model in config is always honoured.
+JUDGE_MODEL = "claude-sonnet-5-5"
+
+
+def _judge_model() -> Optional[str]:
+    """The model to pin the screen to, or None to use the coach_reply route as configured."""
+    model = os.environ.get("COACH_REPLY_JUDGE_MODEL", JUDGE_MODEL).strip()
+    if not model:
+        return None
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config  # type: ignore
+        configured = str((_get_auxiliary_task_config("coach_reply") or {}).get("model") or "").strip()
+    except Exception:
+        configured = ""
+    if configured and configured != "auto" and not configured.startswith("class:"):
+        return None
+    return model
+
 
 def aux_judge(system: str, prompt: str) -> str:
-    """Aux task `coach_reply` (auxiliary.coach_reply.{provider,model}; default: the auto aux model), thinking off."""
+    """Aux task `coach_reply`, thinking off, on JUDGE_MODEL when the route is a class (fallback: the route itself)."""
     from agent.auxiliary_client import call_llm  # type: ignore
-    resp = call_llm(task="coach_reply", messages=[{"role": "system", "content": system},
-                                                 {"role": "user", "content": prompt}],
-                    max_tokens=2000, temperature=0, timeout=call_timeout(60),
-                    reasoning_config=dict(JUDGE_REASONING))
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+
+    def call(model: Optional[str]):
+        kw = {"model": model} if model else {}
+        return call_llm(task="coach_reply", messages=messages, max_tokens=2000, temperature=0,
+                        timeout=call_timeout(60), reasoning_config=dict(JUDGE_REASONING), **kw)
+
+    model = _judge_model()
+    resp = None
+    if model:
+        try:
+            resp = call(model)
+        except BudgetExhausted:
+            raise
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).info("coach reply judge: %s unavailable (%s: %s); using the coach_reply route",
+                                             model, type(e).__name__, str(e)[:200])
+    if resp is None:
+        resp = call(None)
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 
