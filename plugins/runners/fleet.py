@@ -173,6 +173,8 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
             # Registry hold metadata (ms epoch like last_seen); only a current hold reports it.
             hold_reason=(entry.get('hold_reason') or None) if state == 'draining' else None,
             hold_by=(entry.get('hold_by') or None) if state == 'draining' else None,
+            # The card/session the holder declared (Board hold_owner); hold_by is the authenticated principal.
+            hold_owner=(entry.get('hold_owner') or None) if state == 'draining' else None,
             hold_at=entry.get('hold_at') if state == 'draining' and isinstance(entry.get('hold_at'), (int, float)) else None,
             labels=list(entry.get('labels') or []) if entry else [],
             pinned_only=bool(entry and entry.get('pinned_only')),

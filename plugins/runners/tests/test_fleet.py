@@ -50,6 +50,16 @@ def test_held_machine_keeps_hold_metadata_from_registry():
     assert reg['machines']['spare']['hold_reason'] == 'disk cleanup'  # never mutate registry
 
 
+def test_held_machine_reports_hold_owner_only_while_draining():
+    reg = _registry(hub={}, spare=dict(hold=True, hold_reason='roll', hold_by='admin', hold_owner='card:t_01a1ce31e56561be',
+                                       hold_at=NOW - MIN),
+                    old=dict(hold=True, hold_by='admin'), live=dict(hold=False, hold_owner='card:t_stale'))
+    m = {r['name']: r for r in fleet.gateway_workers(reg, [], NOW)['machines']}
+    assert (m['spare']['hold_by'], m['spare']['hold_owner']) == ('admin', 'card:t_01a1ce31e56561be')
+    assert m['old']['hold_owner'] is None  # Board older than hold_owner
+    assert m['live']['hold_owner'] is None  # released: never a current owner
+
+
 def test_live_leases_fill_slots_across_boards(tmp_path):
     _shadow(tmp_path, 'default', [
         ('t_a', 'Card A', 'running', 100, 'hub', NOW + MIN),

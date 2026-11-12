@@ -292,6 +292,23 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   await ui.close()
 })
 
+test('draining: hover names the hold_owner card/session, falling back to hold_by', async () => {
+  const body = fleet()
+  const held = { state: 'draining', reason: 'draining', labels: [], pinned_only: false, slots: 2, slots_source: 'registry', running: [] }
+  body.gateways.machines = [
+    { name: 'carded', ...held, hold_reason: 'roll', hold_by: 'admin', hold_owner: 'card:t_01a1ce31e56561be', hold_at: NOW - 60000 },
+    { name: 'plain', ...held, hold_reason: 'roll', hold_by: 'admin', hold_owner: null, hold_at: NOW - 60000 }
+  ]
+  const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
+  const carded = ui.container.querySelector('[data-machine="carded"]')
+  const want = 'draining: roll (held by card:t_01a1ce31e56561be, 1m ago); finishes running cards, takes no new ones'
+  assert.ok(carded.querySelector(':scope > .hermes-fleet-info').dataset.tip.startsWith(want), carded.querySelector('.hermes-fleet-info').dataset.tip)
+  for (const s of carded.querySelectorAll('.hermes-fleet-slot.is-draining')) assert.equal(s.title, want)
+  const plain = ui.container.querySelector('[data-machine="plain"]')
+  assert.ok(plain.querySelector('.hermes-fleet-info').dataset.tip.startsWith('draining: roll (held by admin, 1m ago)'))
+  await ui.close()
+})
+
 test('gateway rows: one grid line each in a shared column grid, no Investigate control', async () => {
   const body = fleet()
   body.gateways.machines = body.gateways.machines.map((m) => ({ ...m, waiting: 1, ineligible: 2, load: { cpu_load1: 1, cpus: 8, mem_used_pct: 10, disk_free_gb: 5, disk_total_gb: 50, at: NOW, stale: false } }))
