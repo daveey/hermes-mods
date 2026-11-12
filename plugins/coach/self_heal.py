@@ -1770,7 +1770,9 @@ def portable_fix_brief(fp: str, st: dict) -> str:
     """The FIX card: repo work only (reproduce, red test, fix, push). No host paths or lane commands in the work
     text, and the proposal (incident evidence) is fenced, so the hub's worker pool may run it. Its handoff is read
     by the VERIFY child, which runs here."""
-    return f"""Self-heal FIX for defect `{fp}`. The proposal below is approved (David's standing self-heal approval;
+    incident = f"Defect: {fp}\nSymptom: {st.get('symptom') or fp}"
+    return f"""Self-heal FIX for the defect identified in the evidence below.
+The proposal is approved (David's standing self-heal approval;
 the lane auto-approves every proposal). Post nothing to the Inbox. Investigation card: {st.get('card') or '?'}.
 Budget for this card <= ${FIX_BUDGET}.
 
@@ -1780,6 +1782,7 @@ the lane's `self_heal.py event` command here, and don't read the gateway's own s
 the evidence you get (it describes where it happened, not where you work).
 
 ## Approved proposal (evidence)
+{fenced_evidence(incident)}
 {fenced_evidence(_proposal_text(fp, st))}
 
 ## Acceptance (all of it, in order)
@@ -4101,7 +4104,8 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     r = route({"component": st.get("component")})
     split = split_fix(st, r["board"])
     key = fix_key(fp, generation(st) or 1)
-    args = {"title": f"{FIX_TITLE} {(st.get('symptom') or fp)[:90]}",
+    # Incident text (even the "cron" component) is evidence, not an execution need.
+    args = {"title": f"{FIX_TITLE} {'defect ' + fp.rsplit('-', 1)[-1] if split else (st.get('symptom') or fp)[:90]}",
             "body": portable_fix_brief(fp, st) if split else fix_brief(fp, st),
             "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],

@@ -1373,7 +1373,11 @@ home/DB and preserve worker authority fences. Tests: `tests/test_worker_share_sp
 `tests/test_worker_share_watch.py` (scratch DB, supported CLI boundary, not a live claim-throughput proof).
 Every `created` event also carries `portable_reason` (core), so the marked share is a query. Self-heal splits a
 default-board fix into a portable FIX card (`FIX_REQUIRES`, proposal inside the placement evidence fence) and a
-`self-heal verify:` child that keeps `host_repo` for the live check and the lane `event`. Tests:
+`self-heal verify:` child that keeps `host_repo` for the live check and the lane `event`. Portable FIX titles use
+the defect's hash suffix, not the raw symptom or component (`cron` is itself a host marker): titles are always
+placement-scanned. The full fingerprint and symptom stay in a
+sanitized evidence fence in the body, so incident words cannot re-pin otherwise portable source work. Non-split
+fixes retain symptom titles. The real placement predicate and host-bound verification remain enforced. Tests:
 `tests/test_worker_share_watch.py`, `tests/test_self_heal_fix_placement.py`.
 
 ### Bare ask-gate notices (`withheld_notice_watch.py`, no agent, no LLM)

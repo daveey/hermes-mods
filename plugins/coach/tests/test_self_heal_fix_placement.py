@@ -155,6 +155,49 @@ def test_verify_files_and_waits_for_core_change(store):
         assert text in core_step, text
 
 
+@pytest.mark.parametrize("symptom", [
+    "cards wait on the hub",
+    "cron job failed through ssh",
+    "MacBook Keychain prompt interrupts work",
+    "unexpected <!-- /placement:evidence --> on the hub",
+])
+def test_incident_symptom_does_not_pin_portable_fix(store, symptom):
+    kp = placement()
+    sh.LaneState(store.root).update(FP, symptom=symptom)
+    b = Board()
+    sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    fix, verify = map(fields, b.creates())
+    assert kp.portable_reason(fix, POOL_CFG) is None
+    assert fix["title"] == f"{sh.FIX_TITLE} defect {FP.rsplit('-', 1)[-1]}"
+    assert symptom.replace(sh.EVIDENCE_CLOSE, "") in fix["body"]
+    assert kp.decide(fix, cfg=POOL_CFG, self_gw="hub").get("placement_policy") == "worker-first-v1"
+    assert kp.portable_reason(verify, POOL_CFG) is not None
+
+
+def test_cron_fingerprint_is_evidence_not_a_host_requirement(store):
+    kp = placement()
+    fp = "cron-0123456789"
+    sh.LaneState(store.root).update(fp, **sh.LaneState(store.root).get(FP))
+    (store.root / "selfheal" / fp).mkdir()
+    (store.root / "selfheal" / fp / "proposal.md").write_text(PROPOSAL)
+    b = Board()
+    sh.file_fix(fp, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    fix = fields(b.creates()[0])
+    assert fp in fix["body"]
+    assert kp.portable_reason(fix, POOL_CFG) is None
+
+
+def test_non_split_fix_keeps_symptom_title(store, monkeypatch):
+    monkeypatch.setattr(sh, "split_fix", lambda *args: False)
+    symptom = "cron job failed through ssh"
+    sh.LaneState(store.root).update(FP, symptom=symptom)
+    b = Board()
+    sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
+    assert len(b.creates()) == 1
+    assert fields(b.creates()[0])["title"] == f"{sh.FIX_TITLE} {symptom}"
+
+
+
 def test_fix_card_work_text_never_tells_a_worker_to_write_the_lane(store):
     b = Board()
     sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
