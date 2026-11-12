@@ -53,7 +53,8 @@ class GitHubActions:
                  jitter=random.random, timeout=10, max_pages=100,
                  max_job_requests=10, max_repositories=10, max_runs=10,
                  enrichment_interval=60, backoff_base=2, backoff_cap=300,
-                 max_cycle_requests=32, pace_requests=False, pacing_window=0):
+                 max_cycle_requests=32, pace_requests=False, pacing_window=0,
+                 quota_reserve=0, max_hourly_requests=None):
         for value in (timeout, max_pages, max_job_requests, max_repositories,
                       max_runs, enrichment_interval, backoff_base, backoff_cap):
             if not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
@@ -72,6 +73,17 @@ class GitHubActions:
         if type(pacing_window) not in (int, float) or not math.isfinite(pacing_window) or not 0 <= pacing_window <= 30:
             raise ValueError('invalid_provider_options')
         self.pacing_window = pacing_window
+        # GitHub meters user tokens (PAT, OAuth) per *user*: every token of that
+        # user shares one 5000/h core bucket with gh, CI helpers and agents.
+        # Pacing to the full remaining budget would spend that shared bucket to
+        # zero by each reset. quota_reserve leaves headroom for everyone else
+        # (no request while remaining <= reserve) and max_hourly_requests caps
+        # this collector's own share per credential.
+        if type(quota_reserve) is not int or quota_reserve < 0:
+            raise ValueError('invalid_provider_options')
+        if max_hourly_requests is not None and (type(max_hourly_requests) is not int or max_hourly_requests < 1):
+            raise ValueError('invalid_provider_options')
+        self.quota_reserve, self.max_hourly_requests = quota_reserve, max_hourly_requests
         self.max_cycle_requests, self.pace_requests = max_cycle_requests, pace_requests
         self._cycle_remaining = None
         self._budgets, self._cache, self._enriched = {}, {}, {}
@@ -192,6 +204,9 @@ class GitHubActions:
             if not budget.reset or now < budget.reset:
                 raise _Failure('rate_limited', math.ceil(budget.reset - now) if budget.reset > now else None)
             budget.remaining = None
+        if (self.quota_reserve and budget.remaining is not None and budget.remaining <= self.quota_reserve
+                and budget.reset and now < budget.reset):
+            raise _Failure('rate_limited', math.ceil(budget.reset - now))
         if now < budget.until:
             raise _Failure('backoff', math.ceil(budget.until - now))
         key = (credential.key, hashlib.sha256(credential.token.encode()).digest(), path)
@@ -229,7 +244,10 @@ class GitHubActions:
         except (ValueError, TypeError, OverflowError):
             raise _Failure('invalid_rate_headers') from None
         if self.pace_requests and budget.remaining is not None and budget.remaining > 0:
-            budget.next_at = max(now, budget.next_at) + max(0, budget.reset-now)/budget.remaining
+            spacing = max(0, budget.reset-now)/max(1, budget.remaining - self.quota_reserve)
+            if self.max_hourly_requests:
+                spacing = max(spacing, 3600 / self.max_hourly_requests)
+            budget.next_at = max(now, budget.next_at) + spacing
         status = response.status
         if metadata and status == 301:
             return response  # canonical.py validates the only admissible next path
@@ -412,6 +430,9 @@ class GitHubActions:
                 if not candidates or not repos:
                     return ProviderResult((), True, None, self.clock(), None)
                 c = self._credential(s)
+                budget = self._budgets.get(c.key)
+                if self.pace_requests and budget and self.clock() + self.pacing_window < budget.next_at:
+                    raise _Failure('budget_deferred')
                 cooldown = (c.key, s['id'])
                 if self.clock() < self._enriched.get(cooldown, 0):
                     raise _Failure('enrichment_cooldown')

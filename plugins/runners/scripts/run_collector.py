@@ -38,6 +38,15 @@ from plugins.runners.probes.ssh import SSHProbe, SSHTarget, ProbeSpec
 from plugins.runners.providers.github_actions import GitHubActions
 from plugins.runners.providers.runtime import BrokerCredential, BrokerCredentialResolver, GitHubHTTPTransport
 
+# The collector reads with GitHub *user* tokens (PAT/OAuth) whose 5000/h core bucket is
+# shared by every token of that user (gh on every host, CI helpers, agents).
+# Unbounded pacing spent the whole remaining bucket (~40 req/min across 547
+# repository scopes) and tripped the shared GitHub quota brake every hour.
+# Stop below QUOTA_RESERVE remaining, and never exceed MAX_HOURLY_REQUESTS per
+# credential (one request per 12 s; runner inventory tolerates the staleness).
+QUOTA_RESERVE = 2500
+MAX_HOURLY_REQUESTS = 300
+
 
 def _pairs(pairs):
     result = {}
@@ -158,7 +167,8 @@ def run(config_path, runtime_path, identity, state_dir, *, stop=None, once=False
         resolver = BrokerCredentialResolver(credentials,
             broker_command=(private.get('broker_executable', 'token-broker'),))
         adapter = GitHubActions(transport=GitHubHTTPTransport(),
-                                credential_resolver=resolver, pace_requests=True, pacing_window=30)
+                                credential_resolver=resolver, pace_requests=True, pacing_window=30,
+                                quota_reserve=QUOTA_RESERVE, max_hourly_requests=MAX_HOURLY_REQUESTS)
         scopes = {s['id']: s for s in config['scopes']}
         jobs = private.get('job_repositories', {})
         for sid, repositories in jobs.items():
