@@ -3,6 +3,8 @@
 Five anti-patterns, measured in the user's own history (coach gap report 2026-10-14):
 - handoff:     the agent hands the user a step it could plausibly do itself (click/log in/run/paste...).
 - confirm:     the agent ends by asking permission for a reversible next step ("Want me to ...?").
+               Also the statement-shaped form: the user redirects work under way and the reply answers with a
+               counter-recommendation and "I haven't ..." instead of starting it (recommend_stall).
 - unverified:  the agent claims done/fixed/working without checking on the user's real path.
 - unwatched:   the agent promises to continue once outside work finishes ("I'll write the report when the
                runs finish") but nothing will wake the session: no background process, kanban card, goal or
@@ -58,6 +60,57 @@ CONFIRM_RE = re.compile(
     r"(?:ready|happy) (?:for me )?to (?:proceed|go|ship|merge|push|apply)|say (?:the word|go|yes)|"
     r"(?:let me know|tell me) if you(?:'d)? (?:want|like) me to)\b[^?\n]{0,200}\?\s*$"
     r"|\b(?:want me to|should i|shall i)\b[^?\n]{0,200}\?)", re.I | re.M)
+# agent-56e18d89f2: a permission ask with no question mark. The user redirected work he had already approved ("how
+# about we make the hub uncapped, but always give the work to the workers"); the reply agreed, countered with "I
+# recommend a large emergency cap rather than completely uncapped", said "I haven't raised the live cap", and started
+# nothing. CONFIRM_RE only matches questions, so the judge never saw it; 47 s later: "do all of this work, dont ask me
+# for permission". A recommendation is a candidate when the same reply holds the work back (a contrast with what was
+# asked, or an "I haven't <done it>") and does not say it is going ahead. Candidates only: the judge sets precision.
+_APOS = r"(?:'|’)"
+RECOMMEND_RE = re.compile(
+    r"\b(?:I(?:" + _APOS + r"d| would)? (?:\w+ )?(?:recommend|suggest|propose|advise)"
+    r"|my (?:recommendation|suggestion|advice) (?:is|would be|here is)\b"
+    r"|I(?:" + _APOS + r"d| would) (?:go with|rather|prefer|lean towards?))\b", re.I)
+RECOMMEND_CONTRAST_RE = re.compile(
+    r"\b(?:rather than|instead of|as opposed to|and not\b|over (?:a|an|the|fully|completely)\b)", re.I)
+HELD_BACK_RE = re.compile(
+    r"\bI(?: have not| did not| haven" + _APOS + r"?t| didn" + _APOS + r"?t|" + _APOS + r"ve not) (?:yet )?(?:actually )?"
+    r"(?:start(?:ed)?|begun|begin|rais(?:ed|e)|lower(?:ed)?|chang(?:ed|e)|appl(?:ied|y)|made|make|touch(?:ed)?|"
+    r"deploy(?:ed)?|merg(?:ed|e)|push(?:ed)?|ship(?:ped)?|enabl(?:ed|e)|disabl(?:ed|e)|implement(?:ed)?|built|build|"
+    r"creat(?:ed|e)|land(?:ed)?|switch(?:ed)?|updat(?:ed|e)|edit(?:ed)?|remov(?:ed|e)|modif(?:ied|y)|turn(?:ed)?|"
+    r"flip(?:ped)?|set|done|do|act(?:ed)?|proceed(?:ed)?|gone ahead|go ahead|kick(?:ed)? off|roll(?:ed)? out)\b", re.I)
+# The reply says the adjusted plan is going ahead (this turn, or by default unless the user objects): not a stall.
+PROCEEDING_RE = re.compile(
+    r"\b(?:start(?:ing|ed) (?:it|that|this|on (?:it|that|this)|the \w+|work)?\s*(?:now|already)\b"
+    r"|I" + _APOS + r"?(?:m| am) (?:now )?(?:starting|implementing|building|proceeding|going ahead|doing|making|applying)\b"
+    r"|I(?:" + _APOS + r"ve| have) (?:started|begun|kicked off|implemented|applied|built)\b"
+    r"|I" + _APOS + r"?ll (?:go ahead|proceed) (?:with|and)\b|going ahead with\b|proceeding with\b"
+    r"|unless you (?:object|say otherwise|tell me otherwise|stop me|disagree|veto)\b"
+    r"|(?:silence|no reply|no answer) (?:=|means|is) (?:go|yes|the default)\b|by default,? I" + _APOS + r"?(?:ll| will)\b"
+    r"|(?:is|are|now) (?:underway|under way|in progress)\b)", re.I)
+# The user asked for the recommendation itself: giving one is the answer, not a stall.
+ASKED_OPINION_RE = re.compile(
+    r"\b(?:what (?:do|would|should) you (?:think|recommend|suggest|advise|propose)|what(?:'|’)?s your (?:recommendation|"
+    r"take|opinion|view|advice|suggestion)|your (?:recommendation|opinion|take|thoughts)\b|do you (?:recommend|think|agree)"
+    r"|which (?:one|option|approach|way)\b|pros and cons|trade-?offs?\b|thoughts\s*\?|recommend(?:ation)?s?\s*\?"
+    r"|should (?:we|i)\b[^.\n]{0,160}\?|is (?:it|that|this) (?:a good|the right|worth|better|safe))", re.I)
+
+
+def recommend_stall(reply: str) -> Optional[str]:
+    """The recommendation sentence when the reply's tail counters the user's direction with a recommendation, holds
+    the work back (a contrast in that sentence, or an "I haven't <done it>" in the tail) and nowhere says it is going
+    ahead. None otherwise. A neutral status line ("I haven't deployed yet; CI is running") has no recommendation and a
+    plain "I recommend X" holds nothing back: neither is a candidate."""
+    tail = (reply or "")[-900:]
+    m = RECOMMEND_RE.search(tail)
+    if not m or PROCEEDING_RE.search(tail):
+        return None
+    start = max(tail.rfind("\n", 0, m.start()), tail.rfind(". ", 0, m.start())) + 1
+    ends = [i for i in (tail.find("\n", m.end()), tail.find(". ", m.end())) if i != -1]
+    sentence = tail[start:min(ends) if ends else len(tail)]
+    if not (RECOMMEND_CONTRAST_RE.search(sentence) or HELD_BACK_RE.search(tail)):
+        return None
+    return " ".join(sentence.split()).strip(" *_")[:200]
 _FINISH = (r"(?:finish(?:es|ed)?|complete[sd]?|land(?:s|ed)?|(?:is|are) done|come[s]? back|end[s]?|pass(?:es)?|"
            r"go(?:es)? green)")
 WAIT_RE = re.compile(
@@ -1779,7 +1832,7 @@ def prefilter(reply: str) -> list[str]:
     out = []
     if HANDOFF_RE.search(r):
         out.append("handoff")
-    if CONFIRM_RE.search(tail):
+    if CONFIRM_RE.search(tail) or recommend_stall(r):
         out.append("confirm")
     if DONE_RE.search(r[:600]) or DONE_RE.search(tail):
         out.append("unverified")
@@ -1974,6 +2027,18 @@ probabilities (0-1):
   irreversible, external-facing (sending messages/emails, spending money, deleting data, force-push, publishing),
   or genuinely ambiguous in intent is NOT a needless confirm (score low). A plan presented for an explicit go
   when the user asked for a plan first is NOT needless.
+  The same ask can be a statement: the user's request gives a direction, tweak or go on work that is already under
+  way or already asked for ("how about we make X", "let's do Y instead", "make it Z"), and the message answers with
+  a recommendation or an adjusted plan ("I recommend A rather than B", "I haven't changed X") but neither starts it
+  this turn (the tool log shows no implementation step, card or worker told to build it; passing the idea on as
+  design input or "not permission" is not starting) nor says it goes ahead by default unless the user objects.
+  That leaves the user to say "go" again: a needless confirm, score it 0.8+. A sound reason to hold back one risky
+  step (not raising a live limit before its guard is deployed) does not excuse starting none of the plan: the safe
+  part, building it, should have started this turn. Score it LOW when the message states the adjusted plan and
+  starts it, or names its default and says it proceeds; when the user asked for an opinion, options or a plan
+  ("what do you recommend?", "should we?", "plan first"); when the only thing held back is new scope beyond the
+  user's direction or a step that spends money, changes permissions, is irreversible or external-facing, and the
+  message says so; and for a neutral status report that recommends nothing.
 - unverified: the message claims the work is done/fixed/working/deployed, but the turn's tool log shows no check
   that exercises the user's actual path (running the real command/app/URL/test the user cares about and seeing the
   right result). Building, type-checking, or testing something adjacent does not count. Saying explicitly that it
@@ -2529,6 +2594,16 @@ def parse_verdict(raw: str) -> Optional[dict]:
     return out
 
 
+# agent-56e18d89f2: the confirm rule's statement-shaped form (recommend_stall); NUDGES["confirm"] talks about a question.
+CONFIRM_RECOMMEND_NUDGE = (
+    "[coach] The user gave a direction on work that is already approved or under way, and your message answers with "
+    "a recommendation or adjusted plan but starts nothing and names no default ({evidence}). That leaves the user to "
+    "say \"go\" again. A direction or tweak on approved work is in scope: state the adjusted plan in one or two lines "
+    "and start it this turn (do it, or start the card/worker that builds it), with your recommendation as the default "
+    "the user can override. Stop to ask only if it changes acceptance, safety limits, permissions or spend, is "
+    "irreversible or external-facing, or is new scope beyond the direction; then say exactly that.")
+
+
 NUDGES = {
     "handoff": ("[coach] Before ending the turn: your message asks the user to do a step themselves ({evidence}). "
                 "The user wants agents to self-serve. Try it yourself first with what you have (shell, ssh, browser "
@@ -2988,6 +3063,14 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                     "verdict": {"status_only": 1.0, "evidence": ev},
                     "nudge": STATUS_ONLY_NUDGE.format(evidence=ev[:200])}
     cands = [r for r in prefilter(reply) if not only or r in only]
+    # agent-56e18d89f2: a confirm candidate that is only a held-back recommendation (no "Want me to ...?"). Dropped when
+    # the user limited the turn to analysis/a plan or asked for the recommendation itself.
+    rec_only = None
+    if "confirm" in cands and not CONFIRM_RE.search((reply or "")[-700:]):
+        rec_only = recommend_stall(reply)
+        if rec_only and (scope_limited(user_ask) or ASKED_OPINION_RE.search(scope_text(user_ask)[-3000:])):
+            cands.remove("confirm")
+            rec_only = None
     if relay_repeat and "report_only" not in cands and (not only or "report_only" in only):
         cands.append("report_only")
     if "report_only" in cands and scoped:
@@ -3013,7 +3096,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         except Exception:
             sp = None
     if sp:
-        kept = [r for r in cands if r not in sp or sp[r] >= screen_below or (forced and r == "report_only")]
+        # the confirm screen asks "does it END BY ASKING permission": a statement-shaped stall has no question, so its
+        # screen score says nothing and the judge decides
+        kept = [r for r in cands if r not in sp or sp[r] >= screen_below or (forced and r == "report_only")
+                or (rec_only and r == "confirm")]
         if not shadow:
             if not kept:
                 if log:
@@ -3089,6 +3175,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return None
     down = kanban_db_down(tool_log) if kanban_down is None else kanban_down
     closed = best == "report_only" and card_closed(tool_log)
+    if best == "confirm" and rec_only:
+        return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v, "variant": "recommend",
+                "reason": "recommend_stall",
+                "nudge": keep_answer(CONFIRM_RECOMMEND_NUDGE.format(evidence=v["evidence"] or rec_only), reply)}
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
             **({"variant": "card_closed"} if closed and not down else {}),
             "nudge": nudge_for(best, v["evidence"], kanban_down=down, card_closed=closed, platform=platform,
@@ -3183,7 +3273,8 @@ def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[
 # <coach>/drafts.jsonl) that the rule would hold, so a regex change is measured against real replies, not hand-picked
 # strings (self-heal agent-ddabb16633: three credit_ask false-positive repairs in 3 days, each fixing one phrase).
 BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job": laptop_job,
-                        "skipped_live": lambda r: skipped_live(r, [])}
+                        "skipped_live": lambda r: skipped_live(r, []),
+                        "recommend_stall": lambda r: recommend_stall(r)}
 
 
 def backtest(rule: str, days: float, db=None, drafts=None) -> list:
