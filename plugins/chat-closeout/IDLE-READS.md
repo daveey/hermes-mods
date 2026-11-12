@@ -21,8 +21,8 @@ The cross-pass cache is deliberately below that layer, and only on Kanban board 
 
 `core.last_user_at` (state.db) is **not** cached and keeps no connection: it uses the pass's `ReadPool`
 (closed when the pass ends) or a connection closed before it returns. Quiet-period decisions use the
-current clock. Remote projection, hub freshness, replica completion lookup and ledger/proof reads are not
-cached either. A missing, unreadable or stale shadow still vetoes absence on the next pass.
+current clock. Remote projection, hub freshness, replica completion lookup and ledger reads are not
+cached either (transcript proofs: see below). A missing, unreadable or stale shadow still vetoes absence on the next pass.
 
 ### Why `_unseen_counts` no longer calls `_all_counts`
 
@@ -83,9 +83,52 @@ reader) and three gate validations (wake, owner wake, watchdog), all for unchang
   with a failed board, a failed inventory read or a failed replica completion read is never kept. Absence coverage
   (`_board_absence_veto`, shadow freshness at the current time) is recomputed on every reuse; `healthy()` and the
   hub-freshness check still run per pass.
-- Not covered: state.db reads (`last_user_at`, proofs) still run every pass; within one pass each connection's
+- Not covered: `last_user_at` (state.db) still runs every pass; within one pass each connection's
   `messages` columns are read once (`ReadPool.cols`, closed with the pass). The watchdog reads the ledger's pending
   rows once per tick instead of once per check.
+
+## Transcript proofs (cross-pass, shared by every entry point)
+
+Hub profile (2026-11-12, serve pid 2040957): `session_proof` was ~3.3% of all samples. The sidebar's waiting
+source (every ~4.5 s), `pre_llm_call` (every LLM call) and the waker each re-scanned every pending chat's transcript
+since its card finished, although nothing in those chats had changed (only heartbeat churn elsewhere). Five whys:
+the proofs were rebuilt because the index lived in one `_proof_pass`; it lived only there because state.db can
+never be observed (retained handle, above), so there was no content key to reuse it by; and `pre_llm_call` ran
+outside any pass, opening a connection and an index per card.
+
+- `_shared_ack_index` keeps one `core.AckIndex(keyed=True)` per (state.db, lineage ids) across passes (LRU, 1024;
+  a lineage with no session in that state.db is not kept, since every profile's state.db is asked). A keyed index
+  reads `core.transcript_key` and its rows in **one** read transaction on the pass's own `ReadPool` connection
+  (rolled back at once; nothing retained), so `AckIndex.key` is exactly the state its rows came from; a later
+  slice read under another key leaves it None (never reused). A pass reuses an index only when the state.db file
+  identity is unchanged and the current key equals `AckIndex.key`. The key: the lineage's active rows' count,
+  highest id, id sum and timestamp sum, the highest id of any of its rows (index-only on
+  `idx_messages_session_active` / `idx_messages_session_id`) and the sessions' `transcript_revision`, which core's
+  `messages_transcript_revision_update` / `messages_display_revision_update` triggers bump on every in-place
+  rewrite of role, content, tool_calls or display_kind (both triggers must exist with those columns in their
+  `AFTER UPDATE OF` list). Every core writer of a column the index reads moves it: `finish_reason` is written on
+  insert, with `content` (transcript repair) or with an inactive twin insert (prune rewrite); `timestamp` repairs
+  move the timestamp sum; `active = 1` is written only by the NULL backfill. It is not proof against an arbitrary
+  writer (several balanced `active` flips keep every sum). Any change re-reads the lineage, so a new answer is
+  proven on the next pass and a rewrite or undo never leaves a stale green. A state.db without both triggers (or
+  the column) gets no key: read every pass as before.
+- Labelling with a key read *before* the rows (first draft) was unsafe: a reply landing between them, later undone
+  (`active = 0`, no trigger), restores the older key while the index still holds the reply (independent review).
+- An index answers only from what it read; a lower `since` reads the missing older slice (under the index's lock:
+  the sidebar, hooks and waker prove from different threads).
+- `pre_llm_call` now proves its batch inside one `_proof_pass` (one connection, shared index), as the waker and
+  the sidebar do.
+
+`tests/test_proof_memo.py` (RED on the previous tree: 6 scans for 3 hook calls, 8 scans for 4 waiting passes):
+heartbeat churn does not re-scan; the hook reuses the sidebar's index with one connection per call; a new answer
+is proven next pass; each rewrite kind (content, display_kind, active, timestamp, tool_calls, delete, and a
+count/max-id-preserving active swap) is re-read; no trigger, no reuse; a replaced state.db is re-read; a lower
+`since` extends the shared index; the memo is bounded; threads share one index consistently; a write between a key
+read and the rows, later undone, is never reused under the older key (both placements; RED on the first draft);
+a trigger naming a column outside its `OF` list does not vouch; an absent lineage is not kept.
+Synthetic (`bench_proofs.py` in the task workspace, 50 waiting chats x ~300 rows since the card finished, churn
+between passes, three runs each): a waiting pass's proofs 41-61 ms -> 10-11 ms (50 -> 0 scans); a
+`pre_llm_call`-shaped batch proof 4.2-6.1 ms -> 1.7-2.3 ms (2 -> 0 scans).
 
 Hub microbenchmark (copied hub state, 40 ticks, not native acceptance): see the task report.
 
@@ -123,7 +166,7 @@ RED evidence before implementation:
 ## Limits
 
 This is structural query-count evidence plus a synthetic hub microbenchmark, not native acceptance; the native
-Mac replay must be rerun to claim a CPU reduction. Remote inventory/merge, hub health, lineage/proofs, state.db
+Mac replay must be rerun to claim a CPU reduction. Remote inventory/merge, hub health, lineage, state.db
 reads, `parked_waits` and clock-sensitive orchestration still run. A retained observer detects committed
 SQLite changes, not arbitrary unsupported in-place replacement of a live database. The race tests commit
 between the pre-read revision and the read; they do not suspend SQLite inside the WAL frame-publication gap.

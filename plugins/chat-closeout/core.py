@@ -1006,6 +1006,55 @@ def ack_proven(state_dbs: Iterable[Path], ids: Iterable[str], tid: str, since: f
 
 
 _ACK_COLS = {'display_kind', 'finish_reason', 'tool_calls', 'active'}
+# state.db triggers that bump ``sessions.transcript_revision`` on an in-place rewrite of a message row, with the
+# columns ``AckIndex`` reads that each one's ``AFTER UPDATE OF`` list must name (core ``DEFERRED_INDEX_SQL``).
+TRANSCRIPT_TRIGGERS = {'messages_transcript_revision_update': ('role', 'content', 'tool_calls'),
+                       'messages_display_revision_update': ('display_kind',)}
+_TRIGGER_OF = re.compile(r'\bafter\s+update\s+of\s+(.*?)\s+on\s+"?messages"?\b(.*)$', re.I | re.S)
+
+
+def _trigger_vouches(sql: Any, needs: tuple[str, ...]) -> bool:
+    """The trigger fires on an update of every column in ``needs`` (its ``OF`` list, not a comment or ``WHEN``)
+    and its action bumps ``transcript_revision``."""
+    m = _TRIGGER_OF.search(re.sub(r'--[^\n]*', ' ', str(sql or '')))
+    if m is None:
+        return False
+    cols = {c.strip().strip('"').lower() for c in m.group(1).split(',')}
+    return set(needs) <= cols and 'transcript_revision' in m.group(2).lower()
+
+
+def transcript_key(conn: sqlite3.Connection, ids: list[str]) -> Optional[tuple]:
+    """Write-side key of every ``messages`` row an ``AckIndex`` of ``ids`` can read, or None (no reuse) when this
+    state.db cannot vouch for in-place rewrites. Index-only reads (``idx_messages_session_active`` /
+    ``idx_messages_session_id``), one statement:
+
+    - inserts, deletes and ``active`` flips: the active rows' count, highest id and id sum, and the highest id of
+      any row (a prune rewrite inserts an inactive twin of the row it rewrites);
+    - timestamp repairs (no trigger covers ``timestamp``): the active rows' timestamp sum;
+    - role/content/tool_calls/display_kind rewrites: the sessions' ``transcript_revision``, bumped by core's
+      triggers (both must exist and list those columns).
+
+    Not airtight against an arbitrary writer (several active flips can keep every sum), but every core writer moves
+    it: ``active = 1`` is written only by the NULL-backfill migration, ``finish_reason`` only on insert, with
+    ``content`` (transcript repair) or with a twin insert (prune rewrite). A key labels rows only when read in the
+    same snapshot as them (``AckIndex(keyed=True)``)."""
+    ids = [str(i) for i in ids]
+    if not ids:
+        return None
+    sql = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+                            tuple(TRANSCRIPT_TRIGGERS)).fetchall())
+    if not all(_trigger_vouches(sql.get(name), needs) for name, needs in TRANSCRIPT_TRIGGERS.items()):
+        return None
+    if 'transcript_revision' not in _cols(conn, 'sessions'):
+        return None
+    ph = ",".join("?" for _ in ids)
+    row = conn.execute(
+        f"SELECT COUNT(*), COALESCE(MAX(id), 0), TOTAL(id), TOTAL(timestamp), "
+        f"(SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id IN ({ph})), "
+        f"(SELECT COUNT(*) FROM sessions WHERE id IN ({ph})), "
+        f"(SELECT COALESCE(SUM(transcript_revision), 0) FROM sessions WHERE id IN ({ph})) "
+        f"FROM messages WHERE session_id IN ({ph}) AND active = 1", (*ids, *ids, *ids, *ids)).fetchone()
+    return tuple(ids), tuple(row)
 
 
 class AckIndex:
@@ -1016,23 +1065,36 @@ class AckIndex:
     the missing older slice and prepends it; nothing is read twice. Tool rows can never pair, so they are skipped.
 
     State across a prepend: ``head_max`` is the newest qualifying reply before the first user row of what is
-    already indexed; any such reply answers the trailing notice of an older slice."""
+    already indexed; any such reply answers the trailing notice of an older slice.
 
-    def __init__(self, path: Path, ids: list[str]):
+    ``keyed`` (a cross-pass shared index): each read takes ``transcript_key`` and the rows in ONE read transaction,
+    so ``key`` is exactly the state everything indexed was read from; a later slice read under another key leaves
+    ``key`` None (mixed snapshots: never reused). Unkeyable: ``key`` None."""
+
+    def __init__(self, path: Path, ids: list[str], keyed: bool = False):
         self.path, self.ids = Path(path), list(ids)
         self.lo: Optional[float] = None
         self.best: dict[tuple[str, str], float] = {}
         self.head_max = float("-inf")
         self.usable = True
+        self.keyed = keyed
+        self.key: Optional[tuple] = None
+        self.lock = threading.Lock()
 
     def _extend(self, since: float, pool: Optional[ReadPool]) -> None:
         conn = pool.get(self.path) if pool is not None else ro_connect(self.path)
-        failed = False
+        failed = began = False
+        key = None
         try:
             cols = pool.cols(self.path, 'messages') if pool is not None else _cols(conn, 'messages')
             if not _ACK_COLS.issubset(cols):
                 self.usable = False
                 return
+            if self.keyed:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN")  # one read snapshot: the key and the rows it labels
+                    began = True
+                key = transcript_key(conn, self.ids)
             ph = ",".join("?" for _ in self.ids)
             upper = "AND timestamp < ? " if self.lo is not None else ""
             args = (*self.ids, since) + ((self.lo,) if self.lo is not None else ())
@@ -1044,10 +1106,17 @@ class AckIndex:
             failed = True
             raise
         finally:
+            if began:
+                try:
+                    conn.rollback()  # read-only: ends the snapshot; no transaction outlives this read
+                except sqlite3.Error:
+                    failed = True
             if pool is None:
                 conn.close()
             elif failed:
                 pool.drop(self.path)
+        if self.keyed:
+            self.key = key if self.lo is None else (self.key if key == self.key else None)
         pending: Optional[tuple[float, Optional[tuple[str, str]]]] = None  # newest user row: (at, notice key)
         head_max, seen_user, best = float("-inf"), False, self.best
         for r in rows:
@@ -1069,17 +1138,18 @@ class AckIndex:
 
     def proves(self, tid: str, since: float, pool: Optional[ReadPool] = None) -> bool:
         since = float(since)
-        if not self.usable:
-            return False
-        if self.lo is None or since < self.lo:
-            try:
-                self._extend(since, pool)
-            except sqlite3.Error:
-                return False  # unreadable now; a later call reads it again
+        with self.lock:  # a shared index (the plugin's cross-pass memo) is proven from several threads
             if not self.usable:
                 return False
-        target = _notice_target(tid)
-        return target is not None and self.best.get(target, float("-inf")) >= since
+            if self.lo is None or since < self.lo:
+                try:
+                    self._extend(since, pool)
+                except sqlite3.Error:
+                    return False  # unreadable now; a later call reads it again
+                if not self.usable:
+                    return False
+            target = _notice_target(tid)
+            return target is not None and self.best.get(target, float("-inf")) >= since
 
 
 # ---- the ledger ------------------------------------------------------------------------------------------------

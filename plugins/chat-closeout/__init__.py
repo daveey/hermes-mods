@@ -25,6 +25,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -1132,7 +1133,8 @@ def subscribed_open_cards(session_id: str, db_paths: Optional[list[Path]] = None
 def session_proof(sid: str, tid: str, card: dict) -> bool:
     """Transcript evidence that a finished card's final notice was delivered to the chat and answered. Inside a
     ``_proof_pass`` every card of one lineage is proven from one ``core.AckIndex`` per state.db (one transcript
-    read per lineage, not one per card)."""
+    read per lineage, not one per card), shared across passes while the lineage's transcript key holds
+    (``_shared_ack_index``)."""
     try:
         at = card.get("completed_at")
         if at is None:
@@ -1147,13 +1149,58 @@ def session_proof(sid: str, tid: str, card: dict) -> bool:
         for path in state_dbs():
             idx = acks.get((str(path), tuple(ids)))
             if idx is None:
-                idx = acks[(str(path), tuple(ids))] = core.AckIndex(path, ids)
+                idx = acks[(str(path), tuple(ids))] = _shared_ack_index(path, ids, res["pool"])
             if idx.proves(tid, float(at), res["pool"]):
                 return True
         return False
     except Exception:
         logger.debug("chat-closeout: ack proof unavailable", exc_info=True)
         return False
+
+
+# Cross-pass transcript proofs (IDLE-READS.md "Transcript proofs"): (state.db, lineage ids) -> (file id, AckIndex).
+_ACK_MEMO_CAP = 1024
+_ack_memo_lock = threading.Lock()
+_ack_memo: "OrderedDict[tuple[str, tuple[str, ...]], tuple[Optional[tuple], core.AckIndex]]" = OrderedDict()
+
+
+def _ack_memo_reset() -> None:
+    with _ack_memo_lock:
+        _ack_memo.clear()
+
+
+def _shared_ack_index(path: Path, ids: list[str], pool: "core.ReadPool") -> "core.AckIndex":
+    """The lineage's answered-notice index, reused from an earlier pass (the sidebar's, a hook's, the waker's) while
+    nothing it can read changed: the same state.db file and a current ``core.transcript_key`` (on this pass's
+    connection) equal to the key the index's rows were read under (``AckIndex.key``, same snapshot as the rows).
+    Otherwise a fresh keyed index; one for a lineage with no session in this state.db is not kept (nothing to
+    reuse, and every profile's state.db is asked). Unkeyable state.db: a plain per-pass index, as before."""
+    memo_key = (str(path), tuple(ids))
+    ident: Optional[tuple] = None
+    try:
+        st = os.stat(path)
+        ident = (st.st_dev, st.st_ino)
+        key = core.transcript_key(pool.get(path), ids)
+    except (OSError, sqlite3.Error):
+        key = None
+    if key is None:
+        with _ack_memo_lock:
+            _ack_memo.pop(memo_key, None)
+        return core.AckIndex(path, ids)
+    with _ack_memo_lock:
+        hit = _ack_memo.get(memo_key)
+        if hit is not None and hit[0] == ident and hit[1].usable and hit[1].key == key:
+            _ack_memo.move_to_end(memo_key)
+            return hit[1]
+        idx = core.AckIndex(path, ids, keyed=True)
+        if key[1][5]:  # some session of the lineage lives in this state.db
+            _ack_memo[memo_key] = (ident, idx)
+            _ack_memo.move_to_end(memo_key)
+            while len(_ack_memo) > _ACK_MEMO_CAP:
+                _ack_memo.popitem(last=False)
+        else:
+            _ack_memo.pop(memo_key, None)
+        return idx
 
 
 def _reconcile_asks(sid: str, row: dict, cards: dict) -> dict:
@@ -1223,7 +1270,8 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
             return None
         cards = read_cards(row["batch"])
         fix = _reconcile_asks(session_id, row, cards)
-        fix.update(core.reconcile_done({**row, **fix}, cards, lambda t, c: session_proof(session_id, t, c)))
+        with _proof_pass():  # one state.db connection and one lineage index for every card (shared across passes)
+            fix.update(core.reconcile_done({**row, **fix}, cards, lambda t, c: session_proof(session_id, t, c)))
         if fix:
             ledger().write(session_id, **fix)
             row = {**row, **fix}
