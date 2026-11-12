@@ -426,7 +426,7 @@ const GW_COLS = [
   ['waiting', 'Waiting', 'Unleased ready cards that match this machine and need a slot here'],
   ['ineligible', "Can't run", 'Unleased ready cards whose placement, skills or pins do not match this machine'],
   ['cpu', 'CPU', '1-min load ÷ cores'], ['ram', 'RAM', 'Memory in use'], ['disk', 'Disk free'],
-  ['meta', ''], ['count', 'Busy']
+  ['count', 'Busy']
 ]
 
 function GatewayHead() {
@@ -456,8 +456,9 @@ function GatewayRow({ m, now }) {
     m.reason,
     v ? (v.stale ? `load ${v.stale}` : null) : 'load not reported'
   ].filter(Boolean).join(' · ')
-  return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
-    h('span', { className: 'hermes-fleet-name' }, text(m.name)),
+  // Flags and reasons are hover text on the row (and the dotted-underlined name), not a column.
+  return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name, title: meta || undefined },
+    h('span', { className: `hermes-fleet-name${meta ? ' has-note' : ''}`, title: meta ? `${text(m.name)}: ${meta}` : undefined }, text(m.name)),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
@@ -468,7 +469,6 @@ function GatewayRow({ m, now }) {
     h('span', { className: 'hermes-fleet-cell hermes-fleet-waiting', title: m.waiting != null ? `${m.waiting} unleased ready card(s) for gateway-dispatched profiles match placement labels (including skill labels) on ${m.name}. Need a slot here; portable cards can also fit other machines. Does not include transient admission limits or machine availability.` : undefined }, m.waiting != null ? `${m.waiting}` : ''),
     h('span', { className: 'hermes-fleet-cell hermes-fleet-ineligible', title: m.ineligible != null ? `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` : undefined }, m.ineligible != null ? `${m.ineligible}` : ''),
     h(MeterCell, { k: 'cpu', v }), h(MeterCell, { k: 'ram', v }), h(MeterCell, { k: 'disk', v }),
-    h('span', { className: 'hermes-fleet-meta', title: meta || undefined }, meta),
     h('span', { className: 'hermes-fleet-count' },
       m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`)
   )
@@ -719,7 +719,7 @@ export function Runners({ ctx }) {
           : h('span', null, label))),
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
-      style: { width: 'min(1000px, calc(100vw - 24px))', maxHeight: '70vh', overflowY: 'auto' }
+      style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '70vh', overflowY: 'auto' }
     }, view ? h(Panel, { view, now, repairClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
   )
 }
@@ -754,7 +754,7 @@ const CSS = `
 .hermes-fleet-group-meta{font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap}
 .hermes-fleet-chev{color:var(--ui-text-tertiary);font-size:10px}
 .hermes-fleet-group>.hermes-fleet-row{padding-left:18px}
-.hermes-fleet-gw{display:grid;grid-template-columns:repeat(7,max-content) minmax(0,1fr) max-content;row-gap:3px}
+.hermes-fleet-gw{display:grid;grid-template-columns:repeat(7,max-content) minmax(max-content,1fr);row-gap:3px}
 .hermes-fleet-gw>.hermes-fleet-row,.hermes-fleet-cols{display:grid;grid-column:1/-1;grid-template-columns:subgrid;column-gap:16px;align-items:center;white-space:nowrap}
 .hermes-fleet-gw>.hermes-fleet-row>*{grid-row:1}
 .hermes-fleet-cols{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
@@ -770,8 +770,8 @@ const CSS = `
 .hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:7}
 .hermes-fleet-gw .hermes-fleet-meter.is-stale,.hermes-fleet-gw .hermes-fleet-meter.is-none{color:var(--ui-text-tertiary)}
 .hermes-fleet-gw .hermes-fleet-num{flex:1;text-align:right}
-.hermes-fleet-gw .hermes-fleet-meta{grid-column:8;overflow:hidden;text-overflow:ellipsis}
-.hermes-fleet-gw .hermes-fleet-count{grid-column:9}
+.hermes-fleet-gw .hermes-fleet-name.has-note{text-decoration:underline dotted var(--ui-text-tertiary);text-underline-offset:3px;cursor:help}
+.hermes-fleet-gw .hermes-fleet-count{grid-column:8}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
 .hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}
