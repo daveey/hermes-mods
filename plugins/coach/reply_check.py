@@ -1362,11 +1362,19 @@ def merge_forecast(reply: str, tool_log: Optional[list] = None) -> Optional[str]
 # in the host's zone), more than FC_GRACE_S and at most FC_AHEAD_MAX_S later than now on today's clock. A time further
 # ahead is taken as an earlier day's ("since 4:28pm PT" said at 05:30); the incident's slips were 6-41 min, and a wrong
 # DST offset is 1 h.
-# Forecast words before it in the sentence (by/until/ETA/will/from/between/before...), another day or date in the
-# sentence, code spans, quotes and `>` lines are ignored. A PDT label while PST is in force (and the reverse) is a hit.
+# A tagged time counts only with positive past evidence (t_01a1d00595da7ccd: a forecast blacklist let 64 of 66 hub
+# replies through as "past", e.g. "Auto-posts at 3:42 PM PT", "should install around 03:51 PST", "Retrying once at
+# 22:38 PT"): the nearest cue in its clause is a past one (checked/ran/finished/merged/was/since/... before it, or
+# after it when nothing comes before), or it is a bare stamp ("Red sweep ~21:15 PST:", a clause opening with the
+# time). A nearer future/modal cue (should/will/ends/again/check back/any -ing verb/unless...) wins, and no cue at all
+# passes. A sentence that calls the time wrong (wrong/incorrect/mistaken/fallback) is reporting it, not stamping it.
+# Untagged times are skipped on a UTC host (they are usually earlier-day UTC) and count at most FC_UNTAGGED_AHEAD_S.
+# Another day or date in the sentence (or "that day"), code spans, quotes and `>` lines are ignored. A PDT label while
+# PST is in force (and the reverse) is a hit, unless the text names a date (a reference back across the DST switch).
 PACIFIC = "America/Los_Angeles"
 FC_GRACE_S = 180
 FC_AHEAD_MAX_S = 3 * 3600
+FC_UNTAGGED_AHEAD_S = 3600
 _FC_PT = r"(?:PT|PST|PDT|Pacific(?:\s+time)?)"
 _FC_TIME_RE = re.compile(
     r"(?<![\d:.])(?P<h1>[01]?\d|2[0-3]):(?P<m1>[0-5]\d)(?::[0-5]\d)?(?:\s*(?P<ap1>[ap]\.?m\.?))?"
@@ -1374,13 +1382,71 @@ _FC_TIME_RE = re.compile(
     r"(?![\d:])(?:\s*\(?(?P<tz>" + _FC_PT + r"|UTC|GMT|Z|[ECM][SD]?T|CES?T|BST|IST|JST|AEST)\b)?", re.I)
 _FC_PAST_RE = re.compile(r"\b(?:checked|ran|run\s+at|finished|completed|done|as\s+of|since|swept|verified|"
                          r"confirmed|read|looked)\b[\s~:@]*(?:at\s+|around\s+|~\s*)?$", re.I)
-_FC_FORECAST_RE = re.compile(
-    r"\b(?:by|until|till|til|before|ETA|expected|expect|due|will|won't|going\s+to|scheduled|schedule|planned|next|"
-    r"from|between|wakes?|resumes?|retr(?:y|ies)|re-?check(?:s|ing)?|tonight|later|opens?|starts?|lifts?|resets?|"
-    r"after\s+(?:which|that)|SCHEDULED_UNTIL)\b|[\u2019']ll\b", re.I)
+# Cues for a tagged time: the nearest one in its clause decides. Past is a whitelist (positive evidence); future and
+# modal cues only need to veto a past cue or a bare stamp, since no cue at all already passes.
+_FC_PAST_CUE = (
+    r"checked|ran|finished|completed|done|swept|verified|confirmed|logged|posted|landed|merged|deployed|installed|"
+    r"shipped|pushed|started|stopped|ended|failed|fired|crashed|restarted|rebooted|woke|unblocked|closed|filed|sent|"
+    r"read|looked|saw|noticed|observed|reported|replied|updated|was|were|had|did|happened|occurred|"
+    r"as\s+of|since|last|earlier|already|ago")
+_FC_FUTURE_CUE = (
+    r"should|will|won't|would|could|may|might|must|shall|expect\w*|ETA|due|by|until|till|til|before|next|again|"
+    r"going\s+to|scheduled|schedule|planned|plans?|set\s+(?:to|for)|check(?:s|ing)?\s+back|timer|deadline|"
+    r"from|between|unless|if|once|wakes?|resumes?|retr(?:y|ies)|re-?check(?:s|ing)?|tonight|later|soon|opens?|"
+    r"starts?|ends?|lifts?|resets?|after\s+(?:which|that)|SCHEDULED_UNTIL|\w{2,}ing|\w*[\u2019']ll")
+_FC_CUE_RE = re.compile(r"(?<![\w\u2019'-])(?:(?P<past>" + _FC_PAST_CUE + r")|(?P<fut>" + _FC_FUTURE_CUE + r"))\b",
+                        re.I)
+# -ing words that are not verbs (any other -ing word is a future cue: "Retrying once at 22:38 PT")
+_FC_ING_NOUNS = frozenset(("morning", "evening", "nothing", "something", "anything", "everything", "thing", "things",
+                           "during", "string", "ring", "king", "spring", "ceiling", "building", "meeting", "setting",
+                           "settings", "warning", "warnings", "heading", "ping"))
+_FC_CLAUSE_SEP = re.compile(r"[;,()\[\]\n\u2014\u2013]|:(?:\s|$)|\s-\s")
+_FC_WRONG_RE = re.compile(r"\b(?:wrong|incorrect|mistaken|bogus|typo|fallback)\b", re.I)
+_FC_BARE_AFTER_RE = re.compile(r"\s*(?:[:)\u2014\u2013]|-\s|$)")
+_FC_FUNCTION_WORD_RE = re.compile(
+    r"\b(?:at|around|about|by|until|till|before|after|from|on|in|for|near|to|is|are|be|it|i|we|they|he|she|this|"
+    r"that|the)\b", re.I)
+
+
+def _fc_cue(seg: str, last: bool) -> Optional[str]:
+    """'past', 'fut' or None: the last (or first) cue in `seg`."""
+    cues = []
+    for c in _FC_CUE_RE.finditer(seg):
+        if c.group("fut") and c.group("fut").lower() in _FC_ING_NOUNS:
+            continue
+        cues.append("past" if c.group("past") else "fut")
+    if not cues:
+        return None
+    return cues[-1] if last else cues[0]
+
+
+def _fc_tagged_is_past(before: str, after: str) -> bool:
+    """A Pacific-tagged time stated as when something happened: the nearest cue in its clause is a past one, or it is
+    a bare stamp (`Red sweep ~21:15 PST:`, `21:15 PST — swept`) with no cue at all."""
+    parts = _FC_CLAUSE_SEP.split(before)
+    clause_b = parts[-1]
+    sep = _FC_CLAUSE_SEP.search(after)
+    clause_a = after[:sep.start()] if sep else after
+    if not clause_b.strip() and before.rstrip().endswith("(") and len(parts) > 1:
+        # a conversion in parentheses ("will open at about 06:12 UTC (10:12 pm PST)") belongs to the clause before it
+        return _fc_cue(parts[-2], last=True) == "past"
+    cue = _fc_cue(clause_b, last=True)
+    if cue:
+        return cue == "past"
+    cue = _fc_cue(clause_a, last=False)
+    if cue:
+        return cue == "past"
+    if not _FC_BARE_AFTER_RE.match(after):
+        return False
+    lead = clause_b.strip()
+    if lead.endswith(("~", "@")):
+        return True
+    return len(lead.split()) <= 3 and not _FC_FUNCTION_WORD_RE.search(lead)
 _FC_OTHER_DAY_RE = re.compile(
-    r"\b(?:tomorrow|yesterday|last\s+night|(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
-    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b)|"
+    r"\b(?:tomorrow|yesterday|last\s+night|that\s+(?:day|night|morning|afternoon|evening)|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b|"
+    r"\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b)|"
     r"\b\d{4}-\d{2}-\d{2}\b|(?<![\d:])\d{1,2}[-/]\d{1,2}(?![\d:])", re.I)
 _FC_META_RE = re.compile(r"\bfuture_clock\b", re.I)
 FUTURE_CLOCK_NUDGE = (
@@ -1428,7 +1494,7 @@ def _fc_minutes(h: str, m: str, ap: Optional[str]) -> int:
 def future_clock(text: str, now: Optional[float] = None, local_tz=None) -> Optional[str]:
     """The time stamp (with a little context) when `text` states a past-tense Pacific time later than now (beyond
     FC_GRACE_S), or a PDT/PST label that DST contradicts; else None. `local_tz` (default: this host's zone) reads
-    untagged times after checked/ran/as of/since. Fail-open: any error returns None."""
+    untagged times after checked/ran/as of/since (not on a UTC host). Fail-open: any error returns None."""
     try:
         import datetime as _dt
         t = _wall_now() if now is None else float(now)
@@ -1440,31 +1506,35 @@ def future_clock(text: str, now: Optional[float] = None, local_tz=None) -> Optio
         body = _CODE_QUOTE.sub(" ", text or "")
         body = _QUOTED_RE.sub(" ", body)
         body = re.sub(r"'[^'\n]{6,}'", " ", body)  # a quoted old stamp ('Checked 21:40 PT.')
+        body = body.replace("*", "")  # markdown bold around a time (Auto-posts at **3:42 PM PT**)
         if _FC_META_RE.search(body):
             return None
+        utc_host = now_loc.utcoffset() == _dt.timedelta(0)
+        dated = bool(_FC_OTHER_DAY_RE.search(body))  # a PDT/PST label in a text naming a date is about that date
         for sent in _SENTENCE_END.split(body):
-            if not sent or ":" not in sent or _FC_OTHER_DAY_RE.search(sent):
+            if not sent or ":" not in sent or _FC_OTHER_DAY_RE.search(sent) or _FC_WRONG_RE.search(sent):
                 continue
             for m in _FC_TIME_RE.finditer(sent):
                 tz = (m.group("tz") or "").upper()
                 before = sent[:m.start()]
                 if tz and not re.match(_FC_PT, tz, re.I):
                     continue  # another zone (UTC, ET, ...)
-                if not tz and not _FC_PAST_RE.search(before[-40:]):
-                    continue  # an untagged time not stated as when something happened
+                if not tz and (utc_host or not _FC_PAST_RE.search(before[-40:])):
+                    continue  # an untagged time not stated as when something happened, or on a UTC host
                 ev = " ".join(sent[max(0, m.start() - 30):m.end() + 10].split())
-                if tz in ("PDT", "PST") and (tz == "PDT") != dst:
+                if tz in ("PDT", "PST") and (tz == "PDT") != dst and not dated:
                     return ev
-                if _FC_FORECAST_RE.search(before):
-                    continue
+                if tz and not _fc_tagged_is_past(before, sent[m.end():]):
+                    continue  # a forecast, or no evidence the time already happened
                 cur = now_pac if tz else now_loc
                 cur_min = cur.hour * 60 + cur.minute + cur.second / 60.0
                 ends = [_fc_minutes(m.group("h1"), m.group("m1"), m.group("ap1"))]
                 if m.group("h2"):
                     ends.append(_fc_minutes(m.group("h2"), m.group("m2"), m.group("ap2") or m.group("ap1")))
+                cap = FC_AHEAD_MAX_S if tz else FC_UNTAGGED_AHEAD_S
                 for e in ends:
                     ahead = (e - cur_min) * 60
-                    if FC_GRACE_S < ahead <= FC_AHEAD_MAX_S:
+                    if FC_GRACE_S < ahead <= cap:
                         return ev
     except Exception:
         return None
