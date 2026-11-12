@@ -62,9 +62,9 @@ class TestControls:
     @pytest.mark.parametrize("phrase", [
         "This is not temporary.", "Do not make this temporary.", "It isn't a temporary exception.",
         "This is permanent, no owner needed."])
-    def test_negated_temporary_is_permanent(self, w, surface, phrase):
+    def test_negated_temporary_alone_is_not_permanence(self, w, surface, phrase):
         w.register()
-        assert not w.blocked(surface, SET8, texts=[f"{BASE} {phrase}"])
+        assert w.blocked(surface, SET8, texts=[f"{BASE} {phrase}"]) is (phrase != "This is permanent, no owner needed.")
 
     @pytest.mark.parametrize("wrap", [
         'The assistant wrote: "Do not make this permanent, it is temporary."',

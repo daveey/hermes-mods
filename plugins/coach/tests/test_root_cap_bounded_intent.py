@@ -105,9 +105,11 @@ class TestControls:
         "This is permanent.", "Keep it permanently.", "Don't restore it.", "Do not revert this.",
         "Never roll it back.", "This is not time-boxed.", "It is not temporary, do not restore it.",
         "This is permanent, no owner needed.", "Not only for an hour, keep it."])
-    def test_unbounded_own_words_stay_permanent(self, w, surface, phrase):
+    def test_only_affirmative_permanence_is_unbounded(self, w, surface, phrase):
         w.register()
-        assert not w.blocked(surface, SET8, texts=[f"{BASE} {phrase}"])
+        # v12: negating one bound is not affirmative unbounded scope.
+        unbounded = phrase in {"This is permanent.", "Keep it permanently.", "This is permanent, no owner needed."}
+        assert w.blocked(surface, SET8, texts=[f"{BASE} {phrase}"]) is not unbounded
 
     @pytest.mark.parametrize("wrap", [
         'The assistant wrote: "This is only for 10 minutes. Restore it on owner completion."',

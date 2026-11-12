@@ -1220,8 +1220,8 @@ def _negated_before(low, pos):
 def _temporary_intent(own_text):
     """True when the human's own words (quoted spans already removed; questions and someone else's words skipped)
     make the change bounded: they say it is temporary / non-permanent, restrict it from being permanent, or name a
-    restoration, a time bound or an owner-bound scope. One coherent rule, not a phrase list per wording: an
-    authorization is permanent only when NONE of those bounded-ness signals appears in the user's own speech.
+    restoration, a time bound or an owner-bound scope. This recognises common restrictions only; absence of a
+    signal is NOT permanent permission (_initial_temporary requires positive closed-form scope).
     Unlike _own_terms this KEEPS negated sentences ("Do not make this permanent, it is temporary." is a
     restriction; discarding it as non-affirmative would upgrade the authorization to an untracked permanent one),
     except that a negated restoration/time/owner clause ("Don't restore it", "not only for an hour") is not a bound.
@@ -1261,6 +1261,133 @@ def _about_cap(low, leaf):
 _CARD = re.compile(r"\bt_[0-9a-z]{4,}\b")
 
 
+def _live_scope(own_text):
+    return [s for s in _sentences(own_text)
+            if not _QUESTION_LEAD.search(s.lower()) and not _REPORTED.search(s.lower())]
+
+
+def _permanent_scope(s):
+    # Permanence is a positive, closed form, not a substring test. Unknown
+    # modifiers in the SAME sentence ("semi-permanent", "permanent through
+    # Friday") must not smuggle an untracked exception past the scope check.
+    low = s.lower().strip()
+    auth = (r"(?:yes,?\s+|please,?\s+)?i (?:authori[sz]e|approve|permit|allow) "
+            r"(?:changing|raising|increasing) (?:the )?(?:root )?(?:kanban\.)?max_in_progress "
+            r"from \d+ to \d+ permanently(?: for this rollout|, it's the owner's call and i'm sure)?")
+    standalone = (r"(?:permanently(?: for this rollout)?|(?:this|it) is permanent(?:, no owner needed)?|"
+                  r"(?:make|keep|treat|consider|mark) (?:that|it|this)(?: (?:change|raise|increase|override))? "
+                  r"(?:as )?permanent(?:ly)?|(?:root )?(?:kanban\.)?max_in_progress is permanent)")
+    return bool(re.fullmatch(r"(?:" + auth + "|" + standalone + r")[.!]?", low))
+
+
+def _bare_authorization(s, leaf):
+    # Closed grammar for the one backwards-compatible implicit unbounded approval.
+    # Unknown modifiers (including new bounded synonyms) cannot grant permanence.
+    ordinary = re.fullmatch(
+        r"\s*i\s+(?:authori[sz]e|approve|permit|allow)\s+(?:changing|raising|increasing|a change to)\s+"
+        r"(?:root\s+)?(?:kanban\.)?" + re.escape(leaf) + r"\s+from\s+\d+\s+to\s+\d+[.!]?\s*", s.lower())
+    revision = re.fullmatch(r"i authori[sz]e (?:root )?(?:kanban\.)?" + re.escape(leaf)
+                            + r"\s*=\s*\d+ superseding contract revision [0-9a-f]{12,64}[.!]?", s.lower())
+    return bool(ordinary or revision)
+
+
+def _neutral_scope(s):
+    # Closed courtesy grammar; not an arbitrary 'thanks ...' prefix that could
+    # conceal an unrecognised restriction in the rest of the sentence.
+    return bool(re.fullmatch(r"(?:thanks|thank you)(?:,?\s+it['’]s\s*)?[.!]?", s.lower().strip()))
+
+
+def _initial_temporary(own_text, leaf):
+    live = [s for s in _live_scope(own_text) if not _neutral_scope(s)]
+    if _temporary_intent(own_text):
+        return True
+    if len(live) == 1 and _bare_authorization(live[0], leaf):
+        return False
+    # A bare approval plus an extra own sentence is no longer a bare approval.
+    # Only affirmative permanence can supply unbounded scope; unresolved scope
+    # is never silently upgraded to a permanent exception.
+    return not (live and all(_permanent_scope(s) or _bare_authorization(s, leaf) for s in live)
+                and any(_permanent_scope(s) for s in live))
+
+
+def _provenance_fields(s):
+    low = s.lower()
+    fields = set()
+    if re.search(r"\b(?:restore|restoration|revert)\w*\b", low):
+        fields.add("restore")
+    # The restore trigger's 'owner completion' is not an owner assignment.
+    if re.search(r"\bowner\b(?!\s+(?:completion|completes|is done|finishes|terminal)\b)", low) or _CARD.search(low):
+        fields.add("owner")
+    return fields
+
+
+def _provenance_field(s):
+    fields = _provenance_fields(s)
+    return next(iter(fields)) if len(fields) == 1 else None
+
+
+def _scope_relevant(s, leaf):
+    low = s.lower()
+    # Provenance is an explicit link to the surviving decision even when the
+    # human omits the key and pronoun ("Forget the restore step").
+    field = _provenance_field(s)
+    # A named different object is not this cap's restoration. A bare field
+    # mention, on the other hand, cannot safely leave stale provenance valid.
+    other_object = bool(re.search(r"\b(?:restore|revert) (?:the|my|your|a|an) (?!cap\b|limit\b|change\b|value\b|setting\b|step\b|trigger\b|terms\b)\w+", low))
+    field_link = bool(_provenance_fields(s)) and not other_object
+    if _permanent_scope(s) and not _about_cap(low, leaf):
+        return False  # a bare pronoun cannot relax the surviving cap decision
+    return (_about_cap(low, leaf) or field_link or bool(re.match(r"(?:permanen|(?:quasi|semi)[- ]permanen)", low))
+            or (not other_object and _temporary_intent(s))
+            or bool(re.match(r"(?:this|that|it)\b", low))
+            or bool(re.search(r"\b(?:it|that|this)\s+back\b", low)))
+
+
+def _positive_field(s, field):
+    if not _own_terms(s):
+        return False
+    low = s.lower()
+    # Mentioning the field is not assigning it. Unrecognised field mutations
+    # invalidate the previous field and demand a fresh affirmative assignment.
+    if field == "restore":
+        trigger = r"(?:(?:on|upon|at) (?:owner |card |run )?(?:completion|done)|(?:when )?(?:owner|card|run) (?:completes|is done|finishes|terminal)|at " + _ISO.pattern + r")"
+        return bool(re.fullmatch(
+            r"(?:(?:for (?:that|this) change,?|this is not temporary, but)\s*)?(?:please |i will )?restore "
+            r"(?:(?:root )?(?:kanban\.)?max_in_progress |it |that |this )?to \d+ " + trigger
+            + r"(?: (?:or|and) " + trigger + r")?(?:, whichever is first)?[.!]?", low, re.I))
+    return bool(re.fullmatch(r"(?:regarding that change:\s*)?owner card t_[0-9a-z]+"
+                             r"(?:,\s*(?:run \d+|this session|profile [\w-]+|gateway [\w-]+))*[.!]?", low))
+
+
+def _initial_terms(own_text):
+    # Use the same ordered field semantics within a message as across messages.
+    # A late withdrawal must not disappear in _own_terms and reveal stale terms.
+    keep = []
+    # Canonical compound assignment has two independent fields. Split only its
+    # explicit clause boundaries so updating restore cannot erase the owner.
+    parts = []
+    for original in _live_scope(own_text):
+        if _own_terms(original):
+            split = re.sub(r"\s+for owner card\s+", ". Owner card ", original, flags=re.I)
+            split = re.sub(r",\s+restoring\s+", ". Restore ", split, flags=re.I)
+            parts.extend(_sentences(split))
+        else:
+            parts.append(original)
+    for s in parts:
+        fields = _provenance_fields(s)
+        if fields:
+            keep = [x for x in keep if not (_provenance_fields(x) & fields)]
+            field = _provenance_field(s)
+            if field and _positive_field(s, field):
+                keep.append(s)
+        elif (_scope_relevant(s, "max_in_progress") and not _temporary_intent(s)
+              and not _bare_authorization(s, "max_in_progress") and not _permanent_scope(s)):
+            keep = []  # same unknown-scope invalidation as a later own turn
+        elif _own_terms(s):
+            keep.append(s)
+    return " ".join(keep)
+
+
 def _fold_followup(current, own_text, item, leaf):
     """A later native message of the human that refers to the surviving authorization (names the key, or points at
     'that/it/this change') acts only through its OWN sentences (quoted / reported / interrogative text is skipped, as
@@ -1269,47 +1396,51 @@ def _fold_followup(current, own_text, item, leaf):
     terms replace the earlier ones field by field (latest wins); a plain affirmative 'permanent' relaxes it back
     (the latest decision governs, as for a later value). Unrelated messages change nothing. The authorization, its
     target value and its sha stay those of the authorizing message; the follow-up's sha/ref is linked."""
-    live = [x for x in _sentences(own_text)
-            if not _QUESTION_LEAD.search(x.lower()) and not _REPORTED.search(x.lower())]
-    if not any(leaf in x.lower() or _DEICTIC.search(x.lower()) for x in live):
+    live = _live_scope(own_text)
+    relevant = [s for s in live if _scope_relevant(s, leaf)]
+    if not relevant:
         return
-    mine = " ".join(live)
     link = {"sha": _sha(item["text"]), "ref": item["ref"]}
-    # Withdrawal: the human's own negated restoration about THIS change ("Do not restore it to 7 on owner
-    # completion.") removes the earlier restore terms, so they can no longer satisfy the provenance demand; the write
-    # then refuses until a valid replacement (or a genuine permanent supersession) exists.
-    withdrawn = any(_about_cap(x.lower(), leaf) and any(_negated_before(x.lower(), m.start())
-                                                       for m in _BOUND_RESTORE.finditer(x.lower()))
-                    for x in live)
-    if withdrawn:
-        current["terms_text"] = " ".join(x for x in _sentences(current["terms_text"])
-                                         if not _BOUND_RESTORE.search(x.lower()) and "restore" not in x.lower())
-        current["followups"].append(link)
-    if not _temporary_intent(mine):
-        # Relaxation to permanent is read from a sentence that itself concerns this change: an unrelated
-        # "The database migration is permanent." next to "Keep that unchanged." relaxes nothing.
-        if any(_PERMANENT_NOW.search(x.lower()) and not _PERM_NEG.search(x.lower()) and not _NEG.search(x.lower())
-               and not _CANCEL.search(x.lower()) and _about_cap(x.lower(), leaf) for x in live):
+    changed = False
+    for s in relevant:
+        low = s.lower()
+        # Relaxation must be about the cap itself, not an unrelated adjacent
+        # sentence, and must be affirmative. It is the sole way to discard a
+        # pending temporary/uncertain scope without supplying fresh terms.
+        if _about_cap(low, leaf) and _permanent_scope(s):
             current["temporary"] = False
             current["terms_text"] = ""
-            if not withdrawn:
-                current["followups"].append(link)
-        return
-    current["temporary"] = True
-    if not withdrawn:
+            changed = True
+            continue
+        if re.fullmatch(r"keep (?:that|it|this) unchanged[.!]?", low):
+            continue
+        field = _provenance_field(s)
+        if field and re.fullmatch(r"(?:don't|do not) forget to restore (?:it|this|that) afterwards[.!]?", low):
+            current["temporary"] = True  # reminder, not replacement/withdrawal
+            changed = True
+            continue
+        fields = _provenance_fields(s)
+        if fields:
+            old = _sentences(current["terms_text"])
+            # Invalidate ALL fields mentioned in a compound mutation. A fresh
+            # restore after withdrawing both fields must not resurrect its owner.
+            current["terms_text"] = " ".join(x for x in old if not (_provenance_fields(x) & fields))
+            if field and _positive_field(s, field):
+                current["terms_text"] = (s + " " + current["terms_text"]).strip()
+            current["temporary"] = True
+            changed = True
+            continue
+        if _temporary_intent(s):
+            current["temporary"] = True
+            changed = True
+            continue
+        # Unknown own scope is not permission to preserve a permanent exception
+        # or reuse a previously valid temporary assignment. Demand fresh terms.
+        current["temporary"] = True
+        current["terms_text"] = ""
+        changed = True
+    if changed:
         current["followups"].append(link)
-    later = _own_terms(mine)
-    has_restore = any("restore" in x.lower() for x in _sentences(later))
-    has_card = bool(_CARD.search(later.lower()))
-    keep = []
-    for x in _sentences(current["terms_text"]):
-        low = x.lower()
-        if has_restore and "restore" in low:
-            continue
-        if has_card and (_CARD.search(low) or re.search(r"\b(?:run\s+\d+|this session)\b", low)):
-            continue
-        keep.append(x)
-    current["terms_text"] = (later + " " + " ".join(keep)).strip()
 
 
 def _decision(items, rec, new_value):
@@ -1352,8 +1483,8 @@ def _decision(items, rec, new_value):
                 continue
             # Temporary provenance (owner/run/session/restore/expiry/trigger) comes only from this message's own
             # affirmative sentences: quoted, reported, interrogative or withdrawing text is never a term.
-            own = _own_terms(text_own)
-            current = {"text": raw, "terms_text": own, "temporary": _temporary_intent(text_own),
+            own = _initial_terms(text_own)
+            current = {"text": raw, "terms_text": own, "temporary": _initial_temporary(text_own, leaf),
                        "sha": _sha(raw), "ref": item["ref"], "target": target, "followups": []}
             set_here = True
         if current is not None and not set_here and current is before:
