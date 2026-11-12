@@ -40,6 +40,22 @@ def test_store_bucketed_sums_and_missing(tmp_path):
     st.put("hub", "tokens_io", [(since, 10.0), (since + 60, 20.0), (since + 120, None), (since + 900, 7.0)])
     b = st.bucketed(since, END, 900)  # 24h-style 15-minute buckets
     assert b[("hub", "tokens_io")] == [30.0, 7.0, None, None]
+    sums, sampled = st.bucketed_sampled(since, END, 900)
+    assert sums == b
+    assert sampled[("hub", "tokens_io")] == [2, 1, 0, 0]  # the NULL minute is not a sampled one
+
+
+def test_partly_sampled_hour_rates_over_sampled_minutes(tmp_path):
+    # 7d: the sampler started 7 minutes before the end of the last hour bucket: 7 x 2000 tokens.
+    st = Store(tmp_path / "s.sqlite")
+    st.put("hub", "tokens_io", [(END - 60 * i, 2000.0) for i in range(1, 8)])
+    p = SE.build(st, {}, ["hub"], "hub", "7d", now=NOW)
+    assert p["series"]["tokens_io"]["hub"][-1] == 14000.0
+    assert p["sampled"]["tokens_io"]["hub"][-1] == 7 and p["sampled"]["tokens_io"]["hub"][0] == 0
+    # 14000 tokens over 7 sampled minutes = 2000/m (dividing by the whole hour would say 233/m)
+    assert SE.rate(14000.0, 7 * 60, "m") == 2000.0
+    assert "cards_in" not in p["sampled"]
+    assert p["sampled"]["sess_in"]["hub"] is None  # hub never reported sessions here
 
 
 def test_build_payload(tmp_path):

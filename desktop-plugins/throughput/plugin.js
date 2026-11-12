@@ -53,8 +53,20 @@ export function colorFor(gateways) {
   return out
 }
 
-// A per-bucket (or per-minute) count array as a rate in the chosen unit; missing stays null.
-export const toRate = (counts, seconds, unit) => counts.map((c) => (c == null ? null : (c / seconds) * UNIT_S[unit]))
+// A per-bucket (or per-minute) count array as a rate in the chosen unit; missing stays null. `seconds` is one
+// number for every bucket, or an array (the sampled seconds of each bucket; 0 sampled = missing).
+export const toRate = (counts, seconds, unit) => counts.map((c, i) => {
+  const s = Array.isArray(seconds) ? seconds[i] : seconds
+  return c == null || !s ? null : (c * UNIT_S[unit]) / s
+})
+
+// Seconds actually sampled per bucket for a sampled metric (tokens, sessions); null = whole buckets (cards, or an
+// older backend without `sampled`).
+export function sampledSeconds(payload, metric, gw) {
+  const s = payload?.sampled || {}
+  const a = metric === 'tokens' ? (s.tokens_io?.[gw] ?? s.tokens_cache?.[gw]) : s[metric]?.[gw]
+  return Array.isArray(a) ? a.map((n) => n * 60) : null
+}
 
 // Counts per bucket for one metric, or null when the gateway doesn't report it. `tokens` combines
 // tokens_io with tokens_cache when cache is on (missing only if both are).
@@ -109,7 +121,7 @@ export function layers(payload, metric, gws, view) {
   const L = []
   for (const g of gws) {
     const c = counts(payload, metric, g, view.cache)
-    if (c) L.push({ g, v: toRate(c, payload.bucket_s, view.unit) })
+    if (c) L.push({ g, v: toRate(c, sampledSeconds(payload, metric, g) ?? payload.bucket_s, view.unit) })
   }
   const len = L[0]?.v.length ?? Math.round(((payload?.now ?? 0) - (payload?.since ?? 0)) / (payload?.bucket_s || 60))
   const total = Array.from({ length: len }, (_, i) => {

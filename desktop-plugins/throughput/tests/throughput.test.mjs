@@ -53,6 +53,22 @@ test('toRate: counts per bucket to /s /m /h (hand-computed)', () => {
   assert.deepEqual(P.toRate([30], 300, 'm'), [6])
   assert.deepEqual(P.toRate([30], 300, 'h'), [360])
   assert.deepEqual(P.toRate([90_000], 3600, 'm'), [1500])
+  // per-bucket sampled seconds: 14000 tokens sampled for 7 of 60 minutes = 2000/m; 0 sampled = missing
+  assert.deepEqual(P.toRate([14_000, 5, null], [420, 0, 3600], 'm'), [2000, null, null])
+})
+
+test('partly sampled buckets: rates use the sampled minutes; cards use whole buckets', () => {
+  const p = { bucket_s: 3600, now: 7200, since: 0, gateways: ['hub'],
+    series: { tokens_io: { hub: [null, 14_000] }, tokens_cache: { hub: [null, 700] }, cards_in: { hub: [60, 6] } },
+    sampled: { tokens_io: { hub: [0, 7] }, tokens_cache: { hub: [0, 7] } } }
+  assert.deepEqual(P.sampledSeconds(p, 'tokens', 'hub'), [0, 420])
+  assert.equal(P.sampledSeconds(p, 'cards_in', 'hub'), null)
+  assert.deepEqual(P.layers(p, 'tokens', ['hub'], V()).total, [null, 2000])
+  assert.deepEqual(P.layers(p, 'tokens', ['hub'], V({ cache: true })).total, [null, 2100])
+  assert.deepEqual(P.layers(p, 'cards_in', ['hub'], V()).total, [1, 0.1])
+  // an older backend without `sampled`: whole buckets
+  delete p.sampled
+  assert.deepEqual(P.layers(p, 'tokens', ['hub'], V()).total.map((x) => x && Math.round(x)), [null, 233])
 })
 
 test('rate now: last 5 min on 1h, 15 min otherwise; unsampled minutes are excluded, not 0', () => {

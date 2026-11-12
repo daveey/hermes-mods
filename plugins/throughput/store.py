@@ -126,14 +126,22 @@ class Store:
     def bucketed(self, since: int, until: int, bucket_s: int) -> dict[tuple[str, str], list[Optional[float]]]:
         """``{(gateway, metric): [sum per bucket]}`` over ``[since, until)``; a bucket with no sampled minute is
         None (missing), a bucket with some sampled minutes sums those."""
+        return self.bucketed_sampled(since, until, bucket_s)[0]
+
+    def bucketed_sampled(self, since: int, until: int, bucket_s: int):
+        """``(sums, sampled)``: ``bucketed`` plus ``{(gateway, metric): [sampled minutes per bucket]}``, so a
+        partly sampled bucket's rate can be its sum over the sampled minutes, not over the whole bucket."""
         n = (until - since) // bucket_s
         out: dict[tuple[str, str], list[Optional[float]]] = {}
+        cover: dict[tuple[str, str], list[int]] = {}
         with self._conn() as c:
             rows = c.execute(
                 "SELECT gateway, metric, (minute - ?) / ?, SUM(value), COUNT(value) FROM minutes "
                 "WHERE minute >= ? AND minute < ? GROUP BY 1, 2, 3", (since, bucket_s, since, until)).fetchall()
         for g, m, b, total, sampled in rows:
             arr = out.setdefault((g, m), [None] * n)
+            cov = cover.setdefault((g, m), [0] * n)
             if 0 <= b < n and sampled:
                 arr[b] = float(total)
-        return out
+                cov[b] = int(sampled)
+        return out, cover

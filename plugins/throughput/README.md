@@ -37,7 +37,9 @@ The REST API also starts one if the process has none.
  "recent": {"tokens_io": {"hub": [600, 610]}}, "recent_minutes": 15}
 ```
 
-`series` holds counts per bucket (the Desktop converts to /s, /m, /h); `recent` holds the last 15 per-minute
+`series` holds counts per bucket; `sampled` (tokens and sessions only) holds the sampled minutes per bucket, so
+the Desktop divides a partly sampled bucket's count by the minutes actually sampled (cards are complete, so by
+the whole bucket) and converts to /s, /m, /h; `recent` holds the last 15 per-minute
 counts for the "rate now" numbers. Built at most once per range per 15 s (single flight), in a worker thread.
 
 ## Tests
