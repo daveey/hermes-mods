@@ -36,8 +36,8 @@ offline, green = all fine). Click to expand its machines as before; which groups
 localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list. Each gateway machine is one line under a column header
 (Machine, Slots, Waiting, Can't run, CPU, RAM, Disk free, Busy): rows hold bare numbers and bars, the
 header carries the unit, and all rows share one column grid. Flags and reasons (pinned only, slots not set, on hold,
-not seen, load N min old, load not reported) are hover text on a small ⓘ after the machine name,
-shown only on machines that have any. A stale load greys its cells and an unreported one shows "–". The panel is up to 680 px wide.
+not seen, load N min old, load not reported) are a tooltip on a small ⓘ at the right end of the row,
+shown only on machines that have any (drawn by CSS: native `title` tooltips do not appear in the Desktop popover). A stale load greys its cells and an unreported one shows "–". The panel is as wide as this table (at least 680 px, at most the window) and reserves a gutter for its scrollbar.
 
 Load: each gateway machine reports CPU load, RAM in use and disk space to the Board every 30 s (core
 `hermes_cli/machine_metrics.py` → `POST /v2/machines/me/metrics`, returned by `GET /v2/machines`). The row

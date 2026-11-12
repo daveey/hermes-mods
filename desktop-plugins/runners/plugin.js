@@ -422,11 +422,11 @@ function openCard(run) {
 
 // Column headers for the gateway grid: the unit of each number lives here, not in every row.
 const GW_COLS = [
-  ['name', 'Machine'], ['info', ''], ['slots', 'Slots'],
+  ['name', 'Machine'], ['slots', 'Slots'],
   ['waiting', 'Waiting', 'Unleased ready cards that match this machine and need a slot here'],
   ['ineligible', "Can't run", 'Unleased ready cards whose placement, skills or pins do not match this machine'],
   ['cpu', 'CPU', '1-min load ÷ cores'], ['ram', 'RAM', 'Memory in use'], ['disk', 'Disk free'],
-  ['count', 'Busy']
+  ['count', 'Busy'], ['info', '']
 ]
 
 function GatewayHead() {
@@ -456,11 +456,10 @@ function GatewayRow({ m, now }) {
     m.reason,
     v ? (v.stale ? `load ${v.stale}` : null) : 'load not reported'
   ].filter(Boolean).join(' · ')
-  // Flags and reasons are hover text on a small (i) next to the name, not a column.
+  // Flags and reasons are a small (i) at the end of the row; its tooltip is drawn by CSS from data-tip
+  // (native title tooltips do not show inside the Desktop popover).
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
     h('span', { className: 'hermes-fleet-name' }, text(m.name)),
-    meta ? h('span', { className: 'hermes-fleet-info', role: 'img', tabIndex: 0, title: meta, 'aria-label': `${text(m.name)}: ${meta}` }, 'i')
-      : h('span', { className: 'hermes-fleet-info is-empty', 'aria-hidden': 'true' }),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
@@ -472,7 +471,9 @@ function GatewayRow({ m, now }) {
     h('span', { className: 'hermes-fleet-cell hermes-fleet-ineligible', title: m.ineligible != null ? `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` : undefined }, m.ineligible != null ? `${m.ineligible}` : ''),
     h(MeterCell, { k: 'cpu', v }), h(MeterCell, { k: 'ram', v }), h(MeterCell, { k: 'disk', v }),
     h('span', { className: 'hermes-fleet-count' },
-      m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`)
+      m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
+    meta ? h('span', { className: 'hermes-fleet-info', role: 'img', tabIndex: 0, 'data-tip': meta, 'aria-label': `${text(m.name)}: ${meta}` }, 'i')
+      : h('span', { className: 'hermes-fleet-info is-empty', 'aria-hidden': 'true' })
   )
 }
 
@@ -721,7 +722,8 @@ export function Runners({ ctx }) {
           : h('span', null, label))),
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
-      style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '70vh', overflowY: 'auto' }
+      className: 'hermes-fleet-popover',
+      style: { width: 'max-content', minWidth: 'min(680px, calc(100vw - 24px))', maxWidth: 'calc(100vw - 24px)', maxHeight: '70vh', overflowY: 'auto', overflowX: 'auto', scrollbarGutter: 'stable' }
     }, view ? h(Panel, { view, now, repairClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
   )
 }
@@ -734,6 +736,7 @@ const CSS = `
 .hermes-fleet-chipbar.is-full{background:rgba(214,69,69,.3)}
 .hermes-fleet-chipbar.is-full>span{background:#d64545}
 .hermes-fleet{display:flex;flex-direction:column;gap:3px;font-size:12px;padding:4px}
+.hermes-fleet>:not(.hermes-fleet-gw){contain:inline-size}
 .hermes-fleet-head{display:flex;justify-content:space-between;margin-top:8px;font-weight:600;text-transform:uppercase;font-size:11px;color:var(--ui-text-secondary)}
 .hermes-fleet-head:first-child{margin-top:0}
 .hermes-fleet-row{display:grid;grid-template-columns:150px minmax(0,1fr) 44px;column-gap:8px;align-items:center;min-height:20px}
@@ -756,26 +759,27 @@ const CSS = `
 .hermes-fleet-group-meta{font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap}
 .hermes-fleet-chev{color:var(--ui-text-tertiary);font-size:10px}
 .hermes-fleet-group>.hermes-fleet-row{padding-left:18px}
-.hermes-fleet-gw{display:grid;grid-template-columns:repeat(8,max-content) minmax(max-content,1fr);row-gap:3px}
+.hermes-fleet-gw{display:grid;grid-template-columns:repeat(7,max-content) minmax(max-content,1fr) max-content;row-gap:3px}
 .hermes-fleet-gw>.hermes-fleet-row,.hermes-fleet-cols{display:grid;grid-column:1/-1;grid-template-columns:subgrid;column-gap:16px;align-items:center;white-space:nowrap}
 .hermes-fleet-gw>.hermes-fleet-row>*{grid-row:1}
 .hermes-fleet-cols{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
 .hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count]{text-align:right}
 .hermes-fleet-gw .hermes-fleet-name{grid-column:1;max-width:150px}
-.hermes-fleet-gw .hermes-fleet-slots{grid-column:3;flex-wrap:nowrap}
+.hermes-fleet-gw .hermes-fleet-slots{grid-column:2;flex-wrap:nowrap}
 .hermes-fleet-gw .hermes-fleet-cell{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary)}
-.hermes-fleet-gw .hermes-fleet-waiting{grid-column:4;margin:0;text-align:right}
-.hermes-fleet-gw .hermes-fleet-ineligible{grid-column:5;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-waiting{grid-column:3;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-ineligible{grid-column:4;margin:0;text-align:right}
 .hermes-fleet-gw .hermes-fleet-meter{display:flex;gap:6px}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=cpu]{grid-column:6}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=ram]{grid-column:7}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:8}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=cpu]{grid-column:5}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=ram]{grid-column:6}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:7}
 .hermes-fleet-gw .hermes-fleet-meter.is-stale,.hermes-fleet-gw .hermes-fleet-meter.is-none{color:var(--ui-text-tertiary)}
 .hermes-fleet-gw .hermes-fleet-num{flex:1;text-align:right}
-.hermes-fleet-gw .hermes-fleet-info{grid-column:2;margin-left:-10px;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
+.hermes-fleet-gw .hermes-fleet-info{grid-column:9;margin-left:-8px;position:relative;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
 .hermes-fleet-gw .hermes-fleet-info.is-empty{visibility:hidden}
+.hermes-fleet-gw .hermes-fleet-info:hover::after,.hermes-fleet-gw .hermes-fleet-info:focus-visible::after{content:attr(data-tip);position:absolute;right:-2px;top:calc(100% + 5px);z-index:5;padding:3px 7px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);color:var(--ui-text-primary,inherit);font:normal 400 11px/1.4 system-ui,sans-serif;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:none}
 .hermes-fleet-gw .hermes-fleet-info:hover,.hermes-fleet-gw .hermes-fleet-info:focus-visible{border-color:var(--ui-text-secondary);color:inherit;outline:none}
-.hermes-fleet-gw .hermes-fleet-count{grid-column:9}
+.hermes-fleet-gw .hermes-fleet-count{grid-column:8}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
 .hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}

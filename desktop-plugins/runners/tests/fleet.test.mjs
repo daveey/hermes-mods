@@ -60,11 +60,13 @@ test('registry: gateway machines show fixed slots, flags and unset slot counts',
   // Flags and reasons are hover text, not panel text.
   const note = mini.querySelector(':scope > .hermes-fleet-info')
   assert.equal(note.textContent, 'i')
-  assert.equal(note.title, 'pinned only · slots not set · not seen for 30 min · load not reported')
-  assert.equal(note.getAttribute('aria-label'), `mini: ${note.title}`)
+  assert.equal(note.dataset.tip, 'pinned only · slots not set · not seen for 30 min · load not reported')
+  assert.equal(note.getAttribute('aria-label'), `mini: ${note.dataset.tip}`)
+  assert.equal(note.title, '', 'no native title: the tooltip is the CSS one')
+  assert.equal(mini.lastElementChild, note, 'rightmost')
   assert.equal(mini.title, '', 'the hover text is on the (i), not the whole row')
   assert.doesNotMatch(mini.textContent, /pinned only|slots not set|not seen/)
-  assert.equal(ui.container.querySelector('[data-machine="worker-1"] > .hermes-fleet-info').title, 'load not reported')
+  assert.equal(ui.container.querySelector('[data-machine="worker-1"] > .hermes-fleet-info').dataset.tip, 'load not reported')
   // Labels (capabilities) are not shown on gateway rows.
   assert.doesNotMatch(mini.textContent, /macos/)
   assert.doesNotMatch(hub.textContent, /linux/)
@@ -92,7 +94,7 @@ test('waiting: header counts dispatched cards; rows split placement fit with too
   assert.deepEqual(['waiting', 'ineligible'].map((k) => mini.querySelector(`.hermes-fleet-${k}`).textContent), ['0', '90'])
   // The units are in the column header, once.
   assert.deepEqual([...ui.container.querySelectorAll('.hermes-fleet-cols > span')].map((e) => e.textContent),
-    ['Machine', '', 'Slots', 'Waiting', "Can't run", 'CPU', 'RAM', 'Disk free', 'Busy'])
+    ['Machine', 'Slots', 'Waiting', "Can't run", 'CPU', 'RAM', 'Disk free', 'Busy', ''])
   await ui.close()
   const old = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))  // older gateway: no count
   assert.doesNotMatch(old.container.textContent, /waiting/)
@@ -128,10 +130,10 @@ test('load meters: reported, absent and stale', async () => {
   assert.equal(hub.querySelectorAll('.is-high').length, 1, 'RAM ≥ 90% is highlighted')
   assert.deepEqual(cells('worker-1').map((c) => c.textContent), ['13%', '–', '–'])
   assert.ok(cells('worker-1').every((c) => c.classList.contains('is-stale')))
-  assert.match(ui.container.querySelector('[data-machine="worker-1"] > .hermes-fleet-info').title, /load 10m old/)
+  assert.match(ui.container.querySelector('[data-machine="worker-1"] > .hermes-fleet-info').dataset.tip, /load 10m old/)
   assert.match(cells('worker-1')[0].title, /CPU 13% \(10m old\)/)
   assert.deepEqual(cells('mini').map((c) => c.textContent), ['–', '–', '–'])
-  assert.match(ui.container.querySelector('[data-machine="mini"] > .hermes-fleet-info').title, /load not reported/)
+  assert.match(ui.container.querySelector('[data-machine="mini"] > .hermes-fleet-info').dataset.tip, /load not reported/)
   assert.doesNotMatch(ui.container.querySelector('.hermes-fleet-gw').textContent, /load not reported|old/)
   assert.equal(P.loadParts({ cpus: 16, at: NOW }), null, 'a report with no readable values is "not reported"')
   // CI: the collector's probe has load (no core count) and disk; machines without a probe show no meter line.
@@ -265,11 +267,11 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   assert.deepEqual(rows.map((r) => r.dataset.machine), ['hub', 'worker-1', 'mini'])
   for (const r of rows) {
     assert.deepEqual([...r.children].map((c) => c.className.split(' ')[0]),
-      ['hermes-fleet-name', 'hermes-fleet-info', 'hermes-fleet-slots', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-count'])
+      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-count', 'hermes-fleet-info'])
     assert.equal(r.children.length, ui.container.querySelectorAll('.hermes-fleet-cols > span').length, 'one cell per header column')
   }
   // Flags are hover text on the (i): a row with nothing to say keeps an empty, hidden placeholder so columns hold.
-  assert.deepEqual(rows.map((r) => { const e = r.querySelector(':scope > .hermes-fleet-info'); return [e.title, e.textContent, e.classList.contains('is-empty')] }),
+  assert.deepEqual(rows.map((r) => { const e = r.querySelector(':scope > .hermes-fleet-info'); return [e.dataset.tip || '', e.textContent, e.classList.contains('is-empty')] }),
     [['slots from local cap', 'i', false], ['', '', true], ['pinned only · slots not set · not seen for 30 min', 'i', false]])
   // CI rows keep their own layout outside the gateway grid.
   assert.equal(ui.container.querySelector('.hermes-fleet-gw [data-machine="ec2-gwgen"]'), null)
@@ -278,6 +280,8 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   // The shared columns come from the stylesheet: rows are subgrids of one gateway grid, on one grid row.
   const css = (await import('node:fs')).readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
   assert.match(css, /\n\.hermes-fleet-gw\{display:grid;/)
+  assert.match(css, /\.hermes-fleet-info:hover::after,[^{]*\{content:attr\(data-tip\)/)
+  assert.match(css, /scrollbarGutter: 'stable'/)
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row,\.hermes-fleet-cols\{[^}]*grid-template-columns:subgrid[^}]*white-space:nowrap/)
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row>\*\{grid-row:1\}/)
   await ui.close()
