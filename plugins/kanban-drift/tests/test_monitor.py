@@ -331,3 +331,64 @@ def test_main_presence_not_probed_for_available_target(tmp_path, monkeypatch, ca
     assert code == 0
     assert not marker.exists()
     assert json.loads(capsys.readouterr().out)["absent_targets"] == []
+
+
+# Composed-hook regression (defect cron-0d63c0cf26): in production native_tool reads the model-facing result,
+# after transform_tool_result hooks ran. skill-triggers decorates kanban_create, so a repair filing must still
+# parse, read back and dedupe with that hook in the path, and a refusal must stay an explicit error.
+def _skill_triggers(home, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "skill_triggers_for_drift", Path(__file__).parents[2] / "skill-triggers" / "__init__.py")
+    st = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(st)
+    skill = home / "skills" / "devops" / "kanban-orchestrator"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("**Card bodies for this user**: spec.\n\n**Card mechanics for this user**: x.\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(st, "_skill_dirs", lambda: [home / "skills"])
+    monkeypatch.setattr(st, "_viewed_in_db", lambda s, k: False)
+    return st
+
+
+def _hooked_model_tools(monkeypatch, tools, st):
+    import types
+    fake = types.ModuleType("model_tools")
+    hooked = []
+
+    def handle_function_call(name, args, **_):
+        raw = json.dumps(tools(name, args))
+        out = st.transform_tool_result(tool_name=name, args=args, result=raw, session_id="")
+        hooked.append(out is not None)
+        return out if out is not None else raw
+
+    fake.handle_function_call = handle_function_call
+    monkeypatch.setitem(sys.modules, "model_tools", fake)
+    return hooked
+
+
+def test_composed_skill_triggers_hook_create_readback_restart_dedup(tmp_path, monkeypatch):
+    st = _skill_triggers(tmp_path / "home", monkeypatch)
+    tools = Tools()
+    hooked = _hooked_model_tools(monkeypatch, tools, st)
+    state = tmp_path / "drift.json"
+    m = monitor.Monitor(state, monitor.native_tool)
+    assert m.sample("worker/default", DIRTY)["card"] is None
+    card = m.sample("worker/default", DIRTY)["card"]
+    assert card == "t_fixture_0" and any(hooked)  # the hook really decorated the create result
+    assert monitor.Monitor(state, monitor.native_tool).sample("worker/default", DIRTY)["card"] == card
+    assert len(tools.cards) == 1 and sum(n == "kanban_create" for n, _ in tools.calls) == 1
+
+
+def test_composed_skill_triggers_hook_refusal_stays_explicit(tmp_path, monkeypatch):
+    st = _skill_triggers(tmp_path / "home", monkeypatch)
+
+    def refuse(name, args):
+        return {"error": "placement_unavailable: target not live", "success": False}
+
+    _hooked_model_tools(monkeypatch, refuse, st)
+    m = monitor.Monitor(tmp_path / "drift.json", monitor.native_tool)
+    m.sample("worker/default", DIRTY)
+    with pytest.raises(RuntimeError, match="placement_unavailable"):
+        m.sample("worker/default", DIRTY)
+    row = m.state["targets"]["worker/default"]
+    assert row["card"] is None and row["incident"]  # identity kept for a safe retry, no phantom card
