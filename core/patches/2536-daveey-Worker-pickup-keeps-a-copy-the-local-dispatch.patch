@@ -1,0 +1,221 @@
+From eba518b16ac466ef7591338254b4322f991ff516 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:33:18 +0000
+Subject: [PATCH] [daveey] Worker pickup keeps a copy the local dispatcher
+ holds instead of re-importing it every tick
+
+A copied foreign card the respawn guard held (active_pr) was unclaimed and not
+running, so the next tick's evict() dropped it and pickup() copied it again,
+first in candidate order. On worker-3 at 9/10 in progress (pickup budget 1) it
+took the only slot every tick: 77 imports of t_01a1cde626be2ada in 07:42-08:16Z,
+then t_01a1ce8aff1f09c1, while two cards pinned to the machine waited
+budget_exhausted for ~8 min (t_01a1ced8ec470e59).
+
+evict() now keeps a ready/review copy with a recorded respawn_guarded hold that
+check_respawn_guard still confirms. A kept copy is already here, so _skip_reason
+spends no budget on it. Keeping it is safe for the Board lease: the copy holds
+none, any machine can still lease the card, a local spawn still needs a grant,
+and the feed keeps the copy current (own_partition), so it is evicted as before
+once it ends, blocks, parks or the guard lifts. Hold maintenance stays with the
+home (foreign_copy). The check runs outside the eviction write (the guard may
+read PR state); a failed check evicts as before.
+
+Proof:
+- tests/hermes_cli/test_kanban_pickup_held_copy.py: budget 1, first candidate
+  held by active_pr, a second pinned card eligible. Before: the pinned card is
+  never imported in 4 ticks (RED, 3 of 5 tests fail). After: imported and
+  running by tick 2, the held card copied exactly once across 6 ticks.
+- Mutants on each new condition (status, recorded hold, live guard, the skip,
+  the except) are all killed.
+- 64 kanban pickup/worker-node/placement test files: 1458 passed.
+- Replay on worker-3's live boards (read-only): 6 evictable copies, 1 has a
+  recorded hold in ready (t_01a1cea109ada326 active_pr, re-imported twice in
+  the last minute of the log); the other 5 evict as before.
+---
+ hermes_cli/kanban_worker_node.py              |  29 +++++
+ .../test_kanban_pickup_held_copy.py           | 120 ++++++++++++++++++
+ 2 files changed, 149 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_held_copy.py
+
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 0251f144e5..721ff49e7f 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -308,12 +308,15 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     gone: list[str] = []
+     if not rows:
+         return gone
++    held = _guard_held(conn, [tid for (tid,) in rows])
+     present = {t for t in (*_CHILD_TABLES, "task_chat_links")
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()}
+     from hermes_cli.kanban_db_connect import write_txn
+     with write_txn(conn):
+         conn.execute("UPDATE kanban_sync_state SET applying = 1")
+         for (tid,) in rows:
++            if tid in held:
++                continue
+             if not conn.execute(
+                     "SELECT 1 FROM tasks WHERE id=? AND created_on IS NOT NULL AND created_on != ? "
+                     "AND claim_lock IS NULL AND status != 'running'" + keep, (tid, own)).fetchone():
+@@ -343,6 +346,32 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     return gone
+ 
+ 
++def _guard_held(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
++    """[daveey] Copies the local dispatcher holds in its ready/review lane (respawn guard: ``active_pr``, cooldowns,
++    ...): a recorded ``respawn_guarded`` hold that the guard still confirms. Eviction keeps them. Dropping one
++    re-imported it the next tick, where it took the pickup budget again and was held again: on worker-3 at 9/10
++    in progress (budget 1) a held ``active_pr`` card took the only slot for ~8 min, 77 imports, while two cards
++    pinned to the machine waited ``budget_exhausted`` (t_01a1ced8ec470e59). A kept copy is already here, so pickup
++    spends no budget on it. It holds no lease: the Board still lets any machine lease it, and the feed keeps the
++    copy current, so it is evicted once it ends, blocks or parks, and its home owns hold maintenance
++    (``foreign_copy``). Computed outside the eviction write: the guard may read PR state."""
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_reason
++    held: set[str] = set()
++    for tid in ids:
++        try:
++            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
++            if row is None or row["status"] not in ("ready", "review"):
++                continue
++            if guard_hold_reason(conn, tid, include_replies=False) is None:
++                continue  # the local dispatcher never held it (or a later event broke the hold)
++            if dispatch.check_respawn_guard(conn, tid, lane=row["status"]) is not None:
++                held.add(tid)
++        except Exception:  # health: allow BLE001 -- a failed check evicts as before; the lease still decides
++            _log.warning("kanban worker node: guard check for copy %s failed", tid, exc_info=True)
++    return held
++
++
+ def dispatch_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
+     """Advisory prefilter; the direct claim gate remains authoritative on errors."""
+     try:
+diff --git a/tests/hermes_cli/test_kanban_pickup_held_copy.py b/tests/hermes_cli/test_kanban_pickup_held_copy.py
+new file mode 100644
+index 0000000000..e862cef703
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_held_copy.py
+@@ -0,0 +1,120 @@
++"""A copy the local dispatcher holds (respawn guard) stays, so pickup never re-spends its budget on it.
++
++worker-3 2026-11-12: at 9/10 in progress (pickup budget 1) an ``active_pr``-held card was evicted and
++re-imported every tick and took the only slot; two cards pinned to the machine waited ``budget_exhausted``."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++
++
++@pytest.fixture
++def guard(monkeypatch):
++    """``check_respawn_guard`` holding the ids in ``held`` (the real guard needs a PR comment plus gh state)."""
++    held: dict[str, str] = {}
++    real = kbd.check_respawn_guard
++    monkeypatch.setattr(kbd, "check_respawn_guard",
++                        lambda conn, tid, lane="ready": held.get(tid) or real(conn, tid, lane=lane))
++    return held
++
++
++@pytest.fixture
++def imports(monkeypatch):
++    seen: list[str] = []
++    real = wn.import_cards
++
++    def counting(conn, replica, ids):
++        done = real(conn, replica, ids)
++        seen.extend(done)
++        return done
++    monkeypatch.setattr(wn, "import_cards", counting)
++    return seen
++
++
++def _status(conn, tid):
++    t = kb.get_task(conn, tid)
++    return t.status if t else None
++
++
++def test_a_held_copy_does_not_take_the_pickup_budget_every_tick(gws, guard, imports):
++    hub, worker = gws
++    held = support._hub_card(hub, title="held by active_pr", priority=900, runs_on=PIN)
++    pinned = support._hub_card(hub, title="pinned, eligible", priority=0, runs_on=PIN)
++    guard[held] = "active_pr"
++    for _ in range(4):
++        worker.round()
++        worker.tick(max_spawn=1)  # budget 1: nothing runs yet
++        if _status(worker.conn, pinned) == "running":
++            break
++    assert _status(worker.conn, pinned) == "running"
++    assert imports.count(pinned) == 1
++    assert imports.count(held) == 1  # copied once, then kept while held
++    assert _status(worker.conn, held) == "ready"
++    for _ in range(2):  # the held copy is never copied again while the guard holds it
++        worker.round()
++        worker.tick(max_spawn=2)
++    assert imports.count(held) == 1 and _status(worker.conn, held) == "ready"
++
++
++def test_a_copy_whose_guard_lifts_is_evicted(gws, guard):
++    hub, worker = gws
++    tid = support._hub_card(hub, runs_on=PIN)
++    guard[tid] = "active_pr"
++    worker.round()
++    worker.tick()
++    worker.round()  # push the recorded hold
++    worker.enter()
++    assert wn.evict(worker.conn) == [] and _status(worker.conn, tid) == "ready"
++    guard.pop(tid)
++    assert wn.evict(worker.conn) == [tid]
++
++
++def test_a_copy_the_dispatcher_never_held_is_evicted(gws, guard):
++    hub, worker = gws
++    tid = support._hub_card(hub, runs_on=PIN)
++    guard[tid] = "active_pr"
++    worker.round()
++    worker.enter()
++    replica = wn.open_replica(worker.conn)
++    try:
++        assert wn.import_cards(worker.conn, replica, [tid]) == [tid]
++    finally:
++        replica.close()
++    assert wn.evict(worker.conn) == [tid]  # no recorded hold here: the guard alone does not keep it
++
++
++def test_a_held_copy_that_leaves_the_lane_is_evicted(gws, guard):
++    hub, worker = gws
++    tid = support._hub_card(hub, runs_on=PIN)
++    guard[tid] = "active_pr"
++    worker.round()
++    worker.tick()
++    worker.round()
++    worker.enter()
++    assert wn.evict(worker.conn) == []
++    worker.conn.execute("UPDATE kanban_sync_state SET applying = 1")
++    worker.conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    worker.conn.execute("UPDATE kanban_sync_state SET applying = 0")
++    worker.conn.commit()
++    assert wn.evict(worker.conn) == [tid]
++
++
++def test_a_failed_guard_check_evicts_as_before(gws, guard, monkeypatch):
++    hub, worker = gws
++    tid = support._hub_card(hub, runs_on=PIN)
++    guard[tid] = "active_pr"
++    worker.round()
++    worker.tick()
++    worker.round()
++    worker.enter()
++
++    def boom(conn, task_id, lane="ready"):
++        raise RuntimeError("gh down")
++    monkeypatch.setattr(kbd, "check_respawn_guard", boom)
++    assert wn.evict(worker.conn) == [tid]
+-- 
+2.43.0
+

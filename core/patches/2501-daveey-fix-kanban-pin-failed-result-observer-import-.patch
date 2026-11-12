@@ -1,0 +1,154 @@
+From f5ef9106e9fcd9ac96933a6f691217062ae4e85c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:36:13 +0000
+Subject: [PATCH] [daveey] fix(kanban): pin failed-result observer import path
+ (no more ruamel crash loop)
+
+The Linux failed-result observer unit ran the PM store python as bare
+`sys.executable -m hermes_cli.kanban_failed_result_observer`. build_subprocess_env
+strips Hermes-owned PYTHONPATH and a managed gateway pops it at boot, so the unit's
+--setenv carried none and the store python (no third-party packages) died on
+`No module named 'ruamel'`; Restart=on-failure + StartLimitIntervalSec=0 looped it
+(1068 restarts per unit, 2336 tracebacks/2h on hermes-hub).
+
+Pin the checkout + committed dependency site-packages on the observer env with
+cron.scheduler_worker_env.pin_hermes_tree_on_pythonpath (the kanban worker / cron
+worker fix for #122222) and launch with -P, on both the systemd and non-Linux paths.
+Regression test runs the unit's ExecStart interpreter with only its --setenv env and
+imports ruamel/hermes_yaml/the observer (RED before: ModuleNotFoundError ruamel).
+---
+ hermes_cli/kanban_failed_result_observer.py   |  5 +-
+ hermes_cli/kanban_failed_result_service.py    | 21 +++++++-
+ ...test_kanban_failed_result_launch_safety.py | 50 +++++++++++++++++++
+ 3 files changed, 72 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index 7b37f46197..d1668aafc5 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -38,7 +38,8 @@ def arm(context):
+     if sys.platform == 'linux':
+         from hermes_cli.kanban_failed_result_service import arm_service
+         return arm_service(context, startup_seconds=START_SECONDS)
+-    command = [sys.executable, '-m', __name__, json.dumps(context)]
++    from hermes_cli.kanban_failed_result_service import observer_argv_env
++    command, env = observer_argv_env(build_subprocess_env(extra=systemd_user_bus_env()), context)
+     launch = restart_safe_gateway_child_argv(
+         command, unit_suffix=f'failed-result-{os.getpid()}-{time.monotonic_ns()}',
+         require_restart_safe_scope=True, outlives_parent=True)
+@@ -48,7 +49,7 @@ def arm(context):
+         launch.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+         # detached-spawn: ok — independent reconciler must outlive the failed writer to close its run
+         start_new_session=True, close_fds=True,
+-        env=build_subprocess_env(extra=systemd_user_bus_env()),
++        env=env,
+         cwd=project_root_str(),
+     )
+     assert proc.stdout is not None
+diff --git a/hermes_cli/kanban_failed_result_service.py b/hermes_cli/kanban_failed_result_service.py
+index 0d8bf60d1e..1b7dcbb19e 100644
+--- a/hermes_cli/kanban_failed_result_service.py
++++ b/hermes_cli/kanban_failed_result_service.py
+@@ -11,6 +11,23 @@ from pathlib import Path
+ 
+ from hermes_platform.resolver import locate_command
+ 
++OBSERVER_MODULE = 'hermes_cli.kanban_failed_result_observer'
++
++
++def observer_argv_env(env, context):
++    """[daveey] Same-interpreter observer argv plus its import path pinned on ``env``.
++
++    ``build_subprocess_env`` strips Hermes-owned PYTHONPATH (user children must not see our tree),
++    and a managed gateway's PM store python owns no third-party packages, so a bare
++    ``sys.executable -m`` observer died on ``No module named 'ruamel'`` in a restart loop. Pin the
++    checkout and committed dependency site-packages exactly as the kanban worker and cron worker do.
++    """
++    from cron.scheduler_worker_env import hermes_module_argv, pin_hermes_tree_on_pythonpath
++    from hermes_cli._startup_fast import project_root_str
++
++    env = pin_hermes_tree_on_pythonpath(env, Path(project_root_str()))
++    return [*hermes_module_argv(sys.executable, OBSERVER_MODULE), json.dumps(context)], env
++
+ 
+ def arm_service(context, *, startup_seconds=5.0):
+     """Acknowledge initialized board access only after systemd takes custody.
+@@ -30,7 +47,7 @@ def arm_service(context, *, startup_seconds=5.0):
+     context = {**context, 'ready_path': str(ready)}
+     unit = f'hermes-failed-result-{os.getpid()}-{time.monotonic_ns()}.service'
+     context['observer_unit'] = unit
+-    env = build_subprocess_env(extra=systemd_user_bus_env())
++    argv, env = observer_argv_env(build_subprocess_env(extra=systemd_user_bus_env()), context)
+     command = [*binary, '--user', '--quiet', '--collect', f'--unit={unit}',
+                '--property=Type=exec', '--property=Slice=app.slice',
+                '--property=Restart=on-failure', '--property=RestartSec=500ms',
+@@ -43,7 +60,7 @@ def arm_service(context, *, startup_seconds=5.0):
+                 'HOME', 'LANG', 'TZ', 'TMPDIR'):
+         if key in env:
+             command.append(f'--setenv={key}={env[key]}')
+-    command += ['--', sys.executable, '-m', 'hermes_cli.kanban_failed_result_observer', json.dumps(context)]
++    command += ['--', *argv]
+     try:
+         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, encoding='utf-8', timeout=startup_seconds, env=env, check=False)
+diff --git a/tests/hermes_cli/test_kanban_failed_result_launch_safety.py b/tests/hermes_cli/test_kanban_failed_result_launch_safety.py
+index d885fca1df..94b0c2d207 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_launch_safety.py
++++ b/tests/hermes_cli/test_kanban_failed_result_launch_safety.py
+@@ -54,3 +54,53 @@ def test_service_uses_canonical_install_root_and_reads_readiness(board, tmp_path
+     unit = service.arm_service(context, startup_seconds=.1)
+     assert unit.endswith('.service')
+     assert f'--working-directory={root}' in calls[0]
++
++
++def test_service_execstart_interpreter_imports_runtime_dependencies(board, monkeypatch):
++    """The unit runs with ONLY its --setenv environment: its interpreter must import ruamel/hermes_yaml.
++
++    A managed gateway boots the PM store python (no third-party packages) with PYTHONPATH popped and
++    its venv on sys.path in-process, so ``sys.executable -m`` without a pinned PYTHONPATH crash-looped
++    on ``No module named 'ruamel'`` (2336 tracebacks/2h on hermes-hub).
++    """
++    import os
++    import subprocess
++    import sys
++
++    import ruamel.yaml
++    from cron import scheduler_worker_env
++
++    base = Path(sys.base_prefix) / 'bin' / f'python{sys.version_info.major}.{sys.version_info.minor}'
++    if not base.is_file():
++        pytest.skip('no base interpreter beside this venv')
++    bare = subprocess.run([str(base), '-I', '-c', 'import ruamel.yaml'], capture_output=True, env={}, check=False)
++    if bare.returncode == 0:
++        pytest.skip('base interpreter imports ruamel by itself: not a store-python layout')
++    real_run = subprocess.run  # service.subprocess IS subprocess: keep the real one for the probe
++    _, context = board
++    site_packages = Path(ruamel.yaml.__file__).resolve().parents[2]
++    monkeypatch.delenv('PYTHONPATH', raising=False)
++    monkeypatch.setattr(sys, 'executable', str(base))
++    monkeypatch.setattr(scheduler_worker_env, '_committed_dependency_site_packages', lambda root: site_packages)
++    monkeypatch.setattr(service, 'locate_command', lambda name: SimpleNamespace(command=('/usr/bin/systemd-run',)))
++    calls = []
++
++    def submit(command, **kwargs):
++        calls.append(command)
++        payload = json.loads(command[-1])
++        Path(payload['ready_path']).write_text(payload['observer_unit'], encoding='utf-8')
++        return SimpleNamespace(returncode=0, stderr='')
++
++    monkeypatch.setattr(service.subprocess, 'run', submit)
++    service.arm_service(context, startup_seconds=.1)
++    command = calls[0]
++    split = command.index('--')
++    options, exec_start = command[:split], command[split + 1:]
++    env = dict(o.removeprefix('--setenv=').split('=', 1) for o in options if o.startswith('--setenv='))
++    cwd = next(o.removeprefix('--working-directory=') for o in options if o.startswith('--working-directory='))
++    module = exec_start.index('-m')
++    assert exec_start[module + 1] == 'hermes_cli.kanban_failed_result_observer'
++    probe = [*exec_start[:module], '-c', 'import ruamel.yaml, hermes_yaml, hermes_cli.kanban_failed_result_observer']
++    done = real_run(probe, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False)
++    assert done.returncode == 0, done.stderr[-2000:]
++    assert os.path.realpath(exec_start[0]) == os.path.realpath(base)
+-- 
+2.43.0
+

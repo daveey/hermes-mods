@@ -1,0 +1,139 @@
+From 5fc0e16993ecf2bde3d13dab2c99d7e017a50829 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:01:11 +0000
+Subject: [PATCH] [daveey] Nudge workers to apply bounded recommended decisions
+
+---
+ agent/prompt_builder.py                  |  7 ++++-
+ hermes_cli/kanban_block_policy.py        | 29 ++++++++++++++++++
+ tests/tools/test_kanban_user_ask_lint.py | 39 ++++++++++++++++++++++++
+ tools/kanban_tools.py                    |  5 ++-
+ 4 files changed, 78 insertions(+), 2 deletions(-)
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index f05bbc45ed..c0c8bb2f52 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -286,7 +286,12 @@ KANBAN_GUIDANCE = (
+     "fresh run resumes from the checkpoint and it never counts as a failure or a block. Do not burn runtime in "
+     "sleep/poll loops: for waits over ~10 minutes (CI, releases, soaks, training checkpoints) start the work in the "
+     "background and call `kanban_continue(checkpoint=..., resume_after_seconds=N)` so the card wakes when it is due.\n"
+-    "4. **Block on genuine ambiguity.** If you need a human decision you cannot infer (a credential only the user "
++    "4. **Apply your in-gate recommendation; block on genuine ambiguity.** If you have an evidence-backed "
++    "recommended option inside the card's limits and normal review and landing gates, apply it rather than "
++    "asking David. Comment the pick and how to reverse it, then continue. Ask only for real money above standing "
++    "envelopes, permissions or credentials, other people, safety or privacy consent, hard-to-reverse effects, "
++    "or genuinely toss-up options with no evidence of David's preference. This never bypasses review or landing "
++    "gates. If you need a human decision you cannot infer (a credential only the user "
+     "holds, UX choice, paywalled source), call `kanban_block(kind=\"needs_input\", reason=\"...\", "
+     "human_request={action, why_human, interaction, scope, evidence})` and stop. Don't guess. A block with no "
+     "human_request, wake_check or clock_only is refused (`agent_owned_block`): access another agent or gateway "
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index 6b0209bdc1..cd64cac135 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -98,6 +98,35 @@ def _assignment_routes(task) -> bool:
+         return False
+ 
+ 
++# Conservative advisory only: these are human boundaries, not an authorization classifier.
++_RECOMMENDATION_BOUNDARY = re.compile(
++    r"\b(?:spend\w*|cost\w*|budget\w*|pay\w*|purchas\w*|money|dollars?|"
++    r"permission\w*|credential\w*|password\w*|tokens?|secrets?|access|"
++    r"consent|privacy|safety|delet\w*|irreversible|destructive|"
++    r"person|people|Rose|colleague\w*|reviewer\w*|customer\w*|vendor\w*|"
++    r"physical|press|plug|unplug|touch|sign[ -]?in)\b|[$€£]", re.IGNORECASE)
++
++
++def recommended_choice_warning(human_request) -> dict:
++    """Non-fatal nudge for a recommended decision; never applies it or changes admission."""
++    if not isinstance(human_request, dict):
++        return {}
++    if human_request.get("interaction") not in {"reply", "approval"}:
++        return {}
++    text = " ".join(str(human_request.get(key) or "") for key in ("action", "scope"))
++    if _RECOMMENDATION_BOUNDARY.search(text):
++        return {}
++    choices = human_request.get("choices")
++    if not isinstance(choices, list) or not any(
++        isinstance(choice, dict) and re.search(r"\brecommended\b", str(choice.get("label") or ""), re.IGNORECASE)
++        for choice in choices
++    ):
++        return {}
++    return {"warning": "this looks like a decision you can apply yourself under David's standing rule; "
++            "apply the recommended option and comment the pick, unless it is a toss-up. "
++            "This warning does not undo the block or grant permission; this run still ends."}
++
++
+ ASK_LINT_CODE = "user_ask_incomplete"
+ _UNBLOCK = re.compile(r"\bun-?block", re.IGNORECASE)
+ _ARCHIVE = re.compile(r"\barchiv", re.IGNORECASE)
+diff --git a/tests/tools/test_kanban_user_ask_lint.py b/tests/tools/test_kanban_user_ask_lint.py
+index bbbc496ca8..0f51393dde 100644
+--- a/tests/tools/test_kanban_user_ask_lint.py
++++ b/tests/tools/test_kanban_user_ask_lint.py
+@@ -46,6 +46,45 @@ def _task(tid):
+         conn.close()
+ 
+ 
++@pytest.mark.parametrize("action,scope,interaction,choices,warns", [
++    ("Choose fixture timing", "code fixtures", "reply", True, True),
++    ("Approve a spend cap of $50", "code fixtures", "reply", True, False),
++    ("Grant permission", "code fixtures", "approval", True, False),
++    ("Give consent", "code fixtures", "reply", True, False),
++    ("Choose fixture timing", "code fixtures", "physical", True, False),
++    ("Choose fixture timing", "code fixtures", "reply", False, False),
++    ("Choose fixture timing", "privacy consent", "reply", True, False),
++    ("Ask the reviewer", "code fixtures", "reply", True, False),
++    ("Delete the data", "code fixtures", "reply", True, False),
++])
++def test_recommended_decision_warning_is_nonfatal(worker_env, action, scope, interaction, choices, warns):
++    from tools import kanban_tools as kt
++    request = {**CLEAR, "action": action + ". Unblock = proceed; archive = skip.",
++               "scope": scope, "interaction": interaction,
++               "choices": [{"label": "Postmerge (recommended)" if choices else "Postmerge", "value": "post"},
++                           {"label": "Premerge", "value": "pre"}]}
++    result = json.loads(kt._handle_block({"reason": "Fixture timing", "kind": "needs_input",
++                                       "human_request": request}))
++    assert result.get("ok") is True, result
++    assert _task(worker_env).status == "blocked"
++    assert ("apply the recommended option" in result.get("warning", "")) is warns
++
++
++@pytest.mark.parametrize("hr", [None, [], {}, {"interaction": "reply"},
++    {"interaction": "reply", "choices": "recommended"},
++    {"interaction": "reply", "choices": [None, {"label": "ordinary"}]}])
++def test_recommendation_warning_ignores_missing_or_malformed_choices(hr):
++    from hermes_cli.kanban_block_policy import recommended_choice_warning
++    assert recommended_choice_warning(hr) == {}
++
++
++def test_worker_guidance_applies_recommendation_with_boundaries():
++    from agent.prompt_builder import KANBAN_GUIDANCE
++    for phrase in ("Comment the pick and how to reverse it", "permissions or credentials",
++                   "safety or privacy consent", "hard-to-reverse", "toss-up"):
++        assert phrase in KANBAN_GUIDANCE
++
++
+ def test_block_with_vague_ask_is_refused(worker_env):
+     from tools import kanban_tools as kt
+     d = json.loads(kt._handle_block({"reason": "Waiting on the design pick", "kind": "needs_input",
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index af94e06853..abf1d0fa15 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1149,7 +1149,10 @@ def _handle_block(args: dict, **kw) -> str:
+                 "so this was recorded as needs_input (sticky until a human unblocks) "
+                 "instead of parking in todo where the dispatcher would respawn it."
+             )
+-        return _ok_landed(kb, conn, tid, "blocked", **extra)
++        from hermes_cli.kanban_block_policy import recommended_choice_warning
++
++        return _ok_landed(kb, conn, tid, "blocked", **extra,
++                          **recommended_choice_warning(args.get("human_request")))
+ 
+ 
+ @_kanban_handler("kanban_schedule")
+-- 
+2.43.0
+

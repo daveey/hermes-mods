@@ -1,0 +1,568 @@
+From 7eae7b3d403fad9acb937bab9e5335ea824da7af Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:17:04 +0000
+Subject: [PATCH] fix(serve): every chat-hosting backend is discoverable for
+ plugin activation, not just the role holder [daveey]
+
+The host rendezvous keeps one record per role. Two Desktop-owned backends can run at once: the
+supervised always-on SSH backend (`hermes serve --isolated`, launchd com.hermes.always-on-dashboard)
+and a local Desktop pool child, or two pool children. Both claim `desktop-serve`; the loser returns
+on HELD_BY_OTHER and publishes nothing, and never re-claims when the holder exits. On daveey-mini
+the always-on backend on :9147 (hosting the MacBook Desktop's chats over SSH) lost the record to a
+pool child at 22:46; once that child exited only `host-desktop-serve.lock` was left, so
+`hermes plugins enable` and hermes-sync's backend activation reached only serve:9119 and :9147 kept
+its old plugin hooks (t_01a1ce929e118cf2).
+
+- gateway/host_backends.py: each serve backend also publishes `serve-backends/<pid>.json` (a
+  HostRecord) + 0600 `<pid>.token`, whatever its role-lock outcome. Readers trust an entry only while
+  its pid names the same incarnation (start ticks + boot epoch) and prune provably dead ones; the
+  entry is removed on exit (atexit + SIGTERM via host_rendezvous.register_exit_cleanup).
+- plugins_activation.serve_backend_records(): role records first, then token-consistent entries not
+  already listed (dedupe pid/port). notify_serve_backend_record dials with the record's own entry
+  token, else its role token only when the role record names the same pid.
+- Discovery only: the attach/refuse ladder still reads role records; an entry never makes a
+  backend a host owner.
+---
+ gateway/host_backends.py                      | 177 ++++++++++++++++++
+ gateway/host_rendezvous.py                    |  25 ++-
+ hermes_cli/plugins_activation.py              |  17 +-
+ hermes_cli/web_server.py                      |   7 +
+ tests/gateway/test_host_backends.py           | 100 ++++++++++
+ ...lugin_activation_second_desktop_backend.py | 117 ++++++++++++
+ 6 files changed, 439 insertions(+), 4 deletions(-)
+ create mode 100644 gateway/host_backends.py
+ create mode 100644 tests/gateway/test_host_backends.py
+ create mode 100644 tests/hermes_cli/test_plugin_activation_second_desktop_backend.py
+
+diff --git a/gateway/host_backends.py b/gateway/host_backends.py
+new file mode 100644
+index 0000000000..1b83eb33be
+--- /dev/null
++++ b/gateway/host_backends.py
+@@ -0,0 +1,177 @@
++"""Per-process entries for every chat-hosting serve backend, next to the host role records.
++
++:mod:`gateway.host_rendezvous` keeps ONE record per role. Two Desktop-owned backends can run at
++once (the supervised always-on SSH backend plus a local Desktop pool child, or two pool children),
++and the one that finds ``desktop-serve`` held publishes nothing. ``hermes plugins enable`` and
++hermes-sync then never reach the chats it hosts: on daveey-mini the always-on backend on :9147
++kept its old plugin hooks after the Desktop child that held the role exited (t_01a1ce929e118cf2).
++
++So every serve backend also publishes ``serve-backends/<pid>.json`` (a :class:`HostRecord`) and a
++0600 ``serve-backends/<pid>.token``, whatever its role-lock outcome. This is discovery only: the
++attach/refuse ladder still reads the role records, and an entry never makes a backend a host owner.
++An entry is trusted only while its pid still names the same process incarnation; a provably dead
++one is pruned by the next reader.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Optional, Sequence
++
++from gateway import host_rendezvous as hr
++from utils import atomic_json_write
++
++logger = logging.getLogger(__name__)
++
++DIRNAME = "serve-backends"
++#: Roles an entry may carry: the chat-hosting serve roles, never the gateway.
++ENTRY_ROLES = (hr.ROLE_SERVE, hr.ROLE_DESKTOP_SERVE)
++
++
++def backends_dir() -> Path:
++    return hr.host_state_dir() / DIRNAME
++
++
++def entry_path(pid: int) -> Path:
++    return backends_dir() / f"{int(pid)}.json"
++
++
++def token_path(pid: int) -> Path:
++    return backends_dir() / f"{int(pid)}.token"
++
++
++def _ensure_dir() -> Path:
++    from hermes_dir_acl import make_user_dir
++
++    hr.ensure_host_state_dir()
++    directory = backends_dir()
++    make_user_dir(directory, parents=True, exist_ok=True, mode=0o700)
++    return directory
++
++
++def publish(
++    role: str,
++    *,
++    host: str = "",
++    port: Optional[int] = None,
++    profiles: Sequence[str] = (),
++    token: Optional[str] = None,
++    home: str = "",
++) -> Optional[hr.HostRecord]:
++    """Publish this process's entry (token first, then the record). ``None`` when not written.
++
++    A backend with no port or no token cannot be dialed, so it publishes nothing."""
++    if role not in ENTRY_ROLES or not token or not (isinstance(port, int) and port > 0):
++        return None
++    from gateway.status import get_process_start_time
++
++    pid = os.getpid()
++    record = hr.HostRecord(
++        role=role,
++        pid=pid,
++        create_time=hr.process_create_time(),
++        start_time=get_process_start_time(pid),
++        boot_epoch=hr._current_boot_epoch(),
++        host=str(host or ""),
++        port=port,
++        protocol_version=hr.HOST_PROTOCOL_VERSION,
++        token_fingerprint=hr.token_fingerprint(token),
++        profiles=tuple(str(p) for p in profiles),
++        updated_at=datetime.now(UTC).isoformat(),
++        home=str(home or ""),
++    )
++    try:
++        _ensure_dir()
++        hr._write_private_text(token_path(pid), token)
++        atomic_json_write(entry_path(pid), record.to_json(), mode=0o600)
++    except OSError:
++        logger.warning("serve backend entry could not be published; plugin activation will not "
++                       "find this backend unless it holds its role record", exc_info=True)
++        return None
++    hr.register_exit_cleanup(clear)
++    return record
++
++
++def clear() -> None:
++    """Remove this process's entry + token (never another process's)."""
++    pid = os.getpid()
++    for path in (entry_path(pid), token_path(pid)):
++        with contextlib.suppress(OSError):
++            path.unlink(missing_ok=True)
++
++
++def _read(path: Path) -> Optional[hr.HostRecord]:
++    if not hr._record_is_own(path):
++        return None
++    try:
++        record = hr.HostRecord.from_json(json.loads(path.read_text(encoding="utf-8-sig")))
++    except (OSError, UnicodeDecodeError, ValueError, TypeError):
++        return None
++    if record is None or record.role not in ENTRY_ROLES or path.stem != str(record.pid):
++        return None
++    return record
++
++
++def _prune(path: Path, record: hr.HostRecord) -> None:
++    """Drop a provably dead entry, unless its pid was republished since it was read."""
++    if _read(path) != record:
++        return
++    for stale in (path, token_path(record.pid)):
++        with contextlib.suppress(OSError):
++            stale.unlink(missing_ok=True)
++
++
++def read_entries() -> list[hr.HostRecord]:
++    """Every live entry, oldest process first. A provably dead one is pruned; an unprovable one
++    (no psutil, permission denied) is kept for the token check and the dial to settle."""
++    directory = backends_dir()
++    try:
++        paths = sorted(directory.glob("*.json"))
++    except OSError:
++        return []
++    out = []
++    for path in paths:
++        record = _read(path)
++        if record is None:
++            continue
++        if record.protocol_version != hr.HOST_PROTOCOL_VERSION:
++            continue
++        if hr._record_incarnation_matches(record) is False:
++            _prune(path, record)
++            continue
++        out.append(record)
++    return sorted(out, key=lambda r: (r.create_time or 0.0, r.pid))
++
++
++def read_token(record: hr.HostRecord) -> str:
++    """The entry token for ``record``'s pid (``""`` when absent)."""
++    try:
++        return token_path(record.pid).read_text(encoding="utf-8-sig").strip()
++    except (OSError, UnicodeDecodeError):
++        return ""
++
++
++def token_is_consistent(record: hr.HostRecord) -> bool:
++    """Does the entry token still hash to the record's fingerprint (no torn restart)?"""
++    return bool(record.token_fingerprint) and hr.token_fingerprint(read_token(record)) == record.token_fingerprint
++
++
++def token_for(record: hr.HostRecord) -> str:
++    """Session token to dial ``record``: its own entry token, else its role token when the role
++    record still names the same pid (a backend from before entries existed). Never another
++    process's token."""
++    token = read_token(record) if isinstance(getattr(record, "pid", None), int) else ""
++    if token and hr.token_fingerprint(token) == getattr(record, "token_fingerprint", ""):
++        return token
++    role = getattr(record, "role", hr.ROLE_SERVE)
++    role_record = hr.read_record(role, include_stale=True)
++    if role_record is None or role_record.pid == getattr(record, "pid", None):
++        # The role's own token: the record is that role's owner, or (no role record to compare,
++        # e.g. a pre-entry caller handing in its own record object) the only token there is.
++        return hr.read_token(role)
++    return ""
+diff --git a/gateway/host_rendezvous.py b/gateway/host_rendezvous.py
+index 4a85516cc3..903938235e 100644
+--- a/gateway/host_rendezvous.py
++++ b/gateway/host_rendezvous.py
+@@ -715,6 +715,7 @@ def clear_record(role: str) -> None:
+ 
+ # Roles this process must clean up on the way out, and the signal handlers we prepended.
+ _cleanup_roles: list[str] = []
++_extra_cleanups: list[Any] = []
+ _prev_signal_handlers: dict[int, Any] = {}
+ 
+ 
+@@ -731,6 +732,9 @@ def _handle_terminating_signal(signum, frame) -> None:
+ 
+     for role in tuple(_cleanup_roles):
+         _cleanup_role(role)
++    for callback in tuple(_extra_cleanups):
++        with contextlib.suppress(Exception):
++            callback()
+     prev = _prev_signal_handlers.get(signum)
+     if callable(prev):
+         prev(signum, frame)
+@@ -757,13 +761,30 @@ def cleanup_on_exit(role: str) -> None:
+     unchanged.
+     """
+     import atexit
+-    import signal as _signal
+-    import threading
+ 
+     role = _validated_role(role)
+     if role not in _cleanup_roles:
+         _cleanup_roles.append(role)
+         atexit.register(_cleanup_role, role)
++    _install_terminating_signal_cleanup()
++
++
++def register_exit_cleanup(callback) -> None:
++    """Run ``callback`` (no args, must not raise) on exit, SIGTERM included, like a role cleanup.
++
++    For files that are not a role record, e.g. :mod:`gateway.host_backends` entries."""
++    import atexit
++
++    if callback not in _extra_cleanups:
++        _extra_cleanups.append(callback)
++        atexit.register(callback)
++    _install_terminating_signal_cleanup()
++
++
++def _install_terminating_signal_cleanup() -> None:
++    import signal as _signal
++    import threading
++
+     if threading.current_thread() is not threading.main_thread():
+         return
+     for name in ("SIGTERM", "SIGBREAK"):
+diff --git a/hermes_cli/plugins_activation.py b/hermes_cli/plugins_activation.py
+index e81118e997..351ea19918 100644
+--- a/hermes_cli/plugins_activation.py
++++ b/hermes_cli/plugins_activation.py
+@@ -245,7 +245,10 @@ def serve_backend_records() -> list:
+     (``serve``) first, then the Desktop child (``desktop-serve``). Both can run at once (a supervised
+     dashboard plus Desktop), and Desktop chats live in the child, so an activation must reach each
+     (t_01a19a63867979de). A stale (dead pid) record is skipped by ``read_record``; one whose token no
+-    longer matches is skipped here. Never raises for one bad record."""
++    longer matches is skipped here. Then every per-process entry (``gateway.host_backends``) not
++    already listed: a second Desktop-owned backend holds no role record (t_01a1ce929e118cf2).
++    Never raises for one bad record."""
++    from gateway import host_backends as hb
+     from gateway import host_rendezvous as hr
+     records, seen = [], set()
+     for role in (hr.ROLE_SERVE, hr.ROLE_DESKTOP_SERVE):
+@@ -258,6 +261,15 @@ def serve_backend_records() -> list:
+         if usable and (record.pid, record.port) not in seen:
+             seen.add((record.pid, record.port))
+             records.append(record)
++    try:
++        entries = hb.read_entries()
++    except Exception:
++        logger.debug("serve backend entries unreadable", exc_info=True)
++        entries = []
++    for record in entries:
++        if record.port and (record.pid, record.port) not in seen and hb.token_is_consistent(record):
++            seen.add((record.pid, record.port))
++            records.append(record)
+     return records
+ 
+ 
+@@ -290,9 +302,10 @@ def notify_serve_backend_record(record, name: str, home: Path) -> dict[str, Any]
+     try:
+         import json
+         import urllib.request
++        from gateway import host_backends as hb
+         from gateway import host_rendezvous as hr
+         from hermes_cli.url_utils import format_url_host
+-        token = hr.read_token(record.role)
++        token = hb.token_for(record)
+         request = urllib.request.Request(
+             f"http://{format_url_host(hr.dial_host(record))}:{record.port}"
+             "/api/dashboard/agent-plugins/activate",
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index dd20dc8de0..1e981be400 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1344,6 +1344,13 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
+ 
+     desktop_child = is_desktop_owned_backend()
+     role = hr.ROLE_DESKTOP_SERVE if desktop_child else hr.ROLE_SERVE
++    # Whatever the role lock says below: a second Desktop-owned backend (the always-on SSH backend
++    # beside a pool child) publishes no role record, and plugin activation must still reach its
++    # chats (t_01a1ce929e118cf2). Discovery only; the attach ladder never reads these entries.
++    from gateway import host_backends
++
++    host_backends.publish(role, host=host, port=port, profiles=hr.served_profiles(),
++                          token=_SESSION_TOKEN)
+ 
+     outcome, error = hr.claim_host_lock(role)
+     if outcome is hr.HostLockOutcome.COULD_NOT_OPEN:
+diff --git a/tests/gateway/test_host_backends.py b/tests/gateway/test_host_backends.py
+new file mode 100644
+index 0000000000..12e1bd8a68
+--- /dev/null
++++ b/tests/gateway/test_host_backends.py
+@@ -0,0 +1,100 @@
++"""Per-process serve backend entries (``gateway.host_backends``, t_01a1ce929e118cf2).
++
++The role record holds one owner per role. On daveey-mini the supervised always-on SSH backend
++(:9147) lost ``desktop-serve`` to a local Desktop pool child, published nothing, and hermes-sync's
++activations never reached its chats. Each backend now also publishes its own entry; these tests
++use a real rendezvous dir, real processes and real liveness proofs.
++"""
++from __future__ import annotations
++
++import dataclasses
++import json
++import os
++import stat
++import subprocess
++import sys
++
++import pytest
++
++from gateway import host_backends as hb
++from gateway import host_rendezvous as hr
++
++
++@pytest.fixture
++def lock_dir(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
++    monkeypatch.setattr(hr, "register_exit_cleanup", lambda callback: None)
++    yield tmp_path / "locks"
++    hb.clear()
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def test_publish_writes_a_private_entry_and_token_that_read_back(lock_dir):
++    record = hb.publish(hr.ROLE_DESKTOP_SERVE, host="127.0.0.1", port=9147, token="always-on-token")
++
++    assert record is not None and record.pid == os.getpid()
++    assert hb.read_entries() == [record]
++    assert hb.read_token(record) == "always-on-token"
++    assert hb.token_is_consistent(record) and hb.token_for(record) == "always-on-token"
++    if sys.platform != "win32":
++        assert stat.S_IMODE(hb.backends_dir().stat().st_mode) == 0o700
++        assert stat.S_IMODE(hb.token_path(record.pid).stat().st_mode) == 0o600
++        assert stat.S_IMODE(hb.entry_path(record.pid).stat().st_mode) == 0o600
++
++
++@pytest.mark.parametrize("kwargs", [
++    {"role": hr.ROLE_DESKTOP_SERVE, "port": 9147, "token": ""},
++    {"role": hr.ROLE_DESKTOP_SERVE, "port": None, "token": "t"},
++    {"role": hr.ROLE_GATEWAY, "port": 9147, "token": "t"},
++])
++def test_an_undialable_backend_publishes_nothing(lock_dir, kwargs):
++    role = kwargs.pop("role")
++    assert hb.publish(role, host="127.0.0.1", **kwargs) is None
++    assert hb.read_entries() == []
++
++
++def test_a_dead_entry_is_pruned_with_its_token(lock_dir):
++    record = hb.publish(hr.ROLE_DESKTOP_SERVE, host="127.0.0.1", port=9147, token="t")
++    dead = _dead_pid()
++    payload = {**record.to_json(), "pid": dead}
++    hb.entry_path(dead).write_text(json.dumps(payload))
++    hb.token_path(dead).write_text("old-token")
++
++    assert [r.pid for r in hb.read_entries()] == [os.getpid()]
++    assert not hb.entry_path(dead).exists() and not hb.token_path(dead).exists()
++
++
++def test_an_entry_whose_name_is_not_its_pid_is_ignored(lock_dir):
++    record = hb.publish(hr.ROLE_DESKTOP_SERVE, host="127.0.0.1", port=9147, token="t")
++    hb.entry_path(record.pid).rename(hb.backends_dir() / "1.json")
++
++    assert hb.read_entries() == []
++
++
++def test_clear_removes_only_this_process_entry(lock_dir):
++    hb.publish(hr.ROLE_SERVE, host="127.0.0.1", port=9119, token="t")
++    other = hb.backends_dir() / "999999.json"
++    other.write_text("{}")
++
++    hb.clear()
++
++    assert not hb.entry_path(os.getpid()).exists() and other.exists()
++
++
++def test_token_for_never_hands_out_another_process_role_token(lock_dir):
++    hr.publish_record(hr.ROLE_DESKTOP_SERVE, host="127.0.0.1", port=58497, token="pool-child-token")
++    entry = hb.publish(hr.ROLE_DESKTOP_SERVE, host="127.0.0.1", port=9147, token="always-on-token")
++    try:
++        # Same role, other pid, torn entry token: the pool child's role token must not be used.
++        foreign = dataclasses.replace(entry, pid=entry.pid + 1)
++        assert hb.token_for(foreign) == ""
++        assert hb.token_for(entry) == "always-on-token"
++        # A record whose entry token does not match it falls back to its own role token only.
++        assert hb.token_for(hr.read_record(hr.ROLE_DESKTOP_SERVE)) == "pool-child-token"
++    finally:
++        hr.clear_record(hr.ROLE_DESKTOP_SERVE)
+diff --git a/tests/hermes_cli/test_plugin_activation_second_desktop_backend.py b/tests/hermes_cli/test_plugin_activation_second_desktop_backend.py
+new file mode 100644
+index 0000000000..5a378600c3
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_activation_second_desktop_backend.py
+@@ -0,0 +1,117 @@
++"""A second Desktop-owned backend with no role record still gets the activation (t_01a1ce929e118cf2).
++
++daveey-mini ran the supervised always-on SSH backend (:9147) and a local Desktop pool child. Both
++are Desktop-owned, so both contend for the single ``desktop-serve`` record; the loser published
++nothing and hermes-sync logged only ``backend serve:9119 ok`` while :9147 kept old hooks. Here the
++loser is a REAL second process that publishes only its per-process entry.
++"""
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from gateway import host_backends as hb
++from gateway import host_rendezvous as hr
++from hermes_cli import plugins_activation
++from tests.hermes_cli.test_plugin_activation_serve_fanout import _listener
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++@pytest.fixture
++def second_backend(monkeypatch, tmp_path):
++    """Start a real process that publishes an entry for ``port`` and stays alive."""
++    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
++    procs, servers = [], []
++
++    def start(token: str = "always-on-token"):
++        server, seen = _listener()
++        servers.append(server)
++        code = ("import sys\nfrom gateway import host_backends as hb\n"
++                f"r = hb.publish('desktop-serve', host='127.0.0.1', port={server.server_address[1]}, "
++                f"token={token!r})\nprint('ready' if r else 'refused', flush=True)\nsys.stdin.read()\n")
++        proc = subprocess.Popen([sys.executable, "-c", code], cwd=REPO, text=True,
++                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                env={**os.environ, "PYTHONPATH": str(REPO)})
++        procs.append(proc)
++        assert proc.stdout.readline().strip() == "ready"
++        return proc, server.server_address[1], seen
++
++    yield start
++    for proc in procs:
++        proc.stdin.close()
++        proc.wait(timeout=30)
++    for server in servers:
++        server.shutdown()
++
++
++def test_the_backend_that_lost_the_desktop_serve_record_is_still_activated(second_backend, tmp_path):
++    pool, pool_seen = _listener()
++    try:
++        assert hr.publish_record(hr.ROLE_DESKTOP_SERVE, host="127.0.0.1", port=pool.server_address[1],
++                                 token="pool-child-token") is not None
++        proc, port, seen = second_backend()
++
++        answer = plugins_activation.notify_serve_backend("probe", tmp_path)
++
++        assert pool_seen == [{"token": "pool-child-token", "name": "probe", "home": str(tmp_path)}]
++        assert seen == [{"token": "always-on-token", "name": "probe", "home": str(tmp_path)}]
++        assert [(b["role"], b["port"], b["pid"]) for b in answer["backends"]] == [
++            ("desktop-serve", pool.server_address[1], os.getpid()), ("desktop-serve", port, proc.pid)]
++        assert answer["ok"] is True and "backend_error" not in answer
++    finally:
++        hr.clear_record(hr.ROLE_DESKTOP_SERVE)
++        pool.shutdown()
++
++
++def test_after_the_record_holder_exits_the_survivor_is_still_found(second_backend, tmp_path):
++    # The mini at 23:03: host-desktop-serve.lock, no host-desktop-serve.json, :9147 alive.
++    proc, port, seen = second_backend()
++
++    records = plugins_activation.serve_backend_records()
++
++    assert [(r.role, r.port, r.pid) for r in records] == [("desktop-serve", port, proc.pid)]
++    plugins_activation.notify_serve_backends("probe", tmp_path)
++    assert seen == [{"token": "always-on-token", "name": "probe", "home": str(tmp_path)}]
++
++
++def test_an_entry_with_a_torn_token_is_skipped(second_backend):
++    proc, _port, _seen = second_backend()
++    hb.token_path(proc.pid).write_text("torn-restart-token")
++
++    assert plugins_activation.serve_backend_records() == []
++
++
++def test_the_entry_goes_away_when_its_backend_exits(second_backend):
++    proc, _port, _seen = second_backend()
++    proc.stdin.close()
++    proc.wait(timeout=30)
++
++    assert hb.read_entries() == []
++    assert not hb.entry_path(proc.pid).exists()
++
++
++def test_a_desktop_backend_that_loses_the_role_record_still_publishes_its_entry(monkeypatch, tmp_path):
++    """``web_server._publish_host_rendezvous`` for the always-on SSH backend while a pool child
++    holds ``desktop-serve``: no role record, but its own entry makes it reachable."""
++    from hermes_cli import web_server
++
++    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
++    monkeypatch.setenv("HERMES_DESKTOP", "1")
++    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "always-on-token")
++    monkeypatch.setattr(web_server, "_SESSION_TOKEN", "always-on-token")
++    monkeypatch.setattr(hr, "claim_host_lock", lambda role: (hr.HostLockOutcome.HELD_BY_OTHER, None))
++    monkeypatch.setattr(hr, "register_exit_cleanup", lambda callback: None)
++    try:
++        web_server._publish_host_rendezvous("127.0.0.1", 9147)
++
++        assert hr.read_record(hr.ROLE_DESKTOP_SERVE) is None
++        records = plugins_activation.serve_backend_records()
++        assert [(r.role, r.port, r.pid) for r in records] == [(hr.ROLE_DESKTOP_SERVE, 9147, os.getpid())]
++        assert hb.token_for(records[0]) == "always-on-token"
++    finally:
++        hb.clear()
+-- 
+2.43.0
+

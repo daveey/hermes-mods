@@ -1,0 +1,769 @@
+From 5e865d9eff779d8cc4ff0566615313f2e02d5697 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:36:07 +0000
+Subject: [PATCH] [daveey] ci-flaky-cards: only persistent unavailability turns
+ the cron red
+
+Superseded cancelled runs are not_applicable; carried-over jobs of a
+re-run attempt are read from the attempt that ran them; a fresh missing
+artifact retries; unreadable data exits 1 only after two consecutive
+polls past a 15 min grace window (bounded state).
+---
+ docs/plans/flaky-artifact-metadata-design.md |   9 +
+ scripts/ci/flaky_artifact_poll.py            |  75 +++++-
+ scripts/ci/flaky_kanban.py                   |  91 ++++++-
+ tests/ci/flaky_artifact_fakes.py             |   8 +
+ tests/ci/test_flaky_artifact_poll.py         |  31 +--
+ tests/ci/test_flaky_exit_policy.py           | 249 +++++++++++++++++++
+ tests/ci/test_flaky_protocol_boundaries.py   |  14 +-
+ 7 files changed, 443 insertions(+), 34 deletions(-)
+ create mode 100644 tests/ci/test_flaky_exit_policy.py
+
+diff --git a/docs/plans/flaky-artifact-metadata-design.md b/docs/plans/flaky-artifact-metadata-design.md
+index 9b7dbf94ad..6bfe54be57 100644
+--- a/docs/plans/flaky-artifact-metadata-design.md
++++ b/docs/plans/flaky-artifact-metadata-design.md
+@@ -22,6 +22,15 @@ New scripts/ci/flaky_artifact.py owns strict schema, exporter CLI and ZIP decodi
+ ## Code review follow-up
+ Independent cumulative review deleg_7e2f726c approved with a medium card-flood concern. Consumer now rejects more than 200 aggregate flaky entries across a run before any card side effects (wire schema remains capped at 10000 per slice). Synthetic tests cover exactly 200 and 201 across slices. Explicit earlier, later or malformed job attempts fail closed; cancelled runs and incomplete reports remain FAILED/unprocessed as required, rather than the recovered WIP's terminal SKIPPED behavior. Protocol input is validated before API URL construction and all list pages are size bounded.
+ 
++## Exit policy amendment (t_01a1ced0875af6be, 2026-11-12)
++
++Natural polls showed the conservative cost above was not bounded in practice: the cron exited 1 on every poll for hours. Of 15 unavailable attempts in one receipt, 13 were cancelled 'CI' runs that a newer push to the same branch had superseded (concurrency cancel; each has a newer run of the same workflow and branch), and 2 were "Re-run failed jobs" attempts whose test jobs were carried over from attempt 1 (new job ids stamped run_attempt 2, attempt 1's timestamps, artifacts named for attempt 1). Amended rules:
++
++1. A cancelled run with test jobs is not_applicable when a newer run (any status) of the same workflow_id and head_branch exists (one read of the workflow's run list for that branch); otherwise, or when that read fails, it stays unavailable.
++2. A carried-over test job (it started before the attempt's run_started_at and an earlier attempt has a job with the same name, started_at and completed_at) is supplied by that earlier attempt's artifact and job id, validated against that attempt. A job that really reran still needs its own attempt's artifact.
++3. missing on a run completed less than the grace window ago (default 15 min, --grace-minutes) logs RETRY, stays unprocessed and is not FAILED.
++4. Unreadable data logs WAITING until it was unavailable in two consecutive polls and completed at least the grace window ago; only then FAILED, which is what exits 1. state.unavailable keeps only attempts still listed and unprocessed (capped at 1000). Card filing failures, runs_unavailable and poll_budget stay FAILED at once.
++
+ ## Source reading list
+ /home/ubuntu/code/_wt/flaky-artifact-metadata/scripts/ci/flaky_kanban.py
+ /home/ubuntu/code/_wt/flaky-artifact-metadata/scripts/run_tests_parallel.py (_write_flaky_report, _report_flaky, main)
+diff --git a/scripts/ci/flaky_artifact_poll.py b/scripts/ci/flaky_artifact_poll.py
+index 8d54290abd..f35ee190d4 100644
+--- a/scripts/ci/flaky_artifact_poll.py
++++ b/scripts/ci/flaky_artifact_poll.py
+@@ -6,13 +6,20 @@ validates ALL of them, and only then returns entries. Nothing here touches the K
+ artifact can never cause a partial card side effect. Failures are fixed codes, never payload or
+ exception text.
+ 
+-Unavailable data stays unprocessed and keeps the cron non-green throughout the lookback window.
+-Even an interrupted attempt may contain flakes in a completed slice; never mistake it for no flakes.
++Unavailable data stays unprocessed (the caller retries it next poll and turns the cron red only once it
++persists). Even an interrupted attempt may contain flakes in a completed slice; never mistake it for no flakes,
++except when a newer run of the same workflow on the same branch superseded the cancelled one (a concurrency
++cancel): that newer run tests the branch, so the cancelled one is ``not_applicable``.
++
++A "Re-run failed jobs" attempt copies every job that passed into the new attempt: a new job id stamped with the
++new ``run_attempt``, but the original ``started_at``/``completed_at``, and no new upload. Such a carried-over job
++is matched to the earlier attempt's job (same name and timestamps), and that attempt's artifact supplies it.
+ """
+ from __future__ import annotations
+ 
+ import http.client
+ import re
++import urllib.parse
+ from dataclasses import dataclass, field
+ from typing import Any, Callable
+ 
+@@ -26,6 +33,8 @@ MAX_RUN_FLAKY = 200
+ PER_PAGE = 100
+ _JOB_SUFFIX = re.compile(r"Run tests \((?:affected, )?([1-9][0-9]*)/([1-9][0-9]*)\)", re.ASCII)
+ _FINISHED = {"success", "failure"}
++_STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", re.ASCII)
++SUPERSEDE_PAGE = 20     # newest runs of (workflow, branch) read to find a newer one; the list is newest-first
+ 
+ 
+ class Unavailable(Exception):
+@@ -111,6 +120,59 @@ def expected_jobs(jobs: list[dict[str, Any]], attempt: int = 1, *,
+     return totals.pop(), by_slice
+ 
+ 
++def superseded(fetch: FetchJson, api: str, run: dict[str, Any]) -> bool:
++    """A newer run of the same workflow on the same branch exists (any status). Unreadable means no."""
++    workflow, branch, run_id = run.get("workflow_id"), run.get("head_branch"), run.get("id")
++    if not (fa._int_in(workflow, 1, fa.MAX_INT) and isinstance(branch, str) and 0 < len(branch) <= 255):
++        return False
++    url = (f"{api}/actions/workflows/{workflow}/runs?branch={urllib.parse.quote(branch, safe='')}"
++           f"&per_page={SUPERSEDE_PAGE}&page=1")
++    try:
++        body = fetch(url)
++    except (OSError, ValueError, http.client.HTTPException):
++        return False
++    batch = body.get("workflow_runs") if isinstance(body, dict) else None
++    if not isinstance(batch, list) or len(batch) > SUPERSEDE_PAGE:
++        return False
++    return any(isinstance(r, dict) and fa._int_in(r.get("id"), 1, fa.MAX_INT) and r["id"] > run_id
++               and r.get("head_branch") == branch and r.get("workflow_id") == workflow for r in batch)
++
++
++def _when(job: dict[str, Any]) -> tuple[str, str, str] | None:
++    """(name, started_at, completed_at): what a carried-over copy keeps of its original. None if malformed."""
++    name, start, end = job.get("name"), job.get("started_at"), job.get("completed_at")
++    if isinstance(name, str) and isinstance(start, str) and isinstance(end, str) \
++            and _STAMP.fullmatch(start) and _STAMP.fullmatch(end):
++        return name, start, end
++    return None
++
++
++def _carried_over(fetch: FetchJson, api: str, run: dict[str, Any], jobs: list[dict[str, Any]],
++                  job_ids: dict[int, tuple[int, int]]) -> dict[int, tuple[int, int]]:
++    """Point each slice job that a "Re-run failed jobs" attempt copied (it started before this attempt did) at
++    the earliest attempt holding a job with its name and timestamps: that job ran and uploaded the artifact.
++    A job that really reran in this attempt (or has no readable timestamps) keeps this attempt's artifact."""
++    started = run.get("run_started_at")
++    if not (isinstance(started, str) and _STAMP.fullmatch(started)):
++        return job_ids
++    by_id = {job.get("id"): job for job in jobs}
++    copies = {s: when for s, (jid, _) in job_ids.items()
++              if (when := _when(by_id.get(jid) or {})) is not None and when[1] < started}
++    out = dict(job_ids)
++    for earlier in range(1, run["run_attempt"]):
++        if not copies:
++            break
++        listed = _pages(fetch, f"{api}/actions/runs/{run['id']}/attempts/{earlier}/jobs", "jobs", "jobs_unavailable")
++        originals = {when: job["id"] for job in listed
++                     if (when := _when(job)) is not None and fa._int_in(job.get("id"), 1, fa.MAX_INT)
++                     and job.get("run_attempt", earlier) == earlier}
++        for slice_no, when in list(copies.items()):
++            if when in originals:
++                out[slice_no] = (originals[when], earlier)
++                del copies[slice_no]
++    return out
++
++
+ def _artifact_id(artifacts: list[dict[str, Any]], name: str) -> int:
+     """The one unexpired artifact called ``name``; missing/expired/ambiguous are fixed codes."""
+     named = [a for a in artifacts if a.get("name") == name]
+@@ -135,9 +197,16 @@ def assess_run(repo: str, run: dict[str, Any], fetch: FetchJson, token: str) ->
+         raise Unavailable("invalid")
+     api = f"https://api.github.com/repos/{repo}"
+     jobs = _pages(fetch, f"{api}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs", "jobs_unavailable")
+-    slices, job_ids = expected_jobs(jobs, attempt, cancelled=run.get("conclusion") == "cancelled")
++    try:
++        slices, job_ids = expected_jobs(jobs, attempt, cancelled=run.get("conclusion") == "cancelled")
++    except Unavailable:
++        if run.get("conclusion") == "cancelled" and superseded(fetch, api, run):
++            return RunResult("not_applicable")
++        raise
+     if not job_ids:
+         return RunResult("not_applicable")
++    if attempt > 1:
++        job_ids = _carried_over(fetch, api, run, jobs, job_ids)
+     if not (isinstance(head_sha, str) and fa._SHA.fullmatch(head_sha)):
+         raise Unavailable("invalid")
+     artifacts = _pages(fetch, f"{api}/actions/runs/{run_id}/artifacts", "artifacts", "artifacts_unavailable")
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index afbc4351d9..4d744b9e39 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -38,6 +38,7 @@ on (the hub's board).
+ from __future__ import annotations
+ 
+ import argparse
++import calendar
+ import hashlib
+ import http.client
+ import json
+@@ -564,34 +565,79 @@ def _filing(result: Any, run: dict[str, Any], repo: str, board: Board, state: di
+ 
+ 
+ def _poll_run(repo: str, token: str, run: dict[str, Any], board: Board, state: dict[str, Any],
+-              relay: HubRelay | None) -> tuple[str, list[str]]:
+-    """``(outcome, log lines)``; outcome is complete|empty|not_applicable|unavailable (unavailable = retry later)."""
++              relay: HubRelay | None) -> tuple[str, list[str], str | None]:
++    """``(outcome, log lines, unavailable code)``; outcome is complete|empty|not_applicable|unavailable
++    (unavailable = retry later). The code is set when the run's data could not be read (``fap.Unavailable``);
++    ``poll_github`` turns it into a RETRY/WAITING/FAILED line by how long it has persisted."""
+     key = f"{run['id']}/{run.get('run_attempt', 1)}"
+     try:
+         result = fap.assess_run(repo, run, lambda url: _gh(url, token), token)
+     except fap.Unavailable as exc:
+-        return "unavailable", [f"FAILED run={key} code={exc.code}"]
++        return "unavailable", [], exc.code
+     if result.kind == "not_applicable":
+         state["runs"].append(key)
+-        return "not_applicable", []
++        return "not_applicable", [], None
+     lines = _filing(result, run, repo, board, state, relay)
+     if any(line.startswith("FAILED") for line in lines):
+-        return "unavailable", lines
++        return "unavailable", lines, None
+     state["runs"].append(key)
+-    return ("complete" if any(entries for _, entries in result.jobs) else "empty"), lines
++    return ("complete" if any(entries for _, entries in result.jobs) else "empty"), lines, None
++
++
++GRACE_SECONDS = 15 * 60     # artifacts are listed before their job even completes; 15 min is ample margin
++MAX_TRACKED = 1000
++
++
++def _age(run: dict[str, Any], now: float) -> float | None:
++    """Seconds since the run (attempt) completed, from its ``updated_at``; None when unreadable."""
++    stamp = run.get("updated_at")
++    if not (isinstance(stamp, str) and fap._STAMP.fullmatch(stamp)):
++        return None
++    try:
++        return now - calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
++    except ValueError:
++        return None
++
++
++def _unavailable_line(key: str, code: str, run: dict[str, Any], tracked: dict[str, Any], seq: int,
++                      now: float, grace: float) -> str:
++    """Fresh ``missing`` (completed under ``grace`` ago) is ``RETRY``; an attempt unavailable in this and the
++    previous poll and completed at least ``grace`` ago is ``FAILED`` (the cron goes red); else ``WAITING``."""
++    prev = tracked.get(key)
++    before = prev.get("polls") if isinstance(prev, dict) and prev.get("seq") == seq - 1 else 0
++    polls = (before if isinstance(before, int) and not isinstance(before, bool) and before > 0 else 0) + 1
++    tracked[key] = {"seq": seq, "polls": polls}
++    age = _age(run, now)
++    if code == "missing" and age is not None and age < grace:
++        return f"RETRY run={key} code={code} age={int(age)}s"
++    if polls >= 2 and not (age is not None and age < grace):
++        return f"FAILED run={key} code={code} polls={polls}"
++    return f"WAITING run={key} code={code} polls={polls}"
+ 
+ 
+ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+                 lookback_hours: float = 6.0, relay: HubRelay | None = None,
+-                deadline: float | None = None, checkpoint: Callable[[], None] | None = None) -> list[str]:
++                deadline: float | None = None, checkpoint: Callable[[], None] | None = None,
++                grace: float = GRACE_SECONDS) -> list[str]:
+     """File cards from the metadata artifacts of recently completed runs not seen before.
+ 
+     ``lookback_hours`` must outlast the slowest workflow plus any cron outage, and stay
+     well under ``save_state``'s 1000-run dedupe memory (the repo sees ~50 runs/hour).
+     A run whose artifacts are unavailable, or whose card filing failed, stays unprocessed
+-    (``FAILED`` line) so the next poll retries it; filed ids are not filed twice.
+-    Cancelled/timed-out jobs and incomplete reports also remain unavailable and unprocessed.
+-    Every
++    so the next poll retries it; filed ids are not filed twice. A card filing failure is a
++    ``FAILED`` line at once. Unreadable data (``fap.Unavailable``) is logged by persistence
++    (``state["unavailable"]``: attempt -> poll sequence and consecutive unavailable polls,
++    pruned to attempts still listed and unprocessed, so it stays bounded):
++
++    * ``RETRY run=<k> code=missing age=<s>s``: completed under ``grace`` ago; the artifact may
++      not be listed yet.
++    * ``WAITING run=<k> code=<c> polls=<n>``: unavailable for the first poll in a row, or still
++      inside ``grace``.
++    * ``FAILED run=<k> code=<c> polls=<n>``: unavailable in this and the previous poll and
++      completed at least ``grace`` ago. Only this one turns the cron red.
++
++    Cancelled/timed-out jobs and incomplete reports remain unavailable and unprocessed, except a
++    cancelled run superseded by a newer run of its workflow and branch (``not_applicable``). Every
+     expected slice must supply a valid artifact before any card is touched. When a run was newly
+     observed the log ends with ``POLL complete=<n> empty=<n> unavailable=<n> not_applicable=<n>``
+     (``complete`` counts every run with readable data, ``empty`` the subset with no flakes).
+@@ -612,17 +658,33 @@ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+         return ["FAILED runs_unavailable"]
+     log: list[str] = []
+     counts = {"complete": 0, "empty": 0, "unavailable": 0, "not_applicable": 0}
++    now = time.time()
++    prior_seq = state.get("poll_seq")
++    seq = state["poll_seq"] = (prior_seq if isinstance(prior_seq, int) else 0) + 1
++    prior = state.get("unavailable")
++    tracked: dict[str, Any] = prior if isinstance(prior, dict) else {}
++    keys = [f"{r['id']}/{r.get('run_attempt', 1)}" for r in runs]
+     fresh = [r for r in sorted(runs, key=lambda r: r["id"]) if f"{r['id']}/{r.get('run_attempt', 1)}" not in done]
++    # Bounded: only attempts still listed and unprocessed are remembered.
++    state["unavailable"] = tracked = {k: tracked[k] for k in keys if k in tracked and k not in done}
+     for index, run in enumerate(fresh):
+         if deadline is not None and time.monotonic() >= deadline:
+             log.append(f"FAILED poll_budget deferred={len(fresh) - index}")
+             break
+-        outcome, lines = _poll_run(repo, token, run, board, state, relay)
++        key = f"{run['id']}/{run.get('run_attempt', 1)}"
++        outcome, lines, code = _poll_run(repo, token, run, board, state, relay)
++        if code is not None:
++            lines = [_unavailable_line(key, code, run, tracked, seq, now, grace)]
++        else:
++            tracked.pop(key, None)
+         log += lines
+         counts[outcome] += 1
+         counts["complete"] += outcome == "empty"    # an empty result is a complete one
+         if checkpoint is not None:
+             checkpoint()
++    if len(tracked) > MAX_TRACKED:
++        newest = sorted(tracked, key=lambda k: int(k.split("/")[0]))[-MAX_TRACKED:]
++        state["unavailable"] = {k: tracked[k] for k in newest}
+     if fresh:
+         log.append("POLL " + " ".join(f"{k}={v}" for k, v in counts.items()))
+     return log
+@@ -644,6 +706,8 @@ def main(argv: list[str] | None = None) -> int:
+     ap.add_argument("--hub-wait", type=float, default=90.0, help="seconds to wait for a cross-gateway comment")
+     ap.add_argument("--budget", type=float, default=420.0,
+                     help="--from-github: seconds after which no further run is started (the cron kills it at 600)")
++    ap.add_argument("--grace-minutes", type=float, default=GRACE_SECONDS / 60,
++                    help="--from-github: a run completed this recently may still be listing its artifacts")
+     args = ap.parse_args(argv)
+ 
+     if args.annotate:
+@@ -666,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
+             print("flaky_kanban: GH_TOKEN/GITHUB_TOKEN not set", file=sys.stderr)
+             return 2
+         log = poll_github(args.repo, token, board, state, relay=relay,
+-                          deadline=time.monotonic() + args.budget,
++                          deadline=time.monotonic() + args.budget, grace=args.grace_minutes * 60,
+                           checkpoint=lambda: save_state(args.state, state))
+     else:
+         entries: list[dict[str, str]] = []
+@@ -676,7 +740,8 @@ def main(argv: list[str] | None = None) -> int:
+     save_state(args.state, state)
+     for line in log:  # silent when nothing flaked (no-agent cron delivers stdout)
+         print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {line}")
+-    # A flake that was not filed must not look like a good run: the cron's status goes non-ok.
++    # A flake that was not filed, or data that stayed unreadable across polls, must not look like a good run:
++    # the cron's status goes non-ok. RETRY/WAITING lines (not yet persistent) do not.
+     return 1 if any(line.startswith("FAILED") for line in log) else 0
+ 
+ 
+diff --git a/tests/ci/flaky_artifact_fakes.py b/tests/ci/flaky_artifact_fakes.py
+index 200c6cb61d..e9547099fc 100644
+--- a/tests/ci/flaky_artifact_fakes.py
++++ b/tests/ci/flaky_artifact_fakes.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import io
+ import json
++import urllib.parse
+ import zipfile
+ from typing import Any
+ 
+@@ -48,6 +49,7 @@ class FakeGitHub:
+ 
+     def __init__(self) -> None:
+         self.runs: list[dict[str, Any]] = []
++        self.other_runs: list[dict[str, Any]] = []   # not completed: only the per-workflow listing shows them
+         self.jobs: dict[tuple[int, int], list[dict[str, Any]]] = {}
+         self.artifacts: dict[int, list[dict[str, Any]]] = {}
+         self.zips: dict[int, bytes | Exception] = {}
+@@ -79,6 +81,12 @@ class FakeGitHub:
+         window = slice((page - 1) * per_page, page * per_page)
+         if base == f"{API}/actions/runs":
+             return {"workflow_runs": sorted(self.runs, key=lambda r: -r["id"])[window]}
++        if base.startswith(f"{API}/actions/workflows/") and base.endswith("/runs"):
++            workflow = int(base.removeprefix(f"{API}/actions/workflows/").removesuffix("/runs"))
++            branch = urllib.parse.unquote(params.get("branch", ""))
++            listed = [r for r in self.runs + self.other_runs
++                      if r.get("workflow_id") == workflow and r.get("head_branch") == branch]
++            return {"workflow_runs": sorted(listed, key=lambda r: -r["id"])[window]}
+         parts = base.removeprefix(f"{API}/actions/runs/").split("/")
+         if parts[1:2] == ["attempts"] and parts[-1] == "jobs":
+             return {"jobs": self.jobs.get((int(parts[0]), int(parts[2])), [])[window]}
+diff --git a/tests/ci/test_flaky_artifact_poll.py b/tests/ci/test_flaky_artifact_poll.py
+index fd7f3eaf66..522483ecea 100644
+--- a/tests/ci/test_flaky_artifact_poll.py
++++ b/tests/ci/test_flaky_artifact_poll.py
+@@ -142,7 +142,7 @@ def test_unavailable_data_is_a_fixed_failed_code_and_leaves_the_run_unprocessed(
+     gh.simple(tests=(A,))
+     _BREAKS[how](gh)
+     log, board, state = _poll()
+-    assert log == [f"FAILED run=5/1 code={code}", "POLL complete=0 empty=0 unavailable=1 not_applicable=0"]
++    assert log == [f"WAITING run=5/1 code={code} polls=1", "POLL complete=0 empty=0 unavailable=1 not_applicable=0"]
+     assert state["runs"] == [] and not board.cards
+     assert SECRET not in "\n".join(log)
+ 
+@@ -152,7 +152,7 @@ def test_unavailable_run_is_retried_next_poll_and_then_filed_once(gh):
+     good = gh.zips[100]
+     gh.zips[100] = fa.ArtifactError("download_unavailable")
+     log, board, state = _poll()
+-    assert log[0] == "FAILED run=5/1 code=download_unavailable" and state["runs"] == []
++    assert log[0] == "WAITING run=5/1 code=download_unavailable polls=1" and state["runs"] == []
+     gh.zips[100] = good
+     log, board, state = _poll(board, state)
+     assert log[0].startswith("opened") and state["runs"] == ["5/1"]
+@@ -163,7 +163,7 @@ def test_all_artifacts_are_validated_before_any_card_side_effect(gh):
+     _two_slices(gh)
+     gh.zips[101] = make_zip(meta(slice_no=2, slices=2, complete=False))
+     log, board, state = _poll()
+-    assert log[0] == "FAILED run=5/1 code=incomplete" and not board.cards and state["cards"] == {}
++    assert log[0] == "WAITING run=5/1 code=incomplete polls=1" and not board.cards and state["cards"] == {}
+     assert gh.downloads == [100, 101]                  # slice 1 was read and valid, yet nothing was filed
+ 
+ 
+@@ -188,7 +188,7 @@ def test_incomplete_or_unrecognised_jobs_never_mean_no_flakes(gh, jobs, code):
+     gh.simple()
+     gh.jobs[(5, 1)] = jobs
+     log, _board, state = _poll()
+-    assert log == [f"FAILED run=5/1 code={code}", "POLL complete=0 empty=0 unavailable=1 not_applicable=0"]
++    assert log == [f"WAITING run=5/1 code={code} polls=1", "POLL complete=0 empty=0 unavailable=1 not_applicable=0"]
+     assert state["runs"] == [] and gh.downloads == []
+ 
+ 
+@@ -210,7 +210,7 @@ def test_listing_failures_leave_that_run_retryable_and_other_runs_proceed(gh):
+     gh.simple(run_id=6, tests=(B,), art_id=200)
+     gh.fail["runs/5/artifacts"] = urllib.error.URLError(SECRET)
+     log, board, state = _poll()
+-    assert log[0] == "FAILED run=5/1 code=artifacts_unavailable"
++    assert log[0] == "WAITING run=5/1 code=artifacts_unavailable polls=1"
+     assert log[1].startswith("opened") and log[-1] == "POLL complete=1 empty=0 unavailable=1 not_applicable=0"
+     assert state["runs"] == ["6/1"] and SECRET not in "\n".join(log)
+     gh.fail.clear()
+@@ -223,7 +223,7 @@ def test_jobs_listing_failure_is_jobs_unavailable(gh):
+     gh.simple()
+     gh.fail["/attempts/1/jobs"] = TimeoutError(SECRET)
+     log, _, state = _poll()
+-    assert log[0] == "FAILED run=5/1 code=jobs_unavailable" and state["runs"] == [] and SECRET not in str(log)
++    assert log[0] == "WAITING run=5/1 code=jobs_unavailable polls=1" and state["runs"] == [] and SECRET not in str(log)
+ 
+ 
+ def test_completed_runs_listing_failure_changes_no_state(gh):
+@@ -233,15 +233,18 @@ def test_completed_runs_listing_failure_changes_no_state(gh):
+     assert log == ["FAILED runs_unavailable"] and state["runs"] == [] and not board.cards and gh.downloads == []
+ 
+ 
+-def test_main_exits_one_on_a_failed_unavailable_line(gh, tmp_path, monkeypatch, capsys):
++def test_main_exits_one_once_an_unavailable_run_persists(gh, tmp_path, monkeypatch, capsys):
+     gh.simple()
+     gh.artifacts[5] = []
+     monkeypatch.setenv("GH_TOKEN", "tok")
+     monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: FakeBoard())
+     monkeypatch.setattr(fk, "HubRelay", lambda *a, **k: None)
+-    rc = fk.main(["--from-github", "--repo", "o/r", "--state", str(tmp_path / "s.json")])
++    argv = ["--from-github", "--repo", "o/r", "--state", str(tmp_path / "s.json")]
++    assert fk.main(argv) == 0
+     out = capsys.readouterr().out
+-    assert rc == 1 and "FAILED run=5/1 code=missing" in out and "POLL complete=0" in out
++    assert "WAITING run=5/1 code=missing polls=1" in out and "FAILED" not in out and "POLL complete=0" in out
++    assert fk.main(argv) == 1
++    assert "FAILED run=5/1 code=missing polls=2" in capsys.readouterr().out
+     assert fk.load_state(tmp_path / "s.json")["runs"] == []
+ 
+ 
+@@ -269,7 +272,7 @@ def test_page_overflow_is_rejected(gh, monkeypatch):
+     monkeypatch.setattr(fap, "MAX_PAGES", 2)
+     gh.artifacts[5] = [artifact(3000 + i, name=f"other-{i}") for i in range(250)] + [artifact(100)]
+     log, _, state = _poll()
+-    assert log[0] == "FAILED run=5/1 code=artifacts_unavailable" and state["runs"] == []
++    assert log[0] == "WAITING run=5/1 code=artifacts_unavailable polls=1" and state["runs"] == []
+ 
+ 
+ def test_rerun_attempt_does_not_mix_in_earlier_attempt_artifacts(gh):
+@@ -278,7 +281,7 @@ def test_rerun_attempt_does_not_mix_in_earlier_attempt_artifacts(gh):
+     gh.artifacts[5] = [artifact(100, attempt=1)]
+     gh.zips[100] = make_zip(meta(attempt=1, tests=(A,)))
+     log, board, state = _poll()
+-    assert log[0] == "FAILED run=5/2 code=missing" and not board.cards
++    assert log[0] == "WAITING run=5/2 code=missing polls=1" and not board.cards
+     gh.artifacts[5].append(artifact(110, attempt=2))
+     gh.zips[110] = make_zip(meta(attempt=2, tests=(B,)))
+     log, board, state = _poll(board, state)
+@@ -335,7 +338,7 @@ def test_explicit_other_or_malformed_job_attempt_is_unavailable(gh, own):
+     gh.run(5, attempt=2)
+     gh.jobs[(5, 2)] = [{**job(19), "run_attempt": own}]
+     log, board, state = _poll()
+-    assert log[0] == "FAILED run=5/2 code=jobs_unavailable"
++    assert log[0] == "WAITING run=5/2 code=jobs_unavailable polls=1"
+     assert not state["runs"] and not board.cards and not gh.downloads
+ 
+ 
+@@ -345,7 +348,7 @@ def test_cancelled_test_run_never_means_no_flakes(gh, jobs):
+     gh.run()["conclusion"] = "cancelled"
+     gh.jobs[(5, 1)] = jobs
+     log, board, state = _poll()
+-    assert log[0] == "FAILED run=5/1 code=jobs_unavailable"
++    assert log[0] == "WAITING run=5/1 code=jobs_unavailable polls=1"
+     assert not state["runs"] and not board.cards
+ 
+ 
+@@ -358,5 +361,5 @@ def test_run_flake_limit_is_aggregate_and_precedes_all_side_effects(gh, total):
+     if total == 200:
+         assert len(board.cards) == total and state["runs"] == ["5/1"]
+     else:
+-        assert log[0] == "FAILED run=5/1 code=invalid"
++        assert log[0] == "WAITING run=5/1 code=invalid polls=1"
+         assert not board.cards and not state["runs"]
+diff --git a/tests/ci/test_flaky_exit_policy.py b/tests/ci/test_flaky_exit_policy.py
+new file mode 100644
+index 0000000000..d8fb47c01f
+--- /dev/null
++++ b/tests/ci/test_flaky_exit_policy.py
+@@ -0,0 +1,249 @@
++"""ci-flaky-cards exit policy: only data that stays unreadable across polls turns the cron red.
++
++Fixtures are metadata-only projections of real example-org/hermes Actions runs from
++2026-11-12 that kept the hub cron (98673e649121) exiting 1 on every poll:
++
++* 43179810118 'CI' on wt/reload-tooldefs-barrier, cancelled 08:10:26Z by the concurrency group when
++  43180734907 (itself cancelled later) and 43181620115 (in progress) were pushed to the same branch.
++* 43165298341 attempt 2, a "Re-run failed jobs" of a run whose 8 test slices passed in attempt 1: attempt 2
++  lists the slices with new job ids and run_attempt 2 but attempt 1's started_at/completed_at, and the only
++  metadata artifacts are flaky-metadata-v1-43165298341-1-{1..8}.
++"""
++from __future__ import annotations
++
++import time
++from pathlib import Path
++
++import pytest
++
++from scripts.ci import flaky_artifact as fa
++from scripts.ci import flaky_kanban as fk
++from tests.ci.flaky_artifact_fakes import FakeGitHub, artifact, job, make_zip, meta
++from tests.ci.test_flaky_kanban import FakeBoard
++
++A = "tests/x.py::test_a"
++WF, BRANCH = 381502190, "wt/reload-tooldefs-barrier"
++OLD = "2026-11-12T08:10:26Z"   # completed long before "now" in these tests
++
++
++@pytest.fixture
++def gh(monkeypatch):
++    fake = FakeGitHub()
++    monkeypatch.setattr(fk, "_gh", fake.gh)
++    monkeypatch.setattr(fa, "download_zip", fake.download)
++    return fake
++
++
++def _state():
++    return fk.load_state(Path("/nonexistent/state.json"))
++
++
++def _cancelled(gh, run_id=43179810118, branch=BRANCH, workflow=WF):
++    run = gh.run(run_id)
++    run.update(conclusion="cancelled", head_branch=branch, workflow_id=workflow, updated_at=OLD)
++    gh.jobs[(run_id, 1)] = [job(131040000001, 1, 2), job(131040000002, 2, 2, conclusion="cancelled")]
++    return run
++
++
++def _main(tmp_path, monkeypatch, capsys):
++    monkeypatch.setenv("GH_TOKEN", "tok")
++    monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: FakeBoard())
++    monkeypatch.setattr(fk, "HubRelay", lambda *a, **k: None)
++    argv = ["--from-github", "--repo", "o/r", "--state", str(tmp_path / "s.json")]
++
++    def run() -> tuple[int, str]:
++        rc = fk.main(argv)
++        return rc, capsys.readouterr().out
++    return run
++
++
++# --- 1. a cancelled run superseded by a newer run of its workflow and branch is not applicable ---------------
++
++
++@pytest.mark.parametrize("newer", ["completed", "in_progress"])
++def test_superseded_cancelled_run_is_not_applicable(gh, tmp_path, monkeypatch, capsys, newer):
++    _cancelled(gh)
++    successor = {"id": 43180734907, "head_branch": BRANCH, "workflow_id": WF, "run_attempt": 1}
++    if newer == "completed":     # also in the completed listing: a cancelled, superseded run with no test jobs yet
++        gh.runs.append({**successor, "head_sha": "a" * 40, "conclusion": "cancelled", "updated_at": OLD})
++        gh.jobs[(43180734907, 1)] = []
++        gh.other_runs.append({"id": 43181620115, "head_branch": BRANCH, "workflow_id": WF, "status": "in_progress"})
++    else:                        # the newer run is still running, so only the per-workflow listing shows it
++        gh.other_runs.append({**successor, "status": "in_progress"})
++    poll = _main(tmp_path, monkeypatch, capsys)
++    rc, out = poll()
++    assert rc == 0 and "FAILED" not in out and "WAITING" not in out
++    assert "not_applicable=" in out and fk.load_state(tmp_path / "s.json")["runs"].count("43179810118/1") == 1
++    assert not gh.downloads and not any("/artifacts" in u for u in gh.urls)
++    assert any(f"/actions/workflows/{WF}/runs?branch=wt%2Freload-tooldefs-barrier" in u for u in gh.urls)
++    assert poll() == (0, "")      # processed: never read again
++
++
++# --- 2. a cancelled test run nothing superseded stays unavailable -----------------------------------------------
++
++
++@pytest.mark.parametrize("other", [
++    None,                                                                   # alone on its branch
++    {"id": 43181620115, "head_branch": "wt/other", "workflow_id": WF},      # newer run, other branch
++    {"id": 43181620115, "head_branch": BRANCH, "workflow_id": 4242},        # newer run, other workflow
++    {"id": 43100000000, "head_branch": BRANCH, "workflow_id": WF},          # older run only
++])
++def test_cancelled_test_run_without_a_newer_run_stays_unavailable(gh, other):
++    _cancelled(gh)
++    if other:
++        gh.other_runs.append(other)
++    board, state = FakeBoard(), _state()
++    log = fk.poll_github("o/r", "tok", board, state)
++    assert log == ["WAITING run=43179810118/1 code=jobs_unavailable polls=1",
++                   "POLL complete=0 empty=0 unavailable=1 not_applicable=0"]
++    assert fk.poll_github("o/r", "tok", board, state)[0] == "FAILED run=43179810118/1 code=jobs_unavailable polls=2"
++    assert state["runs"] == []
++
++
++@pytest.mark.parametrize("breaks", ["lookup_fails", "no_workflow_id", "no_branch"])
++def test_unprovable_supersession_keeps_the_cancelled_run_unavailable(gh, breaks):
++    run = _cancelled(gh)
++    gh.other_runs.append({"id": 43181620115, "head_branch": BRANCH, "workflow_id": WF})
++    if breaks == "lookup_fails":
++        gh.fail["/actions/workflows/"] = OSError("boom")
++    else:
++        run.pop("workflow_id" if breaks == "no_workflow_id" else "head_branch")
++    state = _state()
++    log = fk.poll_github("o/r", "tok", FakeBoard(), state)
++    assert log[0] == "WAITING run=43179810118/1 code=jobs_unavailable polls=1" and state["runs"] == []
++
++
++# --- 3. a just-finished run whose artifact is not listed yet is retried, not FAILED -----------------------------
++
++
++def test_fresh_missing_artifact_retries_without_failed_and_is_ingested_next_poll(gh, tmp_path, monkeypatch, capsys):
++    gh.simple(tests=(A,))
++    gh.runs[0]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 120))
++    listed = gh.artifacts[5]
++    gh.artifacts[5] = []
++    poll = _main(tmp_path, monkeypatch, capsys)
++    rc, out = poll()
++    assert rc == 0 and "RETRY run=5/1 code=missing age=" in out and "FAILED" not in out
++    assert fk.load_state(tmp_path / "s.json")["runs"] == []
++    rc, out = poll()                      # still not listed, still inside the grace window: not red either
++    assert rc == 0 and "RETRY run=5/1 code=missing" in out and "FAILED" not in out
++    gh.artifacts[5] = listed
++    rc, out = poll()
++    assert rc == 0 and "opened" in out and A in out
++    state = fk.load_state(tmp_path / "s.json")
++    assert state["runs"] == ["5/1"] and state["unavailable"] == {}
++
++
++def test_missing_on_a_run_past_the_grace_window_is_not_a_retry(gh):
++    gh.simple()
++    gh.runs[0]["updated_at"] = OLD
++    gh.artifacts[5] = []
++    assert fk.poll_github("o/r", "tok", FakeBoard(), _state())[0] == "WAITING run=5/1 code=missing polls=1"
++
++
++# --- 4. only unavailability that persists across polls (and past the grace window) exits 1 ----------------------
++
++
++def test_persistent_unavailable_attempt_exits_one(gh, tmp_path, monkeypatch, capsys):
++    gh.simple()
++    gh.runs[0]["updated_at"] = OLD
++    gh.zips[100] = fa.ArtifactError("download_unavailable")
++    poll = _main(tmp_path, monkeypatch, capsys)
++    rc, out = poll()
++    assert rc == 0 and "WAITING run=5/1 code=download_unavailable polls=1" in out
++    rc, out = poll()
++    assert rc == 1 and "FAILED run=5/1 code=download_unavailable polls=2" in out
++    rc, out = poll()
++    assert rc == 1 and "FAILED run=5/1 code=download_unavailable polls=3" in out
++    assert fk.load_state(tmp_path / "s.json")["runs"] == []
++
++
++def test_unavailable_inside_the_grace_window_waits_even_when_repeated(gh):
++    gh.simple()
++    gh.runs[0]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
++    gh.zips[100] = fa.ArtifactError("download_unavailable")
++    state = _state()
++    fk.poll_github("o/r", "tok", FakeBoard(), state)
++    assert fk.poll_github("o/r", "tok", FakeBoard(), state)[0] == "WAITING run=5/1 code=download_unavailable polls=2"
++
++
++def test_unavailable_streak_needs_consecutive_polls_and_state_stays_bounded(gh):
++    gh.simple(run_id=5)
++    gh.simple(run_id=6, art_id=200)
++    gh.zips[100] = gh.zips[200] = fa.ArtifactError("download_unavailable")
++    state = _state()
++    fk.poll_github("o/r", "tok", FakeBoard(), state)
++    assert set(state["unavailable"]) == {"5/1", "6/1"}
++    gh.runs = [r for r in gh.runs if r["id"] != 5]          # 5 left the lookback window
++    gh.zips[200] = make_zip(meta(6))                         # 6 became readable
++    log = fk.poll_github("o/r", "tok", FakeBoard(), state)
++    assert state["unavailable"] == {} and state["runs"] == ["6/1"] and "FAILED" not in "\n".join(log)
++    gh.simple(run_id=5)
++    gh.zips[100] = fa.ArtifactError("download_unavailable")
++    state["poll_seq"] += 5                                    # polls that did not see it break the streak
++    state["unavailable"]["5/1"] = {"seq": 1, "polls": 1}
++    assert fk.poll_github("o/r", "tok", FakeBoard(), state)[0] == "WAITING run=5/1 code=download_unavailable polls=1"
++
++
++def test_card_filing_failure_is_still_failed_at_once(gh):
++    gh.simple(tests=(A,))
++
++    class Refusing(FakeBoard):
++        def create(self, *a, **k):
++            raise fk.CreateRefused("overlap", [])
++
++    log = fk.poll_github("o/r", "tok", Refusing(), _state())
++    assert log[0].startswith(f"FAILED {A}: create refused")
++
++
++# --- carried-over jobs of a "Re-run failed jobs" attempt use the attempt that ran them --------------------------
++
++
++def _rerun(gh, rerun_slice2=False):
++    """Run 5 attempt 2 after a failed non-test job: both test slices passed in attempt 1."""
++    run = gh.run(5, attempt=2)
++    run["run_started_at"] = "2026-11-12T06:26:39Z"
++    first = [{**job(131006004001, 1, 2), "run_attempt": 1,
++              "started_at": "2026-11-12T06:03:05Z", "completed_at": "2026-11-12T06:10:50Z"},
++             {**job(131006004071, 2, 2), "run_attempt": 1,
++              "started_at": "2026-11-12T06:03:06Z", "completed_at": "2026-11-12T06:10:31Z"}]
++    gh.jobs[(5, 1)] = first
++    copies = [{**j, "id": j["id"] + 8000000, "run_attempt": 2} for j in first]
++    if rerun_slice2:
++        copies[1].update(started_at="2026-11-12T06:27:00Z", completed_at="2026-11-12T06:35:00Z")
++    gh.jobs[(5, 2)] = copies
++    gh.artifacts[5] = [artifact(100, 5, 1, 1), artifact(101, 5, 1, 2)]
++    gh.zips[100] = make_zip(meta(5, attempt=1, slice_no=1, slices=2, tests=(A,)))
++    gh.zips[101] = make_zip(meta(5, attempt=1, slice_no=2, slices=2))
++    return run
++
++
++def test_carried_over_slices_are_read_from_the_attempt_that_ran_them(gh):
++    _rerun(gh)
++    board, state = FakeBoard(), _state()
++    log = fk.poll_github("o/r", "tok", board, state)
++    assert log[0].startswith("opened") and state["runs"] == ["5/2"] and sorted(gh.downloads) == [100, 101]
++    card = board.cards[state["cards"][A]["card"]]
++    # The job that ran (attempt 1's id), so a flake already filed from attempt 1 is not filed again.
++    assert "https://github.com/o/r/actions/runs/5/job/131006004001" in card["body"]
++
++
++def test_a_slice_that_really_reran_still_needs_its_own_attempt_artifact(gh):
++    _rerun(gh, rerun_slice2=True)
++    state = _state()
++    log = fk.poll_github("o/r", "tok", FakeBoard(), state)
++    assert log[0] == "WAITING run=5/2 code=missing polls=1" and state["runs"] == []
++    gh.artifacts[5].append(artifact(110, 5, 2, 2))
++    gh.zips[110] = make_zip(meta(5, attempt=2, slice_no=2, slices=2))
++    log = fk.poll_github("o/r", "tok", FakeBoard(), state)
++    assert state["runs"] == ["5/2"] and "FAILED" not in "\n".join(log) and 110 in gh.downloads and 101 not in gh.downloads
++
++
++def test_carry_over_needs_matching_timestamps(gh):
++    run = _rerun(gh)
++    gh.jobs[(5, 1)][0]["completed_at"] = "2026-11-12T06:10:51Z"   # not the same job
++    state = _state()
++    assert fk.poll_github("o/r", "tok", FakeBoard(), state)[0] == "WAITING run=5/2 code=missing polls=1"
++    run.pop("run_started_at")
++    gh.jobs[(5, 1)][0]["completed_at"] = "2026-11-12T06:10:50Z"
++    assert fk.poll_github("o/r", "tok", FakeBoard(), state)[0].startswith("FAILED run=5/2 code=missing")
+diff --git a/tests/ci/test_flaky_protocol_boundaries.py b/tests/ci/test_flaky_protocol_boundaries.py
+index bed8f9d4d7..de4265a9e5 100644
+--- a/tests/ci/test_flaky_protocol_boundaries.py
++++ b/tests/ci/test_flaky_protocol_boundaries.py
+@@ -54,8 +54,8 @@ def test_api_get_retries_http_read_failures(monkeypatch, kind):
+ 
+ @pytest.mark.parametrize("kind", ["partial", "protocol"])
+ @pytest.mark.parametrize("stage,receipt", [("runs", "FAILED runs_unavailable"),
+-                                           ("jobs", "FAILED run=5/1 code=jobs_unavailable"),
+-                                           ("artifacts", "FAILED run=5/1 code=artifacts_unavailable")])
++                                           ("jobs", "WAITING run=5/1 code=jobs_unavailable polls=1"),
++                                           ("artifacts", "WAITING run=5/1 code=artifacts_unavailable polls=1")])
+ def test_exhausted_http_reads_have_fixed_receipts_and_persist_retryable_state(tmp_path, monkeypatch, capsys,
+                                                                            kind, stage, receipt):
+     fake = FakeGitHub()
+@@ -80,11 +80,17 @@ def test_exhausted_http_reads_have_fixed_receipts_and_persist_retryable_state(tm
+     path = tmp_path / "state.json"
+     initial = {"cards": {"tests/old.py": {"card": "t_old", "generation": 0}}, "runs": ["4/1"]}
+     fk.save_state(path, initial)
+-    assert fk.main(["--from-github", "--repo", "o/r", "--state", str(path)]) == 1
++    # A run-listing failure is red at once; an unreadable run waits one poll, then turns red if it persists.
++    assert fk.main(["--from-github", "--repo", "o/r", "--state", str(path)]) == (1 if stage == "runs" else 0)
+     out = capsys.readouterr()
+     assert receipt in out.out and SECRET.decode() not in out.out + out.err
+     assert len(failures) == 4
+-    assert fk.load_state(path) == initial
++    after = fk.load_state(path)
++    assert (after["cards"], after["runs"]) == (initial["cards"], initial["runs"])
++    if stage != "runs":
++        assert fk.main(["--from-github", "--repo", "o/r", "--state", str(path)]) == 1
++        assert receipt.replace("WAITING", "FAILED").replace("polls=1", "polls=2") in capsys.readouterr().out
++        assert fk.load_state(path)["runs"] == initial["runs"]
+ 
+ 
+ @pytest.mark.parametrize("kind", ["partial", "protocol"])
+-- 
+2.43.0
+

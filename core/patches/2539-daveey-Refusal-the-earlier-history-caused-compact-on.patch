@@ -1,0 +1,488 @@
+From 3088a72182142449d78067a67a98e47cd8ddc248 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:47:05 +0000
+Subject: [PATCH] [daveey] Refusal the earlier history caused: compact once and
+ retry the same message
+
+Chat 20261102_175427_594451: three harmless questions in a row were refused by
+Anthropic's filter. The refusal came on the turn's first call with no tool
+round, so the request differed from the last answered one only by a benign
+message: the earlier history was the trigger. Recovery dropped the refused
+turn and resent that same history, and the notice said "you're not stuck,
+just ask something else", so every re-ask was refused again.
+
+handle_content_policy_refusal (after the configured fallback try) now asks
+agent/turn_refusal_history.history_refusal_step: when the refused request is
+earlier history + only this turn's user row, it force-compacts the earlier
+history once (trigger=content_policy_history, head/tail protection minimized,
+the current message as verbatim tail), arms restart_with_compressed_messages
+and resends the same message. A summary that does not commit, or a refused
+retry (one per turn), closes the turn with copy that names the history and
+points at /new. Refusals after a tool round, a first message, or a
+compaction that cannot run keep the drop-and-notice path. Log line:
+"history-triggered refusal: compacted+retried outcome=<retried|refused|summary_refused|compaction_skipped>".
+---
+ agent/turn_refusal_history.py                 | 112 ++++++++++++++
+ agent/turn_response_check.py                  |   8 +-
+ agent/turn_truncation.py                      |  24 ++-
+ .../test_content_policy_history_trigger.py    | 139 ++++++++++++++++++
+ ...est_content_policy_history_trigger_loop.py |  86 +++++++++++
+ 5 files changed, 366 insertions(+), 3 deletions(-)
+ create mode 100644 agent/turn_refusal_history.py
+ create mode 100644 tests/agent/test_content_policy_history_trigger.py
+ create mode 100644 tests/agent/test_content_policy_history_trigger_loop.py
+
+diff --git a/agent/turn_refusal_history.py b/agent/turn_refusal_history.py
+new file mode 100644
+index 0000000000..64fec1a959
+--- /dev/null
++++ b/agent/turn_refusal_history.py
+@@ -0,0 +1,112 @@
++"""[daveey] Safety refusals the earlier history caused, not the new message.
++
++A refusal on the turn's first model call, before any tool round, judged a request whose only new part is
++the user's message. When that message is harmless the trigger is the history, and dropping the refused
++turn (the normal recovery) resends the trigger, so every later message is refused too (chat
++20261102_175427_594451: three questions refused in a row behind "just ask something else"). Recovery:
++compact the earlier history once, retry the same message once, and if the summary or the retry is
++refused, say the history is the cause and point at /new.
++"""
++from __future__ import annotations
++
++import logging
++from contextlib import contextmanager
++from dataclasses import dataclass
++from typing import Any, Iterator, Optional
++
++logger = logging.getLogger(__name__)
++
++HISTORY_REFUSAL_COPY = (
++    "{label}'s safety filter refused this request, and summarizing this chat's earlier history didn't get "
++    "past it. When a harmless message is refused like this, the earlier history is the trigger and new "
++    "messages here will be refused too: start a new chat with /new (in a Bot Chat, Archive it from its tab "
++    "menu). If this message itself was sensitive, rewording it may help."
++    "\n\nProvider said: {summary}"
++)
++_COMPACTION_TRIGGER = "content_policy_history"
++
++
++@dataclass
++class HistoryRefusalStep:
++    """``outcome``: ``"retry"`` (``messages``/``conversation_history`` hold the compacted request to
++    resend), ``"refused"`` (the compacted retry was refused too) or ``"summary_refused"`` (the summary
++    over the earlier history did not commit). The last two close the turn with ``HISTORY_REFUSAL_COPY``."""
++
++    outcome: str
++    messages: Any = None
++    conversation_history: Any = None
++
++
++def is_history_triggered(messages: Any, current_turn_user_idx: Any) -> bool:
++    """The refused request held earlier history plus only this turn's user row (no model round yet)."""
++    if not (isinstance(messages, list) and isinstance(current_turn_user_idx, int)
++            and 0 < current_turn_user_idx < len(messages)):
++        return False
++    if messages[current_turn_user_idx + 1:]:
++        return False
++    return any(isinstance(m, dict) and m.get("role") in ("user", "assistant", "tool")
++               for m in messages[:current_turn_user_idx])
++
++
++@contextmanager
++def _whole_history_window(compressor: Any) -> Iterator[None]:
++    """Summarize as much of the head as the compressor allows: the trigger may sit in the first exchange
++    or the recent tail that normal compaction keeps verbatim. The compressor still keeps its required
++    anchors, so a trigger there survives; the retry is then refused and the turn closes with the copy."""
++    saved = {}
++    for name, value in (("protect_first_n", 0), ("protect_last_n", 0), ("tail_token_budget", 1)):
++        if compressor is not None and hasattr(compressor, name):
++            saved[name] = getattr(compressor, name)
++            setattr(compressor, name, value)
++    try:
++        yield
++    finally:
++        for name, value in saved.items():
++            setattr(compressor, name, value)
++
++
++def _log(agent: Any, outcome: str) -> None:
++    logger.warning("%shistory-triggered refusal: compacted+retried outcome=%s",
++                   getattr(agent, "log_prefix", ""), outcome)
++
++
++def history_refusal_step(
++    agent: Any, *, messages: Any, current_turn_user_idx: Any, turn_id: Any, system_message: Any,
++    effective_task_id: Any,
++) -> Optional[HistoryRefusalStep]:
++    """``None`` when the refusal is not history-triggered (keep the drop-and-notice path)."""
++    if getattr(agent, "_history_refusal_retry_turn", None) == turn_id and turn_id is not None:
++        _log(agent, "refused")
++        return HistoryRefusalStep("refused")
++    if not is_history_triggered(messages, current_turn_user_idx):
++        return None
++    head = list(messages[:current_turn_user_idx])
++    current = messages[current_turn_user_idx]
++    try:
++        with _whole_history_window(getattr(agent, "context_compressor", None)):
++            compressed, _prompt = agent._compress_context(
++                head, system_message or "", task_id=effective_task_id or "default", force=True,
++                trigger=_COMPACTION_TRIGGER, verbatim_tail=[current],
++            )
++    except Exception:
++        # Compaction could not run at all: no evidence either way, keep the drop-and-notice path.
++        logger.exception("%shistory-triggered refusal: compaction failed", getattr(agent, "log_prefix", ""))
++        return None
++    lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
++    if lock_skipped is True or isinstance(lock_skipped, str):
++        _log(agent, "compaction_skipped")
++        return None
++    if not isinstance(compressed, list) or compressed is head or compressed in (head, [*head, current]):
++        # The summary over the earlier history alone did not commit (the summarizer refused or aborted).
++        _log(agent, "summary_refused")
++        return HistoryRefusalStep("summary_refused")
++    compressed = list(compressed)
++    last = compressed[-1] if compressed else None
++    if not (isinstance(last, dict) and last.get("role") == "user"
++            and last.get("content") == current.get("content")):
++        compressed.append(current)
++    idx = len(compressed) - 1
++    agent._history_refusal_retry_turn = turn_id  # one compaction + retry per turn
++    # "retried": the compacted request is resent; a refusal of it logs outcome=refused next.
++    _log(agent, "retried")
++    return HistoryRefusalStep("retry", compressed, compressed[:idx])
+diff --git a/agent/turn_response_check.py b/agent/turn_response_check.py
+index 4384b8f1a1..515d91cbf8 100644
+--- a/agent/turn_response_check.py
++++ b/agent/turn_response_check.py
+@@ -42,6 +42,7 @@ class ResponseCheckVerdict:
+     _preflight_compression_blocked: Any
+     _last_preflight_pressure: Any
+     api_duration: Any
++    conversation_history: Any
+     result: Optional[dict[str, Any]] = None
+ 
+ 
+@@ -97,7 +98,7 @@ def check_api_response(
+     max_compression_attempts: Any, length_continue_retries: Any, truncated_response_parts: Any,
+     truncated_tool_call_retries: Any, current_turn_user_idx: Any, api_call_count: Any,
+     api_request_id: Any, api_start_time: Any, effective_task_id: Any, turn_id: Any,
+-    _preflight_compression_blocked: Any, _last_preflight_pressure: Any,
++    _preflight_compression_blocked: Any, _last_preflight_pressure: Any, system_message: Any = None,
+ ) -> ResponseCheckVerdict:
+     """Verify ``response`` in the original order. The retry buffer is NOT cleared on success
+     (bytes back != usable content); ``_preflight_compression_blocked``/``_last_preflight_pressure``
+@@ -114,6 +115,7 @@ def check_api_response(
+             truncated_tool_call_retries=truncated_tool_call_retries,
+             _preflight_compression_blocked=_preflight_compression_blocked,
+             _last_preflight_pressure=_last_preflight_pressure, api_duration=api_duration,
++            conversation_history=conversation_history,
+             result=result,
+         )
+ 
+@@ -172,11 +174,15 @@ def check_api_response(
+             api_call_count=api_call_count, effective_task_id=effective_task_id, turn_id=turn_id,
+             api_request_id=api_request_id, api_start_time=api_start_time, retry_count=retry_count,
+             max_retries=max_retries, current_turn_user_idx=current_turn_user_idx,
++            system_message=system_message,
+         )
+         thinking_spinner = None
+         active_system_prompt = _rv.active_system_prompt
+         if _rv.action == "return":
+             return _verdict("return", _rv.result)
++        if _rv.messages is not None:
++            # History-triggered refusal: compacted history armed restart_with_compressed_messages.
++            messages, conversation_history = _rv.messages, _rv.conversation_history
+         retry_count = 0
+         compression_attempts = 0
+         return _verdict("break")
+diff --git a/agent/turn_truncation.py b/agent/turn_truncation.py
+index 0616f3f94d..ac81a08693 100644
+--- a/agent/turn_truncation.py
++++ b/agent/turn_truncation.py
+@@ -738,6 +738,10 @@ class RefusalVerdict:
+     action: str
+     result: Optional[dict[str, Any]]
+     active_system_prompt: Any
++    # History-triggered refusal (compacted; ``_retry.restart_with_compressed_messages`` armed): the
++    # request to resend.
++    messages: Any = None
++    conversation_history: Any = None
+ 
+ 
+ def handle_content_policy_refusal(
+@@ -745,7 +749,7 @@ def handle_content_policy_refusal(
+     messages: list[dict[str, Any]], api_messages: Any, api_kwargs: Any, active_system_prompt: Any,
+     conversation_history: Any, api_call_count: int, effective_task_id: Any, turn_id: Any,
+     api_request_id: Any, api_start_time: float, retry_count: int, max_retries: int,
+-    current_turn_user_idx: Any = None,
++    current_turn_user_idx: Any = None, system_message: Any = None,
+ ) -> RefusalVerdict:
+     """HTTP-200 refusal (``finish_reason`` ``content_filter`` / ``guardrail_intervened``).
+     Deterministic for the unchanged prompt — never retried: one configured-fallback try,
+@@ -794,9 +798,25 @@ def handle_content_policy_refusal(
+         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+         return RefusalVerdict("break", None, active_system_prompt)
+ 
++    # A refusal before any model round judged only history + this message: compact the history once
++    # and resend the same message (agent/turn_refusal_history.py).
++    from agent.turn_refusal_history import HISTORY_REFUSAL_COPY, history_refusal_step
++    _step = history_refusal_step(
++        agent, messages=messages, current_turn_user_idx=current_turn_user_idx, turn_id=turn_id,
++        system_message=system_message if system_message is not None else active_system_prompt,
++        effective_task_id=effective_task_id,
++    )
++    if _step is not None and _step.outcome == "retry":
++        agent._buffer_diagnostic_status(
++            "⚠️ The safety filter refused this chat's earlier history — compacting it and retrying once...")
++        _retry.restart_with_compressed_messages = True
++        return RefusalVerdict("break", None, active_system_prompt, messages=_step.messages,
++                              conversation_history=_step.conversation_history)
++
+     agent._flush_status_buffer()
+     agent._emit_diagnostic_status("⚠️ The model declined to respond to this request (safety refusal).")
+-    _refusal_response = "⚠️ " + content_policy_copy(
++    _copy = HISTORY_REFUSAL_COPY.format if _step is not None else content_policy_copy
++    _refusal_response = "⚠️ " + _copy(
+         label=provider_label_for(agent.provider),
+         summary=_refusal_text or "the model returned no explanation",
+     )
+diff --git a/tests/agent/test_content_policy_history_trigger.py b/tests/agent/test_content_policy_history_trigger.py
+new file mode 100644
+index 0000000000..9de0d259f8
+--- /dev/null
++++ b/tests/agent/test_content_policy_history_trigger.py
+@@ -0,0 +1,139 @@
++"""[daveey] A safety refusal on the turn's FIRST call, with no tool round, was caused by the earlier
++history, not the new message (chat 20261102_175427_594451: three harmless questions refused in a row).
++
++Dropping only the refused turn resends the trigger, so every later message is refused too. The handler
++must compact the earlier history once and retry the same message once; if the summary or the retry is
++refused, it must say the history is the cause and point at /new instead of "just ask something else".
++"""
++import logging
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++from agent.turn_retry_state import TurnRetryState
++from agent.turn_truncation import handle_content_policy_refusal
++
++MARKER = "TRIGGER-7f3a"
++
++
++def _provider_refuses(messages) -> bool:
++    """Fake provider: refuses any request whose history contains the marker from an earlier turn."""
++    return any(MARKER in str(m.get("content") or "") for m in messages)
++
++
++def _agent(*, summary_refused=False):
++    from agent.transports import get_transport
++
++    agent = MagicMock()
++    agent.api_mode, agent.provider, agent.model, agent.log_prefix = "anthropic_messages", "anthropic", "claude", ""
++    agent._is_anthropic_oauth = False
++    agent._get_transport.return_value = get_transport("anthropic_messages")
++    agent._has_pending_fallback.return_value = False
++    agent._try_activate_fallback.return_value = False
++    agent._extract_reasoning.return_value = ""
++    agent._session_db = None
++    agent._compression_skipped_due_to_lock = None
++    agent._history_refusal_retry_turn = None
++    agent.context_compressor = SimpleNamespace(protect_first_n=3, protect_last_n=20, tail_token_budget=4000)
++
++    def _compress(messages, system_message, **kw):
++        if summary_refused:  # the summarizer was refused too: input comes back unchanged
++            return messages, "sys"
++        tail = list(kw.get("verbatim_tail") or [])
++        summary = {"role": "assistant", "content": "[CONTEXT COMPACTION] earlier discussion about deploy targets"}
++        return [summary, *tail] if tail else [summary], "sys"
++
++    agent._compress_context.side_effect = _compress
++    return agent
++
++
++def _refusal_response():
++    return SimpleNamespace(
++        content=[], stop_reason="refusal", usage=None, model="claude",
++        stop_details={"type": "refusal", "category": "cyber", "explanation": "duplicating model outputs"})
++
++
++def _messages():
++    return [
++        {"role": "user", "content": f"earlier ask {MARKER}"},
++        {"role": "assistant", "content": "earlier answer"},
++        {"role": "user", "content": "should we do it on the mini or the hub?"},
++    ]
++
++
++def _call(agent, messages, idx=2, history=None, retry=None):
++    return handle_content_policy_refusal(
++        agent, _refusal_response(), retry or TurnRetryState(), thinking_spinner=None, messages=messages,
++        api_messages=list(messages), api_kwargs={}, active_system_prompt=None,
++        conversation_history=history if history is not None else messages[:idx],
++        api_call_count=1, effective_task_id="t", turn_id="turn-1", api_request_id="r",
++        api_start_time=0.0, retry_count=0, max_retries=3, current_turn_user_idx=idx,
++    )
++
++
++def test_history_triggered_refusal_compacts_and_retries_the_same_message(caplog):
++    messages = _messages()
++    assert _provider_refuses(messages)  # today's resend after dropping the turn still carries it
++    agent = _agent()
++    retry = TurnRetryState()
++    with caplog.at_level(logging.INFO):
++        verdict = _call(agent, messages, retry=retry)
++
++    # Leave the retry loop with the compressed-restart armed: the loop rebuilds the request and resends.
++    assert verdict.action == "break" and verdict.result is None
++    assert retry.restart_with_compressed_messages is True
++    assert agent._compress_context.call_count == 1
++    kw = agent._compress_context.call_args.kwargs
++    assert kw.get("force") is True and kw.get("trigger") == "content_policy_history"
++    # The earlier history is summarized; the current message is retried verbatim, last.
++    assert verdict.messages[-1]["content"] == "should we do it on the mini or the hub?"
++    assert not _provider_refuses(verdict.messages)  # the retry answers
++    assert verdict.conversation_history == verdict.messages[:-1]
++    assert "history-triggered refusal: compacted+retried" in caplog.text
++
++
++def test_summary_refused_closes_turn_with_history_copy_and_no_retry(caplog):
++    agent = _agent(summary_refused=True)
++    with caplog.at_level(logging.INFO):
++        verdict = _call(agent, _messages())
++
++    assert verdict.action == "return"
++    assert agent._compress_context.call_count == 1
++    text = verdict.result["final_response"]
++    assert "earlier history" in text and "/new" in text
++    assert "ask something else" not in text
++    assert "outcome=summary_refused" in caplog.text
++
++
++def test_retry_refused_again_does_not_compact_twice(caplog):
++    agent = _agent()
++    first = _call(agent, _messages())
++    assert first.action == "break" and first.messages is not None
++    # The retried request is refused as well (the trigger survived in the kept tail).
++    with caplog.at_level(logging.INFO):
++        second = _call(agent, first.messages, idx=len(first.messages) - 1, history=first.messages[:-1])
++    assert second.action == "return"
++    assert agent._compress_context.call_count == 1
++    assert "/new" in second.result["final_response"]
++    assert "ask something else" not in second.result["final_response"]
++    assert "outcome=refused" in caplog.text
++
++
++def test_refusal_after_a_tool_round_keeps_the_drop_and_notice_path():
++    messages = _messages() + [
++        {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function",
++         "function": {"name": "shell", "arguments": "{}"}}]},
++        {"role": "tool", "tool_call_id": "t1", "content": "ran"},
++    ]
++    agent = _agent()
++    verdict = _call(agent, messages)
++    assert verdict.action == "return"
++    agent._compress_context.assert_not_called()
++    assert "ask something else" in verdict.result["final_response"]
++
++
++def test_first_message_of_a_chat_has_no_history_to_blame():
++    agent = _agent()
++    messages = [{"role": "user", "content": "hello"}]
++    verdict = _call(agent, messages, idx=0, history=[])
++    assert verdict.action == "return"
++    agent._compress_context.assert_not_called()
+diff --git a/tests/agent/test_content_policy_history_trigger_loop.py b/tests/agent/test_content_policy_history_trigger_loop.py
+new file mode 100644
+index 0000000000..8e7d591a06
+--- /dev/null
++++ b/tests/agent/test_content_policy_history_trigger_loop.py
+@@ -0,0 +1,86 @@
++"""[daveey] End to end through the real turn loop: a refusal the earlier history caused is compacted and the
++same message answered on the retry, instead of dropping the turn behind "just ask something else"
++(chat 20261102_175427_594451). Unit cases: test_content_policy_history_trigger.py.
++"""
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from run_agent import AIAgent
++
++MARKER = "TRIGGER-7f3a"
++
++
++@pytest.fixture()
++def agent():
++    with (
++        patch("model_tools.get_tool_definitions", return_value=[]),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++    ):
++        a = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
++                    quiet_mode=True, skip_context_files=True, skip_memory=True)
++    a.client = MagicMock()
++    a._cached_system_prompt = "You are helpful."
++    a._use_prompt_caching = False
++    a.compression_enabled = False
++    a.save_trajectories = False
++    return a
++
++
++def _reply(content=None, refusal=None):
++    msg = SimpleNamespace(content=content, tool_calls=None, reasoning=None, reasoning_content=None,
++                          refusal=refusal)
++    return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")],
++                           model="test/model", usage=None, id="resp")
++
++
++def _provider(**kwargs):
++    if any(MARKER in str(m.get("content") or "") for m in kwargs.get("messages") or []):
++        return _reply(refusal="I can't continue this conversation.")
++    return _reply(content="It runs on the hub.")
++
++
++def _compact(messages, system_message, **kw):
++    summary = {"role": "assistant", "content": "[CONTEXT COMPACTION] we discussed where to deploy"}
++    return [summary, *(kw.get("verbatim_tail") or [])], system_message
++
++
++def test_history_triggered_refusal_is_answered_after_one_compaction(agent):
++    agent.client.chat.completions.create.side_effect = _provider
++    history = [{"role": "user", "content": f"earlier {MARKER}"}, {"role": "assistant", "content": "ok"}]
++    with (
++        patch.object(agent, "_compress_context", side_effect=_compact) as compress,
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("does it run on the mini or the hub?", conversation_history=history)
++
++    assert compress.call_count == 1
++    assert agent.client.chat.completions.create.call_count == 2
++    assert result.get("final_response") == "It runs on the hub."
++    assert not result.get("failed")
++
++
++def test_retry_refused_again_ends_turn_with_new_chat_copy_after_two_calls(agent):
++    agent.client.chat.completions.create.side_effect = _provider
++    history = [{"role": "user", "content": f"earlier {MARKER}"}, {"role": "assistant", "content": "ok"}]
++
++    def _compact_keeps_trigger(messages, system_message, **kw):
++        kept = {"role": "assistant", "content": f"[CONTEXT COMPACTION] still mentions {MARKER}"}
++        return [kept, *(kw.get("verbatim_tail") or [])], system_message
++
++    with (
++        patch.object(agent, "_compress_context", side_effect=_compact_keeps_trigger) as compress,
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("does it run on the mini or the hub?", conversation_history=history)
++
++    assert compress.call_count == 1
++    assert agent.client.chat.completions.create.call_count == 2
++    assert result.get("failed") is True
++    assert "/new" in result["final_response"] and "ask something else" not in result["final_response"]
+-- 
+2.43.0
+

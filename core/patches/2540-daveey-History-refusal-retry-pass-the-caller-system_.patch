@@ -1,0 +1,232 @@
+From 7194f0a8a178ce2b8abd787ecc350b2edf71c3f5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:47:02 +0000
+Subject: [PATCH] [daveey] History refusal retry: pass the caller
+ system_message through, keep tool-round copy after a retry
+
+Review of PR #1300: the full built prompt went to _compress_context as the caller's system_message, so the
+rebuild doubled it and the session DB stored the copy; the returned prompt is now adopted. A refusal after
+the retry ran a tool round keeps the tool-round copy (is_history_triggered is checked first). Adds a real
+SessionDB + compressor run_conversation test.
+---
+ agent/turn_refusal_history.py                 | 22 +++--
+ agent/turn_truncation.py                      |  4 +-
+ .../test_content_policy_history_trigger.py    | 30 +++++++
+ .../test_content_policy_history_trigger_db.py | 85 +++++++++++++++++++
+ 4 files changed, 133 insertions(+), 8 deletions(-)
+ create mode 100644 tests/agent/test_content_policy_history_trigger_db.py
+
+diff --git a/agent/turn_refusal_history.py b/agent/turn_refusal_history.py
+index 64fec1a959..2be2a87dea 100644
+--- a/agent/turn_refusal_history.py
++++ b/agent/turn_refusal_history.py
+@@ -35,6 +35,7 @@ class HistoryRefusalStep:
+     outcome: str
+     messages: Any = None
+     conversation_history: Any = None
++    system_prompt: Any = None  # the prompt _compress_context returned (the retry sends it)
+ 
+ 
+ def is_history_triggered(messages: Any, current_turn_user_idx: Any) -> bool:
+@@ -52,7 +53,9 @@ def is_history_triggered(messages: Any, current_turn_user_idx: Any) -> bool:
+ def _whole_history_window(compressor: Any) -> Iterator[None]:
+     """Summarize as much of the head as the compressor allows: the trigger may sit in the first exchange
+     or the recent tail that normal compaction keeps verbatim. The compressor still keeps its required
+-    anchors, so a trigger there survives; the retry is then refused and the turn closes with the copy."""
++    anchors (latest user turn and reply, the lean tail floor) and the lean summary quotes earlier user
++    messages verbatim, so this only removes a trigger in older assistant/tool content. A trigger it keeps
++    makes the retry refused (or the summary refused as would-grow); the turn then closes with the copy."""
+     saved = {}
+     for name, value in (("protect_first_n", 0), ("protect_last_n", 0), ("tail_token_budget", 1)):
+         if compressor is not None and hasattr(compressor, name):
+@@ -74,18 +77,23 @@ def history_refusal_step(
+     agent: Any, *, messages: Any, current_turn_user_idx: Any, turn_id: Any, system_message: Any,
+     effective_task_id: Any,
+ ) -> Optional[HistoryRefusalStep]:
+-    """``None`` when the refusal is not history-triggered (keep the drop-and-notice path)."""
++    """``None`` when the refusal is not history-triggered (keep the drop-and-notice path).
++
++    ``system_message`` is the turn loop's caller prompt (``None`` on a normal turn), passed through to
++    ``_compress_context`` unchanged like the overflow/recovery callers: the full built prompt there is
++    appended to the rebuilt one as a context part and doubles it."""
++    if not is_history_triggered(messages, current_turn_user_idx):
++        # Checked first: a refusal after this turn's retry ran a tool round keeps the tool-round copy.
++        return None
+     if getattr(agent, "_history_refusal_retry_turn", None) == turn_id and turn_id is not None:
+         _log(agent, "refused")
+         return HistoryRefusalStep("refused")
+-    if not is_history_triggered(messages, current_turn_user_idx):
+-        return None
+     head = list(messages[:current_turn_user_idx])
+     current = messages[current_turn_user_idx]
+     try:
+         with _whole_history_window(getattr(agent, "context_compressor", None)):
+-            compressed, _prompt = agent._compress_context(
+-                head, system_message or "", task_id=effective_task_id or "default", force=True,
++            compressed, prompt = agent._compress_context(
++                head, system_message, task_id=effective_task_id or "default", force=True,
+                 trigger=_COMPACTION_TRIGGER, verbatim_tail=[current],
+             )
+     except Exception:
+@@ -109,4 +117,4 @@ def history_refusal_step(
+     agent._history_refusal_retry_turn = turn_id  # one compaction + retry per turn
+     # "retried": the compacted request is resent; a refusal of it logs outcome=refused next.
+     _log(agent, "retried")
+-    return HistoryRefusalStep("retry", compressed, compressed[:idx])
++    return HistoryRefusalStep("retry", compressed, compressed[:idx], prompt)
+diff --git a/agent/turn_truncation.py b/agent/turn_truncation.py
+index ac81a08693..7862591b42 100644
+--- a/agent/turn_truncation.py
++++ b/agent/turn_truncation.py
+@@ -803,13 +803,15 @@ def handle_content_policy_refusal(
+     from agent.turn_refusal_history import HISTORY_REFUSAL_COPY, history_refusal_step
+     _step = history_refusal_step(
+         agent, messages=messages, current_turn_user_idx=current_turn_user_idx, turn_id=turn_id,
+-        system_message=system_message if system_message is not None else active_system_prompt,
++        system_message=system_message,
+         effective_task_id=effective_task_id,
+     )
+     if _step is not None and _step.outcome == "retry":
+         agent._buffer_diagnostic_status(
+             "⚠️ The safety filter refused this chat's earlier history — compacting it and retrying once...")
+         _retry.restart_with_compressed_messages = True
++        if _step.system_prompt:
++            active_system_prompt = _step.system_prompt
+         return RefusalVerdict("break", None, active_system_prompt, messages=_step.messages,
+                               conversation_history=_step.conversation_history)
+ 
+diff --git a/tests/agent/test_content_policy_history_trigger.py b/tests/agent/test_content_policy_history_trigger.py
+index 9de0d259f8..cb1ce9ad80 100644
+--- a/tests/agent/test_content_policy_history_trigger.py
++++ b/tests/agent/test_content_policy_history_trigger.py
+@@ -118,6 +118,36 @@ def test_retry_refused_again_does_not_compact_twice(caplog):
+     assert "outcome=refused" in caplog.text
+ 
+ 
++def test_caller_system_message_passes_through_and_returned_prompt_is_adopted():
++    """A normal turn's caller system_message is None. Handing the full built prompt to _compress_context
++    as the caller's message doubled the rebuilt prompt (review of PR #1300)."""
++    agent = _agent()
++    verdict = handle_content_policy_refusal(
++        agent, _refusal_response(), TurnRetryState(), thinking_spinner=None, messages=_messages(),
++        api_messages=_messages(), api_kwargs={}, active_system_prompt="FULL BUILT PROMPT",
++        conversation_history=_messages()[:2], api_call_count=1, effective_task_id="t", turn_id="turn-1",
++        api_request_id="r", api_start_time=0.0, retry_count=0, max_retries=3, current_turn_user_idx=2,
++    )
++    assert agent._compress_context.call_args.args[1] is None
++    assert verdict.active_system_prompt == "sys"
++
++
++def test_tool_round_refusal_after_the_retry_keeps_the_tool_round_copy():
++    agent = _agent()
++    first = _call(agent, _messages())
++    assert first.action == "break"
++    after_tools = first.messages + [
++        {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function",
++         "function": {"name": "shell", "arguments": "{}"}}]},
++        {"role": "tool", "tool_call_id": "t1", "content": "ran"},
++    ]
++    second = _call(agent, after_tools, idx=len(first.messages) - 1, history=first.messages[:-1])
++    assert second.action == "return"
++    assert agent._compress_context.call_count == 1
++    assert "ask something else" in second.result["final_response"]
++    assert "didn't get past it" not in second.result["final_response"]
++
++
+ def test_refusal_after_a_tool_round_keeps_the_drop_and_notice_path():
+     messages = _messages() + [
+         {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function",
+diff --git a/tests/agent/test_content_policy_history_trigger_db.py b/tests/agent/test_content_policy_history_trigger_db.py
+new file mode 100644
+index 0000000000..266777ddd2
+--- /dev/null
++++ b/tests/agent/test_content_policy_history_trigger_db.py
+@@ -0,0 +1,85 @@
++"""[daveey] History-triggered refusal through the real compressor and SessionDB (no _compress_context mock).
++
++The mocked suites (test_content_policy_history_trigger*.py) never ran the system-prompt rebuild or the session
++DB commit, so passing the full built prompt as the caller's system_message doubled the prompt unnoticed
++(review of PR #1300). Harness: tests/agent/test_in_place_preflight_rewind.py.
++"""
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++MARKER = "TRIGGER-7f3a"
++
++
++def _aux_llm(**kwargs):
++    text = "## Goal\nDeploy questions.\n## Progress\nDiscussed targets." if kwargs.get("task") == "compression" else "Title"
++    message = SimpleNamespace(content=text, tool_calls=None)
++    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")], model="aux", usage=None)
++
++
++def _reply(content=None, refusal=None):
++    message = SimpleNamespace(content=content, tool_calls=None, reasoning=None, reasoning_content=None, refusal=refusal)
++    response = SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")], model="test/model",
++                               id="resp")
++    response.usage = SimpleNamespace(prompt_tokens=5000, completion_tokens=100, total_tokens=5100)
++    return response
++
++
++@pytest.fixture
++def session(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    from run_agent import AIAgent
++
++    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
++    monkeypatch.setattr("agent.context_compressor.call_llm", _aux_llm)
++    monkeypatch.setattr("agent.title_generator.call_llm", _aux_llm)
++    db = SessionDB(db_path=tmp_path / "state.db")
++    with patch("agent.process_bootstrap.OpenAI"):
++        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", model="test/model",
++                        quiet_mode=True, session_db=db, session_id="sid", skip_context_files=True, skip_memory=True)
++    agent.client, agent.tool_delay, agent.save_trajectories = MagicMock(), 0, False
++    yield db, agent
++    db.close()
++
++
++def _gateway_turn(db, agent, text, provider):
++    from gateway.run import _build_gateway_agent_history
++
++    agent.client.chat.completions.create.side_effect = provider
++    history = _build_gateway_agent_history(db.get_messages_as_conversation("sid", repair_alternation=True))[0]
++    return agent.run_conversation(user_message=text, conversation_history=history, task_id="sid",
++                                  persist_user_message=text)
++
++
++def test_history_refusal_retry_keeps_system_prompt_and_one_current_row(session):
++    db, agent = session
++    # The trigger sits in an early assistant reply, older than the lean tail the compressor keeps.
++    for n in range(1, 13):
++        extra = f" {MARKER}" if n == 2 else ""
++        body = f"A{n} answer{extra} " + "lorem ipsum dolor " * 400
++        _gateway_turn(db, agent, f"U{n} question", lambda body=body, **kw: _reply(content=body))
++    prompt_before = db.get_session("sid").get("system_prompt") or ""
++    cached_before = agent._cached_system_prompt
++    assert prompt_before and cached_before
++
++    calls = []
++
++    def provider(**kw):
++        calls.append(kw)
++        if any(MARKER in str(m.get("content") or "") for m in kw.get("messages") or []):
++            return _reply(refusal="I can't continue this conversation.")
++        return _reply(content="A13 It runs on the hub.")
++
++    result = _gateway_turn(db, agent, "U13 does it run on the mini or the hub?", provider)
++
++    assert len(calls) == 2  # refused, then the compacted retry answered
++    assert result.get("final_response") == "A13 It runs on the hub."
++    assert agent._cached_system_prompt == cached_before
++    assert (db.get_session("sid").get("system_prompt") or "") == prompt_before
++    model_history, display = db.get_resume_conversations("sid")
++    live = [m.get("content") or "" for m in model_history if isinstance(m.get("content"), str)]
++    shown = [m.get("content") or "" for m in display if isinstance(m.get("content"), str)]
++    assert sum(c.startswith("U13 ") for c in live) == 1
++    assert sum(c.startswith("U13 ") for c in shown) == 1
++    assert not any(MARKER in c for c in live)
+-- 
+2.43.0
+

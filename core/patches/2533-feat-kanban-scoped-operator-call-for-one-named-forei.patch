@@ -1,0 +1,1411 @@
+From f1b1c8eb7024443c308b514d0a9b61c4ccfba7ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:34:52 +0000
+Subject: [PATCH] feat(kanban): scoped operator call for one named foreign card
+ [daveey]
+
+---
+ hermes_cli/kanban_foreign_card.py             |   7 +-
+ hermes_cli/kanban_move.py                     |   7 +-
+ hermes_cli/kanban_operator_call.py            | 710 ++++++++++++++++++
+ hermes_cli/kanban_parser.py                   |   5 +
+ hermes_cli/kanban_supervisor_requests.py      |  57 +-
+ tests/hermes_cli/test_kanban_operator_call.py | 414 ++++++++++
+ tools/kanban_tools_graph.py                   |   5 +
+ tools/kanban_tools_schemas.py                 |  20 +-
+ 8 files changed, 1214 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_operator_call.py
+ create mode 100644 tests/hermes_cli/test_kanban_operator_call.py
+
+diff --git a/hermes_cli/kanban_foreign_card.py b/hermes_cli/kanban_foreign_card.py
+index ae85287925..1d4905ab54 100644
+--- a/hermes_cli/kanban_foreign_card.py
++++ b/hermes_cli/kanban_foreign_card.py
+@@ -35,7 +35,12 @@ class ForeignCardError(Exception):
+ 
+ def message(task_id: str, owner: Optional[str]) -> str:
+     return (f"{task_id} was created on {owner or 'another gateway'} and lives there; this gateway has only a "
+-            "replica copy. Its owner or the Board must write it." + comment_route(task_id, owner))
++            "replica copy. Its owner or the Board must write it." + comment_route(task_id, owner) + OPERATOR_ROUTE)
++
++
++# The worker-callable path for one comment, move or unblock on another gateway's card (kanban_operator_call).
++OPERATOR_ROUTE = (" A worker can comment on, move or unblock it with kanban_supervisor_request(ops=[{op: 'operator', "
++                  "action, task_id, ...}]); its home gateway applies it.")
+ 
+ 
+ # Gateway names a hub-owned card's ``created_on`` carries (the hub's own name and its alias).
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 2ff22b44c3..7f4abe07b0 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -216,9 +216,10 @@ def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: s
+ 
+ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, checkpoint: str = "", force: bool = False,
+                 machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
+-                cfg: Optional[dict] = None, hub: Any = None) -> dict[str, Any]:
++                cfg: Optional[dict] = None, hub: Any = None, event_extra: Optional[dict] = None) -> dict[str, Any]:
+     """Move a card that is NOT running (ready/todo/scheduled/blocked/triage): same guards, no run to end.
+-    A worker-first policy card instead takes the explicit Board repin path (``hub`` is for tests)."""
++    A worker-first policy card instead takes the explicit Board repin path (``hub`` is for tests).
++    ``event_extra`` is merged into the ``moved`` event (audit provenance, e.g. an operator call's uid)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_worker_node as wn
+     reason = (reason or "").strip()
+@@ -247,7 +248,7 @@ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason:
+         kb._append_event(conn, task_id, MOVED_EVENT, {
+             "from_machine": plan["me"], "runs_on": plan["runs_on"], "previous_runs_on": plan["previous"],
+             "reason": reason[:500], "move_no": plan["move_no"], "forced": plan["forced"],
+-            "matches": plan["matches"], "queued": True, "checkpoint": checkpoint.strip()})
++            "matches": plan["matches"], "queued": True, "checkpoint": checkpoint.strip(), **(event_extra or {})})
+         if checkpoint.strip():
+             kb.add_comment(conn, task_id, "kanban-operator", f"Move checkpoint:\n\n{checkpoint.strip()}")
+     return {"ok": True, "runs_on": plan["runs_on"], "matches": plan["matches"], "move_no": plan["move_no"],
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+new file mode 100644
+index 0000000000..3b53031d8b
+--- /dev/null
++++ b/hermes_cli/kanban_operator_call.py
+@@ -0,0 +1,710 @@
++"""Scoped Board-operator call: a worker asks for ONE op on ONE named foreign card. [daveey]
++
++A gateway's live ``kanban.db`` holds only its own cards, so ``kanban_comment`` / ``kanban_move`` / ``kanban_unblock``
++on a card another gateway created refuse ``foreign_card``. This module is the supported path, one
++``kanban_supervisor_request`` op (``{"op": "operator", "action": "comment"|"move"|"unblock", "task_id": ...}``):
++
++1. Request side (the caller's gateway, its non-worker supervisor drain): re-checks scope, appends
++   ``operator_call_requested`` on the caller's OWN card (the Board carries it to every replica) and parks the request
++   in phase ``awaiting_home``.
++2. Home side (every gateway's dispatcher tick, :func:`apply_incoming`): reads new request events from its replica
++   (id watermark), keeps those naming a card this gateway created, proves the caller (the run was live, the Board
++   lease holder and the event's Board ``origin_gateway`` are the caller's gateway), applies the op through the
++   ordinary functions on its live file and appends ``operator_call_result`` on the target card.
++3. Request side again (:func:`poll`): finds that result in the replica, finishes the request and wakes the caller.
++
++Only comment, move and unblock exist. complete / archive / link / unlink / block / edit of a foreign card stay with
++its owner and are refused; so is any second op or a card the op does not name. No Board admin key is read here.
++Every call, accepted or refused, is logged in ``operator_calls`` on the gateway that saw it.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import os
++import socket
++import sqlite3
++import time
++import uuid
++from contextlib import contextmanager
++from typing import Any, Iterator, Optional
++
++_log = logging.getLogger(__name__)
++
++OP = "operator"
++ACTIONS = ("comment", "move", "unblock")
++OWNER_ONLY = ("complete", "archive", "link", "unlink", "block", "edit", "assign", "delete", "reclaim")
++DEFERRED = ("label_publish",)
++REQUEST_KIND = "operator_call_requested"
++RESULT_KIND = "operator_call_result"
++REFUSED_KIND = "operator_call_refused"
++COMMENT_MARK = "operator_call_commented"
++PHASE = "awaiting_home"
++DEADLINE_S = 24 * 3600
++MAX_TEXT = 8000
++MAX_REASON = 2000
++MAX_IN_FLIGHT = 3
++MAX_PER_DAY = 20
++MAX_PER_TICK = 5
++SCAN_BATCH = 500
++SKEW_S = 120
++AUTHOR = "kanban-operator-call"
++_FIELDS = {"comment": {"text"}, "move": {"runs_on", "reason"}, "unblock": {"reason"}}
++_MARK: dict = {}  # (live db path, board) -> replica event id scanned up to, this process
++_PERSISTED: dict = {}
++
++_SCHEMA = (
++    """CREATE TABLE IF NOT EXISTS operator_calls (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        request_uid TEXT NOT NULL,
++        side TEXT NOT NULL,
++        board TEXT,
++        action TEXT,
++        target_task_id TEXT,
++        caller_gateway TEXT,
++        caller_task_id TEXT,
++        caller_run_id INTEGER,
++        caller_run_uid TEXT,
++        caller_profile TEXT,
++        caller_host TEXT,
++        executor_gateway TEXT,
++        args_digest TEXT,
++        request_event_uid TEXT,
++        outcome TEXT NOT NULL,
++        detail TEXT,
++        supervisor_request_id INTEGER,
++        created_at INTEGER NOT NULL,
++        finished_at INTEGER,
++        UNIQUE(request_uid, side))""",
++    "CREATE INDEX IF NOT EXISTS idx_operator_calls_caller ON operator_calls(caller_task_id, created_at)",
++    "CREATE INDEX IF NOT EXISTS idx_operator_calls_target ON operator_calls(target_task_id, created_at)",
++    "CREATE TABLE IF NOT EXISTS operator_call_scan (board TEXT PRIMARY KEY, last_id INTEGER NOT NULL, "
++    "replica_ino INTEGER)",
++)
++
++
++def _err(code: str, message: str):
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    return SupervisorRequestError(code, message)
++
++
++def ensure_schema(conn: sqlite3.Connection) -> None:
++    for stmt in _SCHEMA:
++        conn.execute(stmt)
++
++
++def _has_log(conn: sqlite3.Connection) -> bool:
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_calls'").fetchone() is not None
++
++
++# --- validation ----------------------------------------------------------------------------------
++
++def is_operator(raw_ops: Any) -> bool:
++    return isinstance(raw_ops, list) and any(isinstance(o, dict) and str(o.get("op") or "").strip() == OP
++                                             for o in raw_ops)
++
++
++def normalize_op(i: int, op: dict) -> dict:
++    action = str(op.get("action") or "").strip()
++    if action in OWNER_ONLY:
++        raise _err("operator_action_refused", f"op {i}: {action} of another gateway's card stays with its owner; "
++                   f"the operator call only does {', '.join(ACTIONS)}")
++    if action in DEFERRED:
++        raise _err("operator_action_refused", f"op {i}: {action} is not available through the operator call yet")
++    if action not in ACTIONS:
++        raise _err("operator_action_refused", f"op {i}: action must be one of {', '.join(ACTIONS)}")
++    task_id = str(op.get("task_id") or "").strip()
++    if not task_id:
++        raise _err("invalid_ops", f"op {i}: task_id (the one foreign card) is required")
++    extra = set(op) - {"op", "action", "task_id"} - _FIELDS[action]
++    if extra:
++        raise _err("invalid_ops", f"op {i}: {action} takes only task_id and {', '.join(sorted(_FIELDS[action]))}; "
++                   f"unexpected {', '.join(sorted(extra))} (one call names one card)")
++    out: dict[str, Any] = {"op": OP, "action": action, "task_id": task_id}
++    if action == "comment":
++        text = str(op.get("text") or "").strip()
++        if not text:
++            raise _err("invalid_ops", f"op {i}: comment text is required")
++        if len(text) > MAX_TEXT:
++            raise _err("invalid_ops", f"op {i}: comment text is over {MAX_TEXT} characters")
++        out["text"] = text
++    else:
++        reason = str(op.get("reason") or "").strip()
++        if not reason:
++            raise _err("invalid_ops", f"op {i}: reason is required for {action}")
++        out["reason"] = reason[:MAX_REASON]
++    if action == "move":
++        from hermes_cli import kanban_worker_node as wn
++        try:
++            labels = wn.normalize_runs_on(op.get("runs_on"))
++        except ValueError as exc:
++            raise _err("invalid_ops", f"op {i}: {exc}") from None
++        out["runs_on"] = list(labels or [])
++    return out
++
++
++def label(op: dict) -> str:
++    return f"operator {op.get('action')} {op.get('task_id')}"
++
++
++def _digest(op: dict) -> str:
++    body = {k: v for k, v in op.items() if k not in ("op",)}
++    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
++
++
++# --- seams (tests replace these) -----------------------------------------------------------------
++
++def _own_gateway(conn: sqlite3.Connection) -> Optional[str]:
++    from hermes_cli import kanban_capability_routing as kcr
++    return kcr._own_gateway(conn)
++
++
++def _db_path(conn: sqlite3.Connection) -> Optional[str]:
++    row = conn.execute("PRAGMA database_list").fetchone()
++    return row[2] if row and row[2] else None
++
++
++@contextmanager
++def _replica(conn: sqlite3.Connection) -> Iterator[Optional[sqlite3.Connection]]:
++    from hermes_cli import kanban_foreign_card as kfc
++    with kfc.open_replica(_db_path(conn)) as rep:
++        yield rep
++
++
++def _board_slug(conn: sqlite3.Connection) -> str:
++    from hermes_cli import kanban_db_sync as sync
++    path = _db_path(conn)
++    return sync.board_slug_for_path(path) if path else "default"
++
++
++def _evidence(board: str, event_uid: str) -> dict:
++    """The Board's own copy of the request event (raises when the Board is unreachable)."""
++    from hermes_cli import kanban_sync_client as ksc
++    return ksc.Hub(ksc.load_identity()).row_evidence(board, "task_events", event_uid)
++
++
++def _outbox_rows(conn: sqlite3.Connection) -> Optional[int]:
++    try:
++        return conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name = 'task_events'").fetchone()[0]
++    except sqlite3.OperationalError:
++        return None
++
++
++def _synced(conn: sqlite3.Connection) -> bool:
++    from hermes_cli import kanban_db_sync as sync
++    try:
++        return bool(sync.sync_state(conn))
++    except Exception:  # health: allow BLE001 -- an unreadable sync state is an unsynced board
++        return False
++
++
++# --- log -----------------------------------------------------------------------------------------
++
++def log(conn: sqlite3.Connection, *, request_uid: str, side: str, outcome: str, op: Optional[dict] = None,
++        caller: Optional[dict] = None, detail: Optional[str] = None, board: Optional[str] = None,
++        executor_gateway: Optional[str] = None, request_event_uid: Optional[str] = None,
++        supervisor_request_id: Optional[int] = None, finished: bool = False) -> None:
++    """Insert or update the ``(request_uid, side)`` log row inside the caller's txn."""
++    ensure_schema(conn)
++    op, caller, now = op or {}, caller or {}, int(time.time())
++    conn.execute(
++        "INSERT INTO operator_calls (request_uid, side, board, action, target_task_id, caller_gateway, "
++        "caller_task_id, caller_run_id, caller_run_uid, caller_profile, caller_host, executor_gateway, args_digest, "
++        "request_event_uid, outcome, detail, supervisor_request_id, created_at, finished_at) "
++        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(request_uid, side) DO UPDATE SET "
++        "outcome=excluded.outcome, detail=COALESCE(excluded.detail, detail), "
++        "request_event_uid=COALESCE(excluded.request_event_uid, request_event_uid), "
++        "executor_gateway=COALESCE(excluded.executor_gateway, executor_gateway), finished_at=excluded.finished_at",
++        (request_uid, side, board, op.get("action"), op.get("task_id"), caller.get("gateway"),
++         caller.get("task_id"), caller.get("run_id"), caller.get("run_uid"), caller.get("profile"),
++         caller.get("host"), executor_gateway, _digest(op) if op else None, request_event_uid, outcome,
++         (detail or None) and str(detail)[:500], supervisor_request_id, now, now if finished else None))
++
++
++def _caller_here(conn: sqlite3.Connection, task: Optional[str], run: Optional[int]) -> dict:
++    run_uid = None
++    if task:
++        try:
++            row = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (run,)).fetchone()
++            run_uid = row[0] if row else None
++        except sqlite3.OperationalError:
++            run_uid = None
++    return {"gateway": _own_gateway(conn), "task_id": task, "run_id": run, "run_uid": run_uid,
++            "profile": os.environ.get("HERMES_PROFILE") or "default", "host": socket.gethostname()}
++
++
++def log_submit_refusal(conn: sqlite3.Connection, *, env_task: Optional[str], env_run: Optional[str], raw_ops: Any,
++                       code: str, message: str) -> None:
++    """Record a refused operator call (its own txn, committed before the caller raises)."""
++    from hermes_cli import kanban_db as kb
++    try:
++        run = int(env_run) if env_run else None
++    except ValueError:
++        run = None
++    op = next((o for o in raw_ops if isinstance(o, dict) and o.get("op") == OP), {}) if isinstance(raw_ops, list) else {}
++    op = {"action": str(op.get("action") or "")[:40], "task_id": str(op.get("task_id") or "")[:64]}
++    try:
++        with kb.write_txn(conn):
++            caller = _caller_here(conn, env_task, run)
++            log(conn, request_uid=uuid.uuid4().hex, side="request", outcome="refused", op=op, caller=caller,
++                detail=f"{code}: {message}", board=_board_slug(conn), finished=True)
++            if env_task and kb.get_task(conn, env_task) is not None:
++                kb._append_event(conn, env_task, REFUSED_KIND, {**op, "code": code, "detail": message[:500]})
++    except Exception:  # health: allow BLE001 -- the refusal itself still reaches the caller
++        _log.warning("kanban: could not log a refused operator call", exc_info=True)
++
++
++# --- request side --------------------------------------------------------------------------------
++
++def _target_row(rep: Optional[sqlite3.Connection], task_id: str) -> Optional[sqlite3.Row]:
++    if rep is None:
++        return None
++    try:
++        return rep.execute("SELECT id, status, created_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    except sqlite3.OperationalError:
++        return None
++
++
++def _rate_refusal(conn: sqlite3.Connection, requester: str) -> Optional[str]:
++    if not _has_log(conn):
++        return None
++    now = int(time.time())
++    open_n = conn.execute("SELECT COUNT(*) FROM operator_calls WHERE side='request' AND caller_task_id=? "
++                          "AND outcome='forwarded'", (requester,)).fetchone()[0]
++    if open_n >= MAX_IN_FLIGHT:
++        return f"{requester} already has {open_n} operator calls in flight (max {MAX_IN_FLIGHT}); wait for them"
++    day_n = conn.execute("SELECT COUNT(*) FROM operator_calls WHERE side='request' AND caller_task_id=? "
++                         "AND outcome != 'refused' AND created_at > ?", (requester, now - 86400)).fetchone()[0]
++    if day_n >= MAX_PER_DAY:
++        return f"{requester} made {day_n} operator calls in 24 h (max {MAX_PER_DAY})"
++    return None
++
++
++def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
++    from hermes_cli import kanban_capability_routing as kcr
++    from hermes_cli import kanban_db as kb
++    target = op["task_id"]
++    verdict = {**op}
++
++    def refuse(code: str, why: str) -> dict:
++        verdict.update(verdict="refused", code=code, reason=why)
++        return verdict
++
++    if target == requester:
++        return refuse("own_card", f"{target} is this worker's own card; use the ordinary kanban tools")
++    if kb.get_task(conn, target) is not None and kcr.card_home(conn, target) is None:
++        return refuse("not_foreign", f"{target} lives on this gateway; use kanban_comment / kanban_move / "
++                                     "kanban_unblock directly")
++    if not _synced(conn) or not _own_gateway(conn):
++        return refuse("not_synced", "this board does not sync to the Board, so no other gateway can be asked")
++    with _replica(conn) as rep:
++        row = _target_row(rep, target)
++        if row is None:
++            return refuse("unknown_task", f"no card {target} in this gateway's Board replica")
++        status, home = row["status"], row["created_on"]
++        human = None
++        if op["action"] == "unblock" and rep is not None:
++            human = rep.execute("SELECT human_request, block_kind FROM tasks WHERE id = ?", (target,)).fetchone()
++    if not home:
++        return refuse("no_home", f"{target} has no created_on; no gateway owns it")
++    if home == _own_gateway(conn):
++        return refuse("not_foreign", f"{target} was created on this gateway")
++    if status in ("done", "archived"):
++        return refuse("terminal", f"{target} is {status}")
++    if op["action"] == "move" and status == "running":
++        return refuse("running", f"{target} is running; only its own run may move it (kanban_move)")
++    if op["action"] == "unblock":
++        if status != "blocked":
++            return refuse("not_blocked", f"{target} is {status}, not blocked")
++        refusal = _human_gate(human[0] if human else None, human[1] if human else None, target)
++        if refusal:
++            return refuse("human_gate", refusal)
++    rate = _rate_refusal(conn, requester)
++    if rate:
++        return refuse("rate_limited", rate)
++    verdict.update(verdict="supervisor", home=home)
++    return verdict
++
++
++def _human_gate(human_request: Any, block_kind: Optional[str], target: str) -> Optional[str]:
++    from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
++    if human_request or block_kind in HUMAN_BLOCK_KINDS:
++        return (f"{target} waits on a human ({block_kind or 'human_request'}); only the human's own unblock "
++                "releases it")
++    return None
++
++
++def start(conn: sqlite3.Connection, req: dict, executor: str) -> str:
++    """Request-side execution: forward the call to the target's home and wait in phase ``awaiting_home``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_supervisor_requests import _finish, requester_refusal
++    requester, op = req["requester_task_id"], req["ops"][0]
++    gone = requester_refusal(conn, requester)
++    verdict = preflight_op(conn, requester, op) if not gone else {"verdict": "refused", "reason": gone}
++    uid = uuid.uuid4().hex
++    caller = _caller_here(conn, requester, req.get("requester_run_id"))
++    board = _board_slug(conn)
++    if verdict["verdict"] != "supervisor":
++        with kb.write_txn(conn):
++            log(conn, request_uid=uid, side="request", outcome="refused", op=op, caller=caller, board=board,
++                detail=verdict.get("reason"), supervisor_request_id=req["id"], finished=True)
++        _finish(conn, req, executor, "rejected", results=[{**op, "outcome": "not_applied",
++                                                           "detail": verdict.get("reason")}],
++                error=verdict.get("reason"))
++        return "rejected"
++    payload = {"request_uid": uid, "board": board, "action": op["action"], "target_task_id": op["task_id"],
++               "args": {k: v for k, v in op.items() if k not in ("op", "action", "task_id")},
++               "caller": caller, "requested_at": int(time.time()), "supervisor_request_id": req["id"],
++               "home": verdict.get("home")}
++    with kb.write_txn(conn):
++        before = _outbox_rows(conn)
++        kb._append_event(conn, requester, REQUEST_KIND, payload)
++        if before is None or (_outbox_rows(conn) or 0) <= before:
++            conn.execute("DELETE FROM task_events WHERE id = (SELECT MAX(id) FROM task_events WHERE task_id = ? "
++                         "AND kind = ?)", (requester, REQUEST_KIND))
++            log(conn, request_uid=uid, side="request", outcome="refused", op=op, caller=caller, board=board,
++                detail="not_synced: the request event would not reach the Board", supervisor_request_id=req["id"],
++                finished=True)
++            failed = True
++        else:
++            ev = conn.execute("SELECT uid FROM task_events WHERE id = (SELECT MAX(id) FROM task_events WHERE "
++                              "task_id = ? AND kind = ?)", (requester, REQUEST_KIND)).fetchone()
++            log(conn, request_uid=uid, side="request", outcome="forwarded", op=op, caller=caller, board=board,
++                request_event_uid=ev[0] if ev else None, supervisor_request_id=req["id"])
++            failed = False
++    if failed:
++        _finish(conn, req, executor, "rejected", results=[{**op, "outcome": "not_applied", "detail": "not_synced"}],
++                error="not_synced: this board cannot carry the request to the card's home")
++        return "rejected"
++    state = {"phase": PHASE, "request_uid": uid, "home": verdict.get("home"),
++             "deadline": int(time.time()) + DEADLINE_S}
++    with kb.write_txn(conn):
++        cur = conn.execute("UPDATE supervisor_requests SET result_json=? WHERE id=? AND status='accepted' "
++                           "AND executor=?", (json.dumps(state), req["id"], executor))
++    return PHASE if cur.rowcount == 1 else "lost_lease"
++
++
++def awaiting(conn: sqlite3.Connection) -> list:
++    return conn.execute(
++        "SELECT id, executor, lease_expires FROM supervisor_requests WHERE status='accepted' AND result_json IS NOT "
++        "NULL AND json_valid(result_json) AND json_extract(result_json, '$.phase')=? ORDER BY id", (PHASE,)).fetchall()
++
++
++def _result_for(conn: sqlite3.Connection, target: str, uid: str) -> Optional[dict]:
++    def scan(c):
++        if c is None:
++            return None
++        for (raw,) in c.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC",
++                                (target, RESULT_KIND)).fetchall():
++            try:
++                p = json.loads(raw or "{}")
++            except ValueError:
++                continue
++            if p.get("request_uid") == uid:
++                return p
++        return None
++    found = scan(conn)  # a pickup copy of the target on this gateway gets the event from the feed
++    if found is None:
++        with _replica(conn) as rep:
++            found = scan(rep)
++    return found
++
++
++_STATUS = {"applied": "done", "already_applied": "done", "refused": "rejected", "failed": "failed"}
++
++
++def poll(conn: sqlite3.Connection, executor: str, *, now: Optional[int] = None) -> list[tuple[int, str]]:
++    """Finish forwarded calls whose home answered (or that ran out of time). No delivery attempts spent."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_notify_reconcile_exec as nrx
++    from hermes_cli.kanban_supervisor_requests import _executor_dead, _finish
++    now = int(time.time()) if now is None else now
++    processed = []
++    for rid, holder, lease in awaiting(conn):
++        if holder != executor and lease and int(lease) > now and not _executor_dead(holder):
++            continue
++        req = nrx._take(conn, int(rid), holder, executor, now)
++        if req is None:
++            continue
++        state, op = req["result"], req["ops"][0]
++        res = _result_for(conn, op["task_id"], state["request_uid"])
++        if res is None and now < int(state.get("deadline") or 0):
++            continue
++        if res is None:
++            status, outcome, detail = "failed", "failed", (f"{state.get('home') or 'the home gateway'} did not "
++                                                           f"answer within {DEADLINE_S // 3600} h")
++        else:
++            outcome, detail = str(res.get("outcome") or "failed"), res.get("detail")
++            status = _STATUS.get(outcome, "failed")
++        results = [{**op, "outcome": outcome, **({"detail": detail} if detail else {}),
++                    "home": res.get("executor_gateway") if res else state.get("home")}]
++        with kb.write_txn(conn):
++            log(conn, request_uid=state["request_uid"], side="request",
++                outcome={"done": "done", "rejected": "rejected"}.get(status, "failed"), detail=detail, finished=True)
++        if kb.get_task(conn, req["requester_task_id"]) is None:
++            # A worker node evicted its copy of the caller card: the result stays on the target card.
++            with kb.write_txn(conn):
++                conn.execute("UPDATE supervisor_requests SET status=?, result_json=?, error=?, finished_at=?, "
++                             "lease_expires=NULL, requester_woken=1 WHERE id=? AND status='accepted' AND executor=?",
++                             (status, json.dumps(results), "requester_gone" if status == "done" else detail, now,
++                              req["id"], executor))
++            processed.append((int(rid), status))
++            continue
++        if _finish(conn, req, executor, status, results=results, error=None if status == "done" else detail):
++            processed.append((int(rid), status))
++        else:
++            processed.append((int(rid), "lost_lease"))
++    return processed
++
++
++# --- home side -----------------------------------------------------------------------------------
++
++def _is_home(conn: sqlite3.Connection, own: str, target: str) -> bool:
++    from hermes_cli import kanban_capability_routing as kcr
++    try:
++        row = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (target,)).fetchone()
++    except sqlite3.OperationalError:
++        return False
++    return bool(row and row[0] and row[0] == own and kcr.card_home(conn, target) is None)
++
++
++def _caller_refusal(rep: sqlite3.Connection, board: str, event: dict, payload: dict) -> tuple[Optional[str], bool]:
++    """``(refusal, retry)``: None when the caller is proven; ``retry`` when the Board could not be read."""
++    caller = payload.get("caller") or {}
++    gw, task, run_uid = caller.get("gateway"), caller.get("task_id"), caller.get("run_uid")
++    at = payload.get("requested_at")
++    if not gw or not task or not run_uid or not isinstance(at, (int, float)):
++        return "caller_unproven: the request names no caller gateway, card, run uid and time", False
++    if event["task_id"] != task:
++        return "caller_unproven: the request event is not on the caller's card", False
++    run = rep.execute("SELECT started_at, ended_at FROM task_runs WHERE task_id = ? AND uid = ?",
++                      (task, run_uid)).fetchone()
++    if run is None or not run[0] or int(run[0]) > at + SKEW_S or (run[1] and int(run[1]) < at - SKEW_S):
++        return f"caller_unproven: run {run_uid} of {task} was not live when the call was made", False
++    claimed = False
++    for (raw,) in rep.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claimed'", (task,)):
++        try:
++            p = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        if p.get("run_uid") == run_uid and p.get("holder") == gw:
++            claimed = True
++            break
++    if not claimed:
++        return f"caller_unproven: the Board never leased run {run_uid} of {task} to {gw}", False
++    if not event.get("uid"):
++        return "caller_unproven: the request event has no Board uid", False
++    try:
++        ev = _evidence(board, event["uid"])
++    except Exception as exc:  # health: allow BLE001 -- unreachable Board: retry next tick
++        _log.info("kanban: operator call evidence for %s unavailable (%s); retrying", event["uid"], exc)
++        return None, True
++    row = ev.get("row") if isinstance(ev, dict) else None
++    if not isinstance(row, dict) or row.get("origin_gateway") != gw or row.get("task_id") not in (None, task):
++        return f"caller_unproven: the Board says the request event came from {(row or {}).get('origin_gateway')}", False
++    created = row.get("created_at")
++    when = int(created) if isinstance(created, (int, float)) else int(at)
++    if when > 10 ** 11:  # Board timestamps are milliseconds
++        when //= 1000
++    if time.time() - when > DEADLINE_S:
++        return "stale_request: the call is older than 24 h", False
++    return None, False
++
++
++def _marker(conn: sqlite3.Connection, target: str, kind: str, uid: str) -> bool:
++    return conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND json_valid(payload) AND "
++        "json_extract(payload, '$.operator_request_uid') = ? LIMIT 1", (target, kind, uid)).fetchone() is not None
++
++
++def _agent_block(conn: sqlite3.Connection, target: str) -> Optional[str]:
++    """None when the current block is an agent's (a hold David placed by hand is his to release)."""
++    row = conn.execute("SELECT status, human_request, block_kind FROM tasks WHERE id = ?", (target,)).fetchone()
++    if row is None:
++        return f"no such task {target}"
++    if row[0] != "blocked":
++        return f"{target} is {row[0]}, not blocked"
++    gate = _human_gate(row[1], row[2], target)
++    if gate:
++        return gate
++    ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
++                      "ORDER BY id DESC LIMIT 1", (target,)).fetchone()
++    try:
++        payload = json.loads(ev[0] or "{}") if ev else {}
++    except ValueError:
++        payload = {}
++    if str(payload.get("actor") or "").strip() == "user":  # kanban_cli_actor: a human shell's block
++        return f"{target} was blocked by hand (a human hold); only its owner or a human releases it"
++    return None
++
++
++def _apply(conn: sqlite3.Connection, payload: dict, own: str) -> tuple[str, Optional[str]]:
++    """Apply one proven call on the home's live file: ``(outcome, detail)``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_move as km
++    uid, target, action = payload["request_uid"], payload["target_task_id"], payload.get("action")
++    caller, args = payload.get("caller") or {}, payload.get("args") or {}
++    author = f"{caller.get('gateway')}/{caller.get('task_id')}"
++    extra = {"operator_request_uid": uid, "operator_caller": {k: caller.get(k) for k in
++                                                               ("gateway", "task_id", "run_id", "run_uid")}}
++    task = kb.get_task(conn, target)
++    if task is None:
++        return "refused", f"no such task {target}"
++    if task.status in ("done", "archived"):
++        return "refused", f"{target} is {task.status}"
++    if action == "comment":
++        if _marker(conn, target, COMMENT_MARK, uid):
++            return "already_applied", None
++        text = str(args.get("text") or "").strip()[:MAX_TEXT]
++        if not text:
++            return "refused", "empty comment"
++        with kb.write_txn(conn):
++            cid = kb.add_comment(conn, target, author, text, origin_gateway=caller.get("gateway"), writer_kind="agent")
++            kb._append_event(conn, target, COMMENT_MARK, {**extra, "comment_id": cid})
++        return "applied", f"comment {cid}"
++    if action == "unblock":
++        if _marker(conn, target, "unblocked", uid):
++            return "already_applied", None
++        refusal = _agent_block(conn, target)
++        if refusal:
++            return "refused", refusal
++        reason = str(args.get("reason") or "").strip()
++        ok = kb.unblock_task(conn, target, comment=(author, f"Unblocked through an operator call: {reason}"),
++                             event_extra=extra, precondition=lambda c: _agent_block(c, target))
++        return ("applied", None) if ok else ("refused", f"cannot unblock {target} (state changed)")
++    if action == "move":
++        if _marker(conn, target, km.MOVED_EVENT, uid):
++            return "already_applied", None
++        out = km.move_queued(conn, target, runs_on=args.get("runs_on") or [], reason=str(args.get("reason") or ""),
++                             event_extra=extra)
++        if out.get("ok"):
++            return "applied", f"runs_on={out.get('runs_on')}"
++        return "refused", f"{out.get('reason_code')}: {out.get('error')}"
++    return "refused", f"operator_action_refused: {action}"
++
++
++def _replica_id(rep: sqlite3.Connection) -> int:
++    """The replica file's inode: a retention rebuild unlinks and recreates it, restarting its event ids."""
++    path = _db_path(rep)
++    try:
++        return os.stat(path).st_ino if path else 0
++    except OSError:
++        return 0
++
++
++def _scan_start(conn: sqlite3.Connection, board: str, rep: sqlite3.Connection) -> int:
++    row = conn.execute("SELECT last_id, replica_ino FROM operator_call_scan WHERE board = ?", (board,)).fetchone()
++    ino = _replica_id(rep)
++    mem = _MARK.get((_db_path(conn), board))
++    candidates = [int(row[0])] if row and int(row[1] or 0) == ino else []
++    if mem and mem[1] == ino:
++        candidates.append(mem[0])
++    last = max(candidates, default=0)
++    top = rep.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
++    return 0 if last > int(top or 0) else last  # a rebuilt replica restarts its ids: rescan (the log dedupes)
++
++
++def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
++    """Home side, each dispatcher tick: execute calls naming this gateway's own cards. Returns (uid, outcome)."""
++    from hermes_cli import kanban_db as kb
++    own = _own_gateway(conn)
++    if not own:
++        return []
++    board = _board_slug(conn)
++    done: list[tuple[str, str]] = []
++    with _replica(conn) as rep:
++        if rep is None:
++            return []
++        if not _has_log(conn) or not conn.execute(
++                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_call_scan'").fetchone():
++            with kb.write_txn(conn):
++                ensure_schema(conn)
++        last = _scan_start(conn, board, rep)
++        rows = rep.execute("SELECT id, uid, task_id, payload FROM task_events WHERE id > ? AND kind = ? "
++                           "ORDER BY id LIMIT ?", (last, REQUEST_KIND, SCAN_BATCH)).fetchall()
++        hi = rep.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0] if len(rows) < SCAN_BATCH \
++            else rows[-1][0]
++        handled = 0
++        for eid, euid, etask, raw in rows:
++            try:
++                payload = json.loads(raw or "{}")
++            except ValueError:
++                continue
++            uid, target = payload.get("request_uid"), payload.get("target_task_id")
++            if not uid or not target or not _is_home(conn, own, target):
++                continue
++            if conn.execute("SELECT 1 FROM operator_calls WHERE request_uid = ? AND side = 'execute'",
++                            (uid,)).fetchone():
++                continue
++            if handled >= MAX_PER_TICK:
++                hi = eid - 1
++                break
++            handled += 1
++            event = {"id": eid, "uid": euid, "task_id": etask}
++            refusal, retry = _caller_refusal(rep, board, event, payload)
++            if retry:
++                hi = eid - 1
++                break
++            outcome, _detail = _execute_one(conn, payload, own, refusal)
++            done.append((uid, outcome))
++        stored = conn.execute("SELECT last_id, replica_ino FROM operator_call_scan WHERE board = ?",
++                              (board,)).fetchone()
++        new = max(int(hi), last)
++        key, ino = (_db_path(conn), board), _replica_id(rep)
++        _MARK[key] = (new, ino)
++        # The watermark lives in memory between ticks; it is persisted when a call was handled or every 10 min,
++        # so an idle board costs no write per tick (a restart rescans at most that window; the log dedupes).
++        if stored is None or ((int(stored[0]), int(stored[1] or 0)) != (new, ino)
++                              and (done or time.time() - _PERSISTED.get(key, 0) > 600)):
++            with kb.write_txn(conn):
++                conn.execute("INSERT INTO operator_call_scan (board, last_id, replica_ino) VALUES (?, ?, ?) "
++                             "ON CONFLICT(board) DO UPDATE SET last_id = excluded.last_id, "
++                             "replica_ino = excluded.replica_ino", (board, new, ino))
++            _PERSISTED[key] = time.time()
++    return done
++
++
++def _execute_one(conn: sqlite3.Connection, payload: dict, own: str, refusal: Optional[str]) -> tuple[str, str]:
++    from hermes_cli import kanban_db as kb
++    uid, target = payload["request_uid"], payload["target_task_id"]
++    action = payload.get("action")
++    op = {"action": action, "task_id": target, **(payload.get("args") or {})}
++    if refusal is None and action not in ACTIONS:
++        refusal = f"operator_action_refused: {action} stays with the card's owner"
++    if refusal is None:
++        try:
++            outcome, detail = _apply(conn, payload, own)
++        except Exception as exc:  # health: allow BLE001 -- recorded as a failed call, never silent
++            _log.exception("kanban: operator call %s on %s failed", uid, target)
++            outcome, detail = "failed", f"{type(exc).__name__}: {exc}"[:500]
++    else:
++        outcome, detail = "refused", refusal
++    with kb.write_txn(conn):
++        log(conn, request_uid=uid, side="execute", outcome=outcome, op=op, caller=payload.get("caller"),
++            detail=detail, board=payload.get("board"), executor_gateway=own,
++            supervisor_request_id=payload.get("supervisor_request_id"), finished=True)
++        kb._append_event(conn, target, RESULT_KIND, {
++            "request_uid": uid, "action": action, "outcome": outcome, "detail": detail, "executor_gateway": own,
++            "caller": {k: (payload.get("caller") or {}).get(k) for k in ("gateway", "task_id", "run_id")}})
++    _log.info("kanban: operator call %s %s on %s from %s: %s", uid, action, target,
++              (payload.get("caller") or {}).get("gateway"), outcome)
++    return outcome, detail or ""
++
++
++def list_calls(conn: sqlite3.Connection, *, task: Optional[str] = None, uid: Optional[str] = None,
++               limit: int = 50) -> list[dict]:
++    if not _has_log(conn):
++        return []
++    sql, params = "SELECT * FROM operator_calls WHERE 1=1", []
++    if task:
++        sql += " AND (caller_task_id = ? OR target_task_id = ?)"
++        params += [task, task]
++    if uid:
++        sql += " AND request_uid = ?"
++        params.append(uid)
++    sql += " ORDER BY id DESC LIMIT ?"
++    params.append(int(limit))
++    cur = conn.execute(sql, params)
++    cols = [d[0] for d in cur.description]
++    return [dict(zip(cols, r)) for r in cur.fetchall()]
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 4dee5fae70..764a60e510 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -405,6 +405,11 @@ _SPECS = [
+         _arg("--drain", action="store_true",
+              help="Execute queued requests as this board's non-worker supervisor executor"),
+         _arg("--task", help="Only requests filed by this task id"),
++        _arg("--id", type=int, help="Only this request id"),
++        _arg("--settled", action="store_true",
++             help="With --id: exit 0 once that request is done/rejected/failed, else 1 (a wake_check)"),
++        _arg("--operator-log", action="store_true",
++             help="List the operator-call log (calls on foreign cards, accepted and refused) instead"),
+         _arg("--status", choices=["pending", "accepted", "done", "rejected", "failed"]),
+         _json_flag(help="Emit JSON"),
+     ], help="List (or --drain) graph-edit requests workers filed with kanban_supervisor_request"),
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index 81df495848..bd664240da 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -139,6 +139,13 @@ def normalize_ops(ops: Any) -> list[dict]:
+             from hermes_cli import kanban_archive_exec as ax
+             out.append(ax.normalize_op(i, op))
+             continue
++        if kind == "operator":
++            from hermes_cli import kanban_operator_call as kox
++            if len(ops) != 1:
++                raise SupervisorRequestError("invalid_ops", "an operator call names exactly one card: one op per "
++                                                            "request")
++            out.append(kox.normalize_op(i, op))
++            continue
+         parent = str(op.get("parent_id") or "").strip()
+         child = str(op.get("child_id") or "").strip()
+         if kind not in OPS:
+@@ -153,7 +160,7 @@ def normalize_ops(ops: Any) -> list[dict]:
+     return out
+ 
+ 
+-_OWN_FAMILIES = ("reconcile_notify", "resume", "retry_limit", "archive")
++_OWN_FAMILIES = ("reconcile_notify", "resume", "retry_limit", "archive", "operator")
+ 
+ 
+ def _family(op: dict) -> str:
+@@ -176,7 +183,14 @@ def _is_reconcile(ops: list[dict]) -> bool:
+     return bool(ops) and ops[0].get("op") == "reconcile_notify"
+ 
+ 
++def _is_operator(ops: list[dict]) -> bool:
++    return bool(ops) and ops[0].get("op") == "operator"
++
++
+ def op_label(op: dict) -> str:
++    if op.get("op") == "operator":
++        from hermes_cli import kanban_operator_call as kox
++        return kox.label(op)
+     if op.get("op") == "resume":
+         from hermes_cli import kanban_resume_exec as rx
+         return rx.label(op)
+@@ -268,6 +282,9 @@ def preflight(conn: sqlite3.Connection, requester: str, ops: list[dict]) -> list
+     if _is_archive(ops):
+         from hermes_cli import kanban_archive_exec as ax
+         return [ax.preflight_op(conn, requester, op) for op in ops]
++    if _is_operator(ops):
++        from hermes_cli import kanban_operator_call as kox
++        return [kox.preflight_op(conn, requester, op) for op in ops]
+     edges = _edges(conn)
+     verdicts = []
+     for op in ops:
+@@ -359,7 +376,20 @@ def list_requests(conn: sqlite3.Connection, *, requester: Optional[str] = None,
+ 
+ def submit(conn: sqlite3.Connection, *, env_task: Optional[str], env_run: Optional[str], ops: Any,
+            reason: Optional[str] = None, dry_run: bool = False) -> dict:
+-    """File (or, with ``dry_run``, only preflight) a request. Duplicates return the existing row."""
++    """File (or, with ``dry_run``, only preflight) a request. Duplicates return the existing row.
++    A refused operator call (``kanban_operator_call``) is logged before the refusal is raised."""
++    try:
++        return _submit(conn, env_task=env_task, env_run=env_run, ops=ops, reason=reason, dry_run=dry_run)
++    except SupervisorRequestError as exc:
++        from hermes_cli import kanban_operator_call as kox
++        if not dry_run and kox.is_operator(ops):
++            kox.log_submit_refusal(conn, env_task=env_task, env_run=env_run, raw_ops=ops, code=exc.code,
++                                   message=str(exc))
++        raise
++
++
++def _submit(conn: sqlite3.Connection, *, env_task: Optional[str], env_run: Optional[str], ops: Any,
++            reason: Optional[str] = None, dry_run: bool = False) -> dict:
+     from hermes_cli import kanban_db as kb
+ 
+     norm = normalize_ops(ops)
+@@ -496,8 +526,9 @@ def _accept_next(conn: sqlite3.Connection, executor: str, now: int,
+ 
+ 
+ def _awaiting_owner(raw: Optional[str]) -> bool:
++    """Waiting on another gateway: reconcile_notify (``awaiting_owner``) or an operator call (``awaiting_home``)."""
+     try:
+-        return isinstance(raw, str) and json.loads(raw).get("phase") == "awaiting_owner"
++        return isinstance(raw, str) and json.loads(raw).get("phase") in ("awaiting_owner", "awaiting_home")
+     except (ValueError, AttributeError):
+         return False
+ 
+@@ -582,6 +613,9 @@ def _execute(conn: sqlite3.Connection, req: dict, executor: str, board: Optional
+     if _is_archive(ops):
+         from hermes_cli import kanban_archive_exec as ax
+         return ax.execute(conn, req, executor)
++    if _is_operator(ops):
++        from hermes_cli import kanban_operator_call as kox
++        return kox.start(conn, req, executor)
+     # Scope is re-checked against the board as it is now, not as it was at submit time.
+     gone = requester_refusal(conn, requester)
+     verdicts = preflight(conn, requester, ops)
+@@ -654,6 +688,12 @@ def drain(conn: sqlite3.Connection, *, board: Optional[str] = None, role: str =
+         processed.append((req["id"], status))
+     from hermes_cli import kanban_notify_reconcile_exec as nrx
+     processed += nrx.poll(conn, executor, now=now)
++    from hermes_cli import kanban_operator_call as kox
++    processed += kox.poll(conn, executor, now=now)
++    try:  # home side: calls other gateways' workers made on this gateway's cards
++        kox.apply_incoming(conn)
++    except Exception:  # health: allow BLE001 -- the requests stay in the replica and are retried next drain
++        _log.warning("kanban: applying incoming operator calls failed", exc_info=True)
+     return {"executor": executor, "processed": processed}
+ 
+ 
+@@ -709,12 +749,23 @@ def cli_command(args) -> int:
+             from hermes_cli.kanban_priority_cli import run
+             return run(conn, args)
+         processed = None
++        if getattr(args, "settled", False):
++            req = get_request(conn, args.id) if getattr(args, "id", None) else None
++            if req is None:
++                return _err("--settled needs --id of an existing request")
++            return 0 if req["status"] in TERMINAL else 1
++        if getattr(args, "operator_log", False):
++            from hermes_cli import kanban_operator_call as kox
++            print(json.dumps(kox.list_calls(conn, task=args.task), indent=2))
++            return 0
+         if args.drain:
+             try:
+                 processed = drain(conn, board=os.environ.get("HERMES_KANBAN_BOARD") or None, role="cli")
+             except SupervisorRequestError as exc:
+                 return _err(str(exc))
+         rows = list_requests(conn, requester=args.task, status=args.status)
++        if getattr(args, "id", None):
++            rows = [r for r in rows if r["id"] == args.id]
+     if args.json:
+         print(json.dumps({"drained": processed, "requests": rows}, indent=2))
+         return 0
+diff --git a/tests/hermes_cli/test_kanban_operator_call.py b/tests/hermes_cli/test_kanban_operator_call.py
+new file mode 100644
+index 0000000000..f6260b5bf0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_operator_call.py
+@@ -0,0 +1,414 @@
++"""Scoped Board-operator call: a worker comments on / moves / unblocks ONE named foreign card. [daveey]
++
++Two board files stand in for two gateways: ``worker-5`` runs the caller card, ``hub`` created the target card. A
++third file is the Board replica both read; :func:`_board` copies every card, run and event into it (as the Board
++feed does), stamps Board uids and remembers which gateway wrote each event (the Board's ``origin_gateway``).
++"""
++from __future__ import annotations
++
++import json
++import time
++import uuid
++from contextlib import contextmanager
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_operator_call as kox
++from hermes_cli import kanban_supervisor_requests as ksr
++from hermes_cli.kanban_db_connect import connect
++
++
++class Fleet:
++    def __init__(self, tmp_path: Path):
++        self.w = connect(tmp_path / "worker5.db")
++        self.h = connect(tmp_path / "hub.db")
++        self.rep = connect(tmp_path / "replica.db")
++        self.gw = {id(self.w): "worker-5", id(self.h): "hub"}
++        self.origin: dict[str, str] = {}
++        self.evidence_down = False
++        for c in (self.w, self.h, self.rep):
++            for table, col in (("tasks", "created_on"), ("task_events", "uid"), ("task_runs", "uid")):
++                if col not in {r[1] for r in c.execute(f"PRAGMA table_info({table})")}:
++                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
++            c.commit()
++
++    def name(self, conn):
++        return self.gw.get(id(conn))
++
++    def card(self, conn, title, **kw) -> str:
++        tid = kb.create_task(conn, title=title, assignee="default", created_by="default", **kw)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (self.name(conn), tid))
++        return tid
++
++    def board(self):
++        """One Board round: every live row reaches the replica; Board uids and origin gateways are stamped."""
++        for src in (self.w, self.h):
++            gw = self.name(src)
++            with kb.write_txn(src):
++                for (eid,) in src.execute("SELECT id FROM task_events WHERE uid IS NULL").fetchall():
++                    src.execute("UPDATE task_events SET uid = ? WHERE id = ?", (str(uuid.uuid4()), eid))
++            own = [r[0] for r in src.execute("SELECT id FROM tasks WHERE created_on = ?", (gw,))]
++            with kb.write_txn(self.rep):
++                for tid in own:
++                    row = src.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++                    cols = row.keys()
++                    self.rep.execute(f"INSERT OR REPLACE INTO tasks ({','.join(cols)}) VALUES "
++                                     f"({','.join('?' * len(cols))})", tuple(row))
++                    for r in src.execute("SELECT * FROM task_runs WHERE task_id = ?", (tid,)).fetchall():
++                        rc = [k for k in r.keys() if k != "id"]
++                        if not self.rep.execute("SELECT 1 FROM task_runs WHERE uid = ?", (r["uid"],)).fetchone():
++                            self.rep.execute(f"INSERT INTO task_runs ({','.join(rc)}) VALUES "
++                                             f"({','.join('?' * len(rc))})", tuple(r[k] for k in rc))
++                        else:
++                            self.rep.execute("UPDATE task_runs SET ended_at = ?, status = ? WHERE uid = ?",
++                                             (r["ended_at"], r["status"], r["uid"]))
++                for r in src.execute("SELECT task_id, kind, payload, created_at, uid FROM task_events").fetchall():
++                    if self.rep.execute("SELECT 1 FROM task_events WHERE uid = ?", (r["uid"],)).fetchone():
++                        continue
++                    self.rep.execute("INSERT INTO task_events (task_id, kind, payload, created_at, uid) "
++                                     "VALUES (?,?,?,?,?)", tuple(r))
++                    self.origin[r["uid"]] = gw
++        # The feed: events on each gateway's own cards that another gateway wrote (none here) would come back.
++
++    def run_uid(self, conn, tid) -> str:
++        uid = str(uuid.uuid4())
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET uid = ? WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
++                         (uid, tid))
++            # The Board's lease event for that run (holder = the gateway it leased the card to).
++            kb._append_event(conn, tid, "claimed", {"holder": self.name(conn), "run_uid": uid,
++                                                     "expires": int(time.time() * 1000) + 60000})
++        return uid
++
++
++@pytest.fixture
++def fleet(tmp_path, monkeypatch):
++    hermes = tmp_path / ".hermes"
++    hermes.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(hermes))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(var, raising=False)
++    f = Fleet(tmp_path)
++
++    @contextmanager
++    def replica(_conn):
++        yield f.rep
++
++    def evidence(_board, uid):
++        if f.evidence_down:
++            raise OSError("board unreachable")
++        row = f.rep.execute("SELECT task_id, created_at FROM task_events WHERE uid = ?", (uid,)).fetchone()
++        return {"table": "task_events", "uid": uid,
++                "row": {"origin_gateway": f.origin.get(uid), "task_id": row[0] if row else None,
++                        "created_at": int(time.time() * 1000)}}
++
++    monkeypatch.setattr(kox, "_own_gateway", f.name)
++    monkeypatch.setattr(kox, "_replica", replica)
++    monkeypatch.setattr(kox, "_synced", lambda conn: True)
++    monkeypatch.setattr(kox, "_evidence", evidence)
++    monkeypatch.setattr(kox, "_outbox_rows", lambda c: c.execute("SELECT COUNT(*) FROM task_events").fetchone()[0])
++    monkeypatch.setattr(kox, "_board_slug", lambda conn: "default")
++    kox._MARK.clear()
++    kox._PERSISTED.clear()
++    caller = f.card(f.w, "needs to talk to a hub card")
++    kb.claim_task(f.w, caller)
++    run_id = kb._current_run_id(f.w, caller)
++    f.run_uid(f.w, caller)
++    target = f.card(f.h, "hub-owned card")
++    f.caller, f.run_id, f.target = caller, run_id, target
++    f.board()
++    yield f
++    for c in (f.w, f.h, f.rep):
++        c.close()
++
++
++def _submit(f, op, **kw):
++    return ksr.submit(f.w, env_task=f.caller, env_run=str(f.run_id), ops=[op], **kw)
++
++
++def _round(f):
++    """Caller's drain forwards, Board carries, home executes, Board carries back, caller's drain finishes."""
++    ksr.drain(f.w)
++    f.board()
++    ksr.drain(f.h)
++    f.board()
++    return ksr.drain(f.w)
++
++
++def _log(conn, side=None):
++    rows = kox.list_calls(conn)
++    return [r for r in rows if side is None or r["side"] == side]
++
++
++def test_worker_comments_on_foreign_card_through_operator_call(fleet):
++    f = fleet
++    out = _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "PR #12 is merged"})
++    assert out["status"] == "pending" and out["ops"][0]["verdict"] == "supervisor", out
++    _round(f)
++    comments = f.h.execute("SELECT author, body, origin_gateway FROM task_comments WHERE task_id = ?",
++                           (f.target,)).fetchall()
++    assert [tuple(c) for c in comments] == [(f"worker-5/{f.caller}", "PR #12 is merged", "worker-5")]
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "done", req
++    assert req["result"][0]["outcome"] == "applied"
++    # The worker never wrote the hub's card; the hub's own executor did, and said so on the card.
++    result = f.h.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                         (f.target, kox.RESULT_KIND)).fetchone()
++    assert json.loads(result[0])["executor_gateway"] == "hub"
++
++
++def test_worker_moves_foreign_card_through_operator_call(fleet, monkeypatch):
++    f = fleet
++    plan = {"runs_on": ["machine:worker-1"], "previous": [], "matches": ["worker-1"], "move_no": 1,
++            "forced": False, "me": "hub"}
++    monkeypatch.setattr(km, "check", lambda *a, **k: plan)
++    from hermes_cli import kanban_worker_repin as repin
++    monkeypatch.setattr(repin, "applies", lambda conn, tid: False)
++    from hermes_cli import kanban_worker_node as wn
++    set_to: dict = {}
++    monkeypatch.setattr(wn, "set_runs_on", lambda conn, tid, labels: set_to.__setitem__(tid, labels))
++    out = _submit(f, {"op": "operator", "action": "move", "task_id": f.target, "runs_on": ["machine:worker-1"],
++                      "reason": "needs the GPU box"})
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "done", (req["error"], req["result"])
++    moved = f.h.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                        (f.target, km.MOVED_EVENT)).fetchone()
++    payload = json.loads(moved[0])
++    assert set_to == {f.target: ["machine:worker-1"]}
++    assert payload["runs_on"] == ["machine:worker-1"]
++    assert payload["operator_caller"]["task_id"] == f.caller
++    assert payload["operator_request_uid"]
++
++
++def test_every_call_logged_with_card_and_caller(fleet):
++    f = fleet
++    _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "hello"})
++    with pytest.raises(ksr.SupervisorRequestError):
++        _submit(f, {"op": "operator", "action": "archive", "task_id": f.target})
++    _round(f)
++    req_rows = _log(f.w, "request")
++    assert {r["outcome"] for r in req_rows} == {"done", "refused"}
++    for r in req_rows:
++        assert r["target_task_id"] == f.target
++        assert (r["caller_gateway"], r["caller_task_id"], r["caller_run_id"]) == ("worker-5", f.caller, f.run_id)
++        assert r["caller_run_uid"]
++    refused = next(r for r in req_rows if r["outcome"] == "refused")
++    assert refused["action"] == "archive" and "operator_action_refused" in refused["detail"]
++    exe = _log(f.h, "execute")
++    assert len(exe) == 1
++    assert (exe[0]["target_task_id"], exe[0]["caller_gateway"], exe[0]["caller_task_id"], exe[0]["outcome"],
++            exe[0]["executor_gateway"]) == (f.target, "worker-5", f.caller, "applied", "hub")
++    # The refusal is fleet-visible on the caller's card too.
++    assert f.w.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = ?",
++                       (f.caller, kox.REFUSED_KIND)).fetchone()
++
++
++@pytest.mark.parametrize("action", ["complete", "archive", "link", "unlink", "block", "edit"])
++def test_owner_only_ops_are_refused(fleet, action):
++    with pytest.raises(ksr.SupervisorRequestError) as exc:
++        _submit(fleet, {"op": "operator", "action": action, "task_id": fleet.target})
++    assert exc.value.code == "operator_action_refused"
++
++
++def test_label_publish_is_not_offered_yet(fleet):
++    with pytest.raises(ksr.SupervisorRequestError) as exc:
++        _submit(fleet, {"op": "operator", "action": "label_publish", "task_id": fleet.target})
++    assert exc.value.code == "operator_action_refused"
++
++
++def test_only_one_named_card_per_call(fleet):
++    f = fleet
++    other = f.card(f.h, "another hub card")
++    f.board()
++    op = {"op": "operator", "action": "comment", "task_id": f.target, "text": "x"}
++    with pytest.raises(ksr.SupervisorRequestError) as exc:
++        ksr.submit(f.w, env_task=f.caller, env_run=str(f.run_id),
++                   ops=[op, {**op, "task_id": other}])
++    assert "exactly one card" in str(exc.value)
++    with pytest.raises(ksr.SupervisorRequestError) as exc:  # a second card smuggled in the args
++        _submit(f, {**op, "child_id": other})
++    assert exc.value.code == "invalid_ops"
++    assert all(r["outcome"] == "refused" for r in _log(f.w))
++
++
++def test_home_executes_only_the_card_the_request_names(fleet):
++    """A forged request event naming a card on the caller's own card is refused at the home: caller unproven."""
++    f = fleet
++    other = f.card(f.h, "unrelated hub card")
++    with kb.write_txn(f.h):  # someone on the hub writes a request event pretending to be worker-5's caller
++        kb._append_event(f.h, other, kox.REQUEST_KIND, {
++            "request_uid": "forged", "board": "default", "action": "comment", "target_task_id": other,
++            "args": {"text": "spoofed"}, "caller": {"gateway": "worker-5", "task_id": f.caller, "run_id": f.run_id,
++                                                     "run_uid": "x"}, "requested_at": int(time.time())})
++    f.board()
++    kox.apply_incoming(f.h)
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (other,)).fetchone()
++    row = next(r for r in _log(f.h, "execute") if r["request_uid"] == "forged")
++    assert row["outcome"] == "refused" and "caller_unproven" in row["detail"]
++
++
++def test_origin_gateway_mismatch_is_refused(fleet):
++    f = fleet
++    _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "hi"})
++    ksr.drain(f.w)
++    f.board()
++    for uid in list(f.origin):
++        f.origin[uid] = "worker-9"  # the Board says another gateway wrote the request event
++    ksr.drain(f.h)
++    assert not f.h.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (f.target,)).fetchone()
++    assert "caller_unproven" in _log(f.h, "execute")[0]["detail"]
++    f.board()
++    out = ksr.drain(f.w)
++    assert any(s == "rejected" for _rid, s in out["processed"]), out
++
++
++def test_local_card_and_own_card_are_refused(fleet):
++    f = fleet
++    local = f.card(f.w, "a worker-5 card")
++    f.board()
++    for tid, code in ((local, "not_foreign"), (f.caller, "own_card")):
++        out = _submit(f, {"op": "operator", "action": "comment", "task_id": tid, "text": "x"}, dry_run=True)
++        assert out["ops"][0]["code"] == code, out
++
++
++def test_unblock_refuses_human_gate_and_hand_hold(fleet):
++    f = fleet
++    asked = f.card(f.h, "waits on David")
++    kb.block_task(f.h, asked, reason="pick A or B", kind="needs_input")
++    held = f.card(f.h, "held by hand")
++    kb.block_task(f.h, held, reason="hold", actor="user", kind="transient")
++    agent = f.card(f.h, "agent block")
++    kb.block_task(f.h, agent, reason="waiting on CI", kind="transient")
++    f.board()
++    out = _submit(f, {"op": "operator", "action": "unblock", "task_id": asked, "reason": "decided"}, dry_run=True)
++    assert out["ops"][0]["code"] == "human_gate", out
++    # The hand hold passes the caller's preflight (the replica has no actor) but the home refuses it.
++    _submit(f, {"op": "operator", "action": "unblock", "task_id": held, "reason": "go"})
++    _round(f)
++    assert kb.get_task(f.h, held).status == "blocked"
++    assert "by hand" in _log(f.h, "execute")[0]["detail"]
++    out = _submit(f, {"op": "operator", "action": "unblock", "task_id": agent, "reason": "CI is green"})
++    _round(f)
++    assert kb.get_task(f.h, agent).status != "blocked"
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
++
++
++def test_running_target_is_not_moved(fleet):
++    f = fleet
++    kb.claim_task(f.h, f.target)
++    f.board()
++    out = _submit(f, {"op": "operator", "action": "move", "task_id": f.target, "runs_on": ["machine:worker-1"],
++                      "reason": "x"}, dry_run=True)
++    assert out["ops"][0]["code"] == "running"
++
++
++def test_replay_never_applies_twice(fleet):
++    f = fleet
++    _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "once"})
++    ksr.drain(f.w)
++    f.board()
++    kox.apply_incoming(f.h)
++    kox._MARK.clear()  # a restart, and a lost watermark: everything is rescanned
++    with kb.write_txn(f.h):
++        f.h.execute("DELETE FROM operator_call_scan")
++    kox.apply_incoming(f.h)
++    with kb.write_txn(f.h):  # even the log row lost (crash after the comment): the card's marker answers
++        f.h.execute("DELETE FROM operator_calls")
++        f.h.execute("DELETE FROM operator_call_scan")
++    kox._MARK.clear()
++    kox.apply_incoming(f.h)
++    assert f.h.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (f.target,)).fetchone()[0] == 1
++    assert _log(f.h, "execute")[0]["outcome"] == "already_applied"
++
++
++def test_unreachable_board_defers_instead_of_refusing(fleet):
++    f = fleet
++    _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "later"})
++    ksr.drain(f.w)
++    f.board()
++    f.evidence_down = True
++    assert kox.apply_incoming(f.h) == []
++    f.evidence_down = False
++    assert kox.apply_incoming(f.h) and f.h.execute("SELECT 1 FROM task_comments WHERE task_id = ?",
++                                                   (f.target,)).fetchone()
++
++
++def test_parked_caller_is_woken_on_the_result(fleet):
++    from hermes_cli.kanban_db_schedule import schedule_task
++    f = fleet
++    out = _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "hi"})
++    ksr.drain(f.w)
++    assert schedule_task(f.w, f.caller, reason=f"waiting on supervisor request #{out['request_id']}",
++                         clock_only=True)
++    f.board()
++    ksr.drain(f.h)
++    f.board()
++    ksr.drain(f.w)
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
++    assert kb.get_task(f.w, f.caller).status != "scheduled"
++    assert f.w.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'supervisor_request_wake'",
++                       (f.caller,)).fetchone()
++
++
++def test_evicted_caller_copy_still_finishes(fleet):
++    f = fleet
++    out = _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "hi"})
++    ksr.drain(f.w)
++    f.board()
++    ksr.drain(f.h)
++    f.board()
++    with kb.write_txn(f.w):  # a worker node evicted its copy of the caller card meanwhile
++        f.w.execute("DELETE FROM task_events WHERE task_id = ?", (f.caller,))
++        f.w.execute("DELETE FROM task_runs WHERE task_id = ?", (f.caller,))
++        f.w.execute("DELETE FROM tasks WHERE id = ?", (f.caller,))
++    ksr.drain(f.w)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "done" and req["error"] == "requester_gone"
++
++
++def test_home_offline_fails_after_deadline(fleet):
++    f = fleet
++    out = _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "hi"})
++    ksr.drain(f.w)
++    later = int(time.time()) + kox.DEADLINE_S + 60
++    ksr.drain(f.w, now=later)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "failed" and "did not answer" in (req["error"] or "")
++
++
++def test_reconcile_poller_leaves_operator_calls_alone(fleet):
++    from hermes_cli import kanban_notify_reconcile_exec as nrx
++    f = fleet
++    out = _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "hi"})
++    ksr.drain(f.w)
++    assert nrx.awaiting(f.w) == []
++    assert [r[0] for r in kox.awaiting(f.w)] == [out["request_id"]]
++
++
++def test_unsynced_board_refuses_not_synced(fleet, monkeypatch):
++    f = fleet
++    monkeypatch.setattr(kox, "_outbox_rows", lambda c: None)
++    out = _submit(f, {"op": "operator", "action": "comment", "task_id": f.target, "text": "hi"})
++    ksr.drain(f.w)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "rejected" and "not_synced" in req["error"]
++    assert not f.w.execute("SELECT 1 FROM task_events WHERE kind = ?", (kox.REQUEST_KIND,)).fetchone()
++
++
++def test_worker_context_cannot_execute(fleet, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", fleet.caller)
++    with pytest.raises(ksr.SupervisorRequestError) as exc:
++        ksr.drain(fleet.h)
++    assert exc.value.code == "worker_context"
++
++
++def test_operator_path_never_reads_an_admin_key():
++    """The worker never holds the Board admin key: nothing in the operator path names it."""
++    src = Path(kox.__file__).read_text()
++    assert "admin.key" not in src and "/v1/admin" not in src and "admin machine" not in src
+diff --git a/tools/kanban_tools_graph.py b/tools/kanban_tools_graph.py
+index 1f549de982..1ad945c94b 100644
+--- a/tools/kanban_tools_graph.py
++++ b/tools/kanban_tools_graph.py
+@@ -91,6 +91,11 @@ def handle_supervisor_request(args: dict, **kw) -> str:
+             f"Supervisor request #{out['request_id']} is {out['status']}. It is agent-owned, not a human "
+             "ask. Park this card with kanban_schedule(reason='SCHEDULED_UNTIL=<ISO8601> waiting on "
+             f"supervisor request #{out['request_id']}'); the result wakes it, also if it lands first.")
++        if ksr._is_operator(out.get("ops") or []):
++            out["next_step"] += (
++                " An operator call is executed by the card's home gateway; add wake_check="
++                f"'hermes kanban supervisor-requests --id {out['request_id']} --settled' so a worker node keeps "
++                "this card's copy until the answer arrives.")
+     return _ok(**out)
+ 
+ 
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 7bb70acc7c..57733eeb0f 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -1034,24 +1034,36 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+         "task's creator tree: created by a card this task created (up to 3 hops) whose creator(s) are all "
+         "done or archived, so no live card owns it. Cards this task created directly are refused (use "
+         "kanban_archive), as are claimed/running/done cards and anything outside the tree; a request "
+-        "carries only archive ops."
++        "carries only archive ops. "
++        "Op operator {action, task_id, ...} is the scoped Board-operator call for ONE card ANOTHER gateway "
++        "created (the ones kanban_comment/kanban_move/kanban_unblock refuse as foreign_card): action "
++        "comment {text}, move {runs_on, reason} (not while it runs) or unblock {reason} (an agent's block "
++        "only, never one waiting on a human). That card's home gateway executes it; complete/archive/link/"
++        "unlink of a foreign card are refused (its owner's), one op per request, every call logged."
+     ),
+     {
+         "ops": {
+             "type": "array",
+             "description": "Edge edits applied in order, reconcile_notify ops, resume ops, retry_limit ops, "
+-                           "or archive ops (max 20).",
++                           "archive ops (max 20), or exactly one operator op.",
+             "items": {
+                 "type": "object",
+                 "properties": {
+                     "op": {"type": "string", "enum": ["link", "unlink", "reconcile_notify", "resume", "retry_limit",
+-                                                         "archive"]},
++                                                         "archive", "operator"]},
++                    "action": {"type": "string", "enum": ["comment", "move", "unblock"],
++                               "description": "operator: what to do on the foreign card."},
++                    "text": {"type": "string", "description": "operator comment: the comment body."},
++                    "runs_on": {"type": "array", "items": {"type": "string"},
++                                "description": "operator move: the new machine labels."},
++                    "reason": {"type": "string", "description": "operator move/unblock: why (required)."},
+                     "parent_id": {"type": "string"},
+                     "child_id": {"type": "string"},
+                     "task_id": {"type": "string", "description": "reconcile_notify: the subscribed task; "
+                                                                  "resume: the card to requeue; "
+                                                                  "retry_limit: the card to edit; "
+-                                                                 "archive: the card to cancel."},
++                                                                 "archive: the card to cancel; "
++                                                                 "operator: the one foreign card."},
+                     "max_retries": {"type": "integer", "description": "retry_limit: the new breaker, 1-10."},
+                     "chat_id": {"type": "string", "description": "reconcile_notify: the tui row's chat (session id)."},
+                     "thread_id": {"type": "string", "description": "reconcile_notify: the row's thread, if any."},
+-- 
+2.43.0
+

@@ -1,0 +1,280 @@
+From bcf98ee242101097d9d24db788c7e3f812228426 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:36:38 +0000
+Subject: [PATCH] fix(kanban): release published custody and preserve kernel
+ parks [daveey]
+
+---
+ docs/kanban-workspace-publication.md          | 13 ++-
+ hermes_cli/goals.py                           |  3 +-
+ hermes_cli/kanban_db_run.py                   |  3 +-
+ hermes_cli/kanban_goal_recovery.py            |  3 +-
+ hermes_cli/kanban_workspace_publication.py    | 28 +++++-
+ .../test_kanban_publication_recovery.py       | 95 +++++++++++++++++++
+ 6 files changed, 134 insertions(+), 11 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_publication_recovery.py
+
+diff --git a/docs/kanban-workspace-publication.md b/docs/kanban-workspace-publication.md
+index 81e4840109..9c646681c0 100644
+--- a/docs/kanban-workspace-publication.md
++++ b/docs/kanban-workspace-publication.md
+@@ -54,6 +54,12 @@ Before voluntary continue, block, schedule or review handoff of an active run:
+   is the first receipt for compact readers; the plural field is authoritative for
+   multiple roots. Involuntary/unguarded endings record unverified custody without
+   a remote probe and without preventing run recovery.
++  Kernel goal-loop budget, non-finalization and unachievable parks are involuntary;
++  a kernel-only call scope preserves their existing transition/ownership checks.
++- Carry forward the newest unresolved receipt per path. An exactly published
++  receipt releases historical custody (including older unpublished receipts and
++  checkpoint mentions); a current explicit reference or declared workspace is
++  still checked anew. Removing an unpublished root does not release custody.
+ 
+ No staging, automatic commit, push, credential grant, host-marker removal or move
+ exception is performed. In particular, copied databases, ignored build outputs,
+@@ -69,8 +75,11 @@ and disposable bare origins. It covers unpublished/dirty/untracked work, deleted
+ remote branches with stale tracking refs, successful exact publication, explicit
+ retention reasons, final-local-state races, crash audit, and the scratch + external
+ linked-worktree pattern through current checkpoint, metadata and prior checkpoint.
+-A source checkout mentioned incidentally for read-only runtime inspection is not
+-inferred to be an owned implementation worktree. Existing placement refusals remain.
++A plain clone mentioned in scratch text is not inferred to be owned, even if it
++contains unpublished commits. Linked-worktree mentions are checked regardless of
++prose such as "read-only"; declared Git workspaces are always checked. Existing
++placement refusals remain. Recovery regressions in `test_kanban_publication_recovery.py`
++cover kernel stops, release after publication, caller receipt stripping and malformed paths.
+ 
+ DB entrypoints are exercised directly. CLI/tool transport, natural deployed
+ recovery and cross-worker reconstruction are separate acceptance, not inferred
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+index 67c5b91770..f9652cfe27 100644
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -1689,7 +1689,8 @@ def run_kanban_goal_loop(
+ 
+     def _block(message: str) -> None:
+         try:
+-            block_fn(message)
++            from hermes_cli.kanban_workspace_publication import involuntary_park
++            involuntary_park(task_id, block_fn, message)
+         except Exception as exc:
+             _log(f"kanban goal loop: block_fn failed ({exc})")
+ 
+diff --git a/hermes_cli/kanban_db_run.py b/hermes_cli/kanban_db_run.py
+index 50299db429..028ddc42c6 100644
+--- a/hermes_cli/kanban_db_run.py
++++ b/hermes_cli/kanban_db_run.py
+@@ -16,6 +16,7 @@ def _end_run(
+     row: they are the only evidence left of the OS process once the task row
+     is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
+     to end a worker that survived its own terminal transition."""
++    from hermes_cli import kanban_db as _kb
+     now = int(time.time())
+     run_id = _kb._current_run_id(conn, task_id)
+     if run_id is None:
+@@ -39,5 +40,3 @@ def _end_run(
+     )
+     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+     return run_id
+-
+-from hermes_cli import kanban_db as _kb
+diff --git a/hermes_cli/kanban_goal_recovery.py b/hermes_cli/kanban_goal_recovery.py
+index e2c5f49089..b236989db8 100644
+--- a/hermes_cli/kanban_goal_recovery.py
++++ b/hermes_cli/kanban_goal_recovery.py
+@@ -16,9 +16,10 @@ class GoalRejection:
+ 
+ def park(conn, task, reason, *, expected_run_id):
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_workspace_publication import involuntary_park
+     if not task or expected_run_id is None:
+         return False
+-    return kb.block_task(conn, task.id, kind='transient', reason=reason,
++    return involuntary_park(task.id, kb.block_task, conn, task.id, kind='transient', reason=reason,
+                          expected_run_id=expected_run_id,
+                          goal_rejection=GoalRejection(digest(subject(task, reason))))
+ 
+diff --git a/hermes_cli/kanban_workspace_publication.py b/hermes_cli/kanban_workspace_publication.py
+index 8898692458..f53e8f92a9 100644
+--- a/hermes_cli/kanban_workspace_publication.py
++++ b/hermes_cli/kanban_workspace_publication.py
+@@ -15,6 +15,7 @@ import subprocess
+ import time
+ 
+ _receipt: ContextVar[tuple | None] = ContextVar('workspace_publication', default=None)
++_kernel_park: ContextVar[str | None] = ContextVar('workspace_kernel_park', default=None)
+ _deadline: ContextVar[float | None] = ContextVar('workspace_publication_deadline', default=None)
+ _REASON = re.compile(r'^UNPUBLISHED_WORK_REASON=([^\r\n]+)', re.MULTILINE)
+ 
+@@ -63,7 +64,8 @@ def _paths(conn, task_id, text=''):
+         found[str(declared)] = declared
+     retained = conn.execute('SELECT summary, metadata FROM task_runs WHERE task_id=? '
+                             'ORDER BY id DESC LIMIT 3', (task_id,)).fetchall()
+-    texts = [text]
++    texts = []
++    latest = {}
+     for summary, metadata in retained:
+         texts.append(summary or '')
+         try:
+@@ -79,10 +81,13 @@ def _paths(conn, task_id, text=''):
+                 for receipt in receipts:
+                     raw = receipt.get('path') if isinstance(receipt, dict) else None
+                     if isinstance(raw, str) and Path(raw).is_absolute():
+-                        found[raw] = Path(raw)
+-    for value in texts:
++                        latest.setdefault(raw, receipt.get('state'))
++    found.update((raw, Path(raw)) for raw, state in latest.items() if state != 'published')
++    for value, historical in [(value, True) for value in texts] + [(text, False)]:
+         for raw in re.findall(r"(?:/|~/)[^\s`'\"<>;,()\[\]]+", value):
+             path = Path(raw.rstrip('.')).expanduser()
++            if historical and latest.get(str(path)) == 'published':
++                continue
+             if (path / '.git').is_file():
+                 found[str(path)] = path
+     return list(found.values())
+@@ -106,15 +111,26 @@ def _observe(path):
+             receipt['reason'] = 'workspace_changed_during_probe'
+             return receipt
+         receipt.update(state='published', reason='exact_origin_branch')
+-    except (OSError, subprocess.SubprocessError, UnicodeError):
++    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+         pass  # Unknown publication must never become a successful publication receipt.
+     return receipt
+ 
+ 
++def involuntary_park(task_id, fn, *args, **kwargs):
++    """Kernel-only call scope; never inferred from worker metadata or reason text."""
++    token = _kernel_park.set(task_id)
++    try:
++        return fn(*args, **kwargs)
++    finally:
++        _kernel_park.reset(token)
++
++
+ def publication_guard(fn):
+     """Observe before any transition transaction; exceptions leave run ownership intact."""
+     @wraps(fn)
+     def wrapped(conn, task_id, *args, **kwargs):
++        if _kernel_park.get() == task_id:
++            return fn(conn, task_id, *args, **kwargs)
+         row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id = ?', (task_id,)).fetchone()
+         text = kwargs.get('checkpoint') or kwargs.get('reason') or kwargs.get('summary') or ''
+         metadata = kwargs.get('metadata') or {}
+@@ -149,11 +165,13 @@ def publication_guard(fn):
+ 
+ def closed_metadata(conn, task_id, run_id, metadata):
+     """Server-owned receipt; involuntary exits cannot be refused by network failure."""
++    metadata = {key: value for key, value in (metadata or {}).items()
++                if key not in ('workspace_publication', 'workspace_publications')}
+     current = _receipt.get()
+     paths = _paths(conn, task_id)
+     observations = [{'path': str(path), 'state': 'unverified', 'reason': 'involuntary_or_unguarded_exit'}
+                     for path in paths]
+-    if current and current[:3] == (id(conn), task_id, run_id):
++    if _kernel_park.get() != task_id and current and current[:3] == (id(conn), task_id, run_id):
+         observations = [dict(item) for item in current[3]]
+         deadline = time.monotonic() + 1
+         for observed in observations:
+diff --git a/tests/hermes_cli/test_kanban_publication_recovery.py b/tests/hermes_cli/test_kanban_publication_recovery.py
+new file mode 100644
+index 0000000000..d30830a03c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_publication_recovery.py
+@@ -0,0 +1,95 @@
++"""Kernel parks preserve custody without refusing an involuntary stop."""
++import json
++
++import pytest
++
++from hermes_cli import goals
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_goal_recovery import park
++pytest_plugins = ['tests.hermes_cli.test_kanban_workspace_publication']
++
++
++@pytest.mark.parametrize('verdict,max_turns', [('continue', 1), ('done', 3), ('blocked', 1)])
++def test_kernel_goal_park_retains_unpublished_custody(git_task, monkeypatch, verdict, max_turns):
++    tid, _, _ = git_task
++    monkeypatch.setattr(goals, 'judge_goal', lambda *a: (verdict, 'fixture verdict', False, False, False))
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET goal_mode=1 WHERE id=?', (tid,))
++        run_id = kb._current_run_id(conn, tid)
++        result = goals.run_kanban_goal_loop(
++            task_id=tid, goal_text='fixture', run_turn=lambda _: 'not finalized',
++            task_status_fn=lambda: kb.get_task(conn, tid).status,
++            block_fn=lambda reason: kb.block_task(conn, tid, reason=reason, expected_run_id=run_id),
++            unachievable_fn=lambda reason: park(conn, kb.get_task(conn, tid), reason, expected_run_id=run_id),
++            max_turns=max_turns)
++        assert not result['failed']
++        assert kb.get_task(conn, tid).status != 'running'
++        row = conn.execute('SELECT ended_at, metadata FROM task_runs WHERE id=?', (run_id,)).fetchone()
++        assert row[0] is not None
++        receipt = json.loads(row[1])['workspace_publication']
++        assert receipt['state'] == 'unverified'
++        assert receipt['reason'] == 'involuntary_or_unguarded_exit'
++
++
++@pytest.mark.parametrize('remove', [False, True])
++def test_published_custody_releases_prior_unpublished_receipts(git_task, tmp_path, remove):
++    import subprocess
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli import kanban_db_workspace as kw
++    from tests.hermes_cli.test_kanban_workspace_publication import _publish
++
++    tid, _, git = git_task
++    _publish(git_task, tmp_path)
++    wt = tmp_path / 'implementation'
++    git('worktree', 'add', '-b', 'implementation', str(wt))
++    scratch = tmp_path / 'scratch'
++    scratch.mkdir()
++    with kbc.connect_closing() as conn:
++        kw.set_workspace_path(conn, tid, scratch)
++        assert kc.continue_task(conn, tid, checkpoint=f'{wt}\nUNPUBLISHED_WORK_REASON=not pushed yet')['ok']
++        assert kb.claim_task(conn, tid)
++        subprocess.check_call(['git', '-C', str(wt), 'push', 'origin', 'implementation'])
++        assert kc.continue_task(conn, tid, checkpoint='Published now')['ok']
++        assert kb.claim_task(conn, tid)
++        if remove:
++            git('worktree', 'remove', str(wt))
++        else:
++            (wt / 'new.txt').write_text('unrelated later work')
++        for _ in range(4):
++            run = kb._current_run_id(conn, tid)
++            assert kc.continue_task(conn, tid, checkpoint='No retained work')['ok']
++            data = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run,)).fetchone()[0])
++            assert not data.get('workspace_publications')
++            assert kb.claim_task(conn, tid)
++
++
++def test_caller_cannot_supply_receipts_without_observations(git_task, tmp_path):
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli import kanban_db_workspace as kw
++
++    tid, _, _ = git_task
++    scratch = tmp_path / 'scratch'
++    scratch.mkdir()
++    with kbc.connect_closing() as conn:
++        kw.set_workspace_path(conn, tid, scratch)
++        run = kb._current_run_id(conn, tid)
++        forged = {'path': '/forged', 'state': 'published'}
++        assert kc.continue_task(conn, tid, checkpoint='fixture', metadata={
++            'workspace_publication': forged, 'workspace_publications': [forged]})['ok']
++        data = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run,)).fetchone()[0])
++        assert 'workspace_publication' not in data
++        assert 'workspace_publications' not in data
++
++
++def test_malformed_retained_path_allows_explicit_retention(git_task):
++    from hermes_cli import kanban_continuation as kc
++
++    tid, _, _ = git_task
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            conn.execute('UPDATE task_runs SET metadata=? WHERE id=?',
++                         (json.dumps({'workspace_publications': [{'path': '/a\u0000b', 'state': 'unverified'}]}),
++                          kb._current_run_id(conn, tid)))
++        assert kc.continue_task(conn, tid, checkpoint='UNPUBLISHED_WORK_REASON=retain evidence')['ok']
+-- 
+2.43.0
+

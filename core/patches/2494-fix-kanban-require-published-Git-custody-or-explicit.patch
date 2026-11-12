@@ -1,0 +1,666 @@
+From 324697f54c90acd6e93128186328b946a5b34ee1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:49:12 +0000
+Subject: [PATCH] fix(kanban): require published Git custody or explicit
+ retention at handoff [daveey]
+
+---
+ docs/kanban-workspace-publication.md          | 122 ++++++++++++
+ hermes_cli/kanban_continuation.py             |   3 +
+ hermes_cli/kanban_db.py                       |  36 +---
+ hermes_cli/kanban_db_run.py                   |  43 ++++
+ hermes_cli/kanban_db_schedule.py              |   3 +
+ hermes_cli/kanban_workspace_publication.py    | 162 +++++++++++++++
+ .../test_kanban_workspace_publication.py      | 188 ++++++++++++++++++
+ 7 files changed, 525 insertions(+), 32 deletions(-)
+ create mode 100644 docs/kanban-workspace-publication.md
+ create mode 100644 hermes_cli/kanban_db_run.py
+ create mode 100644 hermes_cli/kanban_workspace_publication.py
+ create mode 100644 tests/hermes_cli/test_kanban_workspace_publication.py
+
+diff --git a/docs/kanban-workspace-publication.md b/docs/kanban-workspace-publication.md
+new file mode 100644
+index 0000000000..81e4840109
+--- /dev/null
++++ b/docs/kanban-workspace-publication.md
+@@ -0,0 +1,122 @@
++# Git-workspace custody at Kanban handoff
++
++## Problem and evidence-backed cause chain
++
++Observed: resumed cards require their previous host because implementation commits,
++uncommitted patches and checkpoint files were retained only on its disk. This is
++not evidence that every host marker is wrong: live runtime evidence remains local.
++
++1. Runs can close successfully without publishing their implementation. Before this
++   change, `kanban_continuation.continue_task` stored checkpoint metadata and called
++   `_end_run`; `kanban_db_schedule.schedule_task` and `kanban_db.block_task` similarly
++   changed status and ended the run. `_end_run` only updated SQLite run/task rows.
++   None of those paths inspected Git publication.
++2. A checkpoint was treated as durable continuation state even when it pointed to
++   a different, unpublished worktree outside the card's scratch workspace. The
++   scratch/worktree distinction describes the launch directory, not all artifacts
++   owned by the run. A branch name alone cannot reconstruct dirty files or a
++   commit the remote does not have.
++3. Recovery retained the filesystem rather than transporting source identity.
++   `kanban_db_workspace._ensure_git_worktree` reused a local branch or created it
++   from local HEAD; `_restore_repo_for_missing_worktree` searched local repositories
++   for that branch. Neither fetched a published checkpoint branch on another host.
++4. Movement therefore deliberately refused every `dir`/`worktree` card in
++   `kanban_move.check` with `workspace_bound`. Removing that guard alone would
++   permit silent loss or execution of a different branch/HEAD.
++5. **Root (happened):** lifecycle persistence and workspace custody had no shared
++   publication contract. Host binding was a safety containment, not source transport.
++   **Root (not caught):** tests explicitly pinned unconditional worktree movement
++   refusal (`test_workspace_bound_cards_never_move`), while lifecycle tests exercised
++   SQLite/checkpoint transitions without a real unpublished Git implementation.
++   New real-Git regressions failed on the old code with “DID NOT RAISE”.
++
++Recurrence: earlier published-worktree routing work introduced a narrow *creation
++text* exemption (`kanban_published_worktree`); it did not alter park lifecycle,
++move, pickup or workspace reconstruction. This fix does not claim that exemption
++failed to deploy or that runtime observations are portable.
++
++## Countermeasure
++
++Before voluntary continue, block, schedule or review handoff of an active run:
++
++- Inspect the declared Git workspace, and existing linked-worktree roots explicitly
++  named in the checkpoint/reason/summary, metadata `worktree`/`worktrees`, or the last
++  three saved run checkpoints. Do not recursively scan or upload scratch artifacts.
++- Require a clean worktree and an exact live `origin` branch SHA match, not a stale
++  remote-tracking ref. Probe outside the transition write transaction, sharing one
++  five-second budget across roots. Recheck local branch/HEAD/cleanliness inside the
++  transition, sharing a one-second local fence budget.
++- Otherwise refuse with `unpublished_workspace`, unless the checkpoint/reason has
++  a nonempty line `UNPUBLISHED_WORK_REASON=<why the work must remain on this host>`.
++  The exception records explicit custody; it does not authorize relocation.
++- Save server-derived `workspace_publications` receipts on the closed run. A
++  caller-provided receipt cannot override the observation. `workspace_publication`
++  is the first receipt for compact readers; the plural field is authoritative for
++  multiple roots. Involuntary/unguarded endings record unverified custody without
++  a remote probe and without preventing run recovery.
++
++No staging, automatic commit, push, credential grant, host-marker removal or move
++exception is performed. In particular, copied databases, ignored build outputs,
++unregistered/unmentioned worktrees and non-Git scratch scripts are **not** made
++portable. Publication receipts are not portability grants. A hard process/host
++crash cannot execute a publication step; subsequent lifecycle recovery can record
++retained custody only.
++
++## Verification
++
++`tests/hermes_cli/test_kanban_workspace_publication.py` uses real Git repositories
++and disposable bare origins. It covers unpublished/dirty/untracked work, deleted
++remote branches with stale tracking refs, successful exact publication, explicit
++retention reasons, final-local-state races, crash audit, and the scratch + external
++linked-worktree pattern through current checkpoint, metadata and prior checkpoint.
++A source checkout mentioned incidentally for read-only runtime inspection is not
++inferred to be an owned implementation worktree. Existing placement refusals remain.
++
++DB entrypoints are exercised directly. CLI/tool transport, natural deployed
++recovery and cross-worker reconstruction are separate acceptance, not inferred
++from these unit/integration tests.
++
++## Follow-up: branch-backed portable source manifest
++
++Persist a versioned `workspace_source` JSON field on tasks and in Board replication:
++`{version:1, repository:<canonical credential-free URL>, branch:<full refs/heads/...>,
++commit:<full object id>, published_at:<owner timestamp>, manifest_revision:<CAS>,
++artifacts:<explicit durable attachment references>}`. A path is host-local derived
++state, never source identity. Do not infer the repo from its basename or branch name.
++Keep source claims and publication receipts server-owned and bind them to the run
++UID, owning machine, task revision and approved repository.
++
++Binding points to change together:
++
++1. Creation/enrollment: `kanban_db_creation`, `kanban_worker_placement` and
++   `kanban_placement` persist/validate the source contract and preserve independent
++   host markers, profile tools and explicit host requirements.
++2. Movement/reservation: `kanban_move.check`, worker-placement reevaluation,
++   `kanban_runs_on_capabilities` and Board policy permit a worktree only with a
++   current published manifest and a capable destination. Dirty/unpushed/unknown
++   custody and plain `dir` workspaces remain host-bound.
++3. Pickup: `kanban_worker_node` plus Board row transport validate the manifest
++   before admitting execution. Exclude foreign live workspaces; do not reuse an
++   identical pathname as proof. Preserve lease/CAS/single-writer authority.
++4. Resolver: `kanban_db_workspace.resolve_worktree_for_dispatch`,
++   `_resolve_worktree_workspace` and `_ensure_git_worktree` locate an explicitly
++   registered clone of the same repository on the destination, fetch the named
++   branch, verify exact commit, and materialize that task's own local worktree.
++   Missing source, remote drift, occupied/dirty paths, wrong repo, detached or
++   diverged local branches must fail closed without resetting or overwriting.
++5. Park/handoff: reuse the custody guard, add an authorized secret-scanned push of
++   already committed task source only (never arbitrary staging/auto-commit), and
++   attach a separately durable evidence manifest. Publish-before-release must be
++   idempotent and revalidated against run/task generation; push failure retains
++   host custody and records the reason.
++
++Acceptance: isolated two-clone/two-host fixture resumes exact branch+SHA after the
++original worktree is removed; includes scratch-owned external worktrees and
++attachments. Real normal-ingress worker execution records hostname, Board holder,
++source identity and tested SHA. Inject rejected pushes, absent credentials, remote
++branch deletion/drift, stale tracking refs, dirty/untracked/ignored private evidence,
++concurrent park/edit/claim, foreign leases, repo URL rewrites and active destination
++worktrees. Each must refuse without losing local state or admitting a second writer.
++Test create, move, scheduled continuation, review handoff, timeout and crash recovery;
++verify old mixed-version clients fail closed. Ship source schema/Board/core through
++normal exact-head review+CI, then prove actual cross-worker claim and reconstruction.
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 8885e3a260..9c139b2351 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -22,6 +22,8 @@ import sqlite3
+ import time
+ from typing import Callable, Any, Optional
+ 
++from hermes_cli.kanban_workspace_publication import publication_guard
++
+ CONTINUED_OUTCOME = "continued"
+ CONTINUATION_WOKEN_EVENT = "continuation_woken"
+ DEFAULT_SOFT_DEADLINE_FRACTION = 0.85
+@@ -81,6 +83,7 @@ def consecutive_continuations(conn: sqlite3.Connection, task_id: str) -> int:
+     return count
+ 
+ 
++@publication_guard
+ def continue_task(
+     conn: sqlite3.Connection, task_id: str, *, checkpoint: str,
+     resume_after_seconds: int = 0, expected_run_id: Optional[int] = None,
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 34b147d6e8..a980e91720 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -18,6 +18,7 @@ import contextlib
+ import json
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
++from hermes_cli.kanban_workspace_publication import publication_guard
+ import os
+ import re
+ import secrets
+@@ -1857,38 +1858,7 @@ def _append_event(
+     append_event(conn, task_id, kind, payload, run_id=run_id)
+ 
+ 
+-def _end_run(
+-    conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
+-    error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+-) -> Optional[int]:
+-    """Close the active run (``status`` defaults to ``outcome``) and clear
+-    ``current_run_id``; None when no run was active (never-claimed task).
+-
+-    ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
+-    row: they are the only evidence left of the OS process once the task row
+-    is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
+-    to end a worker that survived its own terminal transition."""
+-    now = int(time.time())
+-    run_id = _current_run_id(conn, task_id)
+-    if run_id is None:
+-        return None
+-    conn.execute(
+-        """
+-        UPDATE task_runs
+-           SET status        = ?,
+-               outcome       = ?,
+-               summary       = ?,
+-               error         = ?,
+-               metadata      = ?,
+-               ended_at      = ?,
+-               claim_expires = NULL
+-         WHERE id = ?
+-           AND ended_at IS NULL
+-        """,
+-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+-    )
+-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+-    return run_id
++from hermes_cli.kanban_db_run import _end_run
+ 
+ 
+ def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+@@ -2943,6 +2913,7 @@ def _refuse_untimed_probe(kind: Optional[str], wake_check: Optional[str], clock_
+         "would run it. Use kind='time' to wait on it; for a human ask, put it in human_request.resolved_check.")
+ 
+ 
++@publication_guard
+ def block_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+@@ -3154,6 +3125,7 @@ def redact_review_value(value: Any) -> Any:
+     return value
+ 
+ 
++@publication_guard
+ def request_review(
+     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
+     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
+diff --git a/hermes_cli/kanban_db_run.py b/hermes_cli/kanban_db_run.py
+new file mode 100644
+index 0000000000..50299db429
+--- /dev/null
++++ b/hermes_cli/kanban_db_run.py
+@@ -0,0 +1,43 @@
++"""Run terminal persistence; late-bound DB facade for compatibility."""
++from __future__ import annotations
++
++import sqlite3
++import time
++from typing import Optional
++
++def _end_run(
++    conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
++    error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
++) -> Optional[int]:
++    """Close the active run (``status`` defaults to ``outcome``) and clear
++    ``current_run_id``; None when no run was active (never-claimed task).
++
++    ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
++    row: they are the only evidence left of the OS process once the task row
++    is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
++    to end a worker that survived its own terminal transition."""
++    now = int(time.time())
++    run_id = _kb._current_run_id(conn, task_id)
++    if run_id is None:
++        return None
++    from hermes_cli.kanban_workspace_publication import closed_metadata
++    metadata = closed_metadata(conn, task_id, run_id, metadata)
++    conn.execute(
++        """
++        UPDATE task_runs
++           SET status        = ?,
++               outcome       = ?,
++               summary       = ?,
++               error         = ?,
++               metadata      = ?,
++               ended_at      = ?,
++               claim_expires = NULL
++         WHERE id = ?
++           AND ended_at IS NULL
++        """,
++        (status or outcome, outcome, summary, error, _kb._json_or_null(metadata), now, run_id),
++    )
++    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
++    return run_id
++
++from hermes_cli import kanban_db as _kb
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index ad4d8c581c..dad39b9bf0 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -9,7 +9,10 @@ import sqlite3
+ import time as _time
+ from typing import Any, Optional
+ 
++from hermes_cli.kanban_workspace_publication import publication_guard
+ 
++
++@publication_guard
+ def schedule_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     expected_run_id: Optional[int] = None, wake_check: Optional[str] = None,
+diff --git a/hermes_cli/kanban_workspace_publication.py b/hermes_cli/kanban_workspace_publication.py
+new file mode 100644
+index 0000000000..c99bbfa57b
+--- /dev/null
++++ b/hermes_cli/kanban_workspace_publication.py
+@@ -0,0 +1,162 @@
++"""Require publication or explicit host custody before a Git-workspace handoff.
++
++Never stage, commit or push arbitrary worker files. Observation is outside the
++transition transaction; the final local-state fence is inside it. A receipt is
++not a portability grant: independent workspace/placement guards still apply.
++"""
++from __future__ import annotations
++
++from contextvars import ContextVar
++from functools import wraps
++from pathlib import Path
++import re
++import json
++import subprocess
++import time
++
++_receipt: ContextVar[tuple | None] = ContextVar('workspace_publication', default=None)
++_deadline: ContextVar[float | None] = ContextVar('workspace_publication_deadline', default=None)
++_REASON = re.compile(r'^UNPUBLISHED_WORK_REASON=([^\r\n]+)', re.MULTILINE)
++
++
++def _git(path, deadline, *args):
++    from tools.environments.local import build_subprocess_env
++
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        raise subprocess.TimeoutExpired('git', 5)
++    return subprocess.check_output(
++        ['git', '-c', 'core.fsmonitor=false', '-c', 'protocol.ext.allow=never', '-C', str(path), *args],
++        env=build_subprocess_env(extra={'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
++                                      'GIT_NO_LAZY_FETCH': '1', 'SSH_ASKPASS_REQUIRE': 'never',
++                                      'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes -o ConnectTimeout=2'}),
++        stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=remaining,
++        text=True, encoding='utf-8').strip()
++
++
++def _local(path, deadline):
++    return {'branch': _git(path, deadline, 'symbolic-ref', '--quiet', '--short', 'HEAD'),
++            'head': _git(path, deadline, 'rev-parse', 'HEAD'),
++            'dirty': bool(_git(path, deadline, 'status', '--porcelain', '--untracked-files=all',
++                               '--ignore-submodules=none'))}
++
++
++def _workspace(conn, task_id):
++    row = conn.execute('SELECT workspace_path FROM tasks WHERE id = ?', (task_id,)).fetchone()
++    if not row or not row[0]:
++        return None
++    path = Path(row[0]).expanduser()
++    if not any((p / '.git').exists() for p in (path, *path.parents)):
++        return None
++    return path
++
++
++def _paths(conn, task_id, text=''):
++    """Declared workspace plus explicit Git roots retained in current/prior checkpoints.
++
++    Scratch is a container, not evidence that its separately named implementation
++    worktree is disposable. Do not recursively scan its artifacts or read files.
++    """
++    found = {}
++    declared = _workspace(conn, task_id)
++    if declared:
++        found[str(declared)] = declared
++    retained = conn.execute('SELECT summary, metadata FROM task_runs WHERE task_id=? '
++                            'ORDER BY id DESC LIMIT 3', (task_id,)).fetchall()
++    texts = [text]
++    for summary, metadata in retained:
++        texts.append(summary or '')
++        try:
++            data = json.loads(metadata or '{}')
++        except (ValueError, TypeError):
++            continue
++        if isinstance(data, dict):
++            texts.extend(str(data.get(key) or '') for key in ('checkpoint', 'worktree', 'worktrees'))
++    for value in texts:
++        for raw in re.findall(r"(?:/|~/)[^\s`'\"<>;,()\[\]]+", value):
++            path = Path(raw.rstrip('.')).expanduser()
++            if (path / '.git').is_file():
++                found[str(path)] = path
++    return list(found.values())
++
++
++def _observe(path):
++    deadline = _deadline.get() or time.monotonic() + 5
++    receipt = {'path': str(path), 'state': 'unverified', 'reason': 'git_probe_failed'}
++    try:
++        local = _local(path, deadline)
++        receipt.update(local)
++        if local['dirty']:
++            receipt['reason'] = 'uncommitted_or_untracked_changes'
++            return receipt
++        ref = 'refs/heads/' + local['branch']
++        remote = _git(path, deadline, 'ls-remote', '--exit-code', 'origin', ref).split()
++        if remote != [local['head'], ref]:
++            receipt['reason'] = 'origin_branch_differs'
++            return receipt
++        if _local(path, deadline) != local:
++            receipt['reason'] = 'workspace_changed_during_probe'
++            return receipt
++        receipt.update(state='published', reason='exact_origin_branch')
++    except (OSError, subprocess.SubprocessError, UnicodeError):
++        pass  # Unknown publication must never become a successful publication receipt.
++    return receipt
++
++
++def publication_guard(fn):
++    """Observe before any transition transaction; exceptions leave run ownership intact."""
++    @wraps(fn)
++    def wrapped(conn, task_id, *args, **kwargs):
++        row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id = ?', (task_id,)).fetchone()
++        text = kwargs.get('checkpoint') or kwargs.get('reason') or kwargs.get('summary') or ''
++        metadata = kwargs.get('metadata') or {}
++        references = '\n'.join(str(metadata.get(key) or '') for key in ('worktree', 'worktrees'))
++        paths = _paths(conn, task_id, text + '\n' + references) if row and row[0] == 'running' and row[1] else []
++        if not paths:
++            return fn(conn, task_id, *args, **kwargs)
++        # Nested lifecycle calls reuse only this exact run's preflight.
++        current = _receipt.get()
++        if current and current[:3] == (id(conn), task_id, row[1]):
++            return fn(conn, task_id, *args, **kwargs)
++        budget = _deadline.set(time.monotonic() + 5)
++        try:
++            observations = [({'path': str(path), 'state': 'unverified', 'reason': 'already_in_transaction'}
++                             if conn.in_transaction else _observe(path)) for path in paths]
++        finally:
++            _deadline.reset(budget)
++        reason = _REASON.search(text)
++        for observed in observations:
++            if observed['state'] != 'published':
++                if not reason or not reason[1].strip():
++                    raise ValueError('unpublished_workspace: commit and push the task branch before parking, or add '
++                                     'UNPUBLISHED_WORK_REASON=<why work must remain on this host> to the checkpoint/reason')
++                observed['retention_reason'] = reason[1].strip()[:1000]
++        token = _receipt.set((id(conn), task_id, row[1], observations))
++        try:
++            return fn(conn, task_id, *args, **kwargs)
++        finally:
++            _receipt.reset(token)
++    return wrapped
++
++
++def closed_metadata(conn, task_id, run_id, metadata):
++    """Server-owned receipt; involuntary exits cannot be refused by network failure."""
++    current = _receipt.get()
++    paths = _paths(conn, task_id)
++    observations = [{'path': str(path), 'state': 'unverified', 'reason': 'involuntary_or_unguarded_exit'}
++                    for path in paths]
++    if current and current[:3] == (id(conn), task_id, run_id):
++        observations = [dict(item) for item in current[3]]
++        deadline = time.monotonic() + 1
++        for observed in observations:
++            if observed['state'] == 'published':
++                try:
++                    local = _local(Path(observed['path']), deadline)
++                except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
++                    raise ValueError('unpublished_workspace: final local-state fence failed') from exc
++                if any(local[key] != observed[key] for key in local):
++                    raise ValueError('unpublished_workspace: workspace changed before handoff')
++    if not observations:
++        return metadata
++    return {**(metadata or {}), 'workspace_publication': observations[0],
++            'workspace_publications': observations}
+diff --git a/tests/hermes_cli/test_kanban_workspace_publication.py b/tests/hermes_cli/test_kanban_workspace_publication.py
+new file mode 100644
+index 0000000000..551a81b80d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_workspace_publication.py
+@@ -0,0 +1,188 @@
++"""Git custody at run handoff; real Git repositories, no credentials/network."""
++from __future__ import annotations
++
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_workspace as kw
++
++
++@pytest.fixture
++def git_task(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'home'))
++    for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_TASK',
++                'HERMES_KANBAN_RUN_ID', 'HERMES_DELEGATED_CHILD_CONTEXT'):
++        monkeypatch.delenv(key, raising=False)
++    repo = tmp_path / 'repo'
++    repo.mkdir()
++
++    def git(*args):
++        return subprocess.check_output(
++            ['git', '-c', 'user.name=Example', '-c', 'user.email=example@example.com',
++             '-C', str(repo), *args], text=True, encoding='utf-8', stderr=subprocess.STDOUT).strip()
++
++    git('init', '-b', 'task/example')
++    (repo / 'source.txt').write_text('implementation\n')
++    git('add', 'source.txt')
++    git('commit', '-m', 'implementation')
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Git custody fixture')
++        kw.set_workspace_path(conn, tid, repo)
++        kb.claim_task(conn, tid)
++    return tid, repo, git
++
++
++def test_continue_refuses_unpublished_git_work(git_task):
++    tid, _, _ = git_task
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='unpublished_workspace'):
++            kc.continue_task(conn, tid, checkpoint='Resume the implementation')
++        assert kb.get_task(conn, tid).status == 'running'
++        assert kb._current_run_id(conn, tid) is not None
++
++
++def test_scratch_mention_of_source_repo_is_not_worktree_custody(git_task, tmp_path):
++    tid, repo, _ = git_task
++    scratch = tmp_path / 'scratch'
++    scratch.mkdir()
++    with kbc.connect_closing() as conn:
++        kw.set_workspace_path(conn, tid, scratch)
++        # A source checkout mentioned only for an installed-runtime probe is not
++        # an owned implementation worktree. Preserve unrelated host-marker guards.
++        assert kc.continue_task(conn, tid, checkpoint=f'Read-only runtime check of {repo}')['ok']
++
++
++@pytest.mark.parametrize('source', ['checkpoint', 'metadata', 'prior_checkpoint'])
++def test_scratch_handoff_cannot_hide_explicit_git_worktree(git_task, tmp_path, source):
++    import json
++
++    tid, _, git = git_task
++    repo = tmp_path / 'implementation'
++    git('worktree', 'add', '-b', 'scratch-implementation', str(repo))
++    scratch = tmp_path / 'scratch'
++    scratch.mkdir()
++    with kbc.connect_closing() as conn:
++        kw.set_workspace_path(conn, tid, scratch)
++        args = {'checkpoint': 'Resume implementation'}
++        if source == 'checkpoint':
++            args['checkpoint'] = f'Worktree {repo} has implementation; resume it'
++        elif source == 'metadata':
++            args['metadata'] = {'worktree': str(repo)}
++        else:
++            with kb.write_txn(conn):
++                conn.execute('UPDATE task_runs SET metadata=? WHERE id=?',
++                             (json.dumps({'checkpoint': f'Worktree {repo} retained'}), kb._current_run_id(conn, tid)))
++        with pytest.raises(ValueError, match='unpublished_workspace'):
++            kc.continue_task(conn, tid, **args)
++        assert kb.get_task(conn, tid).status == 'running'
++
++
++@pytest.mark.parametrize('operation', ['block', 'schedule', 'review'])
++def test_other_handoffs_refuse_unpublished_git_work(git_task, operation):
++    tid, _, _ = git_task
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='unpublished_workspace'):
++            if operation == 'block':
++                kb.block_task(conn, tid, reason='Temporary outage', kind='transient')
++            elif operation == 'schedule':
++                kb.schedule_task(conn, tid, reason='Waiting for a clock', clock_only=True)
++            else:
++                kb.request_review(conn, tid, summary='Ready for review')
++        assert kb.get_task(conn, tid).status == 'running'
++
++
++def _publish(git_task, tmp_path):
++    _, _, git = git_task
++    remote = tmp_path / 'origin.git'
++    subprocess.check_call(['git', 'init', '--bare', str(remote)], stdout=subprocess.DEVNULL)
++    git('remote', 'add', 'origin', str(remote))
++    git('push', 'origin', 'HEAD')
++    return remote
++
++
++def test_published_clean_branch_records_server_receipt(git_task, tmp_path):
++    import json
++
++    tid, _, git = git_task
++    _publish(git_task, tmp_path)
++    with kbc.connect_closing() as conn:
++        run = kb._current_run_id(conn, tid)
++        result = kc.continue_task(conn, tid, checkpoint='Resume published source',
++                                  metadata={'workspace_publication': {'state': 'forged'}})
++        assert result['ok']
++        receipt = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run,)).fetchone()[0])
++        assert receipt['workspace_publication']['state'] == 'published'
++        assert receipt['workspace_publication']['head'] == git('rev-parse', 'HEAD')
++
++
++@pytest.mark.parametrize('change', ['dirty', 'untracked', 'unpushed', 'remote_deleted'])
++def test_tracking_ref_is_not_publication_proof(git_task, tmp_path, change):
++    tid, repo, git = git_task
++    _publish(git_task, tmp_path)
++    if change == 'dirty':
++        (repo / 'source.txt').write_text('new work')
++    elif change == 'untracked':
++        (repo / 'new.txt').write_text('new work')
++    elif change == 'unpushed':
++        (repo / 'source.txt').write_text('new work')
++        git('add', 'source.txt')
++        git('commit', '-m', 'unpublished')
++    else:
++        git('push', 'origin', '--delete', 'task/example')
++        # Deliberately retain a convincing but stale local tracking ref.
++        git('update-ref', 'refs/remotes/origin/task/example', 'HEAD')
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='unpublished_workspace'):
++            kc.continue_task(conn, tid, checkpoint='Resume source')
++        assert kb.get_task(conn, tid).status == 'running'
++
++
++def test_explicit_retention_reason_records_host_custody(git_task):
++    import json
++
++    tid, _, _ = git_task
++    with kbc.connect_closing() as conn:
++        run = kb._current_run_id(conn, tid)
++        assert kc.continue_task(conn, tid, checkpoint='UNPUBLISHED_WORK_REASON=contains private evidence')['ok']
++        receipt = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run,)).fetchone()[0])
++        assert receipt['workspace_publication']['state'] == 'unverified'
++        assert receipt['workspace_publication']['retention_reason'] == 'contains private evidence'
++
++
++def test_crash_records_unknown_custody_without_network(git_task, monkeypatch):
++    import json
++    from hermes_cli import kanban_workspace_publication as pub
++
++    tid, _, _ = git_task
++    monkeypatch.setattr(pub, '_observe', lambda _: pytest.fail('crash must not perform network IO'))
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        run = kb._end_run(conn, tid, outcome='crashed', error='fixture')
++        receipt = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id=?', (run,)).fetchone()[0])
++        assert receipt['workspace_publication']['state'] == 'unverified'
++        assert receipt['workspace_publication']['reason'] == 'involuntary_or_unguarded_exit'
++
++
++def test_local_mutation_after_probe_rolls_back_handoff(git_task, tmp_path, monkeypatch):
++    from hermes_cli import kanban_workspace_publication as pub
++
++    tid, repo, _ = git_task
++    _publish(git_task, tmp_path)
++    observe = pub._observe
++
++    def racing_observe(path):
++        result = observe(path)
++        (repo / 'source.txt').write_text('racing work')
++        return result
++
++    monkeypatch.setattr(pub, '_observe', racing_observe)
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='workspace changed before handoff'):
++            kc.continue_task(conn, tid, checkpoint='Resume source')
++        assert kb.get_task(conn, tid).status == 'running'
++        assert kb._current_run_id(conn, tid) is not None
+-- 
+2.43.0
+

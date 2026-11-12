@@ -1,0 +1,315 @@
+From 0cc4a9adb26f0a237ffcc31d3404b83dc0a47205 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:27:18 +0000
+Subject: [PATCH] [daveey] fix(kanban): decomposer never assigns an enrolled
+ worker-first card to a profile no pool worker runs
+
+Two re-park escalation owners (t_01a1ccb8c3b2510e, t_01a1ce2404cb1b90) were created in triage with
+no assignee and enrolled worker-first-v1 (default is allowlisted). The auto-decomposer then specified
+them to mac-ops; placement is fixed at creation, so each needed profile:mac-ops, which no pool worker
+carries, and sat queued until an orchestrator finished it by hand.
+
+kanban_profile_runnable.runnable_for(name, task) judges an existing card: an enrolled worker-first
+card needs an active, unheld, picking-up pool worker attesting profile:<name>, whatever the
+allowlist says; any other card runs on this gateway. The decomposer keeps only such profiles for the
+card itself (single-task assignee and the root's owner after fan-out), falls back to
+default_assignee when that is runnable, else leaves the card's assignee unchanged, and marks the
+others "children only" in the roster prompt. Fan-out children are inserted unenrolled and run on
+this gateway, so they keep the whole roster. kanban_specify assigns nothing, so it is unchanged.
+---
+ hermes_cli/kanban_decompose.py                |  58 +++++++--
+ hermes_cli/kanban_profile_runnable.py         |  28 ++++-
+ .../test_kanban_decompose_runnable.py         | 116 ++++++++++++++++++
+ 3 files changed, 189 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_decompose_runnable.py
+
+diff --git a/hermes_cli/kanban_decompose.py b/hermes_cli/kanban_decompose.py
+index 226a07b7fd..f90e551ef9 100644
+--- a/hermes_cli/kanban_decompose.py
++++ b/hermes_cli/kanban_decompose.py
+@@ -178,15 +178,20 @@ def _build_roster() -> tuple[list[dict], set[str]]:
+     return roster, {p.name for p in all_profiles}
+ 
+ 
+-def _format_roster(roster: list[dict]) -> str:
++def _format_roster(roster: list[dict], card_names: Optional[set[str]] = None) -> str:
++    """``card_names`` (None = all): profiles that may own the card itself; the others are marked children-only."""
+     if not roster:
+         return "  (no profiles installed — decomposer cannot route work)"
+     return "\n".join(
+-        f"  - {entry['name']}{'' if entry['has_description'] else ' ⚠ undescribed'}: {entry['description']}"
++        f"  - {entry['name']}{'' if entry['has_description'] else ' ⚠ undescribed'}"
++        f"{'' if card_names is None or entry['name'] in card_names else _CHILD_ONLY}: {entry['description']}"
+         for entry in roster
+     )
+ 
+ 
++_CHILD_ONLY = " ⚠ no pool worker runs it: fanout children only, never this task itself"
++
++
+ def _normalize_assignee_choice(assignee: object, *, default_assignee: str, valid_names: set[str]) -> str:
+     """A valid assignee, else ``default_assignee`` — promoted work is never
+     left unassigned."""
+@@ -205,9 +210,22 @@ class _Routing:
+     auto_promote: bool
+     roster: list[dict]
+     valid_names: set[str]
+-
+-
+-def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
++    # Profiles that may own the card ITSELF (single-task assignee, root after fan-out). Its placement is fixed
++    # at creation, so an enrolled worker-first card keeps only profiles a pool worker runs; ``card_default``
++    # is None when default_assignee is not one of them (keep the card's assignee). Fan-out children are inserted
++    # unenrolled and run on this gateway, so they keep the whole roster. [daveey]
++    card_names: Optional[set[str]] = None
++    card_default: Optional[str] = None
++    card_root: Optional[str] = None  # the root's owner after fan-out: orchestrator, else card_default
++
++    def __post_init__(self) -> None:
++        if self.card_names is None:  # built without a card: every profile may own it
++            self.card_names = set(self.valid_names)
++            self.card_default = self.default_assignee
++            self.card_root = self.orchestrator
++
++
++def _load_routing(*, root_assignee: Optional[str] = None, task: object = None) -> _Routing:
+     from hermes_cli.config import load_config_readonly
+     try:
+         cfg = load_config_readonly()
+@@ -215,13 +233,31 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
+         cfg = {}
+     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+     roster, valid_names = _build_roster()
+-    return _Routing(
++    routing = _Routing(
+         orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile", fallback=root_assignee),
+         default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee", fallback=root_assignee),
+         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
+         roster=roster,
+         valid_names=valid_names,
+     )
++    from hermes_cli.kanban_profile_runnable import runnable_for
++    routing.card_names = {n for n in valid_names if runnable_for(n, task)}
++    routing.card_default = routing.default_assignee if runnable_for(routing.default_assignee, task) else None
++    routing.card_root = routing.orchestrator if runnable_for(routing.orchestrator, task) else routing.card_default
++    return routing
++
++
++def _card_assignee(task_id: str, choice: object, routing: _Routing) -> Optional[str]:
++    """The card's own new assignee: ``choice`` when it may own the card, else ``card_default``
++    (None = leave the card's assignee unchanged)."""
++    chosen = _normalize_assignee_choice(
++        choice, default_assignee=routing.card_default or "", valid_names=routing.card_names or set(),
++    )
++    picked = choice.strip() if isinstance(choice, str) else ""
++    if picked in routing.valid_names and picked not in (routing.card_names or set()):
++        logger.info("decompose: task %s: no pool worker runs %r; assignee %r instead",
++                    task_id, picked, chosen or "(unchanged)")
++    return chosen or None
+ 
+ 
+ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+@@ -229,9 +265,7 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
+     title_val, body_val = _title_body(parsed)
+     assignee_val = None
+     if not task.assignee:
+-        assignee_val = _normalize_assignee_choice(
+-            parsed.get("assignee"), default_assignee=routing.default_assignee, valid_names=routing.valid_names,
+-        )
++        assignee_val = _card_assignee(task.id, parsed.get("assignee"), routing)
+     if title_val is None and body_val is None:
+         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
+     try:
+@@ -294,7 +328,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
+             child_ids = decompose_triage_task(
+                 conn,
+                 task_id,
+-                root_assignee=routing.orchestrator,
++                root_assignee=routing.card_root,
+                 children=children,
+                 author=author,
+                 auto_promote=routing.auto_promote,
+@@ -334,10 +368,10 @@ def decompose_task(
+         if refusal:
+             return DecomposeOutcome(task_id, False, refusal)
+ 
+-    routing = _load_routing(root_assignee=task.assignee)
++    routing = _load_routing(root_assignee=task.assignee, task=task)
+     user_prompt = _USER_TEMPLATE.format(
+         **_task_prompt_fields(task),
+-        roster=_format_roster(routing.roster),
++        roster=_format_roster(routing.roster, routing.card_names),
+         default_assignee=routing.default_assignee,
+     )
+     audit_author = author or _profile_author()
+diff --git a/hermes_cli/kanban_profile_runnable.py b/hermes_cli/kanban_profile_runnable.py
+index 7b65058fa3..d5a5253cf9 100644
+--- a/hermes_cli/kanban_profile_runnable.py
++++ b/hermes_cli/kanban_profile_runnable.py
+@@ -31,6 +31,32 @@ def runnable(name: str) -> bool:
+     except Exception:  # health: allow BLE001 -- an unreadable rule set must not invent a runnable pool
+         logger.warning("kanban: placement check for profile %s failed", name, exc_info=True)
+         return False
++    return _attested(name, members)
++
++
++def runnable_for(name: str, task: object) -> bool:
++    """Whether an existing card can run once assigned to ``name``. Its placement is fixed at creation: an
++    enrolled ``worker-first-v1`` card runs only on a pool worker attesting ``profile:<name>``, whatever the
++    assignee allowlist says (the decomposer once moved two enrolled owners to ``mac-ops``, which no pool
++    worker carries); any other card stays on this gateway, which has every local profile."""
++    from hermes_cli.kanban_worker_placement import POLICY
++
++    if getattr(task, "placement_policy", None) != POLICY:
++        return True
++    from hermes_cli import kanban_placement as placement
++
++    try:
++        pools = placement.config().get("worker_pools")
++        members = pools.get(placement.reg.self_gateway()) if isinstance(pools, dict) else None
++    except Exception:  # health: allow BLE001 -- no pool config: judge against every registered machine
++        logger.warning("kanban: pool config unreadable for profile %s", name, exc_info=True)
++        members = None
++    return _attested(name, members if isinstance(members, list) and members else None)
++
++
++def _attested(name: str, members: list | None) -> bool:
++    """An active, unheld, picking-up machine among ``members`` (None = every registered one) attests
++    ``profile:<name>``; an unreadable registry counts as none."""
+     from hermes_cli import kanban_worker_node as wn
+ 
+     try:
+@@ -42,7 +68,7 @@ def runnable(name: str) -> bool:
+     if not isinstance(machines, dict):
+         return False
+     label = f"profile:{name}"
+-    for member in members:
++    for member in machines if members is None else members:
+         entry = machines.get(member)
+         if (isinstance(entry, dict) and entry.get("state", "active") == "active" and not entry.get("hold")
+                 and wn.advertises_pickup(entry) and label in (entry.get("labels") or [])):
+diff --git a/tests/hermes_cli/test_kanban_decompose_runnable.py b/tests/hermes_cli/test_kanban_decompose_runnable.py
+new file mode 100644
+index 0000000000..e17c0d1c2d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_decompose_runnable.py
+@@ -0,0 +1,116 @@
++"""The decomposer never hands an enrolled worker-first card to a profile no pool worker runs. [daveey]
++
++Two escalation owners were created in triage, enrolled ``worker-first-v1`` (assignee None -> default, which is
++allowlisted), and the auto-decomposer then specified them to ``mac-ops``. Placement is fixed at creation, so each
++then needed ``profile:mac-ops``, which no pool worker carries, and sat queued until an orchestrator finished it.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_decompose as decomp
++
++PROFILES = ["default", "mac-ops", "researcher"]
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    """A hub gateway whose pool is worker-1 (profile:default only); every profile is installed."""
++    from hermes_cli import config, profiles
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_worker_node as wn
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    cfg = {"kanban": {"default_assignee": "default",
++                      "placement": {"worker_pools": {"hub": ["worker-1"]}, "assignees": ["default", "mac-ops"]}}}
++    entry = {"state": "active", "pickup": "explicit", "last_seen": time.time() * 1000, "labels": ["profile:default"]}
++    monkeypatch.setattr(config, "load_config_readonly", lambda: cfg)
++    monkeypatch.setattr(kp.reg, "self_gateway", lambda: "hub")
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"worker-1": entry}})
++    fakes = [SimpleNamespace(name=n, description=f"desc for {n}") for n in PROFILES]
++    monkeypatch.setattr(profiles, "list_profiles", lambda: fakes)
++    monkeypatch.setattr(profiles, "profile_exists", lambda n: n in PROFILES)
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    return cfg, entry
++
++
++def _triage(*, enrolled: bool = True) -> str:
++    """A triage card with no assignee, enrolled by create_task itself (portable: default is allowlisted)."""
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="escalation owner", triage=True)
++        assert kb.get_task(conn, tid).placement_policy == "worker-first-v1"
++        if not enrolled:
++            conn.execute("UPDATE tasks SET placement_policy=NULL WHERE id=?", (tid,))
++            conn.commit()
++    return tid
++
++
++def _decompose(tid: str, payload: dict):
++    resp = MagicMock()
++    resp.choices = [MagicMock()]
++    resp.choices[0].message.content = json.dumps(payload)
++    with patch("agent.auxiliary_client.call_llm", return_value=resp) as llm:
++        outcome = decomp.decompose_task(tid, author="me")
++    assert outcome.ok, outcome.reason
++    return outcome, llm
++
++
++def _assignee(tid: str):
++    with kbc.connect() as conn:
++        return kb.get_task(conn, tid).assignee
++
++
++SINGLE = {"fanout": False, "title": "Fix the Mac thing", "body": "do it", "assignee": "mac-ops"}
++
++
++def test_enrolled_card_never_specified_to_a_profile_no_pool_worker_runs(board) -> None:
++    tid = _triage()
++    _, llm = _decompose(tid, SINGLE)
++    assert _assignee(tid) == "default"
++    prompt = llm.call_args.kwargs["messages"][-1]["content"]
++    assert "mac-ops ⚠ no pool worker runs it" in prompt and "default ⚠" not in prompt
++
++
++def test_enrolled_card_keeps_a_pick_a_live_pool_worker_carries(board) -> None:
++    board[1]["labels"].append("profile:mac-ops")
++    tid = _triage()
++    _decompose(tid, SINGLE)
++    assert _assignee(tid) == "mac-ops"
++
++
++def test_enrolled_card_ignores_an_unrunnable_default_assignee(board) -> None:
++    board[0]["kanban"]["default_assignee"] = "mac-ops"
++    tid = _triage()
++    _decompose(tid, SINGLE)
++    assert _assignee(tid) is None  # unchanged: the assignee it was enrolled under
++
++
++def test_unenrolled_card_accepts_any_installed_profile(board, monkeypatch) -> None:
++    from hermes_cli import kanban_worker_node as wn
++    monkeypatch.setattr(wn, "registry", lambda: pytest.fail("registry read for a card outside the pool"))
++    tid = _triage(enrolled=False)
++    _decompose(tid, SINGLE)
++    assert _assignee(tid) == "mac-ops"
++
++
++def test_fanout_root_of_an_enrolled_card_never_goes_to_an_unrunnable_orchestrator(board) -> None:
++    board[0]["kanban"]["orchestrator_profile"] = "mac-ops"
++    tid = _triage()
++    outcome, _ = _decompose(tid, {"fanout": True, "tasks": [
++        {"title": "on the Mac", "body": "b", "assignee": "mac-ops", "parents": [], "requires": []},
++    ]})
++    assert _assignee(tid) == "default"
++    # Children are inserted unenrolled and run on this gateway, which has every profile.
++    assert _assignee(outcome.child_ids[0]) == "mac-ops"
+-- 
+2.43.0
+

@@ -1,0 +1,696 @@
+From ecd5b6494a5343e363826987a5b08c670dfce463 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:55:51 +0000
+Subject: [PATCH] fix(desktop): a pinned route's quota wall shows its reset and
+ Choose a model, not "internal problem"
+
+A chat explicitly pinned to a walled subscription route (openai-codex/gpt-6-astra, quota out until a
+known reset) is refused before the turn with failure_reason route_refused and the backend's own
+sentence (agent.model_routing_walls.held_reply: the reset in PT, /model). The descriptor was a bare
+{layer: gateway, code: route_refused}, so Desktop drew the gateway layer's generic "Hermes hit an
+internal problem ... Send your message again" card, and the transcript kept "Your request was not
+processed. Send it again ...", advice that cannot work until the reset and never names the fix.
+
+Backend:
+- agent/error_surface.py: a route_refused descriptor carries the turn's final_response as `message`.
+- gateway/run_turn_runner.py: `_resolution_failure_result` stamps the route refusal's error_surface
+  and a refusal_notice on the result (like session_policy.refused_turn_result), so the live
+  message.complete carries the card and settlement commits it on the failed-turn boundary
+  (display_metadata) for a reopened chat.
+- gateway_refusal_boundary writes `refusal_notice` as the boundary copy when present; the messaging
+  path's failed-turn notice for route_refused is the same ROUTE_REFUSED_TURN_NOTICE ("Your request
+  was not processed."), with no "Send it again".
+
+Desktop:
+- route_refused is an error code with its own title/fallback body in every locale; its body is the
+  backend sentence (`message`), and its one action is Choose a model (no Retry).
+- turnFailure: an older backend's route_refused frame without `message` uses the turn text (minus
+  an appended failed-turn notice) as the body.
+
+Tests: RED on the source-only revert, GREEN after: route-refused-completion.test.tsx (live frame,
+with and without `message`; generic gateway control), assistant-message.test.tsx (rendered card:
+sentence, title, Choose a model, no Retry; host_error control keeps the generic card),
+chat-messages.test.ts (reopened boundary row), tests/gateway/test_route_refused_card.py.
+session_busy / content-policy / terminal-error suites unchanged and green.
+---
+ agent/error_surface.py                        |   8 ++
+ agent/turn_failure_copy.py                    |   4 +
+ .../gateway-event/message-stream.ts           |   5 +-
+ .../route-refused-completion.test.tsx         |  80 ++++++++++++++
+ .../thread/assistant-message.test.tsx         |  29 +++++
+ apps/desktop/src/i18n/ar_assistant.ts         |   4 +
+ apps/desktop/src/i18n/de_error_codes.ts       |   4 +
+ apps/desktop/src/i18n/en_error_codes.ts       |   4 +
+ apps/desktop/src/i18n/es_error_codes.ts       |   4 +
+ apps/desktop/src/i18n/fr_error_codes.ts       |   4 +
+ apps/desktop/src/i18n/ja_error_codes.ts       |   4 +
+ apps/desktop/src/i18n/ru_error_codes.ts       |   4 +
+ apps/desktop/src/i18n/zh-hant_assistant.ts    |   4 +
+ apps/desktop/src/i18n/zh_error_codes.ts       |   4 +
+ apps/desktop/src/lib/chat-messages.test.ts    |  24 +++++
+ apps/desktop/src/lib/error-surface-copy.ts    |   6 +-
+ apps/desktop/src/lib/error-surface.ts         |  27 +++++
+ gateway/run_turn_persistence.py               |   5 +
+ gateway/run_turn_runner.py                    |  23 +++-
+ gateway/session_settlement_recovery.py        |   7 +-
+ locales/_keys.desktop.json                    |   2 +
+ tests/gateway/test_route_refused_card.py      | 102 ++++++++++++++++++
+ 22 files changed, 348 insertions(+), 10 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
+ create mode 100644 tests/gateway/test_route_refused_card.py
+
+diff --git a/agent/error_surface.py b/agent/error_surface.py
+index 18a297be71..67d97351d8 100644
+--- a/agent/error_surface.py
++++ b/agent/error_surface.py
+@@ -62,6 +62,10 @@ _NON_RETRYABLE_REASONS = {
+     "context_overflow", "interpreter_shutdown", "upstream_blocked", "pre_final_gate_unresolved", "route_refused",
+ }
+ 
++# Refusals whose ``final_response`` is a user-facing sentence written for this failure
++# (gateway/run_turn_runner.py ``_resolution_failure_reply``): it rides as ``message``.
++_OWN_SENTENCE_REASONS = {"route_refused"}
++
+ # Providers whose base_url is user-supplied rather than a known vendor.
+ _CUSTOM_ENDPOINT_PROVIDERS = {"custom", "local", "llama.cpp", "llamacpp", "ollama", "lmstudio", "vllm"}
+ 
+@@ -206,6 +210,10 @@ def build_error_surface_from_result(result: Any, provider: str = "", model: str
+         if not isinstance(retryable, bool):
+             retryable = reason not in _NON_RETRYABLE_REASONS
+         surface = _surface(_result_layer(reason, error_text, provider), reason, retryable, provider, model)
++        # A pre-turn route refusal's reply is the backend's own sentence (which route, the reset in PT,
++        # /model): it is the card body, not the layer's generic "internal problem" gloss.
++        if reason in _OWN_SENTENCE_REASONS and isinstance(final := result.get("final_response"), str) and final.strip():
++            surface["message"] = final.strip()
+         # When the provider named the moment its limit lifts (Retry-After / ``resets_at``,
+         # ``agent/turn_recovery.py::_stamp_limit_reset``) the card can say "Limit resets at HH:mm"
+         # next to Retry instead of leaving the user to guess (#98852). Epoch seconds.
+diff --git a/agent/turn_failure_copy.py b/agent/turn_failure_copy.py
+index 7cfb24d0b2..42ce796dd1 100644
+--- a/agent/turn_failure_copy.py
++++ b/agent/turn_failure_copy.py
+@@ -60,6 +60,10 @@ PARTIAL_FAILED_TURN_NOTICE = (
+     "This turn did not complete. Some actions may already have run; verify their effects "
+     "before resending."
+ )
++# [daveey] The router refused the chat's own route before anything ran (a pinned subscription wall): a
++# resend repeats the refusal until the reset, so the boundary drops the "Send it again" advice. The
++# error card beside it carries the reset and the way out (/model).
++ROUTE_REFUSED_TURN_NOTICE = "Your request was not processed."
+ # [daveey] A backend restart (``backend_exit``) stopped the turn before any tool ran: restart recovery
+ # continues it (auto-continue / the boot sweep), and a For-you decision has no button left to press, so
+ # "Send it again" would be wrong advice (self-heal desktop-3a6213ce74).
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
+index e85f26123e..a3bde7ccf0 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
+@@ -6,7 +6,7 @@ import { translateNow } from '@/i18n'
+ import { type GatewayEventPayload, markQueuedPromptStarted } from '@/lib/chat-messages'
+ import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
+ import { playCompletionSound } from '@/lib/completion-sound'
+-import { parseErrorSurface } from '@/lib/error-surface'
++import { parseErrorSurface, withRefusalSentence } from '@/lib/error-surface'
+ import { triggerHaptic } from '@/lib/haptics'
+ import { isSessionBusyRefusal } from '@/lib/session-busy-refusal'
+ import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
+@@ -92,7 +92,8 @@ function turnFailure(payload: GatewayEventPayload | undefined, finalText: string
+   return {
+     error: coerceGatewayText(payload.error).trim() || finalText || 'Hermes reported an error',
+     partial: Boolean(payload.partial),
+-    surface: parseErrorSurface(payload.error_surface)
++    // A pre-turn refusal's text is the backend's sentence (model, reset, /model): the card body.
++    surface: withRefusalSentence(parseErrorSurface(payload.error_surface), finalText)
+   }
+ }
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
+new file mode 100644
+index 0000000000..d49a0bf763
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
+@@ -0,0 +1,80 @@
++import { act, cleanup } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { TRANSLATIONS } from '@/i18n'
++import { errorCardActions } from '@/lib/error-surface'
++import { errorCardText } from '@/lib/error-surface-copy'
++
++import { type MessageStreamHarness, renderMessageStream } from './test-harness'
++
++// A chat pinned to a walled subscription route is refused before any model runs
++// (gateway/run_turn_runner.py `_resolution_failure_reply` → agent.model_routing_walls.held_reply).
++const SID = 'session-1'
++
++const HELD =
++  '⚠️ openai-codex/gpt-6-astra subscription quota is out until Tue 11-17 21:59 PT. ' +
++  'This chat is pinned to it; use /model to switch, or resend after the reset.'
++
++const RAW = 'Subscription quota unavailable for openai-codex/gpt-6-astra; resets at 1794981540.0'
++const thread = TRANSLATIONS.en.assistant.thread
++
++let stream: MessageStreamHarness
++
++async function failTurn(payload: Record<string, unknown>) {
++  stream = renderMessageStream(SID)
++  await act(() => stream.handleEvent({ payload: {}, session_id: SID, type: 'message.start' }))
++  await act(() =>
++    stream.handleEvent({
++      payload: { status: 'error', recoverable: true, error: RAW, failure_reason: 'route_refused', ...payload },
++      session_id: SID,
++      type: 'message.complete'
++    })
++  )
++
++  return [...stream.state().messages].reverse().find(m => m.role === 'assistant' && !m.hidden)
++}
++
++describe('a pinned route refused before the turn (route_refused)', () => {
++  afterEach(() => {
++    cleanup()
++    vi.restoreAllMocks()
++  })
++
++  it.each([
++    ['the backend sentence on the descriptor', { message: HELD }, HELD],
++    // An older backend stamps only the code: the turn text is that sentence (the messaging
++    // path's appended "Send it again" boundary notice is not part of it).
++    [
++      'only the turn text (older backend)',
++      {},
++      `${HELD}\n\nYour request was not processed. Send it again if you still want me to carry it out.`
++    ]
++  ])('shows the wall, the reset and the way out from %s, not "internal problem"', async (_case, extra, text) => {
++    const bubble = await failTurn({
++      text,
++      error_surface: { layer: 'gateway', code: 'route_refused', retryable: false, ...extra }
++    })
++
++    const card = errorCardText(thread, bubble?.errorSurface)
++    expect(card.body).toBe(HELD)
++    expect(card.body).toContain('Tue 11-17 21:59 PT')
++    expect(card.body).not.toContain(thread.errorLayerBodies.gateway)
++    expect(card.title).toBe(thread.errorCodes.route_refused.title)
++    // A resend repeats the refusal until the reset: the card's button opens the model picker.
++    expect(errorCardActions(bubble?.errorSurface)).toEqual({ primary: 'choose_model' })
++  })
++
++  it('control: a genuine runtime failure keeps the generic gateway card', async () => {
++    const bubble = await failTurn({
++      text: 'some reply text',
++      failure_reason: 'host_error',
++      error_surface: { layer: 'gateway', code: 'host_error', retryable: false }
++    })
++
++    expect(bubble?.errorSurface?.message).toBeUndefined()
++    expect(errorCardText(thread, bubble?.errorSurface)).toEqual({
++      title: thread.errorLayers.gateway,
++      body: thread.errorLayerBodies.gateway
++    })
++  })
++})
+diff --git a/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx b/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx
+index 3138837654..5f5a9974d4 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx
+@@ -508,6 +508,35 @@ describe('code-keyed error card copy and actions', () => {
+     expect(screen.getByText(/HTTP 400/).closest('[data-slot="aui_error-details"]')).not.toBeNull()
+   })
+ 
++  it('shows a pinned route wall with its reset and Choose a model, not "internal problem"', async () => {
++    // agent/error_surface.py stamps the held reply as `message` on a route_refused descriptor.
++    const held =
++      '⚠️ openai-codex/gpt-6-astra subscription quota is out until Tue 11-17 21:59 PT. ' +
++      'This chat is pinned to it; use /model to switch, or resend after the reset.'
++
++    render(
++      <Harness
++        assistant={failedMessage(
++          { code: 'route_refused', layer: 'gateway', message: held, retryable: false },
++          'Subscription quota unavailable for openai-codex/gpt-6-astra; resets at 1794981540.0'
++        )}
++      />
++    )
++
++    expect(await screen.findByText(held)).toBeTruthy()
++    expect(screen.getByText(copy(codes.route_refused.title))).toBeTruthy()
++    expect(screen.queryByText(en.assistant.thread.errorLayerBodies.gateway)).toBeNull()
++    expect(screen.getByRole('button', { name: 'Choose a model' })).toBeTruthy()
++    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
++  })
++
++  it('keeps the generic gateway card for a genuine runtime failure', async () => {
++    render(<Harness assistant={failedMessage({ code: 'host_error', layer: 'gateway', retryable: false })} />)
++
++    expect(await screen.findByText(en.assistant.thread.errorLayerBodies.gateway)).toBeTruthy()
++    expect(screen.queryByRole('button', { name: 'Choose a model' })).toBeNull()
++  })
++
+   it('offers Compress conversation and Start new session for a context overflow', async () => {
+     render(<Harness assistant={failedMessage({ code: 'context_overflow', layer: 'provider', retryable: true })} />)
+ 
+diff --git a/apps/desktop/src/i18n/ar_assistant.ts b/apps/desktop/src/i18n/ar_assistant.ts
+index ce44aa5633..db8429a683 100644
+--- a/apps/desktop/src/i18n/ar_assistant.ts
++++ b/apps/desktop/src/i18n/ar_assistant.ts
+@@ -219,6 +219,10 @@ export const arAssistant = {
+           body: 'خادم النماذج المحلي لا يعمل بعد: ربما لا يزال قيد التشغيل. أعد المحاولة بعد لحظة، أو انتقل إلى نموذج آخر.',
+           bodyNoRetry:
+             'خادم النماذج المحلي متوقف. شغّله من تطبيق Hermes لسطح المكتب أو عبر `hermes model` في الطرفية، أو انتقل إلى نموذج آخر.'
++        },
++        route_refused: {
++          title: 'نموذج هذه المحادثة غير متاح',
++          body: 'النموذج المثبّت لهذه المحادثة لا يستقبل الطلبات الآن، لذا لم تُرسل رسالتك. اختر نموذجًا آخر، أو أعد الإرسال عند عودته.'
+         }
+       },
+       errorAuthKinds: {
+diff --git a/apps/desktop/src/i18n/de_error_codes.ts b/apps/desktop/src/i18n/de_error_codes.ts
+index 12039b5781..ebe5f23cbc 100644
+--- a/apps/desktop/src/i18n/de_error_codes.ts
++++ b/apps/desktop/src/i18n/de_error_codes.ts
+@@ -25,5 +25,9 @@ export const deErrorCodes: Partial<ThreadCopy['errorCodes']> = {
+     body: 'Der lokale Modellserver läuft noch nicht: Er startet möglicherweise noch. Versuchen Sie es gleich noch einmal oder wechseln Sie zu einem anderen Modell.',
+     bodyNoRetry:
+       'Der lokale Modellserver ist ausgeschaltet. Starten Sie ihn in der Hermes-Desktop-App oder mit `hermes model` im Terminal, oder wechseln Sie zu einem anderen Modell.'
++  },
++  route_refused: {
++    title: 'Das Modell dieses Chats ist nicht verfügbar',
++    body: 'Das Modell, auf das dieser Chat festgelegt ist, nimmt gerade keine Anfragen an, daher wurde Ihre Nachricht nicht gesendet. Wählen Sie ein anderes Modell oder senden Sie erneut, sobald es wieder verfügbar ist.'
+   }
+ }
+diff --git a/apps/desktop/src/i18n/en_error_codes.ts b/apps/desktop/src/i18n/en_error_codes.ts
+index 056c684cb3..fcd944a7b8 100644
+--- a/apps/desktop/src/i18n/en_error_codes.ts
++++ b/apps/desktop/src/i18n/en_error_codes.ts
+@@ -131,6 +131,10 @@ export const enErrorCodes: ThreadCopy['errorCodes'] = {
+     bodyNoRetry:
+       'The local model server is turned off. Start it from the Hermes desktop app or `hermes model` in a terminal, or switch to another model.'
+   },
++  route_refused: {
++    title: "This chat's model is unavailable",
++    body: "The model this chat is pinned to can't take requests right now, so your message was not sent. Choose another model, or resend once it is back."
++  },
+   SESSION_OWNER_UNCONFIRMED: {
+     title: 'Your message may already be queued',
+     body: 'The gateway did not confirm your message in time. If it was queued, it runs once the earlier turn finishes or is resolved. Check the chat before sending it again.'
+diff --git a/apps/desktop/src/i18n/es_error_codes.ts b/apps/desktop/src/i18n/es_error_codes.ts
+index 524b493654..7a6940283a 100644
+--- a/apps/desktop/src/i18n/es_error_codes.ts
++++ b/apps/desktop/src/i18n/es_error_codes.ts
+@@ -25,5 +25,9 @@ export const esErrorCodes: Partial<ThreadCopy['errorCodes']> = {
+     body: 'El servidor de modelos local aún no está en ejecución: puede que todavía se esté iniciando. Reintenta en un momento o cambia a otro modelo.',
+     bodyNoRetry:
+       'El servidor de modelos local está apagado. Inícialo desde la app de escritorio de Hermes o con `hermes model` en una terminal, o cambia a otro modelo.'
++  },
++  route_refused: {
++    title: 'El modelo de este chat no está disponible',
++    body: 'El modelo fijado para este chat no acepta solicitudes ahora mismo, así que tu mensaje no se envió. Elige otro modelo o vuelve a enviarlo cuando esté disponible.'
+   }
+ }
+diff --git a/apps/desktop/src/i18n/fr_error_codes.ts b/apps/desktop/src/i18n/fr_error_codes.ts
+index 216cd3c3f1..c596f39cb7 100644
+--- a/apps/desktop/src/i18n/fr_error_codes.ts
++++ b/apps/desktop/src/i18n/fr_error_codes.ts
+@@ -25,5 +25,9 @@ export const frErrorCodes: Partial<ThreadCopy['errorCodes']> = {
+     body: 'Le serveur de modèles local ne tourne pas encore : il est peut-être encore en train de démarrer. Réessayez dans un instant, ou passez à un autre modèle.',
+     bodyNoRetry:
+       'Le serveur de modèles local est arrêté. Démarrez-le depuis l’application de bureau Hermes ou avec `hermes model` dans un terminal, ou passez à un autre modèle.'
++  },
++  route_refused: {
++    title: 'Le modèle de ce chat est indisponible',
++    body: 'Le modèle auquel ce chat est fixé n’accepte pas de requêtes pour le moment, votre message n’a donc pas été envoyé. Choisissez un autre modèle, ou renvoyez-le quand il sera de retour.'
+   }
+ }
+diff --git a/apps/desktop/src/i18n/ja_error_codes.ts b/apps/desktop/src/i18n/ja_error_codes.ts
+index 37100f0c36..6bb3c2dc72 100644
+--- a/apps/desktop/src/i18n/ja_error_codes.ts
++++ b/apps/desktop/src/i18n/ja_error_codes.ts
+@@ -111,5 +111,9 @@ export const jaErrorCodes: Partial<ThreadCopy['errorCodes']> = {
+     body: 'ローカルモデルサーバーはまだ動作していません。起動中の可能性があります。少し待ってから再試行するか、別のモデルに切り替えてください。',
+     bodyNoRetry:
+       'ローカルモデルサーバーはオフになっています。Hermes デスクトップアプリか、ターミナルの `hermes model` から起動するか、別のモデルに切り替えてください。'
++  },
++  route_refused: {
++    title: 'このチャットのモデルは利用できません',
++    body: 'このチャットに固定されたモデルは現在リクエストを受け付けていないため、メッセージは送信されませんでした。別のモデルを選ぶか、復旧後にもう一度送信してください。'
+   }
+ }
+diff --git a/apps/desktop/src/i18n/ru_error_codes.ts b/apps/desktop/src/i18n/ru_error_codes.ts
+index 12407411d9..69450ab313 100644
+--- a/apps/desktop/src/i18n/ru_error_codes.ts
++++ b/apps/desktop/src/i18n/ru_error_codes.ts
+@@ -26,6 +26,10 @@ export const ruErrorCodes: Partial<ThreadCopy['errorCodes']> = {
+     bodyNoRetry:
+       'Локальный сервер моделей выключен. Запустите его в настольном приложении Hermes или командой `hermes model` в терминале, либо переключитесь на другую модель.'
+   },
++  route_refused: {
++    title: 'Модель этого чата недоступна',
++    body: 'Модель, закреплённая за этим чатом, сейчас не принимает запросы, поэтому ваше сообщение не отправлено. Выберите другую модель или отправьте снова, когда она станет доступна.'
++  },
+   agent_init_failed: {
+     title: 'Не удалось начать этот чат',
+     body: provider =>
+diff --git a/apps/desktop/src/i18n/zh-hant_assistant.ts b/apps/desktop/src/i18n/zh-hant_assistant.ts
+index 392c9f4c68..1592128f23 100644
+--- a/apps/desktop/src/i18n/zh-hant_assistant.ts
++++ b/apps/desktop/src/i18n/zh-hant_assistant.ts
+@@ -238,6 +238,10 @@ export const zhHantAssistant = {
+           body: '本機模型伺服器尚未執行：它可能仍在啟動中。請稍後重試，或切換到其他模型。',
+           bodyNoRetry:
+             '本機模型伺服器已關閉。請在 Hermes 桌面應用程式或終端機中的 `hermes model` 啟動它，或切換到其他模型。'
++        },
++        route_refused: {
++          title: '此聊天的模型無法使用',
++          body: '此聊天固定使用的模型目前無法接受請求，因此你的訊息未送出。請選擇其他模型，或在其恢復後重新傳送。'
+         }
+       },
+       errorLayers: {
+diff --git a/apps/desktop/src/i18n/zh_error_codes.ts b/apps/desktop/src/i18n/zh_error_codes.ts
+index 619cc59beb..ab3ff491b9 100644
+--- a/apps/desktop/src/i18n/zh_error_codes.ts
++++ b/apps/desktop/src/i18n/zh_error_codes.ts
+@@ -106,5 +106,9 @@ export const zhErrorCodes: Partial<ThreadCopy['errorCodes']> = {
+     body: '本地模型服务器尚未运行：它可能仍在启动。请稍后重试，或切换到其他模型。',
+     bodyNoRetry:
+       '本地模型服务器已关闭。请在 Hermes 桌面应用或终端中的 `hermes model` 启动它，或切换到其他模型。'
++  },
++  route_refused: {
++    title: '此聊天的模型不可用',
++    body: '此聊天固定使用的模型目前无法接受请求，因此你的消息未发送。请选择其他模型，或在其恢复后重新发送。'
+   }
+ }
+diff --git a/apps/desktop/src/lib/chat-messages.test.ts b/apps/desktop/src/lib/chat-messages.test.ts
+index 92535feeda..0dfe4fcd25 100644
+--- a/apps/desktop/src/lib/chat-messages.test.ts
++++ b/apps/desktop/src/lib/chat-messages.test.ts
+@@ -691,6 +691,30 @@ describe('toChatMessages', () => {
+     expect(chatMessageText(messages[2])).toBe('Your request was not processed.')
+   })
+ 
++  it('redraws a pinned route wall from the boundary row with its own sentence', () => {
++    // gateway/session_settlement_recovery.py gateway_refusal_boundary: the route refusal's card rides
++    // the boundary, whose own copy drops the "Send it again" advice.
++    const held = '⚠️ openai-codex/gpt-6-astra subscription quota is out until Tue 11-17 21:59 PT. Use /model to switch.'
++
++    const messages = toChatMessages([
++      { role: 'user', content: 'whats left', timestamp: 1 },
++      {
++        role: 'assistant',
++        content: 'Your request was not processed.',
++        display_kind: 'failed_turn',
++        display_metadata: {
++          error: 'Subscription quota unavailable for openai-codex/gpt-6-astra; resets at 1794981540.0',
++          error_surface: { code: 'route_refused', layer: 'gateway', message: held, retryable: false }
++        },
++        timestamp: 2
++      }
++    ])
++
++    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system'])
++    expect(messages[1].errorSurface).toMatchObject({ code: 'route_refused', message: held, retryable: false })
++    expect(chatMessageText(messages[2])).toBe('Your request was not processed.')
++  })
++
+   it('shows only the notice for a boundary row without a usable error surface', () => {
+     const messages = toChatMessages([
+       { role: 'user', content: 'do the thing', timestamp: 1 },
+diff --git a/apps/desktop/src/lib/error-surface-copy.ts b/apps/desktop/src/lib/error-surface-copy.ts
+index 392a8532f7..0bedd2296d 100644
+--- a/apps/desktop/src/lib/error-surface-copy.ts
++++ b/apps/desktop/src/lib/error-surface-copy.ts
+@@ -19,6 +19,8 @@ export interface ErrorCardText {
+   body: string
+ }
+ 
++const OWN_SENTENCE_CODES: ReadonlySet<string> = new Set(['usage_window', 'route_refused'])
++
+ const render = (value: ErrorCardCopy['title'], provider: string, model = '') =>
+   typeof value === 'function' ? value(provider, model) : value
+ 
+@@ -84,9 +86,9 @@ export function errorCardText(
+       }
+     }
+ 
+-    // Free-tier and usage-window refusals arrive with the backend's own sentence (the
++    // Free-tier, usage-window and route refusals arrive with the backend's own sentence (the
+     // wait, the model, the way forward); the table body is only the fallback for an older backend.
+-    const ownSentence = isFreeTierSurface(surface) || surface?.code === 'usage_window'
++    const ownSentence = isFreeTierSurface(surface) || OWN_SENTENCE_CODES.has(key.code)
+ 
+     const body = surface?.retryable === false && copy.bodyNoRetry ? copy.bodyNoRetry : copy.body
+ 
+diff --git a/apps/desktop/src/lib/error-surface.ts b/apps/desktop/src/lib/error-surface.ts
+index 8d5f74cf2c..e60d4d59f5 100644
+--- a/apps/desktop/src/lib/error-surface.ts
++++ b/apps/desktop/src/lib/error-surface.ts
+@@ -68,6 +68,10 @@ export const ERROR_CODE_KEYS = [
+   // The managed local model server is down (starting, or switched off): named as itself, not as
+   // the custom-server endpoint copy, and with no Desktop-only pane (the Webapp shares this card).
+   'local_runtime_unavailable',
++  // The router refused the chat's own model before the turn began (gateway/run_turn_runner.py
++  // `_resolution_failure_reply`: a pinned route's subscription wall or a routing refusal). The
++  // backend's sentence (model, reset time, /model) rides in `message`; a resend fails the same way.
++  'route_refused',
+   // The owner did not confirm a forwarded send in time; it may already be queued: no Retry.
+   'SESSION_OWNER_UNCONFIRMED',
+   'agent_init_failed',
+@@ -252,6 +256,27 @@ export function parseErrorSurface(value: unknown): ErrorSurface | null {
+   }
+ }
+ 
++// agent/turn_failure_copy.py FAILED_TURN_NOTICE / ROUTE_REFUSED_TURN_NOTICE: the messaging path
++// appends the boundary notice to a failed turn's reply. It is not part of the refusal's own sentence
++// (and its "Send it again" is the wrong advice for a refusal a resend repeats), so it never joins the body.
++const TRAILING_FAILED_TURN_NOTICE = /\s*Your request was not processed\.[^\n]*$/
++
++// Refusals whose turn text IS the backend's own user-facing sentence (the wall, the reset, the way
++// out), stamped before any model ran: gateway/run_turn_runner.py `_resolution_failure_reply`.
++const OWN_SENTENCE_REFUSALS: ReadonlySet<string> = new Set(['route_refused'])
++
++/** A stamped pre-turn refusal from a backend that did not put its sentence in `message`: the turn's
++ *  final text is that sentence, so it becomes the card body instead of the generic layer copy. */
++export function withRefusalSentence(surface: ErrorSurface | null, text: string): ErrorSurface | null {
++  if (!surface || surface.message || !OWN_SENTENCE_REFUSALS.has(surface.code)) {
++    return surface
++  }
++
++  const sentence = text.trim().replace(TRAILING_FAILED_TURN_NOTICE, '').trim()
++
++  return sentence ? { ...surface, message: sentence } : surface
++}
++
+ /** "HH:mm" for a provider reset moment, in the user's local clock. */
+ export function formatResetClock(resetsAt: number): string {
+   const at = new Date(resetsAt * 1000)
+@@ -554,6 +579,8 @@ const CODE_ACTIONS: Partial<Record<ErrorCodeKey, ErrorCardActions>> = {
+   session_read_only: { primary: 'start_new_session' },
+   workspace_unavailable: { primary: 'retry', secondary: 'start_new_session' },
+   launch_credentials_unavailable: { primary: 'start_new_session' },
++  // The chat's model is walled until its reset: another model is the way on, never a Retry.
++  route_refused: { primary: 'choose_model' },
+   loop_error: { primary: 'retry', secondary: 'start_new_session' }
+ }
+ 
+diff --git a/gateway/run_turn_persistence.py b/gateway/run_turn_persistence.py
+index 0392151bfe..7218788d55 100644
+--- a/gateway/run_turn_persistence.py
++++ b/gateway/run_turn_persistence.py
+@@ -330,6 +330,11 @@ class GatewayTurnPersistenceMixin:
+             # the typed result fields, the same notice the owner retains for display.
+             from agent.turn_failure_copy import refused_turn_display_notice
+             return refused_turn_display_notice(agent_result)
++        if agent_result.get("failure_reason") == "route_refused":
++            # [daveey] Refused before anything ran, and a resend repeats it until the reset: the reply
++            # already names the reset and /model, so the boundary gives no "Send it again" advice.
++            from agent.turn_failure_copy import ROUTE_REFUSED_TURN_NOTICE
++            return ROUTE_REFUSED_TURN_NOTICE
+         from gateway.media_repair import _current_turn_messages
+         # Compression during the failed turn can move the slice boundary; the shared helper falls
+         # back to the last user row so tool evidence is not silently dropped.
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 8585f72c68..26b3fb8638 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -213,6 +213,24 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str,
+     return t("gateway.errors.no_credentials"), auth_permanent, False
+ 
+ 
++def _resolution_failure_result(exc: Exception, platform: Platform) -> dict:
++    """The FAILED, never-run turn result for a model/credential resolution failure."""
++    from agent.turn_failure_copy import stamp_failure
++    text, reason, retryable = _resolution_failure_reply(exc, platform)
++    result = stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
++                            "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
++    if reason == "route_refused":
++        # [daveey] The router refused the chat's own route (a pinned subscription wall): the reply names
++        # the reset and /model, and a resend repeats the refusal. Like the policy refusals
++        # (session_policy.refused_turn_result) the result brings its card (the reply as its body), so
++        # settlement commits it on the failed-turn boundary and a reopened chat still shows the way out.
++        from agent.error_surface import build_error_surface_from_result
++        from agent.turn_failure_copy import ROUTE_REFUSED_TURN_NOTICE
++        result["error_surface"] = build_error_surface_from_result(result)
++        result["refusal_notice"] = ROUTE_REFUSED_TURN_NOTICE
++    return result
++
++
+ 
+ def _observed_turn_persist_message(run_message, override, live_text):
+     """The durable user row for an observed-group turn: the clean text, or for a native image turn the
+@@ -1394,10 +1412,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+             # a FAILED turn: a one-shot client exits non-zero, transcript persistence closes the
+             # turn, and an API receipt reports failure, never a completed turn with an apology.
+             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
+-            from agent.turn_failure_copy import stamp_failure
+-            text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
+-            return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
+-                                  "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
++            return _resolution_failure_result(exc, ctx.source.platform)
+         from gateway.session_authorities import active_authority
+         from gateway.session_worker_construct import session_routing
+         pr = session_routing(active_authority(runner), policy) if policy else runner._provider_routing
+diff --git a/gateway/session_settlement_recovery.py b/gateway/session_settlement_recovery.py
+index 24004e6288..d322261f58 100644
+--- a/gateway/session_settlement_recovery.py
++++ b/gateway/session_settlement_recovery.py
+@@ -151,12 +151,15 @@ def owner_stop_notice(captured, outcome, row=None):
+ 
+ def gateway_refusal_boundary(captured, outcome):
+     """``(notice, display_metadata)`` for a failed turn the gateway itself refused with a renderable
+-    descriptor (``result.error_surface``: ``session_cron.execute``, ``session_policy.refused_turn_result``), else None."""
++    descriptor (``result.error_surface``: ``session_cron.execute``, ``session_policy.refused_turn_result``), else None.
++    The boundary copy is ``result.refusal_notice`` when the error card already carries the sentence (a route
++    refusal: ``run_turn_runner._resolution_failure_result``), else the error itself."""
+     value = (captured or {}).get('result') or {}
+     surface, error = value.get('error_surface'), value.get('error')
+     if outcome != 'failed' or not isinstance(surface, dict) or not isinstance(error, str) or not error:
+         return None
+-    return error, {'error': error, 'error_surface': dict(surface)}
++    notice = value.get('refusal_notice')
++    return (notice if isinstance(notice, str) and notice else error), {'error': error, 'error_surface': dict(surface)}
+ 
+ 
+ def _release_media(authority, admission_id):
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 104c7080c7..9ac1834528 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -272,6 +272,8 @@
+     "assistant.thread.errorCodes.provider_policy_blocked.title",
+     "assistant.thread.errorCodes.rate_limit.body",
+     "assistant.thread.errorCodes.rate_limit.title",
++    "assistant.thread.errorCodes.route_refused.body",
++    "assistant.thread.errorCodes.route_refused.title",
+     "assistant.thread.errorCodes.server_error.body",
+     "assistant.thread.errorCodes.server_error.title",
+     "assistant.thread.errorCodes.session_read_only.body",
+diff --git a/tests/gateway/test_route_refused_card.py b/tests/gateway/test_route_refused_card.py
+new file mode 100644
+index 0000000000..e35f0d94b2
+--- /dev/null
++++ b/tests/gateway/test_route_refused_card.py
+@@ -0,0 +1,102 @@
++"""A pinned route's pre-turn refusal carries its own sentence to the client's error card.
++
++The router refusing a chat's explicit pin (a subscription wall until a known reset) is stamped
++``route_refused`` on the gateway layer. Without the sentence on the descriptor, Desktop showed the
++gateway layer's generic "internal problem ... send your message again" card, advice that can never
++work until the reset, and never named the fix (/model).
++"""
++from agent.error_surface import build_error_surface_from_result
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++from agent.turn_failure_copy import FAILED_TURN_NOTICE, ROUTE_REFUSED_TURN_NOTICE
++from gateway.config import Platform
++from gateway.run_turn_runner import _resolution_failure_result
++from gateway.session_settlement_recovery import completion_payload, gateway_refusal_boundary
++
++RESET = 1794981540.0
++
++
++def _wall():
++    return SubscriptionQuotaUnavailable("openai-codex", "gpt-6-astra", RESET)
++
++
++def test_local_route_refusal_result_carries_its_sentence_as_the_card_body():
++    result = _resolution_failure_result(_wall(), Platform.LOCAL)
++
++    text = result["final_response"]
++    assert "openai-codex/gpt-6-astra" in text and "/model" in text
++    assert str(RESET) not in text  # the reset is named in PT, never as an epoch
++    assert (result["failed"], result["failure_reason"], result["failure_retryable"]) == (True, "route_refused", False)
++    # The raw resolver message stays the error (the card's details), the sentence is the card's body.
++    assert result["error"] == str(_wall())
++    surface = result["error_surface"]
++    assert (surface["layer"], surface["code"], surface["retryable"]) == ("gateway", "route_refused", False)
++    assert surface["message"] == text
++
++
++def test_settlement_commits_the_refusal_and_its_card_as_the_failed_turn_boundary():
++    """A reopened chat redraws the card from the boundary row's display_metadata; the boundary
++    itself never tells the user to send again (a resend repeats the refusal until the reset)."""
++    result = _resolution_failure_result(_wall(), Platform.LOCAL)
++
++    boundary = gateway_refusal_boundary({"result": result}, "failed")
++    assert boundary is not None
++    notice, metadata = boundary
++
++    assert notice == ROUTE_REFUSED_TURN_NOTICE
++    assert "Send it again" not in notice
++    assert metadata["error"] == result["error"]
++    assert metadata["error_surface"]["code"] == "route_refused"
++    assert metadata["error_surface"]["message"] == result["final_response"]
++
++
++def test_messaging_boundary_notice_drops_the_resend_advice():
++    from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
++
++    persistence = GatewayTurnPersistenceMixin()
++    refused = {"failed": True, "failure_reason": "route_refused", "messages": []}
++    other = {"failed": True, "failure_reason": "loop_error", "messages": []}
++
++    assert persistence._hmwa_failed_turn_notice(refused) == ROUTE_REFUSED_TURN_NOTICE
++    assert persistence._hmwa_failed_turn_notice(other) == FAILED_TURN_NOTICE
++
++
++def test_other_gateway_refusals_keep_their_error_as_the_boundary():
++    """Control: a cron-session refusal (no refusal_notice) still writes its error as the boundary."""
++    captured = {"result": {"error": "This chat runs a scheduled job.",
++                           "error_surface": {"layer": "gateway", "code": "cron_session_read_only"}}}
++
++    boundary = gateway_refusal_boundary(captured, "failed")
++    assert boundary is not None and boundary[0] == "This chat runs a scheduled job."
++
++
++def test_live_completion_frame_carries_the_descriptor_with_the_sentence():
++    result = _resolution_failure_result(_wall(), Platform.LOCAL)
++    row = {"admission_id": "adm-1"}
++
++    complete = completion_payload(row, {"outcome": "failed"}, result["final_response"], {"result": result})
++
++    assert complete["status"] == "error"
++    assert complete["error_surface"]["code"] == "route_refused"
++    assert complete["error_surface"]["message"] == result["final_response"]
++
++
++def test_messaging_platform_quota_wall_keeps_its_old_shape():
++    """Control: off the local surface the wall stays an auth_permanent verdict with no descriptor."""
++    exc = _wall()
++    result = _resolution_failure_result(exc, Platform.TELEGRAM)
++
++    assert result["failure_reason"] == "auth_permanent"
++    assert result["error"] == str(exc)
++    assert "error_surface" not in result
++
++
++def test_only_own_sentence_refusals_put_their_reply_on_the_descriptor():
++    """Control: a genuine runtime failure's reply is not promoted to the card body."""
++    route = build_error_surface_from_result(
++        {"failed": True, "error": "x", "failure_reason": "route_refused", "final_response": "  ⚠️ pinned wall  "})
++    loop = build_error_surface_from_result(
++        {"failed": True, "error": "boom", "failure_reason": "loop_error", "final_response": "partial words"})
++
++    assert route is not None and loop is not None
++    assert route["message"] == "⚠️ pinned wall"
++    assert "message" not in loop
+-- 
+2.43.0
+

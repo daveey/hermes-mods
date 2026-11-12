@@ -1,0 +1,1509 @@
+From 430a8d44641a851ee36b4a18582a8a321d7c7c90 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:39:29 +0000
+Subject: [PATCH] fix(kanban): sample the hub CPU advisory on its own thread,
+ not across sync rounds [daveey]
+
+91511fad split the advisory CPU sample across sync-loop iterations: snapshot A after one
+round, B after the next, then the strict 1000-2000 ms window check. A hub round takes 3-20 s
+(board pulls plus feed wakes), so every finish was dropped (cpu_sample_drops climbing, zero
+records), cache/hub-cpu-sample.json aged past 15 s and every hub claim deferred
+hub_cpu_unknown with 0/9 slots in use (hermes-hub, 2026-11-12 07:12-07:16Z, until a user
+service stopgap took over the sampling).
+
+Fix: hermes_cli/machine_cpu_sampler.AdvisorySampler takes a full cpu.sample() (two
+/proc/stat snapshots ~1 s apart, blocking only its own thread) every 5 windows (5 s) while
+the root limit is on, and writes each valid one to the advisory file. The sync loop starts it
+and closes it in a finally, so a stopped loop still lets the advisory go stale (fail-closed).
+The Reporter no longer measures: it takes the sampler's newest sample at most once (never
+replayed), only when measured under the same limit and <= 10 s old. The pending-wake clamp in
+the loop and the unused begin/finish primitives are removed.
+
+Detection: hermes_cli/kanban_hub_cpu_alert.check runs once per embedded-dispatcher tick.
+When the root limit is on and the advisory has been unusable (>15 s, missing or malformed)
+for 60 s of this process's own observation, it opens ONE card per incident
+(idempotency_key hub-cpu-advisory-stale) naming the sample age and the sampler counters; a
+fresh sample ends the incident; a later one comments on the open card (hourly at most) or
+opens a new card once that one is done.
+
+Proof:
+- RED on origin/main ee3cb1f4ca: tests/hermes_cli/test_kanban_sync_slow_round_cpu.py (real
+  _run_forever + real Reporter + real cpu.sample window check over /proc/stat, window scaled
+  to 200-400 ms, rounds that outlast it) fails "advisory not written while the sync round
+  ran: 0 records". GREEN here, 3/3 repeat runs.
+- Mutants killed: dropping sampler.close() in the loop's finally (slow-round test), letting
+  the Reporter take a sample with the gate off (test_machine_metrics).
+- hermes-core-wt test: 34 kanban-sync/metrics/admission files 735 passed; 53 gateway
+  dispatcher/watcher files 772 passed. scripts/check --base origin/main ok.
+---
+ docs/worker-first-v1.md                       |   2 +-
+ gateway/kanban_watchers.py                    |   2 +
+ hermes_cli/kanban_admission.py                |   2 +-
+ hermes_cli/kanban_hub_cpu_alert.py            | 126 +++++++++++++++
+ hermes_cli/kanban_sync_client.py              |  73 +++++----
+ hermes_cli/machine_cpu_metrics.py             |  38 +----
+ hermes_cli/machine_cpu_sampler.py             | 120 ++++++++++++++
+ hermes_cli/machine_metrics.py                 |  66 ++------
+ tests/hermes_cli/test_hub_cpu_gate_budget.py  |  30 ++--
+ tests/hermes_cli/test_kanban_hub_cpu_alert.py | 148 ++++++++++++++++++
+ .../test_kanban_sync_slow_round_cpu.py        |  90 +++++++++++
+ .../test_kanban_sync_split_cpu_loop.py        |  57 -------
+ tests/hermes_cli/test_kanban_sync_timing.py   |  21 +--
+ .../test_kanban_sync_timing_loop.py           |  15 +-
+ tests/hermes_cli/test_machine_cpu_sampler.py  | 122 +++++++++++++++
+ .../test_machine_cpu_split_primitives.py      |  24 ---
+ tests/hermes_cli/test_machine_metrics.py      |   8 +-
+ .../test_machine_metrics_drop_quality.py      |  95 -----------
+ .../test_machine_metrics_split_cpu.py         |  47 ------
+ .../test_machine_metrics_split_finish.py      |  97 ------------
+ 20 files changed, 704 insertions(+), 479 deletions(-)
+ create mode 100644 hermes_cli/kanban_hub_cpu_alert.py
+ create mode 100644 hermes_cli/machine_cpu_sampler.py
+ create mode 100644 tests/hermes_cli/test_kanban_hub_cpu_alert.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_slow_round_cpu.py
+ delete mode 100644 tests/hermes_cli/test_kanban_sync_split_cpu_loop.py
+ create mode 100644 tests/hermes_cli/test_machine_cpu_sampler.py
+ delete mode 100644 tests/hermes_cli/test_machine_cpu_split_primitives.py
+ delete mode 100644 tests/hermes_cli/test_machine_metrics_drop_quality.py
+ delete mode 100644 tests/hermes_cli/test_machine_metrics_split_cpu.py
+ delete mode 100644 tests/hermes_cli/test_machine_metrics_split_finish.py
+
+diff --git a/docs/worker-first-v1.md b/docs/worker-first-v1.md
+index 6cc9c1886c..bf8b47f8b6 100644
+--- a/docs/worker-first-v1.md
++++ b/docs/worker-first-v1.md
+@@ -9,7 +9,7 @@ Workers always win. The Board reserves the origin hub for a portable card only w
+ * Board: operator-owned `worker_overflow` setting, e.g. `{"hub": {"machine": "hub", "cpu_busy_below_pct": 50}}`; `{}`/absent disables it. The lease grant re-runs the decision with the current registry and records the consumed sample; a worker freeing up, a CPU rise, a used sample or a disabled setting refuses the grant.
+ * Core: `kanban.admission.cpu_busy_below_pct` in the **installation-root** config enables (a) a 10 s metrics report carrying `cpu_busy_pct`/`cpu_busy_window_ms`/`cpu_busy_sample_end_ms` (2 s hard total, never replayed), (b) a lock-free advisory pre-check before any Board lease, and (c) the final gate: with `admission.lock` held and before the claim commits, an independent full ~1 s `/proc/stat` sample must be strictly below the limit and the host running count below the root `kanban.max_in_progress`. Any unknown (unreadable config, bad value, failed sample, window outside 1-2 s, passed deadline) refuses. The gate applies to every new ready/review claim on that host (legacy, host-bound and policy cards); the worker load formula is not used for the origin's own cards.
+ * Rollout order: deploy Boards and clients first; set root `cpu_busy_below_pct`; verify reports; only then enable Board `worker_overflow`. Rollback: set Board `worker_overflow` to `{}` and read it back (outstanding hub reservations become unclaimable). Rollback keeps the root CPU guard and `kanban.max_in_progress` (7): removing the root key or raising the cap is a separate, explicit operator decision, never part of rollback. After rollback the Board still admits the origin hub's review continuation of a card it already ran on the hub (review ruling 11), on the hub's non-CPU admission only (active, unheld, pickup, capability, fresh metrics, no drain, memory < 85 %, a free slot under a known cap); the root CPU guard is then that claim's only CPU check, which is why rollback keeps it. Rollback never creates an overflow, a hub reservation or a new hub assignment, and there is no operator move of a review card to ready: a review card the hub can never admit moves only once its refusal reason is cleared or overflow is re-enabled.
+-* The advisory is fed only by the sync loop's metrics reporter (`cache/hub-cpu-sample.json`, written before the Board POST, so a Board outage does not starve it). When the sync loop is not running (sync role given up, no identity) or a round stretches past the 15 s freshness, every hub claim on that host defers as `hub_cpu_unknown`: fail-closed by design. The slowest healthy round (10 s cadence + <= 2 s sample + 2 s POST budget) stays inside 15 s.
++* The advisory is fed only by the sync loop's advisory sampler thread (`hermes_cli/machine_cpu_sampler.py`, `cache/hub-cpu-sample.json`): a full ~1 s sample every 5 s on its own thread, written independently of the Board POST, so neither a Board outage nor a slow sync round (3-20 s on the hub) starves it. Each metrics report attaches the newest sample not yet reported (at most 10 s old). The loop starts the thread and stops it when the loop ends, so when the sync loop is not running (sync role given up, no identity) every hub claim on that host defers as `hub_cpu_unknown`: fail-closed by design. When the advisory stays stale for 60 s of dispatcher observation while the root limit is on, the dispatcher opens one Kanban card per incident (`hermes_cli/kanban_hub_cpu_alert.py`, key `hub-cpu-advisory-stale`). An earlier design measured inside the loop and validated the 1-2 s window across loop iterations; on the hub every sample was dropped (2026-11-12).
+ * Turns are not refused by a claim's sample: on **every** host (whether or not the root limit is set), chat, notification and review turns wait out a busy `admission.lock` for longer than its longest designed hold (`admission_fence.CLAIM_MAX_HOLD_S`), a waiting turn makes the next claims defer to their next tick (also on hosts without the CPU gate, e.g. worker-1: `BUSY_WAIT_S` rose from 0.5 s to 3.0 s for all turn sources), and `prompt.admit` waits outside the session resume lock and then retries its admission once (nothing durable precedes admission, so no duplicate turn).
+ * A Board grant the core gate refuses (or any claim that never started locally) is released with `unused_grant: true`; the Board then keeps the card first-start, so overflow is evaluated again.
+ 
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 5e73f4752f..98f8a64b1c 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -401,6 +401,8 @@ class GatewayKanbanWatchersMixin:
+                         clocked = _kbd.all_clock_held(res for _slug, res in (results or []))
+                         bad_ticks = (bad_ticks + 1 if ready_pending and not any_spawned and not capped and not clocked
+                                      else 0)
++                    from hermes_cli import kanban_hub_cpu_alert  # one card per stale-advisory incident [daveey]
++                    await _to_thread_process_service(kanban_hub_cpu_alert.check)
+                     now = int(time.time())
+                     # Only an ungated tick can be "stuck": an estop or drain hold spawns 0 on purpose.
+                     if gate is None and bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 86be4940c8..6d9c2a8508 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -32,7 +32,7 @@ def _defer(task_id, reason):
+ def hub_cpu_advisory(task_id=None):
+     """Lock-free pre-check before a Board lease (review ruling 5). Returns a refusal reason or None.
+ 
+-    Off unless the root limit is set. Uses the metrics reporter's latest complete sample: missing, stale (>15 s),
++    Off unless the root limit is set. Uses the advisory sampler's latest complete sample: missing, stale (>15 s),
+     future or malformed reads as unknown and defers; a fresh value at or above the limit defers. Advisory only."""
+     from hermes_cli import machine_cpu_metrics as cpu
+     from hermes_cli import machine_metrics
+diff --git a/hermes_cli/kanban_hub_cpu_alert.py b/hermes_cli/kanban_hub_cpu_alert.py
+new file mode 100644
+index 0000000000..e7ce6d35d7
+--- /dev/null
++++ b/hermes_cli/kanban_hub_cpu_alert.py
+@@ -0,0 +1,126 @@
++"""One Kanban card when the hub CPU advisory goes stale while the root CPU limit is on. [daveey]
++
++With ``kanban.admission.cpu_busy_below_pct`` set, every claim on this host first reads the advisory sample
++(``kanban_admission.hub_cpu_advisory``); a sample older than 15 s defers the claim as ``hub_cpu_unknown``. On
++2026-11-12 every sample was dropped for four minutes and the hub claimed nothing with all slots free, and the only
++signal was the dispatcher's "stuck" log line. Now the dispatcher calls :func:`check` once per tick: once the
++advisory has been unusable for :data:`STALE_FOR_S` of this process's own observation (a gateway that just started
++never files for the downtime before it), it opens ONE card (``idempotency_key='hub-cpu-advisory-stale'``) on the
++default board, naming the sample age and this process's sampler counters. One incident files once; a fresh sample
++ends it, and the next incident comments on the open card (at most hourly) or opens a new card once that card is done.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from typing import Callable, Optional
++
++log = logging.getLogger(__name__)
++
++KEY = "hub-cpu-advisory-stale"
++AUTHOR = "hub-cpu-advisory"
++STALE_FOR_S = 60.0
++_COMMENT_EVERY = 3600
++
++
++class _Incident:
++    def __init__(self) -> None:
++        self.stale_since: Optional[float] = None
++        self.filed = False
++
++
++_STATE = _Incident()
++
++
++def _sample_age_s(now_wall: float) -> Optional[float]:
++    """Seconds since the advisory sample's end, or None when it cannot be used (missing, malformed, future)."""
++    from hermes_cli import machine_metrics as mm
++    end = (mm.read_hub_cpu_sample() or {}).get("cpu_busy_sample_end_ms")
++    if not isinstance(end, (int, float)) or isinstance(end, bool):
++        return None
++    age_ms = now_wall * 1000 - end
++    return age_ms / 1000 if 0 <= age_ms else None
++
++
++def check(*, mono: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
++          state: Optional[_Incident] = None, file_fn: Optional[Callable[[str], Optional[str]]] = None) -> Optional[str]:
++    """One dispatcher-tick observation. Returns the card id when this call filed (or commented) it. Never raises."""
++    try:
++        return _check(mono, wall, state or _STATE, file_fn or report)
++    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban: hub CPU advisory staleness check failed", exc_info=True)
++        return None
++
++
++def _check(mono, wall, state: _Incident, file_fn) -> Optional[str]:
++    from hermes_cli import kanban_admission as ka
++    from hermes_cli import machine_cpu_metrics as cpu
++    limit_state, _limit = cpu.root_limit()
++    if limit_state != cpu.ON:
++        state.stale_since, state.filed = None, False
++        return None
++    age = _sample_age_s(wall())
++    if age is not None and age * 1000 <= ka.ADVISORY_MAX_AGE_MS:
++        state.stale_since, state.filed = None, False  # fresh: the incident (if any) is over
++        return None
++    now = mono()
++    if state.stale_since is None:
++        state.stale_since = now
++        return None
++    if state.filed or now - state.stale_since < STALE_FOR_S:
++        return None
++    state.filed = True
++    from hermes_cli import machine_cpu_sampler as sampler
++    counters = ", ".join(f"{k}={v}" for k, v in sorted(sampler.status().items())) or "no sampler in this process"
++    shown = "missing or unreadable" if age is None else f"{age:.0f} s old"
++    return file_fn(f"advisory sample {shown}, unusable for {now - state.stale_since:.0f} s of dispatcher "
++                   f"observation; sampler: {counters}")
++
++
++def report(detail: str, conn: Optional[sqlite3.Connection] = None) -> Optional[str]:
++    """Open or comment the stale-advisory card on the default board. Best effort: never raises."""
++    try:
++        if conn is None:
++            from hermes_cli import kanban_db as kb
++            from hermes_cli import kanban_db_connect as kbc
++            with kbc.connect_closing(kb.kanban_home() / "kanban.db") as own:
++                return _report(own, detail)
++        return _report(conn, detail)
++    except Exception:  # health: allow BLE001 -- runs on the dispatcher tick
++        log.warning("kanban: could not file the hub CPU advisory card (%s)", detail, exc_info=True)
++        return None
++
++
++def _report(conn: sqlite3.Connection, detail: str) -> str:
++    from hermes_cli import kanban_db as kb
++    log.warning("kanban: hub CPU advisory stale, every claim here defers hub_cpu_unknown: %s", detail)
++    row = conn.execute(
++        "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
++        "ORDER BY status IN ('done', 'failed', 'cancelled'), created_at DESC, rowid DESC LIMIT 1", (KEY,),
++    ).fetchone()
++    if row and row[1] not in ("done", "failed", "cancelled"):
++        recent = conn.execute(
++            "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND created_at >= ? LIMIT 1",
++            (row[0], AUTHOR, int(time.time()) - _COMMENT_EVERY),
++        ).fetchone()
++        if not recent:
++            kb.add_comment(conn, row[0], AUTHOR, f"Again: {detail}")
++        return row[0]
++    body = (
++        "The hub CPU advisory (`~/.hermes/cache/hub-cpu-sample.json`) is stale while the root "
++        "`kanban.admission.cpu_busy_below_pct` is set, so every claim on this host defers as `hub_cpu_unknown` "
++        f"and the host starts no cards.\n\n{detail}\n\n"
++        "Check: the gateway's kanban sync loop runs (`hermes kanban sync status`), and agent.log for "
++        "`machine metrics admission quality: cpu_sample_drops=` lines (each is a dropped advisory sample; the "
++        "sampler is `hermes_cli/machine_cpu_sampler.py`). Done when the file's mtime advances every ~5 s and a "
++        "`claimed` event follows on this host."
++    )
++    tid = kb.create_task(
++        conn, title="Hub CPU advisory stale: every claim here defers hub_cpu_unknown", body=body,
++        assignee="default", created_by=AUTHOR, priority=50, idempotency_key=None if row else KEY,
++    )
++    if row:  # the previous card is finished: the key now names this one (newest wins)
++        with kb.write_txn(conn, allow_nested=True):
++            conn.execute("UPDATE tasks SET idempotency_key = ? WHERE id = ?", (KEY, tid))
++    return tid
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index d21bf5e32a..73f3a0ef92 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1501,40 +1501,45 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     next_links = 0.0
+     from hermes_cli.machine_metrics import Reporter
+     metrics = Reporter(hub.report_metrics)
+-    while keep_running():
+-        boards = board_paths()
+-        for slug, _path in boards:
+-            if slug not in watchers or not watchers[slug].is_alive():
+-                watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
+-                                      on_state=work.feed_state)
+-                watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
+-                watchers[slug].start()
+-        selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
+-        selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
+-        results = sync_all_once(hub, boards=selected)
+-        ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
+-        if ahead:
+-            _log.error("kanban sync: a newer core migrated this host's board; giving up the sync role")
+-            runstate.record_down("gave up the sync role: " + "; ".join(f"board {r.board}: {r.error}" for r in ahead))
+-            return
+-        runstate.clear()  # a completed round: the loop runs
+-        for r in results:
+-            work.finished(r.board, not r.error)
+-            if r.push and (r.push.sent or r.push.rejected):
+-                _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+-                          r.push.sent, r.push.rejected)
+-        if time.monotonic() >= next_links:
+-            reconcile_links(boards, ident.gateway, skip_unchanged=True)
+-            next_links = time.monotonic() + LINKS_EVERY_S
+-        sync_timing.report(metrics.report_due)
+-        remaining = max(0.0, work.deadline - time.monotonic())
+-        deferred_due = next_deferred_repair(boards)
+-        if deferred_due is not None:
+-            remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+-        pending_wake = metrics.pending_wake_in()
+-        if pending_wake is not None:
+-            remaining = min(remaining, pending_wake)
+-        sync_timing.wait(wait_for_work, wake, [p for _s, p in boards], remaining, keep_running)
++    # Hub CPU advisory: measured on its own thread, so a slow sync round can neither void nor delay it. [daveey]
++    from hermes_cli.machine_cpu_sampler import AdvisorySampler
++    sampler = AdvisorySampler()
++    metrics.cpu_take_fn = sampler.take
++    sampler.start()
++    try:
++        while keep_running():
++            boards = board_paths()
++            for slug, _path in boards:
++                if slug not in watchers or not watchers[slug].is_alive():
++                    watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
++                                          on_state=work.feed_state)
++                    watchers[slug] = threading.Thread(target=watcher.run, daemon=True, name=f"kanban-feed-{slug}")
++                    watchers[slug].start()
++            selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
++            selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
++            results = sync_all_once(hub, boards=selected)
++            ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
++            if ahead:
++                _log.error("kanban sync: a newer core migrated this host's board; giving up the sync role")
++                runstate.record_down("gave up the sync role: " + "; ".join(f"board {r.board}: {r.error}" for r in ahead))
++                return
++            runstate.clear()  # a completed round: the loop runs
++            for r in results:
++                work.finished(r.board, not r.error)
++                if r.push and (r.push.sent or r.push.rejected):
++                    _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
++                              r.push.sent, r.push.rejected)
++            if time.monotonic() >= next_links:
++                reconcile_links(boards, ident.gateway, skip_unchanged=True)
++                next_links = time.monotonic() + LINKS_EVERY_S
++            sync_timing.report(metrics.report_due)
++            remaining = max(0.0, work.deadline - time.monotonic())
++            deferred_due = next_deferred_repair(boards)
++            if deferred_due is not None:
++                remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
++            sync_timing.wait(wait_for_work, wake, [p for _s, p in boards], remaining, keep_running)
++    finally:
++        sampler.close()
+     runstate.record_down("stopped (gateway stopping, or the host sync lease went to another gateway)")
+ 
+ 
+diff --git a/hermes_cli/machine_cpu_metrics.py b/hermes_cli/machine_cpu_metrics.py
+index c4f4faf9fc..573dcde034 100644
+--- a/hermes_cli/machine_cpu_metrics.py
++++ b/hermes_cli/machine_cpu_metrics.py
+@@ -8,9 +8,10 @@ included in user/nice and are never added again; ``steal`` counts as busy (time
+ error, malformed line, counter decrease (reboot/reset), non-positive total, or an elapsed window outside
+ [1000, 2000] ms yields ``None`` (unknown), which every caller treats as "refuse", never as idle.
+ 
+-There is no daemon or background sampler. Two callers sample on demand:
+-- the metrics reporter, only on a host whose installation-root config sets
+-  ``kanban.admission.cpu_busy_below_pct`` (the Board uses the reported triple for hub overflow), and
++Two callers sample:
++- the sync loop's advisory sampler thread (``machine_cpu_sampler``), every 5 s and only while the
++  installation-root config sets ``kanban.admission.cpu_busy_below_pct``; it feeds the lock-free advisory file and
++  the metrics report (the Board uses the reported triple for hub overflow), and
+ - the final claim gate in ``kanban_admission.claim_transaction``, with an independent full sample taken while
+   ``admission.lock`` is held.
+ 
+@@ -64,37 +65,6 @@ def _read_proc_stat() -> str:
+     return Path("/proc/stat").read_text(encoding="ascii")
+ 
+ 
+-def begin(*, read: Callable[[], str] = _read_proc_stat,
+-          clock: Callable[[], float] = time.monotonic, linux: Optional[bool] = None) -> tuple:
+-    """Capture A without waiting. Keep its monotonic start even when the read is unknown."""
+-    t0 = clock()
+-    if linux is None:
+-        linux = sys.platform.startswith("linux")
+-    try:
+-        first = parse_proc_stat(read()) if linux else None
+-    except (OSError, UnicodeError, ValueError):
+-        first = None
+-    return t0, first
+-
+-
+-def finish(first: tuple, *, read: Callable[[], str] = _read_proc_stat,
+-           clock: Callable[[], float] = time.monotonic,
+-           wall: Callable[[], float] = time.time) -> Optional[dict[str, Any]]:
+-    """Capture B without waiting; validate exactly the synchronous sampler's window and arithmetic."""
+-    try:
+-        second = parse_proc_stat(read())
+-        window_ms = (clock() - first[0]) * 1000.0
+-        end_ms = int(wall() * 1000)
+-    except (OSError, UnicodeError, ValueError):
+-        return None
+-    if not math.isfinite(window_ms) or not MIN_WINDOW_MS <= round(window_ms, 6) <= MAX_WINDOW_MS:
+-        return None
+-    pct = busy_pct(first[1], second)
+-    if pct is None:
+-        return None
+-    return {"cpu_busy_pct": pct, "cpu_busy_window_ms": round(window_ms), "cpu_busy_sample_end_ms": end_ms}
+-
+-
+ def sample(window_s: float = WINDOW_S, *, read: Callable[[], str] = _read_proc_stat,
+            clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
+            sleep: Callable[[float], None] = time.sleep, linux: Optional[bool] = None) -> Optional[dict[str, Any]]:
+diff --git a/hermes_cli/machine_cpu_sampler.py b/hermes_cli/machine_cpu_sampler.py
+new file mode 100644
+index 0000000000..b3ed472c62
+--- /dev/null
++++ b/hermes_cli/machine_cpu_sampler.py
+@@ -0,0 +1,120 @@
++"""The hub's advisory CPU sampler: its own thread, independent of the sync loop's iteration time. [daveey]
++
++The lock-free advisory (``kanban_admission.hub_cpu_advisory``) refuses every hub claim when
++``cache/hub-cpu-sample.json`` is older than 15 s. Measuring inside the sync loop tied that freshness to the
++loop: the split begin/finish sampler took snapshot A after one round and B after the next, and a hub round of
++3-20 s (board pulls plus feed wakes) always put the window past ``MAX_WINDOW_MS``. Every sample was dropped, the
++file aged, and the hub claimed nothing for minutes (2026-11-12).
++
++This thread takes a full ``machine_cpu_metrics.sample`` (two snapshots ~1 s apart, blocking only itself) every
++:func:`sample_every_s` (5 s) while the root limit is on, and writes each valid one to the advisory file. The sync loop
++starts it and closes it when the loop ends, so a stopped loop still leaves the advisory to go stale (fail-closed).
++The metrics report takes the newest sample with :meth:`AdvisorySampler.take`, at most once per sample (a report is
++never replayed) and only while it is younger than :data:`REPORT_MAX_AGE_S`.
++"""
++from __future__ import annotations
++
++import logging
++from threading import Event, Lock, Thread, current_thread  # bound now: loop tests stub threading.Thread
++import time
++from typing import Any, Callable, Optional
++
++_log = logging.getLogger(__name__)
++
++# One ~1 s sample every 5 windows (5 s): a 20 % duty cycle of two /proc/stat reads, well inside the 15 s advisory.
++SAMPLE_EVERY_WINDOWS = 5
++REPORT_MAX_AGE_S = 10.0
++
++# The last state of this process's sampler, for the dispatcher's stale-advisory card (kanban_hub_cpu_alert).
++_STATUS: dict[str, Any] = {}
++
++
++def status() -> dict[str, Any]:
++    return dict(_STATUS)
++
++
++def sample_every_s() -> float:
++    from hermes_cli import machine_cpu_metrics as cpu
++    return SAMPLE_EVERY_WINDOWS * cpu.WINDOW_S
++
++
++class AdvisorySampler:
++    def __init__(self, *, limit_fn: Optional[Callable[[], tuple]] = None,
++                 sample_fn: Optional[Callable[[], Optional[dict]]] = None,
++                 record_fn: Optional[Callable[[dict], None]] = None,
++                 clock: Callable[[], float] = time.monotonic, every_s: Optional[float] = None) -> None:
++        self.limit_fn, self.sample_fn, self.record_fn = limit_fn, sample_fn, record_fn
++        self.clock = clock
++        self.every_s = every_s
++        self.drops = 0
++        self.consecutive_drops = 0
++        self.records = 0
++        self._lock = Lock()
++        self._latest: Optional[tuple[dict, Any, float]] = None  # (sample, limit, monotonic taken_at)
++        self._taken: Optional[tuple] = None
++        self._stop = Event()
++        self._thread: Optional[Thread] = None
++
++    def run_once(self) -> Optional[dict]:
++        """One measurement round. Returns the recorded sample, or None (gate off, or the sample was dropped)."""
++        from hermes_cli import machine_cpu_metrics as cpu
++        from hermes_cli import machine_metrics as mm
++        state, limit = (self.limit_fn or cpu.root_limit)()
++        if state != cpu.ON:
++            with self._lock:
++                self._latest = None
++            return None
++        started = self.clock()
++        measured = self.sample_fn() if self.sample_fn else cpu.sample(cpu.WINDOW_S)
++        if not measured or not all(k in measured for k in cpu.FIELDS):
++            self.drops += 1
++            self.consecutive_drops += 1
++            _STATUS.update(drops=self.drops, consecutive_drops=self.consecutive_drops)
++            _log.info("machine metrics admission quality: cpu_sample_drops=%d (consecutive=%d, round %.0f ms)",
++                      self.drops, self.consecutive_drops, (self.clock() - started) * 1000.0)
++            return None
++        self.consecutive_drops = 0
++        try:
++            (self.record_fn or mm.record_hub_cpu_sample)(measured)
++        except OSError as exc:
++            _log.debug("hub CPU advisory sample not recorded: %s", exc)
++        with self._lock:
++            self._latest = (dict(measured), limit, self.clock())
++        self.records += 1
++        _STATUS.update(records=self.records, consecutive_drops=0, last_end_ms=measured["cpu_busy_sample_end_ms"])
++        return measured
++
++    def take(self, limit: Any) -> Optional[dict]:
++        """The newest sample for one metrics report: measured under *limit*, not yet reported, still fresh."""
++        with self._lock:
++            latest = self._latest
++            if latest is None or latest is self._taken:
++                return None
++            sample, measured_limit, taken_at = latest
++            if measured_limit != limit or self.clock() - taken_at > REPORT_MAX_AGE_S:
++                return None
++            self._taken = latest
++            return dict(sample)
++
++    def run(self) -> None:
++        # Only close() ends it (the loop's finally): the loop owns keep_running, whose callers may count calls.
++        while not self._stop.is_set():
++            started = self.clock()
++            try:
++                self.run_once()
++            except Exception as exc:  # health: allow BLE001 -- the advisory sampler must keep sampling
++                _log.debug("hub CPU advisory sampler round failed (%s: %s)", type(exc).__name__, exc)
++            every = sample_every_s() if self.every_s is None else self.every_s
++            self._stop.wait(max(0.0, every - (self.clock() - started)))
++
++    def start(self) -> Thread:
++        # health: allow HX012 -- reads only the installation-root config: there is no profile scope to carry
++        self._thread = Thread(target=self.run, daemon=True, name="hub-cpu-advisory-sampler")
++        self._thread.start()
++        return self._thread
++
++    def close(self, timeout: float = 5.0) -> None:
++        self._stop.set()
++        thread = self._thread
++        if thread is not None and thread is not current_thread():
++            thread.join(timeout)
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 89307344a9..b20eb8fcaa 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -7,10 +7,10 @@ since worker-first-v1 (docs/worker-first-v1.md): the Board's worker-pool admissi
+ local run. Cards without ``placement_policy`` are still placed without it.
+ 
+ Hub overflow: on a host whose installation-root config sets ``kanban.admission.cpu_busy_below_pct`` the reporter
+-also measures CPU busy across two nonblocking snapshots about 1 s apart and attaches
+-the complete triple ``cpu_busy_pct``/``cpu_busy_window_ms``/``cpu_busy_sample_end_ms``. ``collect()`` itself never
+-samples CPU busy. A CPU-bearing report has a hard 2 s total transport budget and is never replayed: a failed round
+-drops its sample and the next round measures again.
++also attaches the complete triple ``cpu_busy_pct``/``cpu_busy_window_ms``/``cpu_busy_sample_end_ms`` measured by the
++sync loop's advisory sampler thread (``machine_cpu_sampler``: a ~1 s window every 5 s, off the loop thread).
++``collect()`` itself never samples CPU busy. A CPU-bearing report has a hard 2 s total transport budget and is never
++replayed: each sample is reported at most once, and a failed round drops it.
+ """
+ from __future__ import annotations
+ 
+@@ -185,23 +185,13 @@ class Reporter:
+     def __init__(self, send: Callable[[dict], Any], *, collect_fn: Optional[Callable[[], dict]] = None,
+                  clock: Callable[[], float] = time.monotonic,
+                  cpu_limit_fn: Optional[Callable[[], tuple]] = None,
+-                 cpu_begin_fn: Optional[Callable[..., tuple]] = None,
+-                 cpu_finish_fn: Optional[Callable[..., Optional[dict]]] = None) -> None:
++                 cpu_take_fn: Optional[Callable[[Any], Optional[dict]]] = None) -> None:
+         self.send, self.collect_fn, self.clock = send, collect_fn, clock
+-        # Injection follows the nonblocking begin(**clock) / finish(A, **clock) contract.
+-        # The former blocking cpu_sample_fn seam is deliberately retired.
+         self.cpu_limit_fn = cpu_limit_fn
+-        self.cpu_begin_fn, self.cpu_finish_fn = cpu_begin_fn, cpu_finish_fn
+-        self.cpu_sample_drops = 0
++        # The sync loop sets this to its AdvisorySampler.take (machine_cpu_sampler): the CPU triple is measured on
++        # the sampler's own thread, never on the loop, so a slow round cannot void it. None reports no CPU triple.
++        self.cpu_take_fn = cpu_take_fn
+         self.next_at = 0.0
+-        self._pending = None
+-
+-    def pending_wake_in(self) -> Optional[float]:
+-        """Only a pending measurement adds a wake; the normal poll deadline is unchanged."""
+-        if self._pending is None:
+-            return None
+-        from hermes_cli import machine_cpu_metrics as cpu
+-        return max(0.0, self._pending[0] + cpu.WINDOW_S - self.clock())
+ 
+     def _sample(self, sample: dict, measured: Optional[dict]) -> dict:
+         from hermes_cli import kanban_sync_timing as timing
+@@ -209,49 +199,25 @@ class Reporter:
+         timing.note_cpu_sample(measured)
+         if measured and all(k in measured for k in cpu.FIELDS):
+             sample.update({k: measured[k] for k in cpu.FIELDS})
+-            try:
+-                with timing.span("adv"):
+-                    record_hub_cpu_sample(measured)
+-            except OSError as exc:
+-                _log.debug("hub CPU advisory sample not recorded: %s", exc)
+         return sample
+ 
+     def report_due(self) -> bool:
+-        from hermes_cli import machine_cpu_metrics as cpu
+         now = self.clock()
+-        pending = self._pending
+-        if pending is not None:
+-            if now < pending[0] + cpu.WINDOW_S:
+-                return False
+-            # Consume before any fallible finish work: no stale A survives an exception.
+-            self._pending = None
+-        elif now < self.next_at:
++        if now < self.next_at:
+             return False
+-        else:
+-            self.next_at = now + REPORT_EVERY_S
++        self.next_at = now + REPORT_EVERY_S
+         try:
+             from hermes_cli import kanban_sync_timing as timing
++            from hermes_cli import machine_cpu_metrics as cpu
+             from hermes_cli.machine_drain_metrics import send_compatible
++            with timing.span("collect"):
++                sample = dict((self.collect_fn or collect)())
+             with timing.span("limit"):
+                 state, limit = (self.cpu_limit_fn or cpu.root_limit)()
+             measured = None
+-            if pending is None and state == cpu.ON:
+-                first = (self.cpu_begin_fn or cpu.begin)(clock=self.clock)
+-                self._pending = (first[0], limit, first)
+-                if self.clock() < first[0] + cpu.WINDOW_S:
+-                    return False
+-                # A slow snapshot read can itself exhaust the window. Finish in this call,
+-                # rather than hand the loop a due pending A and force a zero-length wait.
+-                return self.report_due()
+-            with timing.span("collect"):
+-                sample = dict((self.collect_fn or collect)())
+-            if pending is not None:
+-                with timing.span("cpu"):
+-                    if state == cpu.ON and limit == pending[1]:
+-                        measured = (self.cpu_finish_fn or cpu.finish)(pending[2], clock=self.clock)
+-                if measured is None:
+-                    self.cpu_sample_drops += 1
+-                    _log.info("machine metrics admission quality: cpu_sample_drops=%d", self.cpu_sample_drops)
++            if state == cpu.ON and self.cpu_take_fn is not None:
++                with timing.span("cpu"):  # nonblocking: the sampler's newest unreported sample
++                    measured = self.cpu_take_fn(limit)
+             sample = self._sample(sample, measured)
+             with timing.span("send"):  # preserve the transport's existing hard 2 s budget
+                 send_compatible(self.send, sample)
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_budget.py b/tests/hermes_cli/test_hub_cpu_gate_budget.py
+index aecb0be404..0c00101e4c 100644
+--- a/tests/hermes_cli/test_hub_cpu_gate_budget.py
++++ b/tests/hermes_cli/test_hub_cpu_gate_budget.py
+@@ -1,7 +1,7 @@
+ """Hub CPU gate operating budget and configuration surface (review F4, F8).
+ 
+-The lock-free advisory refuses every hub claim when the reporter's latest sample is older than 15 s (fail-closed,
+-intended): so a healthy sync loop must refresh it well inside that age even in its slowest round, a Board outage
++The lock-free advisory refuses every hub claim when the sampler's latest sample is older than 15 s (fail-closed,
++intended): so the advisory sampler must refresh it well inside that age whatever the sync loop's round time, a Board outage
+ must not starve it, and the root key must be a known, documented, off-by-default configuration key.
+ """
+ import time
+@@ -9,32 +9,34 @@ import time
+ from hermes_cli import kanban_admission as ka
+ from hermes_cli import kanban_sync_client as ksc
+ from hermes_cli import machine_cpu_metrics as cm
++from hermes_cli import machine_cpu_sampler as cs
+ from hermes_cli import machine_metrics as mm
+ 
+ 
+-def test_slowest_reporter_round_refreshes_the_advisory_inside_its_freshness_window():
+-    # Cadence + the longest valid sample + the hard POST budget: the next record lands before the 15 s limit.
+-    slowest_s = mm.REPORT_EVERY_S + cm.MAX_WINDOW_MS / 1000 + ksc.CPU_REPORT_BUDGET_S
++def test_slowest_sampler_round_refreshes_the_advisory_inside_its_freshness_window():
++    # The sampler's own cadence + the longest valid sample: the next record lands before the 15 s limit,
++    # whatever the sync loop's round time (the sampler runs on its own thread).
++    slowest_s = cs.sample_every_s() + cm.MAX_WINDOW_MS / 1000
+     assert slowest_s < ka.ADVISORY_MAX_AGE_MS / 1000, slowest_s
++    # A report attaches a sample at most REPORT_MAX_AGE_S old; +2 s POST budget stays inside the Board's 15 s.
++    assert cs.REPORT_MAX_AGE_S + ksc.CPU_REPORT_BUDGET_S < ka.ADVISORY_MAX_AGE_MS / 1000
+ 
+ 
+-def test_advisory_is_recorded_before_the_send_so_a_board_outage_does_not_starve_local_claims(tmp_path, monkeypatch):
++def test_advisory_is_recorded_without_any_send_so_a_board_outage_does_not_starve_local_claims(tmp_path, monkeypatch):
+     import hermes_constants
+     monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: tmp_path)
+     end = int(time.time() * 1000)
++    triple = {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": end}
++    sampler = cs.AdvisorySampler(limit_fn=lambda: (cm.ON, 50.0), sample_fn=lambda: dict(triple))
++    assert sampler.run_once() == triple  # the sampler thread's round: no Board call at all
++    assert mm.read_hub_cpu_sample(tmp_path) == triple
+ 
+     def send(_sample):
+         raise TimeoutError("Board unreachable")
+-    now = [100.0]
+     reporter = mm.Reporter(send, collect_fn=lambda: {"cpus": 4}, cpu_limit_fn=lambda: (cm.ON, 50.0),
+-                           clock=lambda: now[0], cpu_begin_fn=lambda **kw: (now[0], None),
+-                           cpu_finish_fn=lambda *a, **kw: {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000,
+-                                                          "cpu_busy_sample_end_ms": end})
+-    assert reporter.report_due() is False  # begin never sends
+-    now[0] += 1
++                           cpu_take_fn=sampler.take)
+     assert reporter.report_due() is False  # the send failed and nothing raised into the sync loop
+-    assert mm.read_hub_cpu_sample(tmp_path) == {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000,
+-                                               "cpu_busy_sample_end_ms": end}
++    assert mm.read_hub_cpu_sample(tmp_path) == triple
+ 
+ 
+ def test_root_cpu_gate_key_is_known_documented_and_off_by_default():
+diff --git a/tests/hermes_cli/test_kanban_hub_cpu_alert.py b/tests/hermes_cli/test_kanban_hub_cpu_alert.py
+new file mode 100644
+index 0000000000..b5968e6a1f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_cpu_alert.py
+@@ -0,0 +1,148 @@
++"""The dispatcher opens one Kanban card per stale-hub-CPU-advisory incident (2026-11-12: zero claims, log line only)."""
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_hub_cpu_alert as alert
++from hermes_cli import machine_cpu_metrics as cpu
++from hermes_cli import machine_metrics as mm
++
++
++@pytest.fixture
++def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    import hermes_constants
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: home)
++    monkeypatch.setattr(cpu, "root_limit", lambda *a, **k: (cpu.ON, 50.0))
++    kb.init_db()
++    return home
++
++
++class World:
++    def __init__(self, home: Path):
++        self.home, self.mono, self.wall = home, 1000.0, time.time()
++        self.state = alert._Incident()
++
++    def sample(self, age_s: float) -> None:
++        mm.record_hub_cpu_sample({"cpu_busy_pct": 10.0, "cpu_busy_window_ms": 1000,
++                                  "cpu_busy_sample_end_ms": int((self.wall - age_s) * 1000)}, self.home)
++
++    def tick(self, advance: float = 0.0):
++        self.mono += advance
++        self.wall += advance
++        return alert.check(mono=lambda: self.mono, wall=lambda: self.wall, state=self.state)
++
++
++def _cards():
++    with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
++        return conn.execute("SELECT id, status, title, body FROM tasks WHERE idempotency_key = ?",
++                            (alert.KEY,)).fetchall()
++
++
++def _comments(tid):
++    with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
++        return [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (tid,))]
++
++
++def test_stale_for_sixty_seconds_of_observation_opens_exactly_one_card(home):
++    w = World(home)
++    w.sample(age_s=300)  # the old gateway's sample: stale from the first tick on
++    assert w.tick() is None  # first observation starts the clock; a fresh process never files for its downtime
++    assert w.tick(alert.STALE_FOR_S - 1) is None and _cards() == []
++    tid = w.tick(1)
++    assert tid is not None
++    (cid, status, title, body), = _cards()
++    assert cid == tid and status not in ("done", "archived") and "hub_cpu_unknown" in title
++    assert "s old" in body and "60 s of dispatcher observation" in body
++    for _ in range(5):  # the same incident never files again
++        assert w.tick(30) is None
++    assert len(_cards()) == 1
++
++
++def test_missing_advisory_file_counts_as_stale(home):
++    w = World(home)
++    w.tick()
++    tid = w.tick(alert.STALE_FOR_S)
++    assert tid and "missing or unreadable" in _cards()[0][3]
++
++
++def test_a_fresh_sample_ends_the_incident_and_resets_the_clock(home):
++    w = World(home)
++    w.sample(age_s=300)
++    w.tick()
++    w.tick(alert.STALE_FOR_S - 5)
++    w.sample(age_s=1)  # the sampler recovered before the threshold
++    assert w.tick(1) is None and w.state.stale_since is None
++    w.sample(age_s=300)
++    assert w.tick(1) is None and w.tick(alert.STALE_FOR_S - 1) is None  # a new incident needs its own 60 s
++    assert _cards() == []
++
++
++def test_fresh_within_fifteen_seconds_never_files(home):
++    w = World(home)
++    for _ in range(20):
++        w.mono += 10
++        w.wall += 10
++        w.sample(age_s=14)
++        assert w.tick() is None
++    assert _cards() == []
++
++
++@pytest.mark.parametrize("gate", [(cpu.OFF, None), (cpu.UNKNOWN, None)])
++def test_gate_not_on_never_files(home, monkeypatch, gate):
++    monkeypatch.setattr(cpu, "root_limit", lambda *a, **k: gate)
++    w = World(home)
++    w.tick()
++    assert w.tick(alert.STALE_FOR_S * 10) is None and _cards() == []
++
++
++def test_next_incident_comments_on_the_open_card_or_opens_a_new_one_once_it_is_done(home):
++    w = World(home)
++    w.tick()
++    first = w.tick(alert.STALE_FOR_S)
++    w.sample(age_s=0)
++    w.tick(1)  # recovered
++    w.sample(age_s=300)
++    w.tick(1)
++    assert w.tick(alert.STALE_FOR_S) == first  # still open: same card
++    assert len(_cards()) == 1
++    with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (first,))
++    w.sample(age_s=0)
++    w.tick(1)  # recovered
++    assert w.tick(16) is None  # stale again: the clock starts
++    second = w.tick(alert.STALE_FOR_S)
++    assert second and second != first
++    ids = {row[0]: row[1] for row in _cards()}
++    assert ids[first] == "done" and ids[second] != "done"
++    w.sample(age_s=0)
++    w.tick(1)
++    w.tick(16)
++    assert w.tick(alert.STALE_FOR_S) == second  # newest wins: later incidents land on the open card
++
++
++def test_comment_on_a_reopened_incident_is_rate_limited_hourly(home):
++    with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
++        tid = alert._report(conn, "first")
++        assert alert._report(conn, "second") == tid
++        assert alert._report(conn, "third") == tid
++    assert _comments(tid) == ["Again: second"]
++
++
++def test_check_never_raises(home, monkeypatch):
++    def boom(*a, **k):
++        raise RuntimeError("controlled")
++    monkeypatch.setattr(cpu, "root_limit", boom)
++    assert alert.check() is None
++    monkeypatch.setattr(cpu, "root_limit", lambda *a, **k: (cpu.ON, 50.0))
++    w = World(home)
++    w.tick()
++    assert alert.check(mono=lambda: w.mono + 999, wall=lambda: w.wall, state=w.state,
++                       file_fn=lambda d: boom()) is None
+diff --git a/tests/hermes_cli/test_kanban_sync_slow_round_cpu.py b/tests/hermes_cli/test_kanban_sync_slow_round_cpu.py
+new file mode 100644
+index 0000000000..0bf949dace
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_slow_round_cpu.py
+@@ -0,0 +1,90 @@
++"""Regression (2026-11-12, hermes-hub): a sync round longer than the CPU window must not starve the advisory.
++
++The split sampler took snapshot A after one sync round and B after the next, then validated the 1-2 s window. A hub
++round takes 3-20 s, so every sample was dropped, ``cache/hub-cpu-sample.json`` aged past 15 s and every hub claim
++deferred ``hub_cpu_unknown`` with all slots free. This drives the real ``_run_forever`` loop, the real ``Reporter``
++and the real ``machine_cpu_metrics.sample`` window check over real ``/proc/stat``, with the window scaled down
++(1 s -> 0.2 s, 1000-2000 ms -> 200-400 ms) so that each sync round outlasts the longest valid window.
++
++Each round waits (bounded) for the advisory to be written twice while it runs. With measurement tied to the loop
++nothing is written during a round, the rounds time out and the assertions fail.
++"""
++import sys
++import threading
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_admission as ka
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import machine_cpu_metrics as cpu
++from hermes_cli import machine_metrics as mm
++
++pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc/stat")
++
++ROUNDS = 2
++RECORDS_PER_ROUND = 2
++
++
++def test_slow_sync_rounds_keep_the_hub_cpu_advisory_fresh(tmp_path, monkeypatch):
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: tmp_path)
++    monkeypatch.setattr(cpu, "root_limit", lambda *a, **k: (cpu.ON, 100.0))
++    monkeypatch.setattr(cpu, "WINDOW_S", 0.2)
++    monkeypatch.setattr(cpu, "MIN_WINDOW_MS", 200)
++    monkeypatch.setattr(cpu, "MAX_WINDOW_MS", 400)
++
++    records, recorded, sent = [], threading.Condition(), []
++    real_record = mm.record_hub_cpu_sample
++
++    def record(sample, root=None):
++        real_record(sample, root)
++        with recorded:
++            records.append(time.monotonic())
++            recorded.notify_all()
++    monkeypatch.setattr(mm, "record_hub_cpu_sample", record)
++
++    rounds, advisories, waits = [], [], []
++
++    def slow_round(hub, *, boards):
++        t0 = time.monotonic()
++        with recorded:
++            want = len(records) + RECORDS_PER_ROUND
++            recorded.wait_for(lambda: len(records) >= want, timeout=6.0)
++        rounds.append((t0, time.monotonic()))
++        advisories.append(ka.hub_cpu_advisory())  # what a claim would read right now
++        return []
++
++    ident = SimpleNamespace(gateway="test", url="https://example.invalid")
++    monkeypatch.setattr(client, "load_identity", lambda: ident)
++    monkeypatch.setattr(client, "_schema_ahead_boards", lambda b: [])
++    monkeypatch.setattr(client, "board_paths", lambda: [("a", Path("a.db"))])
++    monkeypatch.setattr(client, "Hub", lambda i: SimpleNamespace(report_metrics=sent.append))
++    monkeypatch.setattr(client, "HubLeaseClient", lambda h: None)
++    monkeypatch.setattr(client.sync, "set_lease_client", lambda h: None)
++    monkeypatch.setattr(client, "deferred_repairs_due", lambda *a: [])
++    monkeypatch.setattr(client, "next_deferred_repair", lambda *a: None)
++    monkeypatch.setattr(client, "outbox_pending", lambda *a: False)
++    monkeypatch.setattr(client, "reconcile_links", lambda *a, **kw: None)
++    monkeypatch.setattr(client, "sync_all_once", slow_round)
++    monkeypatch.setattr(client, "FeedWatcher", lambda *a, **kw: SimpleNamespace(run=lambda: None))
++    monkeypatch.setattr(client, "wait_for_work", lambda wake, paths, remaining, keep_running:
++                        waits.append(remaining) or "period")
++    state = SimpleNamespace(clear=lambda: None, record_down=lambda msg: None)
++
++    client._run_forever(lambda: len(rounds) < ROUNDS, 30.0, state)
++    # The loop owns the sampler's lifetime: once it returns, the advisory is no longer refreshed (fail-closed).
++    assert not [t for t in threading.enumerate() if t.name == "hub-cpu-advisory-sampler"]
++
++    assert len(rounds) == ROUNDS
++    assert all(t1 - t0 > cpu.MAX_WINDOW_MS / 1000 for t0, t1 in rounds), rounds  # each round outlasts the window
++    assert len(records) >= ROUNDS * RECORDS_PER_ROUND, "advisory not written while the sync round ran"
++    for t0, t1 in rounds:  # written during each round, not only between rounds
++        assert any(t0 <= at <= t1 for at in records), (t0, t1, records)
++    assert "hub_cpu_unknown" not in advisories, advisories  # fresh: hub claims are not deferred as unknown
++    sample = mm.read_hub_cpu_sample(tmp_path)
++    assert sample is not None and 200 <= sample["cpu_busy_window_ms"] <= 400
++    assert any(cpu.FIELDS[0] in s for s in sent)  # the Board report carries a measured triple too
++    assert waits and all(w > 20.0 for w in waits), waits  # the sampler adds no loop wake (poll period 30 s)
+diff --git a/tests/hermes_cli/test_kanban_sync_split_cpu_loop.py b/tests/hermes_cli/test_kanban_sync_split_cpu_loop.py
+deleted file mode 100644
+index 02362c682a..0000000000
+--- a/tests/hermes_cli/test_kanban_sync_split_cpu_loop.py
++++ /dev/null
+@@ -1,57 +0,0 @@
+-"""Exercise the real loop: a CPU wake is not a poll or board-service request."""
+-from types import SimpleNamespace
+-from pathlib import Path
+-import pytest
+-from hermes_cli import kanban_sync_client as client
+-from hermes_cli import machine_metrics as mm
+-from hermes_cli import machine_cpu_metrics as cpu
+-
+-@pytest.mark.parametrize('period,links_every,expected_service,expected_links', [
+-    (30.0, 60.0, [1, 0], [100.0]),
+-    (1.0, 0.5, [1, 1], [100.0, 101.0]),
+-    (30.0, 0.5, [1, 0], [100.0, 101.0]),
+-])
+-def test_real_loop_clamps_only_pending_and_preserves_poll_and_links(monkeypatch, period, links_every,
+-                                                                    expected_service, expected_links):
+-    now, waits, services, links, sent = [100.0], [], [], [], []
+-    ident = SimpleNamespace(gateway='test', url='https://example.invalid')
+-    monkeypatch.setattr(client, 'load_identity', lambda: ident)
+-    monkeypatch.setattr(client, '_schema_ahead_boards', lambda b: [])
+-    monkeypatch.setattr(client, 'board_paths', lambda: [('a', Path('a.db'))])
+-    monkeypatch.setattr(client, 'Hub', lambda i: SimpleNamespace(report_metrics=sent.append))
+-    monkeypatch.setattr(client, 'HubLeaseClient', lambda h: None)
+-    monkeypatch.setattr(client.sync, 'set_lease_client', lambda h: None)
+-    monkeypatch.setattr(client.time, 'monotonic', lambda: now[0])
+-    monkeypatch.setattr(client, 'deferred_repairs_due', lambda *a: [])
+-    monkeypatch.setattr(client, 'next_deferred_repair', lambda *a: None)
+-    monkeypatch.setattr(client, 'outbox_pending', lambda *a: False)
+-    monkeypatch.setattr(client, 'LINKS_EVERY_S', links_every)
+-    monkeypatch.setattr(client, 'reconcile_links', lambda *a, **kw: links.append(now[0]))
+-    monkeypatch.setattr(client, 'sync_all_once', lambda h, *, boards: services.append(len(boards)) or [])
+-    class NoThread:
+-        def __init__(self, **kw):
+-            pass
+-        def start(self):
+-            pass
+-        def is_alive(self):
+-            return True
+-    monkeypatch.setattr(client.threading, 'Thread', NoThread)
+-    original = mm.Reporter
+-    rep = original(sent.append, clock=lambda: now[0], collect_fn=lambda: {'cpus': 4},
+-                   cpu_limit_fn=lambda: (cpu.ON, 50.0),
+-                   cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
+-                   cpu_finish_fn=lambda *a, **kw: dict(cpu_busy_pct=10, cpu_busy_window_ms=1000,
+-                                                      cpu_busy_sample_end_ms=1700000000000))
+-    monkeypatch.setattr(mm, 'Reporter', lambda send: rep)
+-    monkeypatch.setattr(mm, 'record_hub_cpu_sample', lambda s: None)
+-    def wait(wake, paths, remaining, keep_running):
+-        waits.append(remaining)
+-        now[0] += remaining
+-        return 'period'
+-    monkeypatch.setattr(client, 'wait_for_work', wait)
+-    state = SimpleNamespace(clear=lambda: None, record_down=lambda msg: None)
+-    client._run_forever(lambda: len(waits) < 2, period, state)
+-    assert waits == [1.0, period if period == 1 else period-1]
+-    assert services == expected_service
+-    assert links == expected_links  # early links work is possible and belongs inside analyzer X
+-    assert len(sent) == 1 and rep.pending_wake_in() is None
+diff --git a/tests/hermes_cli/test_kanban_sync_timing.py b/tests/hermes_cli/test_kanban_sync_timing.py
+index d999d6f469..719981ca0f 100644
+--- a/tests/hermes_cli/test_kanban_sync_timing.py
++++ b/tests/hermes_cli/test_kanban_sync_timing.py
+@@ -499,12 +499,11 @@ def _reporter_case(h: Harness, monkeypatch, send):
+         h.clock.advance_ms(5)
+         return {"cpus": 4}
+ 
+-    def sample(*args, **kwargs):
+-        h.clock.advance_ms(2)  # only snapshot B work, never the observation window
++    def take(_limit):
++        h.clock.advance_ms(2)  # only the hand-off from the sampler thread, never an observation window
+         return {"cpu_busy_pct": 41.0, "cpu_busy_window_ms": 1005, "cpu_busy_sample_end_ms": 1_800_000_001_000}
+     return mm.Reporter(send, collect_fn=collect, clock=lambda: h.clock.ns / 1e9,
+-                       cpu_limit_fn=lambda: (cpu.ON, 50.0),
+-                       cpu_begin_fn=lambda **kw: (h.clock.ns / 1e9, None), cpu_finish_fn=sample)
++                       cpu_limit_fn=lambda: (cpu.ON, 50.0), cpu_take_fn=take)
+ 
+ 
+ @pytest.mark.parametrize("failure,outcome,status", [
+@@ -526,18 +525,16 @@ def test_report_record_spans_collect_sample_and_the_whole_send(tmp_path, monkeyp
+             raise failure
+         return {}
+     reporter = _reporter_case(h, monkeypatch, send)
+-    assert h.diag.report(reporter.report_due) is False  # begin has limit span but sends nothing
+-    assert h.diag.report(reporter.report_due) is False  # not due has no component span
++    assert h.diag.report(reporter.report_due) is (failure is None)  # the sampler measured already: one call
+     h.clock.advance_ms(1000)
+-    assert h.diag.report(reporter.report_due) is (failure is None)
+     assert h.diag.report(reporter.report_due) is False  # not due: a quiet report is recorded too
+     h.until[0] = None
+     h.diag.boundary()
+     reps = [r for r in h.records() if r["ev"] == "rep"]
+-    assert len(reps) == 4
+-    begin, early, rep, quiet = reps
+-    assert begin['res'] == 'not_sent' and 'limit_t0' in begin and 'send_t0' not in begin
+-    assert early['res'] == 'not_sent' and not any(f'{span}_t0' in early for span in timing.SPANS)
++    assert len(reps) == 2
++    rep, quiet = reps
++    assert 'limit_t0' in rep
++    assert not any(f'{span}_t0' in quiet for span in timing.SPANS)
+     assert rep["res"] == ("sent" if failure is None else "not_sent")
+     assert rep["collect_t1"] - rep["collect_t0"] == 5 * MS
+     assert rep["cpu_t1"] - rep["cpu_t0"] == 2 * MS
+@@ -554,8 +551,6 @@ def test_reporter_outside_a_report_scope_is_unchanged(tmp_path, monkeypatch):
+     h = Harness(tmp_path)
+     h.arm()
+     reporter = _reporter_case(h, monkeypatch, lambda s: {})
+-    assert reporter.report_due() is False
+-    h.clock.advance_ms(1000)
+     assert reporter.report_due() is True  # no report() scope: spans are no-ops
+     h.until[0] = None
+     h.diag.boundary()
+diff --git a/tests/hermes_cli/test_kanban_sync_timing_loop.py b/tests/hermes_cli/test_kanban_sync_timing_loop.py
+index 45131d0618..404f441e33 100644
+--- a/tests/hermes_cli/test_kanban_sync_timing_loop.py
++++ b/tests/hermes_cli/test_kanban_sync_timing_loop.py
+@@ -148,14 +148,15 @@ def test_real_loop_records_full_report_cost_and_matches_a_change_to_its_boards_s
+     change = chg[0]
+     rep = next(r for r in recs if r["ev"] == "rep" and "send_t0" in r)
+     assert rep["send_t0"] <= change["t"] <= rep["send_t1"], "the frame arrived while the POST was in flight"
+-    begin = next(r for r in recs if r['ev'] == 'rep' and 'limit_t0' in r and 'send_t0' not in r)
+-    assert begin['res'] == 'not_sent' and begin['t1'] <= rep['t0']
+-    assert rep['cpu_t0'] - begin['t0'] >= 1_000_000_000
+-    assert 1000 <= rep['cpu_win_ms'] <= 2000  # observation window, not blocked loop time
+-    assert rep['cpu_t1'] >= rep['cpu_t0']
++    assert 'limit_t0' in rep  # the gated report reads the root limit
++    for r in recs:  # the CPU hand-off never holds the loop: the sampler thread measured the window already
++        if r['ev'] == 'rep' and 'cpu_t0' in r:
++            assert 0 <= r['cpu_t1'] - r['cpu_t0'] < 100_000_000
++        if r['ev'] == 'rep' and 'cpu_win_ms' in r:
++            assert 1000 <= r['cpu_win_ms'] <= 2000  # observation window, not blocked loop time
+     assert rep["send_t1"] - rep["send_t0"] >= int(POST_DELAY_S * 1e9)
+-    assert rep["send_out"] == "ok" and rep["res"] == "sent" and rep["cpu_win_ms"] >= 1000
+-    assert rep["t1"] - rep["t0"] >= (rep["cpu_t1"] - rep["cpu_t0"]) + (rep["send_t1"] - rep["send_t0"])
++    assert rep["send_out"] == "ok" and rep["res"] == "sent"
++    assert rep["t1"] - rep["t0"] >= rep["send_t1"] - rep["send_t0"]
+     svc = next(r for r in recs if r["ev"] == "svc" and r.get("c_first") == change["seq"])
+     assert svc["b"] == change["b"] and svc["out"] == "ok" and svc["loop"] is True
+     assert svc["t0"] >= rep["t1"], "the loop serviced the board only after the report returned"
+diff --git a/tests/hermes_cli/test_machine_cpu_sampler.py b/tests/hermes_cli/test_machine_cpu_sampler.py
+new file mode 100644
+index 0000000000..70f7783b76
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_cpu_sampler.py
+@@ -0,0 +1,122 @@
++"""The hub CPU advisory sampler: its own cadence, at-most-once report hand-off, and fail-closed lifetime."""
++import logging
++import threading
++
++import pytest
++
++from hermes_cli import machine_cpu_metrics as cpu
++from hermes_cli import machine_cpu_sampler as cs
++from hermes_cli import machine_metrics as mm
++
++CPU = dict(cpu_busy_pct=12.5, cpu_busy_window_ms=1000, cpu_busy_sample_end_ms=1_700_000_000_000)
++
++
++def _sampler(now, gate=None, samples=None, recorded=None):
++    gate = gate if gate is not None else [(cpu.ON, 50.0)]
++    samples = samples if samples is not None else []
++    recorded = recorded if recorded is not None else []
++
++    def sample():
++        return samples.pop(0) if samples else dict(CPU)
++    return cs.AdvisorySampler(limit_fn=lambda: gate[0], sample_fn=sample, record_fn=recorded.append,
++                              clock=lambda: now[0])
++
++
++def test_each_valid_sample_is_recorded_and_reported_at_most_once():
++    now, recorded = [100.0], []
++    s = _sampler(now, recorded=recorded)
++    assert s.run_once() == CPU and recorded == [CPU] and s.records == 1
++    assert s.take(50.0) == CPU
++    assert s.take(50.0) is None  # never replayed into a second report
++    second = dict(CPU, cpu_busy_sample_end_ms=CPU["cpu_busy_sample_end_ms"] + 5000)
++    s.sample_fn = lambda: dict(second)
++    s.run_once()
++    assert s.take(50.0) == second
++
++
++def test_take_refuses_a_stale_sample_or_one_measured_under_another_limit():
++    now = [100.0]
++    s = _sampler(now)
++    s.run_once()
++    assert s.take(60.0) is None  # the limit changed since the measurement
++    now[0] += cs.REPORT_MAX_AGE_S + 0.001
++    assert s.take(50.0) is None
++    now[0] = 100.0 + cs.REPORT_MAX_AGE_S
++    assert s.take(50.0) == CPU  # the age bound is inclusive
++
++
++@pytest.mark.parametrize("bad", [None, {}, {"cpu_busy_pct": 1.0, "cpu_busy_window_ms": 1000}])
++def test_a_dropped_sample_is_counted_logged_and_never_recorded(caplog, bad):
++    now, recorded = [100.0], []
++    s = _sampler(now, samples=[bad, bad], recorded=recorded)
++    with caplog.at_level(logging.INFO, logger=cs.__name__):
++        assert s.run_once() is None
++        assert s.run_once() is None
++    assert recorded == [] and s.drops == 2 and s.consecutive_drops == 2
++    assert s.take(50.0) is None
++    assert any("cpu_sample_drops=2 (consecutive=2" in m for m in caplog.messages)
++    assert cs.status()["consecutive_drops"] == 2
++    s.run_once()  # a valid sample ends the run of drops
++    assert s.consecutive_drops == 0 and recorded == [CPU] and cs.status()["consecutive_drops"] == 0
++
++
++@pytest.mark.parametrize("gate", [(cpu.OFF, None), (cpu.UNKNOWN, None)])
++def test_gate_not_on_samples_nothing_and_forgets_the_last_sample(gate):
++    now, recorded, calls = [100.0], [], []
++    g = [(cpu.ON, 50.0)]
++    s = _sampler(now, gate=g, recorded=recorded)
++    s.run_once()
++    g[0] = gate
++    s.sample_fn = lambda: calls.append(1)
++    assert s.run_once() is None and calls == [] and s.drops == 0
++    assert s.take(50.0) is None
++
++
++def test_record_failure_still_hands_the_sample_to_the_report():
++    now = [100.0]
++    s = _sampler(now)
++
++    def fail(_sample):
++        raise OSError("read-only cache")
++    s.record_fn = fail
++    assert s.run_once() == CPU and s.take(50.0) == CPU
++
++
++def test_default_record_writes_the_advisory_file(tmp_path, monkeypatch):
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: tmp_path)
++    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), sample_fn=lambda: dict(CPU))
++    s.run_once()
++    assert mm.read_hub_cpu_sample(tmp_path) == CPU
++
++
++def test_thread_keeps_its_own_cadence_and_stops_on_close():
++    rounds = threading.Semaphore(0)
++    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), every_s=0.01,
++                           sample_fn=lambda: rounds.release() or dict(CPU), record_fn=lambda _s: None)
++    thread = s.start()
++    assert thread.daemon and thread.name == "hub-cpu-advisory-sampler"
++    for _ in range(3):  # several rounds without any caller driving it
++        assert rounds.acquire(timeout=5)
++    s.close()
++    assert not thread.is_alive()
++    idle = cs.AdvisorySampler(limit_fn=lambda: (cpu.OFF, None))  # mid-wait on the default 5 s cadence
++    t2 = idle.start()
++    idle.close()
++    assert not t2.is_alive()  # close wakes the wait at once
++
++
++def test_a_failing_round_does_not_end_the_thread():
++    rounds = threading.Semaphore(0)
++
++    def sample():
++        rounds.release()
++        raise RuntimeError("controlled")
++    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), every_s=0.01, sample_fn=sample)
++    s.start()
++    assert rounds.acquire(timeout=5) and rounds.acquire(timeout=5)
++    s.close()
++
++
++def test_default_cadence_is_five_windows():
++    assert cs.sample_every_s() == 5 * cpu.WINDOW_S == 5.0
+diff --git a/tests/hermes_cli/test_machine_cpu_split_primitives.py b/tests/hermes_cli/test_machine_cpu_split_primitives.py
+deleted file mode 100644
+index e692ea528e..0000000000
+--- a/tests/hermes_cli/test_machine_cpu_split_primitives.py
++++ /dev/null
+@@ -1,24 +0,0 @@
+-"""Nonblocking primitives preserve the locked sampler's arithmetic and window contract."""
+-import pytest
+-from hermes_cli import machine_cpu_metrics as cpu
+-
+-A = "cpu 10 20 30 40 10 5 5 0 999 999"
+-B = "cpu 20 40 40 80 20 10 10 10 999 999"
+-
+-@pytest.mark.parametrize("elapsed,valid", [(0.999, False), (1.0, True), (2.0, True), (2.001, False)])
+-def test_begin_finish_no_sleep_and_same_busy_math(elapsed, valid):
+-    now = [100.0]
+-    first = cpu.begin(read=lambda: A, clock=lambda: now[0], linux=True)
+-    assert now == [100.0]
+-    now[0] += elapsed
+-    result = cpu.finish(first, read=lambda: B, clock=lambda: now[0], wall=lambda: 1700000000.0)
+-    if valid:
+-        assert result == dict(cpu_busy_pct=cpu.busy_pct(cpu.parse_proc_stat(A), cpu.parse_proc_stat(B)),
+-                              cpu_busy_window_ms=round(elapsed*1000), cpu_busy_sample_end_ms=1700000000000)
+-    else:
+-        assert result is None
+-
+-@pytest.mark.parametrize("text", ["bad", "cpu 1 2 3", "cpu -1 2 3 4 5 6 7 8"])
+-def test_bad_first_snapshot_is_unknown(text):
+-    first = cpu.begin(read=lambda: text, clock=lambda: 0.0, linux=True)
+-    assert cpu.finish(first, read=lambda: B, clock=lambda: 1.0) is None
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 58611ef945..4b0d2bf49e 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -95,17 +95,15 @@ def cpu_reporter(send, *, limit=("on", 50.0), cpu=lambda: dict(CPU), calls=None,
+         calls.append("collect")
+         return {"cpus": 4, "drain_active": 0}
+ 
+-    def sample(*args, **kwargs):
++    def take(_limit):
+         calls.append("cpu")
+         return cpu()
+     return mm.Reporter(send, collect_fn=collect, clock=lambda: now[0], cpu_limit_fn=lambda: limit,
+-                       cpu_begin_fn=lambda **kw: (now[0], None), cpu_finish_fn=sample)
++                       cpu_take_fn=take)
+ 
+ 
+ def finish_report(reporter, now):
+-    assert reporter.report_due() is False
+-    now[0] += 1
+-    return reporter.report_due()
++    return reporter.report_due()  # the sampler thread measured already: one call reports
+ 
+ 
+ def test_cpu_triple_only_when_root_gate_configured_and_sampled_last():
+diff --git a/tests/hermes_cli/test_machine_metrics_drop_quality.py b/tests/hermes_cli/test_machine_metrics_drop_quality.py
+deleted file mode 100644
+index e8fddc64b1..0000000000
+--- a/tests/hermes_cli/test_machine_metrics_drop_quality.py
++++ /dev/null
+@@ -1,95 +0,0 @@
+-"""A missing CPU triple is observable quality data, never an admission sample."""
+-import logging
+-
+-import pytest
+-
+-from hermes_cli import machine_cpu_metrics as cpu
+-from hermes_cli import machine_metrics as mm
+-
+-
+-def test_drops_report_cumulative_quality_without_changing_wire_sample(caplog):
+-    now, sent = [100.0], []
+-    rep = mm.Reporter(sent.append, clock=lambda: now[0],
+-                      collect_fn=lambda: {'cpus': 4},
+-                      cpu_limit_fn=lambda: (cpu.ON, 50.0),
+-                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
+-                      cpu_finish_fn=lambda *a, **kw: None)
+-    with caplog.at_level(logging.INFO, logger=mm.__name__):
+-        for start in (100.0, 110.0):
+-            now[0] = start
+-            assert rep.report_due() is False
+-            now[0] += 3.0
+-            assert rep.report_due() is True
+-            assert rep.pending_wake_in() is None
+-            assert rep.report_due() is False
+-    assert sent == [{'cpus': 4}, {'cpus': 4}]
+-    assert [r.getMessage() for r in caplog.records if r.name == mm.__name__] == [
+-        'machine metrics admission quality: cpu_sample_drops=1',
+-        'machine metrics admission quality: cpu_sample_drops=2',
+-    ]
+-    assert rep.cpu_sample_drops == 2
+-
+-
+-def test_drop_quality_survives_send_failure(caplog):
+-    now = [100.0]
+-    def fail_send(sample):
+-        raise OSError('controlled transport failure')
+-    rep = mm.Reporter(fail_send, clock=lambda: now[0], collect_fn=dict,
+-                      cpu_limit_fn=lambda: (cpu.ON, 50.0),
+-                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
+-                      cpu_finish_fn=lambda *a, **kw: None)
+-    with caplog.at_level(logging.INFO, logger=mm.__name__):
+-        assert rep.report_due() is False
+-        now[0] += 3
+-        assert rep.report_due() is False
+-    assert rep.pending_wake_in() is None
+-    assert 'machine metrics admission quality: cpu_sample_drops=1' in caplog.messages
+-
+-
+-@pytest.mark.parametrize('failure_site', ['limit', 'collect', 'finish'])
+-def test_exceptions_before_cpu_decision_are_not_counted_as_drops(caplog, failure_site):
+-    now, sent, reached = [100.0], [], []
+-
+-    def controlled(site, result):
+-        reached.append(site)
+-        if now[0] > 100.0 and failure_site == site:
+-            raise OSError('controlled excluded exception')
+-        return result
+-
+-    rep = mm.Reporter(sent.append, clock=lambda: now[0],
+-                      collect_fn=lambda: controlled('collect', {'cpus': 4}),
+-                      cpu_limit_fn=lambda: controlled('limit', (cpu.ON, 50.0)),
+-                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
+-                      cpu_finish_fn=lambda *a, **kw: controlled('finish', None))
+-    with caplog.at_level(logging.INFO, logger=mm.__name__):
+-        assert rep.report_due() is False
+-        assert rep.pending_wake_in() == cpu.WINDOW_S
+-        reached.clear()
+-        now[0] += cpu.WINDOW_S
+-        assert rep.report_due() is False
+-    assert reached[-1] == failure_site
+-    assert rep.pending_wake_in() is None
+-    assert rep.cpu_sample_drops == 0
+-    assert sent == []
+-    assert not [r for r in caplog.records if r.name == mm.__name__]
+-
+-
+-def test_successful_sample_and_off_report_do_not_log_drops(caplog, monkeypatch):
+-    now, sent = [100.0], []
+-    gate: list[tuple[str, float | None]] = [(cpu.ON, 50.0)]
+-    triple = dict(cpu_busy_pct=12.5, cpu_busy_window_ms=1000, cpu_busy_sample_end_ms=1700000000000)
+-    monkeypatch.setattr(mm, 'record_hub_cpu_sample', lambda sample: None)
+-    rep = mm.Reporter(sent.append, clock=lambda: now[0], collect_fn=lambda: {'cpus': 4},
+-                      cpu_limit_fn=lambda: gate[0],
+-                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
+-                      cpu_finish_fn=lambda *a, **kw: dict(triple))
+-    with caplog.at_level(logging.INFO, logger=mm.__name__):
+-        assert rep.report_due() is False
+-        now[0] += 1
+-        assert rep.report_due() is True
+-        now[0] = 110
+-        gate[0] = (cpu.OFF, None)
+-        assert rep.report_due() is True
+-    assert sent == [dict(cpus=4, **triple), {'cpus': 4}]
+-    assert rep.cpu_sample_drops == 0
+-    assert not [r for r in caplog.records if r.name == mm.__name__]
+diff --git a/tests/hermes_cli/test_machine_metrics_split_cpu.py b/tests/hermes_cli/test_machine_metrics_split_cpu.py
+deleted file mode 100644
+index fcda54e3ea..0000000000
+--- a/tests/hermes_cli/test_machine_metrics_split_cpu.py
++++ /dev/null
+@@ -1,47 +0,0 @@
+-"""Split-phase CPU reporting, tracer slice 1: the begin call on a gated host.
+-
+-On a gated (root limit ON) host the reporter's due call must not block for the ~1 s CPU window on the sync-loop
+-thread: it takes the first same-thread snapshot, advances ``next_at`` once, sends nothing and returns False (the
+-loop's "not sent" result).  The legacy synchronous ``cpu_sample_fn`` is the blocking primitive here: it advances the
+-fake clock by the window, so any call to it on the begin call is the failure this slice forbids.  A gate that is
+-OFF keeps the original single-phase report.
+-"""
+-from hermes_cli import machine_cpu_metrics as cpu
+-from hermes_cli import machine_metrics as mm
+-
+-CPU = {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1_700_000_000_000}
+-
+-
+-def _reporter(limit, now, sent, blocked):
+-    def sample(*args, **kwargs):  # a blocking finish stand-in must never run at begin
+-        blocked.append(now[0])
+-        now[0] += 1.0
+-        return dict(CPU)
+-    return mm.Reporter(sent.append, collect_fn=lambda: {"cpus": 4}, clock=lambda: now[0],
+-                       cpu_limit_fn=lambda: limit, cpu_begin_fn=lambda **kw: (now[0], None),
+-                       cpu_finish_fn=sample)
+-
+-
+-def test_gated_begin_neither_blocks_nor_sends_and_leaves_one_pending_wake():
+-    now, sent, blocked = [1000.0], [], []
+-    reporter = _reporter((cpu.ON, 50.0), now, sent, blocked)
+-
+-    due = reporter.report_due()
+-
+-    assert blocked == [], "begin must not run the ~1 s blocking CPU sample on the loop thread"
+-    assert now[0] == 1000.0, "begin consumed loop time"
+-    assert sent == [], "begin must not send"
+-    assert due is False
+-    assert reporter.next_at == 1000.0 + mm.REPORT_EVERY_S  # the 10 s schedule advances at begin
+-    wake = reporter.pending_wake_in()  # the loop clamps its wait to this: positive, never a zero-wait spin
+-    assert wake is not None and 0.0 < wake <= cpu.MIN_WINDOW_MS / 1000.0
+-
+-
+-def test_off_gate_keeps_the_original_single_phase_report():
+-    now, sent, blocked = [1000.0], [], []
+-    reporter = _reporter((cpu.OFF, None), now, sent, blocked)
+-
+-    assert reporter.report_due() is True
+-
+-    assert sent == [{"cpus": 4}] and blocked == []  # one call, no CPU snapshot, no pending state
+-    assert reporter.next_at == 1000.0 + mm.REPORT_EVERY_S
+diff --git a/tests/hermes_cli/test_machine_metrics_split_finish.py b/tests/hermes_cli/test_machine_metrics_split_finish.py
+deleted file mode 100644
+index 8cdb5976d0..0000000000
+--- a/tests/hermes_cli/test_machine_metrics_split_finish.py
++++ /dev/null
+@@ -1,97 +0,0 @@
+-"""One pending CPU sample is consumed once, even when a finish fails or the gate changes."""
+-import pytest
+-from hermes_cli import machine_cpu_metrics as cpu
+-from hermes_cli import machine_metrics as mm
+-
+-CPU = dict(cpu_busy_pct=12.5, cpu_busy_window_ms=1000, cpu_busy_sample_end_ms=1700000000000)
+-
+-@pytest.fixture
+-def harness(monkeypatch):
+-    now, gate, sent, finishes = [100.0], [(cpu.ON, 50.0)], [], []
+-    monkeypatch.setattr(cpu, 'begin', lambda **kw: (now[0], (100, 50)))
+-    def finish(first, **kw):
+-        finishes.append(first)
+-        return dict(CPU) if 1 <= now[0]-first[0] <= 2 else None
+-    monkeypatch.setattr(cpu, 'finish', finish)
+-    monkeypatch.setattr(mm, 'record_hub_cpu_sample', lambda sample: None)
+-    rep = mm.Reporter(sent.append, clock=lambda: now[0], collect_fn=lambda: {'cpus': 4},
+-                      cpu_limit_fn=lambda: gate[0])
+-    return rep, now, gate, sent, finishes
+-
+-@pytest.mark.parametrize('elapsed', [1.0, 2.0, 2.001, 30.0])
+-def test_finish_once_schedule_unchanged_and_late_sample_dropped(harness, elapsed):
+-    rep, now, _gate, sent, finishes = harness
+-    assert rep.report_due() is False
+-    assert rep.next_at == 110
+-    now[0] += 0.5
+-    assert rep.report_due() is False and rep.pending_wake_in() == 0.5
+-    now[0] = 100 + elapsed
+-    assert rep.report_due() is True
+-    assert sent == [dict(cpus=4, **CPU) if elapsed <= 2 else {'cpus': 4}]
+-    assert len(finishes) == 1 and rep.pending_wake_in() is None
+-    assert rep.next_at == 110
+-    assert rep.cpu_sample_drops == (0 if elapsed <= 2 else 1)
+-    if elapsed < 10:
+-        assert rep.report_due() is False and len(sent) == 1
+-
+-@pytest.mark.parametrize('new_gate', [(cpu.OFF, None), (cpu.UNKNOWN, None), (cpu.ON, 60.0)])
+-def test_limit_rechecked_and_changed_snapshot_discarded(harness, new_gate):
+-    rep, now, gate, sent, finishes = harness
+-    rep.report_due()
+-    gate[0] = new_gate
+-    now[0] += 1
+-    assert rep.report_due() is True
+-    assert sent == [{'cpus': 4}] and finishes == []
+-    assert rep.pending_wake_in() is None and rep.cpu_sample_drops == 1
+-
+-@pytest.mark.parametrize('where', ['finish', 'limit', 'send'])
+-def test_finish_exception_never_leaves_due_pending(harness, monkeypatch, where):
+-    rep, now, _gate, _sent, _finishes = harness
+-    rep.report_due()
+-    def fail(*a, **kw):
+-        raise RuntimeError('controlled failure')
+-    if where == 'finish':
+-        monkeypatch.setattr(cpu, 'finish', fail)
+-    elif where == 'limit':
+-        rep.cpu_limit_fn = fail
+-    else:
+-        rep.send = fail
+-    now[0] += 1
+-    assert rep.report_due() is False
+-    assert rep.pending_wake_in() is None and rep.next_at == 110
+-
+-@pytest.mark.parametrize('status', [404, 405])
+-def test_unsupported_finish_uses_600s_retry(harness, status):
+-    rep, now, _gate, _sent, _finishes = harness
+-    class Unsupported(Exception):
+-        pass
+-    def fail(sample):
+-        exc = Unsupported()
+-        exc.status = status
+-        raise exc
+-    rep.send = fail
+-    rep.report_due()
+-    now[0] += 1
+-    assert rep.report_due() is False
+-    assert rep.next_at == 701 and rep.pending_wake_in() is None
+-
+-
+-def test_pending_wake_and_finish_use_same_window(harness, monkeypatch):
+-    rep, now, _gate, _sent, _finishes = harness
+-    monkeypatch.setattr(cpu, 'WINDOW_S', 0.5)
+-    assert rep.report_due() is False
+-    now[0] += 0.5
+-    assert rep.pending_wake_in() == 0
+-    assert rep.report_due() is True
+-    assert rep.pending_wake_in() is None
+-
+-
+-def test_slow_begin_cannot_return_a_due_pending_snapshot(harness):
+-    rep, now, _gate, sent, _finishes = harness
+-    def slow_begin(**kwargs):
+-        first = (now[0], (100, 50))
+-        now[0] += 1.25
+-        return first
+-    rep.cpu_begin_fn = slow_begin
+-    assert rep.report_due() is True
+-    assert rep.pending_wake_in() is None and len(sent) == 1
+-- 
+2.43.0
+

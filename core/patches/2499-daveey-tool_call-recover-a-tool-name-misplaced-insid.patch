@@ -1,0 +1,302 @@
+From 6757481db195824946b111be25f1c2a48ff224bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:25:28 +0000
+Subject: [PATCH] [daveey] tool_call: recover a tool name misplaced inside an
+ entry's arguments
+
+Coach signature "tool_call calls[<n>] requires a 'name'" (4 sessions, 11-10..11-11).
+Root cause: normalize_tool_call_entries only looked for the top-level entry "name".
+Models (Opus and Sonnet) put it elsewhere in two recoverable shapes, and dropped it
+in a third:
+
+- envelope nested under arguments: {"arguments": {"name": X, "arguments": {...}}}
+- name beside the tool's own params: {"arguments": {"request": ..., "name": X}}
+- a later batch entry with no name, meant to reuse calls[0]'s tool
+
+Fix: lift the name when unambiguous. A nested envelope lifts when X is a registered,
+connectors__ or bridge name (a bridge name then gets its own refusal). A name beside
+params lifts only when X is a registered tool whose served schema declares properties
+and none is called `name`; otherwise `name` may be a real argument and the entry stays
+an error. A genuinely nameless entry now gets an actionable error: the keys it carried,
+the names the batch does carry, that names are never inherited, the no-local-batch rule
+when siblings are local (the next refusal those batches hit), and that nothing ran.
+The message keeps the "calls[<n>] requires a 'name'" prefix.
+
+Proof:
+- RED: the 8 new behavior tests fail on the parent (8 failed, 8 passed).
+- GREEN: tests/tools/test_tool_call_entry_name.py + 11 other files that use
+  normalize/resolve/peel: 228 passed.
+- Mutants: 12/13 killed; the survivor (str() coercion of a non-str inner name) is
+  equivalent, the original guard is covered by {"name": 7} raising without it.
+- Replay over the hub's default and profile state.dbs (24,428 tool_call invocations):
+  7 nameless entries ever (the 4 coach sessions plus 2 others). 4 now recover (2
+  action_request beside `request` -- its schema has no `name` param; envelopes for
+  kanban_continue and run_in_user_terminal); 3 stay errors with the new message.
+  Named entries take the unchanged path.
+---
+ tests/tools/test_tool_call_entry_name.py | 137 +++++++++++++++++++++++
+ tools/tool_search_validation.py          |  86 +++++++++++++-
+ 2 files changed, 221 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_tool_call_entry_name.py
+
+diff --git a/tests/tools/test_tool_call_entry_name.py b/tests/tools/test_tool_call_entry_name.py
+new file mode 100644
+index 0000000000..9fff99eda9
+--- /dev/null
++++ b/tests/tools/test_tool_call_entry_name.py
+@@ -0,0 +1,137 @@
++"""``tool_call`` entries whose tool name is missing or misplaced.
++
++Shapes are the real ones from the coach's "tool_call calls[<n>] requires a 'name'" sessions
++(2026-11-10/11): the envelope nested under ``arguments``, the name written beside the tool's own
++params, and a later batch entry that dropped its name expecting to reuse the first entry's tool.
++"""
++
++import json
++
++import pytest
++
++from tools.registry import registry
++from tools.tool_search import resolve_underlying_call
++from tools.tool_search_validation import normalize_tool_call_entries
++
++_TOOLS = {
++    # action_request-shaped: no `name` parameter.
++    "fake_action_request": {"receipt": {"type": "object"}, "request": {"type": "object"}},
++    # tailnet_exec-shaped.
++    "fake_tailnet_exec": {"command": {"type": "string"}, "host": {"type": "string"}},
++    # A tool whose own parameter is called `name` (skill/profile style).
++    "fake_named_param": {"name": {"type": "string"}, "content": {"type": "string"}},
++    # A registered tool whose schema declares no properties: nothing proves `name` is not its arg.
++    "fake_no_props": None,
++}
++
++
++@pytest.fixture(autouse=True)
++def _fake_tools():
++    for tool, props in _TOOLS.items():
++        params = {"type": "object"} if props is None else {"type": "object", "properties": props}
++        registry.register(
++            name=tool, toolset="fake-entry-name", handler=lambda a, **kw: "{}",
++            schema={"name": tool, "description": "x", "parameters": params})
++    yield
++    for tool in _TOOLS:
++        registry.deregister(tool)
++
++
++def test_nested_envelope_is_unwrapped():
++    # 20261110_171433_c8a00a: the legacy single shape put inside one entry's arguments.
++    inner = {"command": "echo hi", "reason": "r", "wait_s": 900}
++    entries, err = normalize_tool_call_entries(
++        {"calls": [{"arguments": {"name": "fake_tailnet_exec", "arguments": inner}}]})
++    assert err is None
++    assert entries == [{"name": "fake_tailnet_exec", "arguments": inner}]
++
++
++def test_nested_envelope_with_string_arguments_and_no_arguments():
++    entries, err = normalize_tool_call_entries(
++        {"calls": [{"arguments": json.dumps({"name": "fake_tailnet_exec",
++                                             "arguments": json.dumps({"host": "mini"})})}]})
++    assert err is None and entries == [{"name": "fake_tailnet_exec", "arguments": {"host": "mini"}}]
++    entries, err = normalize_tool_call_entries({"calls": [{"arguments": {"name": "fake_tailnet_exec"}}]})
++    assert err is None and entries == [{"name": "fake_tailnet_exec", "arguments": {}}]
++
++
++def test_nested_connector_envelope_is_unwrapped():
++    entries, err = normalize_tool_call_entries(
++        {"calls": [{"arguments": {"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "x"}}}]})
++    assert err is None
++    assert entries == [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {"to": "x"}}]
++
++
++def test_name_beside_params_is_lifted_and_dispatches():
++    # 20261111_091916_d2d36a: {"arguments": {"request": ..., "name": "action_request"}}.
++    request = {"schemaVersion": 2, "kind": "approval"}
++    name, args, err = resolve_underlying_call(
++        {"calls": [{"arguments": {"request": request, "name": "fake_action_request"}}]})
++    assert err is None
++    assert (name, args) == ("fake_action_request", {"request": request})
++
++
++def test_name_beside_params_is_kept_when_the_tool_declares_name():
++    # `name` is that tool's own argument: lifting it would invent the tool choice.
++    entries, err = normalize_tool_call_entries(
++        {"calls": [{"arguments": {"name": "fake_named_param", "content": "x"}}]})
++    assert entries == []
++    assert "calls[0] requires a 'name'" in err
++
++
++@pytest.mark.parametrize("args", [
++    {"name": "not_a_registered_tool", "content": "x"},  # beside params, unknown tool
++    {"name": "fake_no_props", "content": "x"},  # beside params, schema declares nothing
++    {"name": "not_a_registered_tool", "arguments": {}},  # nested envelope, unknown tool
++    {"name": "connectors__gmail__SEND_EMAIL", "to": "x"},  # beside params, no local schema
++    {"name": "   ", "arguments": {}},
++    {"name": 7, "arguments": {}},
++    "not json {",
++    ["fake_tailnet_exec"],
++])
++def test_unrecoverable_shapes_stay_errors(args):
++    entries, err = normalize_tool_call_entries({"calls": [{"arguments": args}]})
++    assert entries == []
++    assert "calls[0] requires a 'name'" in err
++
++
++def test_nested_bridge_name_is_still_refused():
++    entries, err = normalize_tool_call_entries(
++        {"calls": [{"arguments": {"name": "tool_search", "arguments": {}}}]})
++    assert entries == [] and "itself a bridge tool" in err
++
++
++def test_dropped_name_in_a_local_batch_names_both_corrections():
++    # 20261110_223014_e339f4: calls[1] repeated calls[0]'s params without a name. It is never
++    # inherited; the error says so, names the sibling and the no-local-batch rule in one turn.
++    args = {"command": "git log -1", "host": "mini", "reason": "r", "timeout": 60}
++    entries, err = normalize_tool_call_entries({"calls": [
++        {"name": "fake_tailnet_exec", "arguments": dict(args, host="mbp")},
++        {"arguments": args},
++    ]})
++    assert entries == []
++    assert err.startswith("tool_call calls[1] requires a 'name'")
++    assert "it carries command, host, reason, timeout" in err
++    assert "never inherited" in err and "'fake_tailnet_exec'" in err
++    assert "send each local tool call as its own tool_call" in err
++    assert err.endswith("Nothing in this batch was invoked.")
++
++
++def test_dropped_name_in_a_connector_batch_omits_the_local_batch_rule():
++    _, err = normalize_tool_call_entries({"calls": [
++        {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}}, {"arguments": {"to": "x"}}]})
++    assert "'connectors__gmail__SEND_EMAIL'" in err
++    assert "own tool_call" not in err
++
++
++def test_single_nameless_entry_reports_its_keys_only():
++    # 20261111_184938_f73858: one entry, arguments {command}, no name anywhere.
++    _, err = normalize_tool_call_entries({"calls": [{"arguments": {"command": "cat q3.js"}}]})
++    assert "calls[0] requires a 'name'" in err and "it carries command" in err
++    assert "this batch also names" not in err and "own tool_call" not in err
++    _, err = normalize_tool_call_entries({"calls": [{"query": "x"}]})
++    assert "it carries query" in err
++    _, err = normalize_tool_call_entries({"calls": [{"arguments": {f"k{i}": i for i in range(10)}}]})
++    assert "k0, k1, k2, k3, k4, k5, k6, k7, ...)" in err
++    _, err = normalize_tool_call_entries({"calls": [{}]})
++    assert "carries" not in err
+diff --git a/tools/tool_search_validation.py b/tools/tool_search_validation.py
+index 0c16b8edad..13c2ad7332 100644
+--- a/tools/tool_search_validation.py
++++ b/tools/tool_search_validation.py
+@@ -8,6 +8,7 @@ import logging
+ import re
+ from typing import Any, Dict, Iterable, List, Optional, Tuple
+ 
++from tools.connectors.gateway.names import is_connector_name
+ from tools.registry import tool_error
+ from tools.tool_search_catalog import BRIDGE_TOOL_NAMES, _registry_entry
+ 
+@@ -172,6 +173,84 @@ def canonical_bridge_tool_name(name: str) -> str:
+     return name
+ 
+ 
++def _declared_parameter_names(name: str) -> Optional[set[str]]:
++    """Top-level parameter names of a registered tool's served schema; None when unknown."""
++    try:
++        from tools.registry import registry as _registry
++        served = _registry.get_definitions({name}, quiet=True)
++        schema = served[0] if served else _registry.get_schema(name)
++    except Exception:  # a registry bug must not block the call; it keeps the "requires a 'name'" error
++        logger.debug("schema lookup failed for %s", name, exc_info=True)
++        return None
++    if not isinstance(schema, dict):
++        return None
++    fn = schema.get("function") if schema.get("type") == "function" else schema
++    params = fn.get("parameters") if isinstance(fn, dict) else None
++    props = params.get("properties") if isinstance(params, dict) else None
++    return set(props) if isinstance(props, dict) else None
++
++
++def _lift_misplaced_entry_name(raw_args: Any) -> Optional[tuple[str, Any]]:
++    """[daveey] Recover a ``calls[]`` entry whose tool name was put INSIDE ``arguments``.
++
++    Models emit two such shapes (Opus/Sonnet, 2026-11 coach sessions):
++    the whole envelope nested one level down, ``{"arguments": {"name": X, "arguments": {...}}}``,
++    and the name written beside the tool's own params, ``{"arguments": {"request": ..., "name": X}}``.
++    Both used to fail as "requires a 'name'" and cost a turn. Lift only what is unambiguous:
++    the name must be a registered tool (or a ``connectors__`` name for the nested envelope),
++    and beside other params it must name a locally registered tool whose schema declares no
++    ``name`` parameter (otherwise ``name`` is a real argument and the entry stays an error).
++    Returns ``(name, arguments)`` or None.
++    """
++    if isinstance(raw_args, str):
++        try:
++            raw_args = json.loads(raw_args)
++        except json.JSONDecodeError:
++            return None
++    if not isinstance(raw_args, dict):
++        return None
++    inner = raw_args.get("name")
++    if not isinstance(inner, str):
++        return None
++    inner = inner.strip()
++    canonical = canonical_bridge_tool_name(inner)
++    rest = {key: value for key, value in raw_args.items() if key != "name"}
++    if set(rest) <= {"arguments"}:
++        if not (_registry_entry(canonical) is not None or is_connector_name(canonical)
++                or canonical in BRIDGE_TOOL_NAMES):
++            return None
++        return inner, rest.get("arguments")
++    # Beside params: only a registered tool with a known schema that declares no `name`.
++    declared = _declared_parameter_names(canonical)
++    if declared is None or "name" in declared:
++        return None
++    return inner, rest
++
++
++def _missing_name_error(position: int, raw: dict[str, Any], raw_calls: list[Any]) -> str:
++    """[daveey] A nameless entry: say what arrived and the one correction that works.
++
++    The bare "requires a 'name'" sent models back with the same mistake: the usual cause is a
++    batch whose later entry was meant to reuse the earlier entry's tool, and such a batch of local
++    tools is refused next anyway, so the correction names both rules at once."""
++    args = raw.get("arguments")
++    keys = sorted(args) if isinstance(args, dict) else sorted(k for k in raw if k != "name")
++    carried = f" (it carries {', '.join(map(str, keys[:8]))}{', ...' if len(keys) > 8 else ''})" if keys else ""
++    named = list(dict.fromkeys(
++        str(c.get("name")).strip() for c in raw_calls
++        if isinstance(c, dict) and str(c.get("name") or "").strip()))
++    message = (f"tool_call calls[{position}] requires a 'name': the entry has no top-level \"name\" "
++               f"beside \"arguments\"{carried}. Every entry is {{\"name\": <exact tool name>, "
++               "\"arguments\": {...}}; a name is never inherited from another entry")
++    if named:
++        message += f" (this batch also names {', '.join(repr(n) for n in named)})"
++    message += "."
++    if len(raw_calls) > 1 and any(not is_connector_name(n) for n in named):
++        message += (" Only connectors__ tools may share one tool_call: send each local tool call "
++                    "as its own tool_call.")
++    return message + " Nothing in this batch was invoked."
++
++
+ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, Any]], Optional[str]]:
+     """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
+ 
+@@ -204,12 +283,15 @@ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, An
+         if not isinstance(raw, dict):
+             return [], f"tool_call calls[{position}] must be an object with 'name' and 'arguments'"
+         name = str(raw.get("name") or "").strip()
++        raw_args = raw.get("arguments")
+         if not name:
+-            return [], f"tool_call calls[{position}] requires a 'name'"
++            lifted = _lift_misplaced_entry_name(raw_args)
++            if lifted is None:
++                return [], _missing_name_error(position, raw, raw_calls)
++            name, raw_args = lifted
+         name = canonical_bridge_tool_name(name)
+         if name in BRIDGE_TOOL_NAMES:
+             return [], f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
+-        raw_args = raw.get("arguments")
+         if raw_args is None or (isinstance(raw_args, str) and not raw_args.strip()):
+             # "" / whitespace is how some OpenAI-compatible gateways spell "no arguments" for a
+             # parameterless tool (#83937); the loop already treats an empty outer arguments string
+-- 
+2.43.0
+

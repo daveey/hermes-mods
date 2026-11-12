@@ -1,0 +1,213 @@
+From d640eb1bef9163c386bb70a669a80117a09b8839 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:55:52 +0000
+Subject: [PATCH] [daveey] fix(kanban): cap fire->re-park cycles on one opaque
+ probe at 6
+
+After the natural-wait change, a condition_met wake by the same probe ends the
+same-premise run, so a probe that keeps firing while the worker's own check
+disagrees cycled forever (re-park count 0, condition_met counts as progress).
+probe_fire_reparks counts trailing fire->re-park cycles on one probe key
+(reset by an escalation, another premise, another probe's fire or other card
+progress); at PROBE_FIRE_REPARK_LIMIT=6 the park escalates through
+RepeatedPark with record['fired_reparks'] and an owner body that says to fix
+the probe or the worker's check. Task t_01a1ceb8375a719c.
+---
+ hermes_cli/kanban_awaiting.py                 | 69 ++++++++++++++++--
+ .../test_kanban_repark_natural_wait.py        | 71 +++++++++++++++++++
+ 2 files changed, 133 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 5f4a023b90..975fe22346 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -68,6 +68,11 @@ PRODUCER_DONE = "producer_done"
+ CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING, OPAQUE_PROBE_WAIT, PRODUCER_DONE)
+ # Parks in a row on one premise before the next one escalates instead (the 3rd park = 2nd re-park).
+ REPARK_LIMIT = 2
++# Fires of one opaque probe, each followed by a re-park on it, before the next park escalates: a probe
++# that keeps firing while the worker's own check disagrees is broken, not a natural window.
++PROBE_FIRE_REPARK_LIMIT = 6
++# Event rows scanned for those cycles: 2 per cycle plus slack for pacing continues.
++PROBE_FIRE_WINDOW = 4 * PROBE_FIRE_REPARK_LIMIT
+ ESCALATION_PREFIX = "repark-escalation:"
+ ESCALATED_EVENT = "repark_escalated"
+ _TASK_ID = re.compile(r"\bt_[0-9a-f]{8,16}\b")
+@@ -696,6 +701,44 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+     return count
+ 
+ 
++def probe_fire_reparks(conn: sqlite3.Connection, task_id: str, premise: str, probe: Optional[str]) -> int:
++    """Trailing fire->re-park cycles on one opaque ``probe``: ``condition_met`` wakes by that probe, each
++    followed by a re-park on the same premise/probe, newest first. Stops at an escalation, a park on
++    another premise, another probe's fire or any other card progress (``kanban_no_progress``).
++
++    ``prior_same_premise`` ends its run at each such fire (a natural window that closed again), so a probe
++    that is looser than the worker's own check would otherwise cycle forever, one worker run per fire. [daveey]"""
++    if not probe:
++        return 0
++    from hermes_cli.kanban_no_progress import CARD_PROGRESS_EVENTS
++    from hermes_cli.kanban_wake_check import CONDITION_MET_EVENT
++    other = tuple(k for k in CARD_PROGRESS_EVENTS if k != CONDITION_MET_EVENT)
++    kinds = ("scheduled", "continued", ESCALATED_EVENT, CONDITION_MET_EVENT, *other)
++    fires = 0
++    for kind, payload in conn.execute(
++            f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({','.join('?' * len(kinds))}) "
++            f"ORDER BY id DESC LIMIT {PROBE_FIRE_WINDOW}", (task_id, *kinds)):
++        if kind in other or kind == ESCALATED_EVENT:
++            break
++        try:
++            data = json.loads(payload or "{}")
++        except ValueError:
++            data = {}
++        if not isinstance(data, dict):
++            data = {}
++        if kind == CONDITION_MET_EVENT:
++            if not (data.get("wake_check") and _probe_key(data["wake_check"]) == probe):
++                break
++            fires += 1
++            continue
++        got = data.get("awaiting") or {}
++        if not isinstance(got, dict) or got.get("premise") is None:
++            continue  # a continuation with no wait, or a legacy park
++        if got["premise"] != premise and got.get("probe") != probe:
++            break
++    return fires
++
++
+ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optional[str],
+          wake_check: Optional[str] = None, clock_only: bool = False, op: str = "schedule",
+          wake_in: Optional[int] = None) -> dict:
+@@ -703,8 +746,9 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+ 
+     Raises ``RepeatedPark`` on the third park in a row on one premise. Card waits (their producer
+     is accountable), inferred clock waits (pacing continues, operator drags) and re-parks after the
+-    same probe fired (``prior_same_premise``: a natural window that closed again) never escalate,
+-    nor does a deploy wait behind a healthy core update window (``kanban_deploy_window``), whose
++    same probe fired (``prior_same_premise``: a natural window that closed again) do not escalate
++    until ``PROBE_FIRE_REPARK_LIMIT`` such cycles (``probe_fire_reparks``: a broken probe), nor does
++    a deploy wait behind a healthy core update window (``kanban_deploy_window``), whose
+     evidence lands on the record as ``deploy_window`` for the caller's wake floor."""
+     from hermes_cli import kanban_deploy_window as kdw
+     record = resolve(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+@@ -729,8 +773,13 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     if probe:
+         record["probe"] = probe
+     kdw.annotate(conn, task_id, record, now=int(time.time()))
+-    if (not kdw.is_healthy(record)
+-            and prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT):
++    if kdw.is_healthy(record):
++        return record
++    if prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT:
++        raise RepeatedPark(record)
++    fired = probe_fire_reparks(conn, task_id, record["premise"], probe)
++    if fired >= PROBE_FIRE_REPARK_LIMIT:
++        record["fired_reparks"] = fired
+         raise RepeatedPark(record)
+     return record
+ 
+@@ -790,10 +839,16 @@ def escalate(conn: sqlite3.Connection, task_id: str, *, record: dict, reason: Op
+     owner = existing[0] if existing and existing[1] not in ("done", "archived") else None
+     if owner is None:
+         supervisor = _supervisor_profile(task)
++        fired = record.get("fired_reparks")
++        title = (f"Unstick {task_id}: probe fired {fired}x, re-parked each time" if fired
++                 else f"Unstick {task_id}: parked 3x on the same premise")
++        lead = (f"Card {task_id} ({task.title}): probe fired {fired} times and the worker re-parked each time: "
++                "fix the probe or the worker's check." if fired else
++                f"Card {task_id} ({task.title}) tried to park a third time on the same premise with no new "
++                "evidence.")
+         owner = kb.create_task(
+-            conn, title=f"Unstick {task_id}: parked 3x on the same premise",
+-            body=(f"Card {task_id} ({task.title}) tried to park a third time on the same premise with no new "
+-                  f"evidence.\n\nPremise: {json.dumps({k: v for k, v in record.items() if k != 'premise'})}\n"
++            conn, title=title,
++            body=(f"{lead}\n\nPremise: {json.dumps({k: v for k, v in record.items() if k != 'premise'})}\n"
+                   f"Latest reason: {(reason or '(none)')[:1500]}\n\n"
+                   "This is agent-owned work, not a wait and not a question for David. Remove the cause: "
+                   "do the action (grant, install, fix) where the capability lives, or route the card to the "
+diff --git a/tests/hermes_cli/test_kanban_repark_natural_wait.py b/tests/hermes_cli/test_kanban_repark_natural_wait.py
+index a64f705a38..7a124722ac 100644
+--- a/tests/hermes_cli/test_kanban_repark_natural_wait.py
++++ b/tests/hermes_cli/test_kanban_repark_natural_wait.py
+@@ -102,6 +102,77 @@ def test_reparks_after_the_same_probe_fired_never_escalate(kanban_home, monkeypa
+         assert not [e for e in kb.list_events(conn, tid) if e.kind == kaw.ESCALATED_EVENT]
+ 
+ 
++# -- a probe that keeps firing while the worker keeps re-parking is a broken probe -------------------------------
++
++def _fire_cycles(monkeypatch, conn, tid, n: int, start: int = 0) -> list:
++    """``n`` parks on MAC_PROBE, each followed by the probe firing; returns the park results."""
++    outs = []
++    for i in range(start, start + n):
++        _claim(monkeypatch, conn, tid)
++        outs.append(_tool("schedule", _mac_park(i)))
++        assert outs[-1].get("status") == "scheduled", (i, outs[-1])
++        _probe_fires(conn, tid)
++    return outs
++
++
++def test_five_fire_reparks_do_not_escalate(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        _fire_cycles(monkeypatch, conn, tid, 5)
++        _claim(monkeypatch, conn, tid)
++        assert _tool("schedule", _mac_park(5)).get("status") == "scheduled"  # 6th park after 5 fires
++        assert not _owners(conn)
++
++
++def test_the_park_after_six_fires_escalates_naming_the_fire_count(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        _fire_cycles(monkeypatch, conn, tid, kaw.PROBE_FIRE_REPARK_LIMIT)
++        _claim(monkeypatch, conn, tid)
++        out = _tool("schedule", _mac_park(6))
++        assert out.get("status") == "todo" and out.get("code") == kaw.ESCALATED_EVENT, out
++        owners = _owners(conn)
++        assert len(owners) == 1
++        owner = kb.get_task(conn, owners[0][0])
++        assert owner is not None and owner.body
++        assert "probe fired 6 times and the worker re-parked each time" in owner.body
++        assert "fix the probe or the worker's check" in owner.body
++        esc = [e for e in kb.list_events(conn, tid) if e.kind == kaw.ESCALATED_EVENT]
++        assert esc and (esc[-1].payload or {})["awaiting"]["fired_reparks"] == 6
++
++
++def test_another_probes_fire_resets_the_fire_count(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        _fire_cycles(monkeypatch, conn, tid, 3)
++        _claim(monkeypatch, conn, tid)
++        assert _tool("schedule", _mac_park(3, OTHER_PROBE)).get("status") == "scheduled"
++        _probe_fires(conn, tid, OTHER_PROBE)
++        _fire_cycles(monkeypatch, conn, tid, 5, start=4)
++        _claim(monkeypatch, conn, tid)
++        assert _tool("schedule", _mac_park(9)).get("status") == "scheduled"  # 5 fires since OTHER_PROBE's
++        assert not _owners(conn)
++
++
++def test_an_escalation_resets_the_fire_count(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        _fire_cycles(monkeypatch, conn, tid, kaw.PROBE_FIRE_REPARK_LIMIT)
++        _claim(monkeypatch, conn, tid)
++        assert _tool("schedule", _mac_park(6)).get("code") == kaw.ESCALATED_EVENT
++        owner = _owners(conn)[0][0]
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready', assignee='boss' WHERE id=?", (owner,))
++        assert kb.claim_task(conn, owner, claimer="boss") is not None
++        assert kb.complete_task(conn, owner, summary="probe fixed")  # the supervisor acted; the card resumes
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == "ready"
++        _fire_cycles(monkeypatch, conn, tid, 5, start=7)
++        _claim(monkeypatch, conn, tid)
++        assert _tool("schedule", _mac_park(12)).get("status") == "scheduled"
++        assert len(_owners(conn)) == 1
++
++
+ def test_same_probe_woken_only_by_its_deadline_still_escalates(kanban_home, monkeypatch) -> None:
+     """Control: no fire between parks is no new evidence, however the reason is worded."""
+     with kbc.connect_closing() as conn:
+-- 
+2.43.0
+

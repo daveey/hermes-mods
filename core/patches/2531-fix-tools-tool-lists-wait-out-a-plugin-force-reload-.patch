@@ -1,0 +1,206 @@
+From 83f3a262de2c2f9989f36b3fe107c807382e8852 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:57:43 +0000
+Subject: [PATCH] fix(tools): tool lists wait out a plugin force-reload, never
+ on an event loop [daveey]
+
+A tool list computed on another thread while PluginManager.discover_and_load(force=True) sits
+between unloading and re-registering a home's plugins came back without that home's plugin
+tools (get_tool_definitions returned [] for the plugin's toolset mid-pass), and a session keeps
+the list it was built with. get_tool_definitions now calls wait_for_reload_off_loop() first:
+the existing reload barrier, bounded by RELOAD_WAIT_SECONDS, skipped for the reloading context
+and its loader workers (ContextVar) and for a pass in another home, and skipped on a thread
+running an asyncio event loop (the gateway's /reload-mcp refreshes cached agents from async
+handlers: gateway/run_turn.py _execute_mcp_reload, gateway/session_ancillary.py). The TUI's
+tools.show moves to the RPC pool so the wait never holds the RPC reader.
+
+The new-session AIAgent build was already serialised: agent_init._load_tools calls
+discover_plugins(), whose discover_and_load queues on the pass's _discovery_lock
+(hermes_cli/plugins.py) before the tool snapshot is read; a test now covers it.
+---
+ model_tools.py                                |  5 +-
+ tests/tools/test_registry_reload_barrier.py   | 81 +++++++++++++++++++
+ .../tui_gateway/test_tools_readback_scope.py  |  7 ++
+ tools/registry_reload.py                      | 13 +++
+ tui_gateway/methods_tools.py                  |  3 +
+ 5 files changed, 108 insertions(+), 1 deletion(-)
+
+diff --git a/model_tools.py b/model_tools.py
+index 00bc8edc12..7e9316cce4 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -22,7 +22,7 @@ from tools.registry import (
+     CHECK_FN_CACHE_BYPASS, check_fn_cache_epoch, check_fn_cache_scope, check_fn_verdict_window, discover_builtin_tools,
+     registry, tool_error)
+ from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
+-from tools.registry_reload import reload_epoch, settle_reload_since, wait_for_reload
++from tools.registry_reload import reload_epoch, settle_reload_since, wait_for_reload, wait_for_reload_off_loop
+ from toolsets import resolve_toolset, validate_toolset
+ from tools.arg_coercion import coerce_tool_args
+ from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
+@@ -274,6 +274,9 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
+     def compute():
+         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
+                                          skip_tool_search_assembly=skip_tool_search_assembly)
++    # [daveey] A list read mid plugin force-reload lacks the home's plugin tools, and a session keeps it:
++    # wait the pass out first (never on an event-loop thread). See tools/registry_reload.py.
++    wait_for_reload_off_loop()
+     if not quiet_mode:
+         return compute()
+     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
+diff --git a/tests/tools/test_registry_reload_barrier.py b/tests/tools/test_registry_reload_barrier.py
+index a58a41344d..f77539ffa5 100644
+--- a/tests/tools/test_registry_reload_barrier.py
++++ b/tests/tools/test_registry_reload_barrier.py
+@@ -6,6 +6,7 @@ session had just been handed by ``tool_search``. These tests hold a real ``Plugi
+ reload open inside the plugin's ``register()`` and drive the real dispatch entry points meanwhile.
+ """
+ 
++import asyncio
+ import json
+ import sys
+ import threading
+@@ -222,3 +223,83 @@ def test_wait_is_bounded_and_overlap_is_reported():
+     assert registry_reload.settle_reload_since(registry_reload.reload_epoch()) is False
+     with registry_reload.reload_barrier(False):
+         assert not registry_reload.reload_active()
++
++
++# A session's tool list is computed once and kept: one built mid-pass would lack the home's plugin tools
++# for the whole session ("not available in this session"). get_tool_definitions waits the pass out,
++# except on an event-loop thread (the gateway's /reload-mcp refreshes cached agents from async handlers).
++
++def _tool_names():
++    return sorted(t["function"]["name"] for t in model_tools.get_tool_definitions(
++        enabled_toolsets=[TOOLSET], quiet_mode=True, skip_tool_search_assembly=True) or [])
++
++
++def test_tool_definitions_during_force_reload_wait_and_list_the_tool(manager, gate):
++    reload_thread, _ = _reload_held_open(manager, gate)
++    defs_thread, defs_box = _start(_tool_names)
++
++    defs_thread.join(0.5)
++    assert defs_thread.is_alive(), f"tool list computed mid-reload: {defs_box}"
++
++    gate.release.set()
++    reload_thread.join(20)
++    defs_thread.join(20)
++    assert defs_box.get("value") == [TOOL], defs_box
++
++
++def test_new_session_agent_build_during_force_reload_waits(manager, gate):
++    """The real build: AIAgent -> agent_init._load_tools -> discover_plugins, which queues on the pass's
++    ``_discovery_lock`` before the tool snapshot is read."""
++    from run_agent import AIAgent
++
++    def build():
++        agent = AIAgent(api_key="sk-test", base_url="https://openrouter.ai/api/v1", model="x/y", quiet_mode=True,
++                        skip_context_files=True, skip_memory=True, enabled_toolsets=[TOOLSET])
++        return agent._tool_snapshot_generation, sorted(agent.valid_tool_names)  # type: ignore[attr-defined]
++
++    reload_thread, _ = _reload_held_open(manager, gate)
++    build_thread, build_box = _start(build)
++
++    build_thread.join(0.5)
++    assert build_thread.is_alive(), f"agent built mid-reload: {build_box}"
++
++    gate.release.set()
++    reload_thread.join(20)
++    build_thread.join(30)
++    assert "value" in build_box, build_box
++    assert build_box["value"] == build(), "the mid-pass build differs from a build after the pass"
++    assert _tool_names() == [TOOL]
++
++
++def test_tool_definitions_on_an_event_loop_thread_never_wait(manager, gate):
++    reload_thread, _ = _reload_held_open(manager, gate)
++
++    async def on_loop():
++        return _tool_names()
++
++    loop_thread, loop_box = _start(lambda: asyncio.run(on_loop()))
++    loop_thread.join(10)
++    assert not loop_thread.is_alive(), "get_tool_definitions blocked an event-loop thread on a reload"
++    assert loop_box.get("value") == [], loop_box  # the registry as it is, mid-pass
++    gate.release.set()
++    reload_thread.join(20)
++
++
++def test_tool_definitions_in_another_home_do_not_wait(manager, gate, tmp_path):
++    reload_thread, _ = _reload_held_open(manager, gate)
++    other = tmp_path / "other_home"
++    other.mkdir()
++
++    def from_other_home():
++        token = set_hermes_home_override(Path(other))
++        try:
++            return _tool_names()
++        finally:
++            reset_hermes_home_override(token)
++
++    call_thread, call_box = _start(from_other_home)
++    call_thread.join(10)
++    assert not call_thread.is_alive(), "another home's tool list waited on this home's reload"
++    assert "value" in call_box, call_box
++    gate.release.set()
++    reload_thread.join(20)
+diff --git a/tests/tui_gateway/test_tools_readback_scope.py b/tests/tui_gateway/test_tools_readback_scope.py
+index 0ac47e6743..22b512965b 100644
+--- a/tests/tui_gateway/test_tools_readback_scope.py
++++ b/tests/tui_gateway/test_tools_readback_scope.py
+@@ -79,3 +79,10 @@ def test_tools_show_sections_follow_the_sessions_pin(two_homes):
+     work, launch = _sections("work"), _sections("launch")
+     assert "file" in work and "terminal" not in work, sorted(work)
+     assert "terminal" in launch and "file" not in launch, sorted(launch)
++
++
++def test_tools_show_runs_on_the_rpc_pool():
++    """It reads the tool list, which waits out a plugin force-reload: never on the RPC reader."""
++    from tui_gateway import server
++
++    assert "tools.show" in server._LONG_HANDLERS
+diff --git a/tools/registry_reload.py b/tools/registry_reload.py
+index 2bebd1c232..dca6f18d4b 100644
+--- a/tools/registry_reload.py
++++ b/tools/registry_reload.py
+@@ -16,6 +16,7 @@ waited on. The wait is bounded: past the bound the caller proceeds on what the r
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import logging
+ import threading
+ import time
+@@ -95,6 +96,18 @@ def wait_for_reload(scope: Optional[str] = None, timeout: Optional[float] = None
+     return waited
+ 
+ 
++def wait_for_reload_off_loop(scope: Optional[str] = None, timeout: Optional[float] = None) -> bool:
++    """:func:`wait_for_reload` for a caller that may run on an asyncio event-loop thread (a tool-list
++    build reached from an ``async def`` handler, e.g. the gateway's ``/reload-mcp`` refresh of cached
++    agents): there it returns False at once, since blocking the loop for up to the wait bound would
++    stall every connection it serves."""
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return wait_for_reload(scope, timeout)
++    return False
++
++
+ def settle_reload_since(epoch: int, scope: Optional[str] = None, timeout: Optional[float] = None) -> bool:
+     """True when a pass for *scope* ran or started since *epoch* was read (after waiting it out):
+     a miss observed in between is not authoritative and the caller should read again."""
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 1fe36999a0..e794061c0b 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1983,3 +1983,6 @@ def _(rid, params: dict) -> dict:
+ def register(server) -> None:
+     """Rebind this module's helpers + handlers onto ``server`` and register the handlers."""
+     bind_module(globals(), server, skip=("_",))
++    # [daveey] tools.show reads the tool list, which waits out a plugin force-reload (up to
++    # tools.registry_reload.RELOAD_WAIT_SECONDS): on the pool, never the RPC reader.
++    server._LONG_HANDLERS = server._LONG_HANDLERS | {"tools.show"}
+-- 
+2.43.0
+

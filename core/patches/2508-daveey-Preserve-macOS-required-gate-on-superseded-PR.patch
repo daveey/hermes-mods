@@ -1,0 +1,215 @@
+From aeede24e12d101730431ffce8d64854a12ff47c7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:59:47 +0000
+Subject: [PATCH] [daveey] Preserve macOS required gate on superseded PR runs
+
+---
+ .github/workflows/ci.yaml               |  9 ++-
+ scripts/ci/required_results.py          | 27 +++++--
+ tests/ci/test_macos_state_superseded.py | 96 +++++++++++++++++++++++++
+ tests/ci/test_required_results.py       | 13 ++++
+ 4 files changed, 138 insertions(+), 7 deletions(-)
+ create mode 100644 tests/ci/test_macos_state_superseded.py
+
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 3cf76dc6cd..a5081d8b90 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -616,4 +616,11 @@ jobs:
+       - name: Require the selected macOS state lane
+         env:
+           NEEDS: ${{ toJSON(needs) }}
+-        run: printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py --macos-state
++          RELEASE: ${{ inputs.release }}
++          EVENT_NAME: ${{ github.event_name }}
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          args=(--macos-state)
++          if [ "$RELEASE" = true ]; then args+=(--release);
++          elif [ "$EVENT_NAME" = pull_request ]; then args+=(--allow-superseded); fi
++          printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py "${args[@]}"
+diff --git a/scripts/ci/required_results.py b/scripts/ci/required_results.py
+index c9a52250f9..f88f827dac 100644
+--- a/scripts/ci/required_results.py
++++ b/scripts/ci/required_results.py
+@@ -223,6 +223,19 @@ def superseding_run_id(fetch: Callable[[str], Any] = _github_get) -> int | None:
+     return None
+ 
+ 
++def delegated_run(fetch: Callable[[str], Any]) -> int | None:
++    """Share the bounded, fail-closed duplicate lookup between required gates."""
++    try:
++        duplicate = superseding_run_id(fetch)
++    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
++        print(f"Superseding-run lookup failed, keeping the failure: {exc}")
++        return None
++    if duplicate is not None:
++        print(f"::notice::Cancelled duplicate run: run {duplicate} on the same head SHA "
++              "carries the required verdict")
++    return duplicate
++
++
+ def compact_results(needs: dict[str, dict[str, Any]] | None) -> dict[str, str]:
+     """{job_name: result} for every entry, for the PR comment assembler."""
+     return {name: (info or {}).get("result", "") for name, info in (needs or {}).items()}
+@@ -266,6 +279,13 @@ def main(argv: list[str] | None = None, fetch: Callable[[str], Any] = _github_ge
+     needs = json.load(sys.stdin)
+     if args.macos_state:
+         verdict = evaluate_macos_state(needs)
++        # Repair only the cancellation to check that selection is known and
++        # detect succeeded. No skipped, missing or failed lane may delegate.
++        lane = ((needs or {}).get(MACOS_STATE_JOB) or {}).get("result")
++        repaired = {**(needs or {}), MACOS_STATE_JOB: {"result": "success"}}
++        if (args.allow_superseded and lane == "cancelled"
++                and evaluate_macos_state(repaired)["ok"] and delegated_run(fetch) is not None):
++            return 0
+         print(("" if verdict["ok"] else "::error::") + verdict["reason"])
+         return 0 if verdict["ok"] else 1
+     verdict = evaluate_gate(needs, release=args.release)
+@@ -279,16 +299,11 @@ def main(argv: list[str] | None = None, fetch: Callable[[str], Any] = _github_ge
+     print(f"{NEEDS_JSON_OUTPUT}={json.dumps(compact)}")
+     duplicate = None
+     if args.allow_superseded and only_cancellations(needs, verdict):
+-        try:
+-            duplicate = superseding_run_id(fetch)
+-        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:  # fail closed
+-            print(f"Superseding-run lookup failed, keeping the failure: {exc}")
++        duplicate = delegated_run(fetch)
+     for line in render_report(needs, verdict):
+         if duplicate is None or not line.startswith("::error::"):
+             print(line)
+     if duplicate is not None:
+-        print(f"::notice::Cancelled duplicate run: run {duplicate} on the same head SHA "
+-              "carries the required verdict")
+         return 0
+     if verdict["ok"]:
+         print("All checks passed" if args.release else "All checks passed (or were skipped)")
+diff --git a/tests/ci/test_macos_state_superseded.py b/tests/ci/test_macos_state_superseded.py
+new file mode 100644
+index 0000000000..5b7b5ca35e
+--- /dev/null
++++ b/tests/ci/test_macos_state_superseded.py
+@@ -0,0 +1,96 @@
++"""Duplicate cancellation controls for the separately protected macOS gate."""
++import json
++import subprocess
++
++import pytest
++
++from tests.ci.test_required_results import _OWN, _api_down, _dup, _fake_fetch, _run_main
++from tests.ci.test_macos_state_routing import ROOT, context, gha, workflow
++
++
++def needs(selected="true", lane="cancelled", detect="success"):
++    return {"detect": {"result": detect, "outputs": {"hermes_state": selected}},
++            "hermes-state-macos": {"result": lane}}
++
++
++@pytest.mark.parametrize("selected", ["true", "false", None, "", True, False])
++@pytest.mark.parametrize("lane", ["success", "skipped", "failure", "cancelled", None])
++@pytest.mark.parametrize("detect", ["success", "cancelled", "failure", None])
++def test_only_known_selection_and_cancelled_lane_consults_api(monkeypatch, capsys, selected, lane, detect):
++    fetch, calls = _fake_fetch([_dup()])
++    code, out = _run_main(monkeypatch, capsys, needs(selected, lane, detect),
++                          ["--macos-state", "--allow-superseded"], fetch)
++    eligible = detect == "success" and selected in ("true", "false") and lane == "cancelled"
++    ordinary = detect == "success" and (selected == "true" and lane == "success" or
++                                        selected == "false" and lane in ("success", "skipped"))
++    assert bool(calls) is eligible
++    assert code == (0 if eligible or ordinary else 1)
++    assert ("::error::" in out) is not (eligible or ordinary)
++
++
++@pytest.mark.parametrize("other", [None, _dup(id=0), _dup(head_sha="different"),
++    _dup(workflow_id=8), _dup(event="push"), _dup(head_branch="other"),
++    _dup(head_repository={"id": 100}), _dup(status="completed", conclusion="failure"),
++    _dup(status="completed", conclusion="cancelled"),
++    _dup(run_started_at="2026-11-09T11:45:29Z")])
++def test_macos_rejects_non_successor(monkeypatch, capsys, other):
++    fetch, _ = _fake_fetch([] if other is None else [other])
++    code, out = _run_main(monkeypatch, capsys, needs(), ["--macos-state", "--allow-superseded"], fetch)
++    assert code == 1
++    assert "::error::" in out
++
++
++@pytest.mark.parametrize("attempt,prior,expected", [(1, "cancelled", 0), (2, "action_required", 0),
++    (2, "cancelled", 1), (2, "success", 1), (3, "action_required", 1), (None, "cancelled", 1)])
++def test_macos_rerun_limits(monkeypatch, capsys, attempt, prior, expected):
++    fetch, _ = _fake_fetch([_dup()], own={**_OWN, "run_attempt": attempt}, attempt1=prior)
++    code, _ = _run_main(monkeypatch, capsys, needs(), ["--macos-state", "--allow-superseded"], fetch)
++    assert code == expected
++
++
++@pytest.mark.parametrize("fetch", [_api_down, lambda path: {}, lambda path: None,
++    lambda path: _OWN if path.endswith("runs/1") else []])
++def test_macos_lookup_error_fails_closed(monkeypatch, capsys, fetch):
++    code, out = _run_main(monkeypatch, capsys, needs(), ["--macos-state", "--allow-superseded"], fetch)
++    assert code == 1
++    assert "keeping the failure" in out
++    assert "::error::" in out
++
++
++def test_macos_without_opt_in_never_fetches(monkeypatch, capsys):
++    fetch, calls = _fake_fetch([_dup()])
++    code, _ = _run_main(monkeypatch, capsys, needs(), ["--macos-state"], fetch)
++    assert code == 1
++    assert not calls
++
++
++def test_macos_release_rejects_delegation(monkeypatch, capsys):
++    with pytest.raises(SystemExit) as exc:
++        _run_main(monkeypatch, capsys, needs(),
++                  ["--macos-state", "--release", "--allow-superseded"], _api_down)
++    assert exc.value.code == 2
++
++
++@pytest.mark.parametrize("event,release,expected", [
++    ("pull_request", False, ["--macos-state", "--allow-superseded"]),
++    ("pull_request", True, ["--macos-state", "--release"]),
++    ("push", False, ["--macos-state"]),
++    ("workflow_dispatch", False, ["--macos-state"]),
++    ("workflow_call", True, ["--macos-state", "--release"]),
++])
++def test_workflow_passes_delegation_only_for_nonrelease_pr(event, release, expected):
++    ctx = context(event=event, release=release)
++    ctx["github"]["token"] = "fixture-token"
++    ctx["needs"] = needs()
++    job = workflow("ci.yaml")["jobs"]["macos-state-required"]
++    step = next(step for step in job["steps"] if "run" in step)
++    env = {key: gha.to_string(gha.render(value, ctx)) for key, value in step["env"].items()}
++    # Execute the workflow's shell argument construction, recording its CLI boundary.
++    shim = 'python3() { printf "%s\\n" "$@"; }; export -f python3\n'
++    proc = subprocess.run(["bash", "-eo", "pipefail", "-c", shim + gha.render(step["run"], ctx)],
++                          cwd=ROOT, env=env, text=True, encoding="utf-8", capture_output=True,
++                          timeout=30, check=False)
++    assert proc.returncode == 0, proc.stderr
++    assert proc.stdout.splitlines() == ["scripts/ci/required_results.py", *expected]
++    assert json.loads(env["NEEDS"]) == needs()
++    assert env["GH_TOKEN"] == "fixture-token"
+diff --git a/tests/ci/test_required_results.py b/tests/ci/test_required_results.py
+index 1718b19ac1..73955fd81f 100644
+--- a/tests/ci/test_required_results.py
++++ b/tests/ci/test_required_results.py
+@@ -338,6 +338,19 @@ def test_without_flag_cancelled_duplicate_still_fails(monkeypatch, capsys):
+     assert code == 1
+ 
+ 
++@pytest.mark.parametrize("other", [_dup(status="pending"), _dup(status="completed", conclusion="success")])
++def test_macos_cancelled_selected_lane_delegates(monkeypatch, capsys, other):
++    needs = {"detect": {"result": "success", "outputs": {"hermes_state": "true"}},
++             "hermes-state-macos": {"result": "cancelled"}}
++    fetch, calls = _fake_fetch([other])
++    code, out = _run_main(monkeypatch, capsys, needs,
++                          ["--macos-state", "--allow-superseded"], fetch)
++    assert code == 0
++    assert "run 2 on the same head SHA" in out
++    assert "::error::" not in out
++    assert len(calls) == 2
++
++
+ def test_release_rejects_allow_superseded(monkeypatch, capsys):
+     with pytest.raises(SystemExit) as exc:
+         _run_main(monkeypatch, capsys, _CANCELLED_DETECT, ["--release", "--allow-superseded"],
+-- 
+2.43.0
+

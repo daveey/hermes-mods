@@ -1,0 +1,341 @@
+From efaf0fd19b69f69f32a8d73b9686e09ff9dcf940 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:05:21 +0000
+Subject: [PATCH] fix(update): refuse unknown opted-in gateway inventory and
+ count failures [daveey]
+
+---
+ hermes_cli/update_cmd_posix_pause.py          |  26 ++-
+ hermes_cli/update_preswap_discovery.py        |  61 +++++++
+ .../test_update_preswap_strict_discovery.py   | 158 ++++++++++++++++++
+ 3 files changed, 237 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/update_preswap_discovery.py
+ create mode 100644 tests/hermes_cli/test_update_preswap_strict_discovery.py
+
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index c6c8e93b2b..5aadd57a6e 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -204,6 +204,9 @@ def _discover_systemd() -> list[dict]:
+         return []
+     with suppress(Exception):
+         _ensure_user_systemd_env()
++    if _stop_busy_opted_in():
++        from hermes_cli.update_preswap_discovery import systemd_units
++        return systemd_units()
+     units: list[dict] = []
+     seen_pids: set[int] = set()
+     for scope, scope_cmd, listing in _systemd_gateway_unit_listings():
+@@ -622,19 +625,19 @@ def _systemctl_async(unit: dict, args: list[str], deadline: float, *, must: bool
+     from hermes_cli.update_cmd_fleet import _systemctl
+     cmd = _manage_cmd(unit["scope"])
+     if cmd is None:
+-        raise PauseRefused(f"no privilege to stop system unit {unit['unit']}")
++        raise PauseRefused(f"no privilege to stop system unit {unit['unit']}", [unit["unit"]])
+     if (left := _left(deadline)) <= 0:  # no floor: an expired deadline issues nothing
+         if must:
+-            raise PauseRefused(f"the pre-swap deadline passed before systemctl {args[0]} {unit['unit']}")
++            raise PauseRefused(f"the pre-swap deadline passed before systemctl {args[0]} {unit['unit']}", [unit["unit"]])
+         return
+     try:
+         result = _systemctl(cmd + [*args, unit["unit"]], timeout=min(10.0, left))
+     except (OSError, subprocess.SubprocessError) as exc:
+         if must:
+-            raise PauseRefused(f"systemctl {args[0]} {unit['unit']} did not complete: {exc}") from exc
++            raise PauseRefused(f"systemctl {args[0]} {unit['unit']} did not complete: {exc}", [unit["unit"]]) from exc
+         return
+     if must and result.returncode != 0:
+-        raise PauseRefused(f"systemctl {args[0]} {unit['unit']} failed: {(result.stderr or '').strip()}")
++        raise PauseRefused(f"systemctl {args[0]} {unit['unit']} failed: {(result.stderr or '').strip()}", [unit["unit"]])
+ 
+ 
+ def _begin_launchd_bootout(job: dict) -> subprocess.Popen:
+@@ -648,7 +651,7 @@ def _stop_at_once(entry: dict, deadline: float, procs: dict, *, drained: bool =
+     background), a bare process gets marker + SIGTERM. ``_stopped`` verifies the outcome."""
+     from hermes_cli.update_cmd_windows import _write_update_planned_stop_marker
+     if _left(deadline) <= 0:
+-        raise PauseRefused(f"the pre-swap deadline passed before stopping {_names([entry])}")
++        raise PauseRefused(f"the pre-swap deadline passed before stopping {_names([entry])}", [_names([entry])])
+     kind = entry.get("kind")
+     if kind == "systemd":
+         _systemctl_async(entry, ["stop", "--no-block"], deadline, must=True)
+@@ -709,10 +712,10 @@ def _stop_busy_gateways(token: dict, entries: list[dict], deadline: float) -> No
+     waiting: list[dict] = []   # drain accepted: expected to exit on its own
+     settling: list[dict] = []  # a stop is under way: must be verified
+     try:
+-        for entry in entries:
++        for index, entry in enumerate(entries):
+             if _left(deadline) <= 0:
+                 raise PauseRefused(f"the pre-swap deadline passed before {_names([entry])} was asked to stop; "
+-                                   "the checkout was not changed")
++                                   "the checkout was not changed", [_names([e]) for e in entries[index:]])
+             pause_record.mark_stop_sent(token, entry["pid"])  # before the request: see _ask_to_drain
+             if _ask_busy_to_drain(entry, min(2.0, _left(drain_end))):
+                 waiting.append(entry)
+@@ -748,7 +751,8 @@ def _stop_busy_gateways(token: dict, entries: list[dict], deadline: float) -> No
+                         forced.add(entry["pid"])
+                         _force(entry, deadline, procs)
+             time.sleep(min(_POLL_S, max(0.0, _left(deadline))))
+-        raise PauseRefused(f"{_names(settling)} did not stop within {total:.0f}s; the checkout was not changed")
++        raise PauseRefused(f"{_names(settling)} did not stop within {total:.0f}s; the checkout was not changed",
++                           [_names([e]) for e in settling])
+     finally:
+         for proc in procs.values():
+             if proc.poll() is None:
+@@ -925,16 +929,22 @@ def _pause(token: dict) -> str | None:
+             units, jobs, notices = _left_running(units, jobs)
+             bare, more = _discover_bare({u["pid"] for u in units} | {j["pid"] for j in jobs})
+     except Exception as exc:  # health: allow BLE001 -- a discovery that cannot finish stops nothing
++        if opted_in:
++            _deferral_streak(exc if isinstance(exc, PauseRefused) else
++                             PauseRefused(str(exc), ["gateway inventory"]))
+         return f"could not list running gateways ({exc}); the checkout was not changed"
+     finally:
+         _DISCOVERY_DEADLINE = None
+     if opted_in:
+         # A listing that ran out of time or lost a probe is unfinished, never an empty (or smaller) set.
+         if timed_out or _left(deadline) <= 0:
++            _deferral_streak(PauseRefused("deadline passed while listing gateways", ["gateway inventory"]))
+             return "the pre-swap deadline passed while listing gateways; the checkout was not changed"
+         if notices or more:
+             # The caller asked for this host to converge: a gateway the update cannot stop is a refusal.
+             why = "; ".join(line.strip().lstrip("↷ ").strip() for line in notices + more)
++            _deferral_streak(PauseRefused(why, [line.strip().lstrip("↷ ").split(" keeps running", 1)[0]
++                                              for line in notices + more]))
+             return f"gateways that cannot be stopped for the update ({why}); the checkout was not changed"
+     for line in notices + more:
+         print(line)
+diff --git a/hermes_cli/update_preswap_discovery.py b/hermes_cli/update_preswap_discovery.py
+new file mode 100644
+index 0000000000..d1ecee83e5
+--- /dev/null
++++ b/hermes_cli/update_preswap_discovery.py
+@@ -0,0 +1,61 @@
++"""Fail-closed systemd inventory only for the Linux opted-in pre-swap stop.
++
++Fleet restart's best-effort helpers deliberately conflate unknown and excluded. That
++contract must not authorize a checkout move; leave those shared helpers unchanged.
++"""
++from __future__ import annotations
++
++import subprocess
++
++
++def systemd_units() -> list[dict]:
++    from hermes_cli import update_cmd_fleet as fleet
++    from hermes_cli import update_cmd_posix_pause as pause
++    from hermes_cli.update_fleet_scope import (
++        announce_skipped_runtime, gateway_foreign_code_root, home_in_update_scope,
++        systemd_unit_hermes_home,
++    )
++
++    def read(cmd, identity):
++        try:
++            result = fleet._systemctl(cmd, timeout=10)
++        except (OSError, subprocess.SubprocessError) as exc:
++            raise pause.PauseRefused(f"could not inventory {identity}: {exc}", [identity]) from exc
++        if result.returncode != 0:
++            raise pause.PauseRefused(f"could not inventory {identity}: {(result.stderr or '').strip()}", [identity])
++        return (result.stdout or "").strip()
++
++    units, seen = [], set()
++    for scope, cmd in fleet._SYSTEMD_SCOPES:
++        identity = f"systemd {scope} gateway inventory"
++        listing = read(cmd + fleet._LIST_GATEWAY_UNITS, identity)
++        names = []
++        fleet._for_each_systemd_gateway_unit(listing, process_unit=names.append,
++                                            on_unit_timeout=lambda name, exc: None)
++        for name in names:
++            if not name.startswith("hermes-gateway"):
++                continue
++            value = read(cmd + ["show", name, "--property=MainPID", "--value"], name)
++            if not value.isdecimal():
++                raise pause.PauseRefused(f"{name} has unreadable MainPID {value!r}", [name])
++            pid = int(value)
++            if pid == 0:
++                state = read(cmd + ["show", name, "--property=ActiveState", "--value"], name)
++                if state not in ("inactive", "failed"):
++                    raise pause.PauseRefused(f"{name} has no MainPID but is not proven inactive ({state!r})", [name])
++                continue
++            home = systemd_unit_hermes_home(cmd, name)
++            if home is None:
++                raise pause.PauseRefused(f"{name} ownership could not be read", [name])
++            if not home_in_update_scope(home):
++                announce_skipped_runtime("systemd unit", name, home)
++                continue
++            pinned = gateway_foreign_code_root(pid, home)
++            if pinned is not None:
++                announce_skipped_runtime("systemd unit", name, home, code_root=pinned)
++                continue
++            if pid not in seen:
++                seen.add(pid)
++                units.append({"kind": "systemd", "scope": scope, "unit": name, "pid": pid,
++                              "cgroup": pause._unit_cgroup(cmd, name), "home": home})
++    return units
+diff --git a/tests/hermes_cli/test_update_preswap_strict_discovery.py b/tests/hermes_cli/test_update_preswap_strict_discovery.py
+new file mode 100644
+index 0000000000..6f8c511b44
+--- /dev/null
++++ b/tests/hermes_cli/test_update_preswap_strict_discovery.py
+@@ -0,0 +1,158 @@
++"""Opted-in discovery must prove exclusions, not mistake failed probes for emptiness."""
++from __future__ import annotations
++
++import subprocess
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import gateway, update_cmd_fleet as fleet
++from hermes_cli import update_cmd_posix_pause as pause
++from hermes_cli import update_fleet_scope as scope, update_pause_deferrals as deferrals
++
++UNIT = "hermes-gateway-review"
++
++
++@pytest.fixture
++def probes(tmp_path, monkeypatch):
++    monkeypatch.setenv(pause.STOP_BUSY_ENV, "1")
++    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
++    monkeypatch.setattr(gateway, "_ensure_user_systemd_env", lambda: None)
++    monkeypatch.setattr(pause, "_discover_bare", lambda pids: ([], []))
++    monkeypatch.setattr(pause, "_discover_launchd", list)
++    monkeypatch.setattr(scope, "gateway_pid_home", lambda pid: None)
++    from hermes_cli import dashboard_procs
++    monkeypatch.setattr(dashboard_procs, "_hermes_home_for_pid", lambda pid: None)
++    monkeypatch.setattr(deferrals, "state_path", lambda: tmp_path / "streak.json")
++    report = Mock(return_value="fixture-repair")
++    monkeypatch.setattr(deferrals, "report", report)
++    stop = Mock()
++    monkeypatch.setattr(pause, "_stop_gateways", stop)
++    return stop, report
++
++
++@pytest.mark.parametrize("failure,identity", [
++    ("listing", "systemd user gateway inventory"),
++    ("missing", "systemd user gateway inventory"),
++    ("pid_nonzero", UNIT), ("pid_invalid", UNIT), ("pid_empty", UNIT),
++    ("ownership", UNIT), ("cgroup_timeout", UNIT),
++])
++def test_unknown_systemd_discovery_refuses_and_third_attempt_reports(probes, monkeypatch, failure, identity):
++    stop, report = probes
++
++    def systemctl(cmd, **kwargs):
++        if "list-units" in cmd:
++            if "--user" not in cmd:
++                return subprocess.CompletedProcess(cmd, 0, "", "")
++            if failure == "missing":
++                raise FileNotFoundError("no systemctl")
++            return subprocess.CompletedProcess(cmd, int(failure == "listing"),
++                                               f"{UNIT}.service loaded active running gateway\n", "bus failed")
++        if "--property=MainPID" in cmd:
++            return subprocess.CompletedProcess(cmd, int(failure == "pid_nonzero"),
++                                               "invalid" if failure == "pid_invalid" else "" if failure == "pid_empty" else "424242", "")
++        if "--property=Environment" in cmd:
++            if failure == "cgroup_timeout":
++                return subprocess.CompletedProcess(cmd, 0, "HERMES_HOME=/fixture/home", "")
++            return subprocess.CompletedProcess(cmd, 1, "", "denied")
++        if "--property=ControlGroup" in cmd:
++            raise subprocess.TimeoutExpired(cmd, 1)
++        pytest.fail(f"unexpected probe: {cmd}")
++
++    monkeypatch.setattr(scope, "home_in_update_scope", lambda home: True)
++    monkeypatch.setattr(scope, "gateway_foreign_code_root", lambda pid, home: None)
++    monkeypatch.setattr(fleet, "_systemctl", systemctl)
++    for attempt in range(3):
++        verdict = pause._pause(pause._empty_token())
++        assert verdict and "checkout was not changed" in verdict
++        assert deferrals._read()[identity]["count"] == attempt + 1
++    stop.assert_not_called()
++    report.assert_called_once()
++    assert report.call_args.args[0] == identity
++
++
++def test_default_discovery_keeps_best_effort_semantics(probes, monkeypatch):
++    monkeypatch.delenv(pause.STOP_BUSY_ENV)
++    monkeypatch.setattr(fleet, "_systemctl", lambda *a, **k: subprocess.CompletedProcess([], 1, "", "bus failed"))
++    assert pause._pause(pause._empty_token()) is None
++
++
++@pytest.mark.parametrize("reason", ["foreign", "pinned", "inactive"])
++def test_proven_exclusions_do_not_refuse(probes, monkeypatch, reason):
++    def systemctl(cmd, **kwargs):
++        if "list-units" in cmd:
++            return subprocess.CompletedProcess(cmd, 0, f"{UNIT}.service loaded active running gateway\n" if "--user" in cmd else "", "")
++        if "--property=MainPID" in cmd:
++            return subprocess.CompletedProcess(cmd, 0, "0" if reason == "inactive" else "424242", "")
++        if "--property=ActiveState" in cmd:
++            return subprocess.CompletedProcess(cmd, 0, "inactive", "")
++        if "--property=Environment" in cmd:
++            return subprocess.CompletedProcess(cmd, 0, "HERMES_HOME=/fixture/home", "")
++        pytest.fail(f"unexpected probe: {cmd}")
++    monkeypatch.setattr(fleet, "_systemctl", systemctl)
++    monkeypatch.setattr(scope, "home_in_update_scope", lambda home: reason != "foreign")
++    monkeypatch.setattr(scope, "gateway_foreign_code_root", lambda pid, home: "/fixture/pin" if reason == "pinned" else None)
++    assert pause._pause(pause._empty_token()) is None
++
++
++def test_expired_stop_names_all_remaining_entries():
++    entries = [{"pid": 42, "unit": UNIT}, {"pid": 43}]
++    with pytest.raises(pause.PauseRefused) as error:
++        pause._stop_busy_gateways({}, entries, deadline=0)
++    assert error.value.units == [UNIT, "gateway PID 43"]
++
++
++@pytest.mark.parametrize("mode", ["privilege", "deadline", "nonzero", "exception"])
++def test_async_stop_refusal_names_its_unit(monkeypatch, mode):
++    monkeypatch.setattr(pause, "_manage_cmd", lambda s: None if mode == "privilege" else ["systemctl"])
++    def systemctl(*args, **kwargs):
++        if mode == "exception":
++            raise OSError("denied")
++        return subprocess.CompletedProcess([], 1, "", "denied")
++    monkeypatch.setattr(fleet, "_systemctl", systemctl)
++    with pytest.raises(pause.PauseRefused) as error:
++        pause._systemctl_async({"scope": "user", "unit": UNIT}, ["stop"], 0 if mode == "deadline" else float("inf"), must=True)
++    assert error.value.units == [UNIT]
++
++
++def test_stop_verification_failures_report_third_attempt_and_rollback(probes, monkeypatch):
++    from hermes_cli import update_cmd_windows as windows, update_pause_record as record
++    from gateway import status
++
++    _, report = probes
++    # Use the real stop transaction and async systemctl helper, never a host mutation.
++    monkeypatch.setattr(pause, "_stop_gateways", pause._stop_busy_gateways)
++    entries = [{"kind": "systemd", "scope": "user", "unit": UNIT, "pid": 424242},
++               {"pid": 424243, "argv": ["fixture"]}]
++    monkeypatch.setattr(pause, "_discover_systemd", lambda: entries[:1])
++    monkeypatch.setattr(pause, "_discover_bare", lambda pids: (entries[1:], []))
++    monkeypatch.setattr(pause, "_left_running", lambda u, j: (u, j, []))
++    clock = [100.0]
++    class Clock:
++        @staticmethod
++        def monotonic():
++            return clock[0]
++        @staticmethod
++        def sleep(seconds):
++            clock[0] += seconds
++    monkeypatch.setattr(pause, "time", Clock)
++    monkeypatch.setattr(pause, "_PRE_SWAP_DRAIN_WAIT_S", 1.0)
++    monkeypatch.setattr(pause, "_manage_cmd", lambda s: ["systemctl"])
++    monkeypatch.setattr(pause, "_ask_busy_to_drain", lambda *a: False)
++    monkeypatch.setattr(pause, "_alive", lambda pid, ct: pid == 424242)
++    monkeypatch.setattr(pause.os, "kill", lambda *a: None)
++    monkeypatch.setattr(fleet, "_systemctl", lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""))
++    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 1)
++    monkeypatch.setattr(record, "identity", lambda pid=None: {"ct": "ct:1"})
++    for name in ("record_pause", "mark_stop_requested", "mark_stop_sent", "sync"):
++        monkeypatch.setattr(record, name, lambda *a, **k: None)
++    resumed = Mock()
++    monkeypatch.setattr(windows, "_resume_windows_gateways_after_update", resumed)
++    for attempt in range(3):
++        verdict = pause._pause(pause._empty_token())
++        assert verdict and "did not stop" in verdict
++        assert deferrals._read()[UNIT]["count"] == attempt + 1
++        assert "gateway PID 424243" not in deferrals._read()  # already verified stopped
++    assert resumed.call_count == 3
++    report.assert_called_once()
++    assert report.call_args.args[0] == UNIT
+-- 
+2.43.0
+

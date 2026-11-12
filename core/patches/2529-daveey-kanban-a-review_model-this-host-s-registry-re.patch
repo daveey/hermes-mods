@@ -1,0 +1,287 @@
+From 5f189013341c24d1de572adeae91944558a8851d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:29:35 +0000
+Subject: [PATCH] [daveey] kanban: a review_model this host's registry refuses
+ falls back to a registered independent reviewer
+
+Handoff metadata `review_model` (kanban_request_review) became the review
+lane's `review_override` with no routing-registry check. On 2026-11-12 card
+t_01a1ce48c929f055 asked for claude-fable-5-2, which only the hub registers;
+the pool workers that claimed the review spawned it anyway, died at startup
+with ManagedPinRejectedError, and the card gave up to triage after two
+crashes. The task-pin guard (route_model_mismatch) only checks the row's
+model_override, so the override bypassed it.
+
+resolve_review_model now runs the worker's own startup check
+(_check_managed_pin against the assignee's config) on the override. A
+refused override reviews on a registered model distinct from the
+implementer (card pin, else the handoff run's run_route receipt): the strong
+tier, else another deep route, both registry-checked. The model_tier receipt
+records reason `review_override_refused` plus the requested model, the
+refusal code and the registry's allowed pins. With no implementer known or
+no independent registered model, ReviewModelUnavailable refuses admission
+before spawn (infrastructure, retry budget untouched). A host that does
+register the override (the hub) still runs it unchanged.
+---
+ hermes_cli/kanban_model_tier.py               | 12 ++-
+ hermes_cli/kanban_quota_episode.py            |  2 +-
+ hermes_cli/kanban_review_model.py             | 96 ++++++++++++++++---
+ .../test_kanban_managed_pin_policy.py         | 59 ++++++++++++
+ 4 files changed, 155 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index d039c9795b..471e2cf1e4 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -16,8 +16,10 @@ and a later run re-decides. Cards keep the profile's model when:
+ those review/retry/keep-pattern cards run on instead of the profile's model; unset keeps the old behaviour.
+ 
+ Unset ``kanban.default_model`` retains profile routing except for explicit review pins/overrides.
+-Review handoff metadata ``review_model`` (optional ``review_provider``) wins; otherwise concrete author pins
+-choose a distinct strong/deep model. Ready/retry pins and unpinned out-of-scope profiles are unchanged.
++Review handoff metadata ``review_model`` (optional ``review_provider``) wins unless this host's routing registry
++refuses it (``review_override_refused``: a registered reviewer distinct from the implementer, the request kept in
++the receipt); otherwise concrete author pins choose a distinct strong/deep model.
++Ready/retry pins and unpinned out-of-scope profiles are unchanged.
+ Each decision is recorded as a ``model_tier`` event, with ``implementer_model`` on review decisions.
+ """
+ 
+@@ -411,6 +413,12 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+                        "lane": lane}
+             if is_review:
+                 payload["implementer_model"] = implementer_model
++                if reason == "review_override_refused":
++                    # The receipt names what the handoff asked for and why this host substituted. [daveey]
++                    from hermes_cli.kanban_review_model import refused_override
++                    payload["requested"] = refused_override(conn, task)
++                    logger.warning("kanban review %s: review_model %s refused by this host's routing registry; "
++                                   "reviewing on %s", task.id, (payload["requested"] or {}).get("model"), model)
+             with _kb.write_txn(conn):
+                 _kb._append_event(conn, task.id, "model_tier", payload, run_id=getattr(task, "current_run_id", None))
+                 if repinned:
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 02a8f8ce3f..56723b5e0b 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -199,7 +199,7 @@ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+     except Exception:
+         logger.warning('kanban quota: route resolve failed for %s; holding', task.id, exc_info=True)
+         return held, None
+-    if lane == 'review' or base[2] in ('review_unpinned', 'review_override') or unknown:
++    if lane == 'review' or base[2] in ('review_unpinned', 'review_override', 'review_override_refused') or unknown:
+         # An unrecorded wall may be any provider: no route can be proven to avoid it.
+         return held, None
+     try:
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 614426d8a0..26853e048c 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -5,21 +5,31 @@ import json
+ 
+ from agent.model_routing import ModelRoutingError, eligible_routes, is_class_selector, validate_policy
+ 
++# model_tier reason when this host's routing registry refuses the handoff's review_model: the review runs on a
++# registered model distinct from the implementer instead of spawning a worker that dies at startup.
++OVERRIDE_REFUSED = "review_override_refused"
++
+ 
+ class ReviewModelUnavailable(ModelRoutingError):
+     """No independent reviewer is configured; do not spawn the implementer's model."""
+ 
+ 
+-def _override(conn, task):
++def _handoff(conn, task):
++    """``(run_id, metadata)`` of the latest review handoff, or ``(None, {})``."""
+     # Metadata belongs to the handoff run, not to the Task row. Read only the
+     # latest handoff so a subsequent review can deliberately remove an override.
+     row = conn.execute(
+-        "SELECT metadata FROM task_runs WHERE task_id=? AND outcome='review_requested' "
++        "SELECT id, metadata FROM task_runs WHERE task_id=? AND outcome='review_requested' "
+         "ORDER BY id DESC LIMIT 1", (task.id,),
+     ).fetchone()
+-    metadata = json.loads(row[0]) if row and row[0] else {}
++    metadata = json.loads(row[1]) if row and row[1] else {}
+     if not isinstance(metadata, dict):
+         raise ReviewModelUnavailable("Review handoff metadata must be a mapping")
++    return (row[0] if row else None), metadata
++
++
++def _override(conn, task):
++    metadata = _handoff(conn, task)[1]
+     model = metadata.get("review_model")
+     if model is None:
+         return None
+@@ -36,7 +46,47 @@ def _override(conn, task):
+     return model, provider, "review_override"
+ 
+ 
+-def _distinct_deep(pin, assignee):
++def registry_refusal(model, provider, assignee):
++    """The worker's startup pin check (managed routing registry), run before spawn. [daveey]
++
++    Returns the ``ModelPinNotInRegistryError`` a worker for *assignee* on this host would die of, else None."""
++    from hermes_cli.kanban_model_assignment import ModelPinNotInRegistryError, _assignee_config, _check_managed_pin
++    try:
++        _check_managed_pin(model, (provider or "").strip() or None, _assignee_config(assignee))
++    except ModelPinNotInRegistryError as exc:
++        return exc
++    return None
++
++
++def refused_override(conn, task):
++    """``{model, provider, code, allowed}`` when this host refuses the handoff's review_model, else None."""
++    override = _override(conn, task)
++    if override is None:
++        return None
++    refusal = registry_refusal(override[0], override[1], getattr(task, "assignee", None))
++    if refusal is None:
++        return None
++    return {"model": override[0], "provider": override[1], "code": refusal.code, "allowed": refusal.allowed}
++
++
++def _implementer_model(conn, task):
++    """Concrete model the implementer ran: the card pin, else the handoff run's ``run_route`` receipt."""
++    pin = str(getattr(task, "model_override", None) or "").strip()
++    if pin and not is_class_selector(pin):
++        return pin
++    run_id = _handoff(conn, task)[0]
++    row = run_id is not None and conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='run_route' "
++        "ORDER BY id DESC LIMIT 1", (task.id, run_id)).fetchone()
++    try:
++        payload = json.loads(row[0]) if row and row[0] else {}
++    except (TypeError, ValueError):
++        payload = {}
++    model = str(payload.get("model") or "").strip() if isinstance(payload, dict) else ""
++    return model if model and not is_class_selector(model) else None
++
++
++def _distinct_deep(pin, assignee, *, registered=False):
+     from agent.model_routing_agent import class_requirements
+     from hermes_cli.kanban_model_assignment import _assignee_config
+     from hermes_cli.config import is_provider_enabled
+@@ -47,23 +97,47 @@ def _distinct_deep(pin, assignee):
+     routes = eligible_routes(policy, "deep", class_requirements(config), eligible=lambda route: is_provider_enabled(
+         providers.get(route["provider"], {}))) if policy.get("enabled", False) else []
+     for route in routes:
+-        if route["model"] != pin:
++        if route["model"] != pin and not (registered and registry_refusal(route["model"], route["provider"], assignee)):
+             return route["model"], route["provider"], "review_unpinned"
+     raise ReviewModelUnavailable(f"No eligible deep review model distinct from {pin!r}")
+ 
+ 
++def _independent(pin, cfg, assignee, *, registered=False):
++    """A reviewer distinct from *pin*: the strong tier, else another deep route. ``registered`` also requires
++    the host's routing registry to accept it (the fallback for a refused override)."""
++    strong = str(cfg.get("strong_model") or "").strip()
++    if strong and strong != pin and not is_class_selector(strong):
++        from hermes_cli.kanban_model_tier import infer_provider
++        route = strong, str(cfg.get("strong_provider") or "").strip() or infer_provider(strong), "review_unpinned"
++        if not (registered and registry_refusal(route[0], route[1], assignee)):
++            return route
++    return _distinct_deep(pin, assignee, registered=registered)
++
++
+ def resolve_review_model(conn, task, cfg):
+     """Return a review override/distinct route, or None for legacy unpinned reviews."""
+     override = _override(conn, task)
++    assignee = getattr(task, "assignee", None)
+     if override is not None:
+-        return override
++        refusal = registry_refusal(override[0], override[1], assignee)
++        if refusal is None:
++            return override
++        # A review_model this host's registry refuses (handoff metadata naming a model only another host
++        # serves: claude-fable-5-2 on pool workers, 2026-11-12) crashed every review worker at startup until
++        # the card gave up. Review on a registered model independent of the implementer instead.
++        implementer = _implementer_model(conn, task)
++        if not implementer:
++            raise ReviewModelUnavailable(
++                f"review_model {override[0]!r} is refused here ({refusal.code}) and the implementer's model is "
++                "unknown, so no independent registered reviewer can be chosen")
++        try:
++            model, provider, _ = _independent(implementer, cfg, assignee, registered=True)
++        except ReviewModelUnavailable as exc:
++            raise ReviewModelUnavailable(f"review_model {override[0]!r} is refused here ({refusal.code}); {exc}") from exc
++        return model, provider, OVERRIDE_REFUSED
+     pin = str(getattr(task, "model_override", None) or "").strip()
+     if not pin:
+         return None
+     if is_class_selector(pin):
+         raise ReviewModelUnavailable("A class pin does not identify the implementer; set review_model in the handoff")
+-    strong = str(cfg.get("strong_model") or "").strip()
+-    if strong and strong != pin and not is_class_selector(strong):
+-        from hermes_cli.kanban_model_tier import infer_provider
+-        return strong, str(cfg.get("strong_provider") or "").strip() or infer_provider(strong), "review_unpinned"
+-    return _distinct_deep(pin, getattr(task, "assignee", None))
++    return _independent(pin, cfg, assignee)
+diff --git a/tests/hermes_cli/test_kanban_managed_pin_policy.py b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+index 9cca5061a9..af86bc92c2 100644
+--- a/tests/hermes_cli/test_kanban_managed_pin_policy.py
++++ b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+@@ -203,3 +203,62 @@ def test_pin_policy_rejection_is_typed_and_keeps_its_message():
+     assert isinstance(info.value, ModelRoutingError)
+     assert 'Managed subscription policy rejects unregistered or ambiguous concrete pin' in str(info.value)
+     assert info.value.allowed == ['claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-6.1-sol']
++
++
++FABLE = 'claude-fable-5-2'
++
++
++def _hand_off_for_review(conn, metadata, *, pin=None):
++    """Implementer run spawned through dispatch (so its run_route receipt exists), then a review handoff."""
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    tid = kb.create_task(conn, title='Browser build', assignee='worker', model_override=pin,
++                         provider_override='anthropic' if pin else None)
++    dispatch_once(conn, spawn_fn=lambda *args: None, max_spawn=1)
++    assert kb.get_task(conn, tid).status == 'running'
++    assert kb.request_review(conn, tid, summary=f'reviewer-model: wanted {FABLE}, set-model refused: '
++                             'model_pin_not_in_routing_registry', metadata=metadata)
++    return tid
++
++
++def test_refused_review_override_falls_back_to_registered_independent_reviewer(board):
++    """t_01a1ce48c929f055 (2026-11-12): handoff metadata review_model=claude-fable-5-2, which only the hub
++    registers. Pool-worker review spawns died with ManagedPinRejectedError until the card gave up."""
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    conn, _ = board
++    tid = _hand_off_for_review(conn, {'review_model': FABLE, 'review_provider': 'anthropic'})
++    seen = []
++    dispatch_once(conn, spawn_fn=lambda item, *args: seen.append((item.model_override, item.provider_override)),
++                  max_spawn=1)
++    assert seen == [('claude-opus-5-5', 'anthropic')]
++    tier = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]
++    assert tier['reason'] == 'review_override_refused' and tier['lane'] == 'review'
++    assert tier['model'] == 'claude-opus-5-5'
++    assert tier['requested']['model'] == FABLE
++    assert tier['requested']['code'] == 'model_pin_not_in_routing_registry'
++    assert 'claude-opus-5-5' in tier['requested']['allowed']
++    assert kb.get_task(conn, tid).consecutive_failures == 0
++
++
++def test_refused_review_override_without_independent_reviewer_never_spawns(board):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    conn, _ = board
++    # The implementer ran on the only registered deep model: no distinct registered reviewer exists.
++    tid = _hand_off_for_review(conn, {'review_model': FABLE}, pin='claude-opus-5-5')
++    seen = []
++    dispatch_once(conn, spawn_fn=lambda *args: seen.append(args), max_spawn=1)
++    assert seen == []
++    task = kb.get_task(conn, tid)
++    assert task.status == 'review' and task.consecutive_failures == 0 and task.claim_lock is None
++    failed = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'spawn_failed'][-1]
++    assert failed['infrastructure'] is True
++    assert FABLE in failed['error'] and 'model_pin_not_in_routing_registry' in failed['error']
++
++
++def test_registered_review_override_is_kept(board):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    conn, _ = board
++    tid = _hand_off_for_review(conn, {'review_model': 'claude-opus-5-5'})
++    seen = []
++    dispatch_once(conn, spawn_fn=lambda item, *args: seen.append(item.model_override), max_spawn=1)
++    assert seen == ['claude-opus-5-5']
++    assert [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]['reason'] == 'review_override'
+-- 
+2.43.0
+

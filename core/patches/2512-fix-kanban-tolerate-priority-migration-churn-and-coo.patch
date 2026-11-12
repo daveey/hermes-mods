@@ -1,0 +1,1021 @@
+From bfb78bd5471fdb88d406e9fbb313da3265954386 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:11:10 +0000
+Subject: [PATCH] fix(kanban): tolerate priority migration churn and coordinate
+ origins [daveey]
+
+---
+ docs/kanban-priority-rollout.md               |  84 ++++-
+ hermes_cli/kanban_parser.py                   |   4 +-
+ hermes_cli/kanban_priority_cli.py             | 114 +++++--
+ hermes_cli/kanban_priority_executor.py        |  12 +-
+ hermes_cli/kanban_priority_inventory.py       |  42 +++
+ hermes_cli/kanban_priority_prepare.py         |  16 +-
+ hermes_cli/kanban_priority_runner.py          | 162 +++++++++
+ .../hermes_cli/test_kanban_priority_churn.py  | 111 +++++++
+ .../test_kanban_priority_executor.py          |   7 +
+ .../hermes_cli/test_kanban_priority_runner.py | 307 ++++++++++++++++++
+ .../hermes_cli/test_kanban_priority_verify.py |  14 +
+ 11 files changed, 821 insertions(+), 52 deletions(-)
+ create mode 100644 hermes_cli/kanban_priority_inventory.py
+ create mode 100644 hermes_cli/kanban_priority_runner.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_churn.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_runner.py
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+index 360e7504f8..3064fb5c8f 100644
+--- a/docs/kanban-priority-rollout.md
++++ b/docs/kanban-priority-rollout.md
+@@ -47,11 +47,85 @@ The commands below are an operator handoff, not a worker-executable runbook.
+ Digest binding and membership/value CAS provide freshness; there is no time-based
+ grant or expiry. Implementation tests do not establish live operator authorization.
+ 
+-1. Coordinate a quiet migration window across all origins. Before installing any
+-   cap-aware imports, prepare from the raw canonical Board snapshot (no local
+-   cap-aware pull). Use a locally owned existing task for `LOCAL_TASK`; do not
+-   create extra open tasks after capture. `ORIGIN` is the enrolled primary gateway
+-   name. The board flag is before the subcommand.
++### One-command operator coordinator
++
++Run this only from a genuine operator context, with this command surface installed
++on every origin. The local and remote CLIs retain the worker/delegated-lineage
++fences. The coordinator checks lineage before reading configuration or starting
++SSH; remote staging checks it before reading stdin. SSH is transport for an
++already authorized operator, never a worker authorization mechanism.
++
++Create an explicit JSON mapping for **every origin in the captured manifest**:
++
++```json
++{
++  "origin-a": {
++    "host": "operator@origin-a.example.com",
++    "argv": ["hermes", "kanban", "--board", "default", "supervisor-requests"],
++    "task": "EXISTING_LOCAL_TASK_A",
++    "backup": "/absolute/fresh-origin-a.json"
++  },
++  "origin-b": {
++    "host": "operator@origin-b.example.com",
++    "argv": ["/absolute/hermes", "kanban", "--board", "default", "supervisor-requests"],
++    "task": "EXISTING_LOCAL_TASK_B",
++    "backup": "/absolute/fresh-origin-b.json"
++  }
++}
++```
++
++`argv` is the complete remote command prefix, including board and
++`supervisor-requests`; arguments are individually shell-quoted for SSH. Hosts are
++never inferred or hardcoded. The local writer also needs an entry, but executes
++in-process rather than via SSH. Backup paths must be fresh absolute paths, and
++attachment tasks must already belong to their corresponding writers.
++
++```sh
++hermes kanban --board default supervisor-requests --priority-operation migrate \
++  --writer origin-a --host-map-file /absolute/operator-host-map.json \
++  --exception EXCEPTION_LOW --exception EXCEPTION_HIGH --allow-legacy-rollback
++```
++
++Alternatively pass the JSON directly with `--host-map '{...}'` (exactly one map
++flag). `--allow-legacy-rollback` explicitly permits automatic guarded recovery
++of above-cap originals; omit it only if refusing that policy rollback is intended.
++Do not pass separate task, backup, manifest, attachment or digest flags to migrate.
++
++The coordinator captures one global raw manifest, secures its local original and
++attachment, sends the **exact UTF-8 bytes** over SSH stdin with `stage --manifest -`,
++and validates every origin's attachment, writer, inventory and identical SHA256
++receipt **before any apply**. Staging failure or digest mismatch writes no
++priorities, but local preparation and any completed staging consume their fresh
++backup paths even if host-map coverage validation or later staging fails. Retain
++those backups and choose new paths before retrying. It then applies each origin,
++publishes each normal outbox via the
++supported `kanban_sync_client.push` API (no snapshot pull), rejects pending or
++rejected publication, and runs the canonical read-only verifier. Success requires
++canonical verification, not merely local apply receipts.
++
++A later apply refusal, SSH timeout or invalid response stops further applies and
++attempts guarded restore on **every attempted origin**, including the uncertain
++origin, in reverse order. The JSON report separates `attempted` origins from
++acknowledged, validated `applied` receipts and retains restore errors; the command
++exits nonzero even if recovery succeeds. The same CAS makes restore a no-op if
++apply never committed. Once all attempted origins have successful restore
++receipts it also publishes and attempts canonical `verify-restore`. Restore
++refusal never causes a forced write: residual uncertain outcomes require manual
++inspection of the origin's attachment, receipts and current state before resuming.
++Do not treat an absent apply receipt as proof of no write. Publication or canonical
++verification failure also exits nonzero, retaining receipts/backups for operator
++recovery, but does **not** trigger automatic rollback; automatic guarded restore
++is limited to apply failures.
++Save stdout as the durable operation report. No credentials or lineage are cleared.
++
++### Individual operator operations
++
++1. Before installing any cap-aware imports, prepare from the raw canonical Board
++   snapshot (no local cap-aware pull). No global quiet window or dispatcher freeze
++   is required: bounded capture observation and transactional apply/restore guards
++   determine safe progress under churn. Use a locally owned existing task for
++   `LOCAL_TASK`. `ORIGIN` is the enrolled primary gateway name. The board flag is
++   before the subcommand.
+ 
+    ```sh
+    hermes kanban --board default supervisor-requests --priority-operation prepare \
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index f67eeec547..4dee5fae70 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -391,8 +391,10 @@ _SPECS = [
+     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
+     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
+     _cmd("supervisor-requests", [
+-        _arg("--priority-operation", choices=["prepare", "stage", "apply", "restore", "verify", "verify-restore"],
++        _arg("--priority-operation", choices=["prepare", "stage", "apply", "restore", "verify", "verify-restore", "migrate", "publish"],
+              help="Operator-only attached priority migration; never executable by workers"),
++        _arg("--host-map", help="Explicit origin-to-SSH transport/task/backup JSON for migrate"),
++        _arg("--host-map-file", help="File containing the explicit migrate host-map JSON"),
+         _arg("--writer", help="Explicit local primary gateway identity"),
+         _arg("--manifest", help="Original manifest input file for stage"),
+         _arg("--backup", help="New exclusive backup path for prepare/stage"),
+diff --git a/hermes_cli/kanban_priority_cli.py b/hermes_cli/kanban_priority_cli.py
+index bfb5240f91..3d89c0a8b4 100644
+--- a/hermes_cli/kanban_priority_cli.py
++++ b/hermes_cli/kanban_priority_cli.py
+@@ -9,6 +9,7 @@ from hermes_cli import kanban_priority_prepare as prepare
+ from hermes_cli.kanban_db_sync import sync_state
+ from hermes_cli.kanban_output import _err
+ from hermes_cli.kanban_supervisor_requests import _non_worker_refusal
++from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
+ 
+ 
+ def run(conn, args) -> int:
+@@ -22,46 +23,91 @@ def run(conn, args) -> int:
+         if not args.writer:
+             raise ValueError('explicit --writer required')
+         action = args.priority_operation
+-        if action in ('prepare', 'stage'):
+-            if not args.task or not args.backup:
+-                raise ValueError('--task and a fresh --backup path required')
+-            data = None
+-            if action == 'stage':
+-                if not args.manifest or args.exception:
+-                    raise ValueError('stage requires --manifest and no --exception overrides')
+-                data = Path(args.manifest).read_bytes()
+-                manifest = json.loads(data)
+-            else:
+-                if args.manifest:
+-                    raise ValueError('prepare reads canonical Board, not --manifest')
+-                from hermes_cli import kanban_sync_client as sync
+-                identity = sync.load_identity()
+-                state = sync_state(conn) or {}
+-                if identity.gateway != args.writer or state.get('gateway_id') != args.writer:
+-                    raise ValueError('configured gateway differs from explicit writer')
+-                if state.get('mode') != 'primary' or not state.get('board_id'):
+-                    raise ValueError('prepare requires an enrolled primary board')
+-                manifest = prepare.capture(sync.Hub(identity), board_id=state['board_id'], exceptions=args.exception)
+-            result = prepare.stage(conn, manifest, path=Path(args.backup), task_id=args.task,
+-                                   writer=args.writer, original_bytes=data)
+-        elif action in ('verify', 'verify-restore'):
+-            result = _verify(conn, args, undo=action == 'verify-restore')
+-        elif action in ('apply', 'restore'):
+-            if not args.attachment_id or not args.digest:
+-                raise ValueError('--attachment-id and --digest required')
+-            if args.manifest or args.backup or args.exception:
+-                raise ValueError('apply/restore accept only the previously attached manifest')
+-            result = executor.apply_attached(conn, args.attachment_id, args.digest, writer=args.writer,
+-                                             undo=action == 'restore',
+-                                             allow_legacy_rollback=args.allow_legacy_rollback)
+-        else:
++        if action == 'migrate':
++            from hermes_cli import kanban_priority_runner as runner
++            code, result = runner.run(conn, args)
++            print(json.dumps(result, sort_keys=True))
++            return code
++        handlers = {
++            'publish': lambda: _publish(conn, args.writer),
++            'prepare': lambda: _prepare_stage(conn, args),
++            'stage': lambda: _prepare_stage(conn, args),
++            'verify': lambda: _verify(conn, args, undo=False),
++            'verify-restore': lambda: _verify(conn, args, undo=True),
++            'apply': lambda: _apply(conn, args, undo=False),
++            'restore': lambda: _apply(conn, args, undo=True),
++        }
++        if action not in handlers:
+             raise ValueError('unknown priority operation')
+-    except (ValueError, OSError) as exc:
++        result = handlers[action]()
++    except (ValueError, OSError, HubError, SyncUnavailable) as exc:
+         return _err(str(exc))
+     print(json.dumps(result, sort_keys=True))
+     return 0
+ 
+ 
++def _apply(conn, args, *, undo: bool) -> dict:
++    if not args.attachment_id or not args.digest:
++        raise ValueError('--attachment-id and --digest required')
++    if args.manifest or args.backup or args.exception:
++        raise ValueError('apply/restore accept only the previously attached manifest')
++    return executor.apply_attached(conn, args.attachment_id, args.digest, writer=args.writer,
++                                   undo=undo, allow_legacy_rollback=args.allow_legacy_rollback)
++
++
++def _manifest_bytes(path: str) -> bytes:
++    # The caller's operator fence must run before consuming stdin.
++    if path == '-':
++        import sys
++        return sys.stdin.buffer.read()
++    return Path(path).read_bytes()
++
++
++def _prepare_stage(conn, args) -> dict:
++    refusal = _non_worker_refusal()
++    if refusal:
++        raise PermissionError(refusal)
++    if not args.task or not args.backup:
++        raise ValueError('--task and a fresh --backup path required')
++    data = None
++    if args.priority_operation == 'stage':
++        if not args.manifest or args.exception:
++            raise ValueError('stage requires --manifest and no --exception overrides')
++        data = _manifest_bytes(args.manifest)
++        manifest = json.loads(data)
++    else:
++        if args.manifest:
++            raise ValueError('prepare reads canonical Board, not --manifest')
++        from hermes_cli import kanban_sync_client as sync
++        identity = sync.load_identity()
++        state = sync_state(conn) or {}
++        if identity.gateway != args.writer or state.get('gateway_id') != args.writer:
++            raise ValueError('configured gateway differs from explicit writer')
++        if state.get('mode') != 'primary' or not state.get('board_id'):
++            raise ValueError('prepare requires an enrolled primary board')
++        manifest = prepare.capture(sync.Hub(identity), board_id=state['board_id'], exceptions=args.exception)
++    return prepare.stage(conn, manifest, path=Path(args.backup), task_id=args.task,
++                         writer=args.writer, original_bytes=data)
++
++
++def _publish(conn, writer: str) -> dict:
++    """Use the supported outbox push API, without a cap-aware snapshot pull."""
++    refusal = _non_worker_refusal()
++    if refusal:
++        raise PermissionError(refusal)
++    from hermes_cli import kanban_sync_client as sync
++    identity = sync.load_identity()
++    state = sync_state(conn) or {}
++    if (identity.gateway != writer or state.get('gateway_id') != writer
++            or state.get('mode') != 'primary' or not state.get('board_id')):
++        raise ValueError('publication requires the configured enrolled primary writer')
++    result = sync.push(conn, sync.Hub(identity), state['board_id'], writer, primary=True)
++    counts = dict(conn.execute('SELECT state, COUNT(*) FROM kanban_sync_outbox GROUP BY state').fetchall())
++    if counts.get('pending', 0) or counts.get('rejected', 0) or result.rejected or result.deferred:
++        raise ValueError(f'publication incomplete: {counts}')
++    return {'writer': writer, 'sent': result.sent, 'pending': 0, 'rejected': 0}
++
++
+ def _verify(conn, args, *, undo: bool) -> dict:
+     import hashlib
+     from hermes_cli import kanban_sync_client as sync
+diff --git a/hermes_cli/kanban_priority_executor.py b/hermes_cli/kanban_priority_executor.py
+index c3a14938a1..22502f3452 100644
+--- a/hermes_cli/kanban_priority_executor.py
++++ b/hermes_cli/kanban_priority_executor.py
+@@ -46,12 +46,12 @@ def apply_attached(conn, attachment_id: int, digest: str, *, writer: str,
+                                "AND (created_on IS NULL OR created_on='') LIMIT 1").fetchone()
+         if unknown is not None:
+             raise ValueError("missing origin in live inventory")
+-        live = {r["id"]: r["priority"] for r in conn.execute(
+-            "SELECT id,priority FROM tasks WHERE created_on=? AND status NOT IN ('done','archived')", (writer,))}
+-        if set(live) != {r["id"] for r in rows}:
+-            raise ValueError("ownership or membership changed; capture a new manifest")
++        from hermes_cli.kanban_priority_inventory import classify
++        observed = [dict(r) for r in conn.execute("SELECT id,priority,created_on,status FROM tasks")]
++        rows, report = classify(manifest['rows'], observed, writer=writer)
++        live = {r['id']: r['priority'] for r in observed}
+         if all(live[r["id"]] == r[target] for r in rows):
+-            return {"changed": 0, "writer": writer, "manifest_sha256": digest}
++            return {"changed": 0, "writer": writer, "manifest_sha256": digest, **report}
+         if any(live[r["id"]] != r[source] for r in rows):
+             raise ValueError("priorities changed; capture a new manifest")
+         for row in rows:
+@@ -67,4 +67,4 @@ def apply_attached(conn, attachment_id: int, digest: str, *, writer: str,
+             changes.append(row["id"])
+     for task_id in changes:
+         kb.notify_task_updated(conn, task_id, ["priority"])
+-    return {"changed": len(changes), "writer": writer, "manifest_sha256": digest}
++    return {"changed": len(changes), "writer": writer, "manifest_sha256": digest, **report}
+diff --git a/hermes_cli/kanban_priority_inventory.py b/hermes_cli/kanban_priority_inventory.py
+new file mode 100644
+index 0000000000..8e453ae26d
+--- /dev/null
++++ b/hermes_cli/kanban_priority_inventory.py
+@@ -0,0 +1,42 @@
++"""Classify migration churn without relaxing ownership or value fences."""
++from __future__ import annotations
++
++from hermes_cli.kanban_priority import PRIORITY_CAP
++
++
++def classify(planned: list[dict], observed: list[dict], *, writer: str | None = None) -> tuple[list[dict], dict]:
++    """Require positive terminal evidence; missing rows are not departures.
++
++    The caller must hold its write transaction when using the returned active rows.
++    Foreign captured rows present locally are checked for owner drift too, so an
++    incoming transfer cannot masquerade as a newly created capped card.
++    """
++    indexed = {row['id']: row for row in observed}
++    recorded = {row['id']: row for row in planned}
++    active, skipped, arrivals = [], [], []
++    for row in planned:
++        current = indexed.get(row['id'])
++        if writer is not None and row['origin'] != writer and current is None:
++            continue
++        if current is None or current['created_on'] != row['origin']:
++            raise ValueError('ownership or membership changed; capture a new manifest')
++        if writer is not None and row['origin'] != writer:
++            continue
++        if current['status'] in ('done', 'archived'):
++            skipped.append({'id': row['id'], 'status': current['status'], 'priority': current['priority']})
++        else:
++            active.append(row)
++    for current in observed:
++        if current['id'] in recorded or current['status'] in ('done', 'archived'):
++            continue
++        if writer is not None and current['created_on'] != writer:
++            continue
++        if not current['created_on'] or type(current['priority']) is not int or current['priority'] > PRIORITY_CAP:
++            raise ValueError('ownership or membership changed; new open card exceeds cap or lacks origin')
++        arrivals.append({'id': current['id'], 'origin': current['created_on'], 'priority': current['priority']})
++    report = {}
++    if skipped:
++        report['skipped'] = sorted(skipped, key=lambda row: row['id'])
++    if arrivals:
++        report['arrivals'] = sorted(arrivals, key=lambda row: row['id'])
++    return active, report
+diff --git a/hermes_cli/kanban_priority_prepare.py b/hermes_cli/kanban_priority_prepare.py
+index af70bf006b..4fd20a546d 100644
+--- a/hermes_cli/kanban_priority_prepare.py
++++ b/hermes_cli/kanban_priority_prepare.py
+@@ -20,14 +20,18 @@ def verify(hub, manifest: dict, *, undo: bool = False) -> dict:
+     validate(manifest)
+     rows = _inventory(hub, manifest["board_id"])
+     # Reuse capture's validation of IDs, ownership and integer priorities.
+-    observed = validate(plan_global(rows, board_id=manifest["board_id"], exceptions=[]))
+-    actual = {r["id"]: (r["origin"], r["old"]) for r in observed["rows"]}
++    validate(plan_global(rows, board_id=manifest["board_id"], exceptions=[]))
++    from hermes_cli.kanban_priority_inventory import classify
++    try:
++        active, report = classify(manifest['rows'], rows)
++    except ValueError as exc:
++        raise ValueError(f'canonical {exc}') from exc
++    actual = {r['id']: (r['created_on'], r['priority']) for r in rows}
+     target = "old" if undo else "new"
+-    expected = {r["id"]: (r["origin"], r[target]) for r in manifest["rows"]}
+-    if actual != expected:
++    if any(actual[r['id']] != (r['origin'], r[target]) for r in active):
+         raise ValueError("canonical ownership, membership or priorities differ from manifest")
+-    return {"verified": len(expected), "board_id": manifest["board_id"],
+-            "direction": "restore" if undo else "apply"}
++    return {"verified": len(active), "board_id": manifest["board_id"],
++            "direction": "restore" if undo else "apply", **report}
+ 
+ 
+ def _inventory(hub, board_id: str) -> list[dict]:
+diff --git a/hermes_cli/kanban_priority_runner.py b/hermes_cli/kanban_priority_runner.py
+new file mode 100644
+index 0000000000..3cc92d4e4f
+--- /dev/null
++++ b/hermes_cli/kanban_priority_runner.py
+@@ -0,0 +1,162 @@
++"""Operator-only all-origin coordinator; never grants authority or edits lineage."""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++import shlex
++import subprocess
++from types import SimpleNamespace
++
++from hermes_cli.kanban_supervisor_requests import _non_worker_refusal
++from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
++from tools.environments.local import build_subprocess_env
++
++
++def require_operator():
++    refusal = _non_worker_refusal()
++    if refusal:
++        raise PermissionError(refusal)
++
++
++def load_hosts(args):
++    require_operator()  # Fence before reading even the transport configuration.
++    if bool(args.host_map) == bool(args.host_map_file):
++        raise ValueError('exactly one of --host-map or --host-map-file required')
++    hosts = json.loads(args.host_map or Path(args.host_map_file).read_text(encoding='utf-8-sig'))
++    if not isinstance(hosts, dict) or not hosts:
++        raise ValueError('host map must be a nonempty origin mapping')
++    for origin, entry in hosts.items():
++        if not isinstance(origin, str) or not origin or not isinstance(entry, dict):
++            raise ValueError('invalid origin mapping')
++        for key in ('host', 'task', 'backup'):
++            if not isinstance(entry.get(key), str) or not entry[key] or '\x00' in entry[key]:
++                raise ValueError(f'{origin}: missing {key}')
++        if entry['host'].startswith('-') or not Path(entry['backup']).is_absolute():
++            raise ValueError('SSH host must not be an option; backup must be absolute')
++        argv = entry.get('argv')
++        if not isinstance(argv, list) or not argv or any(not isinstance(s, str) or not s or '\x00' in s for s in argv):
++            raise ValueError(f'{origin}: command argv required')
++    return hosts
++
++
++def ssh(entry, words, data=None):
++    """One quoted remote argv, exact UTF-8 manifest bytes on stdin, no shell locally."""
++    require_operator()  # Do not spawn SSH from worker/delegated lineage.
++    result = subprocess.run(
++        ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20',
++         '--', entry['host'], shlex.join(entry['argv'] + words)],
++        input=None if data is None else data.decode('utf-8'),
++        capture_output=True, text=True, encoding='utf-8',
++        env=build_subprocess_env(), timeout=300, check=False,
++    )
++    if result.returncode:
++        raise ValueError(f'SSH operation refused ({result.returncode}): {result.stderr.strip()}')
++    receipt = json.loads(result.stdout)
++    if not isinstance(receipt, dict):
++        raise ValueError('invalid remote receipt')
++    return receipt
++
++
++def run(conn, args):
++    """Return (exit status, full receipts), including guarded rollback failures."""
++    require_operator()
++    from hermes_cli import kanban_priority_cli as cli
++    from hermes_cli import kanban_priority_executor as executor
++
++    hosts = load_hosts(args)
++    if args.writer not in hosts:
++        raise ValueError('local writer missing from host map')
++    if args.manifest or args.backup or args.task or args.attachment_id or args.digest:
++        raise ValueError('migrate takes attachment task/backup paths only from host map')
++    local = hosts[args.writer]
++    prepared_args = SimpleNamespace(**vars(args))
++    prepared_args.task, prepared_args.backup = local['task'], local['backup']
++    prepared_args.priority_operation = 'prepare'
++    prepared = cli._prepare_stage(conn, prepared_args)
++    data = Path(local['backup']).read_bytes()
++    digest = hashlib.sha256(data).hexdigest()
++    origins = prepared['origins']
++    report = {'manifest_sha256': digest, 'staged': {args.writer: prepared},
++              'attempted': [], 'applied': {}, 'restored': {}, 'published': {}, 'errors': []}
++
++    def invoke(origin, action):
++        require_operator()
++        stage = report['staged'][origin]
++        if origin == args.writer:
++            return executor.apply_attached(conn, stage['attachment_id'], digest, writer=origin,
++                                           undo=action == 'restore',
++                                           allow_legacy_rollback=args.allow_legacy_rollback)
++        words = ['--priority-operation', action, '--writer', origin,
++                 '--attachment-id', str(stage['attachment_id']), '--digest', digest]
++        if action == 'restore' and args.allow_legacy_rollback:
++            words.append('--allow-legacy-rollback')
++        return ssh(hosts[origin], words)
++
++    def checked(receipt, origin):
++        if receipt.get('writer') != origin or receipt.get('manifest_sha256') != digest:
++            raise ValueError(f'{origin}: receipt writer/digest mismatch')
++        return receipt
++
++    try:
++        if set(hosts) != set(origins):
++            raise ValueError('host map must exactly cover manifest origins')
++        checked(prepared, args.writer)
++        for origin in sorted(origins):
++            if origin == args.writer:
++                continue
++            entry = hosts[origin]
++            receipt = ssh(entry, ['--priority-operation', 'stage', '--writer', origin,
++                                 '--task', entry['task'], '--backup', entry['backup'], '--manifest', '-'], data)
++            report['staged'][origin] = receipt
++            checked(receipt, origin)
++        # Validate ALL staging receipts before the first priority write.
++        for origin, receipt in report['staged'].items():
++            checked(receipt, origin)
++            if receipt.get('origins') != origins or type(receipt.get('attachment_id')) is not int or receipt['attachment_id'] <= 0:
++                raise ValueError(f'{origin}: invalid staged inventory/attachment receipt')
++        if set(report['staged']) != set(origins):
++            raise ValueError('missing staged origin')
++    except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as exc:
++        report['errors'].append(str(exc))
++        return 1, report
++
++    def settle(*, undo):
++        for origin in sorted(origins):
++            receipt = (cli._publish(conn, args.writer) if origin == args.writer else
++                ssh(hosts[origin], ['--priority-operation', 'publish', '--writer', origin]))
++            if receipt.get('writer') != origin or receipt.get('pending') != 0 or receipt.get('rejected') != 0:
++                raise ValueError(f'{origin}: invalid publication receipt')
++            report['published'][origin] = receipt
++        verify_args = SimpleNamespace(**vars(args))
++        verify_args.manifest, verify_args.digest = local['backup'], digest
++        verify_args.exception = []
++        verify_args.allow_legacy_rollback = False
++        report['canonical_restore' if undo else 'canonical'] = cli._verify(conn, verify_args, undo=undo)
++
++    try:
++        for origin in sorted(origins):
++            # A lost reply can hide a committed write. Restore every attempted
++            # origin on failure; the same CAS makes a non-applied origin a no-op.
++            report['attempted'].append(origin)
++            report['applied'][origin] = checked(invoke(origin, 'apply'), origin)
++    except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as exc:
++        report['errors'].append(f'apply failed; attempting guarded restore of every attempted origin: {exc}')
++        for origin in reversed(report['attempted']):
++            try:
++                report['restored'][origin] = checked(invoke(origin, 'restore'), origin)
++            except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as restore_exc:
++                report['errors'].append(f'{origin}: guarded restore refused; manual inspection required: {restore_exc}')
++        if set(report['restored']) == set(report['attempted']):
++            try:
++                settle(undo=True)
++            except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as restore_exc:
++                report['errors'].append(f'restore publication/verification failed: {restore_exc}')
++        return 1, report
++
++    try:
++        settle(undo=False)
++    except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as exc:
++        report['errors'].append(f'publication/canonical verification failed: {exc}')
++        return 1, report
++    return 0, report
+diff --git a/tests/hermes_cli/test_kanban_priority_churn.py b/tests/hermes_cli/test_kanban_priority_churn.py
+new file mode 100644
+index 0000000000..53765bfa2e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_churn.py
+@@ -0,0 +1,111 @@
++"""Normal queue churn is accepted without weakening migration CAS."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_priority_executor as executor
++from hermes_cli import kanban_priority_prepare as prepare
++from hermes_cli import kanban_priority_migration as migration
++from tests.hermes_cli import test_kanban_priority_executor as fixtures
++from tests.hermes_cli import test_kanban_priority_verify as canonical
++
++kanban_home = fixtures.kanban_home
++conn = fixtures.conn
++
++
++@pytest.mark.parametrize('undo', [False, True])
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_departure_preserves_value_and_updates_remaining(conn, undo, status):
++    ids, attachment, digest = fixtures.setup_plan(conn)
++    if undo:
++        executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME)
++    before = fixtures.helpers.priorities(conn, ids)
++    conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, ids[2]))
++    conn.commit()
++    result = executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME,
++                                     undo=undo, allow_legacy_rollback=True)
++    assert result['changed'] == 1
++    assert result['skipped'] == [{'id': ids[2], 'status': status, 'priority': before[2]}]
++    assert fixtures.helpers.priorities(conn, ids) == [10000 if undo else 450, 10000, before[2]]
++    assert executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME,
++                                  undo=undo, allow_legacy_rollback=True)['changed'] == 0
++
++
++@pytest.mark.parametrize('undo', [False, True])
++@pytest.mark.parametrize('priority', [-1, 0, 1000, 1001])
++def test_arrival_cap_and_atomicity(conn, undo, priority):
++    ids, attachment, digest = fixtures.setup_plan(conn)
++    if undo:
++        executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME)
++    extra = fixtures.helpers.legacy(conn, [priority])[0]
++    conn.execute('UPDATE tasks SET created_on=? WHERE id=?', (fixtures.sync_helpers.ME, extra))
++    conn.commit()
++    before = fixtures.helpers.priorities(conn, ids)
++    if priority > 1000:
++        with pytest.raises(ValueError, match='exceeds cap'):
++            executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME,
++                                    undo=undo, allow_legacy_rollback=True)
++        assert fixtures.helpers.priorities(conn, ids) == before
++    else:
++        result = executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME,
++                                         undo=undo, allow_legacy_rollback=True)
++        assert result['arrivals'] == [{'id': extra, 'origin': fixtures.sync_helpers.ME, 'priority': priority}]
++        assert fixtures.helpers.priorities(conn, ids)[0] == (10000 if undo else 450)
++    assert fixtures.helpers.priorities(conn, [extra]) == [priority]
++
++
++@pytest.mark.parametrize('undo', [False, True])
++@pytest.mark.parametrize('change', ['owner', 'incoming-owner', 'terminal-owner', 'value'])
++def test_owner_and_open_value_remain_fenced(conn, undo, change):
++    ids, attachment, digest = fixtures.setup_plan(conn)
++    if undo:
++        executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME)
++    if change == 'incoming-owner':
++        conn.execute('UPDATE tasks SET created_on=?,priority=0 WHERE id=?', (fixtures.sync_helpers.ME, ids[1]))
++    elif change == 'value':
++        conn.execute('UPDATE tasks SET priority=777 WHERE id=?', (ids[2],))
++    else:
++        conn.execute("UPDATE tasks SET created_on='other' WHERE id=?", (ids[2],))
++        if change == 'terminal-owner':
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (ids[2],))
++    conn.commit()
++    before = fixtures.helpers.priorities(conn, ids)
++    with pytest.raises(ValueError, match='changed'):
++        executor.apply_attached(conn, attachment, digest, writer=fixtures.sync_helpers.ME,
++                                undo=undo, allow_legacy_rollback=True)
++    assert fixtures.helpers.priorities(conn, ids) == before
++
++
++@pytest.mark.parametrize('undo', [False, True])
++@pytest.mark.parametrize('change', ['done', 'archived', 'arrival', 'above-cap', 'owner', 'value', 'missing'])
++def test_canonical_churn_both_directions(undo, change):
++    rows = canonical.inventory()
++    manifest = migration.plan_global(rows, board_id='board', exceptions=[])
++    if not undo:
++        for row, planned in zip(rows, manifest['rows']):
++            row['priority'] = planned['new']
++    if change in ('done', 'archived'):
++        rows[0]['status'] = change
++    elif change in ('arrival', 'above-cap'):
++        rows.append({'id': 'd', 'created_on': 'new-origin', 'status': 'ready',
++                     'priority': 1000 if change == 'arrival' else 1001})
++    else:
++        actions = {
++            'owner': lambda: rows[0].update(created_on='other'),
++            'value': lambda: rows[0].update(priority=777),
++            'missing': lambda: rows.pop(0),
++        }
++        actions[change]()
++    before = copy.deepcopy(rows)
++    if change in ('above-cap', 'owner', 'value', 'missing'):
++        with pytest.raises(ValueError, match='canonical'):
++            prepare.verify(canonical.Canonical(rows), manifest, undo=undo)
++    else:
++        result = prepare.verify(canonical.Canonical(rows), manifest, undo=undo)
++        if change == 'arrival':
++            assert result['arrivals'] == [{'id': 'd', 'origin': 'new-origin', 'priority': 1000}]
++            assert result['verified'] == 2
++        else:
++            assert result['skipped'] == [{'id': 'a', 'status': change, 'priority': rows[0]['priority']}]
++            assert result['verified'] == 1
++    assert rows == before
+diff --git a/tests/hermes_cli/test_kanban_priority_executor.py b/tests/hermes_cli/test_kanban_priority_executor.py
+index f594191810..51bc6b983f 100644
+--- a/tests/hermes_cli/test_kanban_priority_executor.py
++++ b/tests/hermes_cli/test_kanban_priority_executor.py
+@@ -83,6 +83,13 @@ def test_executor_refuses_whole_origin_atomically(conn, case, reason, undo):
+     conn.commit()
+     before = helpers.priorities(conn, ids)
+     outbox_before = [tuple(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox")]
++    if case == 'terminal':
++        result = executor.apply_attached(conn, attachment, digest, writer=writer, undo=undo,
++                                         allow_legacy_rollback=True)
++        assert result['skipped'] == [{'id': ids[2], 'status': 'done', 'priority': before[2]}]
++        assert helpers.priorities(conn, ids)[2] == before[2]
++        assert helpers.priorities(conn, ids)[0] == (10000 if undo else 450)
++        return
+     with pytest.raises(ValueError, match=reason):
+         executor.apply_attached(conn, attachment, digest, writer=writer, undo=undo, allow_legacy_rollback=True)
+     assert helpers.priorities(conn, ids) == before
+diff --git a/tests/hermes_cli/test_kanban_priority_runner.py b/tests/hermes_cli/test_kanban_priority_runner.py
+new file mode 100644
+index 0000000000..56b6cd65e8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_runner.py
+@@ -0,0 +1,307 @@
++"""All-origin orchestration via fake SSH; no live migration or credentials."""
++import hashlib
++import io
++import json
++import shlex
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_priority_cli as cli
++from hermes_cli import kanban_priority_executor as executor
++from hermes_cli import kanban_priority_runner as runner
++from tests.hermes_cli import test_kanban_priority_cli as cli_helpers
++from tests.hermes_cli import test_kanban_priority_executor as helpers
++from tests.hermes_cli import test_kanban_sync_client as sync_helpers
++
++REAL_SUBPROCESS_RUN = subprocess.run
++kanban_home = sync_helpers.kanban_home
++conn = sync_helpers.live
++
++
++@pytest.fixture
++def rig(monkeypatch, tmp_path):
++    from agent import delegation_context
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    monkeypatch.setattr(delegation_context, 'is_delegated_child_process_context', lambda: False)
++    origins = {'a': 1, 'b': 1, 'c': 1}
++    hosts = {o: {'host': f'{o}.example.com', 'argv': ['hermes', 'kanban', '--board', 'test', 'supervisor-requests'],
++                 'task': f'task-{o}', 'backup': str(tmp_path / f'{o}.json')} for o in origins}
++    args = cli_helpers.args('--priority-operation', 'migrate', '--writer', 'a',
++                            '--host-map', json.dumps(hosts), '--allow-legacy-rollback')
++    data = '{ "note": "caf\u00e9", "rows": [] }\r\n'.encode('utf-8')
++    digest = hashlib.sha256(data).hexdigest()
++    events = []
++    def receipt(o):
++        return {'writer': o, 'manifest_sha256': digest, 'attachment_id': 1,
++                'origins': origins, 'backup': hosts[o]['backup']}
++    def prepare(_conn, _args):
++        events.append(('prepare', 'a'))
++        assert _args.priority_operation == 'prepare'
++        assert _args.task == 'task-a'
++        (tmp_path / 'a.json').write_bytes(data)
++        return receipt('a')
++    def apply(_conn, attachment, dg, *, writer, undo, allow_legacy_rollback):
++        assert attachment == 1 and dg == digest
++        assert allow_legacy_rollback
++        events.append(('restore' if undo else 'apply', writer))
++        return receipt(writer)
++    def publish(_conn, writer):
++        events.append(('publish', writer))
++        return {'writer': writer, 'pending': 0, 'rejected': 0}
++    def verify(_conn, _args, *, undo):
++        assert _args.manifest == hosts['a']['backup'] and _args.digest == digest
++        events.append(('verify-restore' if undo else 'verify', 'a'))
++        return {'verified': 3}
++    def transport(cmd, **kwargs):
++        assert cmd[:5] == ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20']
++        assert cmd[-3] == '--'
++        words = shlex.split(cmd[-1])
++        assert words[:5] == hosts['b']['argv']
++        action = words[words.index('--priority-operation') + 1]
++        origin = words[words.index('--writer') + 1]
++        assert cmd[-2] == hosts[origin]['host']
++        assert kwargs['encoding'] == 'utf-8' and kwargs['text']
++        assert kwargs['env'].get('RUNNER_TEST_SENTINEL') == 'retained'
++        if action == 'stage':
++            assert kwargs['input'].encode('utf-8') == data
++            assert words[words.index('--manifest') + 1] == '-'
++            assert words[words.index('--backup') + 1] == hosts[origin]['backup']
++        else:
++            assert kwargs['input'] is None
++        if action in ('apply', 'restore'):
++            assert words[words.index('--digest') + 1] == digest
++            assert words[words.index('--attachment-id') + 1] == '1'
++        if action == 'restore':
++            assert '--allow-legacy-rollback' in words
++        events.append((action, origin))
++        output = {'writer': origin, 'pending': 0, 'rejected': 0} if action == 'publish' else receipt(origin)
++        return SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr='')
++    monkeypatch.setenv('RUNNER_TEST_SENTINEL', 'retained')
++    monkeypatch.setattr(cli, '_prepare_stage', prepare)
++    monkeypatch.setattr(cli, '_publish', publish)
++    monkeypatch.setattr(cli, '_verify', verify)
++    monkeypatch.setattr(executor, 'apply_attached', apply)
++    monkeypatch.setattr(runner.subprocess, 'run', transport)
++    return SimpleNamespace(args=args, hosts=hosts, data=data, events=events, transport=transport)
++
++
++def test_all_stages_before_apply_and_actual_command_wiring(rig, capsys):
++    assert cli.run(None, rig.args) == 0
++    report = json.loads(capsys.readouterr().out)
++    assert set(report['staged']) == {'a', 'b', 'c'}
++    assert report['attempted'] == ['a', 'b', 'c']
++    assert set(report['applied']) == {'a', 'b', 'c'}
++    assert report['canonical'] == {'verified': 3}
++    assert rig.events == [('prepare', 'a'), ('stage', 'b'), ('stage', 'c'),
++                          ('apply', 'a'), ('apply', 'b'), ('apply', 'c'),
++                          ('publish', 'a'), ('publish', 'b'), ('publish', 'c'), ('verify', 'a')]
++
++
++@pytest.mark.parametrize('bad', ['digest', 'writer', 'origins', 'attachment'])
++def test_stage_mismatch_never_writes_priority(rig, monkeypatch, bad):
++    def transport(cmd, **kwargs):
++        result = rig.transport(cmd, **kwargs)
++        receipt = json.loads(result.stdout)
++        receipt[{'digest': 'manifest_sha256', 'writer': 'writer', 'origins': 'origins',
++                 'attachment': 'attachment_id'}[bad]] = {'origins': {'a': 1}, 'attachment': True}.get(bad, 'wrong')
++        result.stdout = json.dumps(receipt)
++        return result
++    monkeypatch.setattr(runner.subprocess, 'run', transport)
++    code, report = runner.run(None, rig.args)
++    assert code != 0 and report['errors']
++    assert not report['applied']
++    assert not any(e[0] in ('apply', 'restore', 'publish') for e in rig.events)
++
++
++@pytest.mark.parametrize('restore_refuses', [False, True])
++def test_later_apply_refusal_restores_attempted_origins_nonzero(rig, monkeypatch, restore_refuses):
++    def transport(cmd, **kwargs):
++        words = shlex.split(cmd[-1])
++        if 'apply' in words and '--writer c' in cmd[-1]:
++            return SimpleNamespace(returncode=1, stdout='', stderr='changed priority')
++        if restore_refuses and 'restore' in words:
++            return SimpleNamespace(returncode=1, stdout='', stderr='restore CAS refused')
++        return rig.transport(cmd, **kwargs)
++    monkeypatch.setattr(runner.subprocess, 'run', transport)
++    code, report = runner.run(None, rig.args)
++    assert code != 0
++    assert set(report['applied']) == {'a', 'b'}
++    assert report['attempted'] == ['a', 'b', 'c']
++    assert set(report['restored']) == ({'a'} if restore_refuses else {'a', 'b', 'c'})
++    assert ('restore', 'a') in rig.events
++    assert ('apply', 'c') not in rig.events
++    assert report['errors']
++    if restore_refuses:
++        assert any('guarded restore refused' in s for s in report['errors'])
++        assert any('manual inspection required' in s for s in report['errors'])
++        assert 'canonical_restore' not in report
++
++
++@pytest.mark.parametrize('failure', ['timeout', 'parse', 'receipt'])
++def test_apply_committed_without_acknowledgement_is_guardedly_restored(rig, monkeypatch, failure):
++    committed = set()
++
++    def transport(cmd, **kwargs):
++        words = shlex.split(cmd[-1])
++        action = words[words.index('--priority-operation') + 1]
++        origin = words[words.index('--writer') + 1]
++        result = rig.transport(cmd, **kwargs)
++        if action == 'apply':
++            committed.add(origin)
++            if origin == 'b':
++                if failure == 'timeout':
++                    raise subprocess.TimeoutExpired(cmd, 300)
++                result.stdout = ('not JSON' if failure == 'parse' else
++                                 json.dumps({'writer': origin, 'manifest_sha256': 'wrong'}))
++        elif action == 'restore':
++            committed.discard(origin)
++        return result
++
++    monkeypatch.setattr(runner.subprocess, 'run', transport)
++    code, report = runner.run(None, rig.args)
++    assert code == 1 and report['errors']
++    assert committed == set()
++    assert report['attempted'] == ['a', 'b']
++    assert set(report['applied']) == {'a'}
++    assert set(report['restored']) == {'a', 'b'}
++    assert [event for event in rig.events if event[0] == 'restore'] == [('restore', 'b'), ('restore', 'a')]
++    assert ('apply', 'c') not in rig.events
++    assert report['canonical_restore'] == {'verified': 3}
++
++
++@pytest.mark.parametrize('delegated', [False, True])
++def test_lineage_rejected_before_file_stdin_or_ssh(monkeypatch, delegated):
++    from agent import delegation_context
++    monkeypatch.setattr(delegation_context, 'is_delegated_child_process_context', lambda: delegated)
++    if not delegated:
++        monkeypatch.setenv('HERMES_KANBAN_TASK', 'worker')
++    def forbidden(*_a, **_kw):
++        pytest.fail('lineage fence reached protected I/O')
++    monkeypatch.setattr(runner.subprocess, 'run', forbidden)
++    monkeypatch.setattr(cli, '_manifest_bytes', forbidden)
++    args = cli_helpers.args('--priority-operation', 'migrate', '--writer', 'a', '--host-map-file', '/missing')
++    with pytest.raises(PermissionError):
++        runner.run(None, args)
++    with pytest.raises(PermissionError):
++        runner.ssh({}, [], b'payload')
++    args.priority_operation = 'stage'
++    args.task, args.backup, args.manifest = 'task', '/missing', '-'
++    assert cli.run(None, args) != 0
++
++
++def test_stage_stdin_keeps_exact_original_bytes(conn, tmp_path, monkeypatch, capsys):
++    ids, _, _ = helpers.setup_plan(conn)
++    rows = [dict(r) for r in conn.execute('SELECT id,priority,created_on,status FROM tasks')]
++    from hermes_cli.kanban_priority_migration import plan_global
++    data = (json.dumps(plan_global(rows, board_id=sync_helpers.BOARD, exceptions=[]), indent=3) + '\r\n').encode()
++    monkeypatch.setattr('sys.stdin', SimpleNamespace(buffer=io.BytesIO(data)))
++    backup = tmp_path / 'stdin.json'
++    args = cli_helpers.args('--priority-operation', 'stage', '--writer', sync_helpers.ME,
++                            '--manifest', '-', '--backup', str(backup), '--task', ids[0])
++    assert cli.run(conn, args) == 0
++    receipt = json.loads(capsys.readouterr().out)
++    assert backup.read_bytes() == data
++    assert receipt['manifest_sha256'] == hashlib.sha256(data).hexdigest()
++
++
++def test_host_map_file_and_coverage(rig, tmp_path):
++    path = tmp_path / 'hosts.json'
++    path.write_text(json.dumps(rig.hosts), encoding='utf-8')
++    rig.args.host_map, rig.args.host_map_file = None, str(path)
++    assert runner.load_hosts(rig.args) == rig.hosts
++    hosts = dict(rig.hosts)
++    del hosts['c']
++    path.write_text(json.dumps(hosts), encoding='utf-8')
++    code, report = runner.run(None, rig.args)
++    assert code != 0 and 'exactly cover' in report['errors'][0]
++    assert not report['applied']
++
++
++def test_publish_uses_supported_push_without_pull(conn, monkeypatch):
++    from hermes_cli import kanban_sync_client as sync
++    helpers.setup_plan(conn)
++    monkeypatch.setattr(sync, 'load_identity', lambda: SimpleNamespace(gateway=sync_helpers.ME))
++    monkeypatch.setattr(sync, 'Hub', lambda identity: 'fake-hub')
++    calls = []
++    def push(connection, hub, board, writer, *, primary):
++        calls.append((connection, hub, board, writer, primary))
++        return sync.PushResult()
++    monkeypatch.setattr(sync, 'push', push)
++    result = cli._publish(conn, sync_helpers.ME)
++    assert result['pending'] == result['rejected'] == 0
++    assert calls == [(conn, 'fake-hub', sync_helpers.BOARD, sync_helpers.ME, True)]
++
++
++def test_canonical_failure_returns_nonzero_keeps_receipts(rig, monkeypatch):
++    def refuse(*args, **kwargs):
++        raise ValueError('canonical mismatch')
++    monkeypatch.setattr(cli, '_verify', refuse)
++    code, report = runner.run(None, rig.args)
++    assert code != 0 and len(report['applied']) == 3
++    assert 'canonical mismatch' in report['errors'][0]
++    assert not report['restored']
++    assert not any(event[0] == 'restore' for event in rig.events)
++
++
++def test_real_subprocess_fake_ssh_preserves_bytes_and_argv(rig, tmp_path, monkeypatch):
++    saved = tmp_path / 'received.bin'
++    argv_file = tmp_path / 'argv.json'
++    executable = tmp_path / 'ssh'
++    executable.write_text(
++        f'#!{sys.executable}\n'
++        'import sys, json\nfrom pathlib import Path\n'
++        f'Path({str(saved)!r}).write_bytes(sys.stdin.buffer.read())\n'
++        f'Path({str(argv_file)!r}).write_text(json.dumps(sys.argv[1:]))\n'
++        'print(json.dumps({"transport": "ok"}))\n', encoding='utf-8')
++    executable.chmod(0o700)
++    monkeypatch.setenv('PATH', str(tmp_path))
++    monkeypatch.setattr(runner.subprocess, 'run', REAL_SUBPROCESS_RUN)
++    entry = {'host': 'operator@fake.example.com', 'argv': ['/command with spaces/hermes', 'kanban']}
++    words = ['--task', "task ' quoted", '--manifest', '-']
++    assert runner.ssh(entry, words, rig.data) == {'transport': 'ok'}
++    assert saved.read_bytes() == rig.data
++    argv = json.loads(argv_file.read_text(encoding='utf-8'))
++    assert argv[:4] == ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20']
++    assert argv[-3:-1] == ['--', entry['host']]
++    assert shlex.split(argv[-1]) == entry['argv'] + words
++
++
++@pytest.mark.parametrize('kind', ['worker', 'delegated'])
++def test_remote_stage_stdin_fence_is_before_read(conn, monkeypatch, kind):
++    from agent import delegation_context
++    monkeypatch.setattr(delegation_context, 'is_delegated_child_process_context', lambda: kind == 'delegated')
++    if kind == 'worker':
++        monkeypatch.setenv('HERMES_KANBAN_TASK', 'worker')
++    class NeverRead:
++        def read(self):
++            pytest.fail('unauthorized remote stdin read')
++    monkeypatch.setattr('sys.stdin', SimpleNamespace(buffer=NeverRead()))
++    args = cli_helpers.args('--priority-operation', 'stage', '--writer', 'a',
++                            '--task', 'task', '--backup', '/fresh', '--manifest', '-')
++    assert cli.run(conn, args) != 0
++
++
++def test_complete_rollback_publishes_and_canonically_verifies(rig, monkeypatch):
++    def transport(cmd, **kwargs):
++        if '--priority-operation apply --writer c' in cmd[-1]:
++            return SimpleNamespace(returncode=1, stdout='', stderr='CAS refusal')
++        return rig.transport(cmd, **kwargs)
++    monkeypatch.setattr(runner.subprocess, 'run', transport)
++    code, report = runner.run(None, rig.args)
++    assert code == 1 and report['canonical_restore'] == {'verified': 3}
++    assert rig.events[-4:] == [('publish', 'a'), ('publish', 'b'), ('publish', 'c'), ('verify-restore', 'a')]
++
++
++def test_publish_hub_error_keeps_receipts(rig, monkeypatch):
++    from hermes_cli.kanban_sync_client import HubError
++    def refuse(*args, **kwargs):
++        raise HubError(503, 'unavailable')
++    monkeypatch.setattr(cli, '_publish', refuse)
++    code, report = runner.run(None, rig.args)
++    assert code == 1 and set(report['applied']) == {'a', 'b', 'c'}
++    assert '503' in report['errors'][0]
++    assert not report['restored']
++    assert not any(event[0] == 'restore' for event in rig.events)
+diff --git a/tests/hermes_cli/test_kanban_priority_verify.py b/tests/hermes_cli/test_kanban_priority_verify.py
+index 2901f5e862..39bdcae6c6 100644
+--- a/tests/hermes_cli/test_kanban_priority_verify.py
++++ b/tests/hermes_cli/test_kanban_priority_verify.py
+@@ -47,5 +47,19 @@ def test_verify_refuses_stale_global_inventory(change):
+         "exception-reopened": lambda: rows[2].update(status="ready"),
+     }
+     actions[change]()
++    if change in ('terminal', 'new'):
++        before = copy.deepcopy(rows)
++        result = prepare.verify(Canonical(rows), manifest)
++        if change == 'terminal':
++            assert result['skipped'] == [{'id': 'a', 'status': 'done', 'priority': rows[0]['priority']}]
++            assert result['verified'] == 1
++        else:
++            assert result['arrivals'] == [{'id': 'd', 'origin': 'one', 'priority': 0}]
++            rows[-1]['priority'] = 1001
++            with pytest.raises(ValueError, match='canonical'):
++                prepare.verify(Canonical(rows), manifest)
++            rows[-1]['priority'] = 0
++        assert rows == before
++        return
+     with pytest.raises(ValueError, match="canonical"):
+         prepare.verify(Canonical(rows), manifest)
+-- 
+2.43.0
+

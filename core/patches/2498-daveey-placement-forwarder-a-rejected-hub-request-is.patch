@@ -1,0 +1,434 @@
+From 9d5d4a43b7a9a75a4149a534d99a063b5e3b20ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:41:04 +0000
+Subject: [PATCH] [daveey] placement forwarder: a rejected hub request is
+ terminal, never a clock park
+
+Incident placement:worker-2:b80b2c801dd844db7b56cbf4 (card t_01a1ce825d4f4a54): the MacBook
+rejected the forwarded copy with create_overlap 8.5 s after it was sent. The only match it named
+was the forwarding card itself, the local placeholder that the target sees through the hub replica.
+Forwarder.run/_await only treated `done` as terminal (remote_task_id), so await_task_id returned
+None and the card was re-parked on the REQUEUE_SECONDS clock every 10 minutes, forever.
+
+- kanban_placement: FAILED_STATES (rejected/expired/failed, hermes-hub's terminal non-done
+  states) and remote_rejection(rid), which parses the target's `kanban create --json` refusal
+  out of the stored result (code, matches, total_matches, note). await_task_id stops
+  waiting as soon as the request has failed.
+- Forwarder._forward: when the client carries options, send distinct_from=[local card id] +
+  distinct_reason, so the receiver's overlap guard never self-matches the placeholder. A client
+  that rejects the option as create_option_unknown still gets the plain forward. The request id is
+  derived from the transport key, so in-flight forwards keep their ids.
+- Forwarder._await: a failed request goes to _rejected instead of a clock park (checked before the
+  45 s wait and after it). A create_overlap that names only this card is re-forwarded once with
+  distinct_from under a new transport key (`...:distinct`, so a new request id) and recorded as
+  reforwarded/reforward_of. An overlap with another card, or with hidden matches
+  (total_matches > shown), blocks for a decision and ends the deferral. Anything else, including
+  a second self-match or an old client that cannot send distinct_from, cancels the deferral
+  (placement_deferred_cancelled), so the card runs here.
+
+Proof: new tests/hermes_cli/test_kanban_placement_rejected.py (the test_kanban_placement.py facade
+is at its 2000-line cap). (a) A rejected sent row never yields a `scheduled` event, either on wake
+or during the first wait, for self-overlap, other-overlap and plain rejections.
+(b) A self-match overlap re-forwards once with distinct_from under a new request id, and a second
+self-match does not forward a third time. 9 hand mutants of the new conditions all killed.
+Replay on worker-2's hub replica: of the sent rows (52 done, 2 rejected), exactly one placement
+request is non-done, the incident row. Only its handling changes: a re-forward with
+distinct_from. The other rejected row is not a placement request.
+Placement suites (placement, _cancel, _identity, origin_notify, lockguard, watcher, ...) pass:
+377 tests.
+---
+ hermes_cli/kanban_placement.py                |  43 +++-
+ hermes_cli/kanban_placement_forward.py        |  79 ++++++-
+ .../test_kanban_placement_rejected.py         | 194 ++++++++++++++++++
+ 3 files changed, 307 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_rejected.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 0362b66597..d079606934 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -955,6 +955,47 @@ def remote_state(rid: str) -> Optional[str]:
+     return row[0] if row else None
+ 
+ 
++# hermes-hub's terminal request states other than ``done``: the target will never make the card. [daveey]
++FAILED_STATES = ("rejected", "expired", "failed")
++
++
++def remote_rejection(rid: str) -> dict:
++    """Why a request in a :data:`FAILED_STATES` state failed: ``{state, code, matches, total_matches, error}``.
++
++    The target's refusal is its ``hermes kanban create --json`` output, which hermes-hub stores as text in the
++    result's ``stdout`` (and ``error``), so the JSON line is parsed out of it. ``{}`` while the request is not
++    failed. Never raises."""
++    row = _sent_row(rid)
++    if not row or row[0] not in FAILED_STATES:
++        return {}
++    out: dict = {"state": row[0], "code": None, "matches": [], "total_matches": 0, "error": ""}
++    try:
++        res = json.loads(row[1] or "{}")
++    except ValueError:
++        res = {}
++    if not isinstance(res, dict):
++        return out
++    out["error"] = str(res.get("error") or res.get("stdout") or "")[:600]
++    out["code"] = res.get("code") if isinstance(res.get("code"), str) else None
++    for text in (res.get("stdout"), res.get("error")):
++        for line in str(text or "").splitlines():
++            line = line.strip()
++            if not line.startswith("{"):
++                continue
++            try:
++                parsed = json.loads(line)
++            except ValueError:
++                continue
++            if isinstance(parsed, dict) and isinstance(parsed.get("code"), str):
++                matches = [m for m in parsed.get("matches") or [] if isinstance(m, dict)]
++                total = parsed.get("total_matches")
++                out.update(code=parsed["code"], matches=matches,
++                           total_matches=total if type(total) is int else len(matches),
++                           error=str(parsed.get("note") or out["error"])[:600])
++                return out
++    return out
++
++
+ _OUTPUT_ID = re.compile(r'"id"\s*:\s*"(t_[A-Za-z0-9_]+)"')
+ 
+ 
+@@ -1042,6 +1083,6 @@ def await_task_id(rid: str, *, hub_cli: str, budget: float, clock: Callable[[],
+         tid = remote_task_id(rid)
+         if tid:
+             return tid, remote_status(rid)
+-        if clock() >= deadline:
++        if clock() >= deadline or remote_state(rid) in FAILED_STATES:  # rejected: it will never come
+             return None, None
+         sleep(1.0)
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 2c7afe8db4..0ee4ad0119 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -17,7 +17,11 @@ instead of an LLM worker (:func:`forward_argv`); it costs seconds, not a worker:
+ 
+ Any failure before the target accepted the card (target not live for :data:`MAX_NOT_LIVE` attempts,
+ refused, an exception) cancels the deferral (``placement_deferred_cancelled``) and ``exec``s the
+-normal worker command, so the card still runs, here. Never a silent stall.
++normal worker command, so the card still runs, here. Never a silent stall. That includes a request the
++target rejected after it was queued (a hub ``rejected``/``expired``/``failed`` state): it is never parked
++on. The forward names the local card in ``distinct_from`` (the target sees it through the replica and
++would refuse its own copy as an overlap); a ``create_overlap`` naming only this card is re-forwarded
++once, under a new request id; an overlap with another card blocks this one for a decision.
+ """
+ from __future__ import annotations
+ 
+@@ -465,6 +469,9 @@ class Forwarder:
+         self.create = kp.create_remote
+         self.await_id = kp.await_task_id
+         self.remote_task_id = kp.remote_task_id
++        self.remote_state = kp.remote_state
++        self.rejection = kp.remote_rejection
++        self.carries_options = lambda: kp.hub_carries_options(self.hub_cli)
+         self.check = lambda gw, tid: kwait.check_remote(gw, "task", tid, until=UNTIL)
+ 
+     # Each step returns a short action word; "fallback" means: exec the normal worker.
+@@ -487,7 +494,7 @@ class Forwarder:
+             return self._await(task, target, st["request_id"])
+         return self._forward(task, target, st)
+ 
+-    def _forward(self, task, target: str, st: dict) -> str:
++    def _forward(self, task, target: str, st: dict, *, reforward_of: Optional[str] = None) -> str:
+         dead = self.live(target)
+         if dead:
+             if int(st.get("not_live") or 0) + 1 >= MAX_NOT_LIVE:
+@@ -495,20 +502,45 @@ class Forwarder:
+             self._event(NOT_LIVE, {"why": dead})
+             return self._park_clock(f"{target} is not live yet ({dead}); retrying the forward")
+         args = remote_args(self.conn, task, self_gw=self.self_gw)
+-        placed = self.create(args, target=target, origin_session=st.get("origin_session"),
+-                             origin_profile=st.get("origin_profile") or "default", self_gw=self.self_gw,
+-                             cfg=self.cfg, hub_cli=self.hub_cli,
+-                             # This is transport identity, not a caller's receiver-side creation key.
+-                             transport_key=f"placement-forward:{self.self_gw}:{task.id}")
++        distinct = self.carries_options()
++        if distinct:
++            # The target's overlap guard sees this local card through the replica and would refuse its own copy
++            # as a duplicate of it (create_overlap naming only this card), so name it as distinct up front.
++            args.update(distinct_from=[task.id], distinct_reason=(
++                f"placement copy of {self.self_gw} card {task.id}: that card is this card's deferred-placement "
++                f"placeholder and completes when this one is done, not separate work"))
++        # This is transport identity, not a caller's receiver-side creation key. A re-forward after a
++        # rejection needs a new one: the request id is derived from it, and the old id is terminal.
++        key = f"placement-forward:{self.self_gw}:{task.id}" + (":distinct" if reforward_of else "")
++        placed = self._create(args, target, st, key)
++        if distinct and not placed.get("ok") and "create_option_unknown" in str(placed.get("error") or "") \
++                and "distinct_" in str(placed.get("error") or ""):
++            # A client that predates distinct_from: send the plain card (as before this option existed).
++            args.pop("distinct_from", None)
++            args.pop("distinct_reason", None)
++            placed = self._create(args, target, st, key)
+         if not placed.get("ok"):
+             return self._cancel(f"{target} refused the card: {placed.get('error')}")
+         rid = placed["request_id"]
+-        self._event(FORWARDED, {"request_id": rid, "queued_only": bool(placed.get("queued_only"))})
++        payload = {"request_id": rid, "queued_only": bool(placed.get("queued_only"))}
++        if reforward_of:
++            payload.update(reforwarded=True, reforward_of=reforward_of)
++        self._event(FORWARDED, payload)
+         return self._await(task, target, rid)
+ 
++    def _create(self, args: dict, target: str, st: dict, key: str) -> dict:
++        return self.create(args, target=target, origin_session=st.get("origin_session"),
++                           origin_profile=st.get("origin_profile") or "default", self_gw=self.self_gw,
++                           cfg=self.cfg, hub_cli=self.hub_cli, transport_key=key)
++
+     def _await(self, task, target: str, rid: str) -> str:
++        from hermes_cli.kanban_placement import FAILED_STATES
++        if self.remote_state(rid) in FAILED_STATES:
++            return self._rejected(task, target, rid)
+         tid, _status = self.await_id(rid, hub_cli=self.hub_cli, budget=AWAIT_BUDGET)
+         if not tid:
++            if self.remote_state(rid) in FAILED_STATES:  # refused during the wait (seconds, usually)
++                return self._rejected(task, target, rid)
+             return self._park_clock(f"request {rid} is queued for {target}; waiting for {target} to make the card")
+         self._event(FORWARDED, {"request_id": rid, "remote_task_id": tid})
+         from hermes_cli import kanban_db as kb
+@@ -517,6 +549,37 @@ class Forwarder:
+                        f"here needs this machine). This card completes when {tid} is done.")
+         return self._park_remote(target, tid)
+ 
++    def _rejected(self, task, target: str, rid: str) -> str:
++        """The target refused request ``rid`` for good (a terminal state other than done): it will never make
++        the card, so never park on it. A ``create_overlap`` naming only this card (the target saw the local
++        placeholder through the replica) is re-forwarded once with ``distinct_from``; a real overlap blocks for a
++        decision; anything else cancels the deferral and runs the card here."""
++        from hermes_cli import kanban_db as kb
++        why = self.rejection(rid) or {}
++        st = state(self.conn, self.task_id) or {}
++        code = why.get("code") or why.get("state") or "rejected"
++        text = (why.get("error") or "").strip()[:400]
++        ids = [str(m.get("id")) for m in why.get("matches") or []]
++        if code == "create_overlap" and ids:
++            others = [i for i in ids if i != task.id]
++            self_only = not others and int(why.get("total_matches") or len(ids)) <= len(ids)
++            if self_only and not st.get("reforwarded") and self.carries_options():
++                print(f"placement forward: {target} refused {rid} as an overlap with this card itself; "
++                      "re-forwarding with distinct_from", flush=True)
++                return self._forward(task, target, st, reforward_of=rid)
++            if not self_only:
++                named = ", ".join(others) or f"{why.get('total_matches')} (not all named in the refusal)"
++                ok = kb.block_task(
++                    self.conn, self.task_id, kind="needs_input", expected_run_id=self.run_id,
++                    reason=(f"{target} refused to make this card (create_overlap): it already has open card(s) "
++                            f"{named} that look like this work. {text} "
++                            "1) If that card covers it, archive this one. 2) If this is separate work, unblock "
++                            "this card: it then runs here."))
++                if ok:
++                    self._event(CANCELLED, {"why": f"{target} rejected {rid}: create_overlap with {others}"})
++                return "blocked" if ok else "block-refused"
++        return self._cancel(f"{target} rejected request {rid} ({code}): {text}"[:600])
++
+     def _settle(self, task, target: str, rtid: str) -> str:
+         from hermes_cli import kanban_db as kb
+         rc, out = self.check(target, rtid)
+diff --git a/tests/hermes_cli/test_kanban_placement_rejected.py b/tests/hermes_cli/test_kanban_placement_rejected.py
+new file mode 100644
+index 0000000000..c538282de2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_rejected.py
+@@ -0,0 +1,194 @@
++"""A placement request the target rejected is terminal, never a clock park. [daveey]
++
++Incident placement:worker-2:b80b2c801dd844db7b56cbf4: the MacBook refused the forwarded copy of a deferred card
++with ``create_overlap``, naming only the forwarding card itself (the local placeholder, seen through the hub
++replica). The forwarder treated only ``done`` as terminal and re-parked the card on a 10-minute clock forever.
++Now a forward names the local card in ``distinct_from``; a self-match is re-forwarded once under a new request
++id; an overlap with another card blocks for a decision; any other rejection runs the card here.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from tests.hermes_cli.test_kanban_placement import HUB_TID, NEW_HELP, _done_parent, _forwarder, _options
++
++pytest_plugins = ["tests.hermes_cli.test_kanban_placement"]  # its ``mac`` fixture (fake hub + board)
++
++
++def _reject(mac, rid, matches=None, *, error=None):
++    """Mark hub request ``rid`` rejected the way hermes-hub 1.9 stores the target's refusal (incident shape)."""
++    if matches is None:
++        res = {"error": error or "no such profile/session here"}
++    else:
++        out = json.dumps({"ok": False, "created": False, "code": "create_overlap", "matches": matches,
++                          "total_matches": len(matches),
++                          "note": f"No card was created: {len(matches)} open card(s) already look like this work."})
++        res = {"error": out + "\nWARNING: openrouter.inference is deprecated", "exit_code": 2, "stdout": out,
++               "stderr": "WARNING: openrouter.inference is deprecated"}
++    mac["hub"].execute("UPDATE sent SET state='rejected', result=?, done_at=? WHERE id=?",
++                       (json.dumps(res), time.time(), rid))
++    mac["hub"].commit()
++
++
++def _match(tid):
++    return {"id": tid, "board": "default", "gateway": "macbook", "status": "ready", "why": "titles share 5 words"}
++
++
++def _scheduled_events(kb, conn, tid) -> int:
++    return sum(e.kind == "scheduled" for e in kb.list_events(conn, tid))
++
++
++@pytest.mark.parametrize("when", ["on_wake", "during_wait"])
++@pytest.mark.parametrize("shape,action", [("self_overlap_old_client", "fallback"), ("other_overlap", "blocked"),
++                                          ("plain", "fallback")])
++def test_rejected_request_is_never_clock_parked(mac, monkeypatch, when, shape, action):
++    """Incident placement:worker-2:b80b2c80: the target rejected the request, and the forwarder re-parked it on
++    a 10-min clock forever because only ``done`` was terminal."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    matches = {"self_overlap_old_client": [_match(child)], "other_overlap": [_match("t_0123456789abcdef")],
++               "plain": None}[shape]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++        if when == "during_wait":
++            def await_rejected(rid, **kw):
++                _reject(mac, rid, matches)
++                return kp.await_task_id(rid, hub_cli="hermes-hub", budget=30, sleep=_no_sleep)
++            f.await_id = await_rejected
++        else:
++            assert f.run() == "requeued"  # queued, not answered yet: the 10-min clock is right here
++            _reject(mac, kpf.state(conn, child)["request_id"], matches)
++            kb.unblock_task(conn, child)
++            kb.recompute_ready(conn)
++            f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++            f.await_id = lambda rid, **kw: pytest.fail("waited 45 s on a request already rejected")
++        before = _scheduled_events(kb, conn, child)
++        assert f.run() == action
++        assert _scheduled_events(kb, conn, child) == before
++        assert kb.get_task(conn, child).status == {"fallback": "running", "blocked": "blocked"}[action]
++        assert kpf.state(conn, child) is None  # deferral ended: the local worker (or an unblock) runs it here
++        assert len(mac["calls"]) == 1  # an old client cannot send distinct_from, so no futile re-forward
++        if action == "blocked":
++            assert "t_0123456789abcdef" in json.dumps([e.payload for e in kb.list_events(conn, child)])
++
++
++def _no_sleep(_s):
++    raise AssertionError("await_task_id kept polling a rejected request")
++
++
++def test_self_match_overlap_reforwards_once_with_distinct_from(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = NEW_HELP
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        # The forward names the local placeholder up front, so the target's overlap guard never self-matches.
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++        assert f.run() == "requeued"
++        first = mac["calls"][0]
++        assert _options(first)["distinct_from"] == [child] and child in _options(first)["distinct_reason"]
++        rid1 = first[first.index("--id") + 1]
++        # A target that still refused it as an overlap with only this card (the legacy request in the incident
++        # was sent without distinct_from): re-forward once, under a new request id.
++        _reject(mac, rid1, [_match(child)])
++        kb.unblock_task(conn, child)
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=HUB_TID)
++        assert f.run() == "parked"
++        assert len(mac["calls"]) == 2
++        second = mac["calls"][1]
++        rid2 = second[second.index("--id") + 1]
++        assert rid2 != rid1 and _options(second)["distinct_from"] == [child]
++        st = kpf.state(conn, child)
++        assert st["request_id"] == rid2 and st["reforwarded"] and st["reforward_of"] == rid1
++        assert st["remote_task_id"] == HUB_TID
++
++
++def test_second_self_match_rejection_runs_the_card_here_without_a_third_forward(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = NEW_HELP
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++        f.await_id = lambda rid, **kw: (_reject(mac, rid, [_match(child)]), (None, None))[1]
++        assert f.run() == "fallback"
++        assert len(mac["calls"]) == 2  # the forward and one re-forward, never more
++        assert kpf.state(conn, child) is None and kb.get_task(conn, child).status == "running"
++
++
++def test_self_match_with_hidden_matches_is_not_treated_as_self_only(mac, monkeypatch):
++    """``total_matches`` above the shown list: another card hides behind it, so no re-forward: a decision."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = NEW_HELP
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++        f.rejection = lambda rid: {"state": "rejected", "code": "create_overlap", "matches": [_match(child)],
++                                   "total_matches": 4, "error": "4 open cards"}
++        f.await_id = lambda rid, **kw: (_reject(mac, rid, [_match(child)]), (None, None))[1]
++        assert f.run() == "blocked" and len(mac["calls"]) == 1
++        assert "4 (not all named" in json.dumps([e.payload for e in kb.list_events(conn, child)])
++
++
++def test_client_without_distinct_from_still_gets_the_plain_forward(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = NEW_HELP
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch)
++        real, sent = f.create, []
++
++        def create(args, **kw):
++            sent.append(dict(args))
++            if "distinct_from" in args:
++                return {"ok": False, "error": "create_option_unknown: distinct_from (allowed: skills, ...)"}
++            return real(args, **kw)
++        f.create = create
++        assert f.run() == "parked"
++        assert "distinct_from" in sent[0] and "distinct_from" not in sent[1] and "distinct_reason" not in sent[1]
++        assert len(mac["calls"]) == 1
++
++
++def test_remote_rejection_reads_the_incident_row(mac):
++    from hermes_cli import kanban_placement as kp
++    mac["hub"].execute("INSERT INTO sent (id, body, state, created_at) VALUES ('placement:x:1', '{}', 'sent', 0)")
++    mac["hub"].commit()
++    assert kp.remote_rejection("placement:x:1") == {}
++    _reject(mac, "placement:x:1", [_match("t_01a1ce825d4f4a54")])
++    why = kp.remote_rejection("placement:x:1")
++    assert why["code"] == "create_overlap" and why["total_matches"] == 1
++    assert [m["id"] for m in why["matches"]] == ["t_01a1ce825d4f4a54"] and "No card was created" in why["error"]
++    _reject(mac, "placement:x:1", error="exit 1")
++    assert kp.remote_rejection("placement:x:1") == {"state": "rejected", "code": None, "matches": [],
++                                                     "total_matches": 0, "error": "exit 1"}
+-- 
+2.43.0
+

@@ -1,0 +1,281 @@
+From 205993443df6d7c8b2cf914a70b7433d4c289ff2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:45:20 +0000
+Subject: [PATCH] [daveey] unloaded sweep re-renders a partly delivered claim
+ range
+
+The local unloaded sweeper claims a subscription's whole cursor range and wrote one
+notice keyed by every formatted event in it. Since #1164 the writer refuses a row whose
+kanban_event_keys only partly overlap the chat's lineage (KanbanNoticeOverlapError).
+When a live poller had written the row for an earlier event (e.g. blocked) and died
+before its ack, every sweep pass on the passive-row path raised, rewound the cursor and
+logged a traceback, and the later done notice waited until the chat was opened.
+
+_deliver_sub now drops claimed events whose '<board>:<event id>' key is already in the
+tip's lineage (kanban_notice_keys_delivered) before rendering text and metadata; a range
+with nothing left is acked without a row. A failed key read keeps the whole range, and
+the writer's atomic recheck still guards a race after the filter: it raises, rewinds and
+the next pass re-filters.
+
+SweepBatches.flush also catches OverflowError (datetime.fromtimestamp of an absurd owner
+time such as -1e30), as collect already does, so one corrupt record releases only its
+own chat's claims instead of aborting the flush for every other chat.
+
+Proof: the four tests in test_kanban_unloaded_partial_overlap.py and
+test_absurd_owner_time_in_one_chat_never_holds_another_chats_group fail on main
+(6d9af3bb7d) and pass with the fix; the except-clause mutant is killed by the
+failed-key-read test. 22 kanban unloaded/remote/at-least-once files: 260 passed.
+
+Card: t_01a1ce5a5b6f9bb3
+---
+ tests/tui_gateway/test_kanban_remote_late.py  |  18 +++
+ .../test_kanban_unloaded_partial_overlap.py   | 150 ++++++++++++++++++
+ tui_gateway/kanban_remote_late.py             |   3 +-
+ tui_gateway/kanban_unloaded.py                |  17 ++
+ 4 files changed, 187 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tui_gateway/test_kanban_unloaded_partial_overlap.py
+
+diff --git a/tests/tui_gateway/test_kanban_remote_late.py b/tests/tui_gateway/test_kanban_remote_late.py
+index eda8608f36..388614735b 100644
+--- a/tests/tui_gateway/test_kanban_remote_late.py
++++ b/tests/tui_gateway/test_kanban_remote_late.py
+@@ -373,6 +373,24 @@ def test_render_failure_releases_claims_and_isolates_chats(arrival, monkeypatch)
+     assert len(retry) == 1 and len(retry[0]["children"]) == 2
+ 
+ 
++def test_absurd_owner_time_in_one_chat_never_holds_another_chats_group(arrival):
++    """``datetime.fromtimestamp(-1e30)`` raises OverflowError while rendering one chat's late group; that chat's
++    claims are released and the other chat's group is still delivered in the same flush."""
++    from tests.tui_gateway.test_kanban_remote_notices import OTHER
++
++    replica, ledger, now, insert, db, opener = arrival
++    insert(2, "done", 8 * 3600)
++    db.create_session(OTHER, "desktop")
++    _put(replica, [_card("t_late_absurd", OTHER, status="done", at=-1e30)])
++
++    got = krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                   ledger=ledger, now=now)
++
++    assert [g["session_id"] for g in got] == [CHAT]
++    assert _delivered_by_session(ledger) == {(CHAT, 1)}  # OTHER's claim released, not left in flight
++    assert len(db.get_messages(CHAT)) == 1 and db.get_messages(OTHER) == []
++
++
+ def test_wake_failure_never_unclaims_a_persisted_chat(arrival):
+     replica, ledger, now, _insert, db, opener = arrival
+     other = _two_chats(arrival)
+diff --git a/tests/tui_gateway/test_kanban_unloaded_partial_overlap.py b/tests/tui_gateway/test_kanban_unloaded_partial_overlap.py
+new file mode 100644
+index 0000000000..983b80c2a8
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_unloaded_partial_overlap.py
+@@ -0,0 +1,150 @@
++"""The local unloaded sweeper re-renders a claim range that a chat's lineage already partly holds. [daveey]
++
++A live poller wrote the row for the card's ``blocked`` event and died before its ack; the card was then unblocked
++and completed. The sweeper claims the whole cursor range ``(old, new]``. Since #1164 the writer refuses a row whose
++keys only partly overlap the lineage (``KanbanNoticeOverlapError``), so without a pre-filter every pass rewound and
++logged a traceback and the done notice waited until the chat was opened (t_01a1ce5a5b6f9bb3).
++"""
++
++import collections
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from tests.tui_gateway import test_kanban_unloaded_sweep as sweep
++from tui_gateway import kanban_unloaded as ku
++
++db = sweep.db
++_row_path_only = sweep._row_path_only
++CHAT, LATER = sweep.CHAT, sweep.LATER
++
++
++def _events(tid, kind):
++    conn = kbc.connect()
++    try:
++        return [e for e in kb.list_events(conn, tid) if e.kind == kind]
++    finally:
++        conn.close()
++
++
++def _blocked_then_done(seed):
++    """A tui-subscribed card that blocks, gets a live row for its ``blocked`` event (``seed``), then completes."""
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="partly delivered card", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT)
++        assert kb.block_task(conn, tid, reason="registry is down")
++    finally:
++        conn.close()
++    seed(tid)
++    conn = kbc.connect()
++    try:
++        assert kb.unblock_task(conn, tid)
++        assert kb.complete_task(conn, tid, summary="shipped after all")
++    finally:
++        conn.close()
++    return tid
++
++
++def _keys(db):
++    return [k for m in sweep._notices(db) for k in (m["display_metadata"] or {}).get("kanban_event_keys", [])]
++
++
++def _last_event_id(tid):
++    conn = kbc.connect()
++    try:
++        return max(int(e.id) for e in kb.list_events(conn, tid))
++    finally:
++        conn.close()
++
++
++def test_partly_delivered_range_writes_only_the_missing_notice(db, caplog):
++    def seed(tid):
++        (blocked,) = _events(tid, "blocked")
++        db.append_kanban_notice(CHAT, "blocked notice", {"notice_id": "live:x",
++                                                         "kanban_event_keys": [f"default:{int(blocked.id)}"]})
++
++    tid = _blocked_then_done(seed)
++    (completed,) = _events(tid, "completed")
++    assert len(sweep._notices(db)) == 1
++
++    out = ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db))
++
++    assert [d["task_id"] for d in out] == [tid]
++    notices = sweep._notices(db)
++    assert len(notices) == 2
++    new = notices[-1]
++    assert new["display_metadata"]["kanban_event_keys"] == [f"default:{int(completed.id)}"]
++    assert "shipped after all" in new["content"] and "registry is down" not in new["content"]
++    assert sweep._cursor(tid) == _last_event_id(tid)
++    assert "kanban unloaded sweep failed" not in caplog.text
++
++    assert ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db)) == []
++    assert len(sweep._notices(db)) == 2
++    assert [k for k, n in collections.Counter(_keys(db)).items() if n > 1] == []
++
++
++def test_fully_delivered_range_is_acked_without_a_row(db):
++    def seed(tid):
++        pass
++
++    tid = _blocked_then_done(seed)
++    keys = [f"default:{int(e.id)}" for kind in ("blocked", "completed") for e in _events(tid, kind)]
++    db.append_kanban_notice(CHAT, "both notices", {"notice_id": "live:y", "kanban_event_keys": keys})
++
++    assert ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db)) == []
++
++    assert len(sweep._notices(db)) == 1
++    assert sweep._cursor(tid) == _last_event_id(tid)
++    assert ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db)) == []
++    assert len(sweep._notices(db)) == 1
++
++
++def test_failed_key_read_offers_the_whole_range_and_the_writer_still_guards_it(db, monkeypatch):
++    """The filter is an optimization over the writer's atomic recheck: an unreadable lineage keeps the old
++    behavior (the overlap is refused, the claim rewinds) and the next pass delivers."""
++    import sqlite3
++
++    def seed(tid):
++        (blocked,) = _events(tid, "blocked")
++        db.append_kanban_notice(CHAT, "blocked notice", {"notice_id": "live:x",
++                                                         "kanban_event_keys": [f"default:{int(blocked.id)}"]})
++
++    tid = _blocked_then_done(seed)
++    before = sweep._cursor(tid)
++    with monkeypatch.context() as m:
++        m.setattr(db, "kanban_notice_keys_delivered",
++                  lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
++        assert ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db)) == []
++        assert sweep._cursor(tid) == before and len(sweep._notices(db)) == 1
++    assert len(ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db))) == 1
++    assert len(sweep._notices(db)) == 2 and sweep._cursor(tid) == _last_event_id(tid)
++
++
++def test_race_after_the_filter_rewinds_and_retries(db, monkeypatch, caplog):
++    """A live poller lands the blocked notice between the filter's read and the write: the writer's atomic recheck
++    refuses the now partly covered batch, the claim rewinds, and the next pass delivers only the done notice."""
++    tid = _blocked_then_done(lambda tid: None)
++    (blocked,) = _events(tid, "blocked")
++    (completed,) = _events(tid, "completed")
++    before = sweep._cursor(tid)
++    real = db.kanban_notice_keys_delivered
++
++    def stale_read(tip, keys):
++        got = real(tip, keys)
++        monkeypatch.setattr(db, "kanban_notice_keys_delivered", real)
++        db.append_kanban_notice(CHAT, "racer", {"notice_id": "live:z",
++                                                "kanban_event_keys": [f"default:{int(blocked.id)}"]})
++        return got
++
++    monkeypatch.setattr(db, "kanban_notice_keys_delivered", stale_read)
++    assert ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db)) == []
++    assert sweep._cursor(tid) == before and len(sweep._notices(db)) == 1
++    assert "KanbanNoticeOverlapError" in caplog.text
++
++    assert [d["task_id"] for d in ku.sweep_once(set(), now=LATER, session_db=sweep._session_db(db))] == [tid]
++    notices = sweep._notices(db)
++    assert len(notices) == 2
++    assert notices[-1]["display_metadata"]["kanban_event_keys"] == [f"default:{int(completed.id)}"]
++    assert sweep._cursor(tid) == _last_event_id(tid)
++    assert [k for k, n in collections.Counter(_keys(db)).items() if n > 1] == []
+diff --git a/tui_gateway/kanban_remote_late.py b/tui_gateway/kanban_remote_late.py
+index 1f8a501275..450d673a68 100644
+--- a/tui_gateway/kanban_remote_late.py
++++ b/tui_gateway/kanban_remote_late.py
+@@ -129,7 +129,8 @@ class SweepBatches:
+         for (profile, tip), entries in pending.items():
+             try:
+                 delivered.append(self._flush_one(profile, tip, entries))
+-            except (sqlite3.Error, OSError, ValueError, KeyError, TypeError, RuntimeError):
++            # OverflowError: datetime.fromtimestamp of an absurd owner time (-1e30) in group(); collect catches it too.
++            except (sqlite3.Error, OSError, ValueError, KeyError, TypeError, RuntimeError, OverflowError):
+                 logger.warning("late remote notices for %s not delivered; claims released for the next pass",
+                                tip, exc_info=True)
+                 release_undelivered([entry[0] for entry in entries], self.ledger)
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 540112b6ae..643fada2d5 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -36,6 +36,7 @@ from __future__ import annotations
+ import contextlib
+ import logging
+ import os
++import sqlite3
+ import threading
+ import time
+ from pathlib import Path
+@@ -405,6 +406,7 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+                 _kbn.remove_notify_sub(conn, **ident)
+         if not claimed:
+             return None  # a live poller or another sweeper got there first
++        claimed = _undelivered(db, tip, slug, claimed)
+     if skip is not None:
+         logger.info("kanban notice for %s/%s not delivered to chat %s: %s", slug, ident["task_id"], tip, skip)
+         return None
+@@ -448,6 +450,21 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+             "texts": texts, "woken": verdict == "started", "wake_result": verdict, "held_by": held_by}
+ 
+ 
++def _undelivered(db, tip, slug, claimed: list) -> list:
++    """``claimed`` minus the events whose ``"<board>:<event id>"`` key a notice row in ``tip``'s lineage already
++    holds (a live poller wrote it, then died before its ack). The writer refuses a range that only partly overlaps
++    the lineage (KanbanNoticeOverlapError), so without this every pass rewound and retried it, and nothing was
++    delivered until the chat was opened (t_01a1ce5a5b6f9bb3). A failed read keeps the whole range: the writer's
++    atomic recheck still guards it, and a race after this read still raises, rewinds and retries next pass. [daveey]"""
++    try:
++        done = db.kanban_notice_keys_delivered(tip, [f"{slug}:{int(e.id)}" for e in claimed])
++    except (sqlite3.Error, OSError):
++        logger.warning("kanban unloaded sweep: delivered-key read for %s failed; offering the whole range", tip,
++                       exc_info=True)
++        return claimed
++    return [e for e in claimed if f"{slug}:{int(e.id)}" not in done]
++
++
+ def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s) -> tuple[Optional[str], Optional[str]]:
+     """``(held_by, verdict)``: verdict None means a wake slot was taken and the caller must spawn the wake; any other
+     verdict says why the row is written now. Never raises: the events are already claimed."""
+-- 
+2.43.0
+

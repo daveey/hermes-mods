@@ -1,0 +1,117 @@
+From 83dd89d04ccc78970b4133e8fde3b9afa8fb9edf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:01:48 +0000
+Subject: [PATCH] [daveey] Starvation pick belongs to an unserved board:
+ restart the clock at the board's latest worker start
+
+A starved head the claim loop keeps skipping (dispatch guard, per-profile cap, claim deferral, no assignee)
+kept its board's first pick on every contended tick, which the board then spent on a lower card ahead of
+higher-ranked cards on other boards (review t_01a1ce52219c30ed). The starvation clock now starts at the later
+of the head's ready entry and the board's latest task_runs.started_at, so a stuck head wins at most one
+first pick per STARVE_SECONDS; ahead_elsewhere uses the same clock.
+---
+ hermes_cli/kanban_board_share.py              | 22 +++++++---
+ .../gateway/test_kanban_cross_board_slots.py  | 44 +++++++++++++++++++
+ 2 files changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_board_share.py b/hermes_cli/kanban_board_share.py
+index ab386cd132..66f4b5e77c 100644
+--- a/hermes_cli/kanban_board_share.py
++++ b/hermes_cli/kanban_board_share.py
+@@ -16,9 +16,10 @@ returns None and every board ticks as before.
+ 
+ Starvation guard (deliberate per-board minimum): priorities are set per board by different owners, so pure
+ priority would let one board's flood of high numbers hold another board's cards forever. A board whose top card
+-has been ready :data:`STARVE_SECONDS` or longer takes the first pick (oldest wait first), so no board waits much
+-longer than that plus one worker turnover. Ranking is advisory: guards and refusals decided at claim time are not
+-modelled, and the host cap check in each board's tick stays authoritative.
++has been ready :data:`STARVE_SECONDS` or longer, while the board started no card, takes the first pick (oldest wait
++first), so no board waits much longer than that plus one worker turnover, and a head that can never start wins
++its board at most one starvation pick per window. Ranking is advisory: guards and refusals decided at claim time
++are not modelled, and the host cap check in each board's tick stays authoritative.
+ """
+ from __future__ import annotations
+ 
+@@ -63,12 +64,21 @@ def candidates(conn, limit: int) -> list[Candidate]:
+                   for r in rows if r["id"] not in refused]
+     found = sorted(found, key=Candidate.rank)[:limit]
+     if found:  # only the head's wait decides starvation; one event scan per board
+-        from hermes_cli.kanban_parent_unclaimed import ready_since
+-        head = found[0]
+-        found[0] = head._replace(ready_since=float(ready_since(conn, head.task_id, int(head.created_at))))
++        found[0] = found[0]._replace(ready_since=_starve_clock(conn, found[0]))
+     return found
+ 
+ 
++def _starve_clock(conn, head: Candidate) -> float:
++    """When the board's starvation wait began: the head's last entry into ready, or the board's latest worker
++    start if later. A board that starts any card is served, so a head the claim loop keeps skipping (dispatch
++    guard, per-profile cap, claim deferral, no assignee) earns its board at most one first pick per
++    :data:`STARVE_SECONDS` instead of the first pick on every tick."""
++    from hermes_cli.kanban_parent_unclaimed import ready_since
++    since = float(ready_since(conn, head.task_id, int(head.created_at)))
++    row = conn.execute("SELECT MAX(started_at) FROM task_runs").fetchone()
++    return max(since, float(row[0] or 0)) if row is not None else since
++
++
+ def _starved(cands: list[Candidate], now: float) -> bool:
+     return bool(cands) and cands[0].ready_since > 0 and now - cands[0].ready_since >= STARVE_SECONDS
+ 
+diff --git a/tests/gateway/test_kanban_cross_board_slots.py b/tests/gateway/test_kanban_cross_board_slots.py
+index 209d39738d..fa997064b4 100644
+--- a/tests/gateway/test_kanban_cross_board_slots.py
++++ b/tests/gateway/test_kanban_cross_board_slots.py
+@@ -97,6 +97,50 @@ def test_flooded_board_cannot_starve_another_board_forever(home, monkeypatch):
+     assert spawned == [("hermes", starved)], spawned
+ 
+ 
++def test_a_guarded_starved_head_does_not_win_its_board_every_first_pick(home, monkeypatch):
++    """Reviewer probe (PR #1238): hermes' starved head is dispatch-guarded and never starts. Once hermes has been
++    served (a worker started after the head became ready) it is not starved, so default's p1000 card takes the
++    only slot, not hermes' p0 filler; the queue count no longer lists the guarded head either."""
++    from hermes_cli import kanban_board_share as share
++    from hermes_cli import kanban_model_assignment as kma
++    from hermes_cli import kanban_queue_position as kqp
++    old = time.time() - share.STARVE_SECONDS - 60
++    guarded = _card("hermes", "hermes p500, guarded, starved", 500, ready_since=old)
++    filler = _card("hermes", "hermes p0 filler", 0)
++    top = _card("default", "default p1000 card", 1000)
++    with kbc.connect_closing(board="hermes") as conn:  # hermes started a worker after the head became ready
++        conn.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'done', ?)",
++                     (filler, int(time.time() - 600)))
++        conn.commit()
++    real_guard = kma.dispatch_guard
++    monkeypatch.setattr(kma, "dispatch_guard", lambda conn, task_id, **kw: (
++        "test guard" if task_id == guarded else real_guard(conn, task_id, **kw)))
++    spawned = []
++    dispatcher = _dispatcher(monkeypatch, spawned, start_board="hermes")
++
++    dispatcher.tick_once()
++
++    assert spawned == [("default", top)], spawned
++    with kbc.connect_closing(board="hermes") as conn:
++        assert kb.get_task(conn, filler).status == "ready"
++    mine = _card("default", "default p900 card", 900)
++    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 1)
++    with kbc.connect_closing(board="default") as conn:
++        place = kqp.position(conn, kb.get_task(conn, mine), "default")
++    assert place is not None and "ahead_other_boards" not in place, place
++
++
++def test_board_started_nothing_keeps_the_starvation_pick(home):
++    from hermes_cli import kanban_board_share as share
++    old = time.time() - share.STARVE_SECONDS - 60
++    head = _card("hermes", "hermes p0, starved", 0, ready_since=old)
++    with kbc.connect_closing(board="hermes") as conn:  # a start BEFORE the head became ready does not count
++        conn.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'done', ?)",
++                     (head, int(old - 60)))
++        conn.commit()
++        assert share._starved(share.candidates(conn, 5), time.time())
++
++
+ def test_queue_text_counts_higher_ranked_cards_on_other_boards(home, monkeypatch):
+     from hermes_cli import kanban_parent_unclaimed as pu
+     from hermes_cli import kanban_queue_position as kqp
+-- 
+2.43.0
+

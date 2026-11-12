@@ -1,0 +1,2593 @@
+From e86edd3cef904873cb194ffdbd97743bd4451a9e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 13:17:04 +0000
+Subject: [PATCH] fix(kanban): finalize failures by run and defer neutral
+ effects [daveey]
+
+---
+ gateway/kanban_watchers.py                    |   4 +-
+ gateway/kanban_watchers_notifier.py           |  48 ++-
+ hermes_cli/kanban_db.py                       |  25 +-
+ hermes_cli/kanban_db_dispatch.py              | 101 ++++--
+ .../kanban_db_dispatch_crash_accounting.py    |  22 +-
+ hermes_cli/kanban_db_dispatch_dead_worker.py  |   1 +
+ hermes_cli/kanban_db_notify.py                |   5 +
+ hermes_cli/kanban_db_sync.py                  |   9 +-
+ hermes_cli/kanban_failure_notice.py           |  51 +++
+ hermes_cli/kanban_failure_release.py          |  66 ++++
+ hermes_cli/kanban_failure_summary.py          |  13 +-
+ hermes_cli/kanban_local_failure.py            |  32 ++
+ hermes_cli/kanban_neutral_release.py          |  86 +++++
+ hermes_cli/kanban_notify_receipts.py          |  36 +++
+ hermes_cli/kanban_quota_episode.py            |  13 +-
+ hermes_cli/kanban_quota_release.py            |  58 ++++
+ hermes_cli/kanban_sync_client.py              |   6 +-
+ tests/gateway/test_kanban_failure_delivery.py | 108 +++++++
+ tests/hermes_cli/kanban_real_board_bridge.py  |  91 ++++++
+ .../test_kanban_board_bridge_lifecycle.py     |  48 +++
+ tests/hermes_cli/test_kanban_failure_once.py  |  71 +++++
+ .../test_kanban_failure_transport.py          | 297 ++++++++++++++++++
+ .../test_kanban_local_failure_receipt.py      | 216 +++++++++++++
+ .../hermes_cli/test_kanban_neutral_release.py |  99 ++++++
+ tests/hermes_cli/test_kanban_quota_release.py |  74 +++++
+ .../test_kanban_real_board_failure.py         | 139 ++++++++
+ .../test_kanban_real_board_neutral.py         |  88 ++++++
+ tests/hermes_cli/test_kanban_sync_leases.py   |  15 +-
+ tests/hermes_cli/test_kanban_sync_run_rows.py |  48 ++-
+ .../test_kanban_failure_delivery.py           |  67 ++++
+ tui_gateway/session_notifications.py          |   9 +-
+ 31 files changed, 1875 insertions(+), 71 deletions(-)
+ create mode 100644 hermes_cli/kanban_failure_notice.py
+ create mode 100644 hermes_cli/kanban_failure_release.py
+ create mode 100644 hermes_cli/kanban_local_failure.py
+ create mode 100644 hermes_cli/kanban_neutral_release.py
+ create mode 100644 hermes_cli/kanban_notify_receipts.py
+ create mode 100644 hermes_cli/kanban_quota_release.py
+ create mode 100644 tests/gateway/test_kanban_failure_delivery.py
+ create mode 100644 tests/hermes_cli/kanban_real_board_bridge.py
+ create mode 100644 tests/hermes_cli/test_kanban_board_bridge_lifecycle.py
+ create mode 100644 tests/hermes_cli/test_kanban_failure_once.py
+ create mode 100644 tests/hermes_cli/test_kanban_failure_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_local_failure_receipt.py
+ create mode 100644 tests/hermes_cli/test_kanban_neutral_release.py
+ create mode 100644 tests/hermes_cli/test_kanban_quota_release.py
+ create mode 100644 tests/hermes_cli/test_kanban_real_board_failure.py
+ create mode 100644 tests/hermes_cli/test_kanban_real_board_neutral.py
+ create mode 100644 tests/tui_gateway/test_kanban_failure_delivery.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 98f8a64b1c..2dccfde6e6 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -164,7 +164,7 @@ class GatewayKanbanWatchersMixin:
+                 logger.warning("kanban notifier tick failed: %s", exc)
+             await self._sleep_between_ticks(interval)
+ 
+-    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
++    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> Any:
+         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
+         from hermes_cli import kanban_db as _kb
+         from hermes_cli import kanban_db_connect as _kbc
+@@ -176,7 +176,7 @@ class GatewayKanbanWatchersMixin:
+         with _kb.pin_first_board_resolution():
+             conn = _kbc.connect(board=board)
+             try:
+-                getattr(_kbn, op)(
++                return getattr(_kbn, op)(
+                     conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                     thread_id=sub.get("thread_id") or "", **extra,
+                 )
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index d3fa4e1cc6..f1deb65874 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -53,12 +53,13 @@ def _pin_first():
+ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn")
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn")
++_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn", "failure_finalized")
++TERMINAL_KINDS = (*TERMINAL_KINDS, "failure_finalized")
+ 
+ 
+ def diagnostic_event(ev) -> bool:
+     """Infrastructure attention is distinct from an explicit owner decision."""
+-    if ev.kind in {"crashed", "timed_out", "gave_up", "quota_episode_notice"}:
++    if ev.kind in {"failure_finalized", "crashed", "timed_out", "gave_up", "quota_episode_notice"}:
+         return True
+     if ev.kind in {"blocked", "block_loop_detected"}:
+         return (ev.payload or {}).get("kind") != "needs_input"
+@@ -546,6 +547,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "request_withdrawn": _fmt_request_withdrawn,
+     "completed": _fmt_completed,
+     "blocked": _fmt_blocked,
++    "failure_finalized": _fmt_failure("failure_finalized"),
+     "gave_up": _fmt_failure("gave_up"),
+     "crashed": _fmt_failure("crashed"),
+     "timed_out": _fmt_timed_out,
+@@ -645,6 +647,9 @@ class _KanbanNotification:
+ 
+     def format_event(self, ev: Any) -> Optional[str]:
+         """Render one event; accumulates wake handoff/review detail. None → silent kind."""
++        from hermes_cli.kanban_failure_notice import provisional_failure
++        if provisional_failure(ev):
++            return None
+         formatter = _EVENT_FORMATTERS.get(ev.kind)
+         if formatter is None:
+             return None
+@@ -658,7 +663,9 @@ class _KanbanNotification:
+     def build_wake_text(self) -> None:
+         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
+         task, sub = self.task, self.sub
+-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
++        from hermes_cli.kanban_failure_notice import provisional_failure
++        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS
++                           and not provisional_failure(ev)} if self.wake_agent else set()
+         self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
+         if not self.wake_kinds:
+             return
+@@ -670,7 +677,11 @@ class _KanbanNotification:
+             # for child tasks; use it only for legacy rows.
+             self.session_key = sub["chat_id"] or getattr(task, "session_id", None) or ""
+         # i18n keys: gateway.kanban.wake.<kind> for each _WAKE_KINDS entry.
+-        _parts = [t(f"gateway.kanban.wake.{k}") for k in _WAKE_KINDS if k in self.wake_kinds]
++        _parts = [t(f"gateway.kanban.wake.{k}") for k in _WAKE_KINDS
++                  if k in self.wake_kinds and k != "failure_finalized"]
++        from hermes_cli.kanban_failure_summary import describe_failure
++        _parts.extend(describe_failure(ev.kind, self.title, ev.payload or {})
++                      for ev in self.d["events"] if ev.kind == "failure_finalized")
+         _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
+         synth = t(
+             "gateway.kanban.wake.message",
+@@ -792,6 +803,12 @@ class _KanbanNotification:
+                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+         return True
+ 
++    async def failure_receipts(self, lane, run_uids=()):
++        return await _to_thread_process_service(partial(
++            self.runner._kanban_sub_op, self.board_slug, "notify_failure_receipts", self.sub,
++            lane=lane, run_uids=run_uids,
++        ))
++
+     async def _send_pings(self) -> bool:
+         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+         for ev in self.d["events"]:
+@@ -814,8 +831,14 @@ class _KanbanNotification:
+             if ev.id <= self.sub.get("last_ping_event_id", 0):
+                 continue
+             try:
++                from hermes_cli.kanban_failure_notice import failure_uid
++                uid = failure_uid(ev)
++                if uid and uid in await self.failure_receipts("ping"):
++                    continue
+                 if await self._send_event(ev, msg) is False:
+                     continue
++                if uid:
++                    await self.failure_receipts("ping", [uid])
+                 await _to_thread_process_service(partial(
+                     self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
+                     event_id=ev.id,
+@@ -862,11 +885,15 @@ class _KanbanNotification:
+                 return
+             # All text pings delivered (or skipped for non-push / wake-only).
+             original_events = self.d["events"]
++            from hermes_cli.kanban_failure_notice import failure_uid, fresh_events
++            wake_events = original_events
++            if any(failure_uid(ev) for ev in original_events):
++                wake_events = fresh_events(original_events, await self.failure_receipts("wake"))
+             from gateway.warning_notifications import warning_notifications_enabled
+             split = not warning_notifications_enabled(self.platform_str)
+-            wake_groups = ([original_events] if not split else [
+-                [ev for ev in original_events if diagnostic_event(ev)],
+-                [ev for ev in original_events if not diagnostic_event(ev)],
++            wake_groups = ([wake_events] if not split else [
++                [ev for ev in wake_events if diagnostic_event(ev)],
++                [ev for ev in wake_events if not diagnostic_event(ev)],
+             ])
+             wake_payloads = []
+             for events in wake_groups:
+@@ -878,7 +905,8 @@ class _KanbanNotification:
+                     self.format_event(ev)
+                 self.build_wake_text()
+                 if self.wake_kinds:
+-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
++                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds,
++                                          [failure_uid(ev) for ev in events if failure_uid(ev)]))
+             self.d = {**self.d, "events": original_events}
+         is_push = self.is_push_adapter
+         from gateway.wake import WakeNotAccepted
+@@ -886,8 +914,10 @@ class _KanbanNotification:
+         # A requested wake is required even when its passive ping already landed.
+         if wake_payloads:
+             try:
+-                for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
++                for self.synth, self.wake_diagnostic, self.wake_kinds, run_uids in wake_payloads:
+                     await self.wake()
++                    if run_uids:
++                        await self.failure_receipts("wake", run_uids)
+                 self.clear_failures()
+             except WakeNotAccepted:
+                 # Startup / full queue is not a dead destination. Keep the durable
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index a980e91720..62004ef62a 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2309,6 +2309,11 @@ def release_stale_claims(
+                 reason="ttl_expired_worker_alive",
+             )
+             continue
++        # [daveey] Expired primary leases are finalized by the Board alarm.
++        # Local termination is still necessary, but publishing a competing
++        # reclaim/counter would overwrite that authoritative result after sleep.
++        if _sync.board_mode(conn) == "primary":
++            continue
+         with write_txn(conn):
+             # Again under the write lock: an interpreter that bound since the check above
+             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
+@@ -2321,8 +2326,8 @@ def release_stale_claims(
+                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                 "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                 # A worker that registered its own pid since the SELECT keeps its claim.
+-                "AND worker_pid IS ?",
+-                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"]),
++                "AND worker_pid IS ? AND current_run_id IS ?",
++                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"], row["current_run_id"]),
+             )
+             if cur.rowcount != 1:
+                 continue
+@@ -2339,18 +2344,16 @@ def release_stale_claims(
+                     "heartbeat_stale": bool(heartbeat_stale),
+                     "heartbeat_awake_age": _opt_int(hb_awake_age),  # [daveey]
+                     "retry_status": retry_status,
++                    "failure_notice": "canonical",
+                 },
+             )
++            _record_task_failure(
++                conn, row["id"], error, run_id=run_id,
++                outcome="reclaimed", failure_limit=failure_limit,
++                release_claim=False, end_run=False, allow_nested=True,
++                event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
++            )
+             reclaimed += 1
+-        # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
+-        # the run ended without a verdict, so it counts toward the breaker and a
+-        # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
+-        _record_task_failure(
+-            conn, row["id"], error,
+-            outcome="reclaimed", failure_limit=failure_limit,
+-            release_claim=False, end_run=False,
+-            event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+-        )
+         # Post-commit observer; every non-reclaim branch ``continue``d above.
+         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
+             _fire_kanban_lifecycle_hook(
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 58e0db732a..243bf75ba5 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -755,7 +755,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+         "  AND t.worker_pid IS NOT NULL"
+     ).fetchall()
+     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, terminate_modern_bindings
++    from hermes_cli.kanban_failure_release import queued
+     for row in rows:
++        if queued(conn, row["current_run_id"]):
++            continue  # Await authoritative feed; never signal an already-released attempt again.
+         if owner_reclaim_blocked(conn, row["id"], for_termination=True, selected=row):
+             continue
+         lock = row["claim_lock"] or ""
+@@ -797,6 +800,21 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+             if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
+                 continue
+             retry_status = _kb._retry_status_for_run(conn, tid)
++            # [daveey] Fence the captured attempt after the kill wait. A new run
++            # can reuse the dispatcher lock (and even PID), but not its run id.
++            current = conn.execute(
++                "SELECT 1 FROM tasks WHERE id=? AND status='running' AND worker_pid=? "
++                "AND claim_lock IS ? AND current_run_id IS ?",
++                (tid, pid, row["claim_lock"], row["current_run_id"]),
++            ).fetchone()
++            if current is None:
++                continue
++            from hermes_cli.kanban_failure_release import queue
++            if queue(conn, tid, row["current_run_id"], outcome="timed_out", error=error,
++                     failure_limit=DEFAULT_FAILURE_LIMIT,
++                     extra={"pid": pid, "sigkill": killed, "retry_status": retry_status}):
++                timed_out.append(tid)
++                continue
+             cur = conn.execute(
+                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+@@ -817,20 +835,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+                     conn, tid, outcome="timed_out", status="timed_out",
+                     error=error, metadata=payload,
+                 )
++                payload["failure_notice"] = "canonical"
+                 _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
++                _record_task_failure(
++                    conn, tid, error=error, run_id=run_id, outcome="timed_out", allow_nested=True,
++                    event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
++                )
+                 timed_out.append(tid)
+-        # Outside the write_txn above because ``_record_task_failure`` opens its
+-        # own. If the breaker trips this flips the task to ``blocked`` and emits
+-        # ``gave_up`` on top of the ``timed_out`` already emitted.
+-        if cur.rowcount == 1:
+-            _record_task_failure(
+-                conn, tid,
+-                error=error,
+-                outcome="timed_out",
+-                release_claim=False,
+-                end_run=False,
+-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+-            )
+     return timed_out
+ 
+ 
+@@ -1290,9 +1301,9 @@ class _CrashSweep:
+     host_rebooted: list[str] = field(default_factory=list)  # reboot bystanders, requeued uncounted [daveey]
+     owner_unavailable: list[str] = field(default_factory=list)  # owner never answered, requeued uncounted [daveey]
+     owner_restarted: list[str] = field(default_factory=list)  # lost to an owner restart, requeued uncounted [daveey]
+-    # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
+-    # ``_record_task_failure`` (needs its own write_txn).
++    # ``(task_id, pid, claimer, dead_worker)``: accounted in the reclaim txn.
+     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
++    auto_blocked: list[str] = field(default_factory=list)
+     # Worker-exit observer payloads, fired only after every reclaim/accounting
+     # txn has committed.
+     exited_hook_payloads: list[dict] = field(default_factory=list)
+@@ -1303,6 +1314,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+                           *, failed_results_only: bool = False) -> _CrashSweep:
+     """Release every host-local ``running`` task whose worker PID is dead."""
+     sweep = _CrashSweep()
++    from hermes_cli.kanban_neutral_release import drain
++    sweep.exited_hook_payloads.extend(drain(conn))
++    for hook in sweep.exited_hook_payloads:
++        target = {"rate_limited": sweep.rate_limited, "reclaimed": sweep.owner_restarted, "host_reboot": sweep.host_rebooted,
++                  "owner_down": sweep.owner_unavailable, "owner_unavailable": sweep.owner_unavailable}
++        target[hook["outcome"]].append(hook["task_id"])
+     with _kb.write_txn(conn):
+         rows = conn.execute(
+             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id, "
+@@ -1317,6 +1334,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+             lock = row["claim_lock"] or ""
+             if not _kb._claim_is_local(lock, host_prefix):
+                 continue
++            from hermes_cli.kanban_failure_release import queued
++            if queued(conn, row["current_run_id"]):
++                continue
+             # Launch-window grace so a freshly-spawned worker isn't reclaimed
+             # before its PID is visible on /proc.
+             started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
+@@ -1344,6 +1364,19 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None,
+                 dead.event_payload['reconciled_at'] = int(time.time())
+                 dead.event_payload['reconciled_by'] = 'observer' if failed_results_only else 'dispatcher'
+             _owner_death.note(dead, conn, row["id"], row["current_run_id"])  # owner died under it [daveey]
++            dead.run_id = row["current_run_id"]
++            dead.event_payload["retry_status"] = _kb._retry_status_for_run(conn, row["id"])
++            from hermes_cli import kanban_neutral_release
++            if kanban_neutral_release.queue(conn, row, dead):
++                continue
++            from hermes_cli.kanban_failure_release import deferred_crash
++            if deferred_crash(conn, dead):
++                sweep.crashed.append(row["id"])
++                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
++                continue
++            if not (dead.rate_limited or dead.owner_restart
++                    or dead.owner_unavailable or (dead.host_reboot and not dead.reboot_culprit)):
++                dead.event_payload["failure_notice"] = "canonical"
+             from hermes_cli.kanban_run_finalizer import close_dead_run
+             closed = close_dead_run(conn, row, dead)
+             if closed is None:
+@@ -1413,13 +1446,12 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
+     """
+     sweep = _reclaim_dead_workers(conn, board=board, failed_results_only=failed_results_only)
+     # Closure and accounting committed together; only external observers remain.
+-    auto_blocked = sweep.auto_blocked
+     for _, _, _, dead in sweep.crash_details:
+         _worker_scope.release_failure(dead.event_payload)
+     # Side-channel attributes keep the public ``list[str]`` return stable;
+     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
+     # requeues did NOT count a failure and are NOT crashes.
+-    detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
++    detect_crashed_workers._last_auto_blocked = sweep.auto_blocked  # type: ignore[attr-defined]
+     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+     detect_crashed_workers._last_host_rebooted = sweep.host_rebooted  # type: ignore[attr-defined]
+     detect_crashed_workers._last_owner_restarted = sweep.owner_restarted  # type: ignore[attr-defined]
+@@ -1450,7 +1482,7 @@ def _record_task_failure(
+     release_claim: bool = False,
+     end_run: bool = False,
+     event_payload_extra: Optional[dict] = None,
+-    infrastructure: bool = False, block_kind: str = "transient",
++    infrastructure: bool = False, block_kind: str = "transient", run_id: int | None = None,
+     allow_nested: bool = False,
+ ) -> bool:
+     """Record a non-success outcome and maybe trip the circuit breaker; every
+@@ -1481,6 +1513,15 @@ def _record_task_failure(
+         ).fetchone()
+         if row is None:
+             return False
++        from hermes_cli.kanban_failure_release import queue
++        if queue(conn, task_id, run_id if run_id is not None else row["current_run_id"],
++                 outcome=outcome, error=error, failure_limit=failure_limit, force_trip=force_trip,
++                 infrastructure=infrastructure, block_kind=block_kind, extra=event_payload_extra or {}):
++            return False  # Only the authoritative feed can report a completed breaker transition.
++        from hermes_cli import kanban_local_failure as local_failure
++        run_id = run_id if run_id is not None else row["current_run_id"]
++        if not local_failure.admit(conn, task_id, run_id):
++            return False
+         retry_status = (
+             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
+             if release_claim
+@@ -1519,7 +1560,13 @@ def _record_task_failure(
+                 run_id = _kb._end_run(
+                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
+                 )
+-                _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
++                _kb._append_event(conn, task_id, outcome, {
++                    "error": error, **detail, **({"failure_notice": "canonical"} if run_id is not None else {}),
++                }, run_id=run_id)
++            local_failure.finalized(conn, task_id, run_id, failures=failures,
++                                    effective_limit=effective_limit, tripped=False,
++                                    trigger_outcome=outcome, error=error, retry_status=retry_status,
++                                    infrastructure=infrastructure)
+             return False
+ 
+         # Spawn path (release_claim) is still running and also clears claim
+@@ -1542,7 +1589,6 @@ def _record_task_failure(
+             "trigger_outcome": outcome,
+             "retry_status": retry_status,
+         }
+-        run_id = None
+         if end_run:
+             # Only the spawn path has an open run to close.
+             run_id = _kb._end_run(
+@@ -1560,8 +1606,16 @@ def _record_task_failure(
+             # judge this block: ``recompute_ready`` holds it for an operator.
+             payload["sticky"] = True
+         if event_payload_extra:
+-            payload.update(event_payload_extra)
++            payload = {**event_payload_extra, **payload}
++        if fix_id := payload.get("fix_card"):
++            from hermes_cli import kanban_systemic_crash as systemic
++            if not systemic.attach(conn, fix_id, task_id, allow_nested=True):
++                # Custody is settled before publishing the one final failure event.
++                payload.update(sticky=True, fix_card_link_failed=True)
++        if run_id is not None:
++            payload["failure_notice"] = "canonical"
+         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
++        local_failure.finalized(conn, task_id, run_id, **{**payload, "tripped": True})
+         return True
+ 
+ 
+@@ -1668,6 +1722,9 @@ def check_respawn_guard(
+     if row is None:
+         return None
+ 
++    from hermes_cli.kanban_quota_release import pending_task
++    if pending_task(conn, task_id):
++        return "rate_limit_cooldown"
+     now = int(time.time())
+     from hermes_cli.kanban_quota_episode import decision, episode
+     if episode(conn, task_id):
+@@ -2201,10 +2258,14 @@ def _run_reclaim_phase(
+         result.released_leftover_claims = release_leftover_local_claims(conn)  # not gated: not running [daveey]
+     if has_running:
+         result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
++    # An ended primary run can still owe post-feed effects even with no running tasks.
++    from hermes_cli.kanban_neutral_release import pending
++    if has_running or pending(conn):
+         result.crashed = detect_crashed_workers(conn, board=board)
+         result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
+         result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+         result.reclaimed += len(getattr(detect_crashed_workers, "_last_owner_restarted", []))
++    if has_running:
+         result.timed_out = enforce_max_runtime(conn)
+     from hermes_cli.kanban_supervisor_requests import dispatcher_drain  # [daveey] non-worker executor
+     result.supervisor_requests = [] if dry_run else dispatcher_drain(conn, board=board)
+diff --git a/hermes_cli/kanban_db_dispatch_crash_accounting.py b/hermes_cli/kanban_db_dispatch_crash_accounting.py
+index a143bed81c..76110e739c 100644
+--- a/hermes_cli/kanban_db_dispatch_crash_accounting.py
++++ b/hermes_cli/kanban_db_dispatch_crash_accounting.py
+@@ -42,6 +42,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list, *, allow_nes
+     for tid, pid, claimer, dead in crash_details:
+         error_text = dead.error_text
+         if dead.protocol_violation:
++            from hermes_cli.kanban_failure_release import queue
++            if queue(conn, tid, dead.run_id, outcome="crashed", error=error_text,
++                     protocol_violation=True, failure_limit=_d._PROTOCOL_VIOLATION_FAILURE_LIMIT):
++                continue  # Board computes the streak from authoritative closed runs.
+             streak = _d._protocol_violation_streak(conn, tid)
+             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
+             if trow is None:
+@@ -51,13 +55,18 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list, *, allow_nes
+                 int(task_override) if task_override is not None else _d._PROTOCOL_VIOLATION_FAILURE_LIMIT
+             )
+             if streak < violation_limit:
+-                # Below budget: already back at ``ready`` with the error stamped.
+-                # No ``_record_task_failure`` — must not consume the unified budget.
++                # Finalize the exempt run too, so a late reclaim cannot charge it.
++                from hermes_cli import kanban_local_failure as local
++                if local.admit(conn, tid, dead.run_id):
++                    failures = conn.execute("SELECT consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++                    local.finalized(conn, tid, dead.run_id, failures=failures, effective_limit=violation_limit,
++                                    error=error_text, trigger_outcome="crashed", protocol_violations=streak,
++                                    protocol_violation_limit=violation_limit, tripped=False)
+                 continue
+             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
+             # already made against the violation streak above.
+             tripped = _d._record_task_failure(
+-                conn, tid,
++                conn, tid, run_id=dead.run_id,
+                 error=error_text,
+                 outcome="crashed",
+                 failure_limit=violation_limit,
+@@ -78,7 +87,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list, *, allow_nes
+             flag = "unknown_skill" if dead.unknown_skill else "stdlib_shadow" if dead.stdlib_shadow else \
+                 "reboot_culprit" if dead.reboot_culprit else "terminal_provider"
+             tripped = _d._record_task_failure(
+-                conn, tid,
++                conn, tid, run_id=dead.run_id,
+                 error=error_text,
+                 outcome="crashed",
+                 force_trip=True,
+@@ -104,7 +113,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list, *, allow_nes
+                 # No fix card could be opened: trips at 1, held for an operator.
+                 extra["sticky"] = True
+             tripped = _d._record_task_failure(
+-                conn, tid,
++                conn, tid, run_id=dead.run_id,
+                 error=error_text,
+                 outcome="crashed",
+                 failure_limit=1 if is_systemic else None,
+@@ -113,9 +122,6 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list, *, allow_nes
+                 allow_nested=allow_nested,
+                 event_payload_extra=extra,
+             )
+-            if tripped and fix_id and not _systemic.attach(conn, fix_id, tid, allow_nested=allow_nested):
+-                with _d._kb.write_txn(conn, allow_nested=allow_nested):  # unlinked: keep it held
+-                    _d._kb._append_event(conn, tid, "gave_up", {**extra, "sticky": True, "fix_card_link_failed": True})
+         if tripped:
+             auto_blocked.append(tid)
+     return auto_blocked
+diff --git a/hermes_cli/kanban_db_dispatch_dead_worker.py b/hermes_cli/kanban_db_dispatch_dead_worker.py
+index 3f027c7322..38bb53bd0e 100644
+--- a/hermes_cli/kanban_db_dispatch_dead_worker.py
++++ b/hermes_cli/kanban_db_dispatch_dead_worker.py
+@@ -28,6 +28,7 @@ class _DeadWorker:
+     owner_unavailable: bool = False  # the profile owner never answered the claim: no failure counted [daveey]
+     owner_restart: bool = False  # the profile owner restarted under the attempt: requeued uncounted [daveey]
+     owner_down: bool = False  # the profile owner's service is failed/masked/disabled: requeued uncounted [daveey]
++    run_id: int | None = None  # captured under the reclaim transaction, never inferred after it
+ 
+     @property
+     def run_outcome(self) -> str:
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index b5e367b40f..33356f1728 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -890,6 +890,11 @@ def advance_notify_cursor(
+         )
+ 
+ 
++def notify_failure_receipts(conn, **kwargs):
++    from hermes_cli.kanban_notify_receipts import notify_failure_receipts as receipts
++    return receipts(conn, **kwargs)
++
++
+ def record_notify_ping(
+     conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+     thread_id: Optional[str] = None, event_id: int,
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 6289464e36..51c5d4c6f9 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1276,7 +1276,7 @@ def _without_unacked_fields(conn: sqlite3.Connection, ch: RemoteChange) -> Mappi
+     9821, 2026-10-29)."""
+     pending: set[str] = set()
+     for (fields,) in conn.execute("SELECT fields FROM kanban_sync_outbox WHERE table_name = 'tasks' AND row_uid = ? "
+-                                  "AND state != 'rejected'", (ch.uid,)):
++                                  "AND state != 'rejected' AND op IN ('upsert', 'import')", (ch.uid,)):
+         try:
+             pending.update(json.loads(fields or "{}"))
+         except ValueError:
+@@ -1360,6 +1360,13 @@ def _local_row_is_newer(conn: sqlite3.Connection, table: str, ch: RemoteChange,
+     acknowledged (``task_runs.sync_version``). Without this, our own earlier push of a run (its outbox row already
+     gone) or the Board's lease-grant copy, pulled after the run ended here, reopened it as ``running`` and the next
+     push sent that back to the Board."""
++    if table == "task_runs" and ch.fields.get("ended_at") is not None and board_mode(conn) == "primary":
++        local = conn.execute("SELECT ended_at, sync_version FROM task_runs WHERE id = ?", (row_id,)).fetchone()
++        if local["ended_at"] is None and ch.version > (local["sync_version"] or 0):
++            # A Board lease can expire before the local run's initial insert is
++            # pushed. That pending startup is not newer than an authoritative
++            # end. The push reserializes the now-ended row, retaining its end.
++            return False
+     if conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name = ? AND row_uid = ? AND state = 'pending' "
+                     "AND op != 'restore' LIMIT 1", (table, ch.uid)).fetchone():
+         return True
+diff --git a/hermes_cli/kanban_failure_notice.py b/hermes_cli/kanban_failure_notice.py
+new file mode 100644
+index 0000000000..d6fe14cbf7
+--- /dev/null
++++ b/hermes_cli/kanban_failure_notice.py
+@@ -0,0 +1,51 @@
++"""Failure-notice protocol shared by chat consumers. [daveey]"""
++from __future__ import annotations
++
++
++def provisional_failure(event) -> bool:
++    """Upgraded producers retain raw diagnostics, but only finalization is public.
++
++    Explicit producer opt-in retains compatibility with historical/legacy events;
++    no batching or assumption that a later final event has already arrived.
++    """
++    return (getattr(event, "kind", "") in {"crashed", "reclaimed", "timed_out", "gave_up", "spawn_failed", "protocol_violation"}
++            and (getattr(event, "payload", None) or {}).get("failure_notice") == "canonical")
++
++
++def event_key(board: str, event) -> str:
++    """Portable run identity for the transcript's existing durable dedup ledger."""
++    payload = getattr(event, "payload", None) or {}
++    if getattr(event, "kind", "") == "failure_finalized" and payload.get("run_uid"):
++        return f"{board}:failure:{payload['run_uid']}"
++    return f"{board}:{int(event.id)}"
++
++
++def failure_uid(event):
++    payload = getattr(event, "payload", None) or {}
++    return payload.get("run_uid") if getattr(event, "kind", "") == "failure_finalized" else None
++
++
++def fresh_events(events, delivered):
++    seen = set(delivered)
++    result = []
++    for event in events:
++        uid = failure_uid(event)
++        if uid and uid in seen:
++            continue
++        result.append(event)
++        if uid:
++            seen.add(uid)
++    return result
++
++
++def fresh_texts(batch, delivered):
++    """Deduplicate both persisted keys and repeats within one delivery batch."""
++    seen = set(delivered)
++    fresh = []
++    for text in batch:
++        keys = set(getattr(text, "_kb_keys", ()) or ())
++        if keys and keys <= seen:
++            continue
++        fresh.append(text)
++        seen.update(keys)
++    return fresh
+diff --git a/hermes_cli/kanban_failure_release.py b/hermes_cli/kanban_failure_release.py
+new file mode 100644
+index 0000000000..64ea3881c1
+--- /dev/null
++++ b/hermes_cli/kanban_failure_release.py
+@@ -0,0 +1,66 @@
++"""Durable run-scoped failure commands for authoritative primary Boards. [daveey]
++
++Queue under the caller's write transaction BEFORE changing mirrored task/run rows.
++A command acknowledgement is not a mirrored state: only the Board feed finalizes
++those rows and emits the public failure notice.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++from hermes_cli import kanban_db_sync as sync
++
++
++def deferred_crash(conn: sqlite3.Connection, dead) -> bool:
++    """Charged primary crashes wait for authoritative release, not local mirror edits."""
++    if sync.board_mode(conn) != "primary":
++        return False
++    if dead.host_reboot and dead.reboot_culprit:
++        return True  # Culprit attribution outranks an owner loss during the same reboot.
++    return not (
++        dead.rate_limited or dead.owner_restart or dead.owner_unavailable
++        or dead.host_reboot
++    )
++
++
++def queued(conn: sqlite3.Connection, run_id: int | None) -> bool:
++    """Skip repeated observations/side effects while the authoritative feed lags."""
++    if sync.board_mode(conn) != "primary":
++        return False
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_failure_commands'").fetchone():
++        return False
++    return conn.execute("SELECT 1 FROM kanban_failure_commands WHERE run_uid=?",
++                        (sync.run_uid(conn, run_id),)).fetchone() is not None
++
++
++def queue(conn: sqlite3.Connection, task_id: str, run_id: int | None, *,
++          outcome: str, error: str, **policy) -> bool:
++    """True means Board authority owns this failure (including an already queued run).
++
++    A missing portable identity on a primary board is an error, never permission
++    to fall back to a competing local counter. Receipts survive outbox acks.
++    """
++    if sync.board_mode(conn) != "primary":
++        return False
++    uid = sync.run_uid(conn, run_id)
++    if not uid:
++        raise ValueError("primary failure release requires a portable run identity")
++    row = conn.execute("SELECT task_id FROM task_runs WHERE id=?", (run_id,)).fetchone()
++    if row[0] != task_id:
++        raise ValueError("failure release run belongs to another task")
++    if not conn.in_transaction:
++        raise ValueError("failure release requires a write transaction")
++    conn.execute("CREATE TABLE IF NOT EXISTS kanban_failure_commands ("
++                 "run_uid TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
++                 "op_id TEXT NOT NULL)")
++    op_id = sync.uuid7()
++    inserted = conn.execute("INSERT OR IGNORE INTO kanban_failure_commands VALUES (?, ?, ?)",
++                            (uid, task_id, op_id)).rowcount
++    if inserted:
++        fields = {**policy, "run_uid": uid, "outcome": outcome, "error": error[:500]}
++        conn.execute("INSERT INTO kanban_sync_outbox "
++                     "(op_id,table_name,row_uid,op,fields,hlc,created_at) VALUES (?, 'tasks', ?, 'release', ?, '', ?)",
++                     (op_id, task_id, json.dumps(fields), int(time.time())))
++    return True
+diff --git a/hermes_cli/kanban_failure_summary.py b/hermes_cli/kanban_failure_summary.py
+index 55356222fd..21a3cf7af7 100644
+--- a/hermes_cli/kanban_failure_summary.py
++++ b/hermes_cli/kanban_failure_summary.py
+@@ -99,16 +99,19 @@ def describe_failure(kind: str, title: str, payload: Mapping[str, Any]) -> str:
+     limit = _as_int(payload.get("effective_limit"))
+     attempts = ""
+     if failures:
+-        attempts = f"{failures} of {limit}" if limit else str(failures)
++        attempts = f"{min(failures, limit)} of {limit}" if limit else str(failures)
+ 
+-    retry = str(payload.get("retry_status") or "")
+-    if kind == "gave_up":
++    retry = str(payload.get("final_status") if kind == "failure_finalized" else payload.get("retry_status") or "")
++    if kind == "failure_finalized" and retry == "triage":
++        state = (f"stopped after {attempts} failed attempt(s); task is in automatic triage" if attempts
++                 else "task is in automatic triage")
++    elif kind == "gave_up":
+         state = (f"stopped after {attempts} failed attempt(s); task is Blocked" if attempts
+                  else "stopped after repeated failed attempts; task is Blocked")
+     elif retry == "blocked" or cls == "provider_config":
+         state = "task is Blocked"
+-    elif retry_promised(payload):
+-        # Only the recorded retry policy may promise a retry.
++    elif retry in ("ready", "review"):
++        # Only the recorded final disposition may promise a retry.
+         state = f"task returned to {retry}; the dispatcher's normal retry policy applies"
+     else:
+         state = "retry state was not recorded"
+diff --git a/hermes_cli/kanban_local_failure.py b/hermes_cli/kanban_local_failure.py
+new file mode 100644
+index 0000000000..d825ee3fbd
+--- /dev/null
++++ b/hermes_cli/kanban_local_failure.py
+@@ -0,0 +1,32 @@
++"""Run-scoped local failure receipts (primary boards use Board authority)."""
++from __future__ import annotations
++
++import sqlite3
++
++
++def admit(conn: sqlite3.Connection, task_id: str, run_id: int | None) -> bool:
++    """Claim accounting inside its transaction; never infer an ended run identity."""
++    if run_id is None:
++        return True  # Legacy callers without a run retain their old accounting.
++    if conn.execute("SELECT 1 FROM task_runs WHERE id=? AND task_id=?", (run_id, task_id)).fetchone() is None:
++        return False
++    if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? AND id>?", (task_id, run_id)).fetchone():
++        return False  # A delayed observer must not charge a replacement attempt.
++    conn.execute("CREATE TABLE IF NOT EXISTS kanban_local_failures ("
++                 "run_id INTEGER PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE, "
++                 "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE)")
++    return conn.execute("INSERT OR IGNORE INTO kanban_local_failures(run_id,task_id) VALUES (?,?)",
++                        (run_id, task_id)).rowcount == 1
++
++
++def finalized(conn: sqlite3.Connection, task_id: str, run_id: int | None, **payload) -> None:
++    """Append the final notice atomically with the accounting receipt and counter."""
++    if run_id is None:
++        return
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
++    kb._append_event(conn, task_id, "failure_finalized", {
++        **payload, "run_uid": sync.run_uid(conn, run_id) or f"local:{run_id}",
++        "final_status": row["status"],
++    }, run_id=run_id)
+diff --git a/hermes_cli/kanban_neutral_release.py b/hermes_cli/kanban_neutral_release.py
+new file mode 100644
+index 0000000000..7764aa0e10
+--- /dev/null
++++ b/hermes_cli/kanban_neutral_release.py
+@@ -0,0 +1,86 @@
++"""Primary neutral releases and durable post-feed effect receipts. [daveey]"""
++import json
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_failure_release as release
++
++
++def reason_for(dead):
++    """Use final annotations, not the initial exit-code classification."""
++    if dead.host_reboot:
++        return None if dead.reboot_culprit else "reboot_bystander"
++    if dead.owner_down:
++        return "owner_down"
++    if dead.owner_unavailable:
++        return "owner_unavailable"
++    if dead.owner_restart:
++        return "owner_restart"
++    return "rate_limited" if dead.rate_limited else None
++
++
++def queue(conn, row, dead):
++    reason = reason_for(dead)
++    if sync.board_mode(conn) != "primary" or reason is None:
++        return False
++    release.queue(conn, row["id"], dead.run_id, outcome=reason,
++                  error=dead.error_text, extra=dict(dead.event_payload))
++    conn.execute("CREATE TABLE IF NOT EXISTS kanban_neutral_effects ("
++                 "run_uid TEXT PRIMARY KEY REFERENCES kanban_failure_commands(run_uid) ON DELETE CASCADE, "
++                 "event_kind TEXT NOT NULL, hook TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
++    hook = {"task_id": row["id"], "assignee": row["assignee"], "run_id": dead.run_id,
++            "worker_pid": row["worker_pid"], "exit_kind": dead.kind, "exit_code": dead.code,
++            "outcome": dead.run_outcome, "retry_status": dead.event_payload["retry_status"]}
++    conn.execute("INSERT OR IGNORE INTO kanban_neutral_effects (run_uid,event_kind,hook) VALUES (?,?,?)",
++                 (sync.run_uid(conn, dead.run_id), dead.event_kind, json.dumps(hook)))
++    return True
++
++
++def pending(conn):
++    """Read-only idle gate: avoid write transactions when there are no effects."""
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_neutral_effects'").fetchone():
++        return False
++    return conn.execute("SELECT 1 FROM kanban_neutral_effects WHERE done=0 LIMIT 1").fetchone() is not None
++
++
++def drain(conn):
++    """Return newly durable best-effort observer payloads, never on an ACK alone.
++
++    The marker commits before observer calls (as with ordinary reaping hooks).
++    An observer is best-effort, not an exactly-once external delivery contract.
++    """
++    from hermes_cli import kanban_db as kb
++    if not pending(conn):
++        return []
++    hooks, quotas = [], []
++    with kb.write_txn(conn, allow_nested=True):
++        for row in conn.execute("SELECT e.*, c.task_id, r.id AS run_id, r.outcome FROM kanban_neutral_effects e "
++                                "JOIN kanban_failure_commands c USING(run_uid) "
++                                "JOIN task_runs r ON r.uid=e.run_uid AND r.task_id=c.task_id "
++                                "WHERE e.done=0 AND r.ended_at IS NOT NULL").fetchall():
++            hook = json.loads(row["hook"])
++            if row["outcome"] != hook["outcome"]:
++                # Board expiry won the fence: never replay the losing neutral observation.
++                conn.execute("UPDATE kanban_neutral_effects SET done=1 WHERE run_uid=?", (row["run_uid"],))
++                continue
++            event = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
++                                 (row["task_id"], row["run_id"], row["event_kind"])).fetchone()
++            if event is None:
++                continue
++            hook["run_id"] = row["run_id"]
++            if hook["outcome"] == "rate_limited":
++                from hermes_cli.kanban_quota_release import prepare
++                quotas.append((row['run_uid'], hook, prepare(conn, row)))
++                continue
++            hooks.append(hook)
++            conn.execute("UPDATE kanban_neutral_effects SET done=1 WHERE run_uid=?", (row["run_uid"],))
++    for uid, hook, state in quotas:
++        from hermes_cli.kanban_quota_release import finish
++        try:
++            finish(state)
++        except OSError:
++            kb._log.warning('kanban: quota wall write deferred for %s', hook['task_id'], exc_info=True)
++            continue
++        with kb.write_txn(conn):
++            conn.execute("UPDATE kanban_neutral_effects SET done=1 WHERE run_uid=?", (uid,))
++        hooks.append(hook)
++    return hooks
+diff --git a/hermes_cli/kanban_notify_receipts.py b/hermes_cli/kanban_notify_receipts.py
+new file mode 100644
+index 0000000000..963e8f8ced
+--- /dev/null
++++ b/hermes_cli/kanban_notify_receipts.py
+@@ -0,0 +1,36 @@
++"""Durable, per-subscription failure delivery receipts. [daveey]
++
++Ping and wake are independent obligations. Record only successful delivery, not
++claiming; failed wakes must remain retryable even when the ping already landed.
++As with the existing ping cursor, an ambiguous transport ACK is not exactly-once
++transport: adapters must supply that guarantee themselves.
++"""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++
++
++def _ensure(conn):
++    conn.execute("""CREATE TABLE IF NOT EXISTS kanban_notify_receipts (
++        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
++        platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT NOT NULL,
++        lane TEXT NOT NULL, run_uid TEXT NOT NULL,
++        PRIMARY KEY (task_id, platform, chat_id, thread_id, lane, run_uid)
++    )""")
++
++
++def notify_failure_receipts(conn, *, task_id, platform, chat_id, thread_id=None, lane, run_uids=()):
++    """Checkpoint successful run deliveries, and return the lane's delivered keys."""
++    if lane not in {"ping", "wake"}:
++        raise ValueError("unknown notification receipt lane")
++    key = (task_id, platform.lower(), chat_id, thread_id or "", lane)
++    with kb.write_txn(conn):
++        _ensure(conn)
++        conn.executemany(
++            "INSERT OR IGNORE INTO kanban_notify_receipts VALUES (?, ?, ?, ?, ?, ?)",
++            [(*key, uid) for uid in run_uids],
++        )
++        return {row[0] for row in conn.execute(
++            "SELECT run_uid FROM kanban_notify_receipts WHERE task_id=? AND platform=? "
++            "AND chat_id=? AND thread_id=? AND lane=?", key,
++        )}
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 56723b5e0b..0762ed6501 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -19,13 +19,18 @@ logger = logging.getLogger(__name__)
+ MAX_BACKOFF_SECONDS = 7200
+ 
+ 
+-def episode(conn, task_id):
++def episode(conn, task_id, *, run_id=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_quota_receipt import receipt_deadline, receipt_route, valid_deadline
+     runs = []
++    bound = conn.execute("SELECT ended_at,id FROM task_runs WHERE task_id=? AND id=? AND ended_at IS NOT NULL",
++                         (task_id, run_id)).fetchone() if run_id is not None else None
++    if run_id is not None and bound is None:
++        return None
+     for row in conn.execute(
+         "SELECT id, outcome, ended_at FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+-        "ORDER BY ended_at DESC, id DESC", (task_id,)):
++        "AND (? IS NULL OR (ended_at,id)<=(?,?)) ORDER BY ended_at DESC, id DESC",
++        (task_id, run_id, bound['ended_at'] if bound else None, run_id)):
+         if row['outcome'] != 'rate_limited':
+             break
+         runs.append(row)
+@@ -251,13 +256,13 @@ def notice_text(payload):
+     return f' quota wall: {count} consecutive requeues; {action}. No failure budget consumed.'
+ 
+ 
+-def record_episode(conn, task_id, run_id):
++def record_episode(conn, task_id, run_id, *, captured=False):
+     """Called inside the reaper transaction; event and notice are atomic/idempotent.
+ 
+     Database errors propagate (the reaper's transaction owns them); a failure while choosing
+     the notice's wording falls back to the bare wait, so it can never leave a card running."""
+     from hermes_cli import kanban_db as kb
+-    state = episode(conn, task_id)
++    state = episode(conn, task_id, run_id=run_id if captured else None)
+     if not state or state['run_id'] != run_id:
+         return
+     exists = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='quota_episode'",
+diff --git a/hermes_cli/kanban_quota_release.py b/hermes_cli/kanban_quota_release.py
+new file mode 100644
+index 0000000000..5fd7088bd0
+--- /dev/null
++++ b/hermes_cli/kanban_quota_release.py
+@@ -0,0 +1,58 @@
++"""Durable quota effects after an authoritative neutral release. [daveey]
++
++The episode, notice and comment commit together with a fixed wall deadline.
++A failed wall write leaves the neutral receipt pending; retry never moves the
++reset deadline. Admission waits for this receipt, including split feed pages.
++"""
++import json
++import time
++
++
++def prepare(conn, row):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_quota_episode as quota
++    from hermes_cli import kanban_provider_walls as walls
++
++    conn.execute("CREATE TABLE IF NOT EXISTS kanban_quota_effects ("
++                 "run_uid TEXT PRIMARY KEY REFERENCES kanban_failure_commands(run_uid) ON DELETE CASCADE, "
++                 "state TEXT NOT NULL)")
++    stored = conn.execute("SELECT state FROM kanban_quota_effects WHERE run_uid=?", (row['run_uid'],)).fetchone()
++    if stored:
++        state = json.loads(stored[0])
++    else:
++        quota.record_episode(conn, row['task_id'], row['run_id'], captured=True)
++        event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
++                             "AND kind='quota_episode'", (row['task_id'], row['run_id'])).fetchone()
++        if event is None:
++            raise RuntimeError('quota release is not the latest ended run; refusing admission')
++        state = kb._json_dict(event[0])
++        state['write_wall'] = bool(state.get('provider') and state['until'] - time.time() >= walls.MIN_WALL_SECONDS)
++        conn.execute("INSERT INTO kanban_quota_effects (run_uid,state) VALUES (?,?)",
++                     (row['run_uid'], json.dumps(state)))
++    return state
++
++
++def finish(state):
++    if state['write_wall'] and state['until'] > time.time():
++        persist_wall(state['provider'], state['until'])
++
++
++def persist_wall(provider, until, *, now=None, path=None):
++    """Write a fixed deadline, propagating failure so the receipt stays pending."""
++    from hermes_cli import kanban_provider_walls as walls
++    now = time.time() if now is None else now
++    path = path or walls.walls_path()
++    current = walls.active_walls(now=now, path=path)
++    current[provider] = max(until, current.get(provider, 0))
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix('.tmp')
++    temporary.write_text(json.dumps(current), encoding='utf-8')
++    temporary.replace(path)
++
++
++def pending_task(conn, task_id):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_neutral_effects'").fetchone():
++        return False
++    return conn.execute("SELECT 1 FROM kanban_neutral_effects e JOIN kanban_failure_commands c USING(run_uid) "
++                        "WHERE c.task_id=? AND e.done=0 AND e.event_kind='rate_limited' LIMIT 1",
++                        (task_id,)).fetchone() is not None
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 73f3a0ef92..460d67fbc9 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -572,6 +572,8 @@ def translate(row: dict, hlc: str) -> dict:
+     if row["op"] == "delete":
+         return {**op, "op": "delete"}
+     fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"])
++    if row["op"] == "release":
++        return {**fields, "client_op_id": row["op_id"], "op": "release", "task": row["row_uid"]}
+     out = {**op, "op": "upsert", "fields": _wire_fields(row["table_name"], fields)}
+     if row["op"] in ("import", "compat_import") and row["table_name"] == "tasks":
+         out["import"] = True
+@@ -712,7 +714,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     sent = next(op.get('fields', {}) for op in wire if op['client_op_id'] == op_id)
+                     acknowledge(conn, op_id, res.get("row"), sent=sent)
+                     conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id = ?", (op_id,))
+-                    if row["table_name"] == "tasks" and res.get("version"):
++                    if row["table_name"] == "tasks" and row["op"] != "release" and res.get("version"):
+                         conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
+                                      (res["version"], row["row_uid"]))
+                     elif row["table_name"] == "task_runs" and res.get("version"):
+@@ -784,7 +786,7 @@ def pending_task_fields(conn: sqlite3.Connection) -> dict[str, set[str]]:
+     """Wire fields per task with a local edit still in the outbox (not rejected)."""
+     out: dict[str, set[str]] = {}
+     for uid, fields in conn.execute("SELECT row_uid, fields FROM kanban_sync_outbox "
+-                                    "WHERE table_name = 'tasks' AND state != 'rejected'"):
++                                    "WHERE table_name = 'tasks' AND op IN ('upsert', 'import') AND state != 'rejected'"):
+         out.setdefault(uid, set()).update(json.loads(fields))
+     return out
+ 
+diff --git a/tests/gateway/test_kanban_failure_delivery.py b/tests/gateway/test_kanban_failure_delivery.py
+new file mode 100644
+index 0000000000..0242d7fc5e
+--- /dev/null
++++ b/tests/gateway/test_kanban_failure_delivery.py
+@@ -0,0 +1,108 @@
++"""Messaging failure finalization dedup across durable claims and restarts."""
++import asyncio
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kbn
++from tests.gateway import test_kanban_notifier as helpers
++
++
++@pytest.mark.parametrize("split", [True, False])
++@pytest.mark.parametrize("delivery_mode", ["notify+wake", "wake"])
++def test_final_failure_ping_and_wake_once(tmp_path, monkeypatch, split, delivery_mode):
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
++    kb.init_db()
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="failure fixture", assignee="worker")
++    kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1", delivery_mode=delivery_mode)
++    expected_pings = int(delivery_mode == "notify+wake")
++    adapter = helpers.RecordingAdapter()
++
++    def emit(kind, run="run-one", **extra):
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, kind, {"run_uid": run, **extra})
++
++    def tick():
++        # New runner each time: dedup must survive process-local state loss.
++        asyncio.run(helpers._run_one_notifier_tick(monkeypatch, helpers._make_runner(adapter)))
++
++    try:
++        emit("reclaimed", failure_notice="canonical")
++        if split:
++            tick()
++            assert not adapter.sent and not adapter.handled
++        emit("crashed", failure_notice="canonical")
++        emit("gave_up", failure_notice="canonical", failures=3, effective_limit=2)
++        emit("failure_finalized", final_status="triage", failures=3, effective_limit=2)
++        if not split:
++            emit("failure_finalized", final_status="triage", failures=3, effective_limit=2)
++        tick()
++        assert len(adapter.sent) == expected_pings
++        assert len(adapter.handled) == 1
++        assert "automatic triage" in adapter.handled[0].text
++        assert "gateway.kanban.wake.failure_finalized" not in adapter.handled[0].text
++        assert "3 of 2" not in adapter.handled[0].text
++        if expected_pings:
++            assert "3 of 2" not in adapter.sent[0]["text"]
++        emit("failure_finalized", final_status="triage", failures=3, effective_limit=2)
++        tick()
++        assert len(adapter.sent) == expected_pings
++        assert len(adapter.handled) == 1
++        emit("failure_finalized", run="run-two", final_status="ready", failures=1, effective_limit=2)
++        tick()
++        assert len(adapter.sent) == 2 * expected_pings
++        assert len(adapter.handled) == 2
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("failed_lane", ["ping", "wake"])
++def test_failed_delivery_retries_only_missing_obligation(tmp_path, monkeypatch, failed_lane):
++    from gateway.wake import WakeNotAccepted
++
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "retry.db"))
++    kb.init_db()
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="retry fixture", assignee="worker")
++    sub = dict(task_id=tid, platform="telegram", chat_id="chat-1")
++    kbn.add_notify_sub(conn, **sub, delivery_mode="notify+wake")
++
++    class FlakyAdapter(helpers.RecordingAdapter):
++        failed = False
++
++        async def send(self, *args, **kwargs):
++            if failed_lane == "ping" and not self.failed:
++                self.failed = True
++                raise OSError("controlled send refusal")
++            await super().send(*args, **kwargs)
++
++        async def handle_message(self, event):
++            if failed_lane == "wake" and not self.failed:
++                self.failed = True
++                raise WakeNotAccepted()
++            await super().handle_message(event)
++
++    adapter = FlakyAdapter()
++
++    def tick():
++        asyncio.run(helpers._run_one_notifier_tick(monkeypatch, helpers._make_runner(adapter)))
++
++    try:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "failure_finalized", {
++                "run_uid": "retry-run", "final_status": "triage", "failures": 1, "effective_limit": 1,
++            })
++        tick()
++        assert adapter.failed
++        assert len(adapter.sent) == int(failed_lane == "wake")
++        assert not adapter.handled
++        assert kbn.notify_failure_receipts(conn, **sub, lane="wake") == set()
++        tick()
++        assert len(adapter.sent) == 1
++        assert len(adapter.handled) == 1
++        for lane in ("ping", "wake"):
++            assert kbn.notify_failure_receipts(conn, **sub, lane=lane) == {"retry-run"}
++        tick()
++        assert len(adapter.sent) == len(adapter.handled) == 1
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/kanban_real_board_bridge.py b/tests/hermes_cli/kanban_real_board_bridge.py
+new file mode 100644
+index 0000000000..d8ce8c9377
+--- /dev/null
++++ b/tests/hermes_cli/kanban_real_board_bridge.py
+@@ -0,0 +1,91 @@
++"""Opt-in HTTP bridge to the actual hermes-hub Vitest Worker, never a fake Board."""
++import json
++import queue
++import subprocess
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++
++class BoardBridge:
++    def __init__(self):
++        self.commands = queue.Queue()
++        self.replies = queue.Queue()
++        self.ready = queue.Queue()
++        owner = self
++
++        class Handler(BaseHTTPRequestHandler):
++            def log_message(self, *args):
++                pass
++
++            def respond(self, status, value):
++                body = value.encode() if isinstance(value, str) else json.dumps(value).encode()
++                self.send_response(status)
++                self.send_header("Content-Type", "application/json")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++
++            def do_GET(self):
++                self.handle_request()
++
++            def do_POST(self):
++                self.handle_request()
++
++            def handle_request(self):
++                body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
++                if self.path == "/next":
++                    try:
++                        value = owner.commands.get(timeout=1)
++                    except queue.Empty:
++                        value = {"noop": True}
++                    self.respond(200, value)
++                elif self.path in {"/ready", "/reply"}:
++                    target = owner.ready if self.path == "/ready" else owner.replies
++                    target.put(json.loads(body))
++                    self.respond(200, {})
++                else:
++                    owner.commands.put({"path": self.path, "method": self.command,
++                                        "headers": dict(self.headers), "body": body})
++                    result = owner.replies.get(timeout=30)
++                    self.respond(result["status"], result["text"])
++
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.url = f"http://127.0.0.1:{self.server.server_port}"
++        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++        self.thread.start()
++
++    def wait_ready(self, process, timeout=60):
++        """Fail promptly on peer exit, while bounding a live-but-unready peer."""
++        deadline = time.monotonic() + timeout
++        while True:
++            try:
++                return self.ready.get_nowait()
++            except queue.Empty:
++                pass
++            code = process.poll()
++            if code is not None:
++                raise RuntimeError(f"Worker bridge exited before readiness (exit {code})")
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise TimeoutError("Worker bridge not ready before deadline")
++            try:
++                return self.ready.get(timeout=min(0.1, remaining))
++            except queue.Empty:
++                continue
++
++    def alarm(self, board, task, run):
++        self.commands.put({"alarm": True, "board": board, "task": task, "run": run})
++        return self.replies.get(timeout=30)
++
++    def close(self, process):
++        self.commands.put({"stop": True})
++        try:
++            process.wait(timeout=15)
++        except subprocess.TimeoutExpired:
++            process.terminate()
++            process.wait(timeout=10)
++        finally:
++            self.server.shutdown()
++            self.server.server_close()
++            self.thread.join(timeout=5)
+diff --git a/tests/hermes_cli/test_kanban_board_bridge_lifecycle.py b/tests/hermes_cli/test_kanban_board_bridge_lifecycle.py
+new file mode 100644
+index 0000000000..1aea7fc59a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_board_bridge_lifecycle.py
+@@ -0,0 +1,48 @@
++"""Bounded readiness and cleanup for the real Board integration peer."""
++import queue
++from types import SimpleNamespace
++
++import pytest
++
++from tests.hermes_cli.kanban_real_board_bridge import BoardBridge
++
++
++def test_ready_peer_returns_key():
++    bridge = SimpleNamespace(ready=queue.Queue())
++    bridge.ready.put({"key": "fixture-key"})
++    process = SimpleNamespace(poll=lambda: None)
++    assert BoardBridge.wait_ready(bridge, process, timeout=1) == {"key": "fixture-key"}
++
++
++def test_exited_peer_fails_without_waiting_for_readiness():
++    class NoWaitQueue:
++        def get_nowait(self):
++            raise queue.Empty
++
++        def get(self, **kwargs):
++            pytest.fail("already-exited peer must not wait")
++
++    bridge = SimpleNamespace(ready=NoWaitQueue())
++    process = SimpleNamespace(poll=lambda: 7)
++    with pytest.raises(RuntimeError, match="exited.*7"):
++        BoardBridge.wait_ready(bridge, process, timeout=60)
++
++
++def test_live_peer_readiness_timeout_is_bounded():
++    bridge = SimpleNamespace(ready=queue.Queue())
++    process = SimpleNamespace(poll=lambda: None)
++    with pytest.raises(TimeoutError, match="not ready"):
++        BoardBridge.wait_ready(bridge, process, timeout=0)
++
++
++def test_peer_becomes_ready_during_wait():
++    class DelayedQueue:
++        def get_nowait(self):
++            raise queue.Empty
++
++        def get(self, **kwargs):
++            return {"key": "delayed-key"}
++
++    bridge = SimpleNamespace(ready=DelayedQueue())
++    process = SimpleNamespace(poll=lambda: None)
++    assert BoardBridge.wait_ready(bridge, process, timeout=1) == {"key": "delayed-key"}
+diff --git a/tests/hermes_cli/test_kanban_failure_once.py b/tests/hermes_cli/test_kanban_failure_once.py
+new file mode 100644
+index 0000000000..dc2c2147a4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failure_once.py
+@@ -0,0 +1,71 @@
++"""Regression coverage for failure notices from overlapping run observers."""
++
++import pytest
++
++from hermes_cli.kanban_failure_summary import describe_failure
++from types import SimpleNamespace
++
++
++@pytest.mark.parametrize("kind", ["crashed", "timed_out", "gave_up"])
++def test_canonical_protocol_suppresses_provisional_desktop_notice(kind):
++    from tui_gateway.session_notifications import _format_kanban_event_text
++    event = SimpleNamespace(kind=kind, payload={"failure_notice": "canonical", "retry_status": "ready"})
++    assert _format_kanban_event_text({"task_id": "fixture"}, None, event, "default") is None
++
++
++def test_canonical_desktop_notice_is_rendered_with_final_status():
++    from tui_gateway.session_notifications import _format_kanban_event_text
++    event = SimpleNamespace(kind="failure_finalized", payload={
++        "run_uid": "run-fixture", "final_status": "triage", "tripped": True,
++        "failures": 3, "effective_limit": 2, "retry_status": "ready"})
++    text = _format_kanban_event_text({"task_id": "fixture"}, None, event, "default")
++    assert text and "triage" in text and "2 of 2" in text
++    assert "returned to ready" not in text
++
++
++@pytest.mark.parametrize("kind", ["crashed", "timed_out", "gave_up"])
++def test_legacy_failure_notices_remain_visible(kind):
++    from tui_gateway.session_notifications import _format_kanban_event_text
++    event = SimpleNamespace(kind=kind, payload={"retry_status": "ready"})
++    assert _format_kanban_event_text({"task_id": "fixture"}, None, event, "default")
++
++
++def test_final_event_semantic_key_and_diagnostic_classification():
++    from hermes_cli.kanban_failure_notice import event_key
++    from gateway.kanban_watchers_notifier import diagnostic_event
++    first = SimpleNamespace(id=1, kind="failure_finalized", payload={"run_uid": "run-a"})
++    replay = SimpleNamespace(id=2, kind="failure_finalized", payload={"run_uid": "run-a"})
++    next_run = SimpleNamespace(id=3, kind="failure_finalized", payload={"run_uid": "run-b"})
++    assert event_key("default", first) == event_key("default", replay)
++    assert event_key("default", first) != event_key("default", next_run)
++    assert event_key("default", first) != event_key("other", first)
++    assert diagnostic_event(first)
++    assert event_key("default", SimpleNamespace(id=4, kind="crashed", payload={})) == "default:4"
++    assert event_key("default", SimpleNamespace(id=5, kind="failure_finalized", payload={})) == "default:5"
++
++
++@pytest.mark.parametrize("failures,limit", [(3, 2), (9, 1), (2, 2)])
++def test_notice_never_displays_more_attempts_than_budget(failures, limit):
++    text = describe_failure("gave_up", "fixture", {
++        "failures": failures,
++        "effective_limit": limit,
++        "trigger_outcome": "crashed",
++        "retry_status": "triage",
++    })
++    assert f"{min(failures, limit)} of {limit} failed attempt(s)" in text
++
++
++@pytest.mark.parametrize("status", ["ready", "review", "triage"])
++def test_final_notice_uses_authoritative_status_not_retry_phase(status):
++    text = describe_failure("failure_finalized", "fixture", {
++        "failures": 3, "effective_limit": 2, "trigger_outcome": "crashed",
++        "retry_status": "ready", "final_status": status, "tripped": status == "triage",
++    })
++    if status == "triage":
++        assert "2 of 2 failed attempt(s)" in text
++        assert "triage" in text
++        assert "returned to ready" not in text
++        assert "Blocked" not in text
++        assert "no user action" in text
++    else:
++        assert f"returned to {status}" in text
+diff --git a/tests/hermes_cli/test_kanban_failure_transport.py b/tests/hermes_cli/test_kanban_failure_transport.py
+new file mode 100644
+index 0000000000..77041ee6f4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failure_transport.py
+@@ -0,0 +1,297 @@
++"""Failure commands must cross the sync boundary as operations, not counter rows."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def live(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, "default", "fixture")
++    sync.set_mode(conn, "primary")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _running(conn):
++    tid = kb.create_task(conn, title="failure transport fixture", assignee="worker")
++    with kbc.write_txn(conn):
++        rid = conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at) "
++                           "VALUES (?, 'worker', 'running', 1)", (tid,)).lastrowid
++        conn.execute("UPDATE tasks SET status='running', current_run_id=?, sync_version=5 WHERE id=?", (rid, tid))
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    return tid, rid
++
++
++def test_queue_release_is_durable_run_scoped_and_does_not_write_mirrors(live):
++    from hermes_cli import kanban_failure_release as release
++    tid, rid = _running(live)
++    before = dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    with kbc.write_txn(live):
++        assert release.queue(live, tid, rid, outcome="crashed", error="exit 1")
++        assert release.queue(live, tid, rid, outcome="crashed", error="late exit")
++    rows = list(live.execute("SELECT * FROM kanban_sync_outbox"))
++    assert len(rows) == 1
++    assert rows[0]["op"] == "release"
++    assert json.loads(rows[0]["fields"])["run_uid"] == sync.run_uid(live, rid)
++    assert dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    assert live.execute("SELECT status FROM task_runs WHERE id=?", (rid,)).fetchone()[0] == "running"
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")  # acknowledged: receipt still prevents a second command
++        assert release.queue(live, tid, rid, outcome="crashed", error="again")
++    assert not list(live.execute("SELECT * FROM kanban_sync_outbox"))
++
++
++@pytest.mark.parametrize("mode", ["off", "shadow"])
++def test_queue_release_only_primary(live, mode):
++    from hermes_cli import kanban_failure_release as release
++    tid, rid = _running(live)
++    sync.set_mode(live, mode)
++    with kbc.write_txn(live):
++        assert not release.queue(live, tid, rid, outcome="crashed", error="exit 1")
++    assert not list(live.execute("SELECT * FROM kanban_sync_outbox"))
++
++
++@pytest.mark.parametrize("bad_run", [None, -1])
++def test_primary_missing_identity_never_falls_back_to_local_accounting(live, bad_run):
++    from hermes_cli import kanban_failure_release as release
++    tid, _ = _running(live)
++    with kbc.write_txn(live), pytest.raises(ValueError, match="portable run identity"):
++        release.queue(live, tid, bad_run, outcome="crashed", error="exit")
++    assert not list(live.execute("SELECT * FROM kanban_sync_outbox"))
++
++
++def test_primary_rejects_foreign_run_and_nontransactional_queue(live):
++    from hermes_cli import kanban_failure_release as release
++    tid, rid = _running(live)
++    with kbc.write_txn(live), pytest.raises(ValueError, match="another task"):
++        release.queue(live, "t_other", rid, outcome="crashed", error="exit")
++    with pytest.raises(ValueError, match="write transaction"):
++        release.queue(live, tid, rid, outcome="crashed", error="exit")
++    assert not list(live.execute("SELECT * FROM kanban_sync_outbox"))
++
++
++def test_receipt_and_command_roll_back_together_and_new_run_can_queue(live):
++    from hermes_cli import kanban_failure_release as release
++    tid, rid = _running(live)
++    with pytest.raises(RuntimeError), kbc.write_txn(live):
++        release.queue(live, tid, rid, outcome="crashed", error="exit")
++        raise RuntimeError("abort")
++    assert not list(live.execute("SELECT * FROM kanban_sync_outbox"))
++    with kbc.write_txn(live):
++        assert release.queue(live, tid, rid, outcome="crashed", error="exit")
++        rid2 = live.execute("INSERT INTO task_runs (task_id, profile, status, started_at) "
++                            "VALUES (?, 'worker', 'running', 2)", (tid,)).lastrowid
++        live.execute("DELETE FROM kanban_sync_outbox WHERE op != 'release'")
++        assert release.queue(live, tid, rid2, outcome="crashed", error="new exit")
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 2
++    assert live.execute("SELECT COUNT(*) FROM kanban_failure_commands").fetchone()[0] == 2
++
++
++def test_release_ack_does_not_hide_authoritative_task_feed(live):
++    tid, rid = _running(live)
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                     "VALUES ('release-fixture','tasks',?,'release',?,'',1)",
++                     (tid, json.dumps({"run_uid": sync.run_uid(live, rid), "outcome": "crashed"})))
++    class Hub:
++        def ops(self, board, wire):
++            assert len(wire) == 1 and wire[0]["op"] == "release"
++            return {"results": [{"client_op_id": "release-fixture", "status": "applied", "version": 9}]}
++    assert client.push(live, Hub(), "default", "fixture", primary=True).applied == 1
++    assert live.execute("SELECT sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[0] == 5
++
++
++def test_pending_release_is_not_a_local_task_edit(live):
++    tid, rid = _running(live)
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                     "VALUES ('release-fixture','tasks',?,'release',?,'',1)",
++                     (tid, json.dumps({"run_uid": sync.run_uid(live, rid), "outcome": "crashed", "error": "exit"})))
++    assert client.pending_task_fields(live) == {}
++    change = sync.RemoteChange(seq=1, table="tasks", uid=tid, op="upsert", version=6,
++                               hlc="", origin_gateway="board", fields={"error": "authoritative"})
++    assert sync._without_unacked_fields(live, change) == change.fields
++
++
++@pytest.mark.parametrize("force_trip,infrastructure", [(False, False), (True, False), (False, True)])
++def test_dispatch_failure_queues_before_mutating_primary_mirror(live, force_trip, infrastructure):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    tid, rid = _running(live)
++    before = dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    for _ in range(2):
++        assert not dispatch._record_task_failure(
++            live, tid, error="spawn refused", outcome="spawn_failed", release_claim=True,
++            end_run=True, force_trip=force_trip, infrastructure=infrastructure,
++            failure_limit=2, event_payload_extra={"fixture": True}, block_kind="assignment",
++        )
++    assert dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    assert live.execute("SELECT status FROM task_runs WHERE id=?", (rid,)).fetchone()[0] == "running"
++    rows = list(live.execute("SELECT * FROM kanban_sync_outbox"))
++    assert len(rows) == 1 and rows[0]["op"] == "release"
++    fields = json.loads(rows[0]["fields"])
++    assert fields == {"run_uid": sync.run_uid(live, rid), "outcome": "spawn_failed",
++                      "error": "spawn refused", "force_trip": force_trip,
++                      "infrastructure": infrastructure, "failure_limit": 2,
++                      "extra": {"fixture": True}, "block_kind": "assignment"}
++
++
++@pytest.mark.parametrize("flag", [None, "terminal_provider", "unknown_skill", "stdlib_shadow", "reboot_culprit", "protocol_violation"])
++def test_primary_real_crash_sweep_queues_once_without_provisional_state(live, monkeypatch, flag):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_owner_recovery as recovery
++    tid, rid = _running(live)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET worker_pid=987654, claim_lock=?, started_at=1 WHERE id=?",
++                     (kb._host_prefix() + "fixture", tid))
++        live.execute("DELETE FROM kanban_sync_outbox")
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++    monkeypatch.setattr(recovery, "managed_run_exit_code", lambda *a: 1)
++    observed = []
++    monkeypatch.setattr(recovery, "apply_attempt_note", lambda *a: observed.append(a[1]))
++    monkeypatch.setattr(dispatch._host_reboot, "victims", lambda *a: (None, []))
++    monkeypatch.setattr(dispatch._host_reboot, "note", lambda *a: None)
++    monkeypatch.setattr(dispatch._host_reboot, "comment_culprit", lambda *a: None)
++    monkeypatch.setattr(dispatch._owner_death, "note", lambda *a: None)
++    flags = {flag: ({"fixture": True} if flag == "reboot_culprit" else True)} if flag else {}
++    def dead_worker(*args, **kwargs):
++        dead = dispatch._DeadWorker("crashed", 1, "fixture exit 1", "crashed", {"exit_code": 1})
++        for key, value in flags.items():
++            setattr(dead, key, value)
++        return dead
++    monkeypatch.setattr(dispatch, "_classify_dead_worker", dead_worker)
++    before = dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert dispatch.detect_crashed_workers(live) == [tid]
++    assert dispatch.detect_crashed_workers(live) == []
++    assert observed == [tid]
++    assert dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    rows = list(live.execute("SELECT * FROM kanban_sync_outbox"))
++    assert len(rows) == 1 and rows[0]["op"] == "release"
++    fields = json.loads(rows[0]["fields"])
++    assert fields["run_uid"] == sync.run_uid(live, rid)
++    if flag == "protocol_violation":
++        assert fields["protocol_violation"] is True
++        assert fields["failure_limit"] == 3
++        assert "force_trip" not in fields
++    else:
++        assert fields["force_trip"] is bool(flag)
++    if flag and flag != "protocol_violation":
++        assert fields["extra"][flag] == flags[flag]
++    assert not list(live.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN ('crashed','gave_up')", (tid,)))
++
++
++@pytest.mark.parametrize("mode,flags,expected", [
++    ("off", {}, False), ("shadow", {}, False), ("primary", {}, True),
++    ("primary", {"protocol_violation": True}, True), ("primary", {"rate_limited": True}, False),
++    ("primary", {"owner_restart": True}, False), ("primary", {"owner_unavailable": True}, False),
++    ("primary", {"host_reboot": True}, False),
++    ("primary", {"host_reboot": True, "reboot_culprit": {"fixture": True}}, True),
++    ("primary", {"host_reboot": True, "reboot_culprit": {"fixture": True}, "owner_unavailable": True}, True),
++    ("primary", {"host_reboot": True, "reboot_culprit": {"fixture": True}, "owner_restart": True}, True),
++])
++def test_deferred_crash_retains_exemptions(live, mode, flags, expected):
++    from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
++    from hermes_cli.kanban_failure_release import deferred_crash
++    sync.set_mode(live, mode)
++    dead = _DeadWorker("crashed", 1, "fixture", "crashed", {})
++    for key, value in flags.items():
++        setattr(dead, key, value)
++    assert deferred_crash(live, dead) is expected
++
++
++@pytest.mark.parametrize("path", ["timeout", "stale"])
++def test_primary_timeout_and_stale_do_not_publish_competing_state(live, monkeypatch, path):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_owner_recovery as recovery
++    tid, rid = _running(live)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET worker_pid=987654, claim_lock=?, claim_expires=1, "
++                     "max_runtime_seconds=1, started_at=1 WHERE id=?", (kb._host_prefix() + "fixture", tid))
++        live.execute("DELETE FROM kanban_sync_outbox")
++    monkeypatch.setattr(kb, "_pid_alive", lambda *a: False)
++    monkeypatch.setattr(kb, "_worker_alive", lambda *a: False)
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++    monkeypatch.setattr(dispatch, "_poll_worker_exit", lambda *a: None)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked_after_kill", lambda *a, **kw: False)
++    monkeypatch.setattr(sync, "lease_lost", lambda *a: True)
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda *a, **kw: {})
++    before = dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    signals = []
++    for attempt in range(2):
++        if path == "timeout":
++            assert dispatch.enforce_max_runtime(live, signal_fn=lambda *a: signals.append(a)) == ([tid] if attempt == 0 else [])
++        else:
++            assert kb.release_stale_claims(live) == 0  # Board alarm owns expired leases.
++    assert len(signals) == (1 if path == "timeout" else 0)
++    assert dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    assert live.execute("SELECT status FROM task_runs WHERE id=?", (rid,)).fetchone()[0] == "running"
++    commands = list(live.execute("SELECT * FROM kanban_sync_outbox"))
++    assert len(commands) == (1 if path == "timeout" else 0)
++    if commands:
++        fields = json.loads(commands[0]["fields"])
++        assert fields["outcome"] == "timed_out" and fields["run_uid"] == sync.run_uid(live, rid)
++
++
++@pytest.mark.parametrize("changed", ["status", "worker_pid", "claim_lock", "current_run_id"])
++def test_timeout_revalidates_attempt_after_kill_wait(live, monkeypatch, changed):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_owner_recovery as recovery
++    tid, rid = _running(live)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET worker_pid=987654, claim_lock=?, max_runtime_seconds=1 WHERE id=?",
++                     (kb._host_prefix() + "fixture", tid))
++        live.execute("DELETE FROM kanban_sync_outbox")
++    monkeypatch.setattr(kb, "_pid_alive", lambda *a: False)
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked_after_kill", lambda *a, **kw: False)
++    def advance(*args):
++        value = {"status": "ready", "worker_pid": 987655, "claim_lock": "new:claim", "current_run_id": None}[changed]
++        with kbc.write_txn(live):
++            live.execute(f"UPDATE tasks SET {changed}=? WHERE id=?", (value, tid))
++            live.execute("DELETE FROM kanban_sync_outbox")
++    monkeypatch.setattr(dispatch, "_poll_worker_exit", advance)
++    assert dispatch.enforce_max_runtime(live, signal_fn=lambda *a: None) == []
++    assert not list(live.execute("SELECT * FROM kanban_sync_outbox"))
++    assert live.execute("SELECT status FROM task_runs WHERE id=?", (rid,)).fetchone()[0] == "running"
++    assert live.execute("SELECT consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()[0] == 0
++
++
++def test_queued_receipt_is_run_scoped_primary_only_and_cleans_up(live):
++    from hermes_cli import kanban_failure_release as release
++    tid, rid = _running(live)
++    assert not release.queued(live, rid)
++    with kbc.write_txn(live):
++        release.queue(live, tid, rid, outcome="crashed", error="exit")
++        live.execute("DELETE FROM kanban_sync_outbox")
++    assert release.queued(live, rid)
++    assert not release.queued(live, None)
++    other_tid, other_rid = _running(live)
++    assert other_tid != tid and not release.queued(live, other_rid)
++    for mode in ("off", "shadow"):
++        sync.set_mode(live, mode)
++        assert not release.queued(live, rid)
++    sync.set_mode(live, "primary")
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM tasks WHERE id=?", (tid,))
++    assert not list(live.execute("SELECT * FROM kanban_failure_commands"))
++
++
++def test_release_outbox_keeps_run_identity_and_policy():
++    fields = {"run_uid": "run-fixture", "outcome": "crashed", "error": "exited 1",
++              "force_trip": True, "failure_limit": 2}
++    wire = client.translate({"op_id": "failure-fixture", "table_name": "tasks",
++                             "row_uid": "t_fixture", "op": "release", "fields": json.dumps(fields)}, "unused")
++    assert wire == {"client_op_id": "failure-fixture", "op": "release", "task": "t_fixture", **fields}
+diff --git a/tests/hermes_cli/test_kanban_local_failure_receipt.py b/tests/hermes_cli/test_kanban_local_failure_receipt.py
+new file mode 100644
+index 0000000000..9cf70a8562
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_local_failure_receipt.py
+@@ -0,0 +1,216 @@
++"""Local failure receipts retain the captured run across competing observers."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from tests.hermes_cli import test_kanban_failure_transport as transport
++
++live = transport.live
++
++
++def _local_crash(live, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_owner_recovery as recovery
++    tid, rid = transport._running(live)
++    sync.set_mode(live, "off")
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET worker_pid=987654, claim_lock=?, started_at=1 WHERE id=?",
++                     (kb._host_prefix() + "fixture", tid))
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++    monkeypatch.setattr(recovery, "managed_run_exit_code", lambda *a: 1)
++    monkeypatch.setattr(recovery, "apply_attempt_note", lambda *a: None)
++    monkeypatch.setattr(dispatch._host_reboot, "victims", lambda *a: (None, []))
++    monkeypatch.setattr(dispatch._host_reboot, "note", lambda *a: None)
++    monkeypatch.setattr(dispatch._owner_death, "note", lambda *a: None)
++    monkeypatch.setattr(dispatch, "_classify_dead_worker", lambda *a, **kw:
++                        dispatch._DeadWorker("crashed", 1, "fixture exit", "crashed", {}))
++    return tid, rid
++
++
++@pytest.mark.parametrize("limit", [1, 3])
++def test_local_protocol_has_one_final_notice_without_early_charge(live, monkeypatch, limit):
++    from hermes_cli.kanban_failure_notice import provisional_failure
++    from types import SimpleNamespace
++    tid, rid = _local_crash(live, monkeypatch)
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET max_retries=? WHERE id=?", (limit, tid))
++    monkeypatch.setattr(dispatch, "_classify_dead_worker", lambda *a, **kw:
++                        dispatch._DeadWorker("clean_exit", 0, "protocol violation", "protocol_violation",
++                                             {"protocol_violation": True}, protocol_violation=True))
++    assert dispatch.detect_crashed_workers(live) == [tid]
++    events = [SimpleNamespace(kind=r["kind"], payload=json.loads(r["payload"])) for r in live.execute(
++        "SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN "
++        "('protocol_violation','gave_up','failure_finalized')", (tid,))]
++    assert [e.kind for e in events if not provisional_failure(e)] == ["failure_finalized"]
++    assert kb.get_task(live, tid).consecutive_failures == (1 if limit == 1 else 0)
++    dispatch._record_task_failure(live, tid, "late reclaim", outcome="reclaimed", run_id=rid)
++    assert kb.get_task(live, tid).consecutive_failures == (1 if limit == 1 else 0)
++
++
++def test_systemic_link_failure_emits_one_give_up_per_run(live, monkeypatch):
++    from hermes_cli import kanban_systemic_crash as systemic
++    tids = [_local_crash(live, monkeypatch)[0] for _ in range(3)]
++    monkeypatch.setattr(systemic, "attach", lambda *a: False)
++    assert sorted(dispatch.detect_crashed_workers(live)) == sorted(tids)
++    for tid in tids:
++        rows = list(live.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)))
++        assert len(rows) == 1
++        assert json.loads(rows[0][0])["sticky"] is True
++        assert json.loads(rows[0][0])["fix_card_link_failed"] is True
++        assert kb.get_task(live, tid).consecutive_failures == 1
++
++
++def test_local_crash_accounting_failure_rolls_back_reclaim(live, monkeypatch):
++    tid, rid = _local_crash(live, monkeypatch)
++    real = dispatch._record_task_failure
++
++    def fail_after_accounting(*args, **kwargs):
++        real(*args, **kwargs)
++        raise RuntimeError("accounting failed")
++
++    monkeypatch.setattr(dispatch, "_record_task_failure", fail_after_accounting)
++    with pytest.raises(RuntimeError, match="accounting failed"):
++        dispatch.detect_crashed_workers(live)
++    task = kb.get_task(live, tid)
++    assert task.status == "running"
++    assert task.current_run_id == rid
++    assert task.consecutive_failures == 0
++    assert live.execute("SELECT ended_at FROM task_runs WHERE id=?", (rid,)).fetchone()[0] is None
++    assert not list(live.execute("SELECT kind FROM task_events WHERE task_id=? AND kind IN "
++                                "('crashed','gave_up','failure_finalized')", (tid,)))
++    monkeypatch.setattr(dispatch, "_record_task_failure", real)
++    assert dispatch.detect_crashed_workers(live) == [tid]
++    assert kb.get_task(live, tid).consecutive_failures == 1
++
++
++def test_local_crash_sweep_suppresses_provisional_notice(live, monkeypatch):
++    from hermes_cli.kanban_failure_notice import provisional_failure
++    from types import SimpleNamespace
++    tid, rid = _local_crash(live, monkeypatch)
++    assert dispatch.detect_crashed_workers(live) == [tid]
++    dispatch._record_task_failure(live, tid, "late reclaim", outcome="reclaimed", run_id=rid)
++    assert kb.get_task(live, tid).consecutive_failures == 1
++    events = [SimpleNamespace(kind=r["kind"], payload=json.loads(r["payload"])) for r in live.execute(
++        "SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN ('crashed','gave_up','failure_finalized')", (tid,))]
++    assert [e.kind for e in events if not provisional_failure(e)] == ["failure_finalized"]
++
++
++@pytest.mark.parametrize("limit", [1, 2])
++def test_local_reclaim_and_crash_charge_captured_run_once(live, limit):
++    from hermes_cli import kanban_db_sync as sync
++    tid, rid = transport._running(live)
++    sync.set_mode(live, "off")
++    for outcome in ("reclaimed", "crashed"):
++        dispatch._record_task_failure(live, tid, "exit", outcome=outcome, run_id=rid, failure_limit=limit)
++    assert kb.get_task(live, tid).consecutive_failures == 1
++    events = list(live.execute("SELECT kind, payload, run_id FROM task_events WHERE task_id=?", (tid,)))
++    assert sum(e["kind"] == "gave_up" for e in events) == (1 if limit == 1 else 0)
++    final = [e for e in events if e["kind"] == "failure_finalized"]
++    assert len(final) == 1
++    assert final[0]["run_id"] == rid
++    assert json.loads(final[0]["payload"])["final_status"] == ("triage" if limit == 1 else "running")
++
++
++def test_local_receipt_survives_counter_reset_and_event_prune(live):
++    from hermes_cli import kanban_db_sync as sync
++    tid, rid = transport._running(live)
++    sync.set_mode(live, "off")
++    dispatch._record_task_failure(live, tid, "exit", outcome="crashed", run_id=rid)
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET consecutive_failures=0 WHERE id=?", (tid,))
++        live.execute("DELETE FROM task_events WHERE task_id=?", (tid,))
++    dispatch._record_task_failure(live, tid, "late", outcome="reclaimed", run_id=rid)
++    assert kb.get_task(live, tid).consecutive_failures == 0
++    assert not list(live.execute("SELECT * FROM task_events WHERE task_id=?", (tid,)))
++
++
++def test_local_late_old_run_cannot_charge_new_run(live):
++    from hermes_cli import kanban_db_sync as sync
++    tid, old = transport._running(live)
++    sync.set_mode(live, "off")
++    with kb.write_txn(live):
++        new = live.execute("INSERT INTO task_runs(task_id,profile,status,started_at) VALUES (?,'worker','running',2)", (tid,)).lastrowid
++        live.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (new, tid))
++    dispatch._record_task_failure(live, tid, "late", outcome="crashed", run_id=old)
++    assert kb.get_task(live, tid).consecutive_failures == 0
++    dispatch._record_task_failure(live, tid, "new exit", outcome="crashed", run_id=new)
++    assert kb.get_task(live, tid).consecutive_failures == 1
++
++
++def test_local_failure_receipt_rolls_back_with_counter_and_event(live):
++    from hermes_cli import kanban_db_sync as sync
++    tid, rid = transport._running(live)
++    sync.set_mode(live, "off")
++    with pytest.raises(RuntimeError, match="rollback"), kb.write_txn(live):
++        dispatch._record_task_failure(live, tid, "exit", outcome="crashed", run_id=rid)
++        raise RuntimeError("rollback")
++    assert kb.get_task(live, tid).consecutive_failures == 0
++    dispatch._record_task_failure(live, tid, "exit", outcome="crashed", run_id=rid)
++    assert kb.get_task(live, tid).consecutive_failures == 1
++    assert live.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='failure_finalized'", (tid,)).fetchone()[0] == 1
++
++
++def test_stale_reclaim_cannot_end_replacement_run(live, monkeypatch):
++    from hermes_cli import kanban_owner_recovery as recovery
++    tid, old = _local_crash(live, monkeypatch)
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET claim_expires=1 WHERE id=?", (tid,))
++    monkeypatch.setattr(kb, "_stale_claim_kept", lambda *a, **kw: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked_after_kill", lambda *a, **kw: False)
++    replacement = []
++
++    def replace_run(*args, **kwargs):
++        with kb.write_txn(live):
++            new = live.execute("INSERT INTO task_runs(task_id,profile,status,started_at) "
++                               "VALUES (?,'worker','running',2)", (tid,)).lastrowid
++            live.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (new, tid))
++            replacement.append(new)
++        return {}
++
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", replace_run)
++    assert kb.release_stale_claims(live) == 0
++    task = kb.get_task(live, tid)
++    assert task.status == "running"
++    assert task.current_run_id == replacement[0] != old
++    assert task.consecutive_failures == 0
++    assert live.execute("SELECT ended_at FROM task_runs WHERE id=?", (replacement[0],)).fetchone()[0] is None
++
++
++@pytest.mark.parametrize("delete", ["task_runs", "tasks"])
++def test_unsynced_receipt_identity_and_cascade(tmp_path, monkeypatch, delete):
++    from hermes_cli import kanban_db_connect as kbc
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, False)
++    with kbc.connect(home / "kanban.db") as conn:
++        assert "uid" not in {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
++        tid = kb.create_task(conn, title="local receipt", assignee="worker")
++        with kb.write_txn(conn):
++            rid = conn.execute("INSERT INTO task_runs(task_id,profile,status,started_at) "
++                               "VALUES (?,'worker','running',1)", (tid,)).lastrowid
++            conn.execute("UPDATE tasks SET current_run_id=?,status='running' WHERE id=?", (rid, tid))
++        for outcome in ("reclaimed", "crashed"):
++            dispatch._record_task_failure(conn, tid, "exit", outcome=outcome, run_id=rid, failure_limit=1)
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++        events = list(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='failure_finalized'", (tid,)))
++        assert len(events) == 1
++        assert json.loads(events[0][0])["run_uid"] == f"local:{rid}"
++        with kb.write_txn(conn):
++            if delete == "tasks":
++                conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
++            else:
++                conn.execute("DELETE FROM task_runs WHERE id=?", (rid,))
++        assert not list(conn.execute("SELECT * FROM kanban_local_failures"))
++
++
++def test_local_foreign_run_cannot_charge_task(live):
++    from hermes_cli import kanban_db_sync as sync
++    tid, _ = transport._running(live)
++    _, foreign = transport._running(live)
++    sync.set_mode(live, "off")
++    dispatch._record_task_failure(live, tid, "exit", outcome="crashed", run_id=foreign)
++    assert kb.get_task(live, tid).consecutive_failures == 0
++    assert not list(live.execute("SELECT * FROM task_events WHERE task_id=? AND kind='failure_finalized'", (tid,)))
+diff --git a/tests/hermes_cli/test_kanban_neutral_release.py b/tests/hermes_cli/test_kanban_neutral_release.py
+new file mode 100644
+index 0000000000..d5f8b9ea6d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_neutral_release.py
+@@ -0,0 +1,99 @@
++"""Primary owner/reboot losses wait for Board evidence before exit observers."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync, kanban_owner_recovery as recovery
++from tests.hermes_cli import test_kanban_failure_transport as support
++
++live = support.live
++
++
++@pytest.mark.parametrize("reason,event,outcome,flags", [
++    ("rate_limited", "rate_limited", "rate_limited", {"rate_limited": True}),
++    ("owner_restart", "owner_restart_lost", "reclaimed", {"owner_restart": True}),
++    ("owner_unavailable", "owner_unavailable", "owner_unavailable", {"owner_unavailable": True}),
++    ("owner_down", "owner_down", "owner_down", {"owner_down": True, "owner_unavailable": True}),
++    ("reboot_bystander", "host_reboot", "host_reboot", {"host_reboot": True}),
++])
++def test_neutral_sweep_queues_without_mirror_edits_and_drains_after_feed(live, monkeypatch, reason, event, outcome, flags):
++    tid, rid = support._running(live)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET worker_pid=987654, claim_lock=?, started_at=1 WHERE id=?",
++                     (kb._host_prefix() + "fixture", tid))
++        live.execute("DELETE FROM kanban_sync_outbox")
++    monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++    monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++    monkeypatch.setattr(recovery, "managed_run_exit_code", lambda *a: 1)
++    monkeypatch.setattr(recovery, "apply_attempt_note", lambda *a: None)
++    monkeypatch.setattr(dispatch._host_reboot, "victims", lambda *a: (None, []))
++    monkeypatch.setattr(dispatch._host_reboot, "note", lambda *a: None)
++    monkeypatch.setattr(dispatch._owner_death, "note", lambda *a: None)
++    dead = dispatch._DeadWorker(reason, 1, "fixture neutral exit", event, {"fixture": True}, **flags)
++    monkeypatch.setattr(dispatch, "_classify_dead_worker", lambda *a, **kw: dead)
++    hooks = []
++    monkeypatch.setattr(kb, "_kanban_observer_consumed", lambda *a: True)
++    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lambda *a, **kw: hooks.append(kw))
++    before = dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert dispatch.detect_crashed_workers(live) == []
++    assert dispatch.detect_crashed_workers(live) == []
++    assert dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
++    commands = list(live.execute("SELECT fields FROM kanban_sync_outbox WHERE op='release'"))
++    assert len(commands) == 1
++    fields = json.loads(commands[0][0])
++    assert fields["outcome"] == reason
++    assert fields["extra"]["fixture"] is True
++    assert not hooks
++    # Command ACK / task row alone are insufficient; the end and event can arrive separately.
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++        live.execute("UPDATE tasks SET status='ready', current_run_id=NULL WHERE id=?", (tid,))
++    dispatch.detect_crashed_workers(live)
++    assert not hooks
++    with kbc.write_txn(live):
++        live.execute("UPDATE task_runs SET ended_at=2, outcome=?, status=? WHERE id=?", (outcome, outcome, rid))
++    dispatch.detect_crashed_workers(live)
++    assert not hooks
++    with kbc.write_txn(live):
++        kb._append_event(live, tid, event, {"retry_status": "ready"}, run_id=rid)
++    dispatch.detect_crashed_workers(live)
++    assert len(hooks) == 1
++    assert hooks[0]["run_id"] == rid and hooks[0]["outcome"] == outcome
++    dispatch.detect_crashed_workers(live)
++    assert len(hooks) == 1
++    from hermes_cli.kanban_neutral_release import drain, pending
++    assert not pending(live)
++    statements = []
++    live.set_trace_callback(statements.append)
++    try:
++        assert drain(live) == []
++    finally:
++        live.set_trace_callback(None)
++    assert not any(s.upper().startswith("BEGIN") for s in statements)
++    assert live.execute("SELECT consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()[0] == 0
++    assert not list(live.execute("SELECT 1 FROM task_events WHERE kind IN ('gave_up','failure_finalized')"))
++
++
++def test_neutral_reason_precedence_and_local_controls(live):
++    from hermes_cli.kanban_neutral_release import reason_for
++    dead = dispatch._DeadWorker("fixture", 1, "fixture", "crashed", {}, rate_limited=True, owner_restart=True)
++    assert reason_for(dead) == "owner_restart"
++    dead.owner_unavailable = True
++    assert reason_for(dead) == "owner_unavailable"
++    dead.owner_down = True
++    assert reason_for(dead) == "owner_down"
++    dead.host_reboot = True
++    assert reason_for(dead) == "reboot_bystander"
++    dead.reboot_culprit = {"fixture": True}
++    assert reason_for(dead) is None
++    assert reason_for(dispatch._DeadWorker("rate_limited", 1, "quota", "rate_limited", {}, rate_limited=True)) == "rate_limited"
++    from hermes_cli.kanban_neutral_release import queue
++    tid, rid = support._running(live)
++    dead.run_id = rid
++    dead.reboot_culprit = None
++    row = live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    for mode in ("off", "shadow"):
++        sync.set_mode(live, mode)
++        with kbc.write_txn(live):
++            assert not queue(live, row, dead)
+diff --git a/tests/hermes_cli/test_kanban_quota_release.py b/tests/hermes_cli/test_kanban_quota_release.py
+new file mode 100644
+index 0000000000..ed0fea9158
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_release.py
+@@ -0,0 +1,74 @@
++"""Quota post-feed receipts survive wall I/O failure and later ended runs."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as dispatch
++from hermes_cli import kanban_neutral_release as neutral, kanban_quota_release as quota
++from tests.hermes_cli import test_kanban_failure_transport as support
++
++live = support.live
++
++
++def queued(live):
++    tid, rid = support._running(live)
++    dead = dispatch._DeadWorker('rate_limited', 1, 'quota', 'rate_limited',
++                                {'retry_status': 'ready'}, rate_limited=True)
++    dead.run_id = rid
++    with kbc.write_txn(live):
++        row = live.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++        assert neutral.queue(live, row, dead)
++        live.execute("UPDATE task_runs SET ended_at=10000,outcome='rate_limited' WHERE id=?", (rid,))
++        kb._append_event(live, tid, 'rate_limited', {}, run_id=rid)
++        kb._append_event(live, tid, 'run_route', {'provider': 'fixture', 'model': 'fixture'}, run_id=rid)
++    return tid, rid
++
++
++def test_wall_failure_keeps_task_gated_then_retries_fixed_deadline(live, monkeypatch, tmp_path):
++    monkeypatch.setattr(kb, '_resolve_rate_limit_cooldown_seconds', lambda: 3600)
++    monkeypatch.setattr(quota.time, 'time', lambda: 10000)
++    tid, _rid = queued(live)
++    original = quota.persist_wall
++    def fail(*a, **kw):
++        raise OSError('fixture wall write failure')
++    monkeypatch.setattr(quota, 'persist_wall', fail)
++    assert neutral.drain(live) == []
++    assert quota.pending_task(live, tid)
++    for lane in ('ready', 'review'):
++        assert dispatch.check_respawn_guard(live, tid, lane=lane) == 'rate_limit_cooldown'
++    state = json.loads(live.execute('SELECT state FROM kanban_quota_effects').fetchone()[0])
++    assert state['until'] == 13600
++    assert live.execute("SELECT COUNT(*) FROM task_events WHERE kind='quota_episode'").fetchone()[0] == 1
++    monkeypatch.setattr(quota.time, 'time', lambda: 11000)
++    path = tmp_path / 'walls.json'
++    monkeypatch.setattr(quota, 'persist_wall', lambda p, until: original(p, until, path=path))
++    assert len(neutral.drain(live)) == 1
++    assert json.loads(path.read_text()) == {'fixture': 13600}
++    assert not quota.pending_task(live, tid)
++    assert neutral.drain(live) == []
++    assert live.execute("SELECT COUNT(*) FROM task_events WHERE kind='quota_episode'").fetchone()[0] == 1
++
++
++def test_expired_wall_does_not_retry_io(monkeypatch):
++    monkeypatch.setattr(quota.time, 'time', lambda: 20000)
++    monkeypatch.setattr(quota, 'persist_wall', lambda *a: pytest.fail('expired write'))
++    quota.finish({'write_wall': True, 'provider': 'fixture', 'until': 19000})
++
++
++def test_delayed_quota_effect_is_anchored_to_captured_run(live, monkeypatch):
++    monkeypatch.setattr(quota.time, 'time', lambda: 10000)
++    tid, rid = queued(live)
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_runs(task_id,started_at,ended_at,outcome,status) VALUES (?,10001,10002,'completed','done')", (tid,))
++    assert len(neutral.drain(live)) == 1
++    event = live.execute("SELECT run_id,payload FROM task_events WHERE kind='quota_episode'").fetchone()
++    assert event['run_id'] == rid
++    assert json.loads(event['payload'])['count'] == 1
++    assert not quota.pending_task(live, tid)
++
++
++def test_captured_episode_foreign_and_unended_controls(live):
++    from hermes_cli.kanban_quota_episode import episode
++    tid, rid = support._running(live)
++    assert episode(live, tid, run_id=rid) is None
++    assert episode(live, 'foreign', run_id=rid) is None
+diff --git a/tests/hermes_cli/test_kanban_real_board_failure.py b/tests/hermes_cli/test_kanban_real_board_failure.py
+new file mode 100644
+index 0000000000..3233f1d314
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_real_board_failure.py
+@@ -0,0 +1,139 @@
++"""Acceptance: real Worker alarm + real dispatcher + persisted Desktop transcript.
++
++Run with HERMES_TEST_BOARD_SOURCE pointing at the hermes-hub checkout containing
++worker/test/core-failure-bridge.test.ts. No production service or user chat is used.
++"""
++import os
++import subprocess
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_db_dispatch as dispatch, kanban_db_notify as kbn
++from hermes_cli import kanban_owner_recovery as recovery, kanban_sync_client as client
++from hermes_state import SessionDB
++from tools.environments.local import build_subprocess_env
++from tui_gateway import server as notices
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_real_board_bridge import BoardBridge
++
++
++@pytest.fixture
++def board_peer(tmp_path):
++    source = os.environ.get("HERMES_TEST_BOARD_SOURCE")
++    if not source:
++        pytest.skip("requires the real hermes-hub Worker checkout")
++    bridge = BoardBridge()
++    log_path = tmp_path / "board-peer.log"
++    with log_path.open("w", encoding="utf-8") as log:
++        env = build_subprocess_env()
++        env["CORE_FAILURE_BRIDGE"] = bridge.url
++        process = subprocess.Popen(
++            ["npx", "vitest", "run", "test/core-failure-bridge.test.ts"],
++            cwd=Path(source) / "worker", env=env, stdout=log, stderr=subprocess.STDOUT,
++            text=True, encoding="utf-8",
++        )
++        try:
++            try:
++                key = bridge.wait_ready(process)["key"]
++            except (RuntimeError, TimeoutError) as exc:
++                pytest.fail(f"{exc}: " + log_path.read_text(encoding="utf-8"))
++            yield bridge, client.Hub(client.Identity(bridge.url, key, "failure-fixture"))
++        finally:
++            bridge.close(process)
++    assert process.returncode == 0, log_path.read_text(encoding="utf-8")
++
++
++@pytest.mark.parametrize("split", [False, True])
++@pytest.mark.parametrize("alarm_first", [True, False])
++def test_alarm_and_dispatcher_finalize_one_failure_and_one_chat(tmp_path, monkeypatch, board_peer, alarm_first, split):
++    bridge, hub = board_peer
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, "default", "failure-fixture")
++    sync.set_mode(conn, "primary")
++    previous = sync.set_lease_client(client.HubLeaseClient(hub))
++    db = SessionDB(home / "state.db")
++    db.create_session("failure-chat", source="desktop")
++    session = {"session_key": "failure-chat", "profile_home": str(home), "agent": SimpleNamespace(session_db=db)}
++    try:
++        tid = kb.create_task(conn, title="real Board failure fixture", assignee="worker", runs_on=[])
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET consecutive_failures=1, max_retries=2 WHERE id=?", (tid,))
++        assert client.push(conn, hub, "default", "failure-fixture", primary=True).rejected == 0
++        client.pull(conn, hub, "default", observers=True)
++        assert kb.claim_task(conn, tid, ttl_seconds=900, claimer=kb._host_prefix() + "fixture")
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET worker_pid=987654, started_at=1 WHERE id=?", (tid,))
++        assert client.push(conn, hub, "default", "failure-fixture", primary=True).rejected == 0
++        client.pull(conn, hub, "default", observers=True)
++        uid = conn.execute("SELECT uid FROM task_runs WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)", (tid,)).fetchone()[0]
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="failure-chat")
++
++        def poll():
++            claims = []
++            texts = notices._collect_kanban_notifications(session, claims)
++            session["_kanban_claims"] = claims
++            if texts:
++                verdict, _, _ = notices._kb_persist_batch(session, texts, True)
++                assert verdict in {"written", "delivered"}
++                notices._kb_ack_durable(session, {id(t) for t in texts})
++
++        if split:
++            real_changes = hub.changes
++            monkeypatch.setattr(hub, "changes", lambda board, since: real_changes(board, since, limit=1))
++            real_apply = sync.apply_remote_changes
++
++            def apply_and_poll(*args, **kwargs):
++                result = real_apply(*args, **kwargs)
++                poll()
++                return result
++
++            monkeypatch.setattr(sync, "apply_remote_changes", apply_and_poll)
++        monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++        monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++        monkeypatch.setattr(recovery, "managed_run_exit_code", lambda *a: 1)
++        monkeypatch.setattr(recovery, "apply_attempt_note", lambda *a: None)
++        monkeypatch.setattr(dispatch._host_reboot, "victims", lambda *a: (None, []))
++        monkeypatch.setattr(dispatch._host_reboot, "note", lambda *a: None)
++        monkeypatch.setattr(dispatch._host_reboot, "comment_culprit", lambda *a: None)
++        monkeypatch.setattr(dispatch._owner_death, "note", lambda *a: None)
++        monkeypatch.setattr(dispatch, "_classify_dead_worker", lambda *a, **kw:
++                            dispatch._DeadWorker("crashed", 1, "fixture exit 1", "crashed", {"exit_code": 1}))
++        if alarm_first:
++            assert bridge.alarm("default", tid, uid)["status"] == 200
++        # Deliberately retain the stale running mirror until the local observer acts.
++        assert dispatch.detect_crashed_workers(conn) == [tid]
++        poll()
++        client.push(conn, hub, "default", "failure-fixture", primary=True)
++        if not alarm_first:
++            assert bridge.alarm("default", tid, uid)["status"] == 200
++        client.pull(conn, hub, "default", observers=True)
++        poll()
++        row = conn.execute("SELECT status, consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()
++        assert tuple(row) == ("triage", 2)
++        events = list(conn.execute("SELECT kind,payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)))
++        assert len(events) == 1
++        board_tasks = hub.snapshot_page("default", "tasks")["rows"]
++        board_task = next(r for r in board_tasks if r["id"] == tid)
++        assert board_task["consecutive_failures"] == 2
++        board_events = hub.snapshot_page("default", "task_events")["rows"]
++        assert len([e for e in board_events if e["task_id"] == tid and e["kind"] == "gave_up"]) == 1
++        messages = db.get_messages("failure-chat")
++        assert len(messages) == 1, messages
++        assert "triage" in messages[0]["content"]
++        assert "returned to ready" not in messages[0]["content"]
++        assert "3 of 2" not in messages[0]["content"]
++        db.close()
++        db = SessionDB(home / "state.db")
++        session = {"session_key": "failure-chat", "profile_home": str(home), "agent": SimpleNamespace(session_db=db)}
++        client.pull(conn, hub, "default", observers=True)
++        poll()
++        assert len(db.get_messages("failure-chat")) == 1
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
++        db.close()
+diff --git a/tests/hermes_cli/test_kanban_real_board_neutral.py b/tests/hermes_cli/test_kanban_real_board_neutral.py
+new file mode 100644
+index 0000000000..05780cf319
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_real_board_neutral.py
+@@ -0,0 +1,88 @@
++"""Neutral owner losses through real Board release/feed and the actual reaper."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync, kanban_sync_client as client
++from hermes_cli import kanban_owner_recovery as recovery
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_real_board_failure as bridge_support
++
++board_peer = bridge_support.board_peer
++
++
++@pytest.mark.parametrize("alarm_first", [False, True])
++@pytest.mark.parametrize("reason,event,outcome,flags", [
++    ("rate_limited", "rate_limited", "rate_limited", {"rate_limited": True}),
++    ("owner_restart", "owner_restart_lost", "reclaimed", {"owner_restart": True}),
++    ("owner_unavailable", "owner_unavailable", "owner_unavailable", {"owner_unavailable": True}),
++    ("owner_down", "owner_down", "owner_down", {"owner_down": True, "owner_unavailable": True}),
++    ("reboot_bystander", "host_reboot", "host_reboot", {"host_reboot": True}),
++])
++def test_neutral_release_with_split_feed_and_reopened_store(tmp_path, monkeypatch, board_peer,
++                                                          alarm_first, reason, event, outcome, flags):
++    bridge, hub = board_peer
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    path = home / "kanban.db"
++    conn = kbc.connect(path)
++    client.ensure_identity(conn, "default", "failure-fixture")
++    sync.set_mode(conn, "primary")
++    previous = sync.set_lease_client(client.HubLeaseClient(hub))
++    hooks = []
++    monkeypatch.setattr(kb, "_kanban_observer_consumed", lambda *a: True)
++    def observe(name, *args, **kwargs):
++        if name == "on_kanban_worker_exited":
++            hooks.append(kwargs)
++    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", observe)
++    try:
++        tid = kb.create_task(conn, title="neutral Board fixture", assignee="worker", runs_on=[])
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='review', consecutive_failures=1, max_retries=2 WHERE id=?", (tid,))
++        client.push(conn, hub, "default", "failure-fixture", primary=True)
++        client.pull(conn, hub, "default", observers=True)
++        assert kb.claim_review_task(conn, tid, ttl_seconds=900, claimer=kb._host_prefix() + "fixture")
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET worker_pid=987654, started_at=1 WHERE id=?", (tid,))
++        client.push(conn, hub, "default", "failure-fixture", primary=True)
++        client.pull(conn, hub, "default", observers=True)
++        rid = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++        uid = sync.run_uid(conn, rid)
++        monkeypatch.setattr(dispatch, "_worker_alive", lambda *a: False)
++        monkeypatch.setattr(recovery, "owner_reclaim_blocked", lambda *a, **kw: False)
++        monkeypatch.setattr(recovery, "managed_run_exit_code", lambda *a: 1)
++        monkeypatch.setattr(recovery, "apply_attempt_note", lambda *a: None)
++        monkeypatch.setattr(dispatch._host_reboot, "victims", lambda *a: (None, []))
++        monkeypatch.setattr(dispatch._host_reboot, "note", lambda *a: None)
++        monkeypatch.setattr(dispatch._owner_death, "note", lambda *a: None)
++        monkeypatch.setattr(dispatch, "_classify_dead_worker", lambda *a, **kw:
++                            dispatch._DeadWorker(reason, 1, "neutral fixture", event, {"fixture": True}, **flags))
++        if alarm_first:
++            assert bridge.alarm("default", tid, uid)["status"] == 200
++        assert dispatch.detect_crashed_workers(conn) == []
++        assert dispatch.detect_crashed_workers(conn) == []
++        assert not hooks
++        client.push(conn, hub, "default", "failure-fixture", primary=True)
++        conn.close()
++        conn = kbc.connect(path)
++        real_changes = hub.changes
++        monkeypatch.setattr(hub, "changes", lambda board, since: real_changes(board, since, limit=1))
++        real_apply = sync.apply_remote_changes
++        def apply_then_reap(*args, **kwargs):
++            result = real_apply(*args, **kwargs)
++            dispatch.detect_crashed_workers(conn)
++            return result
++        monkeypatch.setattr(sync, "apply_remote_changes", apply_then_reap)
++        client.pull(conn, hub, "default", observers=True)
++        dispatch.detect_crashed_workers(conn)
++        row = conn.execute("SELECT status,consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()
++        assert tuple(row) == (("triage", 2) if alarm_first else ("review", 1))
++        assert len(hooks) == (0 if alarm_first else 1)
++        if hooks:
++            assert hooks[0]["outcome"] == outcome
++            assert hooks[0]["retry_status"] == "review"
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)).fetchone()[0] == int(alarm_first)
++        dispatch.detect_crashed_workers(conn)
++        assert len(hooks) == (0 if alarm_first else 1)
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
+diff --git a/tests/hermes_cli/test_kanban_sync_leases.py b/tests/hermes_cli/test_kanban_sync_leases.py
+index fb6ecfbf2f..01acfdc050 100644
+--- a/tests/hermes_cli/test_kanban_sync_leases.py
++++ b/tests/hermes_cli/test_kanban_sync_leases.py
+@@ -222,11 +222,14 @@ def test_lease_gap_stops_the_worker_once_the_lease_is_really_gone(primary, lease
+         else:
+             _lapse(conn, tid, sync.LEASE_DARK_HOLD_SECONDS + 60)
+             lease_client.renew_mode = "offline"
+-        assert kb.release_stale_claims(conn) == 1
++        before = _run_rows(conn, tid)
++        assert kb.release_stale_claims(conn) == 0
+         reaper.join(timeout=30)
+         assert proc.poll() is not None, "worker kept running after its lease was gone"
+-        assert kb.get_task(conn, tid).status == "ready"
+-        assert _run_rows(conn, tid)[-1][1:] == ("lease_lost", "lease_lost")
++        # The worker is stopped locally; only the authoritative feed ends its run.
++        assert kb.get_task(conn, tid).status == "running"
++        assert _run_rows(conn, tid) == before
++        assert kb.get_task(conn, tid).consecutive_failures == 0
+     finally:
+         if proc.poll() is None:
+             proc.kill()
+@@ -327,10 +330,12 @@ def test_lease_moved_to_another_gateway_stops_the_local_worker(primary, lease_cl
+         sync.apply_remote_changes(conn, [sync.RemoteChange(
+             1, "tasks", tid, "lease", {"lease_holder": "gw_other", "lease_expires": far}, 9, "", "gw_other",
+         )], new_cursor=1)
+-        assert kb.release_stale_claims(conn) == 1
++        before = _run_rows(conn, tid)
++        assert kb.release_stale_claims(conn) == 0
+         reaper.join(timeout=30)
+         assert proc.poll() is not None
+-        assert _run_rows(conn, tid)[-1][1] == "lease_lost"
++        assert _run_rows(conn, tid) == before
++        assert kb.get_task(conn, tid).consecutive_failures == 0
+     finally:
+         if proc.poll() is None:
+             proc.kill()
+diff --git a/tests/hermes_cli/test_kanban_sync_run_rows.py b/tests/hermes_cli/test_kanban_sync_run_rows.py
+index de1e0e3441..a4488bd451 100644
+--- a/tests/hermes_cli/test_kanban_sync_run_rows.py
++++ b/tests/hermes_cli/test_kanban_sync_run_rows.py
+@@ -84,16 +84,58 @@ def _assert_ended(live, svc, uid, outcome):
+     assert not dangling
+ 
+ 
++def _expire_board_lease(svc, tid, uid):
++    """Model the authoritative expiry/feed (the fake has no DO alarm).
++
++    Real alarm/crash races are covered by the Worker suite; here retain the
++    sync regression: an earlier grant/push echo must not reopen the ended run.
++    """
++    b = svc.board(BOARD)
++    lease = b["leases"].pop(tid)
++    assert lease["run_uid"] == uid
++    clock = "9999999999999-0001-board"
++    svc._put(b, "task_runs", uid,
++             {"status": "reclaimed", "outcome": "reclaimed", "ended_at": int(time.time())},
++             "server", None, clock)
++    fields = {"status": "ready", "current_run_uid": None, "lease_holder": None, "lease_expires": None}
++    clocks = {**b["rows"]["tasks"][tid].get("field_hlc", {}), **dict.fromkeys(fields, clock)}
++    svc._put(b, "tasks", tid, {**fields, "field_hlc": clocks}, "server", None, clock)
++
++
+ def test_stale_lock_reclaim_survives_the_echo_of_the_runs_earlier_push(live, kanban_home, svc):
+     tid, uid = _claimed(live, kanban_home, svc, "stale lock")
+     _round(kanban_home, svc)  # the run's insert reaches the Board; its echo now waits in the feed
+     live.execute("UPDATE tasks SET claim_expires = ?, worker_pid = NULL WHERE id = ?", (int(time.time()) - 5, tid))
+-    assert kb.release_stale_claims(live) == 1
++    assert kb.release_stale_claims(live) == 0
++    assert _run(live, uid)["status"] == "running"  # no competing local finalization
++    _expire_board_lease(svc, tid, uid)
+     _round(kanban_home, svc)  # pull (the stale echo) then push (the end)
+     _round(kanban_home, svc)
+     _assert_ended(live, svc, uid, "reclaimed")
+ 
+ 
++@pytest.mark.parametrize("mode,remote_end,local_end,seen,version,expected", [
++    ("primary", 10, None, None, 2, False),
++    ("primary", None, None, None, 2, True),
++    ("shadow", 10, None, None, 2, True),
++    ("primary", 10, 9, None, 2, True),
++    ("primary", 10, None, 2, 2, True),
++    ("primary", 10, None, 3, 2, True),
++])
++def test_pending_run_start_does_not_mask_newer_authoritative_end(
++    live, kanban_home, svc, mode, remote_end, local_end, seen, version, expected,
++):
++    tid, uid = _claimed(live, kanban_home, svc, "pending start fence")
++    rid = live.execute("SELECT id FROM task_runs WHERE uid=?", (uid,)).fetchone()[0]
++    live.execute("UPDATE task_runs SET ended_at=?, sync_version=? WHERE id=?", (local_end, seen, rid))
++    live.commit()
++    sync.set_mode(live, mode)
++    change = sync.RemoteChange(seq=1, table="task_runs", uid=uid, op="upsert", version=version,
++                               hlc="", origin_gateway="server",
++                               fields={"task_id": tid, "ended_at": remote_end, "status": "reclaimed"})
++    assert sync._local_row_is_newer(live, "task_runs", change, rid) is expected
++
++
+ def test_orphan_sweep_survives_the_echo_of_the_runs_earlier_push(live, kanban_home, svc):
+     tid, uid = _claimed(live, kanban_home, svc, "orphan")
+     _round(kanban_home, svc)
+@@ -173,7 +215,9 @@ def test_a_run_that_ends_before_its_first_push_survives_the_grants_own_run_row(l
+     run already ended (a slow round) must not reopen it."""
+     tid, uid = _claimed(live, kanban_home, svc, "slow round")
+     live.execute("UPDATE tasks SET claim_expires = ?, worker_pid = NULL WHERE id = ?", (int(time.time()) - 5, tid))
+-    assert kb.release_stale_claims(live) == 1
++    assert kb.release_stale_claims(live) == 0
++    assert _run(live, uid)["status"] == "running"  # no competing local finalization
++    _expire_board_lease(svc, tid, uid)
+     _round(kanban_home, svc)
+     _round(kanban_home, svc)
+     _assert_ended(live, svc, uid, "reclaimed")
+diff --git a/tests/tui_gateway/test_kanban_failure_delivery.py b/tests/tui_gateway/test_kanban_failure_delivery.py
+new file mode 100644
+index 0000000000..738197e788
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_failure_delivery.py
+@@ -0,0 +1,67 @@
++"""Canonical failures survive split polling and consumer restart in real stores."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kbn
++from hermes_state import SessionDB
++from tui_gateway import server as notices
++
++
++@pytest.mark.parametrize("split", [True, False])
++def test_failure_notice_persisted_once_per_run(tmp_path, split):
++    db_path = tmp_path / "state.db"
++    db = SessionDB(db_path)
++    db.create_session("failure-chat", source="desktop")
++    session = {"session_key": "failure-chat", "profile_home": str(tmp_path), "agent": SimpleNamespace(session_db=db)}
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="failure fixture", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="failure-chat")
++
++        def emit(kind, **payload):
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, kind, payload)
++
++        def poll():
++            claims = []
++            texts = notices._collect_kanban_notifications(session, claims)
++            session["_kanban_claims"] = claims
++            if not texts:
++                return "empty"
++            verdict, _, _ = notices._kb_persist_batch(session, texts, True)
++            assert verdict in {"written", "delivered"}, verdict
++            notices._kb_ack_durable(session, {id(t) for t in texts})
++            return verdict
++
++        emit("reclaimed", failure_notice="canonical", run_uid="run-one")
++        if split:
++            assert poll() == "empty"
++        emit("crashed", failure_notice="canonical", run_uid="run-one")
++        emit("gave_up", failure_notice="canonical", run_uid="run-one", failures=3, effective_limit=2)
++        emit("failure_finalized", run_uid="run-one", final_status="triage", failures=3, effective_limit=2)
++        if not split:
++            emit("failure_finalized", run_uid="run-one", final_status="triage", failures=3, effective_limit=2)
++        assert poll() == "written"
++        rows = db.get_messages("failure-chat")
++        assert len(rows) == 1
++        assert rows[0]["content"].count("triage") == 1
++        assert "3 of 2" not in rows[0]["content"]
++        assert "returned to ready" not in rows[0]["content"]
++        assert "triage" in rows[0]["content"]
++
++        # A new event ID for the same run after a restarted consumer must not
++        # create a second transcript row. No in-memory key cache survives here.
++        db.close()
++        db = SessionDB(db_path)
++        session = {"session_key": "failure-chat", "profile_home": str(tmp_path), "agent": SimpleNamespace(session_db=db)}
++        emit("failure_finalized", run_uid="run-one", final_status="triage", failures=3, effective_limit=2)
++        assert poll() == "delivered"
++        assert len(db.get_messages("failure-chat")) == 1
++
++        emit("failure_finalized", run_uid="run-two", final_status="ready", failures=1, effective_limit=2)
++        assert poll() == "written"
++        assert len(db.get_messages("failure-chat")) == 2
++    finally:
++        conn.close()
++        db.close()
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index ae5e33e64e..5f188767f0 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -169,7 +169,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+                         "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed",
+-                        "chat_wait_unclaimed", "request_withdrawn")
++                        "chat_wait_unclaimed", "request_withdrawn", "failure_finalized")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -621,6 +621,7 @@ _KANBAN_EVENT_FORMATTERS = {
+                          "No answer is needed for this request; this is not approval and not proof of completion."),
+     "completed": ("✔", _kb_completed),
+     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
++    "failure_finalized": ("✖", lambda t, p, title: _kb_failure("failure_finalized", p, title)),
+     "gave_up": ("✖", lambda t, p, title: _kb_failure("gave_up", p, title)),
+     "crashed": ("✖", lambda t, p, title: _kb_failure("crashed", p, title)),
+     "timed_out": ("⏱", _kb_timed_out),
+@@ -635,6 +636,9 @@ _KANBAN_EVENT_FORMATTERS = {
+ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+     """Single-line notification text for one kanban event; wording mirrors gateway/kanban_watchers.py (reads the same
+     as on Telegram). None for silent kinds."""
++    from hermes_cli.kanban_failure_notice import provisional_failure
++    if provisional_failure(ev):
++        return None
+     if (entry := _KANBAN_EVENT_FORMATTERS.get(getattr(ev, "kind", ""))) is None:
+         return None
+     glyph, fmt = entry
+@@ -795,7 +799,8 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+                 text = _format_kanban_event_text(sub, task, ev, slug)
+                 if text:
+                     text = DiagnosticText(text) if diagnostic_event(ev) else _KanbanText(text)
+-                    text._kb_keys = (f"{slug}:{int(ev.id)}",)  # type: ignore[attr-defined]  # event-id identity
++                    from hermes_cli.kanban_failure_notice import event_key
++                    text._kb_keys = (event_key(slug, ev),)  # type: ignore[attr-defined]
+                     texts.append(text)
+                     sub_texts.append(text)
+                     if claim is not None:
+-- 
+2.43.0
+

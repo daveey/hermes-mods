@@ -1,0 +1,155 @@
+From f953a7b2c6115c6a8928c081db711136a4294034 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:19:25 +0000
+Subject: [PATCH] [daveey] Restore attempted origins on any local in-process
+ apply/restore exception
+
+Review of 806ff390 (t_01a1ce2ce3027320): sqlite3.OperationalError or any other
+exception outside the narrow tuple escaped the guarded restore, leaving earlier
+origins applied with no JSON receipt. Catch Exception in the apply loop, each
+per-origin restore and restore settlement. Two new parametrized runner tests
+(4 cases) fail on 806ff390 and pass here.
+---
+ docs/kanban-priority-rollout.md               |  7 ++-
+ hermes_cli/kanban_priority_runner.py          | 14 +++--
+ .../hermes_cli/test_kanban_priority_runner.py | 52 +++++++++++++++++++
+ 3 files changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+index 3064fb5c8f..2e42b02cbf 100644
+--- a/docs/kanban-priority-rollout.md
++++ b/docs/kanban-priority-rollout.md
+@@ -103,9 +103,12 @@ supported `kanban_sync_client.push` API (no snapshot pull), rejects pending or
+ rejected publication, and runs the canonical read-only verifier. Success requires
+ canonical verification, not merely local apply receipts.
+ 
+-A later apply refusal, SSH timeout or invalid response stops further applies and
++A later apply refusal, SSH timeout, invalid response, or **any exception from the
++in-process local writer** (for example `sqlite3.OperationalError: database is
++locked` under live dispatch) stops further applies and
+ attempts guarded restore on **every attempted origin**, including the uncertain
+-origin, in reverse order. The JSON report separates `attempted` origins from
++origin, in reverse order. A restore that raises on one origin is recorded and the
++remaining origins are still restored. The JSON report separates `attempted` origins from
+ acknowledged, validated `applied` receipts and retains restore errors; the command
+ exits nonzero even if recovery succeeds. The same CAS makes restore a no-op if
+ apply never committed. Once all attempted origins have successful restore
+diff --git a/hermes_cli/kanban_priority_runner.py b/hermes_cli/kanban_priority_runner.py
+index 3cc92d4e4f..c2c88cd494 100644
+--- a/hermes_cli/kanban_priority_runner.py
++++ b/hermes_cli/kanban_priority_runner.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import logging
+ from pathlib import Path
+ import shlex
+ import subprocess
+@@ -12,6 +13,8 @@ from hermes_cli.kanban_supervisor_requests import _non_worker_refusal
+ from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
+ from tools.environments.local import build_subprocess_env
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def require_operator():
+     refusal = _non_worker_refusal()
+@@ -138,19 +141,24 @@ def run(conn, args):
+         for origin in sorted(origins):
+             # A lost reply can hide a committed write. Restore every attempted
+             # origin on failure; the same CAS makes a non-applied origin a no-op.
++            # ANY exception (e.g. sqlite3.OperationalError from the in-process
++            # local writer) must reach the guarded restore, not escape it.
+             report['attempted'].append(origin)
+             report['applied'][origin] = checked(invoke(origin, 'apply'), origin)
+-    except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as exc:
++    except Exception as exc:  # deliberate boundary: any failure must reach guarded restore
++        logger.exception('priority migrate: apply failed; restoring attempted origins')
+         report['errors'].append(f'apply failed; attempting guarded restore of every attempted origin: {exc}')
+         for origin in reversed(report['attempted']):
+             try:
+                 report['restored'][origin] = checked(invoke(origin, 'restore'), origin)
+-            except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as restore_exc:
++            except Exception as restore_exc:  # deliberate boundary: keep restoring the rest
++                logger.exception('priority migrate: guarded restore failed on %s', origin)
+                 report['errors'].append(f'{origin}: guarded restore refused; manual inspection required: {restore_exc}')
+         if set(report['restored']) == set(report['attempted']):
+             try:
+                 settle(undo=True)
+-            except (ValueError, OSError, subprocess.SubprocessError, HubError, SyncUnavailable) as restore_exc:
++            except Exception as restore_exc:  # deliberate boundary: always return the receipt
++                logger.exception('priority migrate: restore publication/verification failed')
+                 report['errors'].append(f'restore publication/verification failed: {restore_exc}')
+         return 1, report
+ 
+diff --git a/tests/hermes_cli/test_kanban_priority_runner.py b/tests/hermes_cli/test_kanban_priority_runner.py
+index 56b6cd65e8..166f05f056 100644
+--- a/tests/hermes_cli/test_kanban_priority_runner.py
++++ b/tests/hermes_cli/test_kanban_priority_runner.py
+@@ -3,6 +3,7 @@ import hashlib
+ import io
+ import json
+ import shlex
++import sqlite3
+ import subprocess
+ import sys
+ from types import SimpleNamespace
+@@ -305,3 +306,54 @@ def test_publish_hub_error_keeps_receipts(rig, monkeypatch):
+     assert '503' in report['errors'][0]
+     assert not report['restored']
+     assert not any(event[0] == 'restore' for event in rig.events)
++
++
++@pytest.mark.parametrize('exc', [sqlite3.OperationalError('database is locked'), RuntimeError('unexpected')])
++def test_local_in_process_apply_exception_still_restores_and_reports(rig, monkeypatch, exc):
++    """Review of 806ff390: a non-ValueError from the in-process local writer escaped the
++    guarded restore. Any exception must reach restore and still return the JSON receipt."""
++    real_apply = executor.apply_attached
++
++    def apply(_conn, attachment, dg, *, writer, undo, allow_legacy_rollback):
++        if not undo:
++            rig.events.append(('apply', writer))
++            raise exc
++        return real_apply(_conn, attachment, dg, writer=writer, undo=undo,
++                          allow_legacy_rollback=allow_legacy_rollback)
++    monkeypatch.setattr(executor, 'apply_attached', apply)
++    code, report = runner.run(None, rig.args)
++    assert code == 1
++    assert report['attempted'] == ['a']
++    assert not report['applied']
++    assert set(report['restored']) == {'a'}
++    assert ('restore', 'a') in rig.events
++    assert not any(e[0] == 'apply' and e[1] != 'a' for e in rig.events)
++    assert any('attempting guarded restore' in s and str(exc) in s for s in report['errors'])
++
++
++@pytest.mark.parametrize('exc', [sqlite3.OperationalError('database is locked'), RuntimeError('unexpected')])
++def test_local_restore_exception_does_not_skip_remote_restores(rig, monkeypatch, exc):
++    real_apply = executor.apply_attached
++
++    def apply(_conn, attachment, dg, *, writer, undo, allow_legacy_rollback):
++        if undo:
++            rig.events.append(('restore', writer))
++            raise exc
++        return real_apply(_conn, attachment, dg, writer=writer, undo=undo,
++                          allow_legacy_rollback=allow_legacy_rollback)
++
++    def transport(cmd, **kwargs):
++        words = shlex.split(cmd[-1])
++        action = words[words.index('--priority-operation') + 1]
++        if action == 'apply' and words[words.index('--writer') + 1] == 'c':
++            return SimpleNamespace(returncode=1, stdout='', stderr='changed priority')
++        return rig.transport(cmd, **kwargs)
++    monkeypatch.setattr(executor, 'apply_attached', apply)
++    monkeypatch.setattr(runner.subprocess, 'run', transport)
++    code, report = runner.run(None, rig.args)
++    assert code == 1
++    assert report['attempted'] == ['a', 'b', 'c']
++    assert set(report['applied']) == {'a', 'b'}
++    assert set(report['restored']) == {'b', 'c'}
++    assert any(s.startswith('a: guarded restore refused') and str(exc) in s for s in report['errors'])
++    assert 'canonical_restore' not in report
+-- 
+2.43.0
+

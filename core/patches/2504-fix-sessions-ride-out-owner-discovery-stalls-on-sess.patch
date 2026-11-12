@@ -1,0 +1,1315 @@
+From 5da2d6c85646044032e6c4742f4a83b3e02c2401 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:51:58 +0000
+Subject: [PATCH] fix(sessions): ride out owner-discovery stalls on session
+ writes; Desktop Retry
+
+A Desktop archive PATCH got 503 "owner_unavailable: control_timeout: Exclusive
+maintenance refused ... Drain and stop the gateway, then retry" because the
+session-write route did ONE 1.5s read-only identify while the owning gateway's
+control loop was briefly blocked (hub journal: loop blocked 1084.8ms; identify
+answered in 692.6ms the same second).
+
+Backend (hermes_cli/session_owner_discovery.py, shared by
+_mutate_via_gateway_owner and the router's _on_live_owner):
+- retry ONLY inaccessible/control_timeout discovery: <=3 attempts of <=1.5s,
+  0.25s backoff, one 6s monotonic budget (no attempt with <0.1s left);
+- every other verdict is final on the first read (absent keeps the offline
+  exclusive path and its lock; auth/protocol/permission/profile refusals are
+  never retried); discovery never starts a gateway;
+- the mutation is sent at most once; it is never retried server-side;
+- an exhausted control_timeout is a retryable 503 with no drain/stop advice.
+
+Desktop:
+- archive and rename failures restore the row and offer Retry only while the
+  mutation client retains the intent (shared isDefinitiveSessionMutationRefusal),
+  so a Retry replays the same request_id/expected revision;
+- the archive owner is pinned once (pinSessionWriteOwner); Retry skips
+  preflight/deselect and goes to that same connection/profile;
+- the selected-row owner rename went through an UNFENCED PATCH (refused as an
+  old client); it now uses the fenced renameSession.
+
+Root producer of the control-loop stall remains undetermined (not attributed).
+---
+ .../src/api/session-write-retry.test.ts       |  89 ++++
+ apps/desktop/src/api/sessions.ts              |  20 +-
+ .../chat/sidebar/session-actions-menu.test.ts |  11 +-
+ .../sidebar/session-actions-menu.test.tsx     |  56 +++
+ .../app/chat/sidebar/session-actions-menu.tsx |  65 ++-
+ .../hooks/use-session-actions.test.tsx        |   4 +-
+ .../archive-commit.test.ts                    |  79 ++++
+ .../use-session-actions/archive-commit.ts     |  48 +++
+ .../archive-linked-confirm.test.tsx           |   6 +-
+ .../hooks/use-session-actions/index.ts        |  60 +--
+ apps/desktop/src/lib/session-write-retry.ts   |  17 +
+ apps/shared/src/session-http-mutations.ts     |  12 +-
+ hermes_cli/session_owner_discovery.py         |  83 ++++
+ hermes_cli/web_routers/sessions.py            |   8 +-
+ hermes_cli/web_server_sessions.py             |  10 +-
+ .../test_session_owner_discovery_retry.py     | 401 ++++++++++++++++++
+ .../test_web_server_session_owner_forward.py  |   7 +-
+ 17 files changed, 900 insertions(+), 76 deletions(-)
+ create mode 100644 apps/desktop/src/api/session-write-retry.test.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+ create mode 100644 apps/desktop/src/lib/session-write-retry.ts
+ create mode 100644 hermes_cli/session_owner_discovery.py
+ create mode 100644 tests/hermes_cli/test_session_owner_discovery_retry.py
+
+diff --git a/apps/desktop/src/api/session-write-retry.test.ts b/apps/desktop/src/api/session-write-retry.test.ts
+new file mode 100644
+index 0000000000..ce858be307
+--- /dev/null
++++ b/apps/desktop/src/api/session-write-retry.test.ts
+@@ -0,0 +1,89 @@
++import { beforeEach, expect, it, vi } from 'vitest'
++
++import type * as ClientApi from './client'
++
++vi.mock('@/lib/legacy-session-owner-backfill', () => ({ maybeBackfillLegacySessionOwners: vi.fn() }))
++vi.mock('@/store/transcript-tail', () => ({ recordTranscriptTail: vi.fn() }))
++vi.mock('./client', async importOriginal => ({
++  ...await importOriginal<typeof ClientApi>(), hermesApi: vi.fn()
++}))
++import { sessionWriteRetryAction } from '@/lib/session-write-retry'
++
++import { hermesApi, setApiRequestConnection, setApiRequestProfile } from './client'
++import { pinSessionWriteOwner, renameSession, setSessionArchived } from './sessions'
++
++// The Nov 11 hub refusal, verbatim in shape: a live owner that missed its identify deadlines.
++const STALLED = new Error('503: {"detail":"owner_unavailable: control_timeout: the gateway that owns this profile did not answer in time; nothing was changed, retry"}')
++
++beforeEach(() => { vi.mocked(hermesApi).mockReset(); setApiRequestConnection('owner'); setApiRequestProfile('work') })
++
++function owner(revision: number, failures: Error[]) {
++  const writes: Array<{ body: Record<string, unknown>; connectionId?: string; path: string }> = []
++  let reads = 0
++  vi.mocked(hermesApi).mockImplementation(async request => {
++    if (!request.method || request.method === 'GET') {
++      reads += 1
++
++      return { exists: true, runtime_revision: revision, runtime_generation: 3 } as never
++    }
++
++    writes.push(request as never)
++    const failure = failures.shift()
++
++    if (failure) { throw failure }
++
++    return { ok: true, revision: revision + 1 } as never
++  })
++
++  return { reads: () => reads, writes }
++}
++
++it('pins a write to the connection and profile it was first sent to', () => {
++  expect(pinSessionWriteOwner('alt')).toEqual({ connectionId: 'owner', profile: 'alt' })
++  expect(pinSessionWriteOwner(undefined)).toEqual({ connectionId: 'owner', profile: 'work' })
++  expect(pinSessionWriteOwner({ connectionId: 'mini', profile: 'p' })).toEqual({ connectionId: 'mini', profile: 'p' })
++  setApiRequestConnection(null)
++  expect(pinSessionWriteOwner('alt')).toEqual({ profile: 'alt' })
++})
++
++it('a Retry after an owner stall replays the same fenced archive on the same owner', async () => {
++  const seen = owner(4, [STALLED])
++  const pinned = pinSessionWriteOwner('work')
++  await expect(setSessionArchived('chat', true, pinned)).rejects.toBe(STALLED)
++  // The window moved on to another gateway before the user clicked Retry.
++  setApiRequestConnection('unrelated')
++  setApiRequestProfile('other')
++  await setSessionArchived('chat', true, pinned)
++  expect(seen.writes).toHaveLength(2)
++  expect(seen.reads()).toBe(1) // no fresh precondition for a write the owner may already hold
++  expect(seen.writes[1]).toEqual(seen.writes[0])
++  expect(seen.writes[0].connectionId).toBe('owner')
++  expect(seen.writes[0].body).toMatchObject({ archived: true, pinned: false, profile: 'work', expected_revision: 4,
++    expected_generation: 3, request_id: expect.any(String) })
++})
++
++it('a selected row rename is fenced on its own gateway', async () => {
++  const seen = owner(9, [STALLED])
++  const row = { connectionId: 'mini', profile: 'work' }
++  await expect(renameSession('chat', 'New', row)).rejects.toBe(STALLED)
++  await renameSession('chat', 'New', row)
++  expect(seen.writes.map(write => write.connectionId)).toEqual(['mini', 'mini'])
++  expect(seen.writes[1]).toEqual(seen.writes[0])
++  expect(seen.writes[0].body).toMatchObject({ title: 'New', profile: 'work', expected_revision: 9,
++    request_id: expect.any(String) })
++})
++
++it('offers Retry exactly while the intent is still retained', async () => {
++  expect(sessionWriteRetryAction(STALLED, 'Retry', () => {})?.label).toBeTruthy()
++  expect(sessionWriteRetryAction(new Error('503: owner_unreachable'), 'Retry', () => {})).toBeDefined()
++  expect(sessionWriteRetryAction(new Error('request timed out'), 'Retry', () => {})).toBeDefined()
++
++  // A definitive refusal drops the identity, so the next try would be a NEW edit: no button.
++  const conflict = new Error('409: {"detail":"revision_conflict"}')
++  const seen = owner(2, [conflict])
++  await expect(setSessionArchived('chat', true, 'work')).rejects.toBe(conflict)
++  expect(sessionWriteRetryAction(conflict, 'Retry', () => {})).toBeUndefined()
++  await setSessionArchived('chat', true, 'work')
++  expect(seen.reads()).toBe(2)
++  expect(seen.writes[1].body.request_id).not.toBe(seen.writes[0].body.request_id)
++})
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index c7b93d20b4..dd5c65fbc9 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -756,8 +756,24 @@ export function deleteSession(id: string, profile?: ProfileScope): Promise<{ ok:
+   return mutateSessionHttp(id, 'DELETE', {}, profile)
+ }
+ 
+-export function renameSession(id: string, title: string, profile?: string | null): Promise<{ ok: boolean; title: string }> {
+-  return mutateSessionHttp(id, 'PATCH', { title }, sessionWriteProfile(profile))
++export function renameSession(id: string, title: string, profile?: ProfileScope): Promise<{ ok: boolean; title: string }> {
++  // An object owner (a selected row's gateway) keeps its connection, normalised like archive's.
++  const owner: ProfileScope =
++    profile && typeof profile === 'object'
++      ? { ...profile, profile: sessionWriteProfile(profile.profile) ?? null }
++      : sessionWriteProfile(profile)
++
++  return mutateSessionHttp(id, 'PATCH', { title }, owner)
++}
++
++/** [daveey] Resolve a session write's destination ONCE, so a Retry of a failed edit goes to the
++ *  same connection/profile and so carries the same retained identity (its mutation key) instead
++ *  of re-reading whichever connection or profile the window shows by then. */
++export function pinSessionWriteOwner(profile?: ProfileScope): ProfileScope {
++  const named = profile && typeof profile === 'object' ? profile : { profile }
++  const connectionId = (named.connectionId ?? '').trim() || getApiRequestConnection()
++
++  return { ...(connectionId ? { connectionId } : {}), profile: sessionWriteProfile(named.profile) ?? null }
+ }
+ 
+ /** [daveey] Stop one live background process a sidebar row owns (the process
+diff --git a/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.ts b/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.ts
+index 7f221aac0d..e2d5f2f3d3 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.ts
++++ b/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.ts
+@@ -204,13 +204,10 @@ describe('offline rename owner isolation', () => {
+     $sessions.set([{ ...selected, offline_cached: false }])
+     await renameSessionPreferringRpc(STORED_ID, 'New', 'work', selected)
+     expect(hubRequest).not.toHaveBeenCalled()
+-    expect(hermesApi).toHaveBeenCalledWith({
+-      connectionId: 'mini',
+-      profile: 'work',
+-      path: '/api/sessions/' + STORED_ID,
+-      method: 'PATCH',
+-      body: { title: 'New', profile: 'work' }
+-    })
++    // The selected row's own gateway takes the FENCED edit (snapshot + request identity), never a
++    // bare PATCH: current backends refuse an identity-less write as an out-of-date client.
++    expect(renameSession).toHaveBeenCalledWith(STORED_ID, 'New', { connectionId: 'mini', profile: 'work' })
++    expect(hermesApi).not.toHaveBeenCalled()
+   })
+   it('does not guess an offline owner from a bare id', async () => {
+     $offlineSessions.set([cached(), cached('cloud')])
+diff --git a/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.tsx b/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.tsx
+index 70bf9bf2fb..ae33812890 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-actions-menu.test.tsx
+@@ -43,6 +43,7 @@ vi.mock('@/i18n', () => ({
+         delete: 'Delete',
+         done: 'Done',
+         loading: 'Loading…',
++        retry: 'Retry',
+         save: 'Save'
+       },
+       errors: { genericFailure: 'Something went wrong' },
+@@ -91,6 +92,7 @@ vi.mock('@/store/gateway', () => ({ activeGateway: vi.fn(() => null) }))
+ vi.mock('@/store/notifications', () => ({ notify: vi.fn(), notifyError: vi.fn() }))
+ vi.mock('@/store/projects', () => ({
+   $projectTree: atom<unknown[]>([]),
++  applyRenamedSessionTitle: vi.fn(),
+   moveSessionToProject: vi.fn(),
+   moveToProjectTargets: vi.fn(() => []),
+   projectIdForCwd: vi.fn(() => null),
+@@ -105,6 +107,7 @@ vi.mock('@/store/session', () => ({
+   $selectedStoredSessionId: atom<null | string>(null),
+   $sessions: atom<unknown[]>([]),
+   $unreadFinishedSessionIds: atom<string[]>([]),
++  applySessionTitle: vi.fn(),
+   markSessionRead: vi.fn(),
+   sessionMatchesStoredId: vi.fn((row: { id: string }, id: string) => row.id === id),
+   sessionPinId: vi.fn((s: { id: string }) => s.id),
+@@ -213,6 +216,59 @@ describe('SessionActionsMenu', () => {
+     })
+   })
+ 
++  it('a stalled-owner rename keeps the dialog and offers a Retry of the same id, title and owner', async () => {
++    const { renameSession } = await import('@/hermes')
++    const { notifyError } = await import('@/store/notifications')
++    const stalled = new Error('503: owner_unavailable: control_timeout: the gateway that owns this profile did not answer in time; nothing was changed, retry')
++    vi.mocked(renameSession).mockReset()
++    vi.mocked(notifyError).mockClear()
++    vi.mocked(renameSession).mockRejectedValueOnce(stalled).mockResolvedValueOnce({ ok: true, title: 'Prep Butler' })
++
++    render(
++      <SessionActionsMenu profile="personal" sessionId="s1" title="My session">
++        <button aria-label="Session actions" type="button">
++          ⋮
++        </button>
++      </SessionActionsMenu>
++    )
++
++    const trigger = screen.getByRole('button', { name: 'Session actions' })
++    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
++    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
++    fireEvent.click(trigger)
++    fireEvent.click(await screen.findByRole('menuitem', { name: /rename/i }))
++    const dialog = await screen.findByRole('dialog')
++    fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: 'Prep Butler' } })
++    fireEvent.click(within(dialog).getByRole('button', { name: /save/i }))
++
++    await waitFor(() => expect(notifyError).toHaveBeenCalledOnce())
++    const [error, , options] = vi.mocked(notifyError).mock.calls[0]
++    expect(error).toBe(stalled)
++    expect(options?.action?.label).toBe('Retry')
++    // Nothing was applied: the dialog is still open with the typed title.
++    expect(screen.getByRole('dialog')).toBeTruthy()
++
++    options!.action!.onClick()
++    await waitFor(() => expect(renameSession).toHaveBeenCalledTimes(2))
++    expect(vi.mocked(renameSession).mock.calls).toEqual([['s1', 'Prep Butler', 'personal'], ['s1', 'Prep Butler', 'personal']])
++    expect(vi.mocked(notifyError).mock.calls.slice(1)).toEqual([])
++  })
++
++  it('a definitive rename refusal shows no Retry', async () => {
++    const { renameSession } = await import('@/hermes')
++    const { notifyError } = await import('@/store/notifications')
++    vi.mocked(renameSession).mockReset()
++    vi.mocked(notifyError).mockClear()
++    vi.mocked(renameSession).mockRejectedValueOnce(new Error('409: revision_conflict'))
++
++    render(<RenameSessionDialog currentTitle="Old" onOpenChange={() => {}} open profile="personal" sessionId="s1" />)
++    const dialog = await screen.findByRole('dialog')
++    fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: 'New' } })
++    fireEvent.click(within(dialog).getByRole('button', { name: /save/i }))
++    await waitFor(() => expect(notifyError).toHaveBeenCalledOnce())
++    expect(vi.mocked(notifyError).mock.calls[0][2]?.action).toBeUndefined()
++  })
++
+   it('confirms before deleting — cancel keeps the session, confirm deletes it', async () => {
+     const onDelete = vi.fn()
+     render(
+diff --git a/apps/desktop/src/app/chat/sidebar/session-actions-menu.tsx b/apps/desktop/src/app/chat/sidebar/session-actions-menu.tsx
+index b7a7c1ab7f..3ffac287b3 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-actions-menu.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-actions-menu.tsx
+@@ -2,7 +2,6 @@ import { useStore } from '@nanostores/react'
+ import type * as React from 'react'
+ import { useEffect, useRef, useState } from 'react'
+ 
+-import { hermesApi } from '@/api/client'
+ import { openSession } from '@/app/open-session'
+ import {
+   closeAllTreeTabs,
+@@ -32,6 +31,7 @@ import { ArchiveOff } from '@/lib/icons'
+ import { isSubmitEnter } from '@/lib/ime'
+ import { PROFILE_SWATCHES } from '@/lib/profile-color'
+ import { exportSession } from '@/lib/session-export'
++import { sessionWriteRetryAction } from '@/lib/session-write-retry'
+ import { activeGateway, requestGatewayForAgent } from '@/store/gateway'
+ import { notify, notifyError } from '@/store/notifications'
+ import { queueOfflineSessionAction } from '@/store/offline-session-actions'
+@@ -184,13 +184,11 @@ export async function renameSessionPreferringRpc(
+   }
+ 
+   if (owner) {
+-    return hermesApi<{ ok: boolean; title: string }>({
+-      connectionId: owner.connectionId,
+-      profile: owner.profile,
+-      path: `/api/sessions/${encodeURIComponent(storedSessionId)}`,
+-      method: 'PATCH',
+-      body: { title, profile: owner.profile }
+-    })
++    // The fenced edit (snapshot + request_id/expected_revision) on the row's own gateway: a bare
++    // PATCH carries no mutation identity, which every current backend refuses as an old client.
++    const result = await renameSession(storedSessionId, title, { connectionId: owner.connectionId, profile: owner.profile })
++
++    return { title: result?.title ?? title }
+   }
+ 
+   return renameSession(storedSessionId, title, resolvedProfile)
+@@ -876,26 +874,47 @@ export function RenameSessionDialog({
+ 
+     setSubmitting(true)
+ 
+-    try {
+-      const targetProfile =
+-        (profile ?? '').trim() || $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))?.profile || undefined
++    const targetProfile =
++      (profile ?? '').trim() || $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))?.profile || undefined
++
++    // One attempt bound to this id, title and owner; a failure's Retry reruns exactly it.
++    const attempt = async (): Promise<void> => {
++      let result: Awaited<ReturnType<typeof renameSessionPreferringRpc>>
++
++      try {
++        result = await renameSessionPreferringRpc(sessionId, next, targetProfile, selectedRow)
++      } catch (err) {
++        // The row keeps its title (nothing was applied); the button replays the same intent.
++        notifyError(err, r.renameFailed, {
++          action: sessionWriteRetryAction(err, t.common.retry, () => void attempt()),
++          id: `rename-failed:${sessionId}`
++        })
++
++        return
++      }
+ 
+-      const result = await renameSessionPreferringRpc(sessionId, next, targetProfile, selectedRow)
+       const finalTitle = result.title || next || ''
+ 
+-      // One write, every list: patch the main store AND the project surfaces.
+-      // Bare-id patching only the recents slice left project-scoped rows
+-      // (overview previews, entered-project lanes) on the stale title until a
+-      // profile switch forced a refetch (#123337).
+-      if (!selectedRow?.offline_cached) {
+-        applySessionTitle(sessionId, finalTitle || null)
+-        applyRenamedSessionTitle(sessionId, finalTitle || null)
++      try {
++        // One write, every list: patch the main store AND the project surfaces.
++        // Bare-id patching only the recents slice left project-scoped rows
++        // (overview previews, entered-project lanes) on the stale title until a
++        // profile switch forced a refetch (#123337).
++        if (!selectedRow?.offline_cached) {
++          applySessionTitle(sessionId, finalTitle || null)
++          applyRenamedSessionTitle(sessionId, finalTitle || null)
++        }
++
++        notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
++        onOpenChange(false)
++      } catch (err) {
++        // The owner already took the edit: a local refresh failure gets no Retry (no second write).
++        notifyError(err, r.renameFailed)
+       }
++    }
+ 
+-      notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
+-      onOpenChange(false)
+-    } catch (err) {
+-      notifyError(err, r.renameFailed)
++    try {
++      await attempt()
+     } finally {
+       setSubmitting(false)
+     }
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index ff1076dd65..842de61aeb 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -6835,7 +6835,7 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
+       await handle.archiveSession('tg-arch')
+     })
+ 
+-    expect(mockSetSessionArchived).toHaveBeenCalledWith('tg-arch', true, 'winefox')
++    expect(mockSetSessionArchived).toHaveBeenCalledWith('tg-arch', true, { profile: 'winefox' })
+     expect($messagingSessions.get()).toEqual([])
+   })
+ 
+@@ -6861,7 +6861,7 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
+ 
+     expect(onDeselect).toHaveBeenCalledTimes(1)
+     expect(navigate).not.toHaveBeenCalled()
+-    expect(mockSetSessionArchived).toHaveBeenCalledWith('tg-open', true, 'winefox')
++    expect(mockSetSessionArchived).toHaveBeenCalledWith('tg-open', true, { profile: 'winefox' })
+   })
+ 
+   it('archiving the open session without onDeselect still drops to a fresh draft', async () => {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts
+new file mode 100644
+index 0000000000..da10b48bf0
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts
+@@ -0,0 +1,79 @@
++import { beforeEach, expect, it, vi } from 'vitest'
++
++const { setSessionArchived, notifyError } = vi.hoisted(() => ({
++  setSessionArchived: vi.fn(),
++  notifyError: vi.fn()
++}))
++
++vi.mock('@/hermes', () => ({ setSessionArchived }))
++vi.mock('@/store/notifications', () => ({ notifyError }))
++
++import { commitArchive } from './archive-commit'
++
++const copy = { archiveFailed: 'Archive failed' } as never
++const STALLED = new Error('503: owner_unavailable: control_timeout: the gateway that owns this profile did not answer in time; nothing was changed, retry')
++
++function hiddenRow() {
++  return { end: vi.fn(), hid: true, ids: ['chat'], restore: vi.fn() }
++}
++
++beforeEach(() => {
++  setSessionArchived.mockReset()
++  notifyError.mockReset()
++})
++
++it('restores the row on failure and offers a Retry bound to the same owner and id', async () => {
++  const owner = { connectionId: 'hermes-hub', profile: 'default' }
++  const first = hiddenRow()
++  const again = hiddenRow()
++  const rehide = vi.fn(() => again)
++  const onArchived = vi.fn()
++  setSessionArchived.mockRejectedValueOnce(STALLED).mockResolvedValueOnce({ ok: true })
++
++  expect(await commitArchive({ copy, retryLabel: 'Retry', hidden: first, onArchived, owner, rehide, storedSessionId: 'chat' })).toBe(false)
++  expect(first.restore).toHaveBeenCalledOnce()
++  expect(first.end).not.toHaveBeenCalled()
++  expect(onArchived).not.toHaveBeenCalled()
++  const [error, title, options] = notifyError.mock.calls[0]
++  expect([error, title, options.id]).toEqual([STALLED, 'Archive failed', 'archive-failed:chat'])
++  expect(options.action.label).toBe('Retry')
++
++  options.action.onClick()
++  await vi.waitFor(() => expect(onArchived).toHaveBeenCalledOnce())
++  expect(rehide).toHaveBeenCalledOnce()
++  expect(again.end).toHaveBeenCalledOnce()
++  expect(again.restore).not.toHaveBeenCalled()
++  // Both sends target the exact same owner object and session id.
++  expect(setSessionArchived.mock.calls).toEqual([['chat', true, owner], ['chat', true, owner]])
++  expect(setSessionArchived.mock.calls[1][2]).toBe(owner)
++})
++
++it('a failed Retry restores the row again and keeps offering Retry', async () => {
++  const owner = { profile: 'work' }
++  const again = hiddenRow()
++  setSessionArchived.mockRejectedValue(STALLED)
++  await commitArchive({ copy, retryLabel: 'Retry', hidden: hiddenRow(), onArchived: vi.fn(), owner, rehide: () => again, storedSessionId: 'chat' })
++  notifyError.mock.calls[0][2].action.onClick()
++  await vi.waitFor(() => expect(again.restore).toHaveBeenCalledOnce())
++  expect(notifyError).toHaveBeenCalledTimes(2)
++  expect(notifyError.mock.calls[1][2].action.label).toBe('Retry')
++})
++
++it('a definitive refusal restores the row with no Retry', async () => {
++  const hidden = hiddenRow()
++  setSessionArchived.mockRejectedValueOnce(new Error('409: revision_conflict'))
++  await commitArchive({ copy, retryLabel: 'Retry', hidden, onArchived: vi.fn(), owner: 'work', rehide: hiddenRow, storedSessionId: 'chat' })
++  expect(hidden.restore).toHaveBeenCalledOnce()
++  expect(notifyError.mock.calls[0][2].action).toBeUndefined()
++})
++
++it('success ends the hide without a toast', async () => {
++  const hidden = hiddenRow()
++  const onArchived = vi.fn()
++  setSessionArchived.mockResolvedValueOnce({ ok: true })
++  expect(await commitArchive({ copy, retryLabel: 'Retry', hidden, onArchived, owner: 'work', rehide: hiddenRow, storedSessionId: 'chat' })).toBe(true)
++  expect(onArchived).toHaveBeenCalledOnce()
++  expect(hidden.end).toHaveBeenCalledOnce()
++  expect(hidden.restore).not.toHaveBeenCalled()
++  expect(notifyError).not.toHaveBeenCalled()
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+new file mode 100644
+index 0000000000..8fb49f73a1
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+@@ -0,0 +1,48 @@
++import { type ProfileScope, setSessionArchived } from '@/hermes'
++import type { Translations } from '@/i18n/types'
++import { sessionWriteRetryAction } from '@/lib/session-write-retry'
++import { notifyError } from '@/store/notifications'
++
++import type { softHideArchivedRow } from './archive-soft-hide'
++
++type HiddenRow = ReturnType<typeof softHideArchivedRow>
++
++interface ArchiveCommit {
++  storedSessionId: string
++  /** Resolved once (`pinSessionWriteOwner`) before the first attempt; every Retry reuses it. */
++  owner: ProfileScope
++  hidden: HiddenRow
++  /** Hide the row again for a Retry (the failed attempt put it back). */
++  rehide: () => HiddenRow
++  copy: Translations['desktop']
++  onArchived: () => void
++  /** The toast button's label (`t.common.retry`). */
++  retryLabel: string
++}
++
++/**
++ * [daveey] The archive write, after preflight. A failure restores the row and offers a Retry
++ * bound to this exact owner and id: it re-hides the row and sends the same intent, so the
++ * mutation client replays its retained identity (no fresh request_id for a write the owner may
++ * already hold). Retry skips the preflight and the deselect, which already ran.
++ */
++export async function commitArchive(commit: ArchiveCommit): Promise<boolean> {
++  const { copy, hidden, owner, storedSessionId } = commit
++
++  try {
++    await setSessionArchived(storedSessionId, true, owner)
++    commit.onArchived()
++  } catch (err) {
++    hidden.restore()
++    notifyError(err, copy.archiveFailed, {
++      action: sessionWriteRetryAction(err, commit.retryLabel, () => void commitArchive({ ...commit, hidden: commit.rehide() })),
++      id: `archive-failed:${storedSessionId}`
++    })
++
++    return false
++  }
++
++  hidden.end()
++
++  return true
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+index 3b8f346894..a214245ac3 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -126,7 +126,7 @@ describe('archiveSession linked-work confirmation', () => {
+     await act(() => handle.archiveSession('s-1'))
+ 
+     expect($confirmRequest.get()).toBeNull()
+-    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, 'default')
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, { profile: 'default' })
+   })
+ 
+   it('asks before archiving a chat with open Kanban tasks; Cancel keeps it', async () => {
+@@ -185,7 +185,7 @@ describe('archiveSession linked-work confirmation', () => {
+       await done
+     })
+ 
+-    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, 'default')
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('s-1', true, { profile: 'default' })
+     expect($sessions.get()).toEqual([])
+   })
+ 
+@@ -553,6 +553,6 @@ describe('archive preflight follows the remote owner when Recents lacks it', ()
+     await act(() => handle.archiveSession('hub-1', { selectedRow }))
+ 
+     expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: undefined }))
+-    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, 'default')
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, { profile: 'default' })
+   })
+ })
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 4f81296cda..795f628094 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -17,6 +17,7 @@ import {
+   fetchStoredTranscriptAcrossBackends,
+   getAllSessionMessages,
+   getLatestSessionMessages,
++  pinSessionWriteOwner,
+   setSessionArchived
+ } from '@/hermes'
+ import { useI18n } from '@/i18n'
+@@ -167,6 +168,7 @@ import {
+ } from '../session-context-drift'
+ import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
+ 
++import { commitArchive } from './archive-commit'
+ import { archiveOwnerRow } from './archive-owner'
+ import { archivePreflight, softHideArchivedRow } from './archive-soft-hide'
+ import { branchThroughRowId } from './branch-boundary'
+@@ -3479,43 +3481,45 @@ export function useSessionActions({
+         return
+       }
+ 
+-      try {
+-        // Route to the row's OWN gateway (mirrors deleteSession's removedOwner):
+-        // an All-Gateways row archived via the active connection 404s there.
+-        const archiveOwner: SessionOwnerScope = archived?.connection_id
+-          ? { connectionId: archived.connection_id, profile: archived.profile || 'default' }
+-          : profile
++      // Route to the row's OWN gateway (mirrors deleteSession's removedOwner): an
++      // All-Gateways row archived via the active connection 404s there. Pinned once,
++      // so a Retry goes to the same owner with the same retained identity.
++      const archiveOwner = pinSessionWriteOwner(
++        archived?.connection_id ? { connectionId: archived.connection_id, profile: archived.profile || 'default' } : profile
++      )
+ 
+-        await setSessionArchived(storedSessionId, true, archiveOwner)
+-        // Archived rows never reach the sidebar, so their persisted unread can
+-        // only rot. Dropped after the RPC so a failed archive keeps it.
+-        forgetSessionUnread(archivedIds, profile)
+-        // An archived session is hidden from the sidebar; its tile must go too.
+-        const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+-        closeSessionTile(storedSessionId)
++      await commitArchive({
++        copy,
++        hidden,
++        owner: archiveOwner,
++        rehide: () => softHideArchivedRow(storedSessionId, archived, findListedSession(storedSessionId) ?? listed),
++        retryLabel: t.common.retry,
++        storedSessionId,
++        onArchived: () => {
++          // Archived rows never reach the sidebar, so their persisted unread can
++          // only rot. Dropped after the RPC so a failed archive keeps it.
++          forgetSessionUnread(archivedIds, profile)
++          // An archived session is hidden from the sidebar; its tile must go too.
++          const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
++          closeSessionTile(storedSessionId)
++
++          if (tiledRuntimeId) {
++            runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
++            sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
++            dropSessionState(tiledRuntimeId)
++          }
+ 
+-        if (tiledRuntimeId) {
+-          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+-          sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
+-          dropSessionState(tiledRuntimeId)
++          notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
+         }
+-
+-        notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
+-      } catch (err) {
+-        hidden.restore()
+-        notifyError(err, copy.archiveFailed)
+-
+-        return
+-      }
+-
+-      hidden.end()
++      })
+     },
+     [
+       copy,
+       runtimeIdByStoredSessionIdRef,
+       selectedStoredSessionIdRef,
+       sessionStateByRuntimeIdRef,
+-      startFreshSessionDraft
++      startFreshSessionDraft,
++      t.common.retry
+     ]
+   )
+ 
+diff --git a/apps/desktop/src/lib/session-write-retry.ts b/apps/desktop/src/lib/session-write-retry.ts
+new file mode 100644
+index 0000000000..826604237b
+--- /dev/null
++++ b/apps/desktop/src/lib/session-write-retry.ts
+@@ -0,0 +1,17 @@
++import type { NotificationAction } from '@/store/notifications'
++
++import { isDefinitiveSessionMutationRefusal } from '../../../shared/src/session-http-mutations'
++
++/** [daveey] The toast button for a failed session edit (archive, rename): a Retry that replays
++ *  the SAME intent on the SAME owner, offered only while the mutation client still holds that
++ *  intent's identity. A definitive refusal (conflict, not found, permission) drops the identity,
++ *  so there is nothing to replay and no button: the user re-reads the row instead. A 503 owner
++ *  stall, a timeout or a lost reply keeps it, so the retry carries the same request_id and
++ *  expected revision and the owner answers an already-committed edit from its receipt. */
++export function sessionWriteRetryAction(error: unknown, label: string, retry: () => void): NotificationAction | undefined {
++  if (isDefinitiveSessionMutationRefusal(error)) {
++    return undefined
++  }
++
++  return { label, onClick: retry }
++}
+diff --git a/apps/shared/src/session-http-mutations.ts b/apps/shared/src/session-http-mutations.ts
+index a2973ee2da..afa618b24c 100644
+--- a/apps/shared/src/session-http-mutations.ts
++++ b/apps/shared/src/session-http-mutations.ts
+@@ -46,7 +46,7 @@ export function createSessionMutationClient() {
+     } catch (error) {
+       // These responses definitively rejected the write. Show the conflict;
+       // only a later explicit user action may read a new precondition.
+-      if (/revision_conflict|stale_generation|permission_denied|profile_mismatch|invalid_params|admission_conflict|session_busy|retained_receipts|runtime_coordination_required|unknown_execution|not_found|mutation_identity_required/.test(String(error))) {
++      if (isDefinitiveSessionMutationRefusal(error)) {
+         pending.delete(key)
+       }
+       throw error
+@@ -54,6 +54,16 @@ export function createSessionMutationClient() {
+   }
+ }
+ 
++/** The refusals that end a write for good (the retained identity is dropped). Anything else
++ * (a 503 owner_unavailable/owner_unreachable, a timeout, a lost reply) keeps the identity, so a
++ * user's Retry of the same intent replays the same request_id and expected revision. */
++const DEFINITIVE_SESSION_MUTATION_REFUSAL =
++  /revision_conflict|stale_generation|permission_denied|profile_mismatch|invalid_params|admission_conflict|session_busy|retained_receipts|runtime_coordination_required|unknown_execution|not_found|mutation_identity_required/
++
++export function isDefinitiveSessionMutationRefusal(error: unknown): boolean {
++  return DEFINITIVE_SESSION_MUTATION_REFUSAL.test(String(error))
++}
++
+ /** A v4 UUID on every origin, the one id minter for renderer and plugin code. `crypto.randomUUID`
+  * exists only in secure contexts, so a Webapp opened over plain HTTP from another machine has none. */
+ export function randomUuid(): string {
+diff --git a/hermes_cli/session_owner_discovery.py b/hermes_cli/session_owner_discovery.py
+new file mode 100644
+index 0000000000..0ca6b2d313
+--- /dev/null
++++ b/hermes_cli/session_owner_discovery.py
+@@ -0,0 +1,83 @@
++"""[daveey] Bounded owner discovery for a session write from a backend not composed with the gateway.
++
++One ``identify`` that misses its deadline does not prove the profile owner-less: the gateway's
++control loop can stall for about a second under host load (hub, Nov 11: loop blocked 1084.8 ms,
++an identify answered in 692.6 ms) and a single 1.5 s read then answers ``control_timeout``.
++Every session write behind it was refused with the offline lock's 503, although the owner was
++live and answered the next read.
++
++A ``control_timeout`` is therefore re-read, read-only and before any mutation is sent, inside
++one monotonic budget. Every other verdict is final on its first read: ``absent`` keeps the
++offline path, and refusals about authorization, protocol, permissions or profile identity are
++never retried. Discovery never starts a gateway, and the mutation itself is never retried here:
++the caller sends it at most once, and a client retry replays its own request_id.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import time
++from pathlib import Path
++
++# Total wall-clock spent discovering one write's owner, from the request's point of view.
++OWNER_DISCOVERY_BUDGET_S = 6.0
++# Per-read socket deadline: the single read this replaces.
++OWNER_DISCOVERY_ATTEMPT_S = 1.5
++OWNER_DISCOVERY_ATTEMPTS = 3
++OWNER_DISCOVERY_BACKOFF_S = 0.25
++# A read with less time than this left is not started (discovery refuses a timeout <= 0).
++_MIN_ATTEMPT_S = 0.1
++
++CONTROL_TIMEOUT = "control_timeout"
++# The exhausted-retry 503 tail. The offline lock's own remedy ("Drain and stop the gateway") is
++# wrong here: the owner is live, nothing was written, and the edit only has to be sent again.
++CONTROL_TIMEOUT_DETAIL = ("owner_unavailable: control_timeout: the gateway that owns this profile "
++                          "did not answer in time; nothing was changed, retry")
++
++
++def is_transient(discovery) -> bool:
++    """Only a missed identify deadline with no endpoint is worth another read."""
++    return (getattr(discovery, "endpoint", None) is None and getattr(discovery, "state", None) == "inaccessible"
++            and getattr(discovery, "reason_code", None) == CONTROL_TIMEOUT)
++
++
++def owner_unavailable_detail(discovery, lock_detail) -> str:
++    """The 503 detail once the offline lock lost behind a non-``absent`` verdict."""
++    if is_transient(discovery):
++        return CONTROL_TIMEOUT_DETAIL
++    reason = discovery.reason_code or discovery.state
++    return f"owner_unavailable: {reason}: {lock_detail}"
++
++
++def _timed_out():
++    from hermes_cli.gateway_runtime import GatewayDiscovery
++    return GatewayDiscovery("inaccessible", reason_code=CONTROL_TIMEOUT)
++
++
++async def discover_session_owner(home: Path, *, clock=time.monotonic, sleep=asyncio.sleep):
++    """Discovery's verdict for *home*, re-reading a ``control_timeout`` within the budget.
++
++    Each read runs in a thread under ``asyncio.wait_for`` capped at the remaining budget, so a
++    read that overruns its own socket deadline (the multiplexer fallback can take two) cannot
++    stretch the write past ``OWNER_DISCOVERY_BUDGET_S``; an abandoned read ends on its own
++    socket timeout and is treated as another ``control_timeout``."""
++    from hermes_cli import gateway_runtime
++
++    deadline = clock() + OWNER_DISCOVERY_BUDGET_S
++    discovery = None
++    for attempt in range(OWNER_DISCOVERY_ATTEMPTS):
++        remaining = deadline - clock()
++        if attempt and remaining < OWNER_DISCOVERY_BACKOFF_S + _MIN_ATTEMPT_S:
++            break
++        if attempt:
++            await sleep(OWNER_DISCOVERY_BACKOFF_S)
++            remaining = deadline - clock()
++        read = asyncio.to_thread(gateway_runtime.discover_gateway_endpoint, home,
++                                 timeout=min(OWNER_DISCOVERY_ATTEMPT_S, remaining))
++        try:
++            discovery = await asyncio.wait_for(read, timeout=remaining)
++        except TimeoutError:
++            discovery = _timed_out()
++        if not is_transient(discovery):
++            return discovery
++    return discovery or _timed_out()  # the first read always runs; this only types the result
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index c67f57260e..15ffb9bdd1 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -1120,13 +1120,14 @@ async def _on_live_owner(request: Request, profile: Optional[str], offline: Call
+     from fastapi.responses import JSONResponse, Response
+     from gateway.runtime_ownership import OwnershipConflict
+     from hermes_cli.gateway_client import _session_ticket
+-    from hermes_cli.gateway_runtime import discover_gateway_endpoint, gateway_profile_home
++    from hermes_cli.gateway_runtime import gateway_profile_home
++    from hermes_cli.session_owner_discovery import discover_session_owner, owner_unavailable_detail
+     from hermes_constants import get_hermes_home
+     from hermes_state import _default_db_path
+     import httpx
+ 
+     home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
+-    discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=1.5)
++    discovery = await discover_session_owner(home)
+     endpoint = discovery.endpoint
+     if endpoint is None:
+         try:
+@@ -1134,8 +1135,7 @@ async def _on_live_owner(request: Request, profile: Optional[str], offline: Call
+         except HTTPException as exc:
+             if discovery.state == "absent" or not isinstance(exc.__cause__, OwnershipConflict):
+                 raise
+-            reason = discovery.reason_code or discovery.state
+-            raise HTTPException(status_code=503, detail=f"owner_unavailable: {reason}: {exc.detail}") from exc
++            raise HTTPException(status_code=503, detail=owner_unavailable_detail(discovery, exc.detail)) from exc
+     if not getattr(endpoint, "control_home", True):
+         # A standalone profile gateway answered on its own socket: mint there, never on the launch home's.
+         endpoint = replace(endpoint, control_home=str(home.expanduser().resolve()))
+diff --git a/hermes_cli/web_server_sessions.py b/hermes_cli/web_server_sessions.py
+index 38b83c5254..ea85f810ff 100644
+--- a/hermes_cli/web_server_sessions.py
++++ b/hermes_cli/web_server_sessions.py
+@@ -214,14 +214,15 @@ async def _mutate_via_gateway_owner(profile, actor, params):
+     from fastapi import HTTPException
+     from gateway.runtime_ownership import OwnershipConflict
+     from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, connect_gateway
+-    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+     from hermes_cli.gateway_runtime_discovery import DiscoveryError
++    from hermes_cli.session_owner_discovery import discover_session_owner, owner_unavailable_detail
+     from hermes_cli.web_server_cron import _cron_profile_home
+     from hermes_state import _default_db_path
+ 
+     home = Path(_cron_profile_home(profile)[1]) if profile else Path(_default_db_path()).parent
+-    # Discovery is read-only and never starts a gateway.
+-    discovery = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=1.5)
++    # Discovery is read-only and never starts a gateway; a missed identify deadline is re-read
++    # within one bounded budget before anything is sent.
++    discovery = await discover_session_owner(home)
+     endpoint = discovery.endpoint
+     if endpoint is None:
+         try:
+@@ -231,8 +232,7 @@ async def _mutate_via_gateway_owner(profile, actor, params):
+                 raise
+             known = ''.join(f', {value}' for value in (discovery.reason_code, discovery.detail) if value)
+             _log.warning('session write for %s: gateway owner not reachable (%s%s)', home, discovery.state, known)
+-            reason = discovery.reason_code or discovery.state
+-            raise HTTPException(status_code=503, detail=f'owner_unavailable: {reason}: {exc.detail}') from exc
++            raise HTTPException(status_code=503, detail=owner_unavailable_detail(discovery, exc.detail)) from exc
+     if not getattr(endpoint, 'control_home', True):
+         # The selected home answered on its own socket (a multiplexer-served profile already
+         # names the multiplexer root). Pin it, so the ticket is minted on the socket that just
+diff --git a/tests/hermes_cli/test_session_owner_discovery_retry.py b/tests/hermes_cli/test_session_owner_discovery_retry.py
+new file mode 100644
+index 0000000000..713fbec128
+--- /dev/null
++++ b/tests/hermes_cli/test_session_owner_discovery_retry.py
+@@ -0,0 +1,401 @@
++"""A session write rides out a briefly stalled gateway owner without a second mutation.
++
++Hub, Nov 11: the gateway's control loop blocked for about a second, one 1.5 s ``identify`` answered
++``control_timeout``, and Desktop's archive came back as a 503 telling the user to drain and stop
++the live gateway. Discovery now re-reads a ``control_timeout`` (read-only, before anything is
++sent) inside one bounded budget; every other verdict stays final on its first read, the offline
++lock still decides an owner-less home, and the mutation is sent at most once per request.
++"""
++from contextlib import asynccontextmanager, contextmanager
++import asyncio
++import os
++import signal
++import sqlite3
++import threading
++import time
++from types import SimpleNamespace
++
++import httpx
++import pytest
++from fastapi import HTTPException
++
++from hermes_cli import session_owner_discovery as sod
++from hermes_cli.gateway_runtime import GatewayDiscovery
++
++TIMEOUT = GatewayDiscovery('inaccessible', reason_code='control_timeout')
++
++
++class _Clock:
++    """Monotonic time the fake reads and sleeps advance; no test waits on the wall clock."""
++
++    def __init__(self):
++        self.now = 100.0
++
++    def __call__(self):
++        return self.now
++
++    async def sleep(self, seconds):
++        self.now += seconds
++
++
++def _reads(monkeypatch, verdicts, clock=None, cost=None):
++    """Discovery answers *verdicts* in order (the last repeats); each read records its timeout."""
++    seen = []
++
++    def fake(home, timeout=2.0):
++        seen.append(timeout)
++        if clock is not None:
++            clock.now += timeout if cost is None else cost(timeout)
++        return verdicts[min(len(seen), len(verdicts)) - 1]
++    monkeypatch.setattr('hermes_cli.gateway_runtime.discover_gateway_endpoint', fake)
++    return seen
++
++
++@pytest.mark.asyncio
++async def test_a_control_timeout_is_re_read_until_the_owner_answers(tmp_path, monkeypatch):
++    ready = SimpleNamespace(state='ready', endpoint='owner', reason_code=None, detail=None)
++    clock = _Clock()
++    seen = _reads(monkeypatch, [TIMEOUT, ready], clock)
++    assert await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep) is ready
++    assert seen == [1.5, 1.5]
++
++
++@pytest.mark.asyncio
++async def test_repeated_stalls_stop_within_the_budget(tmp_path, monkeypatch):
++    """Every read spends its whole deadline: three reads, never past six seconds."""
++    clock = _Clock()
++    start = clock.now
++    seen = _reads(monkeypatch, [TIMEOUT], clock)
++    verdict = await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep)
++    assert verdict.reason_code == 'control_timeout' and verdict.endpoint is None
++    assert len(seen) == sod.OWNER_DISCOVERY_ATTEMPTS == 3
++    assert clock.now - start <= sod.OWNER_DISCOVERY_BUDGET_S <= 6.0
++    assert all(0 < timeout <= 1.5 for timeout in seen)
++
++
++@pytest.mark.asyncio
++async def test_overrunning_reads_shrink_to_the_remaining_budget(tmp_path, monkeypatch):
++    """A read that overruns its own deadline (the incident's loop stall) leaves less for the next;
++    one is never started with less than the minimum left, and none gets a timeout <= 0."""
++    clock = _Clock()
++    start = clock.now
++    seen = _reads(monkeypatch, [TIMEOUT], clock, cost=lambda timeout: timeout + 1.0)
++    await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep)
++    assert seen[0] == 1.5 and seen[-1] < 1.5 and all(timeout > 0 for timeout in seen)
++    # The last read was capped by the remaining budget; only its own overrun lies past it.
++    assert clock.now - start - 1.0 <= sod.OWNER_DISCOVERY_BUDGET_S + 1e-9
++
++
++@pytest.mark.asyncio
++async def test_a_read_too_late_to_fit_is_not_started(tmp_path, monkeypatch):
++    clock = _Clock()
++    seen = _reads(monkeypatch, [TIMEOUT], clock, cost=lambda _timeout: 5.8)
++    await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep)
++    assert seen == [1.5]
++
++
++@pytest.mark.asyncio
++async def test_a_read_stuck_past_its_socket_deadline_cannot_stretch_the_write(tmp_path, monkeypatch):
++    """The budget is enforced from the request's side: a read thread that ignores its timeout is
++    abandoned at the deadline and counts as another control_timeout."""
++    monkeypatch.setattr(sod, 'OWNER_DISCOVERY_BUDGET_S', 0.4)
++    release = threading.Event()
++    calls = []
++
++    def stuck(home, timeout=2.0):
++        calls.append(timeout)
++        release.wait(10)
++        return GatewayDiscovery('absent')
++    monkeypatch.setattr('hermes_cli.gateway_runtime.discover_gateway_endpoint', stuck)
++    try:
++        started = time.monotonic()
++        verdict = await sod.discover_session_owner(tmp_path)
++        elapsed = time.monotonic() - started
++    finally:
++        release.set()
++    assert verdict.reason_code == 'control_timeout'
++    assert len(calls) == 1 and 0 < calls[0] <= 0.4  # the next read would not fit in what is left
++    assert elapsed < 2.0
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('verdict', [
++    GatewayDiscovery('absent'),
++    GatewayDiscovery('starting'),
++    GatewayDiscovery('draining', reason_code='update_paused'),
++    GatewayDiscovery('inaccessible', reason_code='authorization'),
++    GatewayDiscovery('inaccessible', reason_code='profile_mismatch'),
++    GatewayDiscovery('inaccessible', reason_code='unsafe_control_permissions'),
++    GatewayDiscovery('inaccessible', reason_code='invalid_control_peer'),
++    GatewayDiscovery('incompatible', reason_code='runtime_protocol'),
++])
++async def test_every_other_verdict_is_final_on_its_first_read(tmp_path, monkeypatch, verdict):
++    clock = _Clock()
++    seen = _reads(monkeypatch, [verdict, TIMEOUT], clock)
++    assert await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep) is verdict
++    assert len(seen) == 1
++
++
++def test_a_timeout_with_an_endpoint_is_not_retried():
++    assert not sod.is_transient(SimpleNamespace(state='inaccessible', reason_code='control_timeout',
++                                                endpoint='owner'))
++    assert sod.is_transient(TIMEOUT)
++
++
++def _standalone_request(monkeypatch, tmp_path):
++    monkeypatch.setattr('hermes_state._default_db_path', lambda: str(tmp_path / 'state.db'))
++    return SimpleNamespace(
++        state=SimpleNamespace(native_http_principal=None,
++                              session=SimpleNamespace(user_id='user-a', provider='oidc',
++                                                      issuer='https://idp.example')),
++        app=SimpleNamespace(state=SimpleNamespace(auth_required=True, session_authority=None,
++                                                  gateway_runner=None)))
++
++
++def _no_backoff(monkeypatch):
++    monkeypatch.setattr(sod, 'OWNER_DISCOVERY_BACKOFF_S', 0.0)
++
++
++@pytest.mark.asyncio
++async def test_initial_timeout_then_healthy_owner_sends_exactly_one_mutation(tmp_path, monkeypatch):
++    from hermes_cli import web_server_sessions
++
++    _no_backoff(monkeypatch)
++    request = _standalone_request(monkeypatch, tmp_path)
++    ready = SimpleNamespace(state='ready', endpoint='owner-endpoint', reason_code=None, detail=None)
++    seen = _reads(monkeypatch, [TIMEOUT, ready])
++    rpcs, offline = [], []
++
++    class Client:
++        async def rpc(self, method, **params):
++            rpcs.append((method, params))
++            return {'session_id': params['session_id'], 'operation': 'sidebar', 'revision': 1}
++
++    @asynccontextmanager
++    async def connect(endpoint=None, subject=None):
++        assert endpoint == 'owner-endpoint'
++        yield Client()
++    monkeypatch.setattr('hermes_cli.gateway_client.connect_gateway', connect)
++    monkeypatch.setattr(web_server_sessions, '_mutate_offline_store',
++                        lambda profile, actor, params: offline.append(params))
++    result = await web_server_sessions._mutate_session_request(
++        request, None, 's1', request_id='req-1', expected_revision=0,
++        operation='sidebar', payload={'archived': True, 'pinned': False}, expected_generation=0)
++    assert result == {'ok': True, 'session_id': 's1', 'operation': 'sidebar', 'revision': 1}
++    assert len(seen) == 2
++    assert [method for method, _ in rpcs] == ['session.mutate']
++    assert rpcs[0][1]['request_id'] == 'req-1'
++    assert offline == []
++
++
++@pytest.mark.asyncio
++async def test_an_ambiguous_forward_is_never_resent_by_the_server(tmp_path, monkeypatch):
++    """A forward that dies after it was sent may have committed: one send, a retryable 503, and the
++    client's retry replays its own request_id; the server never mints or resends one."""
++    from hermes_cli import web_server_sessions
++
++    _no_backoff(monkeypatch)
++    request = _standalone_request(monkeypatch, tmp_path)
++    ready = SimpleNamespace(state='ready', endpoint='owner-endpoint', reason_code=None, detail=None)
++    _reads(monkeypatch, [TIMEOUT, ready])
++    rpcs, offline = [], []
++
++    class Client:
++        async def rpc(self, method, **params):
++            rpcs.append(params)
++            raise TimeoutError('reply lost after send')
++
++    @asynccontextmanager
++    async def connect(endpoint=None, subject=None):
++        yield Client()
++    monkeypatch.setattr('hermes_cli.gateway_client.connect_gateway', connect)
++    monkeypatch.setattr(web_server_sessions, '_mutate_offline_store',
++                        lambda profile, actor, params: offline.append(params))
++    with pytest.raises(HTTPException) as exc:
++        await web_server_sessions._mutate_session_request(
++            request, None, 's1', request_id='req-1', expected_revision=0,
++            operation='sidebar', payload={'archived': True})
++    assert (exc.value.status_code, exc.value.detail) == (503, 'owner_unreachable')
++    assert [params['request_id'] for params in rpcs] == ['req-1']
++    assert offline == []
++
++
++@pytest.mark.asyncio
++async def test_exhausted_stalls_behind_a_held_lock_answer_retry_not_drain(tmp_path, monkeypatch):
++    """The owner still holds the lock: the offline write loses (never bypassed), and the 503 asks for
++    a retry instead of telling the user to drain and stop a live gateway."""
++    from gateway.runtime_ownership import OwnershipConflict
++    from hermes_cli import web_server_sessions
++
++    _no_backoff(monkeypatch)
++    request = _standalone_request(monkeypatch, tmp_path)
++    seen = _reads(monkeypatch, [TIMEOUT])
++    attempts = []
++
++    @contextmanager
++    def held(homes):
++        attempts.append(homes)
++        raise OwnershipConflict('Exclusive maintenance refused: held. Drain and stop the gateway, then retry.')
++        yield
++    monkeypatch.setattr('gateway.runtime_ownership.exclusive_maintenance', held)
++    with pytest.raises(HTTPException) as exc:
++        await web_server_sessions._mutate_session_request(
++            request, None, 's1', request_id='req-1', expected_revision=0,
++            operation='sidebar', payload={'archived': True})
++    assert exc.value.status_code == 503
++    assert exc.value.detail == sod.CONTROL_TIMEOUT_DETAIL
++    assert 'Drain' not in exc.value.detail and 'stop' not in exc.value.detail
++    assert len(seen) == 3 and len(attempts) == 1
++
++
++@pytest.mark.asyncio
++async def test_an_owner_gone_by_the_last_read_still_edits_offline(tmp_path, monkeypatch):
++    """Stalls then no owner at all: the free lock lets the offline write land, as on main."""
++    from hermes_cli import web_server_sessions
++
++    _no_backoff(monkeypatch)
++    request = _standalone_request(monkeypatch, tmp_path)
++    seen = _reads(monkeypatch, [TIMEOUT, TIMEOUT, GatewayDiscovery('absent')])
++    monkeypatch.setattr(web_server_sessions, '_mutate_offline_store', lambda profile, actor, params:
++                        {'session_id': params['session_id'], 'operation': 'sidebar', 'revision': 1})
++    result = await web_server_sessions._mutate_session_request(
++        request, None, 's1', request_id='req-1', expected_revision=0,
++        operation='sidebar', payload={'pinned': True})
++    assert result['revision'] == 1 and len(seen) == 3
++
++
++def test_live_owner_forward_rereads_a_timeout_before_forwarding(tmp_path, monkeypatch):
++    """``_on_live_owner`` (mute, owner-backfill) shares the same discovery."""
++    from contextlib import contextmanager as cm
++
++    import gateway.runtime_ownership as ownership
++    import hermes_state
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from hermes_cli.web_routers.sessions import manage_router
++
++    _no_backoff(monkeypatch)
++    home = tmp_path / 'state'
++    home.mkdir(mode=0o700)
++    seen = _reads(monkeypatch, [TIMEOUT])
++
++    @cm
++    def held(_homes, **_kw):
++        raise ownership.OwnershipConflict('Exclusive maintenance refused: held. Drain and stop the gateway, then retry.')
++        yield
++    monkeypatch.setattr(ownership, 'exclusive_maintenance', held)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', home / 'state.db')
++    app = FastAPI()
++    app.include_router(manage_router)
++    with TestClient(app) as client:
++        refused = client.post('/api/sessions/owner-backfill', json={})
++    assert refused.status_code == 503, refused.text
++    assert refused.json()['detail'] == sod.CONTROL_TIMEOUT_DETAIL
++    assert len(seen) == 3
++
++
++# --- An isolated real gateway, stalled with SIGSTOP (never a live one). ---
++
++AUTH = {'Authorization': 'Bearer standalone-token'}
++
++
++def _standalone_app(home, monkeypatch):
++    import hermes_state
++    from fastapi import FastAPI
++    from hermes_cli import web_server
++    from hermes_cli.web_routers.sessions import manage_router
++
++    monkeypatch.setattr(web_server, '_SESSION_TOKEN', 'standalone-token')
++    monkeypatch.setattr('hermes_state._default_db_path', lambda: home / 'state.db')
++    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', home / 'state.db')
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    app = FastAPI()
++    app.include_router(manage_router)
++    return app
++
++
++def _gateway_pid(home):
++    import json
++    return int(json.loads((home / 'gateway.pid').read_text())['pid'])
++
++
++def _row(home):
++    with sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True) as raw:
++        return raw.execute("SELECT archived, runtime_revision FROM sessions WHERE id = 'chat'").fetchone()
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.asyncio
++async def test_a_stalled_real_owner_takes_the_write_once_it_answers(tmp_path, monkeypatch):
++    from hermes_cli import gateway_runtime
++    from tests.gateway.test_mute_live_owner import _live_gateway
++
++    with _live_gateway(tmp_path) as (home, _descriptor):
++        pid = _gateway_pid(home)
++        real = gateway_runtime.discover_gateway_endpoint
++        reads = []
++
++        def stalled_then_resumed(path, timeout=2.0):
++            verdict = real(path, timeout=timeout)
++            reads.append(verdict.reason_code or verdict.state)
++            if verdict.reason_code == 'control_timeout' and len(reads) == 1:
++                os.kill(pid, signal.SIGCONT)  # the stall ends after the first read missed it
++            return verdict
++        monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint', stalled_then_resumed)
++        app = _standalone_app(home, monkeypatch)
++        body = {'request_id': 'archive-1', 'expected_revision': 0, 'expected_generation': 0,
++                'archived': True, 'pinned': False}
++        os.kill(pid, signal.SIGSTOP)
++        try:
++            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
++                                         base_url='http://localhost', headers=AUTH, timeout=30) as client:
++                done = await client.patch('/api/sessions/chat', json=body)
++                assert done.status_code == 200, done.text
++                assert reads[0] == 'control_timeout' and reads[-1] == 'ready'
++                assert done.json()['revision'] == 1
++                assert _row(home) == (1, 1)
++                # The same intent replayed (a client retry after a lost reply) is the same receipt.
++                again = await client.patch('/api/sessions/chat', json=body)
++                assert again.json() == done.json()
++                assert _row(home) == (1, 1)
++        finally:
++            os.kill(pid, signal.SIGCONT)
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.asyncio
++async def test_a_real_owner_stalled_past_the_budget_refuses_then_retry_lands_once(tmp_path, monkeypatch):
++    from tests.gateway.test_mute_live_owner import _live_gateway
++
++    with _live_gateway(tmp_path) as (home, _descriptor):
++        pid = _gateway_pid(home)
++        app = _standalone_app(home, monkeypatch)
++        body = {'request_id': 'archive-2', 'expected_revision': 0, 'expected_generation': 0,
++                'archived': True, 'pinned': False}
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
++                                     base_url='http://localhost', headers=AUTH, timeout=30) as client:
++            os.kill(pid, signal.SIGSTOP)
++            try:
++                started = time.monotonic()
++                refused = await client.patch('/api/sessions/chat', json=body)
++                elapsed = time.monotonic() - started
++            finally:
++                os.kill(pid, signal.SIGCONT)
++            assert refused.status_code == 503, refused.text
++            assert refused.json()['detail'] == sod.CONTROL_TIMEOUT_DETAIL
++            # Bounded: discovery's budget plus the offline lock's immediate refusal.
++            assert elapsed < sod.OWNER_DISCOVERY_BUDGET_S + 1.5, elapsed
++            # The held lock was never bypassed: nothing changed while the owner was stalled.
++            assert _row(home) == (0, 0)
++            retried = await client.patch('/api/sessions/chat', json=body)
++            assert retried.status_code == 200, retried.text
++            assert retried.json()['revision'] == 1
++            assert _row(home) == (1, 1)
++
++
++def test_the_budget_constants_stay_bounded():
++    worst = (sod.OWNER_DISCOVERY_ATTEMPTS * sod.OWNER_DISCOVERY_ATTEMPT_S
++             + (sod.OWNER_DISCOVERY_ATTEMPTS - 1) * sod.OWNER_DISCOVERY_BACKOFF_S)
++    assert worst <= sod.OWNER_DISCOVERY_BUDGET_S <= 6.0
++    assert asyncio.iscoroutinefunction(sod.discover_session_owner)
+diff --git a/tests/hermes_cli/test_web_server_session_owner_forward.py b/tests/hermes_cli/test_web_server_session_owner_forward.py
+index 98b6734291..8797fa3b93 100644
+--- a/tests/hermes_cli/test_web_server_session_owner_forward.py
++++ b/tests/hermes_cli/test_web_server_session_owner_forward.py
+@@ -131,7 +131,12 @@ async def test_an_owner_discovery_cannot_identify_is_not_owner_less(tmp_path, mo
+             operation='sidebar', payload={'pinned': True})
+     assert exc.value.status_code == 503
+     assert exc.value.detail.startswith(f'owner_unavailable: {reason_code or state}: ')
+-    assert 'Drain and stop the gateway' in exc.value.detail
++    if reason_code == 'control_timeout':
++        # A live owner that only missed its identify deadlines: retry, never drain or stop it.
++        assert 'Drain and stop the gateway' not in exc.value.detail
++        assert exc.value.detail.endswith('retry')
++    else:
++        assert 'Drain and stop the gateway' in exc.value.detail
+ 
+ 
+ @pytest.mark.asyncio
+-- 
+2.43.0
+

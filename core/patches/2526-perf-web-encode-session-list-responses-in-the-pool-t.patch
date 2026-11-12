@@ -1,0 +1,580 @@
+From e11a318393dc6c3d6092d2a22d9c30727cce2bbb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:56:05 +0000
+Subject: [PATCH] perf(web): encode session list responses in the pool thread,
+ not with jsonable_encoder on the loop [daveey]
+
+GET /api/profiles/sessions (Desktop polls it ~0.7/s, limit=200) returned a dict from its
+coalesced pool-thread read, so FastAPI's serialize_response -> jsonable_encoder walked the
+whole page on the event loop (41 of 185 MainThread py-spy samples on a Mac serve).
+
+New hermes_cli/web_json_response.py:
+- native_json_response(payload): JSONResponse(content=payload) built where it is called;
+  a payload json.dumps refuses (TypeError/ValueError: datetime, set, Path, dataclass, Enum,
+  NaN) is returned unchanged so FastAPI's jsonable_encoder path handles it exactly as before;
+  a Response is returned as is.
+- encoded_in_thread(func): functools.wraps wrapper running func then native_json_response in
+  the same worker thread (signature/annotations unchanged for FastAPI and coalesced_read).
+- per_request_response(result): coalesced reads and caches hand one result to several
+  requests, but Starlette sends response.raw_headers as the start message's header list
+  (CORS appends to it in place) and FastAPI sets response.background, so a JSONResponse
+  object must not be sent twice. The rendered body is shared; each request gets its own
+  constant-time Response with the same status, content-type and content-length.
+
+Routes changed (same mechanical change, miss and cache-hit paths):
+- GET /api/profiles/sessions (coalesced read)
+- GET /api/profiles/sessions/sidebar and GET /api/profiles/projects/tree
+  (_sidebar_singleflight_cache: coalesced miss + threadpool cache hit)
+- GET /api/sessions (coalesced read + SESSION_LIST_CACHE peek hit)
+Direct Python callers (get_profiles_sessions, get_profiles_sessions_sidebar, ...) still
+return dicts. Left unchanged: /api/profiles/sessions/stamps (sync def endpoint, FastAPI
+already runs it in the threadpool but encodes on the loop; not the same change), POST and
+mutating routes, and routes with injected Response/response_model/non-200 status.
+
+Proof:
+- tests/hermes_cli/test_web_json_response.py (17 tests): RED on parent (4 route tests fail:
+  jsonable_encoder ran for a JSON-native payload), GREEN here. Byte equality vs
+  JSONResponse(jsonable_encoder(payload)) on 220 fixture rows; 8 non-native payloads take
+  the parent path with the same response or error; two coalesced requests through CORS
+  each get the full body and single vary/ACAO headers.
+- 9/9 spot mutants killed (passthrough, fallback, shared Response, raw miss/hit paths on
+  each route, loop-side encode).
+- 118 related files: 1413 passed, 19 skipped.
+- Bench (hub worker, real profiles router via httpx ASGITransport, 40 requests x 2 rounds):
+  200 rows / 115,594 B: loop-thread CPU 8.33 -> 0.69 ms, process CPU 10.2 -> 3.8 ms per request.
+  500 rows / 289,945 B: loop-thread CPU 20.0 -> 0.72 ms, process CPU 25.0 -> 8.3 ms.
+  Body sha256, content-length and content-type identical before/after.
+---
+ hermes_cli/web_json_response.py            |  61 ++++
+ hermes_cli/web_routers/profiles.py         |  32 +-
+ hermes_cli/web_routers/sessions.py         |  16 +-
+ tests/hermes_cli/test_web_json_response.py | 337 +++++++++++++++++++++
+ 4 files changed, 433 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/web_json_response.py
+ create mode 100644 tests/hermes_cli/test_web_json_response.py
+
+diff --git a/hermes_cli/web_json_response.py b/hermes_cli/web_json_response.py
+new file mode 100644
+index 0000000000..7886e489e4
+--- /dev/null
++++ b/hermes_cli/web_json_response.py
+@@ -0,0 +1,61 @@
++"""Encode JSON list responses in the pool thread, not on the event loop. [daveey]
++
++FastAPI serializes a plain dict/list return value with ``jsonable_encoder``, a
++pure-Python recursive walk that runs on the event loop: for a 200-row
++``/api/profiles/sessions`` page that walk is most of the request's CPU. A
++JSON-native payload (str/int/float/bool/None/dict/list/tuple) needs no such walk:
++``json.dumps`` renders it as is, and for such a payload ``jsonable_encoder``
++returns an equal value, so ``JSONResponse(content=payload)`` built off the loop
++yields the same status, headers and body bytes as FastAPI's default path.
++"""
++import functools
++
++from starlette.responses import JSONResponse, Response
++
++
++def native_json_response(payload):
++    """``JSONResponse(content=payload)``, or ``payload`` unchanged when it is not JSON-native.
++
++    Call it from the worker thread that produced ``payload``. A payload that
++    ``json.dumps`` refuses (datetime, set, Path, dataclass, Enum, NaN, ...) raises
++    ``TypeError``/``ValueError`` here and comes back unchanged, so FastAPI's
++    ``jsonable_encoder`` path handles it exactly as before. A ``Response`` is
++    returned as is.
++    """
++    if isinstance(payload, Response):
++        return payload
++    try:
++        return JSONResponse(content=payload)
++    except (TypeError, ValueError):
++        return payload
++
++
++def per_request_response(result):
++    """A fresh ``Response`` for this request from a possibly shared encoded result.
++
++    A coalesced read or cache hands one result to several waiting requests.
++    Starlette sends ``response.raw_headers`` itself as the start message's header
++    list and middleware (CORS) appends to that list in place, and FastAPI sets
++    ``response.background``, so one ``JSONResponse`` object must not be sent twice.
++    The shared part is the rendered body; the per-request ``Response`` built here
++    is a constant-time wrapper with the same status, content-type and
++    content-length headers. Anything else (a raw payload that took the fallback,
++    a route's own ``Response``) is returned unchanged.
++    """
++    if type(result) is not JSONResponse:
++        return result
++    return Response(content=result.body, status_code=result.status_code, media_type=result.media_type)
++
++
++def encoded_in_thread(func):
++    """Wrap a synchronous read so its result is JSON-encoded in the same (pool) thread.
++
++    ``functools.wraps`` keeps the signature and annotations FastAPI and
++    ``coalesced_read`` read through ``__wrapped__``, so query validation is
++    unchanged. Run the returned callable in a worker thread and pass its result
++    through :func:`per_request_response` on the loop.
++    """
++    @functools.wraps(func)
++    def wrapped(*args, **kwargs):
++        return native_json_response(func(*args, **kwargs))
++    return wrapped
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 32167478b2..98a7d9936b 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -14,6 +14,7 @@ import contextlib
+ import copy
+ import functools
+ from hermes_cli.web_read_coalescing import coalesced_read
++from hermes_cli.web_json_response import encoded_in_thread, native_json_response, per_request_response
+ import inspect
+ import json
+ import logging
+@@ -382,7 +383,12 @@ def _sidebar_singleflight_cache(func):
+                     cache.popitem(last=False)
+             return result
+ 
+-    admitted = coalesced_read(wrapped, thread_runner=lambda func: run_in_threadpool(func))
++    # The HTTP path JSON-encodes in the worker thread (web_json_response), never on the loop.
++    admitted = coalesced_read(encoded_in_thread(wrapped), thread_runner=lambda func: run_in_threadpool(func))
++
++    def _lookup_encoded(key):
++        cached = _lookup(key)
++        return cached if cached is miss else native_json_response(cached)
+ 
+     @functools.wraps(admitted)
+     async def http_endpoint(*args, **kwargs):
+@@ -390,10 +396,10 @@ def _sidebar_singleflight_cache(func):
+         if _SIDEBAR_CACHE_TTL_SECONDS > 0:
+             bound = signature.bind(*args, **kwargs)
+             bound.apply_defaults()
+-            cached = await run_in_threadpool(_lookup, tuple(bound.arguments.items()))
++            cached = await run_in_threadpool(_lookup_encoded, tuple(bound.arguments.items()))
+             if cached is not miss:
+-                return cached
+-        return await admitted(*args, **kwargs)
++                return per_request_response(cached)
++        return per_request_response(await admitted(*args, **kwargs))
+ 
+     wrapped.http_endpoint = http_endpoint
+     return wrapped
+@@ -502,11 +508,19 @@ _SESSION_STAMP_COLUMNS = ("cwd", "git_branch", "git_repo_root", "outcome", "mute
+ 
+ # Admit scan contenders on the event loop, before they consume AnyIO slots.
+ # Keep the synchronous entry point and cross-loop DB lock for direct callers.
+-sessions_router.add_api_route(
+-    "/api/profiles/sessions",
+-    coalesced_read(get_profiles_sessions, thread_runner=lambda func: run_in_threadpool(func)),
+-    methods=["GET"],
+-)
++# The body is JSON-encoded once per coalesced read, in the worker thread: FastAPI's
++# jsonable_encoder walk of a 200-row page on the loop was most of this route's CPU. [daveey]
++_profiles_sessions_admitted = coalesced_read(
++    encoded_in_thread(get_profiles_sessions), thread_runner=lambda func: run_in_threadpool(func))
++
++
++@functools.wraps(_profiles_sessions_admitted)
++async def _profiles_sessions_http(*args, **kwargs):
++    # Joined requests share the rendered body; each sends its own Response object.
++    return per_request_response(await _profiles_sessions_admitted(*args, **kwargs))
++
++
++sessions_router.add_api_route("/api/profiles/sessions", _profiles_sessions_http, methods=["GET"])
+ 
+ 
+ @sessions_router.get("/api/profiles/sessions/stamps")
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 15ffb9bdd1..da5e03974b 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -24,6 +24,7 @@ from hermes_cli.session_listing import stamp_automated, subagent_listing_scope
+ from hermes_cli.session_list_flight import SESSION_LIST_CACHE, data_stamp
+ from hermes_cli.web_deps import late
+ from hermes_cli.web_read_coalescing import coalesced_read
++from hermes_cli.web_json_response import encoded_in_thread, native_json_response, per_request_response
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+@@ -232,7 +233,9 @@ def get_sessions(
+ 
+ 
+ # Queue expensive list contenders before consuming the shared HTTP worker pool.
+-_sessions_admitted = coalesced_read(get_sessions, admission_key=lambda args: args["profile"], max_concurrent=2)
++# The body is JSON-encoded in the worker thread (web_json_response), never on the loop. [daveey]
++_sessions_admitted = coalesced_read(
++    encoded_in_thread(get_sessions), admission_key=lambda args: args["profile"], max_concurrent=2)
+ 
+ 
+ def _peek_sessions(arguments):
+@@ -243,15 +246,20 @@ def _peek_sessions(arguments):
+     return SESSION_LIST_CACHE.peek((str(db_path), *arguments.values()), data_stamp(db_path))
+ 
+ 
++def _peek_sessions_encoded(arguments):
++    hit, value = _peek_sessions(arguments)
++    return hit, (native_json_response(value) if hit else value)
++
++
+ @functools.wraps(_sessions_admitted)
+ async def _sessions_http(*args, **kwargs):
+     from starlette.concurrency import run_in_threadpool
+     bound = inspect.signature(get_sessions).bind(*args, **kwargs)
+     bound.apply_defaults()
+-    hit, value = await run_in_threadpool(_peek_sessions, bound.arguments)
++    hit, value = await run_in_threadpool(_peek_sessions_encoded, bound.arguments)
+     if hit:
+-        return value
+-    return await _sessions_admitted(*args, **kwargs)
++        return per_request_response(value)
++    return per_request_response(await _sessions_admitted(*args, **kwargs))
+ 
+ 
+ list_router.add_api_route("/api/sessions", _sessions_http, methods=["GET"])
+diff --git a/tests/hermes_cli/test_web_json_response.py b/tests/hermes_cli/test_web_json_response.py
+new file mode 100644
+index 0000000000..bcef10e38e
+--- /dev/null
++++ b/tests/hermes_cli/test_web_json_response.py
+@@ -0,0 +1,337 @@
++"""JSON list routes encode in the worker thread, never with jsonable_encoder on the loop. [daveey]
++
++``/api/profiles/sessions`` (Desktop polls it ~0.7/s with limit=200) spent most of its
++CPU in FastAPI's ``serialize_response -> jsonable_encoder`` walk on the event loop.
++The routes now build the ``JSONResponse`` in the pool thread that produced the
++payload (``hermes_cli.web_json_response``), with byte-identical output.
++"""
++import asyncio
++import copy
++import dataclasses
++import datetime
++import enum
++import inspect
++import math
++import threading
++from pathlib import Path
++
++import pytest
++from fastapi.encoders import jsonable_encoder
++from starlette.responses import JSONResponse
++
++from hermes_cli.web_json_response import (
++    encoded_in_thread, native_json_response, per_request_response,
++)
++
++
++def _rows(n=220):
++    """Deterministic, realistic session rows: unicode, None, floats, nesting, int keys."""
++    rows = []
++    for i in range(n):
++        rows.append({
++            "id": f"20261112_{i:06d}_{i * 7919 % 65536:04x}",
++            "title": ["Fix the café ☕ build", "日本語のタイトル", "emoji 🚀🔥 run", None, "quote \" and \\ slash"][i % 5],
++            "source": ["desktop", "cron", "telegram", "kanban"][i % 4],
++            "model": "claude-opus-5-5" if i % 3 else None,
++            "started_at": 1794400000.0 + i * 13.25,
++            "last_active": 1794460000.5 - i * 0.1 if i % 7 else None,
++            "ended_at": None if i % 2 else 1794460100.75,
++            "message_count": i * 3,
++            "tool_call_count": i % 11,
++            "input_tokens": 10 ** 9 + i,
++            "estimated_cost_usd": round(i * 0.0137, 6),
++            "ratio": i / 3,
++            "archived": bool(i % 9 == 0),
++            "pinned": i % 50 == 0,
++            "is_active": i % 4 == 0,
++            "profile": "default" if i % 6 else "worker",
++            "tags": ["a", "b\u00e9", i, None, 1.5][: i % 6],
++            "lineage": (f"p{i}", f"q{i}"),
++            "kanban": {"task_id": f"t_{i:x}", "status": "running", "counts": {1: i, 2: None, 3: [True, False]}},
++            "preview": {"role": "user", "content": "x" * (i % 40), "nested": [[{"k": i}], {}]},
++        })
++    return rows
++
++
++def _payload(rows=None):
++    rows = _rows() if rows is None else rows
++    return {"sessions": rows, "total": len(rows), "profile_totals": {"default": len(rows) - 37, "worker": 37},
++            "limit": 200, "offset": 0, "errors": [], "storage": {}}
++
++
++def _parent(payload):
++    return JSONResponse(jsonable_encoder(payload))
++
++
++def _same_response(a, b):
++    assert a.status_code == b.status_code
++    assert a.raw_headers == b.raw_headers
++    assert a.body == b.body
++
++
++def test_native_payload_matches_parent_bytes():
++    payload = _payload()
++    assert len(payload["sessions"]) >= 200
++    expected = _parent(copy.deepcopy(payload))
++    got = native_json_response(payload)
++    assert type(got) is JSONResponse
++    _same_response(got, expected)
++    # The per-request copy sent on the loop carries the same status, headers and body.
++    fresh = per_request_response(got)
++    assert fresh is not got
++    _same_response(fresh, expected)
++
++
++def test_response_passes_through_and_fallback_is_unchanged(monkeypatch):
++    response = JSONResponse({"a": 1})
++    rendered = []
++    real_render = JSONResponse.render
++    monkeypatch.setattr(JSONResponse, "render", lambda self, content: rendered.append(content) or real_render(self, content))
++    assert native_json_response(response) is response
++    assert rendered == [], "an existing Response was re-encoded"
++    monkeypatch.undo()
++    assert per_request_response(response) is not response  # our own shape: cloned per request
++    payload = {"when": datetime.datetime(2026, 11, 12)}
++    assert native_json_response(payload) is payload
++    assert per_request_response(payload) is payload
++
++
++class _Color(enum.Enum):
++    RED = "red"
++
++
++@dataclasses.dataclass
++class _Point:
++    x: int
++    y: float
++
++
++_NON_NATIVE = {
++    "datetime": {"sessions": [{"at": datetime.datetime(2026, 11, 12, 7, 46, 11)}]},
++    "set": {"ids": {3}},
++    "path": {"cwd": Path("/home/you/code")},
++    "dataclass": {"pt": _Point(1, 2.5)},
++    "enum": {"color": _Color.RED},
++    "nan": {"cost": math.nan},
++    "inf": {"cost": [1.0, -math.inf]},
++    "bytes": {"blob": b"abc"},
++}
++
++
++@pytest.mark.parametrize("name", sorted(_NON_NATIVE))
++def test_non_native_payload_takes_parent_path(name):
++    """A payload json.dumps refuses goes back to FastAPI unchanged: same response or same error."""
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++
++    payload = _NON_NATIVE[name]
++    assert native_json_response(payload) is payload
++
++    app = FastAPI()
++    app.add_api_route("/parent", lambda: payload, methods=["GET"])
++
++    encoded = encoded_in_thread(lambda: payload)
++
++    async def candidate():
++        return per_request_response(await asyncio.to_thread(encoded))
++    app.add_api_route("/candidate", candidate, methods=["GET"])
++
++    outcomes = []
++    with TestClient(app) as client:
++        for path in ("/parent", "/candidate"):
++            try:
++                r = client.get(path)
++            except Exception as exc:  # health: allow BLE001 -- the parent's own error is the expected outcome
++                outcomes.append(("raised", type(exc), str(exc)))
++            else:
++                outcomes.append(("response", r.status_code, sorted(r.headers.items()), r.content))
++    assert outcomes[0] == outcomes[1]
++    if name in ("nan", "inf"):
++        assert outcomes[0][0] == "raised" and outcomes[0][1] is ValueError
++    else:
++        assert outcomes[0][0] == "response" and outcomes[0][1] == 200
++
++
++def test_encoded_in_thread_keeps_signature_and_hints():
++    from hermes_cli.web_routers import profiles, sessions
++    for func in (profiles.get_profiles_sessions, sessions.get_sessions):
++        assert inspect.signature(encoded_in_thread(func)) == inspect.signature(func)
++    routes = {r.path: r for r in profiles.sessions_router.routes}
++    assert (inspect.signature(routes["/api/profiles/sessions"].endpoint)
++            == inspect.signature(profiles.get_profiles_sessions))
++    list_routes = {r.path: r for r in sessions.list_router.routes}
++    assert inspect.signature(list_routes["/api/sessions"].endpoint) == inspect.signature(sessions.get_sessions)
++
++
++# ── Real routers ─────────────────────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture
++def routed(monkeypatch, tmp_path):
++    """The real profiles/sessions routers over deterministic fixture rows."""
++    from hermes_cli.web_routers import profiles, sessions
++
++    rows = _rows()
++    state = {"release": threading.Event(), "entered": threading.Event(), "reads": 0, "block": False}
++    state["release"].set()
++
++    def scan(name, home, errors, read, cache_key):
++        state["reads"] += 1
++        state["entered"].set()
++        if state["block"]:
++            assert state["release"].wait(5)
++        return copy.deepcopy(rows), len(rows)
++
++    def sidebar_read(name, home, errors, callback):
++        return {"recents": copy.deepcopy(rows[:50]), "cron": copy.deepcopy(rows[50:60]),
++                "messaging": copy.deepcopy(rows[60:80]), "usage": {"tokens": 12.5}}
++
++    def project_trees(*args, **kwargs):
++        return [("default", {"projects": [{"id": "p1", "path": "/home/you/code/x", "repos": [],
++                                            "previewSessions": copy.deepcopy(rows[:3]), "lastActive": 2.5}],
++                             "scoped_session_ids": ["a", "b"]})]
++
++    def list_payload(*args):
++        return {"sessions": copy.deepcopy(rows[:100]), "total": 100, "limit": args[0], "offset": 0, "storage": {}}
++
++    db_path = tmp_path / "state.db"
++    db_path.touch()
++    monkeypatch.setattr(profiles, "_profile_targets", lambda label: [("default", None)])
++    monkeypatch.setattr(profiles, "_read_serial_profile_db", scan)
++    monkeypatch.setattr(profiles, "_read_profile_db", sidebar_read)
++    monkeypatch.setattr(profiles, "_tag_rows", lambda rows, name, now: rows)
++    monkeypatch.setattr(profiles, "stamp_automated", lambda rows, *a, **kw: rows)
++    monkeypatch.setattr(profiles, "_corrupt_profile_stores", lambda targets: {})
++    monkeypatch.setattr(profiles, "_profile_state_db", lambda home: db_path)
++    monkeypatch.setattr(profiles, "subagent_listing_scope", lambda *a, **kw: (False, None))
++    monkeypatch.setattr(profiles, "_sidebar_profile_cache_get", lambda key: None)
++    monkeypatch.setattr(profiles, "automated_session_sources", lambda home: set())
++    monkeypatch.setattr(profiles, "profile_project_trees", project_trees)
++    for name in ("kanban", "goal", "cron", "background", "turn"):
++        monkeypatch.setattr(profiles, f"annotate_{name}_activity", lambda rows: rows)
++    monkeypatch.setattr(profiles, "annotate_review_wait", lambda rows: rows)
++    monkeypatch.setattr(sessions, "_session_db_path_for_profile", lambda profile: db_path)
++    monkeypatch.setattr(sessions, "_list_sessions_payload", list_payload)
++    monkeypatch.setattr(sessions, "data_stamp", lambda path: ("stable",))
++    sessions.SESSION_LIST_CACHE.clear()
++    yield state
++    sessions.SESSION_LIST_CACHE.clear()
++
++
++def _app(cors=False):
++    from fastapi import FastAPI
++    from hermes_cli.web_routers import profiles, sessions
++    app = FastAPI()
++    app.include_router(profiles.sessions_router)
++    app.include_router(sessions.list_router)
++    if cors:
++        from starlette.middleware.cors import CORSMiddleware
++        app.add_middleware(CORSMiddleware, allow_origins=["http://desktop.test"], allow_methods=["*"])
++    return app
++
++
++@pytest.fixture
++def encode_spy(monkeypatch):
++    """Count jsonable_encoder calls and record the threads JSONResponse.render ran on."""
++    import fastapi.encoders
++    import fastapi.routing
++
++    spy = {"jsonable": 0, "render_threads": []}
++    real_jsonable = fastapi.encoders.jsonable_encoder
++    real_render = JSONResponse.render
++
++    def jsonable(*args, **kwargs):
++        spy["jsonable"] += 1
++        return real_jsonable(*args, **kwargs)
++
++    def render(self, content):
++        spy["render_threads"].append(threading.get_ident())
++        return real_render(self, content)
++
++    monkeypatch.setattr(fastapi.encoders, "jsonable_encoder", jsonable)
++    monkeypatch.setattr(fastapi.routing, "jsonable_encoder", jsonable)
++    monkeypatch.setattr(JSONResponse, "render", render)
++    return spy
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("route,params", [
++    ("/api/profiles/sessions", {"limit": 200}),
++    ("/api/profiles/sessions/sidebar", {"recents_limit": 50}),
++    ("/api/profiles/projects/tree", {"preview_limit": 3}),
++    ("/api/sessions", {"limit": 100}),
++])
++async def test_route_encodes_off_loop_without_jsonable_encoder(routed, encode_spy, route, params):
++    import httpx
++    loop_thread = threading.get_ident()
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_app()), base_url="http://test") as client:
++        first = await client.get(route, params=params)
++        # The second request is a cache hit for the cached routes (sidebar, tree, /api/sessions).
++        second = await client.get(route, params=params)
++    assert first.status_code == second.status_code == 200
++    assert first.content == second.content
++    assert encode_spy["jsonable"] == 0, "FastAPI's jsonable_encoder ran for a JSON-native payload"
++    assert encode_spy["render_threads"], "the route did not build a JSONResponse"
++    assert loop_thread not in encode_spy["render_threads"], "the JSON encode ran on the event-loop thread"
++    assert first.headers["content-type"] == "application/json"
++    assert int(first.headers["content-length"]) == len(first.content)
++
++
++@pytest.mark.asyncio
++async def test_profiles_sessions_body_matches_parent_path(routed):
++    import httpx
++    from hermes_cli.web_routers import profiles
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_app()), base_url="http://test") as client:
++        got = await client.get("/api/profiles/sessions", params={"limit": 200})
++        bad_archived = await client.get("/api/profiles/sessions", params={"archived": "bogus"})
++        bad_order = await client.get("/api/profiles/sessions", params={"order": "bogus"})
++        too_many = await client.get("/api/profiles/sessions", params={"limit": 501})
++        negative = await client.get("/api/profiles/sessions", params={"offset": -1})
++        at_cap = await client.get("/api/profiles/sessions", params={"limit": 500})
++    expected = _parent(profiles.get_profiles_sessions(
++        limit=200, offset=0, min_messages=0, archived="exclude", order="recent", profile="all",
++        source=None, sources=None, exclude_sources=None, full=False))
++    assert len(got.json()["sessions"]) >= 200
++    assert got.status_code == expected.status_code
++    assert got.content == expected.body
++    assert [(k.lower(), v) for k, v in got.headers.raw] == expected.raw_headers
++    assert bad_archived.status_code == 400 and "archived must be one of" in bad_archived.json()["detail"]
++    assert bad_order.status_code == 400 and "order must be one of" in bad_order.json()["detail"]
++    assert too_many.status_code == 422 and negative.status_code == 422
++    assert at_cap.status_code == 200
++
++
++@pytest.mark.asyncio
++async def test_coalesced_requests_each_get_full_body_and_own_headers(routed):
++    """Two requests joined on one read share the rendered body, not one Response object.
++
++    CORS middleware appends to the start message's header list, which Starlette takes
++    straight from ``response.raw_headers``: a shared Response would send the second
++    caller a doubled ``vary``.
++    """
++    import httpx
++    from tests.waiting import async_wait_until
++
++    routed["block"] = True
++    routed["release"].clear()
++    headers = {"Origin": "http://desktop.test"}
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_app(cors=True)),
++                                 base_url="http://test") as client:
++        first = asyncio.create_task(client.get("/api/profiles/sessions", params={"limit": 200}, headers=headers))
++        await async_wait_until(routed["entered"].is_set, timeout=3)
++        second = asyncio.create_task(client.get("/api/profiles/sessions", params={"limit": 200}, headers=headers))
++        for _ in range(50):
++            await asyncio.sleep(0)
++        routed["release"].set()
++        responses = await asyncio.gather(first, second)
++        # A later, separate read after the joined pair still answers normally.
++        third = await client.get("/api/profiles/sessions", params={"limit": 200}, headers=headers)
++    assert routed["reads"] == 2, "the two concurrent requests did not join one read"
++    bodies = {r.content for r in [*responses, third]}
++    assert len(bodies) == 1
++    assert len(responses[0].json()["sessions"]) >= 200
++    for r in [*responses, third]:
++        assert r.status_code == 200
++        assert r.headers.get_list("access-control-allow-origin") == ["http://desktop.test"]
++        assert r.headers.get_list("vary") == ["Origin"]
++        assert r.headers.get_list("content-length") == [str(len(r.content))]
+-- 
+2.43.0
+

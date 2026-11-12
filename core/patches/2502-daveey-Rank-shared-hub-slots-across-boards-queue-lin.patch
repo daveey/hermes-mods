@@ -1,0 +1,649 @@
+From 7e0d00ffb37732c576122ceeddfa9ba3d7235ea7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:53:19 +0000
+Subject: [PATCH] [daveey] Rank shared hub slots across boards; queue line
+ counts other boards' cards
+
+Root cause: kanban.max_in_progress caps the host, but the gateway dispatcher
+ticked boards one after another in a rotating order (_fair_board_order) and
+each board's dispatch_once took every free slot for its own ready cards
+(_tick_spawn_budget: remaining = cap - running on all boards). A freed slot
+therefore went to whichever board ticked first, not to the best card. On
+hermes-hub 2026-11-12 board `hermes` started two priority-0 cards at
+05:08:50/52 while default-board t_01a1ac912db0cb5c (priority 51010, effective
+1000) sat ready from 04:40 reading "0 card(s) ahead of it, 9/9 worker slots
+busy": _ahead counted one board only.
+
+Fix (hermes_cli/kanban_board_share.py):
+- When free slots are fewer than the dispatchable cards on all boards, rank
+  every board's ready/review candidates in DISPATCH_ORDER and give each board
+  a spawn quota (dispatch_once spawn_quota); boards with a quota tick first,
+  an unspent quota passes on. No contention = old behaviour.
+- Starvation guard: a board whose top card has been ready >= 2 h takes the
+  first pick (oldest first), so one board's flood of high priorities cannot
+  hold another board forever.
+- Queue position adds ahead_other_boards; the queue line and the 30-min
+  nudge read "N card(s) ahead of it (M on other boards sharing these slots)".
+- count_running_tasks_other_boards moves to the new module (re-exported) to
+  keep kanban_db_dispatch.py under its line cap.
+
+Tests: tests/gateway/test_kanban_cross_board_slots.py (two boards, one shared
+slot: high card on the later board starts; flood vs starved board; queue
+text; quota refusal text; plan ranking).
+---
+ gateway/kanban_watchers_dispatcher.py         |  22 +-
+ hermes_cli/kanban_board_share.py              | 220 ++++++++++++++++++
+ hermes_cli/kanban_db_dispatch.py              |  48 +---
+ hermes_cli/kanban_parent_unclaimed.py         |   3 +-
+ hermes_cli/kanban_queue_position.py           |  25 +-
+ .../gateway/test_kanban_cross_board_slots.py  | 151 ++++++++++++
+ 6 files changed, 426 insertions(+), 43 deletions(-)
+ create mode 100644 hermes_cli/kanban_board_share.py
+ create mode 100644 tests/gateway/test_kanban_cross_board_slots.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index dc6ae7f17b..a2198d7f19 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -207,12 +207,14 @@ class _KanbanDispatcher:
+         self.disabled_corrupt_boards.pop(slug, None)
+         return True
+ 
+-    def tick_once_for_board(self, slug: str, *, suppress_spawn: bool = False) -> Optional[object]:
++    def tick_once_for_board(self, slug: str, *, suppress_spawn: bool = False,
++                            spawn_quota: Optional[int] = None) -> Optional[object]:
+         """Run one dispatch_once for a specific board.
+ 
+         The per-board DB is opened explicitly so boards never share a
+         connection or claim across each other. ``suppress_spawn`` (core-update
+         drain hold) runs reclaim, wake probes and promotion but claims nothing.
++        ``spawn_quota`` caps this board's spawns at its cross-board share of the host slots (tick_once).
+         """
+         conn = None
+         fingerprint = self.board_db_fingerprint(slug)
+@@ -220,6 +222,8 @@ class _KanbanDispatcher:
+             return None
+         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+         kwargs["max_in_progress"] = self.live_max_in_progress()
++        if spawn_quota is not None:
++            kwargs["spawn_quota"] = spawn_quota
+         if suppress_spawn:
+             kwargs["max_spawn"] = 0  # budget gate refuses every claim; bookkeeping phases still run
+             kwargs["observation_update_drain"] = True  # diagnostic only, never an admission input
+@@ -284,7 +288,8 @@ class _KanbanDispatcher:
+         tick order. A fixed order (``default`` first, then alphabetical) let a
+         standing backlog on ``default`` take every slot freed after a core-update
+         drain hold or a worker exit, so ready cards on other boards waited behind
+-        it indefinitely. Rotating the start gives each board first pick in turn.
++        it indefinitely. Rotating the start gives each board first pick in turn
++        when slots are plentiful; under contention ``tick_once`` ranks cards across boards instead.
+         """
+         slugs = list(self._board_slugs())
+         if len(slugs) < 2:
+@@ -294,10 +299,19 @@ class _KanbanDispatcher:
+         return slugs[start:] + slugs[:start]
+ 
+     def tick_once(self, *, suppress_spawn: bool = False) -> list[tuple[str, Optional[object]]]:
+-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
++        """Run one dispatch_once per board. Returns (slug, result) pairs.
++
++        When free host slots are fewer than the ready cards on all boards, each board gets a spawn quota from one
++        cross-board ranking (``hermes_cli.kanban_board_share``: priority order plus a starvation guard). [daveey]
++        """
+         self.successful_scopes = []
+         if not suppress_spawn:
+-            return [(slug, self.tick_once_for_board(slug)) for slug in self._fair_board_order()]
++            order = self._fair_board_order()
++            from hermes_cli import kanban_board_share as share
++            quotas = share.shares(order, self.live_max_in_progress())
++            if quotas is not None:
++                return share.run(order, quotas, self.tick_once_for_board)
++            return [(slug, self.tick_once_for_board(slug)) for slug in order]
+         return [(slug, self.tick_once_for_board(slug, suppress_spawn=True)) for slug in self._board_slugs()]
+ 
+     @staticmethod
+diff --git a/hermes_cli/kanban_board_share.py b/hermes_cli/kanban_board_share.py
+new file mode 100644
+index 0000000000..ab386cd132
+--- /dev/null
++++ b/hermes_cli/kanban_board_share.py
+@@ -0,0 +1,220 @@
++"""Shared host slots across boards: one priority order for every board, with a starvation guard. [daveey]
++
++``kanban.max_in_progress`` caps the HOST: each board's dispatcher tick counts the running workers on every other
++board against it (``kanban_db_dispatch._tick_spawn_budget``). The gateway ticks boards one after another in a
++rotating order (``_KanbanDispatcher._fair_board_order``) and each tick used to take every free slot for its own
++cards, so a freed slot went to whichever board's turn came first, not to the best card. On hermes-hub
++2026-11-12 board ``hermes`` started two priority-0 cards (05:08:50/52) while default-board t_01a1ac912db0cb5c
++(priority 51010) sat ready from 04:40 reading "0 card(s) ahead of it, 9/9 worker slots busy"; chats raised it to
++60320, which could not help (effective priority is capped at ``kanban_priority.PRIORITY_CAP``, 1000, anyway).
++
++When the free slots are fewer than the dispatchable cards on all boards, :func:`shares` ranks every board's cards
++in the dispatcher's own order (effective priority, then cards others wait on, then age) and gives each board a
++spawn quota: how many of the top ``free`` cards are its own. :func:`run` ticks the boards with a quota first and
++hands a quota a board could not spend (a claim refused at spawn time) to the next board. Without contention it
++returns None and every board ticks as before.
++
++Starvation guard (deliberate per-board minimum): priorities are set per board by different owners, so pure
++priority would let one board's flood of high numbers hold another board's cards forever. A board whose top card
++has been ready :data:`STARVE_SECONDS` or longer takes the first pick (oldest wait first), so no board waits much
++longer than that plus one worker turnover. Ranking is advisory: guards and refusals decided at claim time are not
++modelled, and the host cap check in each board's tick stays authoritative.
++"""
++from __future__ import annotations
++
++import contextlib
++import heapq
++import logging
++import time
++from pathlib import Path
++from typing import Any, Callable, NamedTuple, Optional
++
++_log = logging.getLogger(__name__)
++
++STARVE_SECONDS = 2 * 60 * 60
++OTHER_BOARDS = "other boards sharing these slots"
++
++
++class Candidate(NamedTuple):
++    task_id: str
++    priority: int
++    waited_on: bool
++    created_at: float
++    ready_since: float
++
++    def rank(self) -> tuple:
++        return (-self.priority, not self.waited_on, self.created_at, self.task_id)
++
++
++def candidates(conn, limit: int) -> list[Candidate]:
++    """Up to ``limit`` unclaimed ready (and review, when review dispatch is on) cards this host could start, in
++    dispatch order; cards this gateway cannot lease (``dispatch_refusals``) are left out."""
++    from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
++    from hermes_cli.kanban_db_dispatch_queries import _WAITERS, DISPATCH_ORDER, EFFECTIVE_PRIORITY
++    from hermes_cli.kanban_worker_node import dispatch_refusals
++    found: list[Candidate] = []
++    for status in ("ready", "review") if review_dispatch_enabled() else ("ready",):
++        refused = dispatch_refusals(conn, status)
++        rows = conn.execute(
++            f"SELECT id, created_at, {EFFECTIVE_PRIORITY} AS eff, EXISTS (SELECT 1 {_WAITERS}) AS waited "
++            f"FROM tasks WHERE status = ? AND claim_lock IS NULL ORDER BY {DISPATCH_ORDER} LIMIT ?",
++            (status, limit + len(refused))).fetchall()
++        found += [Candidate(r["id"], int(r["eff"] or 0), bool(r["waited"]), float(r["created_at"] or 0), 0.0)
++                  for r in rows if r["id"] not in refused]
++    found = sorted(found, key=Candidate.rank)[:limit]
++    if found:  # only the head's wait decides starvation; one event scan per board
++        from hermes_cli.kanban_parent_unclaimed import ready_since
++        head = found[0]
++        found[0] = head._replace(ready_since=float(ready_since(conn, head.task_id, int(head.created_at))))
++    return found
++
++
++def _starved(cands: list[Candidate], now: float) -> bool:
++    return bool(cands) and cands[0].ready_since > 0 and now - cands[0].ready_since >= STARVE_SECONDS
++
++
++def plan(heads: dict[str, list[Candidate]], free: Optional[int], *, now: float) -> Optional[dict[str, int]]:
++    """``{board: quota}`` in first-pick order for ``free`` shared slots, or None when every candidate fits (or the
++    host is uncapped / full: each board's own cap check decides). Boards without a pick are absent."""
++    if free is None or free <= 0 or sum(len(c) for c in heads.values()) <= free:
++        return None
++    queues = {slug: list(c) for slug, c in heads.items() if c}
++    picks: list[str] = []
++    for _since, slug in sorted((q[0].ready_since, slug) for slug, q in queues.items() if _starved(q, now)):
++        if len(picks) < free:
++            queues[slug].pop(0)
++            picks.append(slug)
++    ranked = heapq.merge(*([(c.rank(), slug) for c in q] for slug, q in queues.items()))
++    for _rank, slug in ranked:
++        if len(picks) >= free:
++            break
++        picks.append(slug)
++    quotas: dict[str, int] = {}
++    for slug in picks:
++        quotas[slug] = quotas.get(slug, 0) + 1
++    return quotas
++
++
++@contextlib.contextmanager
++def _board_conn(slug: str):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kb.pin_first_board_resolution():
++        conn = kbc.connect(board=slug)
++    try:
++        yield conn
++    finally:
++        with contextlib.suppress(Exception):
++            conn.close()
++
++
++def _db_path(conn) -> Optional[str]:
++    row = conn.execute("PRAGMA database_list").fetchone()
++    return str(Path(row[2]).resolve()) if row is not None and row[2] else None
++
++
++def shares(slugs: list[str], cap: Optional[int], *, now: Optional[float] = None) -> Optional[dict[str, int]]:
++    """:func:`plan` for this tick's boards under host cap ``cap``; None (tick as before) for one board, no cap,
++    boards sharing one DB file, or any read error."""
++    if cap is None or len(slugs) < 2:
++        return None
++    from hermes_cli.kanban_db_dispatch import count_running_tasks
++    heads: dict[str, list[Candidate]] = {}
++    paths: set[str] = set()
++    running = 0
++    for slug in slugs:
++        try:
++            with _board_conn(slug) as conn:
++                path = _db_path(conn)
++                if path is None or path in paths:  # HERMES_KANBAN_DB pins every slug to one file
++                    return None
++                paths.add(path)
++                running += count_running_tasks(conn)
++                heads[slug] = candidates(conn, cap)
++        except Exception:  # health: allow BLE001 -- an unreadable (e.g. quarantined) board only gets unspent quota
++            _log.debug("kanban dispatcher: board %s unreadable for cross-board slot ranking", slug, exc_info=True)
++    return plan(heads, cap - running, now=time.time() if now is None else now)
++
++
++def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
++    """Total ``running`` tasks across every board EXCEPT ``board`` (re-exported by ``kanban_db_dispatch``).
++
++    Caps bound the HOST, but each board's tick only sees its own DB; without
++    this a derived cap of N gets multiplied by the number of active boards.
++    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
++    board to one file) yields 0. Fails open per board.
++    """
++    from hermes_cli import kanban_db as _kb
++    from hermes_cli import kanban_db_connect as _kbc
++    from hermes_cli.kanban_db_dispatch import count_running_tasks
++    try:
++        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
++    except Exception:
++        current_path = None
++    try:
++        boards = _kb.list_boards(include_archived=False)
++    except Exception:
++        return 0
++    total = 0
++    for meta in boards:
++        slug = meta.get("slug") or _kb.DEFAULT_BOARD
++        try:
++            path = _kb.kanban_db_path(board=slug).expanduser()
++            resolved = str(path.resolve())
++            if current_path is not None and resolved == current_path:
++                continue
++            if not path.exists():
++                continue
++            other = _kbc.connect(board=slug)
++            try:
++                total += count_running_tasks(other)
++            finally:
++                with contextlib.suppress(Exception):
++                    other.close()
++        except Exception:
++            continue
++    return total
++
++
++def run(order: list[str], quotas: dict[str, int], tick: Callable[..., Any]) -> list[tuple[str, Any]]:
++    """Tick boards with a quota first (first-pick order), then the rest; an unspent quota passes on."""
++    out: list[tuple[str, Any]] = []
++    spare = 0
++    for slug in [*quotas, *(s for s in order if s not in quotas)]:
++        quota = quotas.get(slug, 0) + spare
++        res = tick(slug, spawn_quota=quota)
++        spare = max(0, quota - len(getattr(res, "spawned", None) or []))
++        out.append((slug, res))
++    return out
++
++
++def ahead_elsewhere(conn, task_id: str, *, now: Optional[float] = None, limit: int = 500) -> int:
++    """Cards on OTHER boards that rank ahead of ready ``task_id`` for the shared slots (any assignee: the cap is
++    the host's), a starved board's head included. 0 when the card is not a candidate or no other board exists."""
++    from hermes_cli import kanban_db as kb
++    now = time.time() if now is None else now
++    mine = candidates(conn, limit)
++    own = next((c for c in mine if c.task_id == task_id), None)
++    if own is None:
++        return 0
++    own_starved = mine[0] is own and _starved(mine, now)  # it takes a first pick; only older starved heads lead
++    own_path = _db_path(conn)
++    total = 0
++    for meta in kb.list_boards(include_archived=False):
++        slug = meta.get("slug") or kb.DEFAULT_BOARD
++        try:
++            with _board_conn(slug) as other:
++                if _db_path(other) == own_path:
++                    continue
++                cands = candidates(other, limit)
++        except Exception:  # health: allow BLE001 -- an unreadable board adds nothing to an advisory count
++            _log.debug("kanban queue position: board %s unreadable", slug, exc_info=True)
++            continue
++        if own_starved:
++            total += int(_starved(cands, now) and cands[0].ready_since < own.ready_since)
++            continue
++        ahead = [c for c in cands if c.rank() < own.rank()]
++        if _starved(cands, now) and cands[0] not in ahead:
++            ahead.append(cands[0])
++        total += len(ahead)
++    return total
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 60eedae961..58e0db732a 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1934,41 +1934,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
+         return 0
+ 
+ 
+-def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+-    """Total ``running`` tasks across every board EXCEPT ``board``.
+-
+-    Caps bound the HOST, but each board's tick only sees its own DB; without
+-    this a derived cap of N gets multiplied by the number of active boards.
+-    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
+-    board to one file) yields 0. Fails open per board.
+-    """
+-    try:
+-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+-    except Exception:
+-        current_path = None
+-    try:
+-        boards = _kb.list_boards(include_archived=False)
+-    except Exception:
+-        return 0
+-    total = 0
+-    for meta in boards:
+-        slug = meta.get("slug") or _kb.DEFAULT_BOARD
+-        try:
+-            path = _kb.kanban_db_path(board=slug).expanduser()
+-            resolved = str(path.resolve())
+-            if current_path is not None and resolved == current_path:
+-                continue
+-            if not path.exists():
+-                continue
+-            other = _kbc.connect(board=slug)
+-            try:
+-                total += count_running_tasks(other)
+-            finally:
+-                with contextlib.suppress(Exception):
+-                    other.close()
+-        except Exception:
+-            continue
+-    return total
++from hermes_cli.kanban_board_share import count_running_tasks_other_boards  # moved; test seam stays here [daveey]
+ 
+ 
+ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
+@@ -2006,6 +1972,7 @@ def dispatch_once(
+     reconcile_orphans: bool = True,
+     dispatcher_id: Optional[str] = None,
+     observation_update_drain: bool = False,
++    spawn_quota: Optional[int] = None,
+ ) -> DispatchResult:
+     """Run one dispatcher tick under the board's single-writer lock.
+ 
+@@ -2029,6 +1996,7 @@ def dispatch_once(
+             default_assignee=default_assignee,
+             max_in_progress_per_profile=max_in_progress_per_profile,
+             reconcile_orphans=reconcile_orphans,
++            spawn_quota=spawn_quota,
+         )
+         from hermes_cli.kanban_capacity_evidence import observe_dispatch
+         observe_dispatch(conn, result, board=board, dry_run=dry_run,
+@@ -2263,6 +2231,7 @@ def _tick_spawn_budget(
+     max_spawn: Optional[int],
+     max_in_progress: Optional[int],
+     board: Optional[str],
++    spawn_quota: Optional[int] = None,
+ ) -> tuple[bool, Optional[int]]:
+     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
+ 
+@@ -2295,6 +2264,12 @@ def _tick_spawn_budget(
+         remaining = max_in_progress - total_running
+         if spawn_budget is None or spawn_budget > remaining:
+             spawn_budget = remaining
++    if spawn_quota is not None:  # this board's share of the host slots, ranked across boards (kanban_board_share)
++        if spawn_quota <= 0:
++            from hermes_cli.kanban_board_share import OTHER_BOARDS
++            result.at_capacity = f"board_share=0 (free slots go to higher-ranked cards on {OTHER_BOARDS})"
++            return False, None
++        spawn_budget = spawn_quota if spawn_budget is None else min(spawn_budget, spawn_quota)
+ 
+     # Memory-pressure guard: a static cap can't see the host's actual state.
+     # critical -> spawn nothing this tick; elevated -> at most one new worker.
+@@ -2395,6 +2370,7 @@ def _dispatch_once_locked(
+     default_assignee: Optional[str] = None,
+     max_in_progress_per_profile: Optional[int] = None,
+     reconcile_orphans: bool = True,
++    spawn_quota: Optional[int] = None,
+ ) -> DispatchResult:
+     """One dispatcher tick: reclaim stale/crashed running tasks, promote
+     todo -> ready, then atomically claim each spawnable ready/review row and
+@@ -2428,7 +2404,7 @@ def _dispatch_once_locked(
+     if result.core_update_drain_hold is not None:  # every caller (CLI, dashboard, gateway) claims nothing
+         return result
+     may_spawn, spawn_budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
+-                                                 board=board)
++                                                 board=board, spawn_quota=spawn_quota)
+     if not may_spawn:
+         return _kb._sync.worker_pickup_capped(conn, result, dry_run, _profile_exists_fn)  # record why cards wait
+ 
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index d71df57a11..215e150def 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -56,8 +56,9 @@ def _queue_words(place: dict[str, Any]) -> str:
+         # hold on that machine from the chat (t_01a1cca8ed755919). [daveey]
+         from hermes_cli import kanban_queue_position as kqp
+         return kqp.headline(place) if place["lane"] == "machine" else str(kqp.describe(place))
++    from hermes_cli.kanban_queue_position import ahead_words
+     ahead = place.get("ahead")
+-    words = f"{ahead} card(s) ahead of it" if ahead is not None else "queue place unknown"
++    words = ahead_words(place, "{n} card(s) ahead of it") if ahead is not None else "queue place unknown"
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} worker slots busy"
+     return words
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index cf681fa9ab..88c3db8907 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -171,7 +171,27 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+     if placed is not None:
+         return placed
+     running, limit = _running_and_limit(conn, board)
+-    return {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True}
++    from hermes_cli import kanban_board_share as share
++    try:
++        elsewhere = share.ahead_elsewhere(conn, task.id)
++    except Exception:  # health: allow BLE001 -- other boards are advisory; an unreadable count is unknown
++        _log.debug("kanban queue position: other boards unavailable", exc_info=True)
++        elsewhere = None
++    place = {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True}
++    if elsewhere:  # only when other boards' cards rank ahead: the single-board payload keeps its shape
++        place["ahead_other_boards"] = elsewhere
++    return place
++
++
++def ahead_words(place: dict[str, Any], template: str) -> str:
++    """``template`` (with ``{n}``) filled with the total ahead, naming cards on other boards that share the host
++    slots: without them a card read "0 ahead" while other boards' cards took every freed slot (2026-11-12)."""
++    ahead = int(place.get("ahead") or 0)
++    other = place.get("ahead_other_boards") or 0
++    if not other:
++        return template.format(n=ahead)
++    from hermes_cli.kanban_board_share import OTHER_BOARDS
++    return template.format(n=ahead + other) + f" ({other} on {OTHER_BOARDS})"
+ 
+ 
+ _NOT_STUCK = ("queued, not stuck: check placement and available capacity first; re-place if suitable. "
+@@ -241,7 +261,8 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+     if lane == "worker_pool":
+         return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'}). " + _NOT_STUCK
+     ahead = place.get("ahead")
+-    words = f"waiting for a local slot: ~{ahead} ahead" if ahead is not None else "waiting for a local slot"
++    words = (ahead_words(place, "waiting for a local slot: ~{n} ahead") if ahead is not None
++             else "waiting for a local slot")
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} running"
+     return words + ". " + _NOT_STUCK
+diff --git a/tests/gateway/test_kanban_cross_board_slots.py b/tests/gateway/test_kanban_cross_board_slots.py
+new file mode 100644
+index 0000000000..209d39738d
+--- /dev/null
++++ b/tests/gateway/test_kanban_cross_board_slots.py
+@@ -0,0 +1,151 @@
++"""Shared host slots go to the best card on ANY board, with a starvation guard. [daveey]
++
++Regression (hermes-hub, 2026-11-12): ``kanban.max_in_progress`` (9) is one budget for every board, but the gateway
++ticked boards one after another in a rotating order and each tick took every free slot for its own cards. Board
++``hermes`` started two priority-0 cards at 05:08:50/52 while default-board t_01a1ac912db0cb5c (priority 51010) sat
++ready from 04:40 reading "0 card(s) ahead of it, 9/9 worker slots busy"; chats raised it to 60320 for nothing.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    root = tmp_path / "home"
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(var, raising=False)
++    kb.init_db()
++    kb.create_board("hermes")
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 1)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "ok")
++    return root
++
++
++def _card(board, title, priority, *, ready_since=None):
++    with kbc.connect_closing(board=board) as conn:
++        tid = kb.create_task(conn, title=title, assignee="default", priority=priority)
++        if ready_since is not None:
++            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (int(ready_since), tid))
++            conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (int(ready_since), tid))
++        conn.commit()
++    return tid
++
++
++def _dispatcher(monkeypatch, spawned, *, start_board):
++    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
++    real = kbd.dispatch_once
++
++    def spawn(task, workspace, board=None):
++        spawned.append((board or "default", task.id))
++        return 4242
++
++    monkeypatch.setattr(kbd, "dispatch_once", lambda conn, **kw: real(conn, spawn_fn=spawn, **kw))
++    dispatcher = _KanbanDispatcher(kb, _DispatcherSettings(60, None, 1, 2, 0, False, None, None))
++    # Rotate the round-robin start so the board holding the WORSE card ticks first (the 05:08 order).
++    slugs = list(dispatcher._board_slugs())
++    dispatcher._rr_offset = slugs.index(start_board)
++    return dispatcher
++
++
++def test_one_shared_slot_goes_to_the_higher_priority_card_on_the_other_board(home, monkeypatch):
++    high = _card("default", "default top card", 900)
++    low = _card("hermes", "hermes p0 card", 0)
++    spawned = []
++    dispatcher = _dispatcher(monkeypatch, spawned, start_board="hermes")
++
++    results = dispatcher.tick_once()
++
++    assert spawned == [("default", high)], spawned
++    with kbc.connect_closing(board="hermes") as conn:
++        assert kb.get_task(conn, low).status == "ready"
++    hermes = dict(results)["hermes"]
++    assert hermes.at_capacity == "max_in_progress=1/1"  # ticked after default spent the slot
++
++
++def test_zero_quota_refuses_spawns_and_says_why(home):
++    with kbc.connect_closing(board="hermes") as conn:
++        res = kbd.DispatchResult()
++        assert kbd._tick_spawn_budget(conn, res, max_spawn=None, max_in_progress=5, board="hermes",
++                                      spawn_quota=0) == (False, None)
++        assert res.at_capacity == "board_share=0 (free slots go to higher-ranked cards on other boards sharing " \
++                                  "these slots)"
++        assert kbd._tick_spawn_budget(conn, kbd.DispatchResult(), max_spawn=None, max_in_progress=5,
++                                      board="hermes", spawn_quota=2) == (True, 2)
++
++
++def test_flooded_board_cannot_starve_another_board_forever(home, monkeypatch):
++    from hermes_cli import kanban_board_share as share
++    old = time.time() - share.STARVE_SECONDS - 60
++    starved = _card("hermes", "hermes p0, ready past the starvation window", 0, ready_since=old)
++    for i in range(3):
++        _card("default", f"default flood {i}", 1000)
++    spawned = []
++    dispatcher = _dispatcher(monkeypatch, spawned, start_board="default")
++
++    dispatcher.tick_once()
++
++    assert spawned == [("hermes", starved)], spawned
++
++
++def test_queue_text_counts_higher_ranked_cards_on_other_boards(home, monkeypatch):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    from hermes_cli import kanban_queue_position as kqp
++    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 1)
++    _card("hermes", "hermes higher card", 900)
++    _card("hermes", "hermes lower card", 0)
++    mine = _card("default", "default card", 500)
++    with kbc.connect_closing(board="default") as conn:
++        place = kqp.position(conn, kb.get_task(conn, mine), "default")
++    assert place["ahead"] == 0 and place["ahead_other_boards"] == 1
++    assert pu._queue_words(place) == (
++        "1 card(s) ahead of it (1 on other boards sharing these slots), 1/1 worker slots busy")
++    assert kqp.describe(place).startswith(
++        "waiting for a local slot: ~1 ahead (1 on other boards sharing these slots), 1/1 running.")
++
++
++def test_no_other_board_ahead_keeps_the_single_board_wording(home, monkeypatch):
++    from hermes_cli import kanban_parent_unclaimed as pu
++    from hermes_cli import kanban_queue_position as kqp
++    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 1)
++    _card("hermes", "hermes lower card", 0)
++    mine = _card("default", "default card", 500)
++    with kbc.connect_closing(board="default") as conn:
++        place = kqp.position(conn, kb.get_task(conn, mine), "default")
++    assert "ahead_other_boards" not in place
++    assert pu._queue_words(place) == "0 card(s) ahead of it, 1/1 worker slots busy"
++
++
++def test_queue_count_includes_a_starved_head_on_another_board(home, monkeypatch):
++    from hermes_cli import kanban_board_share as share
++    from hermes_cli import kanban_queue_position as kqp
++    _card("hermes", "hermes p0, starved", 0, ready_since=time.time() - share.STARVE_SECONDS - 60)
++    mine = _card("default", "default card", 500)
++    with kbc.connect_closing(board="default") as conn:
++        place = kqp.position(conn, kb.get_task(conn, mine), "default")
++    assert place is not None and place.get("ahead_other_boards") == 1
++
++
++def test_plan_ranks_globally_and_returns_none_without_contention():
++    from hermes_cli import kanban_board_share as share
++    now = 1_000_000.0
++
++    def cand(tid, prio, created=now - 10):
++        return share.Candidate(tid, prio, False, created, created)
++
++    heads = {"default": [cand("a1", 50), cand("a2", 1)], "hermes": [cand("b1", 10)]}
++    assert share.plan(heads, 3, now=now) is None  # room for every card: each board keeps its own order
++    assert share.plan(heads, 2, now=now) == {"default": 1, "hermes": 1}
++    assert share.plan(heads, 1, now=now) == {"default": 1}
++    starving = {"default": [cand("a1", 50)], "hermes": [cand("b1", 0, now - share.STARVE_SECONDS - 1)]}
++    assert share.plan(starving, 1, now=now) == {"hermes": 1}
++    assert list(share.plan({**starving, "x": [cand("c", 99)]}, 2, now=now)) == ["hermes", "x"]
+-- 
+2.43.0
+

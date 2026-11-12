@@ -1,0 +1,77 @@
+From 15dbfce2a6d5f5dbbdca166af762e7a5ba9bef8d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:25:19 +0000
+Subject: [PATCH] [daveey] fix(pm): a worker that dies before its request
+ reports a transport failure
+
+The pm client wrote its request to a worker that may already have exited.
+On a starved CI runner the child's os._exit beat the write, so flush()
+raised a raw BrokenPipeError (re-raised again by Popen.__exit__'s
+stdin.close) instead of InstallError("worker exited without a result").
+This made tests/pm/test_worker.py::test_worker_death_reports_transport_failure
+flaky.
+
+send() now treats EPIPE as "worker gone" and lets the stdout EOF report the
+failure; the finally block closes stdin itself so Popen.__exit__ has no
+refused buffer to re-flush. The test gains a deterministic variant whose
+worker exits before the first write.
+---
+ pm/client.py            | 11 +++++++++--
+ tests/pm/test_worker.py | 11 ++++++++++-
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/pm/client.py b/pm/client.py
+index 10c234101b..dcd91679e1 100644
+--- a/pm/client.py
++++ b/pm/client.py
+@@ -148,8 +148,11 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
+         def send(data):
+             with write_lock:
+                 cancelled = pause_event is not None and pause_event.is_set()
+-                writer.write(json.dumps({"id": request_id, "cancel": cancelled, **data}) + "\n")
+-                writer.flush()
++                try:
++                    writer.write(json.dumps({"id": request_id, "cancel": cancelled, **data}) + "\n")
++                    writer.flush()
++                except BrokenPipeError:
++                    pass  # The worker is gone; its stdout EOF reports the missing result.
+ 
+         def watch_pause():
+             assert pause_event is not None
+@@ -200,6 +203,10 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
+             stopped.set()
+             if monitor is not None:
+                 monitor.join()
++            try:
++                writer.close()  # Popen.__exit__ would re-flush a write the dead worker refused.
++            except BrokenPipeError:
++                pass
+             if process.poll() is None:
+                 process.terminate()
+                 process.wait(timeout=5)
+diff --git a/tests/pm/test_worker.py b/tests/pm/test_worker.py
+index eb76a7eeca..5e00741413 100644
+--- a/tests/pm/test_worker.py
++++ b/tests/pm/test_worker.py
+@@ -514,8 +514,17 @@ def test_invalid_arguments_keep_the_engine_exception_type(client):
+         client.ensure("no-such-package", explicit=True)
+ 
+ 
+-def test_worker_death_reports_transport_failure(client, monkeypatch, isolated_python):
++@pytest.mark.parametrize("exits_before_request", [False, True], ids=["natural", "exits-before-request"])
++def test_worker_death_reports_transport_failure(client, monkeypatch, isolated_python, exits_before_request):
+     monkeypatch.setattr(client, "runtime_command", lambda path, **kwargs: [str(isolated_python), "-I", "-c", "import os; os._exit(7)"])
++    if exits_before_request:
++        # A starved caller can reach its first write after the worker is gone (EPIPE).
++        class ExitedFirst(subprocess.Popen):
++            def __init__(self, *args, **kwargs):
++                super().__init__(*args, **kwargs)
++                self.wait(timeout=120)
++
++        monkeypatch.setattr(subprocess, "Popen", ExitedFirst)
+     with pytest.raises(InstallError, match="worker.*result"):
+         client.ensure("node", explicit=True)
+ 
+-- 
+2.43.0
+

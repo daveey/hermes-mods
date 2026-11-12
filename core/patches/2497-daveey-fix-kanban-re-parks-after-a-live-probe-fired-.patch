@@ -1,0 +1,401 @@
+From 0a29b65b05818f5d05d0d0be480cc6499e1e4d16 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:45:51 +0000
+Subject: [PATCH] [daveey] fix(kanban): re-parks after a live probe fired never
+ escalate; supervisor must be runnable
+
+t_f6d930b7 (Upkeep P5 Mac) parks on a read-only probe, mac-final-ready.py, that exits 0 only while
+the Mac is unlocked and HID idle > 900 s. The probe fired, but the user was back by the time a
+worker ran, so the card re-parked on the same probe. prior_same_premise counted those re-parks as
+one premise (same probe hash), and the third escalated: the card went to todo behind an
+"Unstick ... parked 3x" owner and lost its wake_check. Both owners then went to mac-ops, which no
+pool worker can run, so an orchestrator completed them by hand (11-11 22:30Z, 11-12 05:10Z).
+
+- prior_same_premise: a condition_met wake by the same probe ends the trailing run. Its condition
+  really held (two confirming exit-0 runs), so the next park waits on a natural window that closed
+  again. That is new evidence, not a stuck premise. Parks woken only by their deadline, or after
+  a different probe fired, still count and still escalate.
+- _supervisor skips any candidate profile that a new scratch card could not run. That is the case
+  when the card would enroll in this gateway's worker pool (portable, pool configured) and no
+  active, unheld, picking-up pool member attests profile:<name>. An unreadable registry counts as
+  none. Without a pool, or for a non-portable assignee, local profiles stay valid. With no runnable
+  candidate the owner falls back to triage, as before.
+
+Tests: tests/hermes_cli/test_kanban_repark_natural_wait.py replays the t_f6d930b7 park shape
+(awaiting clock 'Mac HID noninterference quiet window', wake_check set, check_every 300). On base,
+5 of its 10 tests fail. All 10 pass with the fix, as do 1567 tests in the 59 files that touch the
+awaiting, assignment-routing, no-progress, timed-park, schedule and wake-check paths.
+---
+ hermes_cli/kanban_assignment_routing.py       |   4 +
+ hermes_cli/kanban_awaiting.py                 |  31 ++-
+ hermes_cli/kanban_profile_runnable.py         |  50 ++++
+ .../test_kanban_repark_natural_wait.py        | 223 ++++++++++++++++++
+ 4 files changed, 300 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_profile_runnable.py
+ create mode 100644 tests/hermes_cli/test_kanban_repark_natural_wait.py
+
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index 2efd271fb6..509cf57214 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -152,6 +152,10 @@ def _supervisor(task):
+             from hermes_cli.config_backend import config_exists
+             if not config_exists(Path(resolve_profile_env(name)) / 'config.yaml'):
+                 continue
++            # A profile no pool worker or local dispatcher can run strands the card it is handed (t_f6d930b7).
++            from hermes_cli.kanban_profile_runnable import runnable
++            if not runnable(name):
++                continue
+             required = validate_assignment(name, requires=[*(task.requires or []), 'kanban'],
+                                            workspace_kind=task.workspace_kind,
+                                            workspace_path=task.workspace_path, skills=task.skills)
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index d44004aaed..5f4a023b90 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -653,26 +653,40 @@ def probe_premise(wake_check: Optional[str], *, op: str = "schedule", wake_in: O
+     as one premise whatever the reason says. None for card/CI probes and short pacing continues."""
+     if _short_continue(op, wake_in) or not opaque_probe(wake_check):
+         return None
+-    basis = "probe|" + " ".join(str(wake_check).split())
+-    return hashlib.sha256(basis.encode()).hexdigest()[:16]
++    return _probe_key(wake_check)
++
++
++def _probe_key(cmd: Any) -> str:
++    return hashlib.sha256(("probe|" + " ".join(str(cmd).split())).encode()).hexdigest()[:16]
+ 
+ 
+ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+                        probe: Optional[str] = None) -> int:
+     """Trailing parks of this card on ``premise`` (or on the same opaque ``probe``), newest first,
+     stopping at the first other premise or at the last escalation (the supervisor acted since).
+-    A deploy park behind a healthy core update window (``kanban_deploy_window``) is not counted."""
++    A deploy park behind a healthy core update window (``kanban_deploy_window``) is not counted.
++
++    A ``condition_met`` wake by this same probe also ends the run: the probe is live and its condition
++    really held (two confirming exit-0 runs), so a park after it waits on a natural window that closed
++    again (an idle Mac whose user came back), which is new evidence, not a stuck premise. Escalating it
++    froze t_f6d930b7 behind owner cards nothing could run and dropped the working idle trigger. [daveey]"""
+     from hermes_cli.kanban_deploy_window import is_healthy
++    from hermes_cli.kanban_wake_check import CONDITION_MET_EVENT
+     count = 0
+     for kind, payload in conn.execute(
+-            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued',?) "
+-            "ORDER BY id DESC LIMIT 20", (task_id, ESCALATED_EVENT)):
++            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued',?,?) "
++            "ORDER BY id DESC LIMIT 20", (task_id, ESCALATED_EVENT, CONDITION_MET_EVENT)):
+         if kind == ESCALATED_EVENT:
+             break
+         try:
+-            got = json.loads(payload or "{}").get("awaiting") or {}
++            data = json.loads(payload or "{}")
++            got = data.get("awaiting") or {}
+         except (ValueError, AttributeError):
+-            got = {}
++            data, got = {}, {}
++        if kind == CONDITION_MET_EVENT:
++            if probe and isinstance(data, dict) and data.get("wake_check") and _probe_key(data["wake_check"]) == probe:
++                break
++            continue
+         if not isinstance(got, dict) or got.get("premise") is None:
+             continue  # a continuation with no wait, or a legacy park
+         if got["premise"] != premise and not (probe and got.get("probe") == probe):
+@@ -688,7 +702,8 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     """``resolve`` plus re-park escalation: the record to store on the parking event.
+ 
+     Raises ``RepeatedPark`` on the third park in a row on one premise. Card waits (their producer
+-    is accountable) and inferred clock waits (pacing continues, operator drags) never escalate,
++    is accountable), inferred clock waits (pacing continues, operator drags) and re-parks after the
++    same probe fired (``prior_same_premise``: a natural window that closed again) never escalate,
+     nor does a deploy wait behind a healthy core update window (``kanban_deploy_window``), whose
+     evidence lands on the record as ``deploy_window`` for the caller's wake floor."""
+     from hermes_cli import kanban_deploy_window as kdw
+diff --git a/hermes_cli/kanban_profile_runnable.py b/hermes_cli/kanban_profile_runnable.py
+new file mode 100644
+index 0000000000..7b65058fa3
+--- /dev/null
++++ b/hermes_cli/kanban_profile_runnable.py
+@@ -0,0 +1,50 @@
++"""Whether a new scratch card assigned to a profile has somewhere to run. [daveey]
++
++Without worker pools (legacy routing) this gateway's own dispatcher runs every local profile. With a pool
++configured for this gateway, a portable card (``kanban_placement.portable_reason`` is None) is enrolled
++``worker-first-v1`` and only a pool worker attesting ``profile:<name>`` may lease it; the origin never runs it
++(it waits for a manual repin). The re-park escalation once handed its owner cards to ``mac-ops``, which no pool
++worker carries, so the owner sat queued forever while the parked card waited behind it (t_f6d930b7).
++"""
++from __future__ import annotations
++
++import logging
++
++logger = logging.getLogger(__name__)
++
++
++def runnable(name: str) -> bool:
++    """False only when a new scratch card for ``name`` would enroll in this gateway's worker pool and no
++    active, unheld, picking-up pool member attests ``profile:<name>`` (an unreadable registry counts as none)."""
++    from hermes_cli import kanban_placement as placement
++
++    cfg = placement.config()
++    pools = cfg.get("worker_pools")
++    if not isinstance(pools, dict) or not pools:
++        return True
++    try:
++        members = pools.get(placement.reg.self_gateway())
++        if not isinstance(members, list) or not members:
++            return True
++        if placement.portable_reason({"assignee": name, "workspace_kind": "scratch"}, cfg):
++            return True  # not portable: it stays on this gateway, which has the profile
++    except Exception:  # health: allow BLE001 -- an unreadable rule set must not invent a runnable pool
++        logger.warning("kanban: placement check for profile %s failed", name, exc_info=True)
++        return False
++    from hermes_cli import kanban_worker_node as wn
++
++    try:
++        snapshot = wn.registry()
++    except Exception:  # health: allow BLE001 -- no Board identity/registry: no pool worker is known to run it
++        logger.warning("kanban: machine registry unreadable for profile %s", name, exc_info=True)
++        return False
++    machines = snapshot.get("machines") if isinstance(snapshot, dict) else None
++    if not isinstance(machines, dict):
++        return False
++    label = f"profile:{name}"
++    for member in members:
++        entry = machines.get(member)
++        if (isinstance(entry, dict) and entry.get("state", "active") == "active" and not entry.get("hold")
++                and wn.advertises_pickup(entry) and label in (entry.get("labels") or [])):
++            return True
++    return False
+diff --git a/tests/hermes_cli/test_kanban_repark_natural_wait.py b/tests/hermes_cli/test_kanban_repark_natural_wait.py
+new file mode 100644
+index 0000000000..a64f705a38
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_repark_natural_wait.py
+@@ -0,0 +1,223 @@
++"""Re-park escalation must not freeze a live natural-condition wait (t_f6d930b7, 11-11/11-12). [daveey]
++
++The Upkeep P5 Mac card parked on a read-only probe (``mac-final-ready.py``: exit 0 only while the Mac is unlocked
++and HID idle > 900 s). The probe fired, but by the time a worker ran the user was back, so it re-parked on the same
++probe. The third such park escalated: the card went to ``todo`` behind an "Unstick ... parked 3x" owner, its
++wake_check was cleared, and the owner ended up on ``mac-ops``, which no pool worker can run.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_awaiting as kaw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++
++MAC_PROBE = "/usr/bin/python3 -S /home/ubuntu/code/upkeep-system/mac/mac-final-ready.py"
++OTHER_PROBE = "/usr/bin/python3 -S /home/ubuntu/code/upkeep-system/mac/other-ready.py"
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setenv("ASK_GATE_LEDGER", str(home / "state" / "ask-ledger.sqlite"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    yield home
++    kwc._shutdown_for_tests()
++
++
++def _tool(name, args):
++    from tools import kanban_tools as kt
++    return json.loads(getattr(kt, f"_handle_{name}")(args))
++
++
++def _claim(monkeypatch, conn, tid) -> None:
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
++
++
++def _mac_park(n: int, probe: str = MAC_PROBE) -> dict:
++    """The t_f6d930b7 park shape: a declared clock window, a live read-only probe, check_every 300."""
++    idle = (53.029, 126.331, 0.038, 46.34, 210.5)[n % 5]
++    return {
++        "reason": (f"SCHEDULED_UNTIL=2026-11-19T05:{n:02d}:00Z \u2014 Noninterference wait: installed build reachable "
++                   f"and unlocked but fresh HID idle {idle}s, so no navigation or actions were sent."),
++        "wake_check": probe, "check_every": 300,
++        "awaiting": {"kind": "clock", "ref": "Mac HID noninterference quiet window",
++                     "why": f"Read-only ioreg observed unlocked with {idle} seconds idle; the probe needs >900 s."}}
++
++
++def _probe_fires(conn, tid, cmd: str = MAC_PROBE) -> None:
++    """The dispatcher's probe: a few `not yet` readings, then the window opens (confirmed exit 0)."""
++    state = kwc.get_state(conn, tid)
++    assert state and state["cmd"] == cmd and state["every"] == 300, state
++    for _ in range(2):
++        assert kwc.apply_result(conn, tid, cmd, 1, "unlocked, HID idle 40s", generation=state["generation"]) is None
++    assert kwc.apply_result(conn, tid, cmd, 0, "Mac unlocked and HID idle 1055s", generation=state["generation"],
++                            diagnostics={"first_rc": 0, "confirm_rc": 0}) == kwc.CONDITION_MET_EVENT
++    assert kb.get_task(conn, tid).status == "ready"
++
++
++def _deadline_wakes(conn, tid) -> None:
++    assert kb.unblock_task(conn, tid)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++
++
++def _mac_card(conn) -> str:
++    tid = kb.create_task(conn, title="Upkeep system P5 Mac", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    return tid
++
++
++def _owners(conn) -> list:
++    return conn.execute("SELECT id FROM tasks WHERE title LIKE 'Unstick %'").fetchall()
++
++
++def test_reparks_after_the_same_probe_fired_never_escalate(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        for n in range(5):
++            _claim(monkeypatch, conn, tid)
++            out = _tool("schedule", _mac_park(n))
++            assert out.get("status") == "scheduled", (n, out)
++            # The idle trigger stays armed on every park, at its own cadence.
++            state = kwc.get_state(conn, tid)
++            assert state["cmd"] == MAC_PROBE and state["every"] == 300
++            _probe_fires(conn, tid)
++        assert not _owners(conn)
++        assert not conn.execute("SELECT 1 FROM task_links WHERE child_id=?", (tid,)).fetchone()
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == kaw.ESCALATED_EVENT]
++
++
++def test_same_probe_woken_only_by_its_deadline_still_escalates(kanban_home, monkeypatch) -> None:
++    """Control: no fire between parks is no new evidence, however the reason is worded."""
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        outs = []
++        for n in range(3):
++            _claim(monkeypatch, conn, tid)
++            outs.append(_tool("schedule", _mac_park(n)))
++            if outs[-1].get("status") == "scheduled":
++                _deadline_wakes(conn, tid)
++        assert [o.get("status") for o in outs] == ["scheduled", "scheduled", "todo"], outs
++        assert outs[2].get("code") == kaw.ESCALATED_EVENT
++
++
++def test_a_fire_of_another_probe_is_not_progress_for_this_one(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        _claim(monkeypatch, conn, tid)
++        assert _tool("schedule", _mac_park(0, OTHER_PROBE)).get("status") == "scheduled"
++        _probe_fires(conn, tid, OTHER_PROBE)
++        outs = []
++        for n in range(1, 4):
++            _claim(monkeypatch, conn, tid)
++            outs.append(_tool("schedule", _mac_park(n)))
++            if outs[-1].get("status") == "scheduled":
++                _deadline_wakes(conn, tid)
++        assert [o.get("status") for o in outs] == ["scheduled", "scheduled", "todo"], outs
++
++
++def test_one_fire_resets_the_count_but_later_stuck_parks_count_again(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _mac_card(conn)
++        statuses = []
++        for n, wake in enumerate(("deadline", "fire", "deadline", "deadline", None)):
++            _claim(monkeypatch, conn, tid)
++            out = _tool("schedule", _mac_park(n))
++            statuses.append(out.get("status"))
++            if wake == "fire":
++                _probe_fires(conn, tid)
++            elif wake == "deadline" and out.get("status") == "scheduled":
++                _deadline_wakes(conn, tid)
++        # Parks 0-1 then the fire; parks 2-3 after it are two in a row; park 4 is the third: escalates.
++        assert statuses == ["scheduled", "scheduled", "scheduled", "scheduled", "todo"], statuses
++
++
++# -- the escalation owner never lands on a profile nothing can run ---------------------------------------------
++
++@pytest.fixture
++def pool(monkeypatch):
++    """A hub gateway whose portable cards go to worker-1; mac-ops exists as a profile and is allowlisted."""
++    from hermes_cli import config
++    from hermes_cli import config_backend
++    from hermes_cli import kanban_assignment_routing as ar
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_worker_node as wn
++    from hermes_cli import profiles
++
++    cfg = {"kanban": {"orchestrator_profile": "mac-ops",
++                      "placement": {"worker_pools": {"hub": ["worker-1"]}, "assignees": ["default", "mac-ops"]}}}
++    entry = {"state": "active", "pickup": "explicit", "last_seen": time.time() * 1000, "labels": ["profile:default"]}
++    monkeypatch.setattr(config, "load_config_readonly", lambda: cfg)
++    monkeypatch.setattr(config_backend, "config_exists", lambda path: True)
++    monkeypatch.setattr(profiles, "resolve_profile_env", lambda name: f"/profiles/{name}")
++    monkeypatch.setattr(ar, "validate_assignment", lambda name, **kw: [])
++    monkeypatch.setattr(kp.reg, "self_gateway", lambda: "hub")
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": {"worker-1": entry}})
++    return cfg, entry
++
++
++def _task(**kw):
++    base = {"assignee": "default", "created_by": "default", "requires": [], "workspace_kind": "scratch",
++            "workspace_path": None, "skills": None}
++    return SimpleNamespace(**{**base, **kw})
++
++
++def test_supervisor_skips_a_profile_no_pool_worker_carries(pool) -> None:
++    from hermes_cli import kanban_assignment_routing as ar
++    assert ar._supervisor(_task()) == (None, [])
++    assert kaw._supervisor_profile(_task()) is None  # the owner goes to triage, not to mac-ops
++
++
++def test_supervisor_keeps_a_profile_a_live_pool_worker_carries(pool) -> None:
++    from hermes_cli import kanban_assignment_routing as ar
++    _, entry = pool
++    entry["labels"] = ["profile:default", "profile:mac-ops"]
++    assert ar._supervisor(_task())[0] == "mac-ops"
++    entry["hold"] = True  # a held worker leases nothing
++    assert ar._supervisor(_task()) == (None, [])
++
++
++def test_supervisor_falls_through_to_the_next_runnable_candidate(pool) -> None:
++    from hermes_cli import kanban_assignment_routing as ar
++    assert ar._supervisor(_task(assignee="worker", created_by="default"))[0] == "default"
++
++
++@pytest.mark.parametrize("change", ["no_pool", "not_allowlisted"])
++def test_local_profiles_stay_runnable_when_the_card_would_not_enter_the_pool(pool, change, monkeypatch) -> None:
++    from hermes_cli import kanban_assignment_routing as ar
++    from hermes_cli import kanban_worker_node as wn
++    cfg, _ = pool
++    placement = cfg["kanban"]["placement"]
++    if change == "no_pool":
++        placement.pop("worker_pools")
++    else:
++        placement["assignees"] = ["default"]
++    monkeypatch.setattr(wn, "registry", lambda: pytest.fail("registry read for a card that never enters the pool"))
++    assert ar._supervisor(_task())[0] == "mac-ops"
++
++
++def test_unreadable_registry_never_invents_a_runnable_pool(pool, monkeypatch) -> None:
++    from hermes_cli import kanban_profile_runnable as kpr
++    from hermes_cli import kanban_worker_node as wn
++
++    def boom():
++        raise RuntimeError("no board identity")
++    monkeypatch.setattr(wn, "registry", boom)
++    assert kpr.runnable("mac-ops") is False
++    monkeypatch.setattr(wn, "registry", lambda: None)
++    assert kpr.runnable("mac-ops") is False
+-- 
+2.43.0
+

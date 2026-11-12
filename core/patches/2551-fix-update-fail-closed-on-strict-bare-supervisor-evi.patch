@@ -1,0 +1,161 @@
+From 64e3653011583c34c236140f69a60ee433b8922d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:34:01 +0000
+Subject: [PATCH] fix(update): fail closed on strict bare supervisor evidence
+ [daveey]
+
+Problem: real bare discovery admitted custom service gateways and unreadable supervisor evidence to the strict stop set (r7-red.log: 11 failures).
+
+Why: strict discovery reused best-effort _supervisor_markers; failed MainPID/Restart or environment/cgroup reads could mean no supervisor. PID disappearance then did not prove the service disarmed. Root (happened): unknown evidence was conflated with unsupervised. Root (not caught): existing bare fixtures proved argv/home ownership but did not inject service probe and supervisor evidence failures.
+
+Recurrence: follow-up to 6d6ec4612552, which closed ownership uncertainty but retained the best-effort supervisor predicate. Countermeasure: strict-only tri-state evidence, conservatively refusing all unclaimed service cgroups even Restart=no, with readable environment/cgroup required for session/root admission. Default helpers unchanged.
+
+Proof: canonical run_tests.sh RED 11 failed/12 passed; GREEN regression 89 passed, 1 macOS-only skip across five files. Health: 0 blocking, 0 advisory. No actual services or process signals; local commit only.
+---
+ hermes_cli/update_preswap_discovery.py        | 42 ++++++++++--
+ .../test_update_preswap_bare_discovery.py     | 66 +++++++++++++++++++
+ 2 files changed, 103 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/update_preswap_discovery.py b/hermes_cli/update_preswap_discovery.py
+index b1e466aa91..d97732777c 100644
+--- a/hermes_cli/update_preswap_discovery.py
++++ b/hermes_cli/update_preswap_discovery.py
+@@ -61,10 +61,41 @@ def systemd_units() -> list[dict]:
+     return units
+ 
+ 
++def _bare_supervisor_evidence(pid: int, argv: list | None) -> tuple[bool | None, str]:
++    """True = proven bare, False = unmanaged supervisor, None = unreadable evidence.
++
++    Only the managed Hermes units inventoried above can be safely disarmed here.
++    Refuse every other service cgroup (including nested children), even Restart=no:
++    a PID disappearing does not establish custody of its supervisor. The user@ UID
++    manager is infrastructure, not a supervisor of a terminal/session scope.
++    Best-effort fleet helpers intentionally retain their separate default semantics.
++    """
++    import psutil
++    from hermes_cli import update_cmd_posix_pause as pause
++    from hermes_cli.gateway import argv_declares_external_supervisor
++
++    if argv_declares_external_supervisor(argv):
++        return False, "supervised by --external-supervisor"
++    cgroup = pause._pid_cgroup(pid)
++    if not cgroup or not cgroup.startswith("/"):
++        return None, "its supervisor cgroup could not be read"
++    parts = cgroup.strip("/").split("/")
++    for part in parts:
++        manager = part.startswith("user@") and part.endswith(".service") and part[5:-8].isdecimal()
++        if part.endswith(".service") and (not manager or part == parts[-1]):
++            return False, f"unmanaged supervisor systemd unit {part}"
++    try:
++        env = psutil.Process(pid).environ()
++    except (psutil.Error, OSError) as exc:
++        return None, f"its supervisor environment could not be read ({type(exc).__name__})"
++    if env.get("HERMES_S6_SUPERVISED_CHILD"):
++        return False, "supervised by s6"
++    return True, ""
++
++
+ def bare_gateways(service_pids: set[int]) -> tuple[list[dict], list[str]]:
+     """Only proven foreign ownership/code excludes a candidate from the strict pause."""
+     from gateway.status import get_process_start_time
+-    from hermes_cli import update_cmd_posix_pause as pause
+     from hermes_cli.gateway import _capture_gateway_argv, find_gateway_pids
+     from hermes_cli.update_fleet_scope import (
+         announce_skipped_runtime, gateway_foreign_code_root, gateway_pid_home, home_in_update_scope,
+@@ -83,10 +114,11 @@ def bare_gateways(service_pids: set[int]) -> tuple[list[dict], list[str]]:
+         if pinned is not None:
+             announce_skipped_runtime("gateway process", f"PID {pid}", home, code_root=pinned)
+             continue
+-        marker, argv = pause._supervisor_markers(pid), _capture_gateway_argv(pid)
+-        if marker or not argv or not home:
+-            why = f"supervised by {marker}" if marker else "its command line could not be read" if not argv \
+-                else "its Hermes home could not be proved"
++        argv = _capture_gateway_argv(pid)
++        is_bare, why = _bare_supervisor_evidence(pid, argv)
++        if is_bare is not True or not argv or not home:
++            why = why or ("its command line could not be read" if not argv
++                          else "its Hermes home could not be proved")
+             notices.append(f"  ↷ gateway PID {pid} keeps running until after the update ({why})")
+             continue
+         bare.append({"pid": pid, "argv": list(argv), "home": str(home), "ct": get_process_start_time(pid)})
+diff --git a/tests/hermes_cli/test_update_preswap_bare_discovery.py b/tests/hermes_cli/test_update_preswap_bare_discovery.py
+index febe4ae936..3243a06c02 100644
+--- a/tests/hermes_cli/test_update_preswap_bare_discovery.py
++++ b/tests/hermes_cli/test_update_preswap_bare_discovery.py
+@@ -117,6 +117,72 @@ def test_unit_gateway_never_enters_bare_stop_set(bare_probes, tmp_path, monkeypa
+         assert [entry["pid"] for entry in token["posix_units"]] == [PID]
+ 
+ 
++@pytest.mark.platforms("linux")
++def test_s6_session_scope_is_not_bare(bare_probes, tmp_path, monkeypatch):
++    import psutil
++
++    monkeypatch.setattr(dashboard_procs, "_hermes_home_for_pid", lambda pid: str(tmp_path))
++    monkeypatch.setattr(psutil, "Process", lambda pid: Mock(environ=lambda: {"HERMES_S6_SUPERVISED_CHILD": "1"}))
++    verdict = pause._pause(pause._empty_token())
++    assert verdict and "s6" in verdict and "checkout was not changed" in verdict
++    bare_probes.assert_not_called()
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("probe", ["failed", "nonzero", "empty", "restart-no"])
++@pytest.mark.parametrize("nested", [False, True])
++def test_custom_service_never_becomes_bare(bare_probes, tmp_path, monkeypatch, probe, nested):
++    import subprocess
++
++    monkeypatch.setattr(dashboard_procs, "_hermes_home_for_pid", lambda pid: str(tmp_path))
++    cgroup = "/fixture/custom-bot.service" + ("/child" if nested else "")
++    monkeypatch.setattr(pause, "_pid_cgroup", lambda pid="self": cgroup)
++
++    def systemctl(cmd, **kwargs):
++        if probe == "failed":
++            raise OSError("systemctl unavailable")
++        if probe == "nonzero":
++            return subprocess.CompletedProcess(cmd, 1, "", "denied")
++        value = "" if probe == "empty" else str(PID) if "--property=MainPID" in cmd else "no"
++        return subprocess.CompletedProcess(cmd, 0, value, "")
++
++    monkeypatch.setattr(fleet, "_systemctl", systemctl)
++    token = pause._empty_token()
++    verdict = pause._pause(token)
++    assert verdict and "custom-bot.service" in verdict and "checkout was not changed" in verdict
++    assert token["unmapped"] == []
++    bare_probes.assert_not_called()
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("evidence", ["cgroup", "environment", "process"])
++def test_unknown_supervisor_evidence_refuses(bare_probes, tmp_path, monkeypatch, evidence):
++    import psutil
++
++    monkeypatch.setattr(dashboard_procs, "_hermes_home_for_pid", lambda pid: str(tmp_path))
++    if evidence == "cgroup":
++        monkeypatch.setattr(pause, "_pid_cgroup", lambda pid="self": None)
++    else:
++        def unreadable(*args):
++            raise psutil.AccessDenied(PID)
++        monkeypatch.setattr(psutil, "Process", unreadable if evidence == "process" else
++                            lambda pid: Mock(environ=unreadable))
++    verdict = pause._pause(pause._empty_token())
++    assert verdict and "supervisor" in verdict and "checkout was not changed" in verdict
++    bare_probes.assert_not_called()
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("cgroup", ["/", "/fixture/session.scope", "/user.slice/user@1000.service/app.slice/terminal.scope"])
++def test_readable_unsupervised_scope_is_bare(bare_probes, tmp_path, monkeypatch, cgroup):
++    monkeypatch.setattr(dashboard_procs, "_hermes_home_for_pid", lambda pid: str(tmp_path))
++    monkeypatch.setattr(pause, "_pid_cgroup", lambda pid="self": cgroup)
++    token = pause._empty_token()
++    assert pause._pause(token) is None
++    assert token["unmapped_pids"] == [PID]
++    bare_probes.assert_called_once()
++
++
+ @pytest.mark.platforms("linux")
+ def test_default_bare_discovery_keeps_best_effort_exclusion(bare_probes, monkeypatch):
+     monkeypatch.delenv(pause.STOP_BUSY_ENV)
+-- 
+2.43.0
+
