@@ -1,4 +1,5 @@
 """Public, anonymized regressions for generated-message KPI pollution."""
+import re
 import unittest
 import coach_askgate as g
 
@@ -263,7 +264,10 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
             "Take it into account for the work you're doing right now:\n"
             "- default (another session) at 02:20 UTC: " + AGENT_BODY)
 
-    def _home(self, directory, body=None, tool="kanban_comment", role="assistant", name="home"):
+    T = 1793672427  # the live digest turn (2026-11-03 02:20:27 UTC) that delivered the 02:20 UTC note
+    CALL_TS = T - 20  # the agent's kanban_comment tool call, written seconds before delivery
+
+    def _home(self, directory, body=None, tool="kanban_comment", role="assistant", name="home", ts=None, filler=0):
         import json, sqlite3
         from pathlib import Path
         home = Path(directory) / name
@@ -271,13 +275,15 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
         con = sqlite3.connect(home / "state.db")
         con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, "
                     "tool_calls TEXT, timestamp REAL)")
+        rows = [("other", "user", "filler", None, self.CALL_TS - 7200 + i * 0.01) for i in range(filler)]
+        con.executemany("INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES (?,?,?,?,?)", rows)
         if body is not None:
             args = {"task_id": "t_example0002", "body": body}
             if tool == "terminal":
                 args = {"command": "hermes kanban comment t_example0002 " + json.dumps(body)}
             calls = [{"id": "c1", "type": "function", "function": {"name": tool, "arguments": json.dumps(args)}}]
             con.execute("INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES (?,?,?,?,?)",
-                        ("other", role, "", json.dumps(calls), 1.0))
+                        ("other", role, "", json.dumps(calls), self.CALL_TS if ts is None else ts))
         con.commit()
         con.close()
         return home
@@ -295,8 +301,8 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = self._home(directory, self.AGENT_BODY)
             with self._env(home):
-                self.assertTrue(g.note_line_by_agent(self.AGENT_BODY, home))
-                self.assertEqual(g.clean(self.NOTE), "")
+                self.assertTrue(g.note_line_by_agent(self.AGENT_BODY, home, t=self.T, at=("02", "20", "UTC")))
+                self.assertEqual(g.clean(self.NOTE, t=self.T), "")
 
     def test_still_flags_withdraws_the_queued_legacy_row(self):
         import json, tempfile
@@ -307,10 +313,10 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
             p = Path(directory) / "host" / "default"
             p.mkdir(parents=True)
             (p / "s.json").write_text(json.dumps({"id": "s", "source": "kanban", "user_turns": [
-                {"t": 1000, "text": self.NOTE}]}))
-            m = g.hit_defect({"t": 1000, "session": "s", "host": "host", "class": g.ASK_CLASS,
+                {"t": self.T, "text": self.NOTE}]}))
+            m = g.hit_defect({"t": self.T, "session": "s", "host": "host", "class": g.ASK_CLASS,
                               "pattern": "stop-asking", "quote": self.NOTE})
-            row = {"monitor": "ask-gate", "session_id": m["session_id"], "quote": m["quote"], "hit_t": 1000}
+            row = {"monitor": "ask-gate", "session_id": m["session_id"], "quote": m["quote"], "hit_t": self.T}
             with self._env(home):
                 self.assertIn("written by an agent", g.still_flags(row, homes=[home], data=directory) or "")
             with self._env(control):
@@ -321,7 +327,7 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = self._home(directory, self.AGENT_BODY, tool="terminal")
             with self._env(home):
-                self.assertEqual(g.clean(self.NOTE), "")
+                self.assertEqual(g.clean(self.NOTE, t=self.T), "")
 
     def test_controls_keep_the_note(self):
         import tempfile
@@ -333,8 +339,8 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
                     ("other tool", self._home(directory, self.AGENT_BODY, tool="send_message", name="c")),
                     ("no state.db", Path(directory) / "missing")):
                 with self.subTest(name), self._env(home):
-                    self.assertEqual(g.clean(self.NOTE), self.NOTE)
-                    self.assertTrue(g.classify(g.clean(self.NOTE)))
+                    self.assertEqual(g.clean(self.NOTE, t=self.T), self.NOTE)
+                    self.assertTrue(g.classify(g.clean(self.NOTE, t=self.T)))
 
     def test_mixed_note_keeps_the_human_line(self):
         import tempfile
@@ -342,7 +348,7 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = self._home(directory, self.AGENT_BODY)
             with self._env(home):
-                out = g.clean(mixed)
+                out = g.clean(mixed, t=self.T + 300)
                 self.assertNotIn("Duplicate of", out)
                 self.assertEqual(g.classify(out), "why-asking-me")
 
@@ -352,9 +358,68 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
             home = self._home(directory, self.AGENT_BODY)
             with self._env(home):
                 before = g.TOOLCALL_DROPS.get("lines", 0)
-                g.clean(self.NOTE)
+                g.clean(self.NOTE, t=self.T)
                 self.assertGreater(g.TOOLCALL_DROPS["lines"], before)
                 self.assertTrue(any("tool call" in line for line in g.toolcall_drop_lines()))
+
+    # The live hub miss (t_01a1cf33013881c8): the digest clips a long note body at 74 chars, and the hub's 11 GB
+    # state.db made the unbounded LIKE scan run 252 s, past the 15 s deadline. Both kept David's "stop asking".
+    def test_clipped_digest_body_is_dropped(self):
+        import tempfile
+        clipped = self.NOTE.split(": Duplicate", 1)[0] + ": " + self.AGENT_BODY[:74] + "  " + g.CLIP + " " + \
+            self.AGENT_BODY[-40:] + "…"
+        self.assertLess(clipped.index(g.CLIP) - clipped.index("Duplicate"), g.NOTE_PREFIX)
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY)
+            with self._env(home):
+                self.assertEqual(g.clean(clipped, t=self.T), "")
+
+    def _traced(self):
+        from unittest import mock
+        seen, real = [], g.sqlite3.connect
+
+        def connect(*a, **k):
+            con = real(*a, **k)
+            con.set_trace_callback(seen.append)
+            return con
+        return seen, mock.patch.object(g.sqlite3, "connect", connect)
+
+    def test_scan_is_rowid_bounded(self):
+        import sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY, filler=5000)
+            seen, patch = self._traced()
+            with self._env(home), patch:
+                self.assertEqual(g.clean(self.NOTE, t=self.T), "")
+            scans = [q for q in seen if "tool_calls LIKE" in q]
+            self.assertEqual(len(scans), 1, seen)
+            self.assertRegex(scans[0], r"\bid BETWEEN \d+ AND \d+")
+            lo, hi = map(int, re.search(r"BETWEEN (\d+) AND (\d+)", scans[0]).groups())
+            self.assertLess(hi - lo, 10, "the window excludes the 5000 filler rows two hours earlier")
+            con = sqlite3.connect(home / "state.db")
+            plan = " ".join(r[-1] for r in con.execute("EXPLAIN QUERY PLAN " + scans[0]))
+            con.close()
+            self.assertIn("INTEGER PRIMARY KEY (rowid>? AND rowid<?)", plan)
+
+    def test_matching_call_outside_the_window_keeps_the_line(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY, ts=self.CALL_TS - 3 * 3600)
+            with self._env(home):
+                self.assertEqual(g.clean(self.NOTE, t=self.T), self.NOTE)
+            later = self._home(directory, self.AGENT_BODY, ts=self.CALL_TS + 3 * 3600, name="later")
+            with self._env(later):
+                self.assertEqual(g.clean(self.NOTE, t=self.T), self.NOTE)
+
+    def test_no_turn_time_keeps_the_line_without_a_query(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY)
+            seen, patch = self._traced()
+            with self._env(home), patch:
+                self.assertEqual(g.clean(self.NOTE), self.NOTE)
+                self.assertFalse(g.note_line_by_agent(self.AGENT_BODY, home))
+            self.assertEqual(seen, [])
 
 
 def runners_brief():

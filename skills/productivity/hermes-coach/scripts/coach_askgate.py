@@ -32,7 +32,7 @@ filed. Detections come from the local <home>/coach/selfheal.json plus every host
 (coach_feed copies them), since ask-gate runs on the hub and detection state is per host (plugin-03d4509c8a).
 """
 import argparse, functools, glob, json, os, re, sqlite3, subprocess, sys, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -108,8 +108,54 @@ def _ro_connect(path, timeout=2):
         return c
 
 
+NOTE_STAMP = re.compile(r"^- [^\n]*? at (\d{1,2}):(\d{2})(?: ([A-Za-z0-9+\-]+))?: ")  # NOTE_LINE with groups
+STAMP_OFFSETS = {"UTC": 0, "GMT": 0, "Z": 0, "PST": -8, "PDT": -7, "MST": -7, "MDT": -6, "CST": -6, "CDT": -5,
+                 "EST": -5, "EDT": -4}
+NOTE_SLACK = 1800  # seconds either side of a note's stamp searched for the tool call that wrote it
+NOTE_LOOKBACK = 86400  # no usable stamp: the day before the turn
+
+
+def note_window(t, at=None):
+    """The (lo, hi) epoch window in which the tool call that wrote a note delivered at turn time `t` must sit.
+    `at` is the line stamp (HH, MM, zone): the note was written at the latest such wall time at or before t+120 s,
+    +/- NOTE_SLACK. No stamp or an unknown zone -> [t - 1 day, t + 120 s]. No t -> None (nothing is searched)."""
+    if not t:
+        return None
+    t = float(t)
+    zone = (at[2] or "UTC").upper() if at else None
+    off = STAMP_OFFSETS.get(zone) if zone else None
+    if off is None and zone and re.fullmatch(r"[+-]\d{4}", zone):
+        off = (1 if zone[0] == "+" else -1) * (int(zone[1:3]) + int(zone[3:]) / 60)
+    if off is None:
+        return int(t - NOTE_LOOKBACK), int(t + 120)
+    tz = timezone(timedelta(hours=off))
+    end = datetime.fromtimestamp(t + 120, tz)
+    try:
+        at_dt = end.replace(hour=int(at[0]), minute=int(at[1]), second=0, microsecond=0)
+    except ValueError:
+        return int(t - NOTE_LOOKBACK), int(t + 120)
+    if at_dt > end:
+        at_dt -= timedelta(days=1)
+    s = at_dt.timestamp()
+    return int(s - NOTE_SLACK), int(s + NOTE_SLACK)
+
+
+def _first_id_at(con, ts, lo, hi):
+    """Smallest message id in [lo, hi + 1] whose row (the first at or after it) has timestamp >= ts: a binary search
+    on the rowid (messages has no timestamp-only index). hi + 1 -> every row is older."""
+    hi += 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        r = con.execute("SELECT id, timestamp FROM messages WHERE id >= ? ORDER BY id LIMIT 1", (mid,)).fetchone()
+        if r is None or (r[1] is not None and r[1] >= ts):
+            hi = mid
+        else:
+            lo = r[0] + 1
+    return lo
+
+
 @functools.lru_cache(maxsize=512)
-def _tool_call_hit(prefix, db):
+def _tool_call_hit(prefix, db, lo_ts, hi_ts):
     words = sorted(set(re.findall(r"[A-Za-z0-9_]{5,}", prefix)), key=len, reverse=True)[:3]
     if len(words) < 2 or not os.path.exists(db):
         return False
@@ -118,11 +164,18 @@ def _tool_call_hit(prefix, db):
     except Exception:
         return False
     try:
-        deadline = time.monotonic() + 15  # bound one scan of a large state.db; a timeout keeps the line
+        deadline = time.monotonic() + 15  # backstop only: the rowid window keeps the scan small
         con.set_progress_handler(lambda: time.monotonic() > deadline, 100000)
-        sql = ("SELECT tool_calls FROM messages WHERE role = 'assistant' AND tool_calls LIKE '%kanban%comment%'"
-               + " AND tool_calls LIKE ?" * len(words) + " LIMIT 20")
-        for (tc,) in con.execute(sql, [f"%{w}%" for w in words]):
+        first, last = con.execute("SELECT MIN(id), MAX(id) FROM messages").fetchone()
+        if first is None:
+            return False
+        lo = _first_id_at(con, lo_ts, first, last)
+        hi = _first_id_at(con, hi_ts, lo, last) - 1  # last id older than hi_ts
+        if hi < lo:
+            return False
+        sql = ("SELECT tool_calls FROM messages WHERE id BETWEEN ? AND ? AND role = 'assistant'"
+               " AND tool_calls LIKE '%kanban%comment%'" + " AND tool_calls LIKE ?" * len(words) + " LIMIT 20")
+        for (tc,) in con.execute(sql, [lo, hi] + [f"%{w}%" for w in words]):
             if any(prefix in _norm_note(t) for t in _call_texts(tc)):
                 return True
     except Exception:
@@ -132,24 +185,33 @@ def _tool_call_hit(prefix, db):
     return False
 
 
-def note_line_by_agent(body, home=None):
+def _note_prefix(body):
+    """The comparable head of a note body: the text before a digest clip marker (session_digest cuts long bodies,
+    and the marker is never in the tool call), trailing ellipsis dropped, first NOTE_PREFIX chars."""
+    body = (body or "").split(CLIP, 1)[0]
+    return _norm_note(body).rstrip("…").strip()[:NOTE_PREFIX].strip()
+
+
+def note_line_by_agent(body, home=None, t=None, at=None):
     """True when an assistant tool call in the local state.db (read-only) wrote this card-note body: positive
-    provenance for an untagged note from before core recorded writer_kind (agent-b14b35066b). A missing or
-    unreadable state.db, or no match, -> False (the line stays David's for review)."""
-    prefix = _norm_note(body)[:NOTE_PREFIX].strip()
-    if len(prefix) < 20:
+    provenance for an untagged note from before core recorded writer_kind (agent-b14b35066b). Only the rows in
+    note_window(t, at) are searched (a rowid range, so an 11 GB state.db is not scanned); no t, a missing or
+    unreadable state.db, or no match -> False (the line stays David's for review)."""
+    win = note_window(t, at)
+    prefix = _note_prefix(body)
+    if win is None or len(prefix) < 20:
         return False
     home = Path(home or os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
-    return _tool_call_hit(prefix, str(home / "state.db"))
+    return _tool_call_hit(prefix, str(home / "state.db"), *win)
 
 
-def _untagged_by_agent(part):
+def _untagged_by_agent(part, t=None):
     """An unstamped note line (no agent tag) whose body an agent's tool call wrote. Counted for the weekly post."""
-    m = NOTE_LINE.match(part)
+    m = NOTE_STAMP.match(part)
     body = part[m.end():] if m else ""
-    if not note_line_by_agent(body):
+    if not note_line_by_agent(body, t=t, at=m.groups() if m else None):
         return False
-    TOOLCALL_DROPPED.add(_norm_note(body)[:NOTE_PREFIX])
+    TOOLCALL_DROPPED.add(_note_prefix(body))
     TOOLCALL_DROPS["lines"] = len(TOOLCALL_DROPPED)
     return True
 
@@ -163,7 +225,7 @@ def toolcall_drop_lines():
             "matched an agent's kanban_comment tool call in the local state.db, so they were not counted as David's."]
 
 
-def drop_agent_notes(text):
+def drop_agent_notes(text, t=None):
     """A live card note minus the lines an agent wrote (core stamps them "(agent chat",
     agent-261aa31f49): their words are not David's. Each line runs to the next stamp, so a
     multi-line body is dropped whole. An unstamped (older) line is dropped only when the local
@@ -174,7 +236,7 @@ def drop_agent_notes(text):
     if not starts:
         return text
     parts = [text[:starts[0]]] + [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
-    kept = [parts[0]] + [p for p in parts[1:] if not (AGENT_STAMP.match(p) or _untagged_by_agent(p))]
+    kept = [parts[0]] + [p for p in parts[1:] if not (AGENT_STAMP.match(p) or _untagged_by_agent(p, t))]
     if len(kept) == 1:  # every line was an agent's: none of it is David's
         return ""
     return "".join(kept)
@@ -318,7 +380,7 @@ def classify_fix(text):
     return None
 
 
-def clean(text):
+def clean(text, t=None):
     # Only a top-level steering envelope is a user message. Never unwrap one
     # quoted inside an agent-to-agent message.
     if re.match(r"^\s*\[OUT-OF-BAND USER MESSAGE", text):
@@ -328,7 +390,7 @@ def clean(text):
     # Desktop appends these machine-owned sections to real user text. Their
     # quoted button labels are not new complaints from the user.
     text = re.split(r"(?m)^\s*\[(?:(?:user-steps|chat-closeout)\]|System:)", text, maxsplit=1)[0]
-    return drop_agent_notes(text.strip()).strip()
+    return drop_agent_notes(text.strip(), t).strip()
 
 
 # An Inbox notice (plugins/inbox/store.py _post_text/_update_text) ends in "**Proposed:** <accept_prompt>" and the
@@ -414,10 +476,11 @@ def collect(data, since_ts, until_ts, doit=None):
         # A deliberate detector probe opens with `[selfheal-probe]`; its later turns are scripted too. The lane that
         # files the hit may run on another host than the session (no state.db row there), so the hit carries the
         # opener and a probe flag (agent-43f47d4029). Digests keep the first user turns, so turns[0] is the opener.
-        first = clean((turns[0].get("text") if turns and isinstance(turns[0], dict) else "") or "")
+        first = clean((turns[0].get("text") if turns and isinstance(turns[0], dict) else "") or "",
+                      turns[0].get("t") if turns and isinstance(turns[0], dict) else None)
         probe = bool(PROBE.match(first))
         for i, u in enumerate(turns):
-            t, text = u.get("t") or 0, clean(u.get("text") or "")  # "…[N turns omitted]" rows carry t: None
+            t, text = u.get("t") or 0, clean(u.get("text") or "", u.get("t"))  # "…[N turns omitted]" rows carry t: None
             if not (since_ts <= t < until_ts) or not text or generated(text) or SKIP.match(text):
                 continue
             if u.get("generated"):  # the digest's writer flag: core recorded a plugin wrote this turn (plugin-4731e7cdc3)
@@ -728,7 +791,7 @@ def row_is_doit(row, data=None):
             for u in (d.get("user_turns") or []) if isinstance(d, dict) else ():
                 if not isinstance(u, dict) or (t is not None and abs((u.get("t") or 0) - t) > DOIT_NEAR):
                     continue
-                text = clean(u.get("text") or "")
+                text = clean(u.get("text") or "", u.get("t"))
                 if _ws(re.sub(r"\[Image attached[^\]]*\]", "", text)).startswith(q) and (
                         u.get("inbox_doit") is True or inbox_doit(text, u.get("prev"))):
                     return True
@@ -748,7 +811,7 @@ def row_is_review_brief(row, data=None):
             if d.get("source") != "oneshot" or not turns:
                 continue
             u = turns[0]
-            text = clean(u.get("text") or "")
+            text = clean(u.get("text") or "", u.get("t"))
             if abs((u.get("t") or 0) - t) <= DOIT_NEAR and _ws(text).startswith(q) and REVIEW_BRIEF.match(text):
                 return True
     return False
@@ -784,7 +847,7 @@ def row_is_agent_note(row, data=None):
                 raw = u.get("text") or ""
                 body = _note_body(raw).strip()
                 if (NOTE_HEADER.match(body) and _ws(re.sub(r"\[Image attached[^\]]*\]", "", body)).startswith(q)
-                        and not clean(raw)):
+                        and not clean(raw, u.get("t"))):
                     return True
     return False
 
@@ -799,7 +862,8 @@ def still_flags(row, homes=None, data=None):
     session (selfheal_lane.json). Any error -> None, so the row files as before."""
     try:
         q = row.get("quote") or ""
-        if q and (generated(clean(q)) or (NOTE_HEADER.match(q) and not clean(q))):
+        qt = row_hit_t(row)
+        if q and (generated(clean(q, qt)) or (NOTE_HEADER.match(q) and not clean(q, qt))):
             return "monitor no longer flags (ask-gate): quote is a generated prompt, not David"
         if row_is_agent_note(row, data):
             return "monitor no longer flags (ask-gate): card note written by an agent, not David"
