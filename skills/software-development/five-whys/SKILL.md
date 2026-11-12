@@ -136,6 +136,8 @@ Never stop at these. Each is a symptom that needs another why:
 
 ### 5. Check for recurrence
 
+When a historical green commit is not an ancestor of the failing head, compare the exact failing fixture and production source across both histories before proposing timing or environment causes. The green branch may already contain a correction that the current branch lacks; establish containment of that correction separately from who displaced the history.
+
 Search the history (issues, git log, earlier cards, session memory) for the same chain. If it has happened before,
 the earlier countermeasure didn't hold, and *that* is the next why. Ries's rule applies: tolerate a mistake the
 first time, never the second. The second occurrence needs a systemic fix.
