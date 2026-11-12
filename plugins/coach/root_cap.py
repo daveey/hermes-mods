@@ -1184,6 +1184,28 @@ def _own_terms(own_text):
     return " ".join(keep)
 
 
+# "not temporary", "don't make this temporary", "isn't a temporary exception" negate the temporary claim itself.
+_NOT_TEMP = re.compile(r"(?:\bnot\b|n['\u2019]t\b|\bnever\b|\bnon[- ]|\bno\b)(?:\s+\w+){0,3}?\s+temporar")
+_PERM_NEG = re.compile(r"(?:\bnot\b|n['\u2019]t\b|\bnever\b|\bno longer\b)(?:\s+\w+){0,3}?\s+permanen")
+
+
+def _temporary_intent(own_text):
+    """True when the human's own words (quoted spans already removed; questions and someone else's words skipped)
+    say the change is temporary or restrict it from being permanent. Unlike _own_terms this KEEPS negated sentences:
+    "Do not make this permanent, it is temporary." is a restriction, and discarding it as non-affirmative would
+    upgrade the authorization to an untracked permanent one. The restriction only ever tightens the decision: it
+    demands the owner/restore provenance from the human's own affirmative terms."""
+    for s in _sentences(own_text):
+        low = s.lower()
+        if _QUESTION_LEAD.search(low) or _REPORTED.search(low):
+            continue
+        if _PERM_NEG.search(low):
+            return True
+        if "temporar" in low and not _NOT_TEMP.search(low):
+            return True
+    return False
+
+
 def _decision(items, rec, new_value):
     """Latest surviving direct human decision for this contract revision, whatever its value; it is returned only when
     it authorizes `new_value`. A later explicit decision for another value (or a cancellation) therefore supersedes an
@@ -1224,7 +1246,7 @@ def _decision(items, rec, new_value):
             # Temporary provenance (owner/run/session/restore/expiry/trigger) comes only from this message's own
             # affirmative sentences: quoted, reported, interrogative or withdrawing text is never a term.
             own = _own_terms(text_own)
-            current = {"text": raw, "terms_text": own, "temporary": "temporar" in own.lower(),
+            current = {"text": raw, "terms_text": own, "temporary": _temporary_intent(text_own),
                        "sha": _sha(raw), "ref": item["ref"], "target": target}
     if current is None or current["target"] != new_value:
         return None
