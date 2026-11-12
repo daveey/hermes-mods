@@ -246,6 +246,14 @@ there, which execs the skill script.
 - A decision chat's card that's missing from the local board isn't absent: `cross_task read <id>` finds it on its owner gateway.
 - `notify-subscribe` from a Desktop chat warns "binding a different chat" and suggests `agent:main:local:dm:<id>`.
   Ignore that suggestion and keep the bare session id: following it writes a shepherd row for an id that is not a chat.
+- A sweep report that relays an ask owned by another surface (BB Inbox, another chat) gets turned into a new For-you
+  request owned by your chat by the user-step extractor. Right after the reply, withdraw it (`action_request` withdraw),
+  giving a reason that names the owning surface, so the user isn't asked twice.
+- An old ask missing what unblock and archive mean: amend it in place with `hermes kanban block <id> "<same reason>"
+  --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
+  current human_request and block reason first (tasks row or last block event payload), so only the action changes.
+- Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read
+  (the Echo Dot "keep it off or turn it back on?" card was answered in Desktop and closed itself).
 
 ## Done means
 - [ ] Every board was inventoried, and the count per board and status was reported?
