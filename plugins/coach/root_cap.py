@@ -1186,15 +1186,41 @@ def _own_terms(own_text):
 
 # "not temporary", "don't make this temporary", "isn't a temporary exception" negate the temporary claim itself.
 _NOT_TEMP = re.compile(r"(?:\bnot\b|n['\u2019]t\b|\bnever\b|\bnon[- ]|\bno\b)(?:\s+\w+){0,3}?\s+temporar")
-_PERM_NEG = re.compile(r"(?:\bnot\b|n['\u2019]t\b|\bnever\b|\bno longer\b)(?:\s+\w+){0,3}?\s+permanen")
+_PERM_NEG = re.compile(r"(?:\bnot\b|n['\u2019]t\b|\bnever\b|\bno longer\b|\bnon[- ]?)(?:\s+\w+){0,3}?\s+permanen|"
+                       r"\bnon[- ]?permanen")
+# Bounded-ness signals other than the word "temporary": a restoration, a time bound, or an owner-bound scope. Any of
+# them in the human's own affirmative words means the change is NOT an open-ended permanent one, whatever wording
+# was used, so the owner/restore provenance is demanded and (when valid) persisted as a temporary exception.
+_BOUND_RESTORE = re.compile(r"\b(?:restor\w*|revert\w*|roll(?:ed|ing)?[- ]?back|roll (?:it|this|that) back|put (?:it|this|that) back|"
+                            r"set (?:it|this|that) back|change (?:it|this|that) back|go(?:ing)? back to)\b")
+_BOUND_TIME = re.compile(
+    r"\b(?:only|just|solely)\s+(?:for|until|till|while|during|to)\b|"
+    r"\bfor\s+(?:the\s+next\s+|another\s+|about\s+|roughly\s+|up to\s+)?(?:\d+|a|an|one|two|three|four|five|six|"
+    r"ten|few|couple(?:\s+of)?|several)\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?)\b|"
+    r"\b(?:until|till|expires?|expiry|expiring|time[- ]?boxed|time[- ]?limited|one[- ]?off|one[- ]?time|short[- ]?term|"
+    r"for now|for today|for tonight|for the (?:moment|day|night|time being|meantime|duration)|while (?:it|this|that) "
+    r"(?:runs|finishes|completes|drains))\b")
+_BOUND_OWNER = re.compile(r"\bowner\s+(?:card|run|session|task)\b|\bthis (?:session|run) only\b")
+# A bound signal is cancelled only by a negator right in front of it (within two words): "Don't restore it",
+# "not only for an hour", "this is not time-boxed". A negation elsewhere in the sentence ("Don't forget to restore
+# it afterwards") leaves the bound standing, so the unsafe direction (a missed bound = untracked permanent) is closed.
+_NEGATOR_BEFORE = re.compile(r"(?:\bnot|n['\u2019]t|\bnever|\bno|\bwithout|\bnon)[\s-]+(?:\w+[\s-]+){0,1}$")
+
+
+def _negated_before(low, pos):
+    return bool(_NEGATOR_BEFORE.search(low[max(0, pos - 40):pos]))
 
 
 def _temporary_intent(own_text):
     """True when the human's own words (quoted spans already removed; questions and someone else's words skipped)
-    say the change is temporary or restrict it from being permanent. Unlike _own_terms this KEEPS negated sentences:
-    "Do not make this permanent, it is temporary." is a restriction, and discarding it as non-affirmative would
-    upgrade the authorization to an untracked permanent one. The restriction only ever tightens the decision: it
-    demands the owner/restore provenance from the human's own affirmative terms."""
+    make the change bounded: they say it is temporary / non-permanent, restrict it from being permanent, or name a
+    restoration, a time bound or an owner-bound scope. One coherent rule, not a phrase list per wording: an
+    authorization is permanent only when NONE of those bounded-ness signals appears in the user's own speech.
+    Unlike _own_terms this KEEPS negated sentences ("Do not make this permanent, it is temporary." is a
+    restriction; discarding it as non-affirmative would upgrade the authorization to an untracked permanent one),
+    except that a negated restoration/time/owner clause ("Don't restore it", "not only for an hour") is not a bound.
+    The classification only ever tightens the decision: it demands the owner/restore provenance from the human's
+    own affirmative terms (`_own_terms`) and never supplies any."""
     for s in _sentences(own_text):
         low = s.lower()
         if _QUESTION_LEAD.search(low) or _REPORTED.search(low):
@@ -1203,6 +1229,11 @@ def _temporary_intent(own_text):
             return True
         if "temporar" in low and not _NOT_TEMP.search(low):
             return True
+        if _NOT_TEMP.search(low):
+            continue
+        for pat in (_BOUND_RESTORE, _BOUND_TIME, _BOUND_OWNER):
+            if any(not _negated_before(low, m.start()) for m in pat.finditer(low)):
+                return True
     return False
 
 
