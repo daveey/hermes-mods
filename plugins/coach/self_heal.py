@@ -3323,11 +3323,31 @@ def _commit_in_component(repo: Path, sha: str, subject: str, comp: str) -> bool:
     return bool(comp) and bool(re.search(r"\b%s\b" % re.escape(comp), subject.lower()))
 
 
+# A bare "go on" the user sends after a turn that produced no reply: the next turn still answers the complaint.
+NUDGE_RE = re.compile(r"^\s*(?:resume|continue|go on|keep going|carry on|retry|try again|again|go|proceed)\W*$", re.I)
+
+
+def _machine_user_row(content: str) -> bool:
+    """A user row core or Desktop wrote, not the person: "[Turn stopped by Desktop…]", a resume/pause system note."""
+    t = (content or "").strip()
+    return bool(INTERRUPT_RE.match(t)) or t.startswith(RESUME_NOTE_PREFIX) or t.startswith("[System note:")
+
+
+def _stock_reply(content: str) -> bool:
+    """An assistant row that is core's failed-turn notice or a provider error, not an answer."""
+    t = (content or "").strip()
+    return t in FAILED_TURN_NOTICES or provider_error_span(t) is not None or bool(INTERRUPT_RE.match(t))
+
+
 def _complaint_reply_text(sid: str, since: float) -> Optional[str]:
     """The assistant's full reply to the complaint (messages after `since` up to the next user message) from this
     host's state.db; None when the session is not there (another host's session: use its digest). The coach digest's
     last_reply is clipped and is the session's LAST reply, so a fix sha named while answering the complaint was lost
-    in it (desktop-9077b82c2d: "…[clipped" cut before f986de8c)."""
+    in it (desktop-9077b82c2d: "…[clipped" cut before f986de8c).
+    Machine user rows (_machine_user_row) never end the reply, and while the complaint has no real answer yet (only
+    stock notices: _stock_reply, which are left out of the text) a bare nudge ("resume", NUDGE_RE) doesn't either:
+    desktop-0e7cc2f6c8's turn was stopped with "Your request was not processed", the user sent "resume" four hours
+    later, and the fix sha came in that turn. '' = the session is here but nothing answered the complaint."""
     import sqlite3
     db = hermes_home() / "state.db"
     if not sid or not db.is_file():
@@ -3346,8 +3366,10 @@ def _complaint_reply_text(sid: str, since: float) -> Optional[str]:
     out = []
     for role, ts, content in rows:
         if role == "user" and (ts or 0) > since + 2:  # the next user turn ends the complaint's reply
+            if _machine_user_row(str(content or "")) or (not out and NUDGE_RE.match(str(content or ""))):
+                continue
             break
-        if role == "assistant" and content:
+        if role == "assistant" and content and not _stock_reply(str(content)):
             out.append(str(content))
     return "\n".join(out)
 
@@ -3506,7 +3528,7 @@ def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo:
             continue
         has_digest = True
         until = (dg.get("last_activity_at") or since) + SESSION_COMMIT_SLACK_S
-        if reply is None:
+        if not (reply or "").strip():  # no transcript here, or nothing answered the complaint: the digest names it
             text = " ".join([str(dg.get("last_reply") or "")] + [str(t.get(k) or "") for t in dg.get("user_turns") or []
                                                                 if (t.get("t") or 0) > since for k in ("prev", "text")])
             named = set(_SHA.findall(text))
