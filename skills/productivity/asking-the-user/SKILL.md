@@ -60,7 +60,8 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 - `run_in_user_terminal` refusing with "`<mac>` has no Hermes Desktop connected to this gateway right now (live
   Desktops: ...)" means that Mac is asleep or offline (confirm: `tailnet_exec` to it times out). Don't re-call it
   each turn: file one blocked `physical` card ("wake the Mac with Hermes Desktop running") whose `resolved_check`
-  probes the Mac's tailnet ssh port, then run the step when it unblocks. The probe must exit exactly 0 or 1:
+  probes the Mac's tailnet ssh port. When the probe passes the card turns `ready` and would queue for a worker with
+  nothing to do: archive it and run the step yourself in that turn. The probe must exit exactly 0 or 1:
   `timeout 8 bash -c '</dev/tcp/<tailnet ip>/22' 2>/dev/null && exit 0 || exit 1`. A bare `timeout` exits 124
   while the Mac is down, and the create is refused `resolved_check_broken`.
 - A hub `systemctl --user start|stop` of a gateway unit from the chat's own terminal is refused by the gateway
