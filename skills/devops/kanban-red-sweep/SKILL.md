@@ -217,6 +217,21 @@ there, which execs the skill script.
   json_extract(outcome_json,'$.kind')='decision'`), read their cards with `cross_task`, and run the inventory query
   on each other host with `tailnet_exec` (`mbp`, `mini`). Remote cards are commented and unblocked on their own
   host (`tailnet_exec ... hermes kanban comment/unblock`); `cross_task` only reads and comments.
+- A chat still painted red after its cards finished: run `hermes sessions outcome <id> --refresh` on its gateway. It
+  re-derives the outcome from live cards, so a decision about a done card becomes `done`. Never edit `state.db`.
+- Chat-level asks (`us_*` extracted user-steps, For-you requests) can only be withdrawn by the chat that owns them;
+  `action_request` withdraw acts on the calling session only. Send that chat (reaped ones too) a self-contained
+  `cross_session send` that quotes the user's delegation and names the exact asks; it re-tests and withdraws. Read the reply.
+- The For-you list injected at turn start can lag a withdrawal. The `withdraw` result's `state`/`withdrawal.at` is the
+  live answer; check it before re-withdrawing or telling the user something waits on him.
+- Priority-cap rollout (#1137): an upgraded host stores at most 1000 (`kanban edit --priority 60100` prints `Edited`
+  and stores 1000), while un-migrated lanes still hold old values up to 60000+. A capped card can't get ahead there:
+  move it to an idle machine (`kanban move --runs-on`); never raise it through an uncapped writer. Read back every edit.
+- `kanban_create`/`move` refuse a machine on Board hold (`machine_held`). `hermes-mail admin machine-audit <m>` on the
+  hub shows the hold reason and release time. A hold is deliberate, so never clear it to place a card.
+- A decision chat's card that's missing from the local board isn't absent: `cross_task read <id>` finds it on its owner gateway.
+- `notify-subscribe` from a Desktop chat warns "binding a different chat" and suggests `agent:main:local:dm:<id>`.
+  Ignore that suggestion and keep the bare session id: following it writes a shepherd row for an id that is not a chat.
 
 ## Done means
 - [ ] Every board was inventoried, and the count per board and status was reported?
