@@ -31,7 +31,11 @@ Before filing an `action_request` for a card's ask, read the card's newest comme
 already published, and the card's named sole owner chat: if either exists, don't file a second one. Duplicates
 split the user's answer, and the copy not consumed sits stale in For-you. Withdraw yours as soon as the card shows
 the ask was answered elsewhere or the card left `blocked`. Say an ask is withdrawn only once the withdraw result
-reads `withdrawn`. Before saying nothing waits on the user, read the canonical list in full: when the injected
+reads `withdrawn`; `withdraw.requestId` needs the full UUID (an 8-char prefix returns 404 "Unknown request").
+Don't add a `::user-step` marker to a reply that relays an ask you already published with `action_request`: it opens a
+second, plan-less request in For-you. When revising a request that was published with `decisionCard`, resend
+`aliases` holding that card's `kanban` ref (else 422 "must retain exact producer card aliases") and keep
+`scope.sourceRefs` (dropping it gives 422 "Invalid object fields"). Before saying nothing waits on the user, read the canonical list in full: when the injected
 note says it was truncated, parse the saved file it names, because the head/tail preview can hide an open request.
 Never tell the user a choice tile "is in your panel" because a user-steps row or `/requests` 200 exists: a blocked card's ask projects only when its owner chat reads its queue, and Desktop renders it later still. Say it will appear there; claim visible only after a read-only renderer check, or after the user's click is recorded. Publish acceptance fixtures (test tiles) from a disposable scratch chat, never a persistent one (user-steps README, live-fixture rule).
 When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
