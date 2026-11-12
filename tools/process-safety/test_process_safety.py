@@ -21,6 +21,14 @@ def load(name):
 starve = load('starve_owned')
 health = load('agent_health')
 
+def publish_pid(marker, delay=0.0):
+    """Child code that publishes its pid atomically, so the marker never exists empty.
+
+    `delay` sleeps between creating and filling the temp file (tests the race window)."""
+    tmp = str(marker) + '.tmp'
+    return (f'f=open({tmp!r},"w"); time.sleep({delay}); f.write(str(os.getpid())); f.close(); '
+            f'os.replace({tmp!r}, {str(marker)!r})')
+
 class SafetyTests(unittest.TestCase):
     def test_foreign_same_name_process_never_receives_signal(self):
         # Same executable as the target, but a foreign session, like a shared agent.
@@ -44,7 +52,7 @@ class SafetyTests(unittest.TestCase):
     def test_timeout_does_not_leave_child_stopped(self):
         with tempfile.TemporaryDirectory() as d:
             marker = Path(d) / 'pid'
-            cmd = [sys.executable, '-c', f'import os,time; open({str(marker)!r},"w").write(str(os.getpid())); time.sleep(60)']
+            cmd = [sys.executable, '-c', f'import os,time; {publish_pid(marker)}; time.sleep(60)']
             with self.assertRaises(subprocess.TimeoutExpired):
                 starve.run(cmd, .04, .04, .5)
             pid = int(marker.read_text())
@@ -91,10 +99,23 @@ class SafetyTests(unittest.TestCase):
             starve.send([10, 11], signal.SIGCONT)
         self.assertEqual(sender.call_count, 2)
 
+    def test_pid_marker_never_visible_empty(self):
+        # A marker created before its pid is written made polling readers parse ''.
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / 'pid'
+            child = subprocess.Popen([sys.executable, '-c', f'import os,time; {publish_pid(marker, .3)}; time.sleep(30)'])
+            try:
+                deadline = time.monotonic() + 5
+                while not marker.exists():
+                    self.assertLess(time.monotonic(), deadline); time.sleep(.005)
+                self.assertEqual(int(marker.read_text()), child.pid)
+            finally:
+                child.kill(); child.wait()
+
     def test_cli_sigterm_reaps_its_stopped_child(self):
         with tempfile.TemporaryDirectory() as d:
             marker = Path(d) / 'pid'
-            cmd = [sys.executable, '-c', f'import os,time; open({str(marker)!r},"w").write(str(os.getpid())); time.sleep(60)']
+            cmd = [sys.executable, '-c', f'import os,time; {publish_pid(marker)}; time.sleep(60)']
             wrapper = subprocess.Popen([sys.executable, str(HERE / 'starve_owned.py'), '--stopped', '.05', '--', *cmd])
             pid = None
             try:
