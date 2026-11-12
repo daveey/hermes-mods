@@ -274,6 +274,10 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   assert.ok(info.dataset.tip.startsWith(want), info.dataset.tip)
   assert.doesNotMatch(spare.textContent, /disk cleanup|operator-a|on hold/)
   assert.equal(spare.querySelector('.hermes-fleet-drain-label')?.textContent, 'draining')
+  assert.equal(spare.querySelector('.hermes-fleet-machine-name')?.textContent, 'spare')
+  const css = (await import('node:fs')).readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+  assert.match(css, /\.hermes-fleet-drain-label\{flex-shrink:0/)
+  assert.match(css, /max-width:min\(480px,calc\(100vw - 32px\)\);overflow-wrap:anywhere/)
   const slots = [...spare.querySelectorAll('.hermes-fleet-slot.is-draining')]
   assert.equal(slots.length, 3)
   for (const s of slots) assert.equal(s.title, want)

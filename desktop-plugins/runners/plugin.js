@@ -462,8 +462,8 @@ function GatewayRow({ m, now }) {
   // Flags and reasons are a small (i) at the end of the row; its tooltip is drawn by CSS from data-tip
   // (native title tooltips do not show inside the Desktop popover).
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
-    h('span', { className: 'hermes-fleet-name' }, text(m.name),
-      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote, style: { marginLeft: '6px', fontSize: '10px', opacity: 0.75 } }, 'draining') : null),
+    h('span', { className: 'hermes-fleet-name' }, h('span', { className: 'hermes-fleet-machine-name' }, text(m.name)),
+      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, 'draining') : null),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
@@ -768,7 +768,9 @@ const CSS = `
 .hermes-fleet-gw>.hermes-fleet-row>*{grid-row:1}
 .hermes-fleet-cols{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
 .hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count]{text-align:right}
-.hermes-fleet-gw .hermes-fleet-name{grid-column:1;max-width:150px}
+.hermes-fleet-gw .hermes-fleet-name{grid-column:1;max-width:150px;display:flex;align-items:center;gap:6px}
+.hermes-fleet-machine-name{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.hermes-fleet-drain-label{flex-shrink:0;font-size:10px;opacity:.75}
 .hermes-fleet-gw .hermes-fleet-slots{grid-column:2;flex-wrap:nowrap}
 .hermes-fleet-gw .hermes-fleet-cell{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary)}
 .hermes-fleet-gw .hermes-fleet-waiting{grid-column:3;margin:0;text-align:right}
@@ -781,7 +783,7 @@ const CSS = `
 .hermes-fleet-gw .hermes-fleet-num{flex:1;text-align:right}
 .hermes-fleet-gw .hermes-fleet-info{grid-column:9;margin-left:-8px;position:relative;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
 .hermes-fleet-gw .hermes-fleet-info.is-empty{visibility:hidden}
-.hermes-fleet-gw .hermes-fleet-info:hover::after,.hermes-fleet-gw .hermes-fleet-info:focus-visible::after{content:attr(data-tip);position:absolute;right:-2px;top:calc(100% + 5px);z-index:5;padding:3px 7px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);color:var(--ui-text-primary,inherit);font:normal 400 11px/1.4 system-ui,sans-serif;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:none}
+.hermes-fleet-gw .hermes-fleet-info:hover::after,.hermes-fleet-gw .hermes-fleet-info:focus-visible::after{content:attr(data-tip);position:absolute;right:-2px;top:calc(100% + 5px);z-index:5;padding:3px 7px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);color:var(--ui-text-primary,inherit);font:normal 400 11px/1.4 system-ui,sans-serif;white-space:normal;width:max-content;max-width:min(480px,calc(100vw - 32px));overflow-wrap:anywhere;box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:none}
 .hermes-fleet-gw .hermes-fleet-info:hover,.hermes-fleet-gw .hermes-fleet-info:focus-visible{border-color:var(--ui-text-secondary);color:inherit;outline:none}
 .hermes-fleet-gw .hermes-fleet-count{grid-column:8}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
