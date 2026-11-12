@@ -19,6 +19,39 @@ spec.loader.exec_module(publisher)
 DESKTOP_SERVE_PATH = os.pathsep.join([
     '/Users/you/.local/bin', '/Users/you/.cargo/bin', '/Users/you/.nix-profile/bin',
     '/nix/var/nix/profiles/default/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+# GitHub Actions sets CI=true. There a missing tool is a provisioning bug, not a host quirk: a skip would
+# report green while the real pre-commit tests never ran (as with PR #61/#62), so fail instead.
+UNDER_CI = os.environ.get('CI', '').lower() == 'true'
+
+
+def skip_or_fail_in_ci(test, reason, fix):
+    """skipTest(reason) on a dev host; under CI=true fail, naming the provisioning fix."""
+    if UNDER_CI:
+        test.fail(f'{reason}, under CI=true: {fix}')
+    test.skipTest(reason)
+
+
+class SkipOrFailInCiTests(unittest.TestCase):
+    def outcome(self, under_ci):
+        class Probe(unittest.TestCase):
+            def runTest(self):
+                skip_or_fail_in_ci(self, 'real pre-commit tests require gitleaks', 'provision it')
+        result = unittest.TestResult()
+        with patch(__name__ + '.UNDER_CI', under_ci):
+            Probe().run(result)
+        return result
+
+    def test_dev_host_skips_with_the_reason(self):
+        result = self.outcome(False)
+        self.assertEqual([r for _, r in result.skipped], ['real pre-commit tests require gitleaks'])
+        self.assertEqual(result.failures, [])
+
+    def test_ci_fails_naming_the_fix(self):
+        result = self.outcome(True)
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn('real pre-commit tests require gitleaks, under CI=true: provision it',
+                      result.failures[0][1])
 
 
 class BudgetTests(unittest.TestCase):
@@ -139,7 +172,8 @@ class ToolPathTests(unittest.TestCase):
 class PublicationTests(unittest.TestCase):
     def setUp(self):
         if not shutil.which('gitleaks'):
-            self.skipTest('real pre-commit tests require gitleaks')
+            skip_or_fail_in_ci(self, 'real pre-commit tests require gitleaks',
+                               'put gitleaks v8.28.0 on PATH (plugin-suites.yml "Suite provisions")')
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
@@ -285,7 +319,8 @@ fi
         real = shutil.which('gitleaks')
         assert real is not None
         if shutil.which('gitleaks', path=DESKTOP_SERVE_PATH):
-            self.skipTest('gitleaks is on the Desktop serve PATH on this host')
+            skip_or_fail_in_ci(self, 'gitleaks is on the Desktop serve PATH on this host',
+                               'install it outside the Desktop serve PATH (not /usr/bin, /bin, /usr/sbin, /sbin)')
         tools = self.base / 'tools'
         tools.mkdir()
         (tools / 'gitleaks').symlink_to(real)
@@ -300,7 +335,8 @@ fi
 
     def test_truly_missing_gitleaks_still_refused_and_preserved(self):
         if shutil.which('gitleaks', path=DESKTOP_SERVE_PATH):
-            self.skipTest('gitleaks is on the Desktop serve PATH on this host')
+            skip_or_fail_in_ci(self, 'gitleaks is on the Desktop serve PATH on this host',
+                               'install it outside the Desktop serve PATH (not /usr/bin, /bin, /usr/sbin, /sbin)')
         empty = self.base / 'empty-tools'
         empty.mkdir()
         with patch.dict(os.environ, {'PATH': DESKTOP_SERVE_PATH}), \

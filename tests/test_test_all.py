@@ -271,6 +271,34 @@ class TestAll(unittest.TestCase):
         self.assertEqual(runner['counts']("=== 1 failed, 5 passed, 2 subtests failed, 3 subtests passed in 1.0s ===\n"),
                          {'passed': 5, 'failed': 1, 'errors': 0, 'skipped': 0})
 
+    def test_skips_in_a_passing_suite_are_listed_with_their_reasons(self):
+        # A skip counts as a pass, so a missing CI tool used to hide behind a bare "skipped" count.
+        make_tree(self.root, {"tooly": """
+            import unittest
+            class T(unittest.TestCase):
+                def test_ran(self): pass
+                def test_needs_tool(self): self.skipTest('real tests require sometool')
+        """})
+        out = self.root / "r.json"
+        r = run(self.root, '--exact', '-k', 'plugins/tooly', '--json', str(out))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"skipped tests in plugins/tooly \(1\):\n  SKIPPED \[1\] \S*test_load\.py:\d+: "
+                                   r"real tests require sometool")
+        row = json.loads(out.read_text())['suites'][0]
+        self.assertEqual((row['status'], row['passed'], row['skipped']), ('PASS', 1, 1))
+        self.assertEqual(len(row['skip_reasons']), 1)
+
+    def test_live_checkout_guard_names_its_real_publication_tests_on_success(self):
+        d = self.root / "plugins" / "live-checkout-guard"
+        d.mkdir(parents=True)
+        (d / "tests_skill_publish.py").write_text("def test_end_to_end():\n    pass\n")
+        (d / "tests_other.py").write_text("def test_unrelated():\n    pass\n")
+        r = run(self.root, '--exact', '-k', 'plugins/live-checkout-guard')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        echoed = r.stdout.split("=== plugins/live-checkout-guard: required tests ===\n", 1)[1]
+        self.assertRegex(echoed, r"^\S*tests_skill_publish\.py::test_end_to_end PASSED")
+        self.assertNotIn("test_unrelated", r.stdout)
+
     def test_suite_needing_core_is_skipped_with_reason_without_one(self):
         (self.root / "plugins" / "fast-rate-limit-fallback").mkdir(parents=True)
         (self.root / "plugins" / "fast-rate-limit-fallback" / "test_x.py").write_text("def test_x():\n    pass\n")
