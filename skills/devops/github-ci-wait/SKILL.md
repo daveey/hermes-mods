@@ -197,6 +197,7 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
   Root fix: `if: ${{ !cancelled() }}` and run gate/report jobs on a light runner label; PRs pick it up only after
   rebasing, so keep the sweep running until then. Before adding concurrency rules, grep the workflows; they may
   already exist.
+- When re-gating old PRs after a workflow change, a new `pull_request` run's creation time is not proof it used the new workflow. Close/reopen can retain an old merge ref. Inspect the run's `referenced_workflows[].sha`, prove that merge SHA contains the gating commit (GitHub compare or git ancestry), and verify the integrated lane actually ran. If stale, ask the active branch owner to rebase/update and obtain fresh exact-head review; a standalone native pass is not proof the aggregate required it.
 - Runs created during a GitHub Actions incident can stay `queued` with 0 jobs forever (cancel, force-cancel and
   rerun all refused): close and reopen the PR to refire its CI on the same sha, never an empty commit. Guards and
   branch pushes: `references/actions-outages.md` §Ghost runs. Before saying a fix waits on the outage, check that its
