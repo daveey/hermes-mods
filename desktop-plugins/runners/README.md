@@ -13,7 +13,8 @@ The panel has two groups, one row per machine, one square per slot:
   `· N waiting`: unleased ready cards assigned to profiles the machine-wide gateway dispatcher can spawn
   (existing profiles permitted by `kanban.dispatch_profiles`, evaluated under the Kanban home, not the UI profile).
   Each row splits this queue into `N waiting` (placement fits here) and `N can't run here` (labels, including
-  skill labels, machine pins, creator/workspace restrictions or pinned-only policy). Hover either number
+  skill labels, machine pins, creator/workspace restrictions, pinned-only policy, or another gateway's
+  default-placement card that a machine with `explicit` pickup never takes). Hover either number
   for its meaning. Portable cards may fit multiple rows but count once in the header. Availability, holds,
   quotas and transient admission limits are separate: a fit does not promise immediate dispatch.
   The projection assumes the shared board's machine-wide dispatcher policy; it does not inventory remote

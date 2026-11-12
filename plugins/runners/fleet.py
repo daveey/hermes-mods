@@ -102,6 +102,19 @@ def waiting_cards(shadow_dir, profile_dispatchable):
     return out
 
 
+def _offered(card, name, entry):
+    """Whether ``name`` would ever copy this unleased card (core ``kanban_worker_node`` pickup).
+
+    Under ``explicit`` pickup another gateway's card is copied only when placement set ``runs_on``.
+    Without this an idle worker shows the creator's whole default-placement queue as waiting for a
+    slot there. Any other or unreported mode is left to ``eligible``: the registry field alone does
+    not establish what such a machine takes.
+    """
+    if card.get('created_on') in (None, name):
+        return True
+    return entry.get('pickup') != 'explicit' or card.get('runs_on') is not None
+
+
 def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=None, waiting=None,
                     eligible=None):
     """One row per registered machine (and per unregistered lease holder).
@@ -112,7 +125,8 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
     REGISTRY_STALE_S keeps its slots and labels but says nothing about who is up.
     waiting: profile-filtered ``waiting_cards()``; counted once in the header.
     eligible: core ``kanban_worker_node.eligible`` (None means a card fits).
-    Per-row counts overlap for portable cards. Holds and liveness do not change
+    Per-row counts overlap for portable cards; a card the machine's pickup mode never copies
+    (``_offered``) is ineligible there. Holds and liveness do not change
     placement fit: they are reported separately, as are slot/admission limits.
     """
     stale = registry is not None and registry_age_s is not None and registry_age_s > REGISTRY_STALE_S
@@ -153,7 +167,7 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
         fit = None
         if waiting is not None and eligible is not None and entry is not None:
             placement = dict(machines, **{name: dict(entry, hold=False)})
-            fit = sum(eligible(w, name, placement) is None for w in waiting)
+            fit = sum(eligible(w, name, placement) is None and _offered(w, name, entry) for w in waiting)
         rows.append(dict(
             name=name, me=name == me, state=state, reason=reason, last_seen=seen,
             labels=list(entry.get('labels') or []) if entry else [],

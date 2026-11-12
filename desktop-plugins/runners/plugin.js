@@ -437,7 +437,7 @@ function GatewayRow({ m, now, investigator, route }) {
       })),
       ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] })),
       m.waiting != null ? h('span', { className: 'hermes-fleet-waiting', title: `${m.waiting} unleased ready card(s) for gateway-dispatched profiles match placement labels (including skill labels) on ${m.name}. Need a slot here; portable cards can also fit other machines. Does not include transient admission limits or machine availability.` }, `${m.waiting} waiting`) : null,
-      m.ineligible != null ? h('span', { className: 'hermes-fleet-waiting hermes-fleet-ineligible', title: `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}.` }, `${m.ineligible} can't run here`) : null),
+      m.ineligible != null ? h('span', { className: 'hermes-fleet-waiting hermes-fleet-ineligible', title: `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` }, `${m.ineligible} can't run here`) : null),
     h('span', { className: 'hermes-fleet-count' },
       m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
     h('span', { className: 'hermes-fleet-meta' }, [meta, m.reason].filter(Boolean).join(' · ')),

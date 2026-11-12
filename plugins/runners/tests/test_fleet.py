@@ -102,6 +102,26 @@ def test_waiting_split_uses_core_placement_and_skill_labels():
     assert m['held']['state'] == 'draining'
 
 
+def test_waiting_split_respects_pickup_mode_for_other_gateways_cards():
+    """A default-placement card (runs_on NULL) made on another gateway is never copied by a machine whose pickup
+    is 'explicit' (core ``kanban_worker_node`` pickup), so it must not count as waiting there."""
+    import pytest
+    node = pytest.importorskip('hermes_cli.kanban_worker_node')
+    waiting = [
+        dict(runs_on=None, created_on='hub'),             # default placement: stays with its creator
+        dict(runs_on=None, created_on='explicit'),        # the explicit worker's own card
+        dict(runs_on=['linux'], created_on='hub'),        # placed: any linux machine
+        dict(runs_on=[], created_on='hub'),               # explicit empty pin: placed anywhere
+    ]
+    reg = _registry(hub=dict(labels=['linux'], pickup='explicit'), explicit=dict(labels=['linux'], pickup='explicit'),
+                    every=dict(labels=['linux'], pickup='all'))
+    out = fleet.gateway_workers(reg, [], NOW, waiting=waiting, eligible=node.eligible)
+    m = {r['name']: r for r in out['machines']}
+    assert (m['hub']['waiting'], m['hub']['ineligible']) == (3, 1)
+    assert (m['explicit']['waiting'], m['explicit']['ineligible']) == (3, 1)
+    assert (m['every']['waiting'], m['every']['ineligible']) == (4, 0)
+
+
 def test_waiting_unreadable_replica_does_not_report_zero(tmp_path):
     (tmp_path / 'broken.db').write_bytes(b'not a sqlite database')
     assert fleet.waiting_cards(tmp_path, lambda p: True) is None
