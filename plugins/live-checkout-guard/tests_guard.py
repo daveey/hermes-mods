@@ -270,6 +270,64 @@ def test_quoted_redirect_unbalanced_quote_keeps_fallback(env):
     assert why == "output redirection to a.txt, inside the live checkout"
 
 
+# Bash runs a command substitution inside double quotes (and in backticks) like an unquoted one, but shlex kept
+# `"$(...)"` as one data word: `out="$(rm -f plugins/foo.py 2>&1)"` passed while `out=$(rm -f ...)` was refused.
+DQ_RM = "rm on plugins/foo.py, inside the live checkout"
+DQ_OUT = "output redirection to plugins/foo.py, inside the live checkout"
+
+
+@pytest.mark.parametrize("cmd,why", [
+    ('echo "$(rm -f plugins/foo.py)"', DQ_RM), ("echo $(rm -f plugins/foo.py)", DQ_RM),
+    ('echo "$(echo hi > plugins/foo.py)"', DQ_OUT), ("x=$(echo hi > plugins/foo.py)", DQ_OUT),
+    ('out="$(rm -f plugins/foo.py 2>&1)"', DQ_RM), ("out=$(rm -f plugins/foo.py 2>&1)", DQ_RM),
+    ('echo "`rm -f plugins/foo.py`"', DQ_RM), ("echo `rm -f plugins/foo.py`", DQ_RM),
+    ('echo "a $(echo "b c" > plugins/foo.py) d"', DQ_OUT), ('echo "$(echo "$(rm -f plugins/foo.py)")"', DQ_RM),
+    ('echo "# $(rm -f plugins/foo.py)"', DQ_RM), ('printf "%s\\n" "x `rm -f plugins/foo.py`"', DQ_RM),
+    ('bash -c \'out="$(rm -f plugins/foo.py)"\'', DQ_RM), ('echo "$(rm -f /tmp/x)"', None),
+])
+def test_double_quoted_substitution_runs_like_unquoted(env, cmd, why):
+    assert guard.check_shell(cmd, str(env.live)) == why, cmd
+    if why:
+        assert blocked(term(cmd, env.live)), cmd
+
+
+def test_double_quoted_substitution_execute_code(env):
+    live = env.live
+    for src in [f"import os\nos.system('out=\"$(rm -f {live}/plugins/foo.py 2>&1)\"')",
+                f"import subprocess\nsubprocess.run('echo \"`rm -f {live}/foo.py`\"', shell=True)",
+                f"terminal(command='echo \"$(echo hi > {live}/foo.py)\"')",
+                "terminal('out=\"$(rm -f plugins/foo.py 2>&1)\"', workdir='" + str(live) + "')"]:
+        assert blocked(code(src)), src
+    for src in [f"import os\nos.system(\"grep -rn '$(rm -f {live}/foo.py)' README.md\")",
+                f"import os\nos.system('echo \"\\\\$(rm -f {live}/foo.py)\"')",
+                f"terminal('out=\"$(git status 2>&1)\"', workdir='{live}')"]:
+        assert not code(src), src
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -rn '$(rm -f plugins/foo.py)' README.md", 'echo "\\$(rm -f plugins/foo.py)"',
+    'echo "\\`rm -f plugins/foo.py\\`"', 'out="$(git status 2>&1)"', 'out="$(ls plugins 2>/dev/null)"',
+    'echo "$((3 > 2))"', "echo $'\\'$(rm -f plugins/foo.py)'", 'echo hi # "$(rm -f plugins/foo.py)"',
+    'git log --grep "a | tee plugins/foo.py"', 'echo "done && rm -rf plugins"', "grep -rn 'x; rm -rf plugins' README.md",
+    'n="$(grep -c ">" README.md)"', 'out="$(git log -1 2>/dev/null)" && echo "$out"'])
+def test_inert_substitution_shapes_stay_allowed(env, cmd):
+    assert guard.check_shell(cmd, str(env.live)) is None, cmd
+    assert not term(cmd, env.live), cmd
+
+
+def test_double_quoted_substitution_hermes_update_refused(env):
+    assert guard.check_shell('out="$(hermes update 2>&1)"', "/tmp") == "unfenced hermes update"
+    assert guard.check_shell('out="$(hermes update --check 2>&1)"', "/tmp") is None
+    assert guard.check_shell("echo '$(hermes update)'", "/tmp") is None
+
+
+def test_expose_substitutions_unclosed_text_unchanged():
+    for raw in ['echo "$(rm x"', "echo `rm x", "echo \"$(echo 'a)\""]:
+        assert guard._expose_substitutions(raw) == raw
+    assert guard._expose_substitutions('out="$(rm -f x 2>&1)"') == "out=$(rm -f x 2>&1)"
+    assert guard._expose_substitutions('echo "a $(b) c" ""') == 'echo "a "$(b)" c" ""'
+
+
 # ---- execute_code ------------------------------------------------------------------------------
 
 def code(src):

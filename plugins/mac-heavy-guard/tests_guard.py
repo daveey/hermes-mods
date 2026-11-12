@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -675,3 +676,23 @@ def test_quoted_redirect_and_input_dup_targeted(cmd):
 @pytest.mark.parametrize("cmd", ["pytest 2<&1", "pytest <&- | tail", "pytest -q 0<&- 2>&1 | grep -c '>'"])
 def test_input_dup_whole_suite_still_blocked(cmd):
     assert blocked("terminal", command=cmd), cmd
+
+
+# Bash runs a command substitution inside double quotes (and in backticks) like an unquoted one, but shlex kept
+# `"$(...)"` as one data word: `out="$(docker build -t x . 2>&1)"` passed while `out=$(docker build ...)` was refused.
+@pytest.mark.parametrize("cmd", ['out="$(docker build -t x . 2>&1)"', "out=$(docker build -t x . 2>&1)",
+                                 'echo "`docker build -t x .`"', "echo `docker build -t x .`",
+                                 'echo "done: $(uv sync 2>&1 | tail -1)"', 'r="$(pytest -q 2>&1)"',
+                                 'echo "$(echo "$(cargo build --release)")"'])
+def test_double_quoted_substitution_runs_like_unquoted(cmd):
+    assert guard.check_shell(cmd, os.path.expanduser("~")), cmd
+    assert blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", ["echo '$(docker build -t x .)'", 'echo "\\$(docker build -t x .)"',
+                                 'echo "\\`docker build -t x .\\`"', 'out="$(git status 2>&1)"',
+                                 'out="$(ls tests 2>/dev/null)"', 'r="$(pytest -q tests/test_x.py 2>&1)"',
+                                 'echo hi # "$(docker build -t x .)"'])
+def test_inert_substitution_shapes_stay_allowed(cmd):
+    assert guard.check_shell(cmd, os.path.expanduser("~")) is None, cmd
+    assert not blocked("terminal", command=cmd), cmd

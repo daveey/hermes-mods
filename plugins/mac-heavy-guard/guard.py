@@ -78,7 +78,8 @@ def _strip_comments(text: str) -> str:
 
 
 def _tokens(text: str) -> Optional[list[str]]:
-    lex = shlex.shlex(_strip_comments(text.replace("\\\n", " ")), posix=True, punctuation_chars=";&|()\n")
+    lex = shlex.shlex(_expose_substitutions(_strip_comments(text.replace("\\\n", " "))), posix=True,
+                      punctuation_chars=";&|()\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     lex.commenters = ""
@@ -86,6 +87,129 @@ def _tokens(text: str) -> Optional[list[str]]:
         return list(lex)
     except ValueError:  # unbalanced quotes: don't guess
         return None
+
+
+class _Unclosed(Exception):
+    pass
+
+
+def _expose_substitutions(text: str) -> str:
+    """`text` with each command substitution moved out of its double quotes, and backticks spelled `$(...)`.
+
+    Bash runs `"$(cmd)"` and "`cmd`" exactly like the unquoted forms, but shlex keeps a double-quoted string as one
+    word, so `out="$(rm -f x 2>&1)"` hid the rm that `out=$(rm -f x 2>&1)` shows. `echo "a $(cmd) b"` becomes
+    `echo "a "$(cmd)" b"` (`"$(cmd)"` becomes `$(cmd)`): the substitution is lexed as code, the text around it stays
+    quoted data. Quotes inside a substitution start fresh, as in bash (plugins/coach/agent_rules.py `_mask_quoted`).
+    Single quotes, `$'...'`, escaped `\\$(`/`` \\` ``, `$((...))` arithmetic and `#` comments are copied unchanged.
+    Text whose quotes or substitutions do not close comes back unchanged."""
+    n = len(text)
+
+    def comment_at(i: int) -> bool:
+        return text[i] == "#" and (i == 0 or text[i - 1] in " \t\n;&|()")
+
+    def arithmetic(i: int) -> int:  # `$((...))` starting at i: index just past it
+        depth, j = 0, i + 1
+        while j < n:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        raise _Unclosed
+
+    def single(i: int, ansi: bool) -> int:  # quote opening at i: index just past its close
+        j = i + 1
+        while j < n:
+            if ansi and text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == "'":
+                return j + 1
+            j += 1
+        raise _Unclosed
+
+    def code(i: int, stop: str, level: int) -> tuple:
+        if level > 32:
+            raise _Unclosed
+        out, depth = [], 0
+        while i < n:
+            c = text[i]
+            if c == "\\":
+                out.append(text[i:i + 2])
+                i += 2
+            elif stop == "`" and c == "`":
+                return "".join(out), i + 1
+            elif comment_at(i):
+                j = text.find("\n", i)
+                j = n if j < 0 else j
+                out.append(text[i:j])
+                i = j
+            elif c == "'" or text.startswith("$'", i):
+                j = single(i + (c == "$"), c == "$")
+                out.append(text[i:j])
+                i = j
+            elif c == '"':
+                s, i = dquote(i + 1, level)
+                out.append(s)
+            elif text.startswith("$((", i):
+                j = arithmetic(i + 1)
+                out.append(text[i:j])
+                i = j
+            elif text.startswith("$(", i):
+                s, i = code(i + 2, ")", level + 1)
+                out.append("$(" + s + ")")
+            elif c == "`":
+                s, i = code(i + 1, "`", level + 1)
+                out.append("$(" + s + ")")
+            else:
+                if stop == ")" and c == "(":
+                    depth += 1
+                elif stop == ")" and c == ")":
+                    if depth == 0:
+                        return "".join(out), i + 1
+                    depth -= 1
+                out.append(c)
+                i += 1
+        if stop:
+            raise _Unclosed
+        return "".join(out), n
+
+    def dquote(i: int, level: int) -> tuple:  # body of a "..." opened just before i
+        parts, data = [], []
+        while i < n:
+            c = text[i]
+            if c == "\\":
+                data.append(text[i:i + 2])
+                i += 2
+            elif c == '"':
+                if not parts:
+                    return '"' + "".join(data) + '"', i + 1
+                if data:
+                    parts.append('"' + "".join(data) + '"')
+                return "".join(parts), i + 1
+            elif text.startswith("$((", i):
+                j = arithmetic(i + 1)
+                data.append(text[i:j])
+                i = j
+            elif text.startswith("$(", i) or c == "`":
+                if data:
+                    parts.append('"' + "".join(data) + '"')
+                    data = []
+                s, i = code(i + 2, ")", level + 1) if c == "$" else code(i + 1, "`", level + 1)
+                parts.append("$(" + s + ")")
+            else:
+                data.append(c)
+                i += 1
+        raise _Unclosed
+
+    if "$(" not in text and "`" not in text:
+        return text
+    try:
+        return code(0, "", 0)[0]
+    except (_Unclosed, RecursionError):
+        return text
 
 
 _FD_PREFIX = re.compile(r"\d+(?=[<>])")
@@ -196,8 +320,8 @@ def _command_tokens(text: str) -> Optional[list[str]]:
     `pytest` with a test path `2>` or `2>/dev/null` (that hid whole-suite runs)."""
     if _tokens(text) is None:
         return None
-    lex = shlex.shlex(_mask_quoted_redirects(_drop_fd_prefixes(_strip_comments(text.replace("\\\n", " ")))),
-                      posix=True, punctuation_chars=";&|()<>\n")
+    lex = shlex.shlex(_mask_quoted_redirects(_drop_fd_prefixes(_expose_substitutions(
+        _strip_comments(text.replace("\\\n", " "))))), posix=True, punctuation_chars=";&|()<>\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     lex.commenters = ""

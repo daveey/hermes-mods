@@ -265,3 +265,38 @@ def test_real_process_registry_spawn(tmp_path, monkeypatch):
                                           task_id=task):
         time.sleep(0.2)
     assert hook(tool_name="patch", args=_patch(tree / "retention_policy.py"), task_id=task) is None
+
+
+# Bash runs a command substitution inside double quotes (and in backticks) like an unquoted one, but shlex kept
+# `"$(...)"` as one data word: `echo "$(rm -rf plugins/x)"` named no target while `echo $(rm -rf plugins/x)` did.
+def _guard_module():
+    spec = importlib.util.spec_from_file_location("busy_tree_guard_decisions_" + uuid.uuid4().hex,
+                                                  PLUGIN / "guard.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_double_quoted_substitution_targets(tmp_path):
+    g = _guard_module()
+    cwd = str(tmp_path)
+    want = [str(tmp_path / "plugins" / "x")]
+    for cmd in ("rm -rf plugins/x", "echo $(rm -rf plugins/x)", 'echo "$(rm -rf plugins/x)"',
+                'out="$(rm -rf plugins/x 2>&1)"', 'echo "`rm -rf plugins/x`"', "echo `rm -rf plugins/x`",
+                'echo "$(echo hi > plugins/x)"', 'echo "a $(echo "b c" | tee plugins/x) d"'):
+        assert g.shell_targets(cmd, cwd) == want, cmd
+    for cmd in ("echo '$(rm -rf plugins/x)'", 'echo "\\$(rm -rf plugins/x)"', 'echo "\\`rm -rf plugins/x\\`"',
+                'out="$(git status 2>&1)"', 'out="$(ls plugins 2>/dev/null)"', 'echo "$((3 > 2))"'):
+        assert g.shell_targets(cmd, cwd) == [], cmd
+
+
+def test_double_quoted_substitution_refused_in_busy_tree(env):
+    env["reg"].add("python -m pytest", env["fix2"])
+    for cmd in ('echo "$(rm -f retention_policy.py)"', 'out="$(rm -f retention_policy.py 2>&1)"',
+                'echo "`rm -f retention_policy.py`"'):
+        assert env["hook"](tool_name="terminal", args={"workdir": str(env["fix2"]), "command": cmd},
+                           task_id=TASK), cmd
+    for cmd in ("echo '$(rm -f retention_policy.py)'", 'echo "\\$(rm -f retention_policy.py)"',
+                'out="$(git status 2>&1)"'):
+        assert env["hook"](tool_name="terminal", args={"workdir": str(env["fix2"]), "command": cmd},
+                           task_id=TASK) is None, cmd

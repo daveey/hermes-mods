@@ -624,3 +624,38 @@ def test_quoted_redirect_and_input_dup_refused(cmd):
 def test_quoted_redirect_is_an_rm_operand():
     why = plugin.guard.check_shell("rm -f '>' ~/.hermes/kanban.db")
     assert why == "`rm` would delete or truncate live database file ~/.hermes/kanban.db"
+
+
+# Bash runs a command substitution inside double quotes (and in backticks) like an unquoted one, but shlex kept
+# `"$(...)"` as one data word: `out="$(rm -f ~/.hermes/state.db 2>&1)"` passed while `out=$(rm -f ...)` was refused.
+RM_STATE = "`rm` would delete or truncate live database file ~/.hermes/state.db"
+REDIR_STATE = "a `>` redirect would overwrite live database file ~/.hermes/state.db"
+
+
+@pytest.mark.parametrize("cmd,why", [
+    ("echo $(rm -f ~/.hermes/state.db)", RM_STATE), ('echo "$(rm -f ~/.hermes/state.db)"', RM_STATE),
+    ("out=$(rm -f ~/.hermes/state.db 2>&1)", RM_STATE), ('out="$(rm -f ~/.hermes/state.db 2>&1)"', RM_STATE),
+    ("echo `rm -f ~/.hermes/state.db`", RM_STATE), ('echo "`rm -f ~/.hermes/state.db`"', RM_STATE),
+    ("x=$(echo hi > ~/.hermes/state.db)", REDIR_STATE), ('echo "$(echo hi > ~/.hermes/state.db)"', REDIR_STATE),
+    ('echo "$(echo "$(rm -f ~/.hermes/state.db)")"', RM_STATE)])
+def test_double_quoted_substitution_runs_like_unquoted(cmd, why):
+    assert plugin.guard.check_shell(cmd) == why, cmd
+    assert blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", ["echo '$(rm -f ~/.hermes/state.db)'", 'echo "\\$(rm -f ~/.hermes/state.db)"',
+                                 'echo "\\`rm -f ~/.hermes/state.db\\`"', 'out="$(git status 2>&1)"',
+                                 'out="$(ls ~/.hermes 2>/dev/null)"',
+                                 'n="$(sqlite3 ~/.hermes/state.db \'select count(*) from sessions\' 2>&1)"'])
+def test_inert_substitution_shapes_stay_allowed(cmd):
+    assert plugin.guard.check_shell(cmd) is None, cmd
+    assert not blocked("terminal", command=cmd), cmd
+
+
+def test_double_quoted_substitution_execute_code():
+    assert blocked("execute_code", code="import os\nos.system('out=\"$(rm -f ~/.hermes/state.db 2>&1)\"')")
+    assert blocked("execute_code", code="import subprocess\nsubprocess.run('echo \"`rm -f ~/.hermes/kanban.db`\"', "
+                                        "shell=True)")
+    # (no single-quoted negative here: check_python's regex literal scan already reads the inner '...' of
+    # os.system("echo '$(rm ...)'") as its own command, a pre-existing over-approximation of that path)
+    assert not blocked("execute_code", code="import os\nos.system('out=\"$(git status 2>&1)\"')")

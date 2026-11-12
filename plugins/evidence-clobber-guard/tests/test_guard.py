@@ -160,3 +160,16 @@ def test_quoted_redirect_and_input_dup(env):
     for cmd in ("echo '>' > mutation-v2.log", 'echo ">>" > mutation-v2.log', "echo x | tee '>' mutation-v2.log",
                 "python3 mutate.py 2<&1 > mutation-v2.log"):
         assert_blocked(run(env, cmd, env["ev"]), cmd)
+
+
+# Bash runs a command substitution inside double quotes (and in backticks) like an unquoted one, but shlex kept
+# `"$(...)"` as one data word: `out="$(cmd > mutation-v2.log 2>&1)"` truncated the evidence file unchecked.
+def test_double_quoted_substitution_runs_like_unquoted(env):
+    for cmd in ("y=$(python3 mutate.py > mutation-v2.log)", 'echo "$(python3 mutate.py > mutation-v2.log)"',
+                'out="$(python3 mutate.py > mutation-v2.log 2>&1)"', 'echo "`python3 mutate.py > mutation-v2.log`"',
+                "echo `python3 mutate.py > mutation-v2.log`", 'echo "$(python3 mutate.py | tee mutation-v2.log)"'):
+        assert_blocked(run(env, cmd, env["ev"]), cmd)
+    for cmd in ("echo '$(python3 mutate.py > mutation-v2.log)'", 'echo "\\$(python3 mutate.py > mutation-v2.log)"',
+                'echo "\\`python3 mutate.py > mutation-v2.log\\`"', 'out="$(python3 mutate.py >> mutation-v2.log)"',
+                'out="$(git status 2>&1)"', 'n="$(grep -c ">" mutation-v2.log)"'):
+        assert run(env, cmd, env["ev"]) is None, cmd

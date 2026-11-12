@@ -283,6 +283,35 @@ class Systemd(Base):
             self.assertEqual([a.get("unit") for a in self.g.extract_actions(cmd)], ["my-collector.service"], cmd)
             self.assertIn(f"card {OWNER}", self.verdict(cmd))
 
+    # Bash runs a command substitution inside double quotes (and in backticks) like an unquoted one, but shlex kept
+    # `"$(...)"` as one data word: `out="$(systemctl --user stop u 2>&1)"` stopped an owned unit unchecked.
+    def test_double_quoted_substitution_runs_like_unquoted(self):
+        def run(argv, timeout=5):
+            if argv[:2] == ["systemctl", "--user"] and "show" in argv:
+                return 0, f"Environment=FOO=1 HERMES_OWNER_CARD={OWNER}\nWorkingDirectory=/nonexistent\nExecStart=\n"
+            return (1, "") if argv[0] in ("launchctl", "systemctl") else real(argv, timeout)
+        real = self.g.run_cmd
+        self.g.run_cmd = run
+        for cmd in ("out=$(systemctl --user stop my-collector.service 2>&1)",
+                    'out="$(systemctl --user stop my-collector.service 2>&1)"',
+                    'echo "$(systemctl --user stop my-collector.service)"',
+                    'echo "`systemctl --user stop my-collector.service`"',
+                    "echo `systemctl --user stop my-collector.service`",
+                    'echo "$(echo "$(systemctl --user stop my-collector.service)")"'):
+            self.assertEqual([a.get("unit") for a in self.g.extract_actions(cmd)], ["my-collector.service"], cmd)
+            self.assertIn(f"card {OWNER}", self.verdict(cmd))
+        self.assertEqual([a.get("pid") for a in self.g.extract_actions('echo "`kill 4242`"')], [4242])
+        for cmd in ("echo '$(systemctl --user stop my-collector.service)'",
+                    'echo "\\$(systemctl --user stop my-collector.service)"',
+                    'echo "\\`systemctl --user stop my-collector.service\\`"',
+                    'out="$(systemctl --user status my-collector.service 2>&1)"', 'out="$(git status 2>&1)"'):
+            self.assertEqual(self.g.extract_actions(cmd), [], cmd)
+            self.assertIsNone(self.verdict(cmd), cmd)
+        code = 'import os\nos.system(\'out="$(systemctl --user stop my-collector.service 2>&1)"\')\n'
+        self.assertIn(f"card {OWNER}", self.verdict(code, tool="execute_code"))
+        code = "import os\nos.system(\"echo '$(systemctl --user stop my-collector.service)'\")\n"
+        self.assertIsNone(self.verdict(code, tool="execute_code"))
+
 
 class ExecuteCode(Base):
     def test_python_subprocess_bootout_refused(self):
