@@ -29,6 +29,47 @@ after(async () => {
   dom.window.close()
 })
 
+test('finished disclosure combines done and archived and remembers expansion only per chat', async () => {
+  window.localStorage.clear()
+  m.resetDoneCacheForTests()
+  host.state.focusedStoredSessionId.value = 'finished-A'
+  window.__userSteps = { openAskCount: () => 0 }
+  window.__sessionTasks = {
+    snapshot: { stored: 'finished-A', chips: [card('open', 'review')] },
+    lineageIds: async s => new Set([s])
+  }
+  window.hermesDesktop = { api: async () => ({ includes: ['done', 'archived'], tasks: [
+    { id: 'done-one', title: 'Completed row', status: 'done' },
+    { id: 'archived-one', title: 'Archived row', status: 'archived' }
+  ] }) }
+  await React.act(async () => { await m.refreshDone() })
+  await show(J.jsx(m.Panel, {}))
+  const toggle = () => el().querySelector('[data-finished-toggle]')
+  assert.match(el().textContent, /Card open/)
+  assert.equal(toggle()?.textContent, '2 finished')
+  assert.equal(toggle().getAttribute('aria-expanded'), 'false')
+  assert.doesNotMatch(el().textContent, /Completed row|Archived row/)
+  const summary = el().querySelector('[data-status-summary]').textContent
+  assert.match(summary, /1 done/)
+  assert.doesNotMatch(summary, /2 done/)
+  await React.act(async () => toggle().click())
+  assert.match(el().textContent, /Completed row/)
+  assert.match(el().textContent, /Archived row/)
+  assert.equal(el().querySelector('[data-status-summary]').textContent, summary)
+  host.state.focusedStoredSessionId.value = 'finished-B'
+  window.__sessionTasks.snapshot.stored = 'finished-B'
+  await show(J.jsx(m.Panel, {}))
+  assert.equal(toggle()?.getAttribute('aria-expanded'), 'false')
+  host.state.focusedStoredSessionId.value = 'finished-A'
+  window.__sessionTasks.snapshot.stored = 'finished-A'
+  await show(J.jsx(m.Panel, {}))
+  assert.equal(toggle()?.getAttribute('aria-expanded'), 'true')
+  await show(null)
+  await show(J.jsx(m.Panel, {}))
+  assert.equal(toggle()?.getAttribute('aria-expanded'), 'false', 'not persisted outside renderer state')
+  host.state.focusedStoredSessionId.value = 'S1'
+})
+
 const NOW = Date.parse('2026-10-29T15:00:00Z'), S = NOW / 1000
 const card = (id, state, extra = {}) => ({ key: `kb:${id}`, kind: 'kanban', id, state, label: `Card ${id}`, connectionId: 'C1', profile: 'default', board: 'default', gateway: 'G1', since: S - 600, activityAt: S - 60, ...extra })
 
@@ -200,8 +241,12 @@ test('panel: status line, progress bar, needs you, stuck with steps, in progress
   await React.act(async () => { stuck.querySelector('[data-open-card]').click(); await flush() })
   assert.deepEqual(b.opened, ['t_old'])
   const folds = [...el().querySelectorAll('[data-fold]')].map(f => f.querySelector('summary').textContent)
-  assert.deepEqual(folds, ['Not started · 1', 'Done · 2'])
-  assert.deepEqual([...el().querySelectorAll('[data-fold^="Done"] [data-panel-row]')].map(r => r.firstChild.nextSibling.firstChild.textContent), ['Shipped B', 'Shipped A'])
+  assert.deepEqual(folds, ['Not started · 1'])
+  assert.equal(el().querySelector('[data-fold]').open, true, 'open queued work is visible by default')
+  assert.equal(el().querySelector('[data-finished-toggle]').textContent, '2 finished')
+  assert.doesNotMatch(el().textContent, /Shipped B|Shipped A/)
+  await React.act(async () => el().querySelector('[data-finished-toggle]').click())
+  assert.deepEqual([...el().querySelectorAll('[data-finished-cards] [data-panel-row]')].map(r => r.firstChild.nextSibling.firstChild.textContent), ['Shipped B', 'Shipped A'])
 })
 
 test('panel: an unmarked session-cards answer leaves done unknown instead of zeroing work', async () => {
@@ -402,15 +447,17 @@ test('hasOpenWork: finished cards alone are not open work; anything unfinished i
   assert.equal(m.hasOpenWork(empty, { issues: [{ id: 'i' }] }), true)
 })
 
-test('panel: a chat whose cards are all done shows no panel; new open work brings it back', async () => {
+test('panel: a chat whose cards are all done retains its finished disclosure', async () => {
   window.localStorage.clear()
   const s = Date.now() / 1000
   const b = bridges({ chips: [card('t_done', 'done')], cards: [{ id: 't_done', status: 'done', title: 'Shipped', activity_at: s - 60 }] })
   try {
     await show(React.createElement(m.Panel, { key: 'all-green' }))
     await React.act(async () => { await m.refreshDone(); await flush() })
-    assert.equal(el().querySelector('[data-session-status]'), null, 'all green: no panel')
-    assert.equal(el().textContent, '')
+    assert.equal(el().querySelector('[data-finished-toggle]')?.textContent, '1 finished')
+    assert.doesNotMatch(el().textContent, /Shipped/)
+    await React.act(async () => el().querySelector('[data-finished-toggle]').click())
+    assert.match(el().textContent, /Shipped/)
     await React.act(async () => { b.push([card('t_done', 'done'), card('t_run', 'running', { activityAt: s - 30 })]); await flush() })
     assert.ok(el().querySelector('[data-session-status]'), 'open work shows the panel')
     assert.deepEqual(el().querySelector('[data-status-summary]').textContent.split(' · '), ['1 running', '1 done'])
