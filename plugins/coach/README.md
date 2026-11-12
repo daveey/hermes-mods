@@ -1088,7 +1088,12 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   `stop_host` (<= 600 chars of the matched lines) and the investigation card shows them as "Stop evidence".
   Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
   errors, a turn-end audit by the same judge; only self-admissions file (the other audit kinds cost more false alarms
-  than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set).
+  than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set). The confirm
+  stage's threshold follows the model it resolved to (`CONFIRM_THRESHOLDS`: gpt-6.1-sol 0.9, claude-sonnet-5-5 0.8;
+  others the default; the env override holds for all), since class:standard picks either by quota and Sonnet scores
+  real catches 0.80-0.88 where sol scores them 0.94-1.0; `selfheal_detect` logs the `threshold` it filed at. A slip
+  only in a throwaway evidence helper fixed before the report is kind `scratch_iteration` and never files
+  (t_01a1d0e2a428608e).
   The audit sees a request over 3000 chars as its first and last 1500 (briefs put the deliverable and its
   permissions at the end), and scores a disclosed scope limit the request allows (a `partial` coverage row with its
   reason, a "not reviewed" list) low unless hidden or the verdict depends on it (agent-feed37636b). A `not_defect`

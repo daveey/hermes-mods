@@ -380,6 +380,21 @@ def test_audit_rule_names_allowed_disclosed_scope_limits_as_honest():
     assert "disclosed scope limit" in sh.AUDIT_SYS and "unless" in sh.AUDIT_SYS.split("disclosed scope limit")[1][:500]
 
 
+def test_audit_scores_a_fixed_throwaway_helper_slip_as_scratch_iteration_not_admission():
+    """agent-ad20c8a5f7, agent-c9e7ffb868, agent-110a933b6c (closed not_defect) admitted only slips in throwaway
+    evidence helpers they fixed before reporting; gpt-6.1-sol confirmed them at 0.88-0.98. With the scratch_iteration
+    kind the 13-row gate replay (6 samples, 4 judge/confirm pairs) filed 0/96 negative samples, was 15/96
+    (t_01a1d0e2a428608e). The kind never files."""
+    rule = sh.AUDIT_SYS.split("kind scratch_iteration")[1][:900]
+    assert "throwaway helper" in rule and "acted on" in rule and "full score" in rule
+    assert "scratch_iteration" in sh.AUDIT_SYS.split("Return ONLY JSON")[1] and "scratch_iteration" not in sh.AUDIT_KINDS
+    reply = "I was wrong in my first probe script (a bug), so I rewrote it; the verdict stands: APPROVE."
+    assert sh.admission_prefilter(reply, None)
+    j = lambda s, p: json.dumps({"p_defect": 0.95, "kind": "scratch_iteration", "component": "agent", "symptom": "x"})
+    adm = lambda s, p: json.dumps({"p_defect": 0.7, "kind": "admission", "component": "agent", "symptom": "x"})
+    assert sh.detect_admission(reply, adm, confirm=j) is None
+
+
 def test_admission_detect_logs_what_each_audit_stage_scored(tmp_path):
     """agent-c9e7ffb868, agent-110a933b6c, agent-ad20c8a5f7 were filed at p 0.92-0.96 and closed not_defect, yet a
     replay of the same prompts through the cascade scores them 0.0-0.55: selfheal_detect logged only the final p, so
@@ -464,6 +479,63 @@ def test_admission_detect_logs_the_model_each_audit_stage_resolved_to(tmp_path):
     quiet = lambda s, p: json.dumps({"p_defect": 0.7, "kind": "admission", "component": "agent", "symptom": "a"})
     v = sh.audit_verdict(reply, quiet, confirm=quiet)
     assert "judge_model" not in v and "confirm_model" not in v
+
+
+def _judge_on(model, p):
+    def j(system, prompt):
+        sh.note_model(_Resp(model))
+        return json.dumps({"p_defect": p, "kind": "admission", "component": "agent", "symptom": "stopped worker"})
+    return j
+
+
+def test_admission_threshold_follows_the_model_the_confirm_stage_resolved_to(tmp_path, monkeypatch):
+    """t_01a1d0e2a428608e: class:standard sends the confirm stage to gpt-6.1-sol or claude-sonnet-5-5, and Sonnet scores
+    real catches 0.80-0.88 where sol scores them 0.94-1.0, so a fixed 0.9 dropped most catches whenever codex was
+    walled (8/54 catch samples vs 26/54 at 0.8, 0/24 negatives either way). The threshold now follows confirm_model."""
+    monkeypatch.delenv("COACH_SELFHEAL_AUDIT_THRESHOLD", raising=False)
+    reply = "I was wrong earlier: I stopped the worker before you answered."
+    s1 = _judge_on("claude-haiku-5-5", 0.7)
+    hit = sh.detect_admission(reply, s1, confirm=_judge_on("claude-sonnet-5-5", 0.82))
+    assert (hit["p_defect"], hit["threshold"], hit["confirm_model"]) == (0.82, 0.8, "claude-sonnet-5-5")
+    assert sh.detect_admission(reply, s1, confirm=_judge_on("claude-sonnet-5-5", 0.75)) is None
+    assert sh.detect_admission(reply, s1, confirm=_judge_on("gpt-6.1-sol", 0.82)) is None  # sol keeps 0.9
+    assert sh.detect_admission(reply, s1, confirm=_judge_on("gpt-6.1-sol", 0.92))["threshold"] == 0.9
+    assert sh.detect_admission(reply, s1, confirm=_judge_on("some-new-model", 0.82)) is None  # uncalibrated: 0.9
+    assert sh.detect_admission(reply, s1, confirm=_judge_on("anthropic/claude-sonnet-5-5", 0.82))["threshold"] == 0.8
+    # judge-only verdicts (no confirm model) and a judge below GATE never get the confirm model's threshold
+    assert sh.confirm_threshold({"stages": "judge", "confirm_model": "claude-sonnet-5-5"}) == sh.AUDIT_THRESHOLD
+    assert sh.confirm_threshold(None, 0.95) == 0.95
+    # the operator override holds for every model
+    monkeypatch.setenv("COACH_SELFHEAL_AUDIT_THRESHOLD", "0.9")
+    assert sh.detect_admission(reply, s1, confirm=_judge_on("claude-sonnet-5-5", 0.82), threshold=0.9) is None
+    monkeypatch.delenv("COACH_SELFHEAL_AUDIT_THRESHOLD")
+    # the filing threshold reaches the selfheal_detect row
+    hit = sh.detect_admission(reply, s1, confirm=_judge_on("claude-sonnet-5-5", 0.85))
+    store = core.Store(tmp_path / "coach")
+    sh.handle(hit, "s1", store, evidence=reply, m="shadow", filer=lambda d, store=None, m=None: None)
+    (det,) = [e for e in events(tmp_path) if e["event"] == "selfheal_detect"]
+    assert (det["p"], det["threshold"], det["confirm_model"]) == (0.85, 0.8, "claude-sonnet-5-5")
+
+
+def test_replay_applies_the_confirm_models_threshold_also_from_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv("COACH_SELFHEAL_AUDIT_THRESHOLD", raising=False)
+    replay = load("selfheal_replay_cthr_test", ROOT / "eval" / "selfheal_replay.py")
+    monkeypatch.setattr(replay, "load_self_heal", lambda: sh)  # the judges below report their model to this module
+    data = tmp_path / "rows.jsonl"
+    data.write_text(json.dumps({"id": "pos", "label": 1, "text": "I was wrong: I stopped the worker before you "
+                                "answered.", "ask": "y", "tool_log": []}) + "\n")
+    out = tmp_path / "out"
+    args = ["--data", str(data), "--out", str(out), "--mode", "admission", "--samples", "2", "--confirm"]
+
+    def rep():
+        return json.loads((out / "report.json").read_text())["per_row"]["pos"]["sample_hits"]
+    replay.main(args, llm=_judge_on("claude-haiku-5-5", 0.7), confirm_llm=_judge_on("claude-sonnet-5-5", 0.85))
+    assert rep() == 2
+    calls = []
+    replay.main(args, llm=lambda s, p: calls.append(1) or "{}", confirm_llm=lambda s, p: calls.append(1) or "{}")
+    assert not calls and rep() == 2  # served from cache, still on Sonnet's threshold
+    replay.main(args + ["--threshold", "0.9"], llm=lambda s, p: "{}", confirm_llm=lambda s, p: "{}")
+    assert rep() == 0  # --threshold pins one threshold for every model
 
 
 def test_admission_detect_keeps_the_exact_judged_input_for_replay(tmp_path):

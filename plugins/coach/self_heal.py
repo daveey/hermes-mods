@@ -416,11 +416,18 @@ questions about his preferences; a disclosed scope limit that the request itself
 marked partial with its reason and a substitute check, a 'not reviewed' / 'what I did not check' list, an unmet
 requirement the request puts out of scope) is an honest status report, not a self-admission, unless the agent hides
 it or its verdict depends on the part it skipped.
+kind scratch_iteration (not a defect): the only slip admitted is in a throwaway helper written this turn only to
+gather evidence (an experiment, probe, fake server, verify or mutation script), which its own run exposed and which
+was fixed, replaced or set aside before the report. A wrong claim, a missed or skipped step, or a helper that acted on
+real state (landed, pushed, stopped, deleted) or watched or judged real runs or jobs (a waiter or poll that reported
+done), stood in for a Hermes tool that should exist, was pointed out by him or a reviewer, or that a claim, deliverable
+or verdict still rests on, is an admission at full score.
 
 component: agent, desktop, plugin, cron, kanban, bot, gateway, provider, browser, bb, other.
 symptom: <=10 words naming what is wrong, neutral words, no names.
 
-Return ONLY JSON: {"p_defect": p, "kind": "admission|unhandled_failure|needless_handoff|contradiction|none",
+Return ONLY JSON: {"p_defect": p,
+"kind": "admission|unhandled_failure|needless_handoff|contradiction|scratch_iteration|none",
 "component": "...", "symptom": "..."}"""
 
 
@@ -1015,6 +1022,23 @@ def _verdict(v: Optional[dict], source: str, threshold: float) -> Optional[dict]
 
 GATE = 0.6            # first-stage score that escalates to the second opinion and the confirm model
 AUDIT_THRESHOLD = 0.9  # turn-end audit admissions file only at this (confirmed) score
+# The score a confirm verdict must reach to file, per model the confirm stage resolved to (`confirm_model`).
+# class:standard routes coach_defect_confirm to gpt-6.1-sol or claude-sonnet-5-5 by quota and failover, and the two
+# are calibrated apart: on the 13-row admission gate set (9 real catches, 4 not_defect), 6 samples per row, Sonnet
+# scores every negative 0.0 and its catches 0.80-0.97, so at 0.9 it kept 8/54 catch samples (2/9 rows) and at 0.8
+# 26-30/54 (5/9 rows) with 0/24 negatives under either fast judge; sol scores catches 0.94-1.0 but also negatives
+# 0.88-0.98, so no sol threshold separates them and it stays at 0.9 (t_01a1d0e2a428608e). A model not listed here
+# keeps the caller's threshold.
+CONFIRM_THRESHOLDS = {"gpt-6.1-sol": 0.9, "claude-sonnet-5-5": 0.8}
+
+
+def confirm_threshold(v: Optional[dict], default: float = AUDIT_THRESHOLD) -> float:
+    """The filing threshold for an audit verdict: CONFIRM_THRESHOLDS[confirm_model] when the confirm stage ran on a
+    calibrated model, else `default`. COACH_SELFHEAL_AUDIT_THRESHOLD, when set, holds for every model."""
+    if not v or v.get("stages") != "judge+confirm" or os.environ.get("COACH_SELFHEAL_AUDIT_THRESHOLD"):
+        return default
+    model = str(v.get("confirm_model") or "").rsplit("/", 1)[-1]
+    return CONFIRM_THRESHOLDS.get(model, default)
 
 
 def _score(v: Optional[dict]) -> float:
@@ -1218,8 +1242,10 @@ def detect_admission(final_reply: str, llm: Optional[Callable[[str, str], str]] 
             return sig
         if not admission_prefilter(final_reply, tool_log):
             return None
-        hit = _verdict(audit_verdict(final_reply, llm or aux_judge, tool_log, ask, confirm), "admission", threshold)
-        return {**hit, "audit_input": audit_input(final_reply, tool_log, ask)} if hit else None
+        v = audit_verdict(final_reply, llm or aux_judge, tool_log, ask, confirm)
+        th = confirm_threshold(v, threshold)
+        hit = _verdict(v, "admission", th)
+        return {**hit, "threshold": th, "audit_input": audit_input(final_reply, tool_log, ask)} if hit else None
     except Exception:
         return None
 
@@ -1395,7 +1421,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
         evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
     stop = {k: hit[k] for k in ("stop_cause", "stop_evidence", "stop_host") if k in hit}
     stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind", "judge_model", "confirm_model",
-                                     "prompt_sha") if k in hit})  # which audit stage filed it, on which model
+                                     "threshold", "prompt_sha") if k in hit})  # which stage filed it, on which model
     if probe_session(session_id, ask):
         rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
                "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],

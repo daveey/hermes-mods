@@ -108,7 +108,7 @@ def main(argv=None, llm=None, confirm_llm=None):
         for x in cache_path.read_text().splitlines():
             try:
                 d = json.loads(x)
-                cache[d["k"]] = d["raw"]
+                cache[d["k"]] = (d["raw"], d.get("model") or "")
             except Exception:
                 pass
     lock = threading.Lock()
@@ -121,7 +121,10 @@ def main(argv=None, llm=None, confirm_llm=None):
         stage_tag = (f"@{a.confirm_provider}/{a.confirm_model}" if "#confirm" in tag and a.confirm_model else "")
         k = hashlib.sha1(f"{model_tag}{tag}{stage_tag}\n{system}\n{prompt}".encode()).hexdigest()
         if k in cache:
-            return cache[k]
+            raw, m = cache[k]
+            if m and hasattr(sh, "_MODEL_TL"):  # a cached confirm verdict keeps its model's threshold
+                sh._MODEL_TL.model = m
+            return raw
         try:
             if hasattr(sh, "_MODEL_TL"):
                 sh._MODEL_TL.model = ""
@@ -130,14 +133,15 @@ def main(argv=None, llm=None, confirm_llm=None):
             with lock:
                 calls["err"] += 1
             raise exc
-        resolved = getattr(getattr(sh, "_MODEL_TL", None), "model", "") or "(unreported)"
+        reported = getattr(getattr(sh, "_MODEL_TL", None), "model", "") or ""
+        resolved = reported or "(unreported)"
         with lock:
             calls["n"] += 1
             stage = models.setdefault("confirm" if "#confirm" in tag else "judge", {})
             stage[resolved] = stage.get(resolved, 0) + 1
-            cache[k] = raw
+            cache[k] = (raw, reported)
             with open(cache_path, "a") as fh:
-                fh.write(json.dumps({"k": k, "raw": raw}) + "\n")
+                fh.write(json.dumps({"k": k, "raw": raw, **({"model": reported} if reported else {})}) + "\n")
         return raw
 
     confirm = (confirm_llm or sh.confirm_judge()) if a.confirm and a.mode == "admission" else None
@@ -162,7 +166,9 @@ def main(argv=None, llm=None, confirm_llm=None):
 
     def hits(v):
         if a.mode == "admission":  # only these kinds ever file from the turn-end audit (detect_admission)
-            return bool(v and v["p_defect"] >= th and v.get("kind") in sh.AUDIT_KINDS)
+            # detect_admission's per-confirm-model threshold, unless --threshold pins one for every model
+            t = th if a.threshold is not None or not hasattr(sh, "confirm_threshold") else sh.confirm_threshold(v, th)
+            return bool(v and v["p_defect"] >= t and v.get("kind") in sh.AUDIT_KINDS)
         return bool(v and v["p_defect"] >= th and v.get("kind") not in ("product_bug", "external", "none"))
 
     def one(r):
