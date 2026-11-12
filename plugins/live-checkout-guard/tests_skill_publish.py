@@ -427,6 +427,159 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
         self.assertEqual(self.git(self.root, 'status', '--porcelain'), '')
         self.assert_no_worktrees()
 
+    def fake_gh(self):
+        """A gh executable whose push-CI answer for the fetched tip is read from a state file."""
+        bin_dir = self.base / 'bin'
+        bin_dir.mkdir(exist_ok=True)
+        state = self.base / 'ci-state'
+        gh = bin_dir / 'gh'
+        gh.write_text('''#!/bin/sh
+sha=$(git rev-parse origin/main)
+read status conclusion < "$PUBLISH_CI_STATE"
+printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","createdAt":"2026-01-01"}]' "$sha" "$status" "$conclusion"
+''')
+        gh.chmod(0o755)
+        return bin_dir, state
+
+    def load_plugin(self, name):
+        spec = importlib.util.spec_from_file_location(name, HERE / '__init__.py')
+        assert spec is not None and spec.loader is not None
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        hooks = {}
+        class Context:
+            def register_hook(self, hook, fn):
+                hooks[hook] = fn
+        plugin.register(Context())
+        return plugin, hooks
+
+    def wait_for(self, predicate, timeout=30.0):
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.25)
+        return predicate()
+
+    def test_in_progress_ci_then_green_publishes_without_new_skill_manage_call(self):
+        """Regression: a skip only because main CI is still running must not strand the edit."""
+        bin_dir, state = self.fake_gh()
+        state.write_text('in_progress null\n')
+        plugin, hooks = self.load_plugin('live_guard_pending_test')
+        pending = self.base / 'hermes-home/cache/skill-publish-pending'
+        with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'],
+                                    'PUBLISH_CI_STATE': str(state),
+                                    'HERMES_SKILL_PUBLISH_RETRY_INTERVAL': '0.5'}):
+            with self.assertLogs(plugin.logger, level='INFO') as logs:
+                hooks['post_tool_call'](tool_name='skill_manage', args={'action': 'write_file'},
+                    result={'success': True, 'path': str(self.target)},
+                    task_id='card-example', session_id='session-desktop', status='ok')
+            self.assertIn("'status': 'skipped'", logs.output[0])
+            # Still running: nothing is published while the tip's CI is in progress.
+            self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+            self.assertEqual(self.target.read_text(), 'published\n')
+            # CI goes green later; no further skill_manage call is made.
+            state.write_text('completed success\n')
+            published = lambda: self.git(self.origin, 'show', 'main:' + self.path) == 'published'
+            self.assertTrue(self.wait_for(published), 'in-progress-then-green edit was never published')
+            self.assertTrue(self.wait_for(lambda: not list(pending.glob('*.json'))))
+            self.assertTrue(self.wait_for(lambda: self.retry_worker_idle(pending)))
+        subject = self.git(self.origin, 'show', '-s', '--format=%s', 'main')
+        self.assertEqual(subject, 'skills: publish skills/testing/sample '
+                                  '[session:session-desktop card:card-example]')
+        self.assertEqual(self.git(self.root, 'status', '--porcelain'), '')
+        self.assert_no_worktrees()
+
+    def retry_worker_idle(self, pending):
+        import fcntl
+        lock = pending / '.worker.lock'
+        if not lock.exists():
+            return True
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_pending_retry_never_publishes_red_and_expires(self):
+        bin_dir, state = self.fake_gh()
+        pending = self.base / 'hermes-home/cache/skill-publish-pending'
+        clock = [1000.0]
+        with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'],
+                                    'PUBLISH_CI_STATE': str(state)}):
+            # In progress, then red: the record is dropped and nothing is published.
+            state.write_text('in_progress null\n')
+            publisher.defer(self.root, [self.path], session_id='s', task_id='c', spawn=False,
+                            clock=lambda: clock[0])
+            self.assertEqual(len(list(pending.glob('*.json'))), 1)
+            self.assertEqual(publisher.retry_pending(pending, interval=0, clock=lambda: clock[0],
+                                                     passes=1)['kept'], 1)
+            state.write_text('completed failure\n')
+            done = publisher.retry_pending(pending, interval=0, clock=lambda: clock[0], passes=1)
+            self.assertEqual(done['dropped'], 1)
+            self.assertEqual(list(pending.glob('*.json')), [])
+            self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+            # Still in progress past the window: expired, never published.
+            state.write_text('in_progress null\n')
+            publisher.defer(self.root, [self.path], session_id='s', task_id='c', spawn=False,
+                            clock=lambda: clock[0])
+            clock[0] += publisher.RETRY_WINDOW + 1
+            done = publisher.retry_pending(pending, interval=0, clock=lambda: clock[0], passes=1)
+            self.assertEqual(done['expired'], 1)
+            self.assertEqual(list(pending.glob('*.json')), [])
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+        self.assertEqual(self.target.read_text(), 'published\n')
+        self.assert_no_worktrees()
+
+    def test_busy_publication_lock_is_deferred_then_published(self):
+        import fcntl
+        bin_dir, state = self.fake_gh()
+        state.write_text('completed success\n')
+        plugin, hooks = self.load_plugin('live_guard_lock_defer_test')
+        holder = os.open(self.root / '.git/skill-publish.lock', os.O_CREAT | os.O_RDWR)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        pending = self.base / 'hermes-home/cache/skill-publish-pending'
+        with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'],
+                                    'PUBLISH_CI_STATE': str(state),
+                                    'HERMES_SKILL_PUBLISH_RETRY_INTERVAL': '0.5'}):
+            with self.assertLogs(plugin.logger, level='INFO') as logs:
+                hooks['post_tool_call'](tool_name='skill_manage', args={'action': 'write_file'},
+                    result={'success': True, 'path': str(self.target)}, status='ok')
+            self.assertIn('lock busy', logs.output[0])
+            self.assertIn("'deferred'", logs.output[0])
+            self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            self.assertTrue(self.wait_for(
+                lambda: self.git(self.origin, 'show', 'main:' + self.path) == 'published'))
+            self.assertTrue(self.wait_for(lambda: not list(pending.glob('*.json'))))
+            self.assertTrue(self.wait_for(lambda: self.retry_worker_idle(pending)))
+        self.assert_no_worktrees()
+
+    def test_pending_ci_state_is_distinct_from_unknown(self):
+        def gh(rows, code=0):
+            out = json.dumps(rows).encode()
+            return patch.object(publisher, 'bounded', return_value=subprocess.CompletedProcess(
+                ['gh'], code, out, b''))
+        row = lambda status, conclusion, name='CI': {'headSha': 'a' * 40, 'status': status,
+            'conclusion': conclusion, 'workflowName': name, 'createdAt': '2026-01-01'}
+        cases = [([row('in_progress', None)], 'pending'),
+                 ([row('queued', None)], 'pending'),
+                 ([row('completed', 'success'), row('in_progress', None, 'Lint')], 'pending'),
+                 ([row('completed', 'failure'), row('in_progress', None, 'Lint')], 'red'),
+                 ([row('completed', 'skipped')], 'unknown'),
+                 ([], 'unknown'),
+                 ([row('completed', 'success')], 'green')]
+        for rows, expected in cases:
+            with self.subTest(rows=rows), gh(rows):
+                self.assertEqual(publisher.latest_main_ci(self.root, 'a' * 40), expected)
+        with gh([row('in_progress', None)], code=1):
+            self.assertEqual(publisher.latest_main_ci(self.root, 'a' * 40), 'unknown')
+
     def test_cross_skill_batch_uses_separate_real_scope_checked_commits(self):
         other = 'skills/testing/another/SKILL.md'
         (self.root / other).parent.mkdir()

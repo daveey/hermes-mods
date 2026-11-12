@@ -169,6 +169,20 @@ def snapshot(path):
     return data, (s.st_ino, s.st_mtime_ns, s.st_ctime_ns)
 
 
+RUNNING_STATUSES = {'queued', 'in_progress', 'waiting', 'requested', 'pending'}
+
+
+class Deferred(ValueError):
+    """Publication did not run yet for a transient reason; nothing was pushed."""
+
+
+# Deferred publication: a skip only because main CI is still running is retried
+# by one detached worker per HERMES_HOME until green (publish), anything else
+# (drop; edits stay in place for the existing dirt recovery), or the window ends.
+RETRY_INTERVAL = 20.0
+RETRY_WINDOW = 30 * 60.0
+
+
 def latest_main_ci(root, sha):
     """Require a completed successful latest push CI run for this exact main tip."""
     try:
@@ -189,8 +203,13 @@ def latest_main_ci(root, sha):
                {'failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'}
                for r in latest.values()):
             return 'red'
-        return ('green' if all(r['status'] == 'completed' and r['conclusion'] == 'success'
-                               for r in latest.values()) else 'unknown')
+        if all(r['status'] == 'completed' and r['conclusion'] == 'success' for r in latest.values()):
+            return 'green'
+        # Still running (and nothing else odd): the only state the publisher defers and retries.
+        if all((r['status'] == 'completed' and r['conclusion'] == 'success')
+               or r['status'] in RUNNING_STATUSES for r in latest.values()):
+            return 'pending'
+        return 'unknown'
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         return 'unknown'
 
@@ -222,7 +241,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
         except OSError:
             if clock() >= deadline:
                 os.close(fd)
-                raise ValueError('publication lock busy')
+                raise Deferred('publication lock busy')
             time.sleep(0.05)
     archive = None
     worktree = None
@@ -317,7 +336,11 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
                 tip = run(root, 'rev-parse', 'origin/main').decode().strip()
                 if tip == base:
                     raise ValueError('push refused without a main race')
-                if ci(root, tip) != 'green':
+                tip_state = ci(root, tip)
+                if tip_state == 'pending':
+                    # Nothing was pushed: a later retry from a fresh snapshot is safe.
+                    raise Deferred('latest main CI pending during retry')
+                if tip_state != 'green':
                     raise ValueError('latest main CI not green during retry')
                 run(worktree, '-c', 'core.hooksPath=.githooks', 'rebase', tip)
                 base = tip
@@ -341,7 +364,9 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
             raise ValueError('reconcile refused: ' + result.stderr.decode(errors='replace'))
         return {'status': 'published', 'commit': published, 'archive': str(archive)}
     except Exception as exc:
-        raise ValueError('%s%s' % (exc, ('; archive: ' + str(archive)) if archive else '')) from exc
+        # Deferred stays Deferred so the observer/worker can schedule a retry.
+        cls = Deferred if isinstance(exc, Deferred) else ValueError
+        raise cls('%s%s' % (exc, ('; archive: ' + str(archive)) if archive else '')) from exc
     finally:
         try:
             if worktree is not None and worktree.exists():
@@ -403,3 +428,195 @@ def written_paths(args, result, root):
         selected_path(root, name)
         paths.append(name)
     return list(dict.fromkeys(paths))
+
+
+# --- Deferred publication -------------------------------------------------------------
+# The observer never waits for CI (45 s budget, CI takes minutes). A skip that is only
+# "main CI still running" (or a busy publication lock) is recorded under HERMES_HOME and
+# retried by one detached worker. Each retry is a full publish(): fresh snapshot, fetch,
+# CI must be green for the exact tip, the same scope/race/gitleaks rules. Red CI or any
+# publication error drops the record (edits stay in place, as for a direct skip); a tip
+# still pending or unknown is retried until the record's window ends.
+
+def pending_dir():
+    home = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))
+    return home / 'cache' / 'skill-publish-pending'
+
+
+def deferrable(outcome):
+    return isinstance(outcome, dict) and outcome == {
+        'status': 'skipped', 'reason': 'latest main CI pending'}
+
+
+def _record_key(root, paths):
+    import hashlib
+    blob = json.dumps([str(root), sorted(paths)]).encode()
+    return hashlib.sha256(blob).hexdigest()[:24]
+
+
+def _retry_log(directory, message):
+    try:
+        logs = directory.parent.parent / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        with open(logs / 'skill-publish-retry.log', 'a') as fh:
+            fh.write('%s %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S%z'), message))
+    except OSError:
+        pass
+
+
+def defer(root, paths, *, session_id='', task_id='', spawn=True, clock=None, directory=None):
+    """Record a pending publication (newest edit wins, window restarts) and start the worker."""
+    clock = clock or time.time
+    directory = Path(directory) if directory else pending_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = str(Path(root).expanduser().resolve(strict=True))
+    paths = list(dict.fromkeys(paths))
+    if not paths or len(paths) > MAX_PATHS:
+        raise ValueError('empty or oversized publication batch')
+    for name in paths:
+        selected_path(Path(root), name)
+    target = directory / (_record_key(root, paths) + '.json')
+    now = clock()
+    try:
+        created = json.loads(target.read_text()).get('created', now)
+    except (OSError, ValueError, AttributeError):
+        created = now
+    record = {'version': 1, 'root': root, 'paths': paths, 'session_id': str(session_id or ''),
+              'task_id': str(task_id or ''), 'created': created, 'deadline': now + RETRY_WINDOW}
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix='.record-', suffix='.tmp')
+    with os.fdopen(fd, 'w') as fh:
+        json.dump(record, fh)
+    os.replace(tmp, target)
+    _retry_log(directory, 'deferred %s %s' % (record['session_id'] or '-', paths))
+    if spawn:
+        spawn_worker(directory)
+    return {'status': 'deferred', 'record': str(target)}
+
+
+def spawn_worker(directory=None):
+    """Start a detached retry worker (it exits at once if one already holds the lock)."""
+    directory = Path(directory) if directory else pending_dir()
+    logs = directory.parent.parent / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    with open(logs / 'skill-publish-retry.log', 'a') as out:
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--retry-pending',
+                                    '--dir', str(directory)],
+                                   stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                   start_new_session=True, close_fds=True)
+    # Reap it when it exits, without blocking the observer (no zombie, no ResourceWarning).
+    import threading
+    threading.Thread(target=process.wait, name='skill-publish-retry-reaper', daemon=True).start()
+
+
+def kick(directory=None):
+    """Restart the worker when records exist (e.g. after a reboot killed the last one)."""
+    directory = Path(directory) if directory else pending_dir()
+    if directory.is_dir() and any(directory.glob('*.json')):
+        spawn_worker(directory)
+        return True
+    return False
+
+
+def _drop(path, raw):
+    # Keep a record a newer defer() rewrote while this attempt ran.
+    try:
+        if path.read_bytes() == raw:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=time.sleep,
+                  passes=None):
+    """Retry every pending record until none remain. One worker per directory (flock)."""
+    directory = Path(directory) if directory else pending_dir()
+    clock = clock or time.time
+    ci = ci or latest_main_ci
+    if interval is None:
+        interval = float(os.environ.get('HERMES_SKILL_PUBLISH_RETRY_INTERVAL') or RETRY_INTERVAL)
+    counts = {'published': 0, 'kept': 0, 'dropped': 0, 'expired': 0, 'busy': 0}
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(directory / '.worker.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            counts['busy'] = 1
+            return counts
+        done = 0
+        while True:
+            records = sorted(directory.glob('*.json'))
+            if not records:
+                if passes is not None:
+                    return counts
+                # Release, then look again: a record written by a defer() whose own
+                # worker lost the lock race to us must still be picked up.
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                if not any(directory.glob('*.json')):
+                    return counts
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return counts
+                continue
+            for path in records:
+                try:
+                    raw = path.read_bytes()
+                    rec = json.loads(raw)
+                    root, paths = rec['root'], rec['paths']
+                    if (not isinstance(root, str) or not isinstance(paths, list)
+                            or not all(isinstance(p, str) for p in paths)):
+                        raise ValueError('malformed record')
+                    deadline = float(rec['deadline'])
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    _retry_log(directory, 'dropped malformed %s: %s' % (path.name, exc))
+                    path.unlink(missing_ok=True)
+                    counts['dropped'] += 1
+                    continue
+                if clock() > deadline:
+                    _retry_log(directory, 'expired; edits left in place %s' % paths)
+                    _drop(path, raw)
+                    counts['expired'] += 1
+                    continue
+                try:
+                    outcome = publish(root, paths, session_id=rec.get('session_id', ''),
+                                      task_id=rec.get('task_id', ''), ci=ci)
+                except Deferred:
+                    counts['kept'] += 1
+                    continue
+                except Exception as exc:
+                    _retry_log(directory, 'preserved edits %s: %s' % (paths, exc))
+                    _drop(path, raw)
+                    counts['dropped'] += 1
+                    continue
+                if isinstance(outcome, dict) and outcome.get('status') == 'skipped' and \
+                        outcome.get('reason') in ('latest main CI pending', 'latest main CI unknown'):
+                    counts['kept'] += 1
+                    continue
+                _retry_log(directory, 'retry %s %s' % (paths, outcome))
+                _drop(path, raw)
+                counts['published' if outcome.get('status') == 'published' else 'dropped'] += 1
+            done += 1
+            if passes is not None and done >= passes:
+                return counts
+            sleep(interval)
+    finally:
+        os.close(fd)
+
+
+def main(argv):
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--retry-pending', action='store_true', required=True)
+    parser.add_argument('--dir')
+    args = parser.parse_args(argv)
+    counts = retry_pending(args.dir)
+    if not counts['busy']:
+        _retry_log(Path(args.dir) if args.dir else pending_dir(), 'worker exit %s' % counts)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
