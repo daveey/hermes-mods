@@ -996,13 +996,31 @@ CRON_WINDOW_S = 86400
 #   cron/restart_cut.py _detail():  RESTART_CUT_REASON, or RESTART_CUT_REASON + " (<run error>)"
 #   gateway/run_shutdown.py:        "Gateway shutdown (<phase>) killed the job's tool subprocess before ..."
 # A new core wording must be added here and to tests/test_signals.py LIFECYCLE_DETAILS (cron-70b179cf31).
+# Core since daveey-hermes e574134c also types the record: last_failure.kind == LIFECYCLE_INTERRUPT_KIND
+# (cron/jobs.py) on every shutdown_interrupted failure; an ordinary failure has no kind. The prose regex is
+# only the fallback for hosts still on older core, i.e. records with no kind at all.
+LIFECYCLE_INTERRUPT_KIND = "lifecycle_interrupt"
 _CRON_RESTART_CUT = "Interrupted by a gateway restart before the run finished"
 _CRON_LIFECYCLE_RE = re.compile(rf"(?:{re.escape(_CRON_RESTART_CUT)}(?:$| \()|Gateway shutdown \()")
 
 
-def cron_lifecycle_interrupt(detail: str) -> bool:
-    """True when a cron last_failure detail is the owner gateway's restart/shutdown cut, not a job failure."""
-    return bool(_CRON_LIFECYCLE_RE.match(detail or ""))
+def cron_lifecycle_interrupt(last_failure, detail: Optional[str] = None) -> bool:
+    """True when a cron last_failure record is the owner gateway's restart/shutdown cut, not a job failure.
+
+    `last_failure` is the job's last_failure dict (a bare detail string is still accepted). A non-empty
+    `kind` decides alone: only "lifecycle_interrupt" matches, and any other kind never falls back to the
+    prose regex. Without a kind (older core) the anchored producer-prefix regex is matched against `detail`
+    (default: last_failure["detail"])."""
+    if isinstance(last_failure, str):
+        lf, detail = {}, (last_failure if detail is None else detail)
+    else:
+        lf = last_failure if isinstance(last_failure, dict) else {}
+    kind = lf.get("kind")
+    if kind not in (None, ""):
+        return kind == LIFECYCLE_INTERRUPT_KIND
+    if detail is None:
+        detail = lf.get("detail")
+    return bool(_CRON_LIFECYCLE_RE.match(str(detail or "")))
 
 
 def _cron_threshold(h: Path) -> int:
@@ -1053,7 +1071,7 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                 continue  # core parked this failure behind a closed provider window (cron.quota_hold): not counted
             name = job.get("name") or job.get("id")
             detail = str(lf.get("detail") or job.get("last_error") or "run failed")
-            if cron_lifecycle_interrupt(detail):
+            if cron_lifecycle_interrupt(lf, detail):
                 continue  # owner's restart/shutdown cut is never a job defect, even with an old inflated streak
             streak = int(job.get("failure_streak") or 0)
             recent = [t for t in fails.get(k, []) if t > at - CRON_WINDOW_S]

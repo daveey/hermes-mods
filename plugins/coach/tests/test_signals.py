@@ -791,6 +791,41 @@ def test_cron_mixed_real_failures_and_interruptions(home):
     assert len(got) == 1 and "3 failures in 24h" in got[0]["details"]
 
 
+# Typed record (core e574134c, cron/jobs.py LIFECYCLE_INTERRUPT_KIND): kind decides first; the prose regex is
+# only the fallback for a record with no kind (hosts on older core).
+@pytest.mark.parametrize("lf, want", [
+    ({"kind": "lifecycle_interrupt", "detail": "Stopped while the owner gateway went down (new core wording)"}, True),
+    ({"kind": "lifecycle_interrupt"}, True),
+    ({"detail": RESTART_CUT}, True),  # legacy record: regex fallback
+    ({"kind": "", "detail": RESTART_CUT}, True),  # empty kind counts as absent
+    ({"detail": "Script exited with code 1"}, False),  # ordinary failure: no kind, other prose
+    ({"kind": "quota_hold", "detail": RESTART_CUT}, False),  # another kind never falls back to the regex
+    ({"kind": "script_error", "detail": "Gateway shutdown (post-interrupt) killed the job's tool subprocess"}, False),
+])
+def test_cron_lifecycle_interrupt_prefers_kind(lf, want):
+    assert sg.cron_lifecycle_interrupt(lf) is want
+    assert sg.cron_lifecycle_interrupt(lf, lf.get("detail") or "run failed") is want
+
+
+def test_cron_lifecycle_interrupt_accepts_bare_detail_string():
+    assert sg.cron_lifecycle_interrupt(RESTART_CUT) is True
+    assert sg.cron_lifecycle_interrupt("Script exited with code 1") is False
+
+
+@pytest.mark.parametrize("lf, counted", [
+    ({"kind": "lifecycle_interrupt", "detail": "Stopped while the owner gateway went down"}, False),
+    ({"kind": "other_kind", "detail": RESTART_CUT}, True),
+])
+def test_cron_collect_uses_kind(home, lf, counted):
+    k = "default:t"
+    cur = {"cron": {k: NOW - 7200}, "cron_fails": {k: [NOW - 7200, NOW - 3600]}}
+    _write_jobs(home, {"id": "t", "name": "job t", "last_status": "error", "failure_streak": 0,
+                       "last_failure": {"at": _iso(NOW - 600), **lf}})
+    got = sg.collect_cron(home, cur, NOW, "hubhost")
+    assert (len(got) == 1) is counted
+    assert cur["cron"][k] == pytest.approx(NOW - 600)
+
+
 def test_kanban_cards_failed_twice(home):
     ks = kinds(sg.collect(home, {}, "hubhost", NOW), "kanban")
     assert [s["symptom"].split()[2] for s in ks] == ["t_crash2"]  # once is not enough; self-heal's own cards skip
