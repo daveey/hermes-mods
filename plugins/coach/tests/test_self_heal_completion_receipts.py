@@ -74,7 +74,8 @@ def test_deferral_day_uses_emission_clock_not_old_sync_start(store):
     assert rows[0]["utc_day"] == sh._utc_day(rows[0]["ts"])
 
 
-def test_concurrent_fix_denials_log_once_across_processes(store):
+@pytest.mark.parametrize("default_store", [False, True])
+def test_concurrent_fix_denials_log_once_across_processes(store, default_store):
     code = '''
 import sys
 from pathlib import Path
@@ -84,11 +85,13 @@ from core import Store
 cap = {"available": True, "ok_usd": False, "ok_running": True, "why": "daily cap"}
 def no_create(*a, **kw):
     raise AssertionError("denied admission must not call kanban")
-print(sh.file_fix(sys.argv[3], store=Store(Path(sys.argv[2])), now=float(sys.argv[4]),
+sh.coach_root = lambda: Path(sys.argv[2])
+store = None if sys.argv[5] == "True" else Store(Path(sys.argv[2]))
+print(sh.file_fix(sys.argv[3], store=store, now=float(sys.argv[4]),
                   runner=no_create, budget_fn=lambda *a: cap)["action"])
 '''
     assert sh.__file__ is not None
-    argv = [sys.executable, "-c", code, str(Path(sh.__file__).parent), str(store.root), FP, str(NOW)]
+    argv = [sys.executable, "-c", code, str(Path(sh.__file__).parent), str(store.root), FP, str(NOW), str(default_store)]
     children = [subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(6)]
     for child in children:
         out, err = child.communicate(timeout=30)

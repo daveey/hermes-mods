@@ -2829,10 +2829,13 @@ def _store(store=None):
     class _S:
         root = coach_root()
 
+        def clock(self):
+            return time.time()
+
         def log(self, rec):
             self.root.mkdir(parents=True, exist_ok=True)
             with (self.root / "log.jsonl").open("a") as f:
-                f.write(json.dumps({"ts": time.time(), **rec}) + "\n")
+                f.write(json.dumps({"ts": self.clock(), **rec}) + "\n")
     return _S()
 
 
