@@ -47,7 +47,7 @@ else:  # Standalone plugin/cron/CLI loader.
 
 # The placement helper (fence_evidence / home_pin_note) is shared by every coach card producer.
 if __package__:
-    from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, fence_evidence, home_pin_note
+    from .placement_evidence import EVIDENCE_CLOSE, EVIDENCE_OPEN, HomePinUnresolved, fence_evidence, home_pin_note, home_runs_on_argv, incident_title
 else:
     _spec = importlib.util.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     assert _spec and _spec.loader
@@ -55,6 +55,8 @@ else:
     _spec.loader.exec_module(_placement_evidence)
     EVIDENCE_OPEN, EVIDENCE_CLOSE = _placement_evidence.EVIDENCE_OPEN, _placement_evidence.EVIDENCE_CLOSE
     fence_evidence, home_pin_note = _placement_evidence.fence_evidence, _placement_evidence.home_pin_note
+    HomePinUnresolved, home_runs_on_argv = _placement_evidence.HomePinUnresolved, _placement_evidence.home_runs_on_argv
+    incident_title = _placement_evidence.incident_title
 
 COMPONENTS = ("agent", "desktop", "plugin", "cron", "kanban", "bot", "gateway", "provider", "browser", "bb", "other")
 
@@ -1359,11 +1361,11 @@ BB_SKILLS = ("five-whys", "bb-self-fix")
 FIX_SKILLS = ("five-whys", "hermes-mods-repo", "systematic-debugging")
 # Every self-heal card declares what its worker needs: core refuses an agent-run create that omits it
 # (requires_declaration_missing under kanban.require_capability_declaration), which silently dropped investigations.
-SELFHEAL_REQUIRES = ("terminal", "file", "git", "host_repo")
+SELFHEAL_REQUIRES = ("terminal", "file", "git")  # genuine capabilities; the home pin is `--runs-on machine:<gateway>`
 # A default-board fix is split in two (kanban-12ee0e4b65): the FIX card is repo work landed by push, so it declares
-# no host_repo and fences the proposal as evidence, and the hub's worker pool can run it; its VERIFY child stays on
-# this host (host_repo) for the live check and the lane `event` (both read this host's coach store and logs).
-# Before, every fix card stamped host_repo and quoted the hub-words proposal, so none left the hub's 7 slots.
+# no home pin and fences the proposal as evidence, and the hub's worker pool can run it; its VERIFY child stays on
+# this host (`--runs-on machine:<gateway>`) for the live check and the lane `event` (both read this host's coach store and logs).
+# Before, every fix card stamped a home pin and quoted the hub-words proposal, so none left the hub's 7 slots.
 FIX_REQUIRES = ("terminal", "file", "git")
 VERIFY_TITLE = "self-heal verify:"
 VERIFY_RUNTIME = 3600
@@ -1825,7 +1827,7 @@ the evidence you get (it describes where it happened, not where you work).
 
 
 def verify_brief(fp: str, st: dict, fix_card: str) -> str:
-    """The VERIFY child (host_repo, stays here): host steps, live check, and the lane event, from the fix's handoff."""
+    """The VERIFY child (machine-pinned, stays here): host steps, live check, and the lane event, from the fix's handoff."""
     return f"""Self-heal VERIFY for defect `{fp}`: owner/fix card {fix_card} (its parent here).
 {home_pin_note(PIN_VERIFY)}
 {fence_evidence('Symptom to verify: ' + str(st.get('symptom') or fp))}
@@ -2801,12 +2803,12 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
 def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[dict] = None,
               different_error: str = "") -> dict:
     r = route(d, cfg)
-    sym = re.sub(r"\s+", " ", d.get("symptom") or "defect").strip()[:90]
+    sym = incident_title(d.get("symptom"))
     return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
             "body": investigation_brief(d, previous, cfg) + (f"\n\n{different_error}\n" if different_error else ""),
             "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True}
 
 
 def kanban_argv(args: dict, hermes: str = "hermes") -> list:
@@ -2822,9 +2824,20 @@ def kanban_argv(args: dict, hermes: str = "hermes") -> list:
         argv += ["--skill", s]
     req = args.get("requires", SELFHEAL_REQUIRES)
     argv += [x for c in req for x in ("--requires", c)] if req else ["--no-requires"]
+    if args.get("home_pin"):  # the explicit machine pin; raises HomePinUnresolved on a synced board it cannot read
+        argv += home_runs_on_argv()
     for parent in args.get("parents") or []:
         argv += ["--parent", parent]
     return argv
+
+
+def _run_card(args: dict, runner=None):
+    """``_run(kanban_argv(args))``; an unresolvable home pin is a failed create (rc 1), never a portable card."""
+    try:
+        argv = kanban_argv(args)
+    except HomePinUnresolved as exc:
+        return 1, "", f"home pin unresolved: {exc}"
+    return _run(argv, runner)
 
 
 def _run(argv, runner=None, stdin=None):
@@ -3901,7 +3914,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     known, gen = known_cards(st), dec["gen"]
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
-        rc, out, err = _run(kanban_argv(args), runner)
+        rc, out, err = _run_card(args, runner)
         if rc != 0 and _board_missing_output(err, out):
             return _defer_missing_board(d, args.get("board") or "?", store, now)
         tid = _task_id(out) if rc == 0 else None
@@ -4012,7 +4025,7 @@ def _file_backport(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[str
         why = f"backport deferred: {b.get('why') or 'self-heal budget/concurrency'}; the next occurrence retries"
         store.log({**rec, "deferred": why})
         return {"action": "skip", "why": why}
-    rc, out, err = _run(kanban_argv(args), runner)
+    rc, out, err = _run_card(args, runner)
     tid = _task_id(out) if rc == 0 else None
     if not tid:
         why = (err or out).strip()[-300:]
@@ -4068,7 +4081,7 @@ def _file_undeployed(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[s
     args = {"title": f"host {dec['label']} hasn't synced fix {dec['sha'][:11]}"[:200],
             "body": undeployed_brief(d, fp, st, dec), "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": ["hermes-mods-repo"], "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True}
     if m != "live" or not is_hub(cfg):
         store.log({**rec, "would_file": True, "args": args})
         return {"action": "not_deployed", "card": None, "key": key, "why": dec["why"]}
@@ -4077,7 +4090,7 @@ def _file_undeployed(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[s
         why = f"undeployed card deferred: {b.get('why') or 'self-heal budget/concurrency'}; the next occurrence retries"
         store.log({**rec, "deferred": why})
         return {"action": "skip", "why": why, "not_deployed": True}
-    rc, out, err = _run(kanban_argv(args), runner)
+    rc, out, err = _run_card(args, runner)
     tid = _task_id(out) if rc == 0 else None
     if not tid:
         why = (err or out).strip()[-300:]
@@ -4127,13 +4140,13 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     r = route({"component": st.get("component")})
     split = split_fix(st, r["board"])
     key = fix_key(fp, generation(st) or 1)
-    # Incident text (even the "cron" component) is evidence, not an execution need.
-    args = {"title": f"{FIX_TITLE} {'defect ' + fp.rsplit('-', 1)[-1] if split else (st.get('symptom') or fp)[:90]}",
+    # Incident text (even the "cron" component) is evidence, not an execution need; titles never carry it raw.
+    args = {"title": f"{FIX_TITLE} {'defect ' + fp.rsplit('-', 1)[-1] if split else incident_title(st.get('symptom') or fp)}",
             "body": portable_fix_brief(fp, st) if split else fix_brief(fp, st),
             "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY,
-            "requires": list(FIX_REQUIRES if split else SELFHEAL_REQUIRES)}
+            "requires": list(FIX_REQUIRES if split else SELFHEAL_REQUIRES), "home_pin": not split}
     if args.get("board") and not board_present(args["board"]):
         why = f"kanban board {args['board']!r} does not exist"
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args["board"]})
@@ -4147,7 +4160,7 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         # Keep status=proposed: sync rereads the same Do-it outcome and retries admission.
         _log_deferral_once(store, fp, denied, b, now)
         return denied
-    rc, out, err = _run(kanban_argv(args), runner)
+    rc, out, err = _run_card(args, runner)
     tid = _task_id(out) if rc == 0 else None
     if not tid and _board_missing_output(err, out):
         why = (err or out).strip()[-300:] or f"kanban board {args.get('board')!r} does not exist"
@@ -4174,14 +4187,14 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
 
 
 def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: float) -> Optional[str]:
-    """File the VERIFY child of ``fix_card`` (stays on this host: host_repo). -> its id, or None (logged)."""
+    """File the VERIFY child of ``fix_card`` (stays on this host: machine pin). -> its id, or None (logged)."""
     lane = LaneState(store.root)
-    args = {"title": f"{VERIFY_TITLE} {(st.get('symptom') or fp)[:90]}", "body": verify_brief(fp, st, fix_card),
+    args = {"title": f"{VERIFY_TITLE} {incident_title(st.get('symptom') or fp)}", "body": verify_brief(fp, st, fix_card),
             "idempotency_key": verify_key(fp, generation(st) or 1), "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": VERIFY_RUNTIME, "skills": list(VERIFY_SKILLS), "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
+            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True,
             "parents": [fix_card]}
-    rc, out, err = _run(kanban_argv(args), runner)
+    rc, out, err = _run_card(args, runner)
     vid = _task_id(out) if rc == 0 else None
     if not vid or vid == fix_card:
         store.log({"event": "selfheal_file_error", "fingerprint": fp, "stage": "verify", "card": fix_card,
@@ -5006,9 +5019,9 @@ def _lane_card(title: str, body: str, key: str, runner=None) -> dict:
     """A plain Kanban card for a lane defect (not an investigation: those need this lane to become fix cards)."""
     args = {"title": title, "body": body, "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
             "max_runtime": FIX_RUNTIME, "skills": list(FIX_SKILLS), "board": None, "assignee": "default",
-            "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES)}
+            "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True}
     try:
-        rc, out, err = _run(kanban_argv(args), runner)
+        rc, out, err = _run_card(args, runner)
     except Exception as exc:
         return {"action": "error", "why": f"{type(exc).__name__}: {exc}"[:300]}
     tid = _task_id(out) if rc == 0 else None
