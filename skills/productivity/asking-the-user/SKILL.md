@@ -77,7 +77,9 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   `ssh -tt <host> 'sudo ... > out; rm -f /tmp/x'`, copy the output back to the Mac, and `tailnet_copy get` it;
   passing a hub path to the window fails because the path does not exist on the Mac. In zsh, write SSH options inline rather
   than in an unquoted variable, which does not word-split.
-- `ssh host 'cmd'` runs a non-login shell whose PATH lacks `~/bin` (where the hub's `gh` lives). A script that
+- `ssh host 'cmd'` runs a non-login shell whose PATH lacks `~/bin` (the hub's `gh`) and `~/.local/bin` (`uv`,
+  `ruff`). Start every owner-route hub command with `export PATH=$HOME/.local/bin:$HOME/bin:$PATH;`: a `git push`
+  runs the pre-push `scripts/check`, which refuses without ruff and fails the push. A script that
   resolves tools with `which` / `shutil.which` passes under the agent's own terminal, then refuses mid-apply on the
   owner route. Before running a reviewed hub apply this way, check that the package pins absolute tool paths, or
   that its read-only `check` exercises the same lookup. On a hub, also wait for the core-update drain to end before an apply: a drain restarts owner gateways, so the
