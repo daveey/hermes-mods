@@ -1305,6 +1305,13 @@ def _chat_delivery_gate(session_id: str, tool_name: str, args: dict) -> dict | N
                 ref = chat_delivery.find_delivery(s, structured=True, refused=refused)
                 if ref:
                     break
+        if not ref and tool_name in ("kanban_block", "kanban_create") and (
+                named := chat_delivery.named_chat_in_terminal_action(request)):
+            # kanban-53e6157b2f: a user_terminal action that names its sole executor chat (delivery asks above
+            # keep their FINAL SEND refusal).
+            core.log_event("terminal_action_names_chat", tool=tool_name, session=session_id, named=named)
+            return {"action": "block", "message": chat_delivery.terminal_chat_refusal(
+                named, task_id=os.environ.get("HERMES_KANBAN_TASK", ""))}
         if not ref:
             return None
         core.log_event("chat_delivery_ask_refused", tool=tool_name, session=session_id, ref=ref)

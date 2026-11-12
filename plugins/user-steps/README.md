@@ -325,6 +325,10 @@ Retirement paths and evidence review:
   undecided owners in the current local profile, since a deleted chat cannot read its own
   queue. Other profiles and gateways are not swept. `tests/test_owner_gone.py` covers
   these boundaries, the actual router path, and the hook path.
+- **dead-chat terminal asks**: `stale_watch.py` files one Kanban card (key
+  `user-steps-dead-chat-ask:<task>:<session>`, never Inbox) for a blocked card whose `user_terminal` action names a
+  session id that has had no turn in any local profile store 30 min after the block (self-heal kanban-53e6157b2f,
+  `tests/test_dead_chat_ask_watch.py`). CLI runs only; `run()` keeps it off by default (`dead_chats=True`).
 - **hygiene review**: `stale_watch.py` files one local Kanban review card per PT day for
   undecided, non-card-bound asks older than 72 hours that were not reviewed in the last
   seven days. The card includes request IDs/titles, owner-chat titles/last-turn times,

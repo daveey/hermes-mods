@@ -28,7 +28,11 @@ owner and actual user decision before offering choices: another session may alre
 Do not infer personal execution or authorization from an SSO identity alone. Record the superseding decision on
 the existing owners and resume replanning; do not mechanically refresh/apply an obsolete plan or undo newer work.
 Before filing an `action_request` for a card's ask, read the card's newest comments for a request id another chat
-already published, and the card's named sole owner chat: if either exists, don't file a second one. Duplicates
+already published, and the card's named sole owner chat: if either exists, don't file a second one. A named owner
+chat counts only if it has had a turn since the ask was filed; a chat with no turn since (reaped, closed) cannot run
+the step, so the live owner chat that got the notice runs it itself and comments the result on the card, instead of
+deferring to it. A card's action never needs a chat id: the canonical owner-terminal action ("From your own Hermes
+chat open the owner-terminal flow for task <id>") puts chat refs in scope (ask-gate refuses one in the action). Duplicates
 split the user's answer, and the copy not consumed sits stale in For-you. Withdraw yours as soon as the card shows
 the ask was answered elsewhere or the card left `blocked`. Say an ask is withdrawn only once the withdraw result
 reads `withdrawn`; `withdraw.requestId` needs the full UUID (an 8-char prefix returns 404 "Unknown request").

@@ -113,6 +113,12 @@ non-worker `cross_session` as the route. Not matched: "reply in this chat", "tel
 refusal logs `chat_delivery_ask_refused`. Why: self-heal agent-c25865e208 (workers asked David for hours to type a
 line into a repair chat that a FINAL SEND delivered).
 
+**Chat-named terminal asks (L3, no model call).** A `user_terminal` `human_request` (on `kanban_block` or
+`kanban_create`) whose `action` names a chat (an `@session:` ref, a bare session id, "owner chat" / "owner Desktop
+chat") is refused with the canonical action `owner_terminal_action(<task>)`; chat refs go in `scope`. Logs
+`terminal_action_names_chat`. Why: self-heal kanban-53e6157b2f (the named chat was reaped, the live chat deferred to
+it, and the card sat blocked). `tests/test_named_owner_chat_action.py`.
+
 **Terminal hand-offs (L2, no model call).** Before the judge, `handoff.py` looks for a sentence that hands the user a
 step a shell could do: an imperative (run / paste / type / enter / add / install…, after a sentence start, a comma,
 "please", "you need to", "I'd rather you") aimed at something only a shell does (`sudo`, `ssh`, `authorized_keys`,

@@ -232,6 +232,91 @@ def failed_decision_card(f):
             'body': body, 'idempotency_key': 'user-steps-failed-decision:' + oid, 'assignee': 'default'}
 
 
+# ---- a blocked user_terminal ask naming a dead chat as its executor (self-heal kanban-53e6157b2f) ------------
+# "From owner chat <id>, run ..." sat blocked for hours: the named chat had been reaped, got no turn from the notice,
+# and the live chat deferred to it. ask-gate refuses new asks like that; this catches any that got through.
+DEAD_CHAT_ASK_AGE = 1800
+_ASK_SID = re.compile(r"\b\d{8}_\d{6}_[0-9a-f]{6}\b")
+
+
+def _session_dbs(core):
+    h = core.home()
+    return [p for p in [h / 'state.db', *sorted((h / 'profiles').glob('*/state.db'))] if p.is_file()]
+
+
+def last_turn(core, sid, dbs=None):
+    """(found, last message timestamp or None) for a session id across this home's profile stores."""
+    found = False
+    for db in (_session_dbs(core) if dbs is None else dbs):
+        try:
+            c = core._ro_connect(db, timeout=2)
+            try:
+                row = c.execute('SELECT count(*), max(timestamp) FROM messages WHERE session_id=?', (sid,)).fetchone()
+            finally:
+                c.close()
+        except Exception:
+            continue
+        if row and row[0]:
+            found = True
+            if row[1] is not None:
+                return True, float(row[1])
+    return found, None
+
+
+def dead_chat_asks(core, now=None, *, boards=None, turn=None, min_age=DEAD_CHAT_ASK_AGE):
+    """Blocked cards whose user_terminal action names a chat that has had no turn since the block, min_age after it."""
+    now = time.time() if now is None else now
+    boards = core.kanban_boards() if boards is None else boards
+    turn = (lambda sid: last_turn(core, sid)) if turn is None else turn
+    out = []
+    for slug, path in boards:
+        try:
+            c = core._ro_connect(path, timeout=2)
+            try:
+                rows = c.execute("SELECT t.id, t.title, t.human_request, (SELECT max(e.created_at) FROM task_events e "
+                                 "WHERE e.task_id=t.id AND e.kind='blocked') FROM tasks t WHERE t.status='blocked' "
+                                 "AND t.human_request LIKE '%user_terminal%'").fetchall()
+            finally:
+                c.close()
+        except Exception:
+            continue
+        for tid, title, raw, blocked_at in rows:
+            try:
+                hr = json.loads(raw or '{}')
+            except ValueError:
+                continue
+            if not isinstance(hr, dict) or str(hr.get('interaction') or '').lower() != 'user_terminal':
+                continue
+            if blocked_at is None or now - float(blocked_at) < min_age:
+                continue
+            for sid in dict.fromkeys(_ASK_SID.findall(str(hr.get('action') or ''))):
+                found, last = turn(sid)
+                if last is not None and last >= float(blocked_at):
+                    continue
+                out.append({'board': slug, 'task': tid, 'title': title, 'session': sid, 'blockedAt': float(blocked_at),
+                            'lastTurnAt': last, 'found': found, 'action': str(hr.get('action') or '')})
+    return out
+
+
+def dead_chat_ask_card(d):
+    when = time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(d['blockedAt']))
+    last = ('never seen in this home' if not d['found'] else 'no messages' if d['lastTurnAt'] is None
+            else time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(d['lastTurnAt'])))
+    evidence = (f"- Card: {d['task']} (board {d['board']}): {d['title']}\n- Blocked at: {when}\n"
+                f"- Named chat: {d['session']} (last turn: {last})\n- Action:\n{d['action']}")
+    body = (f"A blocked card's user_terminal ask names one chat as its executor, and that chat has had no turn "
+            f"since the block ({DEAD_CHAT_ASK_AGE // 60} min+). David cannot act on it, and a live chat that gets "
+            f"the notice defers to the named one.\n\n{fence_evidence(evidence)}\n\n"
+            f"Re-file the ask on that card with the canonical action (ask-gate chat_delivery.owner_terminal_action: "
+            f"'From your own Hermes chat open the owner-terminal flow for task <id>. ...'), chat refs in scope, and "
+            f"comment on the card; or, from a live owner chat, run the step and comment the result on the card. Then "
+            f"find why ask-gate let the action through (log event terminal_action_names_chat).\n"
+            f"Source: plugins/user-steps/stale_watch.py (self-heal kanban-53e6157b2f).\n\n{home_pin_note(_PIN)}")
+    return {'title': f"user-steps: card {d['task']} waits on dead chat {d['session']} for a terminal step",
+            'body': body, 'idempotency_key': f"user-steps-dead-chat-ask:{d['task']}:{d['session']}",
+            'assignee': 'default'}
+
+
 def _iso_ts(value):
     from datetime import datetime
     try:
@@ -793,7 +878,7 @@ def _ledger(core, owner):
 
 
 def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_card, review_create=None, cards=None,
-        local_gateway=None):
+        local_gateway=None, dead_chats=False):
     now = time.time() if now is None else now
     opened = []
     if cards is not None:
@@ -817,6 +902,10 @@ def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_car
     for u in undelivered_decisions(core, store, now=now):
         create(undelivered_card(u))  # one card per operation; idempotent on its key
         opened.append('undelivered:' + u['operationId'])
+    if dead_chats:
+        for d in dead_chat_asks(core, now=now):
+            create(dead_chat_ask_card(d))  # one card per (card, chat); idempotent on its key
+            opened.append(f"dead-chat-ask:{d['task']}:{d['session']}")
     if review_create is not None:
         listed = review_old_asks(core, store, now=now, create=review_create, local_gateway=_local_gateway(core))
         if listed:
@@ -926,7 +1015,7 @@ def main(argv=None):
     # Dry run writes nothing, so no card closes either.
     cards = None if a.dry_run else _load('cards').QualifiedCardDelivery()
     ids = run(core, chat, store, min_age=a.min_age, create=create, review_create=review_create, cards=cards,
-              local_gateway=local_gateway)
+              local_gateway=local_gateway, dead_chats=True)
     print(json.dumps({'cards': ids}))
     return 0
 

@@ -160,6 +160,37 @@ OWNER_TERMINAL_EVIDENCE = (
 _TASK_ID = re.compile(r"t_[0-9a-f]{8}(?:[0-9a-f]{8})?")
 
 
+# A chat named in a user_terminal ask's ACTION (kanban-53e6157b2f): "From owner chat <id>, run ...", "In owner Desktop
+# chat <id>", an @session ref or a bare session id. David reads the action; a chat there makes him relay to a chat
+# that may be dead (reaped), and the live chat that got the notice defers to it. Chat refs go in scope.
+_BARE_SID = re.compile(r"\b\d{8}_\d{6}_[0-9a-f]{6}\b")
+_OWNER_CHAT = re.compile(r"\bowner(?:'s)?\s+(?:desktop\s+|hermes\s+)?chat\b", re.I)
+
+
+def named_chat_in_terminal_action(request: Any) -> str | None:
+    """The chat a ``user_terminal`` request's action names as executor, else None. Scope may name chats."""
+    if not isinstance(request, dict):
+        return None
+    if str(request.get("interaction") or "").strip().lower() != "user_terminal":
+        return None
+    action = str(request.get("action") or "")
+    for rx in (_REF, _BARE_SID, _OWNER_CHAT):
+        m = rx.search(action)
+        if m:
+            return m.group(0)
+    return None
+
+
+def terminal_chat_refusal(named: str, task_id: str = "") -> str:
+    return ("ask-gate: refused. This user_terminal ask's action names a chat (" + repr(named) + ") as the one that "
+            "must run the step. David reads the action; a named chat may have no live agent (reaped chats get no "
+            "turn), and the live chat that receives the notice then defers to it, so the card sits blocked. Use "
+            f"the canonical action verbatim: {owner_terminal_action(task_id)!r} with interaction 'user_terminal', "
+            f"why_human {OWNER_TERMINAL_REASON!r}, evidence {OWNER_TERMINAL_EVIDENCE!r} (attest the refusals only "
+            "if you got them this turn). Put host, cwd, exact command and any chat refs in scope; chat refs go in "
+            "scope, never in action. Any live owner chat that receives the notice may run it.")
+
+
 def owner_terminal_action(task_id: str) -> str:
     task = task_id if _TASK_ID.fullmatch(task_id or "") else "<task_id>"
     return (f"From your own Hermes chat open the owner-terminal flow for task {task}. "
