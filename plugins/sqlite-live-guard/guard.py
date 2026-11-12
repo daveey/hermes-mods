@@ -654,7 +654,8 @@ def _hd_file_run_re(path: str):
     s, sh = _HD_RUN_START, _HD_SHELL
     subst = r"(?:\$\(|<\(|`)\s*(?:cat\s+(?:-\S+\s+)*|<\s*)" + p + r"\s*[)`]"
     return _hd_exec_re(subst, (
-        s + sh + r"(?:[ \t]+-\S+)*[ \t]*<[ \t]*" + p,
+        s + sh + r"(?:[ \t]+-\S+)*[ \t]*0?<[ \t]*" + p,
+        s + r"0?<[ \t]*" + p + r"[ \t]+" + _HD_RUN_WRAP + sh,
         s + r"cat[ \t]+(?:-\S+[ \t]+)*" + p + r"[ \t]*\|[ \t]*" + _HD_RUN_WRAP + sh,
         s + r"(?:source|\.)[ \t]+/dev/stdin[ \t]*<[ \t]*" + p,
         s + sh + r"[ \t]+(?:-\S+[ \t]+)*<\(\s*cat[ \t]+(?:-\S+[ \t]+)*" + p,
