@@ -52,6 +52,10 @@ the slice's `harvest-v2` source (some families have two); a different prefix set
 For interruptible collectors, checkpoint each external delivery and reconcile its durable receipt before retrying;
 test late completions, interruption and concurrent writers rather than only uninterrupted sequential runs.
 
+When you change a cron's behaviour through its skill, read the cron's prompt too (`~/.hermes/cron/jobs.json`) and edit any
+sentence that contradicts the change. The run obeys the prompt over the skill and will "fix" the skill, code and tests
+back to the prompt's rule. A user-requested exception goes in the prompt and the state file's Lessons as well.
+
 Prepend to the prompt: `STATE: first run python3 $S show <job> and follow its Lessons and Watch list.` Append:
 `Last step, every run (including [SILENT] runs): python3 $S record <job> --last-run ... --tried ...` with the
 fields above. Edit with `hermes cron edit <id> --prompt "$(cat new.txt)"` on the job's host, then trigger or wait
