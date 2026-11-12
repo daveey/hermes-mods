@@ -184,10 +184,25 @@ def test_status_lookup_failure_opens_recurrence(tmp_path, failure):
     assert not r.comments()
 
 
-def test_next_day_opens_a_new_card(tmp_path, capsys):
+def test_next_day_comments_on_the_still_open_incident_card(tmp_path, capsys):
     r = Runner()
     write_log(tmp_path, 40)
     assert run(tmp_path, r) == 0
+    tomorrow = NOW + timedelta(days=1)
+    write_log(tmp_path, 40, now=tomorrow)
+    assert run(tmp_path, r, now=tomorrow) == 0  # yesterday's card is still running: same incident
+    out = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert out["cards"][0]["action"] == "commented" and out["cards"][0]["task_id"] == "t_00000000"
+    assert list(r.keys) == ["backend-timeouts:laptop-1:2026-10-27"]
+    (argv, _), = r.comments()
+    assert argv[3] == "t_00000000"
+
+
+def test_next_day_opens_a_new_card_once_the_earlier_one_closed(tmp_path, capsys):
+    r = Runner()
+    write_log(tmp_path, 40)
+    assert run(tmp_path, r) == 0
+    r.statuses["t_00000000"] = "done"
     tomorrow = NOW + timedelta(days=1)
     write_log(tmp_path, 40, now=tomorrow)
     assert run(tmp_path, r, now=tomorrow) == 0
