@@ -83,11 +83,12 @@ class DisabledSelection(unittest.TestCase):
         a, b = entry('A', access_token='sk-ant-shared-fixture'), entry('B', access_token='sk-ant-shared-fixture')
         ident = _identity_id_for('anthropic', b)
         self.assertEqual(ident, _identity_id_for('anthropic', a))  # two rows of one account
-        with patch.object(cpd, 'disabled_keys', return_value=(frozenset({'A', 'B'}), frozenset())):
+        # Use core's producer: the guarded record shape evolves independently of selection.
+        with patch.object(cpd, 'disabled_keys', return_value=cpd._keys_from_records([{'id': 'A'}, {'id': 'B'}])):
             with self.assertRaisesRegex(s.SelectionRejected, 'disabled'):
                 s.choose_snapshot([a, b], provider='anthropic', model='claude-fixture',
                                   account_id=ident, base_url='https://api.anthropic.com')
-        with patch.object(cpd, 'disabled_keys', return_value=(frozenset({'A'}), frozenset())):
+        with patch.object(cpd, 'disabled_keys', return_value=cpd._keys_from_records([{'id': 'A'}])):
             result = s.choose_snapshot([a, b], provider='anthropic', model='claude-fixture',
                                        account_id=ident, base_url='https://api.anthropic.com')
         self.assertEqual(result.entry_id, 'B')
