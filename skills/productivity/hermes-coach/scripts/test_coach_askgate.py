@@ -233,6 +233,129 @@ class BabyBearSplit(unittest.TestCase):
             self.assertIn("camera stream", row["quote"])
 
 
+class ContentFreeHandoff(unittest.TestCase):
+    """bb-tuner may not carry quotes in its context: the handoff has a twin file with fixed keys only."""
+    QUOTE = "the camera stream is broken, fix it"
+
+    def bb_hits(self, d):
+        import json
+        os.makedirs(f"{d}/macbook/default")
+        with open(f"{d}/macbook/default/s1.json", "w") as fh:
+            json.dump({"id": "s1", "host": "macbook", "source": "desktop", "title": "x", "user_turns": [
+                {"t": 2000, "text": self.QUOTE}, {"t": 2100, "text": "root cause the sidebar bug"}]}, fh)
+        hits, _ = g.collect(d, 0, 10**10)
+        return [h for h in hits if h["class"] == g.BB_CLASS]
+
+    def test_twin_file_has_fixed_keys_and_the_legacy_ids(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bb = self.bb_hits(d)
+            out = Path(d) / "bbt" / "askgate-bb-misses.jsonl"
+            out.parent.mkdir()
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (1, 0))
+            twin = out.parent / "askgate-bb-requests.jsonl"
+            rows = [json.loads(x) for x in twin.read_text().splitlines()]
+            legacy = [json.loads(x) for x in out.read_text().splitlines()]
+            self.assertEqual([r["id"] for r in rows], [r["id"] for r in legacy])
+            self.assertEqual(set(rows[0]), set(g.BB_REQUEST_KEYS))
+            self.assertNotIn("quote", rows[0])
+            self.assertNotIn("camera", twin.read_text())
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (0, 1))  # idempotent
+            self.assertEqual(len(twin.read_text().splitlines()), 1)
+
+    def test_projection_backfills_old_legacy_rows_without_content(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "askgate-bb-misses.jsonl"
+            out.write_text(json.dumps({"id": "askgate-bb:s0:1", "t": 1, "when": "x", "week": "2026-10-12",
+                                       "host": "macbook", "session": "s0", "pattern": "is-broken",
+                                       "quote": self.QUOTE, "extra": "title text"}) + "\nnot json\n"
+                           + json.dumps({"t": 5, "quote": "no id"}) + "\n")
+            self.assertEqual(g.project_bb_handoff(out), 1)
+            self.assertEqual(g.project_bb_handoff(out), 0)
+            twin = Path(d) / "askgate-bb-requests.jsonl"
+            self.assertEqual(json.loads(twin.read_text()), {"id": "askgate-bb:s0:1", "t": 1, "week": "2026-10-12",
+                                                          "host": "macbook", "session": "s0", "pattern": "is-broken"})
+            self.assertIsNone(g.project_bb_handoff(Path(d) / "nope" / "x.jsonl"))
+
+    def test_jsonl_ids_survive_unicode_separators_inside_a_row(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "legacy.jsonl"
+            r = {"id": "askgate-bb:s1:5", "t": 5, "quote": "a\u2028b\u0085c\x0cd\x1ce\x1df"}
+            p.write_text(json.dumps(r, ensure_ascii=False) + "\n" + json.dumps(dict(r, id="askgate-bb:s2:6")) + "\n",
+                         encoding="utf-8")
+            self.assertEqual(g._jsonl_ids(p), {"askgate-bb:s1:5", "askgate-bb:s2:6"})
+            # so a hand-off of a hit whose id is already in the file does not append it again
+            self.assertEqual(g.hand_to_bb_tuner([{"session": "s1", "t": 5, "pattern": "is-broken", "host": "h",
+                                                  "text": "x", "turn": 0}], p)[0], 0)
+
+    def test_unicode_separators_in_a_quote_do_not_make_the_handoff_rewrite_the_row(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            old = self.QUOTE
+            type(self).QUOTE = old + " \u2028 \u0085 \x0c \x1c \x1d"   # splitlines() would cut the legacy row apart
+            try:
+                bb = self.bb_hits(d)
+            finally:
+                type(self).QUOTE = old
+            out = Path(d) / "bbt" / "askgate-bb-misses.jsonl"
+            out.parent.mkdir()
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (1, 0))
+            self.assertEqual(g.hand_to_bb_tuner(bb, out), (0, 1))      # not re-appended on the next run
+            self.assertEqual(len(out.read_bytes().split(b"\n")), 2)     # one row + trailing newline
+            twin = out.parent / "askgate-bb-requests.jsonl"
+            self.assertEqual(len(twin.read_text().splitlines()), 1)
+
+    def test_long_session_ids_hostile_t_values_and_torn_utf8(self):
+        import json, tempfile
+        sid = "local-" + "ab12" * 16                                   # hub session ids are 70 characters
+        good = {"id": f"askgate-bb:{sid}:1793652485", "t": 1793652485, "week": "2026-11-02", "host": "mini",
+                "session": sid, "pattern": "is-broken"}
+        ugly = dict(good, id="askgate-bb:s2:1793652486", t=1793652486, session="s2",
+                    quote="a\u2028b\u0085c\x0cd\x1ce\x1df")                # splitlines() would cut this row apart
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "askgate-bb-misses.jsonl"
+            weird = [dict(good, id=["x"], t=1), dict(good, t=float("nan")), dict(good, t=float("inf")),
+                     dict(good, t=10 ** 400), dict(good, t="1793652485")]
+            with open(out, "wb") as fh:
+                for r in weird:
+                    fh.write(json.dumps(r).encode() + b"\n")
+                fh.write(b'{"quote": "\xe2\x82')                           # torn multi-byte sequence, no newline
+                fh.write(b"\n" + json.dumps(ugly, ensure_ascii=False).encode() + b"\n")
+                fh.write(json.dumps(good).encode() + b"\n")
+            self.assertEqual(g.project_bb_handoff(out), 2)
+            got = [json.loads(x) for x in (Path(d) / "askgate-bb-requests.jsonl").read_text().splitlines()]
+            self.assertEqual(sorted(r["id"] for r in got), sorted([good["id"], ugly["id"]]))
+            self.assertNotIn("quote", json.dumps(got))
+            self.assertEqual(g.project_bb_handoff(out), 0)              # idempotent
+
+    def test_values_are_shape_checked_and_a_torn_twin_line_is_closed(self):
+        import json, tempfile
+        ok = {"id": "askgate-bb:s1:5", "t": 5, "week": "2026-10-12", "host": "macbook", "session": "s1",
+              "pattern": "is-broken"}
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "askgate-bb-misses.jsonl"
+            rows = [dict(ok, host=self.QUOTE, pattern=self.QUOTE, week=self.QUOTE),     # free text in value fields
+                    dict(ok, id="askgate-bb:s2:5", session="other"),                   # id disagrees with session
+                    dict(ok, id="askgate-bb:s3:6"),                                    # id disagrees with t
+                    dict(ok, id="askgate-bb:" + self.QUOTE + ":5", session=self.QUOTE),  # free text as the id
+                    dict(ok, id="askgate-bb:s4:5", session="s4", host="\\ud800bad".encode().decode("unicode_escape")),
+                    dict(ok, id="askgate-bb:s5:5", session="s5", t=True)]
+            out.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            twin = Path(d) / "askgate-bb-requests.jsonl"
+            twin.write_text('{"id": "torn')  # a previous write died mid-line, no newline
+            self.assertEqual(g.project_bb_handoff(out), 2)
+            lines = twin.read_text().splitlines()
+            self.assertEqual(lines[0], '{"id": "torn')
+            got = [json.loads(x) for x in lines[1:]]
+            self.assertEqual([r["id"] for r in got], ["askgate-bb:s1:5", "askgate-bb:s4:5"])
+            self.assertEqual((got[0]["host"], got[0]["pattern"], got[0]["week"]), (None, None, None))
+            self.assertIsNone(got[1]["host"])
+            self.assertNotIn("camera", twin.read_text())
+            twin.read_text().encode("ascii")  # surrogates etc. were never written raw
+
+
 class RouteToLane(unittest.TestCase):
     """The weekly review's Do-it work goes to the self-heal lane: each hit is filed as a monitor finding unless the
     lane already has that session; the card keeps its review prompt only for hits the lane did not take."""
