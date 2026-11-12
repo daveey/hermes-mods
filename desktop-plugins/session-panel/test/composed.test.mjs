@@ -27,6 +27,7 @@ register('data:text/javascript,' + encodeURIComponent(`export async function res
 };return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const panel = await import('../plugin.js')
 const steps = await import('../../user-steps/plugin.js')
+const taskProjection = await import('../../session-tasks/plugin.js')
 const { createRoot } = require('react-dom/client')
 const root = createRoot(document.getElementById('root'))
 const el = () => document.getElementById('root')
@@ -47,7 +48,7 @@ const canonicalRequest = {
   choices: [{ id: 'a', label: 'Keep it', effect: 'answer' }, { id: 'b', label: 'Release it', effect: 'answer' }]
 }
 
-function wire({ chips, items, requests = [] }) {
+function wire({ chips, items, requests = [], ledgerSteps = [STEP] }) {
   window.localStorage.clear()
   window.__sessionTasks = { snapshot: { runtime: 'R1', stored: 'S1', chips }, subscribe: () => () => {}, refresh() {}, openTaskChip() {}, lineageIds: async id => new Set([id]) }
   window.__blockedPanel = { snapshot: { stored: 'S1', connectionId: 'C1', profile: 'default', items } }
@@ -55,7 +56,7 @@ function wire({ chips, items, requests = [] }) {
     api: async ({ path }) => {
       if (path.includes('/session-cards')) return { tasks: [], includes: ['done'] }
       if (path.includes('/requests')) return { requests }
-      if (path.includes('/steps')) return { steps: [STEP], card: null }
+      if (path.includes('/steps')) return { steps: ledgerSteps, card: null }
       if (path.includes('/ping')) return { ok: true }
       return {}
     }
@@ -135,8 +136,71 @@ test('composed: bound card question replaces legacy rows and Skip leaves no Need
   assert.equal(stripCards(id).length, 0)
   assert.equal(el().querySelector('[data-section="needs-you"]'), null)
   assert.equal(window.__sessionTasks.snapshot.chips[0].state, 'blocked')
+  assert.match(el().querySelector('[data-card-status]').textContent, /blocked · request dismissed/)
   assert.equal(steps.requestForSource([{ ...request, presentation: undefined }], ref), null, 'a citation alone is not a bound display alias')
   assert.equal(steps.requestForSource([request], { ...ref, board: 'other' }), null)
+  await React.act(async () => root.render(null)); dispose()
+})
+
+for (const state of ['withdrawn', 'resolved', 'superseded', 'cancelled']) test(`composed: remote blocked owner stays findable after its canonical ask is ${state}`, async () => {
+  await React.act(async () => root.render(null))
+  const id = 't_remote_blocker'
+  const ref = { gatewayId: 'G2', profile: 'default', type: 'kanban', board: 'default', id }
+  const request = { ...canonicalRequest, state, owner: { ...canonicalRequest.owner, gatewayId: 'G2' }, aliases: [ref] }
+  const remote = chip(id, { gateway: 'G2', gatewayId: 'G2', connectionId: 'C2', humanRequest: { action: 'Choose a build host.', why: 'Only the owner can choose.' } })
+  const relay = chip('t_relay', { state: 'scheduled', look: 'waiting', humanRequest: null })
+  const dispose = wire({ chips: [relay, remote], items: [], requests: [request] })
+  const opened = []
+  window.__sessionTasks.openTaskChip = c => opened.push(c)
+  await render(`remote-retired-${state}`)
+  const row = el().querySelector('[data-card-status]')
+  assert.ok(row, 'the blocked owner must not vanish behind the scheduled relay')
+  assert.match(row.textContent, /G2.*default.*t_remote_blocker.*blocked/)
+  assert.match(row.textContent, /Previous request \(reference only\): Choose a build host/)
+  assert.equal(steps.openAskCount(), 0)
+  assert.ok(el().querySelector('[data-section="needs-you"]') === null)
+  assert.equal(row.querySelectorAll('button').length, 1)
+  await React.act(async () => row.querySelector('[data-open-card]').click())
+  assert.deepEqual(opened, [remote])
+  await React.act(async () => root.render(null)); dispose()
+})
+
+for (const status of ['blocked', 'scheduled']) test(`composed: scheduled relay and ${status} remote owner use the task-list projection`, async () => {
+  await React.act(async () => root.render(null))
+  const rows = [
+    { id: 't_relay', title: 'Forwarded work', status: 'scheduled', profile: 'default' },
+    { id: 't_forwarded', title: 'Remote work', status, gateway: 'G2', connectionId: 'C2', profile: 'default', board: 'default',
+      human_request: { action: 'Choose a build host.', why_human: 'The owner must choose.' },
+      wait: { wait_state: status === 'blocked' ? 'human' : 'waiting', waiting_on: status === 'blocked' ? 'you' : 'deployment' } }
+  ]
+  const chips = taskProjection.sessionTaskChips(rows, { connectionId: 'C1', profile: 'default' })
+  const dispose = wire({ chips, items: [] })
+  await render(`projected-${status}`)
+  if (status === 'blocked') {
+    const row = el().querySelector('[data-ask-row]')
+    assert.ok(row)
+    assert.match(row.textContent, /Choose a build host/)
+    assert.match(row.textContent, /t_forwarded/)
+    assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 1')
+  } else {
+    assert.ok(el().querySelector('[data-section="needs-you"]') === null)
+    assert.ok(el().querySelector('[data-card-status]') === null)
+  }
+  await React.act(async () => root.render(null)); dispose()
+})
+
+test('composed: resolved receipt keeps its queue mounted even when no actionable asks remain', async () => {
+  await React.act(async () => root.render(null))
+  const id = 't_receipt_blocker'
+  const ref = { gatewayId: 'G2', profile: 'default', type: 'kanban', board: 'default', id }
+  const request = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000099', state: 'resolved',
+    resolution: { operationId: 'receipt-status', choiceId: 'a', revision: 1 },
+    owner: { ...canonicalRequest.owner, gatewayId: 'G2' }, aliases: [ref] }
+  const dispose = wire({ chips: [chip(id, { gatewayId: 'G2', gateway: 'G2', connectionId: 'C2' })], items: [], ledgerSteps: [], requests: [request] })
+  await render('resolved-receipt-only')
+  assert.ok(el().querySelector('[data-session-panel]'), 'receipt-only work must mount the queue that performs readback')
+  assert.ok(el().querySelector('[data-action-request]'))
+  assert.ok(el().querySelector('[data-card-status]') === null, 'readback-visible queue owns its status')
   await React.act(async () => root.render(null)); dispose()
 })
 
