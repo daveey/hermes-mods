@@ -79,12 +79,29 @@ hook command, never as shell input.
 
 ## Boundaries
 
+Broad-signal rules do not depend on a successful process snapshot: broadcast
+`kill(-1, signal)` (including libc `killpg(1, signal)`), process-group SIGKILL,
+and UID-selected `pkill` SIGKILL are refused for recognized literal commands.
+Use verified individual child PIDs for cleanup. Whole-user-manager termination,
+user-slice disruption and `systemctl --user exit` are refused even through the
+pause wrapper. These checks preserve signal-zero probes. `tests/test_broadcast.py`
+exercises empty discovery, shell/SSH/wrapper forms, inline Python, execute_code,
+nested hook batches and read-only controls without executing any signal payload.
+
+Why this layer was missing: the older group matcher treated `killpg(1, ...)` as
+PGID 1 rather than libc's UID-wide broadcast; an empty discovery result also
+turned dangerous literal broadcasts into no matches. Tests previously seeded
+known backend PIDs. The new empty-discovery cases fail before this change and
+pass after it. This prevents explicit tool commands, not a test fixture calling
+the syscall inside an arbitrary script: that path needs strict PID/ownership
+validation at the actual signal boundary (or OS isolation).
+
 This is a best-effort lexical guard, not a shell security sandbox. It recognizes
 literal commands, selected executable wrappers and at most three nested shell/SSH
 layers. It does not resolve aliases, variables, generated commands, arbitrary scripts,
-arbitrary Python scripts (other than the recognized inline -c os.kill calls), command
-substitutions, variable-derived PIDs, Python aliases/dynamic arguments, or selector-only
-pkill/killall invocations. Complex
+arbitrary Python scripts (other than the recognized inline -c os.kill calls),
+variable-derived PIDs, Python aliases/dynamic arguments, or general selector-only
+pkill/killall invocations beyond the UID-selected SIGKILL rule. Complex
 shell grammar (including heredoc stdin) is not fully parsed; combined SSH option bundles
 and options with values for sudo/systemctl are not fully modeled. The existing
 Hermes execute_code checker is heuristic (including a broad pause-turns allowance).

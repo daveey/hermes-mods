@@ -45,6 +45,8 @@ MESSAGE = (
     "The wrapper holds admission, waits for resumable turns to pause, runs the command under the hold, then "
     "releases it. It still runs the command when a turn does not pause within the timeout.\n"
     "Never signal a live gateway, its launcher, or Desktop backend (only signal 0 is safe). "
+    "Broad signals and whole-user-manager termination are not made safe by the wrapper; "
+    "use verified individual child PIDs for cleanup. "
     "For restart use python3 ~/.hermes/sync-runner/hermes-sync pause-turns --timeout 180 -- "
     "hermes gateway restart. For stacks use sample <pid> 5 on macOS or "
     "py-spy dump --nonblocking --pid <pid> on Linux, never a signal."
@@ -343,6 +345,14 @@ def _targets_pid(pid: int, rows: dict, group=False) -> bool:
     return pid in rows
 
 
+def _broad_signal(pid: int, sig: str, group=False) -> bool:
+    """Independent of discovery: libc killpg(1, sig) is kill(-1, sig)."""
+    if sig in {'0', 'EXIT', 'SIG0'}:
+        return False
+    target = -pid if group else pid
+    return target == -1 or (target <= 0 and sig in {'9', 'KILL', 'SIGKILL'})
+
+
 def _python_signals(code: str, host=None) -> Optional[str]:
     try:
         tree = ast.parse(code)
@@ -364,6 +374,11 @@ def _python_signals(code: str, host=None) -> Optional[str]:
             continue
         if isinstance(node.args[1], ast.Constant) and node.args[1].value == 0:
             continue
+        signal_node = node.args[1]
+        sig = (str(signal_node.value) if isinstance(signal_node, ast.Constant)
+               else signal_node.attr if isinstance(signal_node, ast.Attribute) else '')
+        if _broad_signal(pid, sig, func.attr == 'killpg'):
+            return f'Python os.{func.attr} broad signal target {pid}; use verified individual child PIDs'
         if rows is None:
             rows = protected_processes(host)
         if _targets_pid(pid, rows, func.attr == 'killpg'):
@@ -388,11 +403,45 @@ def _signal_argv(argv: list, depth=0, host=None) -> Optional[str]:
     if re.fullmatch(r'python(?:3(?:\.\d+)?)?', prog) and '-c' in args:
         i = args.index('-c')
         return _python_signals(args[i + 1], host) if i + 1 < len(args) else None
+    # A user manager owns every user service, not only the gateway. Never permit
+    # terminating it through pause-turns, which only fences a particular backend.
+    if prog in {'loginctl', 'systemctl'}:
+        operands, signal_value, skip = [], None, False
+        for i, arg in enumerate(args):
+            if skip:
+                skip = False
+                continue
+            if arg in {'--signal', '-s', '--host', '-H', '--machine', '-M', '--property', '-p'}:
+                skip = True
+                if arg in {'--signal', '-s'} and i + 1 < len(args):
+                    signal_value = args[i + 1]
+            elif arg.startswith('--signal='):
+                signal_value = arg.split('=', 1)[1]
+            elif not arg.startswith('-'):
+                operands.append(arg)
+        verb = operands[0] if operands else ''
+        if prog == 'loginctl' and (verb == 'terminate-user' or
+                (verb == 'kill-user' and signal_value not in {'0', 'SIG0'})):
+            return 'termination or signalling of a whole user service manager'
+        if prog == 'systemctl':
+            if verb == 'exit' and '--user' in args:
+                return 'exit of a whole user service manager'
+            if verb in DISRUPTIVE | {'disable', 'mask'} and not (verb == 'kill' and signal_value in {'0', 'SIG0'}):
+                if any(re.fullmatch(r'user@[^/]+(?:\.service)?|user(?:-[^/]+)?\.slice', a) for a in operands[1:]):
+                    return 'disruption of a whole user service manager'
     if prog not in {'kill', 'pkill', 'killall'}:
         return None
     sig, rest = _signal_args(args, prog)
     if sig in {'0', 'EXIT', 'SIG0'} or (prog == 'kill' and args and args[0] in {'-l', '-L'}):
         return None
+    if prog == 'kill':
+        for operand in rest:
+            if re.fullmatch(r'-?\d+', operand) and _broad_signal(int(operand), sig):
+                return f'broad signal {sig} target {operand}; use verified individual child PIDs'
+    if prog == 'pkill' and sig in {'9', 'KILL', 'SIGKILL'}:
+        if any(a in {'-u', '-U', '--uid', '--euid'} or a.startswith(('--uid=', '--euid='))
+               or re.fullmatch(r'-[^-]*[uU].*', a) for a in rest):
+            return 'UID-selected SIGKILL; use verified individual child PIDs'
     rows = protected_processes(host)
     if prog == 'kill':
         for operand in rest:
