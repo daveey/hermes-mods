@@ -61,7 +61,7 @@ def placement():
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch):
+def store(tmp_path, monkeypatch, board_identity):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("COACH_SELFHEAL_NO_EXEC", "1")
     monkeypatch.setattr(sh, "coach_root", lambda: tmp_path / "coach")
@@ -102,11 +102,20 @@ def fields(argv):
         return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
     return {"title": argv[argv.index("create") + 1], "body": argv[argv.index("--body") + 1],
             "assignee": argv[argv.index("--assignee") + 1], "requires": many("--requires"),
-            "skills": many("--skill"), "parents": many("--parent")}
+            "skills": many("--skill"), "parents": many("--parent"),
+            "runs_on": (many("--runs-on") or [None])[0]}
 
 
-def test_fix_card_from_the_real_template_is_portable(store):
+def test_fix_card_from_the_real_template_is_portable(store, monkeypatch):
     kp = placement()
+    import time
+    from hermes_cli import kanban_capability_registry, kanban_worker_node
+    # Exercise the actual attestation gate with a fixture worker that can ship core;
+    # the production registry is not an input to a producer contract test.
+    monkeypatch.setattr(kanban_capability_registry, "self_gateway", lambda: "hub")
+    monkeypatch.setattr(kanban_worker_node, "registry", lambda: {"machines": {
+        "worker-1": {"state": "active", "pickup": True, "last_seen": time.time() * 1000,
+                     "labels": ["capability:core-ship"]}}})
     b = Board()
     r = sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
     assert r["action"] == "filed"
@@ -212,18 +221,19 @@ def test_verify_child_stays_on_the_hub_and_records_for_the_fix_card(store):
     assert len(b.creates()) == 2 and r["verify_card"] == "t_00000002"
     verify = fields(b.creates()[1])
     assert verify["parents"] == ["t_00000001"]
-    assert "host_repo" in verify["requires"]
-    assert kp.portable_reason(verify, POOL_CFG) is not None
+    assert verify["runs_on"] == "machine:gw-board-a" and "host_repo" not in verify["requires"]
     assert f"{sh.SELF_EVENT} fixed {FP} --card t_00000001" in verify["body"]
     assert f"{sh.SELF_EVENT} not_defect {FP} --card t_00000001" in verify["body"]
     st = sh.LaneState(store.root).get(FP)
     assert (st["status"], st["fix_card"], st["verify_card"]) == ("approved", "t_00000001", "t_00000002")
 
 
-def test_investigation_card_stays_on_the_hub():
+def test_investigation_card_stays_on_the_hub(board_identity):
     kp = placement()
     inv = sh.card_args({"component": "kanban", "symptom": "x", "fingerprint": FP}, "k")
-    assert kp.portable_reason({**inv, "requires": inv["requires"]}, POOL_CFG) == "uncarried requirement"
+    # pinned by its machine label (not a host_repo capability); the hub words in the body also make it non-portable
+    assert "host_repo" not in inv["requires"] and inv["home_pin"] is True
+    assert kp.portable_reason({**inv, "requires": inv["requires"]}, POOL_CFG) == "home gateway marker"
 
 
 def test_bb_and_named_board_fixes_keep_one_hub_card():

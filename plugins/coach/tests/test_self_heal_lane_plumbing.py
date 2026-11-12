@@ -31,7 +31,7 @@ CLOSED = lambda board=None, now=None: {**OPEN(), "ok_usd": False, "why": "cap"}
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch):
+def store(tmp_path, monkeypatch, board_identity):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("COACH_SELFHEAL_NO_EXEC", "1")
     return core.Store(tmp_path / "coach")
@@ -63,6 +63,10 @@ class Board:
         return [a for a in self.calls if "create" in a]
 
 
+def runs_on_of(argv):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "--runs-on"]
+
+
 def requires_of(argv):
     return [argv[i + 1] for i, a in enumerate(argv) if a == "--requires"]
 
@@ -70,14 +74,17 @@ def requires_of(argv):
 # ── requires declaration ──
 def test_fix_and_investigation_argv_declare_requires(store):
     inv = sh.card_args({"component": "plugin", "symptom": "x", "fingerprint": "plugin-0123456789"}, "k")
-    assert requires_of(sh.kanban_argv(inv)) == ["terminal", "file", "git", "host_repo"]
+    inv_argv = sh.kanban_argv(inv)
+    assert requires_of(inv_argv) == ["terminal", "file", "git"] and "host_repo" not in inv_argv
+    assert runs_on_of(inv_argv) == ["machine:gw-board-a"]
     sh.LaneState(store.root).update("cron-0123456789", status="proposed", component="cron", symptom="s")
     b = Board()
     r = sh.file_fix("cron-0123456789", store=store, runner=b, now=NOW, budget_fn=OPEN)
     assert r["action"] == "filed"
-    # a default-board fix card is repo work the worker pool can run; its verify child keeps host_repo
+    # a default-board fix card is repo work the worker pool can run; its verify child keeps the machine pin
     assert requires_of(b.creates()[0]) == ["terminal", "file", "git"]
-    assert requires_of(b.creates()[1]) == ["terminal", "file", "git", "host_repo"]
+    assert requires_of(b.creates()[1]) == ["terminal", "file", "git"] and runs_on_of(b.creates()[0]) == []
+    assert runs_on_of(b.creates()[1]) == ["machine:gw-board-a"]  # the verify child keeps its machine pin
 
 
 def test_argv_without_requires_key_still_declares_and_empty_list_says_no_requires():

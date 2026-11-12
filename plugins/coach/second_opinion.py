@@ -38,13 +38,14 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 try:
-    from .placement_evidence import fence_evidence, home_pin_note
+    from .placement_evidence import fence_evidence, home_pin_note, incident_title
 except ImportError:  # run as a script, or loaded by path: take the sibling file
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     _pe = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_pe)
     fence_evidence, home_pin_note = _pe.fence_evidence, _pe.home_pin_note
+    incident_title = _pe.incident_title
 
 if __package__:
     from .reply_check import render_tool_log
@@ -263,14 +264,14 @@ def card_args(session_id: str, recs: list[dict], ask: str = "", settings: Option
     if ask:
         ev += ["## Original ask", ask[:1500], ""]
     for i, r in enumerate(recs, 1):
-        ev += [f"## Failure {i}", "**Agent claimed:**", "> " + r.get("claim", "").replace("\n", "\n> ")[:2500],
+        ev += [f"## Failure {i}", "**Issue:**", r.get("issue", ""), "**Agent claimed:**", "> " + r.get("claim", "").replace("\n", "\n> ")[:2500],
                "", "**User replied:**", "> " + r.get("user", "").replace("\n", "\n> ")[:1500], ""]
     ev += ["## Files touched in the failing turns", *([f"- `{f}`" for f in files] or ["- (none recorded)"])]
     lines += [fence_evidence("\n".join(ev)), "",
               "Finish with `kanban_complete`: summary = the 1-3 most likely causes with their evidence; "
               "metadata.findings = list of {claim, observed, evidence}."]
     issue = (recs[-1].get("issue") if recs else "") or "failed fix"
-    args = {"title": f"Second opinion (read-only): {issue}"[:120], "assignee": setting("fixloop_review_assignee", settings),
+    args = {"title": f"Second opinion (read-only): {incident_title(issue)}", "assignee": setting("fixloop_review_assignee", settings),
             "body": "\n".join(lines),
             "idempotency_key": f"coach-fixloop:{session_id}:{int(recs[0]['ts']) if recs else 0}",
             "max_runtime_seconds": 1800, "model": model,

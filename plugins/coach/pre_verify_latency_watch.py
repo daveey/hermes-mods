@@ -30,13 +30,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
-    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+    from .placement_evidence import fence_evidence, home_pin_note
 except ImportError:  # run as a script, or loaded by path: take the sibling file
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     _pe = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_pe)
-    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+    fence_evidence, home_pin_note = _pe.fence_evidence, _pe.home_pin_note
 
 AUTHOR = "pre-verify-latency-watch"
 WINDOW_S = 24 * 3600
