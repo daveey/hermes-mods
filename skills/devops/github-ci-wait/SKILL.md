@@ -167,7 +167,11 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
   stall after the 3-minute startup grace period plus two idle polls.
 - Own runs are found in the listing: the newest 100 runs on the branch, or the newest 40 per `--workflow`. On a
   busy branch, an older commit's own run can fall outside that window; it then reads as having none, and a later
-  commit's run stands in. For an old commit, read its own runs with `gh run list --commit <sha>` before trusting a pass.
+  commit's run stands in. The verdict then tracks the branch as it is now, not your commit: `not yet` (rc=2) while
+  newer pushes build, or a later red. To judge an old commit, read its own runs (`gh run list --commit <full 40-char sha>`: a short sha lists
+  none, which reads like superseded). When
+  it has none (superseded), cite each workflow's earliest finished run on a later commit that contains it
+  (`git merge-base --is-ancestor <sha> <headSha>`).
 - Runs triggered by `workflow_run`, `schedule` or `workflow_dispatch` (meta workflows such as "runner-loss
   recovery" and "CI review comment", which run on the branch head) say nothing about your commit. The script
   ignores these three events when discovering workflows and evaluating success, failure and activity; otherwise
