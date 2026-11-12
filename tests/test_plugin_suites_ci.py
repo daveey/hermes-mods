@@ -74,6 +74,11 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertIn("astral-sh/setup-uv@v6", self.text)
         self.assertIn("uv python install '${{ matrix.python }}'", self.text)
 
+    def test_sqlite_fixtures_enable_privileged_read_only_holder_scan(self):
+        step = self.text.split('      - name: Run selected suites', 1)[1]
+        env = step.split('        env:', 1)[1].split('        run:', 1)[0]
+        self.assertRegex(env, r"(?m)^          SWAP_TEST_PRIVILEGED_SCAN: ['\"]1['\"]$")
+
     def test_full_history_and_selection_per_event(self):
         self.assertIn("fetch-depth: 0", self.text)
         self.assertIn('select --base "$PR_BASE"', self.text)
