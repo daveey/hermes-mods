@@ -57,6 +57,12 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
 - `run_in_user_terminal` returning `ok:false` with "`<device>` claimed the request but sent no answer in time" is still
   pending, not failed: call it again with only that `job_id` (and a wait); never resend the command, which would run it twice.
+- `run_in_user_terminal` refusing with "`<mac>` has no Hermes Desktop connected to this gateway right now (live
+  Desktops: ...)" means that Mac is asleep or offline (confirm: `tailnet_exec` to it times out). Don't re-call it
+  each turn: file one blocked `physical` card ("wake the Mac with Hermes Desktop running") whose `resolved_check`
+  probes the Mac's tailnet ssh port, then run the step when it unblocks. The probe must exit exactly 0 or 1:
+  `timeout 8 bash -c '</dev/tcp/<tailnet ip>/22' 2>/dev/null && exit 0 || exit 1`. A bare `timeout` exits 124
+  while the Mac is down, and the create is refused `resolved_check_broken`.
 - A hub `systemctl --user start|stop` of a gateway unit from the chat's own terminal is refused by the gateway
   self-stop guard; put it in the same `ssh -t ubuntu@hermes-hub '...'` user-terminal command as the step that needs it.
 - The tool is eager on most hosts. Where it isn't in the tool list, call it through `tool_call` (name
