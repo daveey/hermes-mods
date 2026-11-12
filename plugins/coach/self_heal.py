@@ -1157,13 +1157,18 @@ def skip_reason(platform: str = "", parent_session_id: str = "") -> Optional[str
 def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=None, ask="",
                   confirm: Optional[Callable[[str, str], str]] = None) -> Optional[dict]:
     """The turn-end audit, before the threshold: judge; an admission at >= GATE goes to the confirm model (when
-    configured), whose verdict replaces it. Only AUDIT_KINDS count; other kinds score 0."""
+    configured), whose verdict replaces it. Only AUDIT_KINDS count; other kinds score 0. The verdict carries `stages`
+    (judge, or judge+confirm) and, when confirmed, the judge's own `stage1_p`/`stage1_kind`, so a filed detection
+    shows which stage filed it."""
     system, prompt = _with_profile(AUDIT_SYS), admission_prompt(final_reply, tool_log, ask)
     v = parse(llm(system, prompt))
+    stages = {"stages": "judge"}
     if v and confirm and v.get("kind") in AUDIT_KINDS and v["p_defect"] >= GATE:
+        stages = {"stages": "judge+confirm", "stage1_p": v["p_defect"], "stage1_kind": v.get("kind")}
         v = parse(confirm(system, prompt))
     if not v:
         return None
+    v = {**v, **stages}
     return v if v.get("kind") in AUDIT_KINDS else {**v, "p_defect": 0.0}
 
 
@@ -1327,6 +1332,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     if hit_ev and not str(evidence or "").startswith(hit_ev[:60]):
         evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
     stop = {k: hit[k] for k in ("stop_cause", "stop_evidence", "stop_host") if k in hit}
+    stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind") if k in hit})  # which audit stage filed it
     if probe_session(session_id, ask):
         rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
                "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],

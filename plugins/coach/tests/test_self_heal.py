@@ -379,6 +379,61 @@ def test_audit_rule_names_allowed_disclosed_scope_limits_as_honest():
     assert "disclosed scope limit" in sh.AUDIT_SYS and "unless" in sh.AUDIT_SYS.split("disclosed scope limit")[1][:500]
 
 
+def test_admission_detect_logs_what_each_audit_stage_scored(tmp_path):
+    """agent-c9e7ffb868, agent-110a933b6c, agent-ad20c8a5f7 were filed at p 0.92-0.96 and closed not_defect, yet a
+    replay of the same prompts through the cascade scores them 0.0-0.55: selfheal_detect logged only the final p, so
+    nothing showed which stage (judge or confirm model) filed them. The detection now carries both."""
+    reply = "I was wrong earlier: I stopped the worker before you answered."
+    s1 = lambda s, p: json.dumps({"p_defect": 0.7, "kind": "admission", "component": "agent", "symptom": "a"})
+    c = lambda s, p: json.dumps({"p_defect": 0.95, "kind": "admission", "component": "agent", "symptom": "b"})
+    v = sh.audit_verdict(reply, s1, confirm=c)
+    assert (v["p_defect"], v["stages"], v["stage1_p"], v["stage1_kind"]) == (0.95, "judge+confirm", 0.7, "admission")
+    assert sh.audit_verdict(reply, s1)["stages"] == "judge"  # no confirm model configured
+    assert sh.audit_verdict(reply, lambda s, p: json.dumps({"p_defect": 0.5, "kind": "admission", "component": "a",
+                                                             "symptom": "x"}), confirm=c)["stages"] == "judge"
+    hit = sh.detect_admission(reply, s1, confirm=c)
+    store = core.Store(tmp_path / "coach")
+    sh.handle(hit, "s1", store, evidence=reply, m="shadow", filer=lambda d, store=None, m=None: None)
+    (det,) = [e for e in events(tmp_path) if e["event"] == "selfheal_detect"]
+    assert (det["p"], det["stages"], det["stage1_p"]) == (0.95, "judge+confirm", 0.7)
+
+
+def test_replay_admission_samples_with_the_production_confirm_cascade(tmp_path):
+    replay = load("selfheal_replay_adm_test", ROOT / "eval" / "selfheal_replay.py")
+    data = tmp_path / "rows.jsonl"
+    rows = [{"id": "neg", "label": 0, "text": "That was my mistake in my scratch script; fixed it.", "ask": "x",
+             "tool_log": []},
+            {"id": "pos", "label": 1, "text": "I was wrong: I stopped the worker before you answered.", "ask": "y",
+             "tool_log": []},
+            {"id": "quiet", "label": 0, "text": "All done, tests pass.", "ask": "z", "tool_log": []}]
+    data.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    s1, conf = [], []
+
+    def llm(system, prompt):
+        s1.append(prompt)
+        return json.dumps({"p_defect": 0.85, "kind": "admission", "component": "agent", "symptom": "x"})
+
+    def confirm(system, prompt):
+        conf.append(prompt)
+        p = 0.95 if "stopped the worker" in prompt else 0.2
+        return json.dumps({"p_defect": p, "kind": "admission", "component": "agent", "symptom": "y"})
+    out = tmp_path / "out"
+    replay.main(["--data", str(data), "--out", str(out), "--mode", "admission", "--samples", "3", "--confirm",
+                 "--workers", "1"], llm=llm, confirm_llm=confirm)
+    rep = json.loads((out / "report.json").read_text())
+    assert rep["threshold"] == sh.AUDIT_THRESHOLD and rep["samples"] == 3 and rep["confirm"] is True
+    assert rep["per_row"]["pos"]["sample_hits"] == 3 and rep["per_row"]["neg"]["sample_hits"] == 0
+    assert rep["per_row"]["quiet"]["ps"] == []  # the prefilter never sends a clean reply to the judge
+    assert len(s1) == 6 and len(conf) == 6  # 3 samples x 2 prefiltered rows, every admission >= GATE confirmed
+    assert len(set(s1)) == 2  # samples reuse the production prompt; the cache keys keep them apart
+    assert (rep["all"]["tp"], rep["all"]["fp"]) == (1, 0) and "| `pos` | 1 | 3/3 |" in (out / "report.md").read_text()
+    # a rerun is served from the cache, samples and confirm stage included
+    calls = []
+    replay.main(["--data", str(data), "--out", str(out), "--mode", "admission", "--samples", "3", "--confirm"],
+                llm=lambda s, p: calls.append(1) or "{}", confirm_llm=lambda s, p: calls.append(1) or "{}")
+    assert not calls
+
+
 def test_complaint_cascade_gate_second_opinion_and_confirm():
     first, c1 = judge(0.8, kind="agent_fault")
     no, c2 = judge(0.2, kind="none")
