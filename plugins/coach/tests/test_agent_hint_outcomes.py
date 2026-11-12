@@ -38,7 +38,8 @@ def call(hooks, i, tool="read_file", args=None, result: object='{"success":true}
     hooks["pre_tool_call"](**kw)
     if order == "sequential":
         hooks["transform_tool_result"](**kw, result=result)
-    hooks["post_tool_call"](**kw, result=result, status="success")
+    # Core's _tool_result_observer_fields emits "ok", not "success".
+    hooks["post_tool_call"](**kw, result=result, status="ok")
     if order == "concurrent":
         hooks["transform_tool_result"](**kw, result=result)
 

@@ -2339,7 +2339,7 @@ class AgentCoach:
                 e = st["active"].get(hid)
                 if e is None:
                     continue
-                if status not in ("success", "error", "timeout"):
+                if status not in ("ok", "success", "error", "timeout"):
                     st["active"].pop(hid, None)  # cancellation/unknown is not observed behavior
                     continue
                 slot.update(done=True, poll=is_poll(tool, args),
@@ -2347,7 +2347,7 @@ class AgentCoach:
                 name = tool.rsplit("__", 1)[-1]
                 d = _as_dict(result)
                 checkpoint = (name in ("kanban_continue", "kanban_comment", "kanban_heartbeat")
-                              and status == "success" and d is not None
+                              and status in ("ok", "success") and d is not None
                               and not failed(name, d, status) and d.get("ok") is not False)
                 if e["rule"] == "no_checkpoint" and checkpoint:
                     self._hint_outcome(sid, e, True, "successful " + name)
