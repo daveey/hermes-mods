@@ -235,6 +235,33 @@ def test_completion_notice_that_never_reached_the_chat_is_recovered(home):
     assert "never reached this chat" in note and "do it now" not in note and "act on anything" in note
 
 
+def _wake_leg(tid=CHILD):
+    """The wake leg of a notify+wake subscription: the turn-starting message the notifier sends in place of the
+    "✔ … Kanban <id> done" notice line (live MacBook Desktop text, 2026-11-11)."""
+    return (f"[kanban] Task {tid} completed.\nTitle: Mac person invite\nAssignee: @default\nBoard: default\n\n"
+            "Check the result or decide the next step.\nResult: Shipped the naming fix; deployed.")
+
+
+def test_wake_leg_completion_in_the_chat_is_not_a_missed_notice(home):
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    _say(home, "user", _wake_leg())
+    assert _followups(home) == []
+
+
+def test_wake_leg_starting_this_turn_is_not_a_missed_notice(home):
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    items = _followups(home)  # pre_llm_call runs before the turn's own message is in state.db
+    assert [i["missed_notice"] for i in items] == [True]
+    assert core.drop_announced(items, _wake_leg()) == []
+
+
+def test_wake_leg_of_another_card_does_not_hide_a_missed_notice(home):
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    _say(home, "user", _wake_leg("t_1111bbbb"))
+    [item] = core.drop_announced(_followups(home), _wake_leg("t_1111bbbb"))
+    assert item["missed_notice"]
+
+
 def _subscribe_after_completion(home, tid=CHILD):
     """The chat subscribed only after the card completed (e.g. it commented on the done card): the notifier starts a
     new subscription past the existing events, so no completion notice was ever owed to it."""

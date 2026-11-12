@@ -163,6 +163,12 @@ def _seen_in_chat(state_db: Optional[Path], keys: Iterable[str], needle: str) ->
         return True
 
 
+def _completion_notices(tid: str) -> tuple[str, str]:
+    """The two texts a completion reaches a chat as: the "✔ … Kanban <id> done" notice line, and the wake leg of a
+    notify+wake subscription, "[kanban] Task <id> completed." Either one means the chat was told."""
+    return f"Kanban {tid} done", f"[kanban] Task {tid} completed"
+
+
 def _tui_subs(conn: sqlite3.Connection, keys: Iterable[str]) -> list:
     """This chat's TUI notice subscriptions, with the in-flight claim columns (NULL on a board from before them)."""
     keys = tuple(keys)
@@ -254,7 +260,7 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
                 # A notice claimed for this chat and not yet acked is in flight: the backend delivers it when the
                 # chat's current turn ends. It counts as missed only once that claim is stale.
                 missed = owed_notice and not _in_flight(sub, ev, now) and \
-                    not _seen_in_chat(state_db, keys, f"Kanban {tid} done")
+                    not any(_seen_in_chat(state_db, keys, text) for text in _completion_notices(tid))
                 if resolved or followup or not (undelivered or missed or unresolved_successor):
                     continue
                 authority = [s.strip() for s in [task["body"] or "", *comments] if kept_obligation(s or "")]
@@ -274,7 +280,7 @@ def drop_announced(items: list[dict], user_message: str) -> list[dict]:
         return items
     out = []
     for it in items:
-        if it["missed_notice"] and f"Kanban {it['task_id']} done" in user_message:
+        if it["missed_notice"] and any(text in user_message for text in _completion_notices(it["task_id"])):
             if not it["undelivered"] and not it.get("unresolved_successor"):
                 continue
             it = dict(it, missed_notice=False)
