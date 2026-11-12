@@ -27,7 +27,10 @@ Run the checker once per wake; schedule the next look with `kanban_continue(resu
 | checks_pending | schedule a retry; not a user ask. A self-hosted job queued with no runner is not yet a runner outage: first read the newest run for the current head and `gh api "repos/O/R/commits?path=.github/workflows&per_page=5"`. The repo may have moved those jobs to other runners, leaving the queued job on an obsolete run. If main changed `runs-on` labels after the PR branched, the PR's own workflow file still targets the retired labels: rebase onto main and `--force-with-lease` push (check `git range-diff` shows all `=`), and hand the card the new head. To get a fix PR through a single scarce runner (e.g. one macOS box), cancel queued runs whose required checks already failed. Those PRs need a rebase anyway. |
 | review_required / changes_requested | request or await a real review; address comments |
 | blocked_unknown | diagnose (rulesets, required checks, queue); do not guess or ask |
+| closed_unknown | CLOSED, mergedAt null, and the base-branch commit lookup failed: retry it, never read it as closed |
 | ready | attempt the normal merge (never `--admin`, never self-approve, never add bypass labels) |
+
+Graphite merge queue (e.g. softmax-universe/softmax) pushes a squash `… (#N)` to the base branch and closes the PR: state CLOSED, mergedAt null. The checker reports merged with the landed sha; by hand, look for the `(#N)` commit on the base branch near closedAt.
 
 `ready` still waits on unresolved review threads, which the script's `gh pr view` fields omit; a Graphite queue
 label just sits on such a PR ("will be added once it meets the requirements"). List them:
