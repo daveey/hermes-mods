@@ -31,7 +31,7 @@ A hit whose turn the self-heal detector already saw (shadow or live) is listed a
 filed. Detections come from the local <home>/coach/selfheal.json plus every host's <data>/<host>/selfheal-seen.json
 (coach_feed copies them), since ask-gate runs on the hub and detection state is per host (plugin-03d4509c8a).
 """
-import argparse, glob, json, os, re, subprocess, sys, time
+import argparse, functools, glob, json, os, re, sqlite3, subprocess, sys, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -59,17 +59,108 @@ REVIEW_BRIEF = re.compile(
     r"^\s*(?:You are (?:an?|the) independent\b[^\n]*\breviewer\b|Review the COMPLETE exact PR\d+\b)", re.I)
 
 
+NOTE_PREFIX = 120  # chars of a note line's body matched against agents' kanban_comment tool calls
+TOOLCALL_DROPPED = set()  # note-line prefixes withdrawn by a tool-call match this run (weekly-post count)
+TOOLCALL_DROPS = {"lines": 0}
+
+
+def _norm_note(s):
+    """Note text for comparison across the JSON/shell escaping a tool call adds: no quotes/backslashes, one space."""
+    return _ws(re.sub(r"[\"'\\`]", "", s or ""))
+
+
+def _call_texts(tool_calls):
+    """The comment bodies an assistant row's tool calls wrote: kanban_comment `body`, or the command of a terminal
+    call that shells out to `hermes kanban comment` (core tags those notes "human")."""
+    try:
+        calls = json.loads(tool_calls) if isinstance(tool_calls, str) else tool_calls
+    except Exception:
+        return
+    for c in calls if isinstance(calls, list) else ():
+        if not isinstance(c, dict):
+            continue
+        fn = c.get("function") if isinstance(c.get("function"), dict) else c
+        name, args = fn.get("name") or "", fn.get("arguments") or fn.get("input") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                continue
+        if not isinstance(args, dict):
+            continue
+        if name.endswith("kanban_comment") and isinstance(args.get("body"), str):
+            yield args["body"]
+        elif name in ("terminal", "shell") and "kanban comment" in str(args.get("command") or ""):
+            yield str(args["command"])
+
+
+@functools.lru_cache(maxsize=512)
+def _tool_call_hit(prefix, db):
+    words = sorted(set(re.findall(r"[A-Za-z0-9_]{5,}", prefix)), key=len, reverse=True)[:3]
+    if len(words) < 2 or not os.path.exists(db):
+        return False
+    try:
+        con = sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except Exception:
+        return False
+    try:
+        deadline = time.monotonic() + 15  # bound one scan of a large state.db; a timeout keeps the line
+        con.set_progress_handler(lambda: time.monotonic() > deadline, 100000)
+        sql = ("SELECT tool_calls FROM messages WHERE role = 'assistant' AND tool_calls LIKE '%kanban%comment%'"
+               + " AND tool_calls LIKE ?" * len(words) + " LIMIT 20")
+        for (tc,) in con.execute(sql, [f"%{w}%" for w in words]):
+            if any(prefix in _norm_note(t) for t in _call_texts(tc)):
+                return True
+    except Exception:
+        return False
+    finally:
+        con.close()
+    return False
+
+
+def note_line_by_agent(body, home=None):
+    """True when an assistant tool call in the local state.db (read-only) wrote this card-note body: positive
+    provenance for an untagged note from before core recorded writer_kind (agent-b14b35066b). A missing or
+    unreadable state.db, or no match, -> False (the line stays David's for review)."""
+    prefix = _norm_note(body)[:NOTE_PREFIX].strip()
+    if len(prefix) < 20:
+        return False
+    home = Path(home or os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+    return _tool_call_hit(prefix, str(home / "state.db"))
+
+
+def _untagged_by_agent(part):
+    """An unstamped note line (no agent tag) whose body an agent's tool call wrote. Counted for the weekly post."""
+    m = NOTE_LINE.match(part)
+    body = part[m.end():] if m else ""
+    if not note_line_by_agent(body):
+        return False
+    TOOLCALL_DROPPED.add(_norm_note(body)[:NOTE_PREFIX])
+    TOOLCALL_DROPS["lines"] = len(TOOLCALL_DROPPED)
+    return True
+
+
+def toolcall_drop_lines():
+    """Weekly-post line: legacy notes withdrawn only because a tool call proved an agent wrote them."""
+    n = TOOLCALL_DROPS["lines"]
+    if not n:
+        return []
+    return [f"Legacy card notes withdrawn by a tool-call match: {n} untagged note line{'s' if n != 1 else ''} "
+            "matched an agent's kanban_comment tool call in the local state.db, so they were not counted as David's."]
+
+
 def drop_agent_notes(text):
     """A live card note minus the lines an agent wrote (core stamps them "(agent chat",
     agent-261aa31f49): their words are not David's. Each line runs to the next stamp, so a
-    multi-line body is dropped whole. Unstamped (older) notes are kept for review."""
+    multi-line body is dropped whole. An unstamped (older) line is dropped only when the local
+    state.db holds the agent tool call that wrote it (agent-b14b35066b); otherwise it is kept for review."""
     if not NOTE_HEADER.match(text):
         return text
     starts = [m.start() for m in NOTE_LINE.finditer(text)]
     if not starts:
         return text
     parts = [text[:starts[0]]] + [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]
-    kept = [parts[0]] + [p for p in parts[1:] if not AGENT_STAMP.match(p)]
+    kept = [parts[0]] + [p for p in parts[1:] if not (AGENT_STAMP.match(p) or _untagged_by_agent(p))]
     if len(kept) == 1:  # every line was an agent's: none of it is David's
         return ""
     return "".join(kept)
@@ -877,6 +968,8 @@ def main():
     else:
         title = f"Ask-gate and had-to-ask-for-a-fix baseline: {a.weeks} weeks to {datetime.now(PT):%Y-%m-%d}"
     md = render(hits, weeks, scanned, title, doit=doit)
+    if toolcall_drop_lines():
+        md += "\n\n" + "\n".join(toolcall_drop_lines())
     so_lines = None
     if a.last_week:
         homes = [Path(h).expanduser() for h in a.home] or None
@@ -929,6 +1022,8 @@ def main():
             detected = []
         if doit:
             extra = (extra or []) + [""] + doit_lines(doit, weeks)
+        if toolcall_drop_lines():
+            extra = (extra or []) + [""] + toolcall_drop_lines()
         if so_lines:
             extra = (extra or []) + [""] + so_lines
             sp = data / "reports" / "askgate" / f"{weeks[0]:%Y-%m-%d}-skill-outcomes.md"
@@ -939,7 +1034,8 @@ def main():
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"posted_by": me, "posted_at": int(time.time()), ASK_CLASS: len(ask), FIX_CLASS: len(fix), BB_CLASS: len(bb),
                                  "fix_sessions": len({h["session"] for h in fix}),
-                                 "detected_not_refiled": len(detected), "inbox_doit": len(doit)}) + "\n")
+                                 "detected_not_refiled": len(detected), "inbox_doit": len(doit),
+                                 "legacy_notes_by_tool_call": TOOLCALL_DROPS["lines"]}) + "\n")
 
 
 if __name__ == "__main__":

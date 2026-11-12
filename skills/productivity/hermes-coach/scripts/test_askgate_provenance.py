@@ -252,6 +252,111 @@ class InboxDoit(unittest.TestCase):
         self.assertIsNone(self._drain('do it yourself', quoted=self.SUBAGENT_NOTE))
 
 
+class LegacyNoteToolCallProvenance(unittest.TestCase):
+    """agent-b14b35066b: a pre-writer_kind note stamped "- default (another session)" (no "agent chat" tag) was
+    filed as David saying "don't investigate again", though the hub state.db held the agent's kanban_comment call
+    with that exact body. Only that positive evidence drops the line; no match keeps it for review."""
+
+    AGENT_BODY = ("Duplicate of t_example0001 (\"same symptom\"), already fixed there. Don't investigate again; "
+                  "complete this card as a duplicate and do it yourself if anything is left.")
+    NOTE = ("New note on your kanban task from the operator (delivered mid-run). "
+            "Take it into account for the work you're doing right now:\n"
+            "- default (another session) at 02:20 UTC: " + AGENT_BODY)
+
+    def _home(self, directory, body=None, tool="kanban_comment", role="assistant", name="home"):
+        import json, sqlite3
+        from pathlib import Path
+        home = Path(directory) / name
+        home.mkdir()
+        con = sqlite3.connect(home / "state.db")
+        con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, "
+                    "tool_calls TEXT, timestamp REAL)")
+        if body is not None:
+            args = {"task_id": "t_example0002", "body": body}
+            if tool == "terminal":
+                args = {"command": "hermes kanban comment t_example0002 " + json.dumps(body)}
+            calls = [{"id": "c1", "type": "function", "function": {"name": tool, "arguments": json.dumps(args)}}]
+            con.execute("INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES (?,?,?,?,?)",
+                        ("other", role, "", json.dumps(calls), 1.0))
+        con.commit()
+        con.close()
+        return home
+
+    def _env(self, home):
+        from unittest import mock
+        if hasattr(g, "_tool_call_hit"):
+            g._tool_call_hit.cache_clear()
+            g.TOOLCALL_DROPPED.clear()
+            g.TOOLCALL_DROPS["lines"] = 0
+        return mock.patch.dict("os.environ", {"HERMES_HOME": str(home)})
+
+    def test_untagged_note_matching_an_agent_tool_call_is_dropped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY)
+            with self._env(home):
+                self.assertTrue(g.note_line_by_agent(self.AGENT_BODY, home))
+                self.assertEqual(g.clean(self.NOTE), "")
+
+    def test_still_flags_withdraws_the_queued_legacy_row(self):
+        import json, tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY)
+            control = self._home(directory, name="control")
+            p = Path(directory) / "host" / "default"
+            p.mkdir(parents=True)
+            (p / "s.json").write_text(json.dumps({"id": "s", "source": "kanban", "user_turns": [
+                {"t": 1000, "text": self.NOTE}]}))
+            m = g.hit_defect({"t": 1000, "session": "s", "host": "host", "class": g.ASK_CLASS,
+                              "pattern": "stop-asking", "quote": self.NOTE})
+            row = {"monitor": "ask-gate", "session_id": m["session_id"], "quote": m["quote"], "hit_t": 1000}
+            with self._env(home):
+                self.assertIn("written by an agent", g.still_flags(row, homes=[home], data=directory) or "")
+            with self._env(control):
+                self.assertIsNone(g.still_flags(row, homes=[control], data=directory))
+
+    def test_shelled_out_kanban_comment_counts(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY, tool="terminal")
+            with self._env(home):
+                self.assertEqual(g.clean(self.NOTE), "")
+
+    def test_controls_keep_the_note(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            for name, home in (
+                    ("unrelated call", self._home(directory, "Something unrelated about another card.", name="a")),
+                    ("user-role row", self._home(directory, self.AGENT_BODY, role="user", name="b")),
+                    ("other tool", self._home(directory, self.AGENT_BODY, tool="send_message", name="c")),
+                    ("no state.db", Path(directory) / "missing")):
+                with self.subTest(name), self._env(home):
+                    self.assertEqual(g.clean(self.NOTE), self.NOTE)
+                    self.assertTrue(g.classify(g.clean(self.NOTE)))
+
+    def test_mixed_note_keeps_the_human_line(self):
+        import tempfile
+        mixed = self.NOTE + "\n- default (another session) at 02:25 UTC: why are you asking me?"
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY)
+            with self._env(home):
+                out = g.clean(mixed)
+                self.assertNotIn("Duplicate of", out)
+                self.assertEqual(g.classify(out), "why-asking-me")
+
+    def test_weekly_counts_tool_call_withdrawals(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY)
+            with self._env(home):
+                before = g.TOOLCALL_DROPS.get("lines", 0)
+                g.clean(self.NOTE)
+                self.assertGreater(g.TOOLCALL_DROPS["lines"], before)
+                self.assertTrue(any("tool call" in line for line in g.toolcall_drop_lines()))
+
+
 def runners_brief():
     """The real opener the runners plugin writes into a 'Repair runner' chat (plugins/runners/repairs.py)."""
     import sys
