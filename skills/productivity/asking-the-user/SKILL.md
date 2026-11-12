@@ -31,6 +31,7 @@ Before filing an `action_request` for a card's ask, read the card's newest comme
 already published, and the card's named sole owner chat: if either exists, don't file a second one. Duplicates
 split the user's answer, and the copy not consumed sits stale in For-you. Withdraw yours as soon as the card shows
 the ask was answered elsewhere or the card left `blocked`.
+Never tell the user a choice tile "is in your panel" because a user-steps row or `/requests` 200 exists: a blocked card's ask projects only when its owner chat reads its queue, and Desktop renders it later still. Say it will appear there; claim visible only after a read-only renderer check, or after the user's click is recorded. Publish acceptance fixtures (test tiles) from a disposable scratch chat, never a persistent one (user-steps README, live-fixture rule).
 When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
 ambiguous acceptance tolerance, test a stricter sufficient bound without redefining the requirement to fit results.
 
