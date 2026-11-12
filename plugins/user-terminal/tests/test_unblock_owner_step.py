@@ -133,6 +133,16 @@ def test_comment_with_job_id_after_block_suppresses(env):
     assert run(db, jobs) is None
 
 
+def test_job_id_comment_in_the_block_second_does_not_count(env):
+    """Comments and events are separate tables: a same-second comment may predate the block, so it never counts."""
+    db, jobs = env
+    block(db, OWNER_REQUEST)
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                    (TASK, "chat", "Ran it: job 20261112-140501-a1b2c3, exit 0", BLOCK_AT))
+    assert "next_step" in json.loads(run(db, jobs))
+
+
 def test_approval_comment_without_job_id_keeps_next_step(env):
     """The incident: the chat commented "David approved" and unblocked; that is not the step running."""
     db, jobs = env

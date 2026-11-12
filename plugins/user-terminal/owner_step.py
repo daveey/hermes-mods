@@ -117,8 +117,10 @@ def transform_unblock_result(tool_name: str, args: Any, result: Any, *, db_path:
             if req is None:
                 return None
             blocked_at = float(row[1] or 0)
+            # Strictly later second: comments and events are separate tables, so a comment in the block's own
+            # second may predate the block.
             comments = [b for (b,) in con.execute(
-                "SELECT body FROM task_comments WHERE task_id=? AND created_at>=?", (task, int(blocked_at)))]
+                "SELECT body FROM task_comments WHERE task_id=? AND created_at>?", (task, int(blocked_at)))]
         finally:
             con.close()
         if any(JOB_ID.search(str(b or "")) for b in comments) or _job_ran_for(task, Path(jobs_root()), blocked_at):
