@@ -367,9 +367,23 @@ def _pre_llm_call(user_message=None, **_kw):
     return {"context": "\n".join(notes)} if notes else None
 
 
+def _relay_guard(tool_name="", args=None, session_id="", **_kw):
+    """pre_tool_call: refuse core's own ``kanban_comment relays_user_message`` when core's verify() would name a
+    user row hermes-mods wrote (a ``[coach]`` nudge or brief) or a ``[selfheal-probe]`` prompt as the user's reply
+    (core does not know those openings). Fail-open: any error lets core decide."""
+    if tool_name != "kanban_comment" or not isinstance(args, dict) or not rh.requested(args):
+        return None
+    try:
+        reason = rh.core_relay_refusal(rf._hermes_home() / "state.db", session_id)
+    except Exception:
+        return None
+    return {"action": "block", "message": reason} if reason else None
+
+
 def register(ctx) -> None:
     ctx.register_tool(name="cross_session", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🔗",
                       description="List/read/message sessions on any Desktop-connected gateway")
     ctx.register_tool(name="cross_task", toolset=TOOLSET, schema=TASK_SCHEMA, handler=handle_task, emoji="🗂️",
                       description="List/read/comment on Kanban tasks on any Desktop-connected gateway")
     ctx.register_hook("pre_llm_call", _pre_llm_call)
+    ctx.register_hook("pre_tool_call", _relay_guard)
