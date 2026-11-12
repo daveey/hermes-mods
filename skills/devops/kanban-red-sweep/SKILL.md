@@ -122,11 +122,11 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   `hermes kanban edit <id> --priority <above the ready head>` for every card you unblock (guessed decisions too).
   A bump below the head leaves the card unstarted, and the board flags it to the chat after 30 min. No priority
   gets past cards that others wait on: move a portable card instead, or do its step here. If the hub or a worker is full, move a portable card to the whole pool, never to one named worker:
-  `hermes kanban move <id> --runs-on <a label every worker carries and the hub/Macs don't, e.g.
-  capability:token-broker; check `hermes-mail admin machines`> --reason "..."` (`--pool` once the pool:worker
-  queue ships). A `machine:<worker>` pin waits again as soon as that worker fills or is held. Pin one worker only
+  `hermes kanban move <id> --pool --reason "..."` (= `--runs-on pool:worker`; pool membership is the Board label
+  `pool:worker`, on workers whose core has PR #1247). A `machine:<worker>` pin waits again as soon as that worker
+  fills or is held. Pin one worker only
   when the card holds state there: an unpushed worktree, or the review card its ship reads (`hermes-core-wt` reads
-  `--review-task` from the local board only). Moves are capped at 3 per card. Don't keep a card on the hub on an
+  `--review-task` from the local board only); `--runs-on machine:<w> --host-reason "..."` records why. Moves are capped at 3 per card. Don't keep a card on the hub on an
   unchecked "only the hub can": pool workers carry Mac reach (`--runs-on capability:tailnet-exec`), hub reads and
   hub writes, so Mac-only work is portable. An assignee profile the pool doesn't run (e.g. `mac-ops`) pins the
   card to the hub and the move fails `capability_mismatch`: `hermes kanban assign <id> default` first, then move.
