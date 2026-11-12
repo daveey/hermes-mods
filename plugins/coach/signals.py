@@ -32,6 +32,8 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               rule) whose `reply_nudge_outcome` says the revised reply still fails (or none came within 15 min);
               a failed revision that is in no assistant row of its session (a detached fork's text the user never
               saw) files as a coach bug (`judged_unsent_draft`), not an agent defect.
+- refusals    a chat whose user asks were refused by the provider's safety filter 2+ times in a row (state.db
+              display_kind `content_refused`), one signal per session (refusal_streak.py, agent-2e0c97e3a0).
 Profiles (<home>/profiles/*) are swept too, except the coach log, which lives in <home>/coach only.
 
 Every collector reads from a cursor (<home>/coach/signals-cursor.json: byte offsets + inode per log, last seen
@@ -2120,6 +2122,7 @@ def collect(home: Path, cur: dict, host: str, now: Optional[float] = None) -> Li
                      ("cron", lambda: collect_cron(home, cur, now, host)),
                      ("kanban", lambda: collect_kanban(home, cur, now, host)),
                      ("gateway", lambda: collect_gateway(home, cur, now, host)),
+                     ("refusals", lambda: collect_refusals(home, cur, now, host)),
                      ("coach", lambda: collect_coach(home, cur, now, host))):
         try:
             sigs = fn()
@@ -2220,6 +2223,15 @@ def _self_heal():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def collect_refusals(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
+    """2+ consecutive safety-filter refusals of a chat's user asks (refusal_streak.py)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_coach_refusal_streak_signals", SELF_DIR / "refusal_streak.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.collect(home, cur, now, host, homes=homes, ro=_ro, fp=fp, backfill_s=BACKFILL_S)
 
 
 def drain_spool(home: Path) -> List[dict]:

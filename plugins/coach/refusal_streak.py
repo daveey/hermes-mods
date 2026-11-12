@@ -1,0 +1,81 @@
+"""refusals: chats the provider's safety filter refused 2+ times in a row (self-heal agent-2e0c97e3a0).
+
+A refusal caused by a chat's earlier history (not the new message) refuses every later message too. Core keeps each
+refused ask as a display-only user row with display_kind `content_refused`; 2+ of those in a row among a session's
+user asks means the user re-asked and still got no answer, so core's history-triggered recovery (compact + retry
+once, then point at /new) did not resolve it. One signal per session: the fingerprint is the session id, and the
+cursor remembers filed sessions so later refusals in the same chat do not refile it.
+
+Stdlib only, Python 3.9+; signals.py loads it by path and passes its own helpers in.
+"""
+from __future__ import annotations
+
+import sqlite3
+from typing import Callable, Dict, List, Optional, Tuple
+
+REFUSED_KIND = "content_refused"
+STREAK_MIN = 2
+MAX_FILED = 500  # remembered sessions per db; older ones age out (their fingerprint still dedups on the lane)
+
+
+def refused_streaks(conn: sqlite3.Connection, since_id: int, since_ts: float) -> List[Tuple[str, int, int, float, str]]:
+    """``(session_id, streak, last_row_id, last_ts, last_ask)`` for every session whose user asks end a run of
+    >= STREAK_MIN consecutive `content_refused` rows at a row newer than ``since_id`` / ``since_ts``. Steers,
+    observed rows and compaction summaries (other display kinds / flags) are not asks and neither break nor
+    extend a run."""
+    sessions = [r[0] for r in conn.execute(
+        "select distinct session_id from messages where role='user' and display_kind=? and id>? and timestamp>=?",
+        (REFUSED_KIND, since_id, since_ts))]
+    out = []
+    for sid in sessions:
+        rows = conn.execute(
+            "select id, timestamp, display_kind, substr(coalesce(content,''),1,200) from messages "
+            "where session_id=? and role='user' and coalesce(observed,0)=0 and coalesce(_compressed_summary,0)=0 "
+            "and (display_kind is null or display_kind=?) order by id", (sid, REFUSED_KIND)).fetchall()
+        best: Optional[Tuple[int, int, float, str]] = None
+        run = 0
+        for rid, ts, kind, content in rows:
+            run = run + 1 if kind == REFUSED_KIND else 0
+            if run >= STREAK_MIN and rid > since_id and ts >= since_ts:
+                best = (run, rid, ts, content)
+        if best:
+            out.append((sid, *best))
+    return out
+
+
+def collect(home, cur: dict, now: float, host: str, *, homes: Callable, ro: Callable, fp: Callable,
+            backfill_s: float) -> List[dict]:
+    seen: Dict[str, dict] = cur.setdefault("refusals", {})
+    out = []
+    for prof, h in homes(home):
+        db = h / "state.db"
+        if not db.is_file():
+            continue
+        key = str(db)
+        st = seen.setdefault(key, {})
+        since_id = int(st.get("last_id") or 0)
+        since_ts = float(st.get("since_ts", now - backfill_s))  # first sight looks back backfill_s only
+        filed = list(st.get("filed") or [])
+        try:
+            c = ro(db)
+            try:
+                top = c.execute("select coalesce(max(id),0) from messages").fetchone()[0]
+                streaks = refused_streaks(c, since_id, since_ts)
+            finally:
+                c.close()
+        except sqlite3.Error:
+            continue  # no display_kind column (older core) or unreadable: nothing to say
+        for sid, n, rid, ts, ask in streaks:
+            if sid in filed:
+                continue
+            filed.append(sid)
+            out.append({
+                "kind": "refusals", "component": "agent", "at": ts, "session_id": sid, "profile": prof,
+                "symptom": f"chat refused by the provider's safety filter {n} times in a row; the user re-asked "
+                           "and got no answer (history-triggered refusal not recovered)",
+                "details": f"session {sid} on {host}: {n} consecutive content_refused user rows, latest row {rid}. "
+                           "Check agent.log for 'history-triggered refusal: compacted+retried outcome=' lines.",
+                "quote": ask, "fp": fp("agent", "refusal_streak", sid),
+            })
+        st.update(last_id=int(top), since_ts=0.0, filed=filed[-MAX_FILED:])
+    return out
