@@ -188,6 +188,13 @@ there, which execs the skill script.
 - The Desktop "For you" panel lists asks from every gateway. Cards that live on another gateway's board are read
   with `cross_task`, not this host's sqlite.
 - Don't publish the "may I sweep?" question as an approval tile first: this skill is the approval.
+- "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
+  `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
+  alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. Until `red_cards.py` covers
+  them, also list the red chats (`select id,title,outcome_json from sessions where coalesce(archived,0)=0 and
+  json_extract(outcome_json,'$.kind')='decision'`), read their cards with `cross_task`, and run the inventory query
+  on each other host with `tailnet_exec` (`mbp`, `mini`). Remote cards are commented and unblocked on their own
+  host (`tailnet_exec ... hermes kanban comment/unblock`); `cross_task` only reads and comments.
 
 ## Done means
 - [ ] Every board was inventoried, and the count per board and status was reported?
