@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, access_scope, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -43,6 +43,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     physical_asks = _sib("physical_asks")
     replan = _sib("replan")
     agent_condition = _sib("agent_condition")
+    access_scope = _sib("access_scope")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 # Surfaces where the typed turn is the single local user's own words. Only an answer typed there may be bound to a
@@ -1048,6 +1049,27 @@ def _judge_explicit(session_id: str, tool_name: str, text: str, tools: list[dict
     return None
 
 
+_ACCESS_SCOPE_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _access_scope_hold(session_id: str, tool_name: str, args: dict) -> dict | None:
+    text = '\n'.join(str(args.get(k) or '') for k in ('title', 'body', 'reason', 'human_request'))
+    request = args.get('human_request')
+    policy = access_scope.tool_policy_request(request) if isinstance(request, dict) else None
+    hit = policy or access_scope.regional_claim(text, _tools_now(session_id))
+    if hit is None:
+        return None
+    key = (session_id, tool_name, core.text_hash(text))
+    n = _ACCESS_SCOPE_HELD.get(key, 0)
+    if n >= access_scope.MAX_HOLDS:
+        return None  # existing ask/authorization gates still run
+    _ACCESS_SCOPE_HELD[key] = n + 1
+    rule = 'tool_policy_escalation' if policy else 'regional_access_scope'
+    core.log_event(rule, session=session_id, tool=tool_name, attempt=n, **hit)
+    message = access_scope.POLICY_MESSAGE if policy else access_scope.regional_message(hit)
+    return {'action': 'block', 'message': message}
+
+
 def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any) -> dict | None:
     if _off() or not isinstance(args, dict):
         return None
@@ -1088,6 +1110,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             return _action_request_gate(session_id, args)
         if tool_name not in ("kanban_create", "kanban_block"):
             return None
+        scoped = _access_scope_hold(session_id, tool_name, args)
+        if scoped is not None:
+            return scoped
         if args.get("human_request") is not None:
             return _human_request_gate(session_id, tool_name, args)
         candidate = str(args.get("reason") or "") if tool_name == "kanban_block" else (
